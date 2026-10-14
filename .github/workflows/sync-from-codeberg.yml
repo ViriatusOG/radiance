@@ -1,0 +1,59 @@
+# Keeps github.com/ViriatusOG/radiance a mirror of https://codeberg.org/StillDeadcode/radiance.
+# Every branch and tag from Codeberg is copied as-is (force-updated, and deleted here
+# when deleted there). Pull-request refs are not copied.
+#
+# Lives on its own branch (mirror-sync), which must be the repository's default branch:
+# GitHub only runs scheduled workflows from the default branch, and keeping it off
+# `main` means main stays identical to Codeberg's.
+name: Sync from Codeberg
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-from-codeberg
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM: https://codeberg.org/StillDeadcode/radiance.git
+      KEEP_BRANCH: ${{ github.ref_name }}   # the branch holding this workflow
+    steps:
+      - name: Fetch every branch and tag from Codeberg
+        run: |
+          git init -q --bare mirror.git
+          cd mirror.git
+          for i in 1 2 3; do
+            git fetch --prune --no-tags "$UPSTREAM" \
+              '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' && break
+            [ "$i" = 3 ] && exit 1
+            sleep $((i * 30))
+          done
+          # Never mirror an empty or broken fetch: that would prune everything here.
+          git rev-parse --verify -q refs/heads/main >/dev/null || { echo "::error::Codeberg returned no main branch"; exit 1; }
+          if git rev-parse --verify -q "refs/heads/$KEEP_BRANCH" >/dev/null; then
+            echo "::error::Codeberg now has a branch called $KEEP_BRANCH; rename this sync branch"; exit 1
+          fi
+          echo "Codeberg main: $(git rev-parse refs/heads/main)"
+          echo "Latest tag: $(git tag --sort=-v:refname | head -1)"
+
+      - name: Push them to GitHub
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd mirror.git
+          url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Keep the branch holding this workflow, so --prune leaves it alone.
+          git fetch -q "$url" "+refs/heads/$KEEP_BRANCH:refs/heads/$KEEP_BRANCH"
+          git push --prune --force "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+          want=$(git rev-parse refs/heads/main)
+          git ls-remote --heads "$url" main | grep -q "^$want" || { echo "::error::GitHub main is not at Codeberg main ($want)"; exit 1; }
+          echo "GitHub main now at $want"
