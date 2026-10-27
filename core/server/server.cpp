@@ -95,6 +95,8 @@ void Server::register_routes() {
     router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
     router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
+    /* LiteLLM's name for the same endpoint. */
+    router_.post("/v1/decisions",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* Speech to text, for a model whose plugin says how it transcribes (RadAudioFormat). */
     router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return handle_speech(q); });
     router_.post("/v1/videos",       [this](const HttpRequest& q) { return handle_video_create(q); });

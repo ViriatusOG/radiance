@@ -399,6 +399,9 @@ json Server::capabilities() const {
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
     caps["audio_generation"] = deps_.audio != nullptr;
     caps["video_generation"] = deps_.videos != nullptr;
+    /* The decision protocol /v1/systemone serves (ServerOptions::decision_type), so a proxy can
+     * route to a decision model without trying a generation; null when it serves none. */
+    caps["decision"] = opt_.decision_type.empty() ? json(nullptr) : json(opt_.decision_type);
     /* What a video request may carry. */
     if (deps_.videos) video_caps(caps, deps_.videos);
     /* The efforts a chat request may send, probed from the template at startup; null when it
