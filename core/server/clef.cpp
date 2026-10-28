@@ -182,12 +182,17 @@ int parse_clef_request(const std::string& body, const OaiDeps& d, const OaiLimit
     const std::vector<int32_t> suffix =
         ids("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:");
     const int64_t n = (int64_t)(prefix.size() + state.size() + schema.size() + suffix.size());
-    if (lim.max_ctx > 0 && n > lim.max_ctx) {
-        ApiError e = err_bad("state", "the prompt is " + std::to_string(n) + " tokens; this "
-                             "deployment's context holds " + std::to_string(lim.max_ctx));
+    /* The context, or the head's own bound where that is less (abi/rad_clef.h). */
+    const int64_t cap = lim.max_ctx > 0 && lim.max_ctx < RAD_CLEF_MAX_PROMPT ? lim.max_ctx
+                                                                             : RAD_CLEF_MAX_PROMPT;
+    if (n > cap) {
+        ApiError e = err_bad("state", "the prompt is " + std::to_string(n) + " tokens; " +
+                             (cap == lim.max_ctx ? "this deployment's context holds "
+                                                 : "clef's head takes at most ") +
+                             std::to_string(cap));
         e.code = "context_length_exceeded";
         e.n_prompt_tokens = n;
-        e.n_ctx = lim.max_ctx;
+        e.n_ctx = cap;
         *err = e;
         return RAD_E_INVAL;
     }

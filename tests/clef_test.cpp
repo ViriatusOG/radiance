@@ -134,6 +134,12 @@ TEST(bad_requests_are_400s) {
     /* The whole prompt must fit; nothing is cut. */
     CHECK(parse(tok, kBody, &r, &e, 100) < 0);
     CHECK_EQ(e.code, "context_length_exceeded");
+    /* And it fits the head's own bound, whatever the context: a byte a token here. */
+    const std::string huge = R"({"state": ")" + std::string(RAD_CLEF_MAX_PROMPT, 'x') +
+                             R"(", "questions": {"q": {"type": "noul"}}})";
+    CHECK(parse(tok, huge, &r, &e, 0) < 0);
+    CHECK_EQ(e.code, "context_length_exceeded");
+    CHECK_EQ(e.n_ctx, (int64_t)RAD_CLEF_MAX_PROMPT);
 }
 
 TEST(answers_are_softmaxes_in_the_releases_shape) {

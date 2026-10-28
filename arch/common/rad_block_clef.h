@@ -151,7 +151,10 @@ inline int ClefHead::declare(RadBuilder* b, const RadModelMeta* meta, const RadB
     if (E % 2) return RAD_E_INVAL;
     bs = rad_kv_block_size(b, kv_trunk);
     if (bs <= 0) return RAD_E_STATE;
-    nblk = (g.max_ctx + bs - 1) / bs;
+    /* Rows a request may hold: the context, or the head's own bound where that is less (the
+     * server refuses a longer prompt before it is admitted). */
+    const int64_t rows = g.max_ctx < RAD_CLEF_MAX_PROMPT ? g.max_ctx : RAD_CLEF_MAX_PROMPT;
+    nblk = (rows + bs - 1) / bs;
     NM   = nblk * bs;
     n_vocab = g.n_vocab;
     layer = bind_layer;

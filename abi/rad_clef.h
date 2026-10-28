@@ -22,7 +22,11 @@ extern "C" {
 enum {
     RAD_CLEF_MAX_QUESTIONS = 64,
     RAD_CLEF_MAX_OPTIONS   = 512,     /* every question's options together */
-    RAD_CLEF_MAX_LEX       = 8192     /* every option's tokens together */
+    RAD_CLEF_MAX_LEX       = 8192,    /* every option's tokens together */
+    /* Prompt tokens. The head gathers every row of a prompt into buffers of its own, so this,
+     * not the deployment's context, sizes them: at the model's own 262144 they would take
+     * 4.5 GiB of the card for prompts that never pass a fifth of it. */
+    RAD_CLEF_MAX_PROMPT    = 32768
 };
 
 /* The header: word 0 is the engine's (RadBatch::plugin_words), the rest the counts the layout is
