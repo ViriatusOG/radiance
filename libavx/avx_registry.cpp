@@ -161,6 +161,8 @@ static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
 static const RadParamSpec pActMul[]   = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
 static const RadParamSpec pSegMean[]  = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pSegPool[]  = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
@@ -934,6 +936,9 @@ static const RadOpSchema kSchemas[] = {
   "y = act(a) * b, act silu / gelu / gelu_tanh, the activation rounded to y's dtype first." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
   "y[s] = the mean of x's rows in cu_seqlens segment s, summed in double, rounded once." },
+{ "seg_softmax_pool", ARR(pSegPool), ARR(oSegPool),
+  "y[s] = v's rows in cu_seqlens segment s summed with the softmax of their scores as weights, "
+  "in f32, rounded once." },
 { "relu", ARR(pMnD), ARR(oUnary), "y = max(x, 0)." },
 { "clamp", ARR(pMnD), ARR(oClamp), "y = min(max(x, lo), hi), lo and hi one-element weights." },
 { "conv2d", ARR(pConv2d), ARR(oConv2d),
@@ -1533,6 +1538,9 @@ SIMPLE("avx_mul_weight", "mul_weight", "elem", "x * a scalar or one-row weight",
        L(mul_weight)),
 SIMPLE("avx_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        L(seg_mean)),
+SIMPLE("avx_seg_softmax_pool", "seg_softmax_pool", "elem",
+       "each cu_seqlens segment's rows summed with the softmax of their scores", DT_FLOAT,
+       L(seg_softmax_pool)),
 SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, L(pool_rows)),
 SIMPLE("avx_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "

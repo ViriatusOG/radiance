@@ -28531,6 +28531,18 @@ static void device_phase(const Plugin& pl) {
             run_case(r, ts, ps);
         }
     }
+    if (sel("seg_softmax_pool_bf16")) {
+        const RadKernelInfo* r = find(pl, "seg_softmax_pool_bf16");
+        if (!r) ok("seg_softmax_pool_bf16", false, "row absent");
+        else {
+            std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 23 }),
+                                          T(nullptr, RAD_BF16, { 23, 645 }),
+                                          T(nullptr, RAD_I32, { 4 }),
+                                          T(nullptr, RAD_BF16, { 3, 645 }) };
+            std::vector<RadParam> ps = { PI("M", 23), PI("n", 645), PS("dtype", "bf16") };
+            run_case(r, ts, ps);
+        }
+    }
     if (sel("qk_norm_rope_bf16")) {
         const RadKernelInfo* r = find(pl, "qk_norm_rope_bf16");
         if (!r) ok("qk_norm_rope_bf16", false, "row absent");

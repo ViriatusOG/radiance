@@ -1886,6 +1886,15 @@ static const RadOperandSpec oSegMean[] = {
     { "cu_seqlens", RAD_OPD_IN,  0 },
     { "y",          RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pSegPool[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"),
+};
+static const RadOperandSpec oSegPool[] = {
+    { "score",      RAD_OPD_IN,  0 },
+    { "v",          RAD_OPD_IN,  0 },
+    { "cu_seqlens", RAD_OPD_IN,  0 },
+    { "y",          RAD_OPD_OUT, 0 },
+};
 /* docs/OPS.md's `qk_norm_rope`: a fused [q | k | v] row in place, theta and not a table. */
 static const RadParamSpec pQkNormRope[] = {
     P_INT("M"), P_INT("head_dim"), P_INT("n_head"), P_INT("n_head_kv"), P_F64("theta"),
@@ -2930,6 +2939,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("seg_mean", pSegMean, oSegMean,
            "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
            "and rounded once; an empty segment is zeros."),
+    SCHEMA("seg_softmax_pool", pSegPool, oSegPool,
+           "Row s of y is v's rows [cu_seqlens[s], cu_seqlens[s+1]) summed with the softmax of "
+           "their scores (one a row, f32, the maximum subtracted) as weights, in f32 and rounded "
+           "once; an empty segment is zeros."),
     SCHEMA("qk_norm_rope", pQkNormRope, oQkNormRope,
            "In place over a fused [q | k | v] row: each q and k head RMS-normed against its gain "
            "(plus wadd) and rounded, then rotated (neox or gptj, rotary_dim of head_dim); with "
@@ -5647,6 +5660,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_seg_mean },
+
+{ "seg_softmax_pool_bf16", "seg_softmax_pool", "elem",
+  "a segment's rows summed with the softmax of their scores as weights: one row a cu_seqlens "
+  "segment",
+  "any n; a thread an output column, one workgroup row a segment, the softmax formed in f32 by "
+  "every thread",
+  "bf16 scores, rows and out, f32 weights and sum, one rounding",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_seg_softmax_pool },
 
 { "qk_norm_rope_bf16", "qk_norm_rope", "attn",
   "per-head RMS norm of q and k (and optionally v, unit gain) with rotary on q and k, in place",

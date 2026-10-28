@@ -786,6 +786,41 @@ extern "C" int r4d_seg_mean_bf16(long x, long cu, long y, int S, int n, int x_ld
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+// ---------------------------------------------------------------------------- seg_softmax_pool
+// ref_seg_softmax_pool: row s of y is v's rows [cu[s], cu[s+1]) summed with the softmax of their
+// scores as weights, the softmax in f32 with the maximum subtracted, the sum in f32, one rounding.
+// A workgroup is 256 columns of one segment, and every thread forms the segment's softmax itself:
+// a segment is one question's few options (clef's routing), so the repeat is cheaper than a
+// reduction. An empty segment writes zeros.
+__global__ __launch_bounds__(kThreads) void seg_softmax_pool_kernel(
+    const uint16_t* __restrict__ sc, const uint16_t* __restrict__ v, const int* __restrict__ cu,
+    uint16_t* __restrict__ y, uint32_t n, uint32_t v_ld, uint32_t y_ld) {
+    const uint32_t s = blockIdx.y;
+    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= n) return;
+    const int b0 = cu[s], b1 = cu[s + 1];
+    float m = -INFINITY;
+    for (int r = b0; r < b1; ++r) m = fmaxf(m, bf2f(sc[r]));
+    float z = 0.0f;
+    for (int r = b0; r < b1; ++r) z += expf(bf2f(sc[r]) - m);
+    float acc = 0.0f;
+    for (int r = b0; r < b1; ++r)
+        acc += expf(bf2f(sc[r]) - m) / z * bf2f(v[(size_t)r * v_ld + i]);
+    y[(size_t)s * y_ld + i] = f32_to_bf16(b1 > b0 ? acc : 0.0f);
+}
+
+extern "C" int r4d_seg_softmax_pool_bf16(long sc, long v, long cu, long y, int S, int n, int v_ld,
+                                         int y_ld, long stream) {
+    if (!sc || !v || !cu || !y) return -1;
+    if (S <= 0 || n <= 0) return -2;
+    hipLaunchKernelGGL(seg_softmax_pool_kernel,
+                       dim3((uint32_t)((n + kThreads - 1) / kThreads), (uint32_t)S),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)sc,
+                       (const uint16_t*)v, (const int*)cu, (uint16_t*)y, (uint32_t)n,
+                       (uint32_t)v_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 // mode: 0 neox, 1 gptj, 2 blocks, 3 gptj_blocks, 4 imrope, 5 axial (`blk` and the position plane
 // stride `pplane` used only by the last four). A null gain is a unit gain; `rot` 0 is the norm
 // alone, and then `pos` may be null. `pos_f32` reads f32 positions as the values they hold.
@@ -1097,6 +1132,30 @@ extern "C" int r4d_rad_seg_mean(const RadArgs* a, RadStream s) {
     if (My < S) return R4D_NO(RAD_E_SHAPE);
     return enc_status(r4d_seg_mean_bf16(r4d_addr(X), r4d_addr(cu), r4d_addr(Y), (int)S, (int)n,
                                         (int)x_ld, (int)y_ld, (long)(uintptr_t)s));
+}
+
+extern "C" int r4d_rad_seg_softmax_pool(const RadArgs* a, RadStream s) {
+    const RadTensor* Sc = r4d_opt(a, 0);
+    const RadTensor* V  = r4d_opt(a, 1);
+    const RadTensor* cu = r4d_opt(a, 2);
+    const RadTensor* Y  = r4d_opt(a, 3);
+    if (!Sc || !V || !cu || !Y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(Sc));
+    R4D_NEED(dt_bf16(V));
+    R4D_NEED(dt_bf16(Y));
+    if (!r4d_contig(Sc)) return R4D_NO(RAD_E_STRIDE);
+    if (cu->dtype != RAD_I32 || !r4d_contig(cu) || r4d_numel(cu) < 2) return R4D_NO(RAD_E_SHAPE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(Y, (int)Y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    const long long S = r4d_numel(cu) - 1;
+    long long Mv = 0, My = 0;
+    const long long v_ld = r4d_rows_pitch(V, n, &Mv);
+    const long long y_ld = r4d_rows_pitch(Y, n, &My);
+    if (v_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (My < S || r4d_numel(Sc) < Mv) return R4D_NO(RAD_E_SHAPE);
+    return enc_status(r4d_seg_softmax_pool_bf16(r4d_addr(Sc), r4d_addr(V), r4d_addr(cu),
+                                                r4d_addr(Y), (int)S, (int)n, (int)v_ld,
+                                                (int)y_ld, (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ qk_norm_rope */

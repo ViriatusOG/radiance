@@ -194,6 +194,8 @@ static const RadParamSpec pActMul[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_
 /* `M` is the step's token count and bands the op; the segment count is cu_seqlens' length. */
 static const RadParamSpec pSegMean[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pSegPool[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 /* `M` is the input row count, a multiple of `k`; y has M / k rows. */
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
@@ -1153,6 +1155,10 @@ static const RadOpSchema kSchemas[] = {
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
   "y[s] = mean of x's rows [cu[s], cu[s+1]): one row a segment, summed in double and rounded "
   "once to y's dtype. An empty segment is a zero row." },
+{ "seg_softmax_pool", ARR(pSegPool), ARR(oSegPool),
+  "y[s] = v's rows [cu[s], cu[s+1]) summed with the softmax of their scores (one a row, f32, the "
+  "maximum subtracted) as weights, in f32 and rounded once to y's dtype. An empty segment is a "
+  "zero row." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then "
   "times `mult` (default 1) and rounded again. M, the input rows, is a multiple of k." },
@@ -2207,6 +2213,9 @@ SIMPLE("ref_chan_stats", "chan_stats", "elem", "per-channel statistics held as w
        DT_FLOAT, ref_chan_stats),
 SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        ref_seg_mean),
+SIMPLE("ref_seg_softmax_pool", "seg_softmax_pool", "elem",
+       "each cu_seqlens segment's rows summed with the softmax of their scores", DT_FLOAT,
+       ref_seg_softmax_pool),
 SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, ref_pool_rows),
 SIMPLE("ref_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "

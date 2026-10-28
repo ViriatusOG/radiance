@@ -968,6 +968,7 @@ TEST(op_vocabulary) {
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
+        "seg_softmax_pool",
         "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
         "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
@@ -3258,6 +3259,21 @@ TEST(op_seg_mean) {
     CHECK_NEAR(y.at(0), 3.0f, 1e-6); CHECK_NEAR(y.at(1), 4.0f, 1e-6);
     CHECK_EQ(y.at(2), 0.0f);         CHECK_EQ(y.at(3), 0.0f);
     CHECK_NEAR(y.at(4), 7.0f, 1e-6); CHECK_NEAR(y.at(5), 9.0f, 1e-6);
+}
+
+/* seg_softmax_pool: a segment's rows summed with the softmax of their scores as weights. Scores 0
+ * and ln 3 weigh two rows 1/4 and 3/4; an empty segment is a zero row. */
+TEST(op_seg_softmax_pool) {
+    T sc(RAD_F32, {4});   sc.f({ 0.0f, 1.0986123f, 5.0f, 2.0f });
+    T v(RAD_F32, {4, 2}); v.f({ 1, 2,  5, 6,  7, 9,  3, 3 });
+    T cu(RAD_I32, {4});   cu.n({0, 2, 2, 4});
+    T y(RAD_F32, {3, 2});
+    A a; a.t(sc).t(v).t(cu).t(y).i("M", 4).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("seg_softmax_pool", a));
+    CHECK_NEAR(y.at(0), 4.0f, 1e-5);   CHECK_NEAR(y.at(1), 5.0f, 1e-5);
+    CHECK_EQ(y.at(2), 0.0f);           CHECK_EQ(y.at(3), 0.0f);
+    /* Scores 5 and 2: weights 1 / (1 + e^-3) and the rest. */
+    CHECK_NEAR(y.at(4), 6.8103f, 1e-3); CHECK_NEAR(y.at(5), 8.7155f, 1e-3);
 }
 
 /* relu and clamp: the plain element rules. */
@@ -9617,6 +9633,7 @@ std::vector<Geo> geometries() {
         G("mul_weight", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("act_mul", "M", 3, a.i("M", R).i("n", 8).s("act", "silu").s("dtype", "f32")),
         G("seg_mean", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32").i("n_seq", 2)),
+        G("seg_softmax_pool", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32").i("n_seq", 2)),
         G("pool_rows", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("pool_cols", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("relu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),

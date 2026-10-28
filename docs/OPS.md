@@ -211,6 +211,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
+| `seg_softmax_pool` | `M`(range) `n` `dtype` | `score`, `v`, `cu_seqlens` → `y` (one softmax-weighted row a segment) |
 | `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
 | `pool_cols` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean column a window of k columns) |
 | `relu` | `M`(range) `n` `dtype` | `x` → `y` |
@@ -288,6 +289,13 @@ rounded to `y`'s dtype before the product, as the unfused pair stores it.
 **`seg_mean`** is mean pooling over a ragged batch: row `s` of `y` is the mean of `x`'s rows
 `[cu[s], cu[s+1])`, summed in double and rounded once. `M` is the step's token count and bands the
 op; the segment count is `cu_seqlens`' length less one. An empty segment is a zero row.
+
+**`seg_softmax_pool`** is `seg_mean` with learned weights: row `s` of `y` is `v`'s rows
+`[cu[s], cu[s+1])` summed with the softmax of their `score`s (one a row of `v`, f32, the maximum
+subtracted) as the weights, the sum in f32 and rounded once. It is a query reading its few
+candidates: clef's joint schema head routes each question over its options this way, the scores
+the options' dot products with the question. `M` bands the op as `seg_mean`'s does, and an empty
+segment is a zero row.
 
 **`pool_rows`** is a vision pooler over windows laid out consecutively: row `r` of `y` is the mean
 of `x`'s rows `[r*k, r*k + k)`, summed in f32 and rounded to `y`'s dtype, then times `mult` and

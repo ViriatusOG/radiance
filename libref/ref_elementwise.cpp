@@ -436,6 +436,39 @@ int ref_seg_mean(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ seg_softmax_pool */
+/* y[s, :] = sum over the segment's rows r of softmax(score)[r] * v[r, :]: one row a cu_seqlens
+ * segment, the weights a softmax over the segment's own scores (f32, the maximum subtracted), the
+ * sum in f32 and rounded once. A query reading its few candidates with learned scores (clef's
+ * routing over a question's options). An empty segment writes zeros. */
+int ref_seg_softmax_pool(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *Sc = &a->t[0], *V = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0);
+    const int64_t S = numel(cu) - 1;
+    if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
+    const int64_t total = cu_at(cu, S);
+    if (total <= 0 || numel(V) < total * n || numel(Sc) < total) return RAD_E_SHAPE;
+
+    REF_PAR_FOR((total + S) * n)
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t b0 = cu_at(cu, s);
+        const int64_t b1 = cu_at(cu, s + 1);
+        const int64_t yb = rowoff(Y, s, n), ys = laststride(Y), vs = laststride(V);
+        float m = -INFINITY, z = 0.0f;
+        for (int64_t r = b0; r < b1; ++r) m = std::max(m, ldt(Sc, rowoff(Sc, r, 1)));
+        for (int64_t r = b0; r < b1; ++r) z += std::exp(ldt(Sc, rowoff(Sc, r, 1)) - m);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int64_t r = b0; r < b1; ++r)
+                acc += std::exp(ldt(Sc, rowoff(Sc, r, 1)) - m) / z *
+                       ldt(V, rowoff(V, r, n) + i * vs);
+            stt(Y, yb + i * ys, b1 > b0 ? acc : 0.0f);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ pool_rows */
 /* Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then
  * multiplied by `mult` and rounded again, as the unfused pair stores the mean. For vision poolers
