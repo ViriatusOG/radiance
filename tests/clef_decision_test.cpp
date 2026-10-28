@@ -1,7 +1,8 @@
 /* clef_decision_test.cpp -- /v1/systemone on a clef container, end to end on the CPU.
  *
  * A tiny qwen35 (tests/tiny_model.h) with a tiny joint schema head of its own, converted with the
- * head added and `decision.type=clef`, served by the radiance binary on the host backend. The
+ * head added, `--arch clef` (the clef plugins) and `decision.type=clef`, served by the radiance
+ * binary on the host backend. The
  * answers are checked against tests/data/golden/clef_tiny.json, the release's own head
  * (joint_schema_model.py) over transformers' forward pass in float32, made by
  * tests/mkclefgolden.py from the checkpoint this test writes (RAD_E2E_KEEP=1 keeps it). The
@@ -288,7 +289,7 @@ TEST(a_clef_container_decides_every_question_on_the_card_and_matches_the_release
     /* Converted with the head added; the head's geometry and scalars land in the header. */
     const std::string rad = dir / "clef-tiny.rad";
     std::string log;
-    const int st = tiny::run({ RAD_E2E_CONVERT, ck, "-o", rad, "--add",
+    const int st = tiny::run({ RAD_E2E_CONVERT, ck, "-o", rad, "--arch", "clef", "--add",
                                ck + "/joint_head.safetensors", "--set", "decision.type=clef" },
                              engine_env(), &log, 300);
     if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(log).c_str());
@@ -388,8 +389,8 @@ TEST(a_clef_convert_without_the_head_is_refused) {
     REQUIRE_EQ(mkdir(ck.c_str(), 0755), 0);
     REQUIRE(write_tiny_clef(ck, 7));
     std::string log;
-    const int st = tiny::run({ RAD_E2E_CONVERT, ck, "-o", dir / "no-head.rad", "--set",
-                               "decision.type=clef" }, engine_env(), &log, 300);
+    const int st = tiny::run({ RAD_E2E_CONVERT, ck, "-o", dir / "no-head.rad", "--arch", "clef",
+                               "--set", "decision.type=clef" }, engine_env(), &log, 300);
     CHECK(st != 0);
     CHECK(log.find("joint_head.safetensors") != std::string::npos);
 }

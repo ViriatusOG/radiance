@@ -2760,16 +2760,21 @@ Cloudflare's clef (27B) and clef-flash (9B) are decision models on Qwen3.5 that 
 request, every question of it jointly: a joint schema head reads the backbone's final hidden state
 at every prompt position, the mean over each question's instructions and each option's text, and
 the lm_head rows of each option's tokens, and gives one logit an option. radiance runs that head
-on the card, after the trunk, inside the `qwen35_bf16` and `qwen35_fp8` plugins
-(`arch/common/rad_block_clef.h`): there is no second process. The head's own tensors ship as
+on the card, after the trunk, in the `clef_bf16` and `clef_fp8` plugins (`arch/clef_bf16`,
+`arch/clef_fp8`: the qwen35 plugins' own code with `arch/common/rad_block_clef.h` after it): there
+is no second process. The head's own tensors ship as
 `joint_head.safetensors` beside the checkpoint and are added at convert; `joint_head_config.json`
 beside them gives the head's geometry.
 
 ```sh
-rad-convert /srv/models/clef-flash -o clef-flash.rad \
+rad-convert /srv/models/clef-flash -o clef-flash.rad --arch clef \
     --add /srv/models/clef-flash/joint_head.safetensors --set decision.type=clef
 radiance --model clef-flash.rad --port 8000
 ```
+
+`--arch clef` selects the `clef_bf16` and `clef_fp8` plugins, the qwen35 trunk built again with
+the head after it; a container left as `qwen35` serves generation and answers `/v1/systemone`
+with 501.
 
 The request and the response are the same as d1's above; `/v1/decisions` is the same endpoint
 under LiteLLM's name. What differs:

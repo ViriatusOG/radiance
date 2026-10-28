@@ -310,7 +310,7 @@ foreach(t engine_e2e_test convert_test clef_decision_test)
       # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
       target_compile_definitions(${t} PRIVATE
         RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
-      add_dependencies(${t} radiance rad-convert libref libquant qwen35_bf16)
+      add_dependencies(${t} radiance rad-convert libref libquant clef_bf16)
     else()
       add_dependencies(${t} ${RAD_E2E_DEPS})
     endif()

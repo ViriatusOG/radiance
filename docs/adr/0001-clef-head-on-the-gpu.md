@@ -12,7 +12,12 @@ On threadripper, fp8 clef-flash with the head in a PyTorch sidecar served 1.43 r
 
 ## Decision
 
-The head runs on the GPU, in the plugin step (`arch/common/rad_block_clef.h`), with these parts:
+The head runs on the GPU, in the plugin step (`arch/common/rad_block_clef.h`). On this branch
+(`clef-flash-arch-plugin`) it is wired in two plugins of its own, `arch/clef_bf16` and
+`arch/clef_fp8`, which build the qwen35 plugins' source again under architecture id `clef` and
+add the head after the trunk; the qwen35 plugins are untouched. The sibling branch
+(`clef-flash-support`) wires the same block into the qwen35 plugins behind `decision.type=clef`.
+The parts:
 
 1. Every step, the final norm's rows go through the head's `hidden_norm` and into a paged FULL KV group of the head's own (`clef.kv`, one layer bound past the trunk's). Its block size is the trunk's, so the prefix cache keeps those rows with the trunk's cache. 8 KB a token on clef-flash.
 2. On the step that samples a prompt's first token, the head gathers every row of its group back out (`gather_rows` over the sequence's block table, the way the KV tier packs blocks), runs the memory projection and the six cross-attention layers over all of them, averages the question and option spans, routes, runs the decoder layers and the scorer, and writes three values an option (lexical prior, cosine, residual) into the request's logits row.
