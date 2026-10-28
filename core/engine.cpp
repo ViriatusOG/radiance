@@ -2431,6 +2431,19 @@ int Engine::run_server() {
     o.audio_model = aud_gen_ != nullptr;
     o.video_model = vid_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
+    /* clef's learned scalars, which the server applies to what the head returns (server/clef.h);
+     * rad-convert writes them beside decision.type. */
+    if (o.decision_type == "clef") {
+        const char* const keys[3] = { "decision.clef.prior_logit_scale",
+                                      "decision.clef.joint_logit_scale",
+                                      "decision.clef.residual_gate" };
+        o.clef_scalars = true;
+        for (const char* k : keys) o.clef_scalars = o.clef_scalars && rad_meta_gets(&meta_, k, nullptr);
+        o.clef_prior_logit_scale = rad_meta_getf(&meta_, keys[0], 0.0);
+        o.clef_joint_logit_scale = rad_meta_getf(&meta_, keys[1], 0.0);
+        o.clef_residual_gate     = rad_meta_getf(&meta_, keys[2], 0.0);
+    }
+    o.plugin_words = ranks_.empty() ? 0 : ranks_[0]->program.plugin_words;
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;

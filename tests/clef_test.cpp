@@ -10,6 +10,7 @@
 #include "server/adapters.h"
 #include "server/clef.h"
 #include "text/tokenizer.h"
+#include "rad_clef.h"
 
 #include <nlohmann/json.hpp>
 
@@ -155,6 +156,89 @@ TEST(answers_are_softmaxes_in_the_releases_shape) {
     CHECK_EQ(a["legend"]["1"].get<std::string>(), "Now");
     CHECK(clef_answer(r.questions[2], { 0.0f, NAN }, &a, &e) < 0);
     CHECK(clef_answer(r.questions[2], { 0.0f }, &a, &e) < 0);
+}
+
+/* The request's words for the head: the prompt cut into segments at every span's edges, each
+ * span one whole segment, every option's tokens as the prompt holds them. */
+TEST(the_words_cut_the_prompt_at_every_span_and_carry_the_option_tokens) {
+    ByteTokenizer tok;
+    ClefRequest r;
+    ApiError e;
+    CHECK_OK(parse(tok, kBody, &r, &e));
+    std::vector<int32_t> w;
+    CHECK_OK(clef_words(r, &w, &e));
+    const RadClefWords L = rad_clef_words_read(w.data());
+    CHECK_EQ((size_t)L.total, w.size());
+    CHECK_EQ(L.n, (int32_t)r.tokens.size());
+    CHECK_EQ(L.q, 3);
+    CHECK_EQ(L.o, 6);
+    CHECK_EQ(clef_option_count(r), (int64_t)6);
+    /* 9 spans, none adjacent: 18 cuts plus the ends, so 19 segments. */
+    CHECK_EQ(L.s, 19);
+    CHECK_EQ(w[(size_t)L.seg_cu], 0);
+    CHECK_EQ(w[(size_t)(L.seg_cu + L.s)], L.n);
+    for (int32_t i = 0; i < L.s; ++i) CHECK(w[(size_t)(L.seg_cu + i)] < w[(size_t)(L.seg_cu + i + 1)]);
+    /* Each question's segment is exactly its instruction span. */
+    for (size_t qi = 0; qi < r.questions.size(); ++qi) {
+        const int32_t s = w[(size_t)(L.q_seg + (int32_t)qi)];
+        CHECK_EQ((int64_t)w[(size_t)(L.seg_cu + s)], r.questions[qi].question.first);
+        CHECK_EQ((int64_t)w[(size_t)(L.seg_cu + s + 1)], r.questions[qi].question.second);
+        CHECK_EQ(w[(size_t)(L.type + (int32_t)qi)], r.questions[qi].type_id);
+    }
+    CHECK_EQ(w[(size_t)L.opt_cu], 0);
+    CHECK_EQ(w[(size_t)(L.opt_cu + 1)], 2);
+    CHECK_EQ(w[(size_t)(L.opt_cu + 3)], 6);
+    /* Option 2 is the choice's first option, "billing": its segment is its span and its tokens
+     * are the prompt's there. */
+    const TokenSpan sp = r.questions[1].option_spans[0];
+    const int32_t os = w[(size_t)(L.o_seg + 2)];
+    CHECK_EQ((int64_t)w[(size_t)(L.seg_cu + os)], sp.first);
+    CHECK_EQ(w[(size_t)(L.o_q + 2)], 1);
+    const int32_t l0 = w[(size_t)(L.lex_cu + 2)], l1 = w[(size_t)(L.lex_cu + 3)];
+    CHECK_EQ((int64_t)(l1 - l0), sp.second - sp.first);
+    std::vector<int32_t> lex(w.begin() + L.lex_ids + l0, w.begin() + L.lex_ids + l1);
+    CHECK_EQ(tok.decode(lex), "{\"description\":\"Charges\",\"option_id\":\"billing\"}");
+    CHECK_EQ(w[(size_t)(L.lex_cu + L.o)], L.l);
+    CHECK_EQ(w[(size_t)L.last], L.n - 1);
+    CHECK_EQ(w[(size_t)L.cu_k + 1], L.n);
+    CHECK_EQ(w[(size_t)L.cu_o + 1], L.o);
+    CHECK((int32_t)w.size() <= rad_clef_max_words());
+    /* The head's three values an option land in three stretches of the logits row. */
+    const std::vector<int32_t> ids = clef_score_ids(6);
+    CHECK_EQ(ids.size(), (size_t)18);
+    CHECK_EQ(ids[6], (int32_t)RAD_CLEF_MAX_OPTIONS);
+    CHECK_EQ(ids[17], (int32_t)(2 * RAD_CLEF_MAX_OPTIONS + 5));
+}
+
+TEST(too_many_questions_are_a_400) {
+    ByteTokenizer tok;
+    std::string body = R"({"state": "s", "questions": {)";
+    for (int i = 0; i <= RAD_CLEF_MAX_QUESTIONS; ++i)
+        body += (i ? "," : "") + std::string("\"q") + std::to_string(i) + R"(": {"type": "noul"})";
+    body += "}}";
+    ClefRequest r;
+    ApiError e;
+    CHECK_OK(parse(tok, body, &r, &e));
+    std::vector<int32_t> w;
+    CHECK(clef_words(r, &w, &e) < 0);
+    CHECK_EQ(e.param, "questions");
+}
+
+/* exp(prior_scale) * prior + sigmoid(gate) * (exp(joint_scale) * cosine + residual), the scales
+ * clamped at 100. The release's clef-flash values: both scales 2.296875, the gate -2. */
+TEST(the_scalars_combine_the_heads_three_values) {
+    ClefScalars s;
+    s.prior_logit_scale = std::log(2.0);
+    s.joint_logit_scale = std::log(4.0);
+    s.residual_gate = 0.0;                 /* sigmoid 0.5 */
+    const std::vector<float> v = { 1.0f, 2.0f,   /* prior */
+                                   0.5f, 0.25f,  /* cosine */
+                                   3.0f, -1.0f }; /* residual */
+    const std::vector<float> l = clef_logits(v, 2, s);
+    CHECK(std::fabs(l[0] - (2.0 * 1.0 + 0.5 * (4.0 * 0.5 + 3.0))) < 1e-5);
+    CHECK(std::fabs(l[1] - (2.0 * 2.0 + 0.5 * (4.0 * 0.25 - 1.0))) < 1e-5);
+    s.prior_logit_scale = 10.0;            /* past the clamp: 100 */
+    CHECK(std::fabs(clef_logits(v, 2, s)[0] - (100.0 + 0.5 * 5.0)) < 1e-3);
 }
 
 TEST(ids_and_spans_match_the_releases_encode_record) {

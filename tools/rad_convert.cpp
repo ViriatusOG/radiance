@@ -25,6 +25,8 @@
 #include "rad_plugin.h"
 #include "rad_quant.h"
 
+#include <nlohmann/json.hpp>
+
 #include <sys/stat.h>
 
 #ifdef _OPENMP
@@ -49,6 +51,69 @@ using namespace rad;
 namespace {
 
 bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
+
+/* clef (decision.type=clef): the head's geometry from joint_head_config.json beside the
+ * checkpoint, and its three learned scalars from the head's own tensors (joint_head.safetensors,
+ * merged with --add), into the header. The plugin declares the head from the geometry
+ * (arch/common/rad_block_clef.h) and the server applies the scalars (core/server/clef.h). */
+int clef_metadata(const std::string& in, const std::string& config_dir, const Checkpoint& ck,
+                  MetaOwn& meta) {
+    std::string dir = config_dir;
+    if (dir.empty()) {
+        struct stat st{};
+        if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = in;
+        else {
+            const size_t slash = in.find_last_of('/');
+            dir = slash == std::string::npos ? "." : in.substr(0, slash);
+        }
+    }
+    const std::string path = dir + "/joint_head_config.json";
+    std::ifstream f(path);
+    if (!f) {
+        RAD_ERR("%s: decision.type=clef needs the head's joint_head_config.json beside the "
+                "checkpoint (or under --config)", path.c_str());
+        return -1;
+    }
+    nlohmann::json c;
+    try { f >> c; } catch (const std::exception& e) {
+        RAD_ERR("%s: %s", path.c_str(), e.what());
+        return -1;
+    }
+    for (const char* k : { "hidden_size", "width", "routing_layers", "layers", "heads", "feedforward" }) {
+        if (!c.contains(k) || !c[k].is_number_integer() || c[k].get<long long>() <= 0) {
+            RAD_ERR("%s: `%s` is missing or not a positive integer", path.c_str(), k);
+            return -1;
+        }
+        meta.set(std::string("decision.clef.") + k, std::to_string(c[k].get<long long>()));
+    }
+    for (const char* k : { "prior_logit_scale", "joint_logit_scale", "residual_gate" }) {
+        const SrcTensor* t = ck.find(k);
+        if (!t || !t->data || t->bytes < 2) {
+            RAD_ERR("the head's `%s` is not in the checkpoint: add joint_head.safetensors with "
+                    "--add", k);
+            return -1;
+        }
+        float v = 0.0f;
+        if (t->rad_dtype == RAD_BF16) {
+            uint16_t h = 0;
+            std::memcpy(&h, t->data, 2);
+            const uint32_t u = (uint32_t)h << 16;
+            std::memcpy(&v, &u, 4);
+        } else if (t->rad_dtype == RAD_F32 && t->bytes >= 4) {
+            std::memcpy(&v, t->data, 4);
+        } else {
+            RAD_ERR("the head's `%s` is %s; bf16 or f32 is read", k, rad_dtype_name(t->rad_dtype));
+            return -1;
+        }
+        char s[32];
+        std::snprintf(s, sizeof s, "%.9g", (double)v);
+        meta.set(std::string("decision.clef.") + k, s);
+    }
+    RAD_INFO("clef     head %s x %s, %s routing + %s decoder layers; scalars from the checkpoint",
+             meta.get("decision.clef.width"), meta.get("decision.clef.heads"),
+             meta.get("decision.clef.routing_layers"), meta.get("decision.clef.layers"));
+    return 0;
+}
 
 /* `blk.12.attn_q.weight` -> 12; -1 for a model-level name (GGUF naming, as in an imatrix). */
 int32_t layer_from_name(const std::string& n) {
@@ -402,6 +467,9 @@ int main(int argc, char** argv) {
      * and in the engine both read RadModelMeta from the container header, so the value holds for
      * both. */
     for (const auto& kv : set_kv) meta.set(kv.first, kv.second);
+    if (const char* dt = meta.get("decision.type"); dt && !std::strcmp(dt, "clef") &&
+                                                     clef_metadata(in, config_dir, ck, meta) < 0)
+        return 1;
     /* The quantisation descriptor (which selects the plugin pair) is derived from
      * quantization_config, so a --set of it re-derives the descriptor. E.g. a bf16 checkpoint
      * whose recipe writes Qwen's block fp8 targets qwen35_fp8 by setting what that release

@@ -7,6 +7,8 @@
  */
 #include "clef.h"
 
+#include "rad_clef.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -200,6 +202,108 @@ int parse_clef_request(const std::string& body, const OaiDeps& d, const OaiLimit
     append(&out->tokens, schema);
     append(&out->tokens, suffix);
     return RAD_OK;
+}
+
+int64_t clef_option_count(const ClefRequest& r) {
+    int64_t o = 0;
+    for (const ClefQuestion& q : r.questions) o += (int64_t)q.options.size();
+    return o;
+}
+
+int clef_words(const ClefRequest& r, std::vector<int32_t>* out, ApiError* err) {
+    const int64_t N = (int64_t)r.tokens.size(), Q = (int64_t)r.questions.size();
+    const int64_t O = clef_option_count(r);
+    int64_t L = 0;
+    for (const ClefQuestion& q : r.questions)
+        for (const TokenSpan& s : q.option_spans) L += s.second - s.first;
+    if (Q > RAD_CLEF_MAX_QUESTIONS) {
+        *err = err_bad("questions", "at most " + std::to_string(RAD_CLEF_MAX_QUESTIONS) +
+                                    " questions a request");
+        return RAD_E_INVAL;
+    }
+    if (O > RAD_CLEF_MAX_OPTIONS) {
+        *err = err_bad("questions", "at most " + std::to_string(RAD_CLEF_MAX_OPTIONS) +
+                                    " options a request, every question together");
+        return RAD_E_INVAL;
+    }
+    if (L > RAD_CLEF_MAX_LEX) {
+        *err = err_bad("questions", "the options render to " + std::to_string(L) +
+                                    " tokens; at most " + std::to_string(RAD_CLEF_MAX_LEX) +
+                                    " a request");
+        return RAD_E_INVAL;
+    }
+    /* The prompt cut at every span's edges. Spans are disjoint, so each is one whole segment. */
+    std::vector<int32_t> cuts = { 0, (int32_t)N };
+    for (const ClefQuestion& q : r.questions) {
+        cuts.push_back((int32_t)q.question.first);
+        cuts.push_back((int32_t)q.question.second);
+        for (const TokenSpan& s : q.option_spans) {
+            cuts.push_back((int32_t)s.first);
+            cuts.push_back((int32_t)s.second);
+        }
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    const int64_t S = (int64_t)cuts.size() - 1;
+    auto seg_at = [&](int64_t start) {
+        return (int32_t)(std::lower_bound(cuts.begin(), cuts.end(), (int32_t)start) - cuts.begin());
+    };
+
+    const RadClefWords w = rad_clef_words_layout((int32_t)N, (int32_t)Q, (int32_t)O, (int32_t)L,
+                                                 (int32_t)S);
+    std::vector<int32_t>& v = *out;
+    v.assign((size_t)w.total, 0);
+    v[RAD_CLEF_W_N] = (int32_t)N;
+    v[RAD_CLEF_W_Q] = (int32_t)Q;
+    v[RAD_CLEF_W_O] = (int32_t)O;
+    v[RAD_CLEF_W_L] = (int32_t)L;
+    v[RAD_CLEF_W_S] = (int32_t)S;
+    std::copy(cuts.begin(), cuts.end(), v.begin() + w.seg_cu);
+    int64_t o = 0, l = 0;
+    for (int64_t qi = 0; qi < Q; ++qi) {
+        const ClefQuestion& q = r.questions[(size_t)qi];
+        v[(size_t)(w.q_seg + qi)]  = seg_at(q.question.first);
+        v[(size_t)(w.type + qi)]   = q.type_id;
+        v[(size_t)(w.opt_cu + qi)] = (int32_t)o;
+        for (const TokenSpan& s : q.option_spans) {
+            v[(size_t)(w.o_seg + o)]  = seg_at(s.first);
+            v[(size_t)(w.o_q + o)]    = (int32_t)qi;
+            v[(size_t)(w.lex_cu + o)] = (int32_t)l;
+            for (int64_t t = s.first; t < s.second; ++t) v[(size_t)(w.lex_ids + l++)] = r.tokens[(size_t)t];
+            ++o;
+        }
+    }
+    v[(size_t)(w.opt_cu + Q)] = (int32_t)O;
+    v[(size_t)(w.lex_cu + O)] = (int32_t)L;
+    v[(size_t)w.last]         = (int32_t)(N - 1);
+    v[(size_t)w.cu_q]     = 0; v[(size_t)w.cu_q + 1] = (int32_t)Q;
+    v[(size_t)w.cu_o]     = 0; v[(size_t)w.cu_o + 1] = (int32_t)O;
+    v[(size_t)w.cu_k]     = 0; v[(size_t)w.cu_k + 1] = (int32_t)N;
+    return RAD_OK;
+}
+
+std::vector<int32_t> clef_score_ids(int64_t n_options) {
+    std::vector<int32_t> ids;
+    ids.reserve((size_t)(3 * n_options));
+    for (int k = 0; k < 3; ++k)
+        for (int64_t o = 0; o < n_options; ++o) ids.push_back((int32_t)(k * RAD_CLEF_MAX_OPTIONS + o));
+    return ids;
+}
+
+std::vector<float> clef_logits(const std::vector<float>& scores, int64_t n_options,
+                               const ClefScalars& s) {
+    const double cap = std::log(100.0);
+    const double ps = std::exp(std::min(s.prior_logit_scale, cap));
+    const double js = std::exp(std::min(s.joint_logit_scale, cap));
+    const double gate = 1.0 / (1.0 + std::exp(-s.residual_gate));
+    std::vector<float> out((size_t)n_options, 0.0f);
+    if ((int64_t)scores.size() < 3 * n_options) return out;
+    for (int64_t o = 0; o < n_options; ++o) {
+        const double prior = scores[(size_t)o], cosine = scores[(size_t)(n_options + o)];
+        const double residual = scores[(size_t)(2 * n_options + o)];
+        out[(size_t)o] = (float)(ps * prior + gate * (js * cosine + residual));
+    }
+    return out;
 }
 
 int clef_answer(const ClefQuestion& q, const std::vector<float>& logits, json* out, ApiError* err) {

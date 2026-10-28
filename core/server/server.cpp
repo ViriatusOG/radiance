@@ -2,6 +2,7 @@
 #include "server_priv.h"
 
 #include <cstdio>
+#include "clef.h"
 #include "json_partial.h"
 #include "systemone.h"
 #include "rad_internal.h"
@@ -1744,10 +1745,12 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
 HttpResponse Server::handle_systemone(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.decision_type == "clef") return handle_clef(req);
     if (opt_.decision_type != "d1")
         return error_response(err_not_implemented(
             "/v1/systemone serves a decision model; this container does not declare one "
-            "(convert d1 with --set decision.type=d1)"), req.peer);
+            "(convert d1 with --set decision.type=d1, clef with --set decision.type=clef)"),
+            req.peer);
 
     DecisionRequest r;
     ApiError err;
@@ -1860,6 +1863,93 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(json{
         { "answers", std::move(answers) },
         { "usage", { { "input_tokens", r.input_tokens }, { "output_tokens", 0 } } } }));
+}
+
+/* clef (clef.h): one request is the whole prompt, every question decided jointly by the head on
+ * the card (arch/common/rad_block_clef.h). The request's spans and option tokens go down as its
+ * words, and the head's three values an option come back through Request::token_scores, off the
+ * logits row; the learned scalars combine them here and each question's softmax is its answer. */
+HttpResponse Server::handle_clef(const HttpRequest& req) {
+    if (!opt_.clef_scalars)
+        return error_response(err_internal("this container declares clef but carries no "
+                                           "decision.clef.* scalars; convert it again with "
+                                           "rad-convert --set decision.type=clef"), req.peer);
+    ClefRequest r;
+    ApiError err;
+    if (parse_clef_request(req.body, odeps_, lim_, opt_.model_id, &r, &err) < 0)
+        return error_response(err, req.peer);
+    std::vector<int32_t> words;
+    if (clef_words(r, &words, &err) < 0) return error_response(err, req.peer);
+    if ((int64_t)words.size() > opt_.plugin_words)
+        return error_response(err_internal("the loaded plugin takes fewer words a request than "
+                                           "this one needs"), req.peer);
+    const int64_t n_opt = clef_option_count(r);
+    if (auto no = admit(1, req.peer, ApiShape::OpenAI, "questions")) return *no;
+    RAD_INFO("systemone (clef) admitted%s questions=%zu options=%lld prompt=%zu tok",
+             from_peer(req.peer).c_str(), r.questions.size(), (long long)n_opt, r.tokens.size());
+
+    std::vector<Generation> gens(1);
+    Generation& g = gens[0];
+    g.index = 0;
+    g.sink = std::make_shared<Sink>(16);
+    auto ts = std::make_shared<TokenScores>();
+    ts->tokens = clef_score_ids(n_opt);
+    Request rq;
+    rq.prompt = r.tokens;
+    rq.token_scores = ts;
+    rq.plugin_words = std::move(words);
+    rq.max_tokens = 1;
+    rq.sp.temp = 0.0f;
+    rq.sink = g.sink.get();
+    std::vector<Request> part;
+    part.push_back(std::move(rq));
+    std::vector<uint64_t> ids;
+    deps_.sched->submit_all(part, &ids);
+    g.id = ids.empty() ? 0 : ids[0];
+    g.sink->id = g.id;
+    if (!g.id) {
+        retire(gens);
+        release(1);
+        return error_response(err_internal("the scheduler refused the request"), req.peer);
+    }
+    for (;;) {
+        if (g.sink->done()) { g.closed = true; g.finish = g.sink->finish_reason(); break; }
+        if (req.peer_gone() || stopping_.load()) return *abandoned(req, gens, 1);
+        g.sink->wait();
+    }
+    if (g.finish == Finish::Error || g.finish == Finish::Cancelled) {
+        const std::string why = g.finish == Finish::Error ? engine_failure(*g.sink)
+                                                          : "the engine cancelled the request";
+        retire(gens);
+        release(1);
+        return error_response(err_internal(why), req.peer);
+    }
+
+    ClefScalars sc;
+    sc.prior_logit_scale = opt_.clef_prior_logit_scale;
+    sc.joint_logit_scale = opt_.clef_joint_logit_scale;
+    sc.residual_gate     = opt_.clef_residual_gate;
+    const std::vector<float> logits = clef_logits(ts->logits, n_opt, sc);
+    json answers = json::object();
+    size_t at = 0;
+    for (const ClefQuestion& q : r.questions) {
+        std::vector<float> ql(logits.begin() + (std::ptrdiff_t)at,
+                              logits.begin() + (std::ptrdiff_t)(at + q.options.size()));
+        at += q.options.size();
+        json a;
+        if (clef_answer(q, ql, &a, &err) < 0) {
+            retire(gens);
+            release(1);
+            return error_response(err, req.peer);
+        }
+        answers[q.name] = std::move(a);
+    }
+    retire(gens);
+    release(1);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{
+        { "answers", std::move(answers) },
+        { "usage", { { "input_tokens", (int64_t)r.tokens.size() }, { "output_tokens", 0 } } } }));
 }
 
 HttpResponse Server::handle_models(const HttpRequest& req) {

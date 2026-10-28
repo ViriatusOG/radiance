@@ -82,8 +82,15 @@ struct ServerOptions {
     int64_t     video_ttl_s = 3600;
     int64_t     max_videos = 32;
     /* The decision protocol from the container's `decision.type`: "d1" serves /v1/systemone
-     * (systemone.h); empty answers it 501. Never inferred from a name. */
+     * (systemone.h), "clef" serves it through the head on the card (clef.h); empty answers it
+     * 501. Never inferred from a name. */
     std::string decision_type;
+    /* clef: the head's learned scalars from the container header (decision.clef.*, written by
+     * rad-convert from joint_head.safetensors), and whether the header carried them. */
+    double      clef_prior_logit_scale = 0.0, clef_joint_logit_scale = 0.0, clef_residual_gate = 0.0;
+    bool        clef_scalars = false;
+    /* The most words one request may hand the plugin (Program::plugin_words). */
+    int64_t     plugin_words = 0;
     /* What --model named, reported as the model entry's `root` as vLLM reports its loaded path
      * (the served name says nothing about the file behind it). Empty omits the field. */
     std::string model_path;
@@ -243,6 +250,7 @@ private:
     HttpResponse handle_infill(const HttpRequest& req);
     HttpResponse handle_embeddings(const HttpRequest& req);
     HttpResponse handle_systemone(const HttpRequest& req);
+    HttpResponse handle_clef(const HttpRequest& req);
     HttpResponse handle_apply_template(const HttpRequest& req);
     using ToChat = int (*)(const std::string& body, const OaiLimits& lim, std::string* chat,
                            std::string* extra, ApiError* err);

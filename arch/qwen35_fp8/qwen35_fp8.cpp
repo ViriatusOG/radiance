@@ -86,6 +86,7 @@
 #endif
 #include <arch/rad_block_mtp_fp8.h>
 #include <arch/rad_block_dflash2.h>
+#include <arch/rad_block_clef.h>
 #include <arch/rad_block_vit.h>
 
 #include <cstring>
@@ -204,6 +205,10 @@ struct Model {
     bool        media = false;
     VisionTower vit{};
     MediaRows   mrows{};
+
+    /* ---- clef's joint schema head (arch/common/rad_block_clef.h), declared only when the
+     * container says `decision.type=clef`; off, every step below is the one it was. */
+    ClefHead    clef{};
 
     std::vector<Layer> layers;
 
@@ -1269,6 +1274,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not loaded: this deployment "
                     "does not speculate", (long long)nextn);
 
+    /* clef's head (arch/common/rad_block_clef.h) reads the final norm's rows and the lm_head,
+     * and keeps its own cache group, bound well past the trunk's and a drafter's layers. */
+    if (ClefHead::present(meta))
+        RAD_ARCH_TRY(m.clef.declare(b, meta, ctx, nm, g, m.a_h.x, m.b_logits, m.w_lm_head,
+                                    m.kv_full, (int)g.n_layer + 256));
+
     /* The vision tower, last: an encoder pass issues nothing else, so its activations share the
      * arena with every buffer above. Its weight groups start past every text layer, the MTP head
      * and a drafter's. */
@@ -1493,6 +1504,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
     pipe_wait1(c);
     if (L > 0) pipe_taps(c, m, L - 1, R, T - R);
+    /* clef: both pieces' final norm is done by here; the head's cache takes every row. */
+    m.clef.step_tokens(c, batch, m.a_h.x);
 
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
@@ -1501,6 +1514,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         RAD_ISSUE_N(c, m.op_logits, batch->n_out,
                     brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
                     brows(m.b_logits, batch->n_out));
+        m.clef.step_heads(c, batch, m.b_logits, m.w_lm_head);
     }
 }
 #endif
@@ -1596,6 +1610,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.a_h.x, batch->n_tok));
+    /* clef: every token's final hidden state into the head's cache (a no-op without the head). */
+    m.clef.step_tokens(c, batch, m.a_h.x);
 
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
@@ -1605,6 +1621,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_logits, batch->n_out,
                     brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
                     brows(m.b_logits, batch->n_out));
+        m.clef.step_heads(c, batch, m.b_logits, m.w_lm_head);
     }
 }
 

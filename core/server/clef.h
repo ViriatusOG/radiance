@@ -59,5 +59,29 @@ int clef_answer(const ClefQuestion& q, const std::vector<float>& logits, json* o
  * sorted and non-ASCII kept. Exposed for the tests. */
 std::string clef_render(const json& v);
 
+/* The request's words for the head on the card (abi/rad_clef.h, Request::plugin_words): the
+ * prompt cut into segments at every span's edges, which segment each question and option is,
+ * each option's question and tokens, each question's type. 400 past the head's bounds. */
+int clef_words(const ClefRequest& r, std::vector<int32_t>* out, ApiError* err);
+
+/* The options a request has in all, in head order: the head returns three values for each. */
+int64_t clef_option_count(const ClefRequest& r);
+
+/* The logits-row positions the head's three values an option land at (prior, cosine, residual;
+ * each stretch RAD_CLEF_MAX_OPTIONS wide), as TokenScores asks for them. */
+std::vector<int32_t> clef_score_ids(int64_t n_options);
+
+/* The head's learned scalars, from the container header (rad-convert writes them from
+ * joint_head.safetensors; the engine copies them to ServerOptions). */
+struct ClefScalars {
+    double prior_logit_scale = 0.0, joint_logit_scale = 0.0, residual_gate = 0.0;
+};
+
+/* One logit an option from the head's three values (`scores` in clef_score_ids' order):
+ * exp(prior_logit_scale) * prior + sigmoid(residual_gate) * (exp(joint_logit_scale) * cosine +
+ * residual), the scales clamped at 100 as the release clamps them. */
+std::vector<float> clef_logits(const std::vector<float>& scores, int64_t n_options,
+                               const ClefScalars& s);
+
 }  /* namespace server */
 }  /* namespace rad */

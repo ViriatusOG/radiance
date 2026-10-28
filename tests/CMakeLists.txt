@@ -301,18 +301,28 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant qwen35_bf16 lfm2_bf16 gemm
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test)
+foreach(t engine_e2e_test convert_test clef_decision_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
-    add_dependencies(${t} ${RAD_E2E_DEPS})
+    if(t STREQUAL "clef_decision_test")
+      # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
+      target_compile_definitions(${t} PRIVATE
+        RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
+      add_dependencies(${t} radiance rad-convert libref libquant qwen35_bf16)
+    else()
+      add_dependencies(${t} ${RAD_E2E_DEPS})
+    endif()
   endif()
 endforeach()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET clef_decision_test)
+  set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

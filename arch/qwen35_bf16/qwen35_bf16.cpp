@@ -38,6 +38,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_attn_gated.h>
+#include <arch/rad_block_clef.h>
 #include <arch/rad_block_gdn.h>
 #include <arch/rad_block_mlp.h>
 #include <arch/rad_block_vit.h>
@@ -84,6 +85,11 @@ struct Model {
     bool        media = false;
     VisionTower vit{};
     MediaRows   mrows{};
+
+    /* ---- clef's joint schema head (arch/common/rad_block_clef.h), declared only when the
+     * container says `decision.type=clef`; `clef.on` is false otherwise and every step below is
+     * the one it was. */
+    ClefHead    clef{};
 
     std::vector<Layer> layers;
 };
@@ -424,6 +430,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not declared: this plugin "
                     "serves the trunk only", (long long)nextn);
 
+    /* clef's head reads the final norm's rows and the lm_head, and keeps its own cache group,
+     * bound well past the trunk's layers. */
+    if (ClefHead::present(meta))
+        RAD_ARCH_TRY(m.clef.declare(b, meta, ctx, nm, g, m.b_h, m.b_logits, m.w_lm_head,
+                                    m.kv_full, (int)g.n_layer + 256));
+
     /* The vision tower, last, so its activations share the arena with every buffer above. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
     return RAD_OK;
@@ -455,6 +467,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.b_h, batch->n_tok));
+    /* clef: every token's final hidden state into the head's cache (a no-op without the head). */
+    m.clef.step_tokens(c, batch, m.b_h);
 
     /* The lm_head runs only on the rows the sampler asked for; a mid-prompt prefill chunk has
      * n_out zero and skips it. */
@@ -466,6 +480,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_logits, batch->n_out,
                     brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
                     brows(m.b_logits, batch->n_out));
+        /* clef: the head over each sequence that carries a request's words, after the lm_head
+         * has written the row it adds to. */
+        m.clef.step_heads(c, batch, m.b_logits, m.w_lm_head);
     }
 }
 

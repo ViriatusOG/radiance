@@ -2039,7 +2039,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
 | `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API; needs an image model (Qwen-Image 2.1), else 501 (§5.6) |
-| `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
+| `POST /v1/systemone` | Decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; LiquidAI's d1, or Cloudflare's clef and clef-flash with their joint head on the card; needs a container converted as one, else 501 (§5.13). `POST /v1/decisions` is the same endpoint under LiteLLM's name |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
@@ -2753,6 +2753,38 @@ together. A single question is one pass of the whole prompt, tokenised as one te
 
 Against d1's own runner in float32, on eight text cases (one and several questions, JSON and long log
 states): every choice and every `input_tokens` equal, worst probability difference 0.0044.
+
+#### clef and clef-flash
+
+Cloudflare's clef (27B) and clef-flash (9B) are decision models on Qwen3.5 that answer the same
+request, every question of it jointly: a joint schema head reads the backbone's final hidden state
+at every prompt position, the mean over each question's instructions and each option's text, and
+the lm_head rows of each option's tokens, and gives one logit an option. radiance runs that head
+on the card, after the trunk, inside the `qwen35_bf16` and `qwen35_fp8` plugins
+(`arch/common/rad_block_clef.h`): there is no second process. The head's own tensors ship as
+`joint_head.safetensors` beside the checkpoint and are added at convert; `joint_head_config.json`
+beside them gives the head's geometry.
+
+```sh
+rad-convert /srv/models/clef-flash -o clef-flash.rad \
+    --add /srv/models/clef-flash/joint_head.safetensors --set decision.type=clef
+radiance --model clef-flash.rad --port 8000
+```
+
+The request and the response are the same as d1's above; `/v1/decisions` is the same endpoint
+under LiteLLM's name. What differs:
+
+- One request is one prompt, the state and every question together, so questions are not shared
+  through the prefix cache; a state many requests share (the rules in front of each respondent)
+  is, with the head's own per-token rows beside the trunk's cache.
+- `state` must be a non-empty string or JSON value; pictures answer 501 for now.
+- A prompt longer than the context answers 400 with `context_length_exceeded` (clef's own code
+  cuts it silently). A request has at most 64 questions, 512 options and 8192 option tokens.
+- The head runs on one rank, and the lm_head stays bf16 (a recipe that quantises it is refused).
+- `GET /v1/models` reports `"decision": "clef"` in the model's capabilities.
+
+Against clef's own head on the CPU reference, on a tiny model with random weights
+(`tests/clef_decision_test.cpp`): worst probability difference 0.0004.
 
 ### 5.14 Speech to text
 
