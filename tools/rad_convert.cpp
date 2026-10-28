@@ -58,6 +58,14 @@ bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
  * (arch/common/rad_block_clef.h) and the server applies the scalars (core/server/clef.h). */
 int clef_metadata(const std::string& in, const std::string& config_dir, const Checkpoint& ck,
                   MetaOwn& meta) {
+    /* The head lives in the clef plugins, selected by the architecture id. A container that
+     * says decision.type=clef but keeps its qwen35 id would load the trunk alone and answer
+     * /v1/systemone from a head that never ran. */
+    if (meta.arch != "clef") {
+        RAD_ERR("%s: decision.type=clef needs the clef plugins: convert with --arch clef (the "
+                "container's architecture is '%s')", in.c_str(), meta.arch.c_str());
+        return -1;
+    }
     std::string dir = config_dir;
     if (dir.empty()) {
         struct stat st{};

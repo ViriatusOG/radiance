@@ -393,6 +393,13 @@ TEST(a_clef_convert_without_the_head_is_refused) {
                                "--set", "decision.type=clef" }, engine_env(), &log, 300);
     CHECK(st != 0);
     CHECK(log.find("joint_head.safetensors") != std::string::npos);
+    /* And one that keeps the qwen35 id: the head would never run, so the convert refuses it. */
+    log.clear();
+    const int st2 = tiny::run({ RAD_E2E_CONVERT, ck, "-o", dir / "no-arch.rad", "--add",
+                                ck + "/joint_head.safetensors", "--set", "decision.type=clef" },
+                              engine_env(), &log, 300);
+    CHECK(st2 != 0);
+    CHECK(log.find("--arch clef") != std::string::npos);
 }
 
 RAD_TEST_MAIN()
