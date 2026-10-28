@@ -78,6 +78,12 @@ struct Model {
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
+    /* Set by a plugin built over this one whose head answers a request from its words
+     * (RadBatch::plugin_words): a `fill` of the logits rows that plugin declared. A step every
+     * sampled row of which carries words then skips the lm_head and leaves those zero rows for the
+     * sampler, whose token the request discards. Zero, the lm_head runs as it always has, and the
+     * graph this plugin declares is unchanged. */
+    rad_op op_logits_fill = 0;
 
     /* ---- media (arch/common/rad_block_vit.h): the vision tower and the scatter of its rows,
      * declared only when the container carries a tower and the deployment asked for media. */
@@ -459,6 +465,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* The lm_head runs only on the rows the sampler asked for; a mid-prompt prefill chunk has
      * n_out zero and skips it. */
     if (batch->n_out > 0) {
+        if (m.op_logits_fill && plugin_words_cover_rows(batch)) {
+            RAD_ISSUE_N(c, m.op_logits_fill, batch->n_out, brows(m.b_logits, batch->n_out));
+            return;
+        }
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.b_h, batch->n_tok),
                     praw(batch->out_ids, RAD_I32, batch->n_out),

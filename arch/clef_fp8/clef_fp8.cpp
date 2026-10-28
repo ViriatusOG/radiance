@@ -34,6 +34,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     RAD_ARCH_TRY(qwen35_clef_fp8::declare(b, meta, ctx));
     qwen35_clef_fp8::Model& m = qwen35_clef_fp8::g_model[ctx->rank];
+    /* The lm_head's row would be sampled once and discarded: with this fill declared, the trunk
+     * skips the lm_head on a step every sampled row of which carries a request's words
+     * (plugin_words_cover_rows) and leaves zero rows instead. */
+    m.op_logits_fill = clef_logits_fill(b, m.nm, m.g, m.b_logits);
+    if (!m.op_logits_fill) return RAD_E_INVAL;
     ClefHead& h = g_head[ctx->rank];
     h = ClefHead{};
     return h.declare(b, meta, ctx, m.nm, m.g, m.a_h.x, m.b_logits, m.w_lm_head, m.kv_full,

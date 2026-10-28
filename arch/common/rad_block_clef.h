@@ -651,5 +651,16 @@ inline void ClefHead::step_heads(RadCtx* c, const RadBatch* batch, rad_buf b_log
     }
 }
 
+/* The zero logits rows a trunk leaves when it skips its lm_head for rows a decision head answers
+ * (the qwen35 plugins' `op_logits_fill`): declared here, by the plugin that wants the skip, so a
+ * trunk serving a plain container declares the same graph as before. */
+inline rad_op clef_logits_fill(RadBuilder* b, Names& nm, const Geom& g, rad_buf b_logits) {
+    return rw(b, RAD_OP(b, "fill",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_vocab),
+                                   RAD_STR("dtype", "f32"), RAD_F64("value", 0.0)),
+                        RAD_NOWEIGHTS),
+              {}, { b_logits });
+}
+
 }  /* namespace arch */
 }  /* namespace rad */

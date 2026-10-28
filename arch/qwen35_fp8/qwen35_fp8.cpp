@@ -197,6 +197,12 @@ struct Model {
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
+    /* Set by a plugin built over this one whose head answers a request from its words
+     * (RadBatch::plugin_words): a `fill` of the logits rows that plugin declared. A step every
+     * sampled row of which carries words then skips the lm_head and leaves those zero rows for the
+     * sampler, whose token the request discards. Zero, the lm_head runs as it always has, and the
+     * graph this plugin declares is unchanged. */
+    rad_op op_logits_fill = 0;
     rad_op op_rope_cs = 0;   /* rope_table, if the fused prologue is reachable */
 
     /* ---- media (arch/common/rad_block_vit.h): the vision tower and the scatter of its rows,
@@ -1495,6 +1501,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (L > 0) pipe_taps(c, m, L - 1, R, T - R);
 
     if (batch->n_out > 0) {
+        if (m.op_logits_fill && plugin_words_cover_rows(batch)) {
+            RAD_ISSUE_N(c, m.op_logits_fill, batch->n_out, brows(m.b_logits, batch->n_out));
+            return;
+        }
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.a_h.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
                     brows(m.b_hout, batch->n_out));
@@ -1598,6 +1608,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.a_h.x, batch->n_tok));
 
     if (batch->n_out > 0) {
+        if (m.op_logits_fill && plugin_words_cover_rows(batch)) {
+            RAD_ISSUE_N(c, m.op_logits_fill, batch->n_out, brows(m.b_logits, batch->n_out));
+            return;
+        }
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.a_h.x, batch->n_tok),
                     praw(batch->out_ids, RAD_I32, batch->n_out),

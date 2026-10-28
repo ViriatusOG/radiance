@@ -37,6 +37,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * head's are the real ones. The head goes after the vision tower: its buffers join the same
      * arena, and it reads the final norm's rows, the lm_head and the trunk's cache block size. */
     qwen35_bf16::Model& m = qwen35_bf16::g_model[ctx->rank];
+    /* The lm_head's row would be sampled once and discarded: with this fill declared, the trunk
+     * skips the lm_head on a step every sampled row of which carries a request's words
+     * (plugin_words_cover_rows) and leaves zero rows instead. */
+    m.op_logits_fill = clef_logits_fill(b, m.nm, m.g, m.b_logits);
+    if (!m.op_logits_fill) return RAD_E_INVAL;
     ClefHead& h = g_head[ctx->rank];
     h = ClefHead{};
     return h.declare(b, meta, ctx, m.nm, m.g, m.b_h, m.b_logits, m.w_lm_head, m.kv_full,

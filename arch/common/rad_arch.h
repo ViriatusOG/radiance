@@ -1212,6 +1212,17 @@ inline RadOperand bcol_at(rad_buf h, int64_t first_row, int64_t pitch,
     return o;
 }
 
+/* Whether every logits row this step samples belongs to a sequence that carries words for the
+ * plugin (RadBatch::plugin_words). A head that answers from those words then has no use for the
+ * lm_head's row: it is sampled once and discarded. One row a sampled sequence; a speculative
+ * step samples more and answers false. */
+inline bool plugin_words_cover_rows(const RadBatch* b) {
+    if (b->n_out <= 0 || !b->plugin_cu_h) return false;
+    int64_t n = 0;
+    for (int64_t s = 0; s < b->n_seq; ++s) n += b->plugin_cu_h[s + 1] > b->plugin_cu_h[s] ? 1 : 0;
+    return n == b->n_out;
+}
+
 /* Rows [first, first + n), seen by the kernel as [n, pitch]; RadOperand::offset is in elements.
  *
  * Lets one op be issued in slices: an op whose widest kernel stops at M=64 (the delta net's
