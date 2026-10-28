@@ -1219,6 +1219,19 @@ int Builder::declare_pooled(rad_buf b) {
     return RAD_OK;
 }
 
+/* The words a request may hand the plugin (rad_declare_plugin_words). A bound, not a buffer: the
+ * batch builder stages them per sequence beside the step's other arrays. */
+int Builder::declare_plugin_words(int64_t max_words) {
+    if (finished_) { err(RAD_E_STATE, "declare_plugin_words after declare finished"); return RAD_E_STATE; }
+    if (max_words < 0 || max_words > (1 << 20)) {
+        err(RAD_E_INVAL, "declare_plugin_words: %lld words a request; the bound is 0 to %d",
+            (long long)max_words, 1 << 20);
+        return RAD_E_INVAL;
+    }
+    prog_.plugin_words = max_words;
+    return RAD_OK;
+}
+
 /* Validates the encoder at declare: it runs only when a request carries media, so a bad
  * declaration would otherwise surface on the first image as an out-of-bounds pass.
  *
@@ -2589,6 +2602,11 @@ int rad_declare_logits(RadBuilder* b, rad_buf logits) {
 int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_pooled(pooled);
+}
+
+int rad_declare_plugin_words(RadBuilder* b, int64_t max_words) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_plugin_words(max_words);
 }
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {

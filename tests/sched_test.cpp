@@ -3498,6 +3498,82 @@ TEST(a_two_rank_batch_rebases_stream_maps_into_each_ranks_pool_and_shares_the_mi
     bb.fini();
 }
 
+/* A request's words for the plugin (Request::plugin_words) ride the prefill step that samples
+ * its first token, with that row's index in word 0; a sequence without words, or one not at that
+ * step, has an empty range. A request past the declared bound fails the build. */
+TEST(a_requests_plugin_words_ride_the_step_that_samples_its_first_token) {
+    Fixture f;
+    f.build();
+    f.prog.plugin_words = 8;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+    for (uint64_t id = 1; id <= 3; ++id) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_OK(f.kv.ensure(id, 80));
+    }
+    Request r1, r2, r3;
+    r1.prompt.assign(8, 1);
+    r2.prompt.assign(8, 1);
+    r2.plugin_words = { 0, 7, 8, 9 };
+    r3.prompt.assign(8, 1);
+    r3.plugin_words = { 0, 5 };
+
+    StepPlan p;
+    p.reset();
+    auto entry = [&](uint64_t id, const Request* r, bool last) {
+        StepEntry e;
+        e.seq = id;
+        e.card = (int32_t)id - 1;
+        e.req = r;
+        e.n_tokens = 8;
+        e.ctx_len = 0;
+        e.is_prefill = true;
+        e.produces_token = last;
+        p.e.push_back(e);
+        p.n_tok += 8;
+    };
+    entry(1, &r1, true);     /* no words */
+    entry(2, &r2, true);     /* words, sampled this step */
+    entry(3, &r3, false);    /* words, but a mid-prompt chunk */
+    const RadBatch* b = bb.build(p, f.kv, 0);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_plugin_words, (int64_t)4);
+    REQUIRE(b->plugin_cu_h != nullptr);
+    CHECK_EQ(b->plugin_cu_h[0], 0);
+    CHECK_EQ(b->plugin_cu_h[1], 0);
+    CHECK_EQ(b->plugin_cu_h[2], 4);
+    CHECK_EQ(b->plugin_cu_h[3], 4);
+    /* Sequence 1 took logits row 0, so sequence 2's words open with row 1. */
+    CHECK_EQ(b->plugin_words_h[0], 1);
+    CHECK_EQ(b->plugin_words_h[1], 7);
+    CHECK_EQ(b->plugin_words_h[3], 9);
+    CHECK(b->plugin_words != nullptr && b->plugin_cu != nullptr);
+
+    /* No sequence carries words: every field is null. */
+    p.reset();
+    entry(1, &r1, true);
+    b = bb.build(p, f.kv, 1);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_plugin_words, (int64_t)0);
+    CHECK(b->plugin_words == nullptr && b->plugin_cu_h == nullptr);
+
+    /* Past the bound: the build fails rather than overrun the slab. */
+    r3.plugin_words.assign(9, 0);
+    p.reset();
+    entry(3, &r3, true);
+    CHECK(bb.build(p, f.kv, 2) == nullptr);
+    bb.fini();
+}
+
 /* A sequence that leaves a row and returns to it is restaged whole. Its change marks are taken
  * wherever it is written, so the old row's copy goes stale; restaging only later changes would
  * keep entries a rollback replaced earlier. The scheduler's own passes reorder rows, so this

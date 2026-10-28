@@ -678,6 +678,11 @@ int rad_declare_logits(RadBuilder* b, rad_buf logits);
  * this or logits, never both. */
 int rad_declare_pooled(RadBuilder* b, rad_buf pooled);
 
+/* The most integer words one request may hand the plugin (RadBatch::plugin_words), 0 for none.
+ * The engine stages that many a sequence in the step batch and refuses a longer request before
+ * it is admitted, so the plugin reads its words at the size it declared. Additive export. */
+int rad_declare_plugin_words(RadBuilder* b, int64_t max_words);
+
 
 /* ================================================================== the drafter */
 /* The plugin's draft head. The core drives the extra passes, and only the plugin knows what it

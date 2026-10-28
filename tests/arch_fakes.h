@@ -111,6 +111,8 @@ struct RadBuilder {
      * output (rad_declare_pooled). */
     rad_buf logits = 0;
     rad_buf pooled = 0;
+    /* The words a request may hand the plugin (rad_declare_plugin_words). */
+    int64_t plugin_words = 0;
 
     /* The draft head's declaration (rad_declare_drafter), and whether it keeps no cache of its
      * own (rad_drafter_shared_kv) and at which rotary offset. */
@@ -291,6 +293,13 @@ extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
 extern "C" int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
     if (!b || !pooled || b->logits) return RAD_E_INVAL;
     b->pooled = pooled;
+    return RAD_OK;
+}
+
+/* The words a request may hand the plugin, recorded as the core records them. */
+extern "C" int rad_declare_plugin_words(RadBuilder* b, int64_t max_words) {
+    if (!b || max_words < 0) return RAD_E_INVAL;
+    b->plugin_words = max_words;
     return RAD_OK;
 }
 

@@ -290,6 +290,26 @@ typedef struct RadBatch {
      * position tables per grid) reads them here; they live as long as the pass. */
     const int32_t* enc_seg_h;
     const int32_t* enc_seg_w;
+
+    /* ---- appended in ABI 32 (a request's words for the plugin) */
+    /* Integer words a request hands the plugin whole (Request::plugin_words), for a head that
+     * needs more of a request than its tokens: clef's joint schema head reads the prompt's
+     * question and option spans and the option tokens (abi/rad_clef.h). Sequence s's words are
+     * `plugin_words[plugin_cu[s] .. plugin_cu[s+1])`; a sequence with none has an empty range.
+     * The engine writes the sequence's first sampled logits row of this step into word 0 of its
+     * range, so the head can put its result beside that row's logits; the words after it are the
+     * request's own. Carried only on the trunk step that samples a prompt's first token, so a
+     * head runs once a request, when every prompt row has been computed.
+     *
+     * `plugin_words_h` and `plugin_cu_h` are the same words on the host, for a plugin that reads
+     * counts before it issues; they live as long as the pass. All null, with `n_plugin_words`
+     * 0, on a step no sequence of which carries words, and on every step of a program that
+     * declared none (rad_declare_plugin_words). */
+    int64_t        n_plugin_words;
+    const int32_t* plugin_words;       /* [n_plugin_words] device */
+    const int32_t* plugin_cu;          /* [n_seq + 1] device */
+    const int32_t* plugin_words_h;
+    const int32_t* plugin_cu_h;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

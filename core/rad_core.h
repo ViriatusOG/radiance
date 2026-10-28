@@ -370,6 +370,9 @@ public:
     /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
      * no logits buffer. */
     rad_buf pooled_buf = 0;
+    /* The most words one request hands the plugin (rad_declare_plugin_words,
+     * RadBatch::plugin_words); 0 when the plugin reads none. */
+    int64_t plugin_words = 0;
 
     /* Runtime LoRA (core/lora/), empty unless the engine was started with adapters enabled. */
     std::vector<LoraIssueSite> lora_sites;
@@ -743,6 +746,12 @@ struct Request {
     /* Non-null: read the raw logits at these ids at the prompt's last position (TokenScores).
      * The request still samples the one token max_tokens allows; the caller discards it. */
     std::shared_ptr<TokenScores> token_scores;
+
+    /* Words the plugin reads on the step that samples the prompt's first token
+     * (RadBatch::plugin_words): word 0 is the engine's, the rest the caller's. At most
+     * Program::plugin_words of them, which the server checks before submission; clef's are laid
+     * out by abi/rad_clef.h. Empty for every other request. */
+    std::vector<int32_t> plugin_words;
 
     /* An embedding request: the whole prompt in one step, never split (a bidirectional encoder
      * cannot take half its input), finished at that step with its pooled vector in the sink

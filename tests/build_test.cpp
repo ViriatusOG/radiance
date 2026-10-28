@@ -1826,6 +1826,19 @@ TEST(a_widened_weight_cannot_also_be_relayouted) {
     CHECK(any_error(b, "a widening and a relayout"));
 }
 
+/* The words a request may hand the plugin are a bound the program records; a negative or absurd
+ * bound is refused, and declaring none leaves it at zero. */
+TEST(the_plugin_words_bound_is_recorded_and_checked) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    CHECK_EQ(b.program().plugin_words, (int64_t)0);
+    CHECK_OK(b.declare_plugin_words(4096));
+    CHECK_EQ(b.program().plugin_words, (int64_t)4096);
+    CHECK(b.declare_plugin_words(-1) < 0);
+    CHECK(b.declare_plugin_words((int64_t)1 << 21) < 0);
+    CHECK_EQ(b.program().plugin_words, (int64_t)4096);
+}
+
 /* The other direction, the d3 readout: an f32 checkpoint tensor declared bf16 (what the device
  * logits kernel reads) is narrowed by the loader, and the stored form is one plain bf16 plane. */
 TEST(an_f32_source_declared_bf16_is_narrowed_at_load) {

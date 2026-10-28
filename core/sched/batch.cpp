@@ -136,6 +136,9 @@ void BatchBuilder::carve(Set& s, char* h) {
     /* Each row's adapter slot, carved only when the engine serves adapters, so an engine without
      * them lays the slab out as if the array did not exist. */
     pair(&s.h_lora,  &s.d_lora,  lora_on_ ? T : 0);
+    /* Each sequence's words for the plugin, carved only when the program declared a bound. */
+    pair(&s.h_pw,    &s.d_pw,    pw_cap_ ? S * pw_cap_ : 0);
+    pair(&s.h_pwcu,  &s.d_pwcu,  pw_cap_ ? S + 1 : 0);
     /* Host-only (derived metadata is copied into the planned arena), but carved on both sides to
      * keep device offsets equal to host offsets. */
     {
@@ -473,6 +476,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
     lora_on_ = cfg.lora.enabled();
+    pw_cap_ = prog.plugin_words;
     return RAD_OK;
 }
 
@@ -931,6 +935,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_mm = 0;
     bool lora_rows = false;
     int32_t cvec_rows = 0;
+    int64_t n_pw = 0;
+    if (pw_cap_) s.h_pwcu[0] = 0;
     s.h_cu[0] = 0;
     for (int64_t i = 0; i < n_seq; ++i) {
         const StepEntry& e = plan.e[(size_t)i];
@@ -1007,9 +1013,25 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             const int32_t nr = e.hidden_n > 0 ? e.hidden_n : e.n_tokens;
             for (int32_t j = 0; j < nr; ++j) s.h_out[n_out++] = e.hidden_row + j;
         } else if (e.produces_token) {
+            /* The request's words for the plugin ride the trunk step that samples its prompt's
+             * first token (RadBatch::plugin_words); word 0 is that row's index in `out_ids`. */
+            if (pw_cap_ && e.is_prefill && plan.draft_pass == 0 && e.req &&
+                !e.req->plugin_words.empty()) {
+                const std::vector<int32_t>& w = e.req->plugin_words;
+                if ((int64_t)w.size() > pw_cap_) {
+                    RAD_ERR("step batch: sequence %llu carries %zu words for the plugin, past the "
+                            "%lld it declared", (unsigned long long)e.seq, w.size(),
+                            (long long)pw_cap_);
+                    return nullptr;
+                }
+                std::memcpy(s.h_pw + n_pw, w.data(), w.size() * sizeof(int32_t));
+                s.h_pw[n_pw] = (int32_t)n_out;
+                n_pw += (int64_t)w.size();
+            }
             const int32_t first = (int32_t)(k + e.n_tokens) - 1 - e.n_spec;
             for (int32_t j = 0; j <= e.n_spec; ++j) s.h_out[n_out++] = first + j;
         }
+        if (pw_cap_) s.h_pwcu[i + 1] = (int32_t)n_pw;
         if (e.draft_out) s.h_dout[n_dout++] = (int32_t)(k + e.n_tokens - 1);
         /* RADIANCE_DFLASH_TRACE logs each drafter pass's kind, positions and token ids. A wrong
          * anchor, mask id or position base shows only as near-zero acceptance with correct
@@ -1176,6 +1198,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * runs the same pass as an engine serving no adapters. */
         B.lora_slot = lora_rows ? on_rank(base, b0, s.d_lora) : nullptr;
         B.control_vector = cvec_rows;
+        B.n_plugin_words = n_pw;
+        B.plugin_words   = n_pw ? on_rank(base, b0, s.d_pw) : nullptr;
+        B.plugin_cu      = n_pw ? on_rank(base, b0, s.d_pwcu) : nullptr;
+        B.plugin_words_h = n_pw ? s.h_pw : nullptr;
+        B.plugin_cu_h    = n_pw ? s.h_pwcu : nullptr;
         B.enc = 0;
         B.enc_n_patch = 0;
         B.enc_pixels = nullptr;

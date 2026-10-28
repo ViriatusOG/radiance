@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 31 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 32 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -29,7 +29,7 @@
 { "RadArgs", "instance", 48, 8 },
 { "RadArgs", "rank", 56, 4 },
 { "RadArgs", "world_size", 60, 4 },
-{ "RadBatch", "", 0, 360 },
+{ "RadBatch", "", 0, 400 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -80,6 +80,11 @@
 { "RadBatch", "control_vector", 336, 4 },
 { "RadBatch", "enc_seg_h", 344, 8 },
 { "RadBatch", "enc_seg_w", 352, 8 },
+{ "RadBatch", "n_plugin_words", 360, 8 },
+{ "RadBatch", "plugin_words", 368, 8 },
+{ "RadBatch", "plugin_cu", 376, 8 },
+{ "RadBatch", "plugin_words_h", 384, 8 },
+{ "RadBatch", "plugin_cu_h", 392, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },
@@ -215,7 +220,7 @@
 { "RadAudioFormat", "language_lead", 48, 8 },
 { "RadAudioFormat", "languages", 56, 8 },
 { "RadAudioFormat", "n_languages", 64, 4 },
-{ "RadChatFormat", "", 0, 200 },
+{ "RadChatFormat", "", 0, 208 },
 { "RadChatFormat", "struct_size", 0, 4 },
 { "RadChatFormat", "name", 8, 8 },
 { "RadChatFormat", "reasoning_open", 16, 8 },
@@ -245,6 +250,7 @@
 { "RadChatFormat", "object_string_close", 184, 8 },
 { "RadChatFormat", "object_bare_keys", 192, 4 },
 { "RadChatFormat", "reasoning_anywhere", 196, 4 },
+{ "RadChatFormat", "arg_json_value_prefix", 200, 8 },
 { "RadConstraint", "", 0, 32 },
 { "RadConstraint", "key", 0, 8 },
 { "RadConstraint", "op", 8, 4 },

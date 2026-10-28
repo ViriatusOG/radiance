@@ -929,7 +929,7 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
  * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 360,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 400,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -938,6 +938,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some. */
     if (b->enc || b->n_mm_rows > 0) return 0;
+    /* A pass carrying a request's words for the plugin is shaped by them (a head issues per
+     * sequence from their counts), and such a step samples a prompt's first token, which is not
+     * the repeating decode pass. */
+    if (b->n_plugin_words > 0) return 0;
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b or vgen_b carries, which no key
      * below reads. */
     if (b->gen) return 0;

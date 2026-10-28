@@ -220,6 +220,10 @@ private:
         /* [n_tok] each row's runtime LoRA adapter slot (RadBatch::lora_slot): carved only when the
          * engine serves adapters, empty otherwise. */
         int32_t   *h_lora = nullptr, *d_lora = nullptr;
+        /* [max_seqs * plugin_words] and [max_seqs + 1]: each sequence's words for the plugin
+         * (RadBatch::plugin_words), carved only when the program declared a bound. */
+        int32_t   *h_pw = nullptr, *d_pw = nullptr;
+        int32_t   *h_pwcu = nullptr, *d_pwcu = nullptr;
         /* [n_kv_groups][max_seqs]: every conv group's state slot per sequence (see init()). */
         int32_t*   h_convslot = nullptr;
 
@@ -329,6 +333,8 @@ private:
     bool                   mm_on_ = false;
     /* The engine serves runtime LoRA adapters (Config::lora): the batch carries each row's slot. */
     bool                   lora_on_ = false;
+    /* Program::plugin_words: the words a sequence may carry, 0 for none. */
+    int64_t                pw_cap_ = 0;
     int64_t                n_embd_ = 0;
     std::vector<void*>     mm_dev_;
     uint16_t*              mm_host_ = nullptr;
