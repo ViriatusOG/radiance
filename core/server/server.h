@@ -17,6 +17,7 @@
 #include "http.h"
 #include "iface.h"
 #include "laya.h"
+#include "mica.h"
 #include "liveview.h"
 #include "metrics.h"
 #include "oai.h"
@@ -84,7 +85,8 @@ struct ServerOptions {
     int64_t     max_videos = 32;
     /* The decision protocol from the container's `decision.type`: "d1" serves /v1/systemone
      * (systemone.h), "clef" serves it through the head on the card (clef.h), "laya" through the
-     * Laya plugin's option logits (laya.h); empty answers it 501. Never inferred from a name. */
+     * Laya plugin's option logits (laya.h), "mica" through Mica's label logits (mica.h); empty
+     * answers it 501. Never inferred from a name. */
     std::string decision_type;
     /* clef: the head's learned scalars from the container header (decision.clef.*, written by
      * rad-convert from joint_head.safetensors), and whether the header carried them. */
@@ -93,6 +95,8 @@ struct ServerOptions {
     /* laya: the sequence lengths, special tokens and fitted temperatures from the container
      * header (decision.laya.*, written by rad-convert). */
     LayaSettings laya;
+    /* mica: the calibration from the container header (decision.mica.*). */
+    MicaSettings mica;
     /* The most words one request may hand the plugin (Program::plugin_words). */
     int64_t     plugin_words = 0;
     /* What --model named, reported as the model entry's `root` as vLLM reports its loaded path
@@ -256,6 +260,12 @@ private:
     HttpResponse handle_systemone(const HttpRequest& req);
     HttpResponse handle_clef(const HttpRequest& req);
     HttpResponse handle_laya(const HttpRequest& req);
+    HttpResponse handle_mica(const HttpRequest& req);
+    std::optional<HttpResponse> score_prompts(
+        const HttpRequest& req, const char* label, const std::vector<std::vector<int32_t>>& prompts,
+        const std::vector<std::vector<int32_t>>& candidates, const std::vector<std::string>& names,
+        int32_t trunk, const std::shared_ptr<mm::PromptMedia>& media, int64_t input_tokens,
+        std::vector<std::vector<float>>* logits);
     HttpResponse handle_apply_template(const HttpRequest& req);
     using ToChat = int (*)(const std::string& body, const OaiLimits& lim, std::string* chat,
                            std::string* extra, ApiError* err);

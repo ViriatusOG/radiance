@@ -2447,6 +2447,11 @@ int Engine::run_server() {
     /* Laya's sequence lengths, special tokens and fitted temperatures, which the server builds
      * and reads each question with (server/laya.h); rad-convert writes them from the checkpoint's
      * rl_agent_config.json and tokenizer/. */
+    /* Mica's calibration: one temperature, and a bias on a noul's true logit (server/mica.h). */
+    if (o.decision_type == "mica") {
+        o.mica.temperature     = rad_meta_getf(&meta_, "decision.mica.temperature", 1.0);
+        o.mica.noul_logit_bias = rad_meta_getf(&meta_, "decision.mica.noul_logit_bias", 0.0);
+    }
     if (o.decision_type == "laya") {
         server::LayaSettings& l = o.laya;
         l.max_len      = rad_meta_geti(&meta_, "decision.laya.max_len", 0);
