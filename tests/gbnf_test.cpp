@@ -1433,6 +1433,45 @@ TEST(gbnf_a_length_bound_past_two_thousand_is_held_exactly) {
     }
 }
 
+/* Bounded repetitions of one operand share one chain of links, so a schema's many length bounds
+ * cost its longest once rather than their sum. 200 properties at `maxLength: 4000` were 200 chains,
+ * past the compile budget (a tool schema like that is refused in full); shared, they compile, and
+ * every bound, short or long, string or array, is still held exactly. */
+TEST(gbnf_bounds_over_one_operand_share_their_links) {
+    auto bv = bpe_like(59, 1500);
+    std::string props = R"("a":{"type":"string","maxLength":4000},"b":{"type":"string","maxLength":7},)"
+                        R"("c":{"type":"array","items":{"type":"string","maxLength":5},"maxItems":3})";
+    for (int i = 0; i < 200; ++i)
+        props += ",\"f" + std::to_string(i) + "\":{\"type\":\"string\",\"maxLength\":4000}";
+    std::string gbnf, err;
+    CHECK_OK(grammar_from_json_schema("{\"type\":\"object\",\"properties\":{" + props +
+                                          "},\"required\":[\"a\",\"b\",\"c\"]}",
+                                      "root", &gbnf, &err));
+    std::unique_ptr<GbnfGrammar> g;
+    CHECK_OK(GbnfGrammar::create(gbnf, "root", &bv->v, false, {}, {}, &g, &err));
+    auto whole = [&](const std::string& text) {
+        std::unique_ptr<GbnfGrammar> h;
+        std::string e;
+        if (GbnfGrammar::create(gbnf, "root", &bv->v, false, {}, {}, &h, &e) < 0) return false;
+        return h->accept_str(text) >= 0 && h->complete();
+    };
+    auto doc = [](size_t a, size_t b, std::vector<size_t> c, size_t f7) {
+        std::string s = "{\"a\":\"" + std::string(a, 'x') + "\",\"b\":\"" + std::string(b, 'y') +
+                        "\",\"c\":[";
+        for (size_t i = 0; i < c.size(); ++i) s += (i ? ",\"" : "\"") + std::string(c[i], 'z') + "\"";
+        s += "]";
+        if (f7) s += ",\"f7\":\"" + std::string(f7, 'w') + "\"";
+        return s + "}";
+    };
+    CHECK(whole(doc(4000, 7, { 5, 0, 5 }, 4000)));
+    CHECK(whole(doc(0, 0, {}, 0)));
+    CHECK(!whole(doc(4001, 7, { 5 }, 0)));
+    CHECK(!whole(doc(10, 8, { 5 }, 0)));
+    CHECK(!whole(doc(10, 7, { 6 }, 0)));
+    CHECK(!whole(doc(10, 7, { 1, 1, 1, 1 }, 0)));
+    CHECK(!whole(doc(10, 7, { 1 }, 4001)));
+}
+
 /* Identical clauses across tools are one clause to the plan. A tool-calling template writes the
  * same undeclared-parameter clause, free-text value and closing tags as separate rules per tool;
  * the plan hash-conses rules by body, so its size and the compile's vocabulary walks do not grow

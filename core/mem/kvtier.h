@@ -79,7 +79,7 @@ struct TierJob {
     };
     Kind      kind = Kind::WriteBack;
     BlockHash key;
-    /* Per cached group, in PrefixCache::cached_groups() order: the blocks to read for a
+    /* One per entry block, in PrefixCache::entry_groups() order: the blocks to read for a
      * write-back, or the blocks the engine allocated for a promotion. */
     std::vector<int32_t> blocks;
     int32_t   host_slot = -1;

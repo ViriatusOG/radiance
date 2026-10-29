@@ -10,7 +10,7 @@
 
 /* Every `const void*` libr4d takes has one element type, cast inside the kernel (e.g.
  * r4d_gdn_conv_prep_w4_h128_bf16 reads `wgt` as bf16 and `A_log` as f32); the signature does not
- * say so. A plugin declaring `ssm_conv1d.weight` or the `gdn_kkt` buffer as f32 would be read as
+ * say so. A plugin declaring the `gdn_kkt` buffer as f32 would be read as
  * bf16 on the device, while libref (which honours each operand's dtype) stays correct, so the bug
  * would show only on the device path. The shim therefore checks dtypes by name (spec §2.1). */
 static inline int r4d_dt(const RadTensor* t, uint32_t want) {

@@ -10,6 +10,7 @@
  * The error bounds carry margin and catch a wrong plane layout, which decodes to noise.
  */
 #include "quant_fixture.h"
+#include "format/ggml_planes.h"
 
 #include <cstdint>
 
@@ -131,6 +132,24 @@ TEST(ggml_writes_each_type_as_its_affine_planes) {
         CHECK(rad_enc_valid(&e));
         CHECK_EQ(enc_name(e), std::string(t.enc));
         CHECK_EQ(q->row_block(o.data(), o.n(), &qw), (int64_t)1);
+    }
+}
+
+/* The core cannot call libquant, so a GGUF is read through its own copy of the encodings
+ * (core/format/ggml_planes.h); this holds every type of the copy to the quantiser's. */
+TEST(the_reader_names_the_planes_the_quantiser_writes) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* q = quantizer("ggml");
+    REQUIRE(q != nullptr);
+    for (const ggml_planes::Type& t : ggml_planes::kTypes) {
+        Opts o;
+        o.s("type", gguf_dtype(t.ggml)->name);
+        const RadQuantWeight qw = weight_of("w", 4, 512, nullptr);
+        RadEncoding written, read;
+        REQUIRE_EQ(q->encoding(o.data(), o.n(), &qw, &written), RAD_OK);
+        REQUIRE(ggml_plane_encoding(t.ggml, &read));
+        CHECK_EQ(enc_name(read), enc_name(written));
+        CHECK(rad_enc_equal(&read, &written));
     }
 }
 

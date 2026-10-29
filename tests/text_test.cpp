@@ -21,6 +21,8 @@
  */
 #include "rad_test.h"
 
+#include <fstream>
+
 #include "text/gguf.h"
 #include "text/tokenizer.h"
 #include "text/tokenizer_nfc.h"
@@ -2238,6 +2240,31 @@ TEST(the_normal_forms_agree_with_an_independent_implementation) {
         ++rows;
     }
     CHECK(rows > 2500);
+}
+
+/* A release that ships no chat template (DeepSeek's) is why --chat-template exists: the file is
+ * read, trailing newlines stripped exactly as the checkpoint's own file is, and an unreadable or
+ * empty file is refused rather than skipped. */
+TEST(read_chat_template_path_strips_newlines_and_refuses_empty) {
+    VocabBuild vb;
+    const std::string p = radtest::tmp_path("chat_template.jinja");
+    {
+        std::ofstream f(p);
+        f << "{%- raw %}{{ messages }}{%- endraw %}\n\n";
+    }
+    CHECK_OK(read_chat_template_path(p.c_str(), vb));
+    CHECK_EQ(vb.chat_template, std::string("{%- raw %}{{ messages }}{%- endraw %}"));
+
+    vb.chat_template.clear();
+    {
+        std::ofstream f(p);
+        f << "\n\r\n";
+    }
+    CHECK_EQ(read_chat_template_path(p.c_str(), vb), (int)RAD_E_IO);
+    CHECK(vb.chat_template.empty());
+
+    CHECK_EQ(read_chat_template_path(radtest::tmp_path("absent.jinja").c_str(), vb), (int)RAD_E_IO);
+    std::remove(p.c_str());
 }
 
 RAD_TEST_MAIN()

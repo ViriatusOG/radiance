@@ -1080,8 +1080,7 @@ TEST(a_keyframe_pair_is_encoded_and_pins_both_ends) {
     CHECK(stepped);
 }
 
-/* References ride a latent upscale, laid out again at the small size for the steps before it; a
- * keyframe, pinned on the video's own grid, does not. */
+/* References ride a latent upscale, laid out again at the small size for the steps before it. */
 TEST(references_are_laid_out_again_at_an_upscales_small_size) {
     VideoFixture f;
     f.build();
@@ -1120,6 +1119,53 @@ TEST(references_are_laid_out_again_at_an_upscales_small_size) {
         CHECK_OK(f.drv.done());
     }
     CHECK_EQ(kinds, std::string("ECSSUSAD"));
+}
+
+/* A keyframe rides a latent upscale pinned on the grid the steps run on: encoded at the small size
+ * before the prompt, and again at the full size, into the same slot, between the upscale and the
+ * first full-size step. Without its small picture the request is refused. */
+TEST(a_keyframe_is_encoded_again_at_the_full_size_after_an_upscale) {
+    VideoFixture f;
+    f.build();
+    f.prog.video_gen.upscale_max = 4.0;
+    f.prog.video_gen.upscale_refine = 1;
+    with_tower(f, 16);
+    CHECK_OK(f.start_refs());
+    std::string why;
+    auto r = f.req(1, 4);
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    gen::VideoRefMedia kf = picture(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1, 64, 64);
+    kf.small_w = 32;
+    kf.small_h = 32;
+    kf.small_pixels.assign((size_t)32 * 32 * 3, 2.0f);
+    r->refs.push_back(kf);
+    const int64_t T = (int64_t)r->tokens.size();
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    /* The prompt, a keyframe's 2 rows and 60 soundtrack rows, then a video of 2 rows small, 8 full. */
+    std::string kinds;
+    int steps = 0, encodes = 0;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        kinds += b->gen == RAD_GEN_PASS_VENCODE ? 'E' : kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VENCODE) {
+            const int32_t side = encodes++ == 0 ? 32 : 64;
+            CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_KEYFRAME);
+            CHECK_EQ(V->enc_slot, 1);
+            CHECK_EQ(V->enc_height, side);
+            CHECK_EQ(V->enc_width, side);
+        } else if (b->gen == RAD_GEN_PASS_VSTEP) {
+            CHECK_EQ(b->n_tok, T + 2 + 60 + (steps++ < 2 ? 2 : 8));
+            CHECK_EQ(V->ref_tab[1], 1);
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(kinds, std::string("ECSSUESAD"));
 
     VideoFixture g;
     g.build();
@@ -1132,7 +1178,7 @@ TEST(references_are_laid_out_again_at_an_upscales_small_size) {
     r->upscale = 2.0;
     r->refs.push_back(picture(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1, 64, 64));
     CHECK_EQ(g.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
-    CHECK(has(why, "latent_upscale"));
+    CHECK(has(why, "small size"));
 }
 
 /* A reference video with its soundtrack and a standalone soundtrack: one encode pass each, the

@@ -479,4 +479,70 @@ void ExpertStats::stop() {
 
 ExpertStats::~ExpertStats() { stop(); }
 
+/* ------------------------------------------------------------------ --expert-profile */
+
+int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, int32_t* n_trunk) {
+    if (!out) return RAD_E_INVAL;
+    out->clear();
+    if (n_trunk) *n_trunk = -1;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) {
+        RAD_ERR("--expert-profile: cannot read %s: %s", path.c_str(), std::strerror(errno));
+        return RAD_E_IO;
+    }
+    std::string text;
+    char buf[1 << 16];
+    while (const size_t n = std::fread(buf, 1, sizeof buf, f)) text.append(buf, n);
+    const bool bad = std::ferror(f) != 0;
+    std::fclose(f);
+    if (bad) {
+        RAD_ERR("--expert-profile: reading %s failed", path.c_str());
+        return RAD_E_IO;
+    }
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(text); }
+    catch (const nlohmann::json::exception& e) {
+        RAD_ERR("--expert-profile: %s is not JSON: %s", path.c_str(), e.what());
+        return RAD_E_INVAL;
+    }
+    if (!j.is_object() || j.value("format", "") != "radiance-expert-stats/1" ||
+        !j.contains("counts") || !j["counts"].contains("decode") ||
+        !j["counts"]["decode"].is_array()) {
+        RAD_ERR("--expert-profile: %s is not a radiance-expert-stats/1 file with decode counts",
+                path.c_str());
+        return RAD_E_INVAL;
+    }
+    if (n_trunk && j.contains("n_trunk_layers") && j["n_trunk_layers"].is_number_integer())
+        *n_trunk = j["n_trunk_layers"].get<int32_t>();
+    const auto& rows = j["counts"]["decode"];
+    int64_t kept = 0;
+    for (size_t l = 0; l < rows.size(); ++l) {
+        if (!rows[l].is_array()) continue;
+        uint64_t sum = 0;
+        for (const auto& c : rows[l])
+            if (c.is_number_unsigned() || c.is_number_integer())
+                sum += c.get<uint64_t>();
+        if (sum == 0) continue;
+        for (size_t e = 0; e < rows[l].size(); ++e) {
+            const auto& c = rows[l][e];
+            if (!(c.is_number_unsigned() || c.is_number_integer())) continue;
+            const uint64_t n = c.get<uint64_t>();
+            if (n == 0) continue;
+            RadFileProfile p{};
+            p.layer = (int32_t)l;
+            p.expert = (int32_t)e;
+            p.share = (float)((double)n / (double)sum);
+            out->push_back(p);
+            ++kept;
+        }
+    }
+    if (kept == 0)
+        RAD_WARN("--expert-profile: %s has no decode selections; the planner ranks from the "
+                 "container's profile", path.c_str());
+    else
+        RAD_INFO("--expert-profile: %lld decode-hot entries over %zu layers from %s",
+                 (long long)kept, rows.size(), path.c_str());
+    return RAD_OK;
+}
+
 }  /* namespace rad */

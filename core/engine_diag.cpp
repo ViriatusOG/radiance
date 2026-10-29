@@ -6,6 +6,7 @@
  */
 #include "engine_priv.h"
 #include "device/device.h"
+#include "mm/media.h"
 
 #include <algorithm>
 
@@ -37,6 +38,7 @@ diag::Facts Engine::hardware_facts(bool serving) const {
             if (r->device == id.device) mine.push_back(id.bdf);
     diag::Facts f = diag::collect("", serving ? &mine : nullptr);
     f.host.runtime = runtime_version_;
+    f.host.media = mm::decoder_version();
     if (probed_) {
         f.host.memlock_soft = memlock_soft_;
         f.host.io_uring = io_uring_;

@@ -638,6 +638,27 @@ void read_config(const std::string& dir, VocabBuild& out) {
 
 }  /* namespace */
 
+int read_chat_template_path(const char* path, VocabBuild& out) {
+    if (!path) return RAD_E_INVAL;
+    std::ifstream f(path);
+    if (!f) {
+        RAD_ERR("tokenizer: cannot read chat template %s", path);
+        return RAD_E_IO;
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string t = ss.str();
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+    if (t.empty()) {
+        RAD_ERR("tokenizer: chat template %s is empty", path);
+        return RAD_E_IO;
+    }
+    RAD_INFO("tokenizer: chat template from %s (%zu bytes), overriding the checkpoint's",
+             path, t.size());
+    out.chat_template = std::move(t);
+    return RAD_OK;
+}
+
 /* ================================================================== parse_tokenizer_json */
 
 namespace {

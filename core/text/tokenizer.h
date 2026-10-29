@@ -320,6 +320,12 @@ int parse_tokenizer_json(const char* path, VocabBuild& out);
 /* Same, from an in-memory buffer, for a tokenizer.json that arrived some other way. */
 int parse_tokenizer_json_buf(std::string_view json, const char* origin, VocabBuild& out);
 
+/* Read a standalone chat template file into out.chat_template, trailing newlines stripped.
+ * A release that ships no template (DeepSeek's does not) needs one from elsewhere; the caller
+ * passes the file. An unreadable or empty file is an error, never a silent skip. Returns
+ * RAD_OK, or RAD_E_IO when the file cannot be read. */
+int read_chat_template_path(const char* path, VocabBuild& out);
+
 /* Build a VocabBuild from a GGUF's tokenizer.ggml.* metadata.
  *
  * GGUF has no declared chain, only `tokenizer.ggml.pre`, a name llama.cpp derived by hashing the

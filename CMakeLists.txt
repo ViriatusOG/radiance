@@ -297,6 +297,14 @@ add_subdirectory(libquant)
 if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libr4d/CMakeLists.txt)
   add_subdirectory(libr4d)
 endif()
+# libr3d: the RDNA3 kernel library, same shape as libr4d and same guard -- device code needs a HIP
+# toolchain. It declares itself for `^gfx11` and returns without a target when the build's
+# RAD_GPU_TARGETS holds no RDNA3, so a gfx12-only build of this tree does not produce it (and a card
+# with no kernel library of its own keeps refusing device-only ops, which is the rule, not a
+# regression: docs/PLUGIN.md §10).
+if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libr3d/CMakeLists.txt)
+  add_subdirectory(libr3d)
+endif()
 # libavx: the production host kernels (x86 SIMD, dispatched by CPU feature), built on every x86-64.
 # Not optional: host-placed ops need a kernel other than the oracle (rad_gate_reference_kernels
 # refuses libref), and a table too large for the card, such as the n-gram embedding's gather, runs

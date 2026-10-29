@@ -220,11 +220,27 @@ int r4d_gdn_conv_prep_w4_h128_bf16(
         const void* A_log, const void* dt_bias, void* q, void* k, void* v, void* g, void* beta,
         const void* cu, int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr,
         void* stream);
+// The same with an f32 `wgt`, as a GGUF stores ssm_conv1d. Every other operand is as above, and
+// a bf16-representable weight gives the same bytes.
+int r4d_gdn_conv_prep_w4_h128_bf16_f32wgt(
+        const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+        long cs_seq, long cs_dim, long cs_tok, const void* cache_idx, long ci_stride,
+        const void* has_init, int hi_i32,
+        const void* a, const void* b, long ab_stride, int ab_is_bf16,
+        const void* A_log, const void* dt_bias, void* q, void* k, void* v, void* g, void* beta,
+        const void* cu, int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr,
+        void* stream);
 
 // The same convolution for a decode step over a speculative window. The state cache is a rolling
 // buffer of width-1 + num_spec entries read at the slot the last accepted token left; q / k / v
 // are written straight into their own layouts. Replaces causal_conv1d_update and its cat.
 int r4d_gdn_conv_update_w4_h128_bf16(
+        const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+        long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+        long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
+        int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream);
+// The same with an f32 `wgt`, as for the prefill convolution.
+int r4d_gdn_conv_update_w4_h128_bf16_f32wgt(
         const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
         long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
         long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
@@ -685,6 +701,12 @@ void r4d_moe_gemm_pin_down_dec(int pin);
 // (refused likewise, and below 512 rows, whose scratch is not sized for their weight planes).
 // All bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_pin_prefill(int form);
+// Test hook: pins the gated residual read's decode kernels. 0 is the launcher's rule (kernels A and
+// B as one grid at one to seven rows where the per-stream counters exist, the tiled up-mix's K
+// passes pipelined from eight rows), 1 the kernels the rule replaced (A, then the up-mix in a second
+// launch; the tiled up-mix's passes in sequence). Bit-identical; r4d_selftest compares their bytes
+// and --perfhc times both.
+void r4d_hc_read_pin_decode(int form);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.
@@ -791,8 +813,8 @@ int  r4d_gate_quant_fp8(long g, long x, long y, long q, long s, int M, int n, in
 // on the norm's load. IPC arguments are r4d_ar_oneshot_2rank_exact's; `nblocks` is clamped to M
 // because a block owns whole rows, and `x` takes no pitch because it is also the message. Like the
 // int8 twin r4d_ar_ln_had_quant_i8 it has two wires: `wire` 0 is the exact bf16 payload, 6 the
-// rotated 6-bit one. Wire 6 needs `n` to be a multiple of r4d_ar_rmsnorm_quant_fp8_chunk_elems()
-// so a chunk never straddles a row.
+// rotated 6-bit one. Wire 6 needs `n` to be a multiple of 64 (a group never straddles a row); a
+// row that is not whole r4d_ar_rmsnorm_quant_fp8_chunk_elems() chunks pads its last one with zeros.
 int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                               long seq_ctrs, long slot_stride16,
                               long x, long res, long w, long y, long q, long s,

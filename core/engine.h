@@ -241,6 +241,9 @@ private:
     std::vector<TableCopy> table_copies_;
     std::vector<void*> card_copies_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
+    /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
+     * rank's planner in place of the container's activation profile. */
+    std::vector<RadFileProfile> expert_profile_;
     int load_weights();
     int configure_kv();
     /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */

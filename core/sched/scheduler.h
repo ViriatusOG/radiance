@@ -491,12 +491,16 @@ private:
      * place. */
     bool          hit_holes_draft_ = true;
     /* Does a hit leave a hole in the trunk: a paged group with a trunk layer (bound below
-     * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?
-     * Unlike a drafter hole, recomputing the tail cannot repair it; see admit_one. */
+     * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index and
+     * no checkpoint slot carries? Unlike a drafter hole, recomputing the tail cannot repair it;
+     * every hit is refused (admit_one). */
     bool          hit_holes_trunk_ = false;
     /* The end-of-generation ids, sorted and unique (set_eog), and a lookup in them. */
     std::vector<int32_t> eog_;
     bool          is_eog(int32_t id) const;
+    /* A windowed trunk group, which the cache does not index: a hit stands only where it resumes
+     * at a window snapshot (IKVManager::has_window_snapshot), which restores the window. */
+    bool          hit_needs_window_ = false;
     /* R-SWA: the groups whose KV manager carries per-sequence runtime windows, with the W a
      * sequence is armed with (IKVManager::runtime_window_tokens). Empty for every model that does
      * not declare one, in which case admission and commit are exactly as before. A sequence with

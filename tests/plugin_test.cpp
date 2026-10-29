@@ -1126,6 +1126,28 @@ TEST(libr4d_resolves_every_band_of_glm_mla_split_by_rows) {
     }
 }
 
+/* The dense integer gemm_nt_q kernels compile their group in, so their rows take no other: at
+ * group 64 each dtype is a miss, at 128 it resolves. At M = 1 every skinny, tiled and prefill row
+ * of these dtypes is a candidate. */
+TEST(libr4d_resolves_a_dense_integer_gemm_only_at_its_group) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    for (const char* dtype : { "w4a16", "w5a16", "w4a16_asym", "w4a8i8_asym", "w5a8i8", "w2a8",
+                               "w8a16", "w4a8", "w4a8_asym", "w8a8" }) {
+        Geometry g;
+        g.set_i("M", 1);
+        g.set_i("N", 256);
+        g.set_i("K", 256);
+        g.set_s("dtype", dtype);
+        g.set_i("group", 64);
+        CHECK_EQ(picked(r.select("gemm_nt_q", g, RAD_DOMAIN_DEVICE)), "<none>");
+        g.set_i("group", 128);
+        CHECK(r.select("gemm_nt_q", g, RAD_DOMAIN_DEVICE) != nullptr);
+    }
+}
+
 /* ================================================================== constraints that are not intervals */
 namespace {
 std::string extra_dir()   { return home() + "/testkernels/extra"; }

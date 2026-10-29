@@ -391,7 +391,10 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
      * by a repetition count (upstream's cap of 2000 rejects ordinary schemas such as
      * `maxLength: 8000`). It is linear in the count, and nothing after the parse is worse than
      * linear in the rules; the mask plan gives every link past the longest token one class. So
-     * `[^"]{0,8000}` costs about a megabyte and yields the same plan as `[^"]{0,1999}`. */
+     * `[^"]{0,8000}` costs about a megabyte and yields the same plan as `[^"]{0,1999}`.
+     *
+     * S'(x) depends only on S and x, so the links are shared: every bounded repetition of the same
+     * operand points into one chain (rep_links_), and S{0,2000} after S{0,4000} builds nothing. */
     auto handle_repetitions = [&](uint64_t min_times, uint64_t max_times) {
         const bool no_max = max_times == UINT64_MAX;
         if (last_sym_start == rule.size())
@@ -407,17 +410,30 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
 
         /* A refusal names the repetition the client wrote. */
         try {
+            const uint64_t n_opt = no_max ? 1 : max_times - min_times;
+
+            /* A bounded repetition's chain of links for this operand, shared with every earlier
+             * bounded repetition of it; only the links it lacks are built. */
+            std::vector<uint32_t>* links = nullptr;
+            uint64_t n_new = n_opt;
+            if (!no_max && n_opt > 0) {
+                std::vector<std::pair<uint32_t, uint32_t>> key;
+                key.reserve(prev_rule.size());
+                for (const auto& e : prev_rule) key.emplace_back((uint32_t)e.type, e.value);
+                links = &rep_links_[std::move(key)];
+                n_new = n_opt > links->size() ? n_opt - links->size() : 0;
+            }
+
             /* Charge the copies up front: the operand once per required count beyond the first,
-             * and once per optional rule plus its reference, ALT and END. Counts reach 2^64 - 2,
-             * so overflow saturates and is refused before the loops run. Each generated rule's
-             * name and slot are charged again in generate_symbol_id. */
+             * and once per optional rule built plus its reference, ALT and END. Counts reach
+             * 2^64 - 2, so overflow saturates and is refused before the loops run. Each generated
+             * rule's name and slot are charged again in generate_symbol_id. */
             {
                 const uint64_t w      = prev_rule.size();
-                const uint64_t n_rest = no_max ? 1 : max_times - min_times;
                 uint64_t req = 0, opt = 0, copies = 0, bytes = 0;
                 const bool wraps =
                     __builtin_mul_overflow(min_times > 1 ? min_times - 1 : 0, w, &req) ||
-                    __builtin_mul_overflow(n_rest, w + 3, &opt) ||
+                    __builtin_mul_overflow(n_new, w + 3, &opt) ||
                     __builtin_add_overflow(req, opt, &copies) ||
                     __builtin_mul_overflow(copies, (uint64_t)sizeof(GbnfElement), &bytes);
                 charge(wraps ? UINT64_MAX : bytes);
@@ -430,21 +446,26 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
                     rule.insert(rule.end(), prev_rule.begin(), prev_rule.end());
             }
 
-            uint32_t last_rec_rule_id = 0;
-            const uint64_t n_opt = no_max ? 1 : max_times - min_times;
-
             GbnfRule rec_rule(prev_rule);
-            for (uint64_t i = 0; i < n_opt; i++) {
-                rec_rule.resize(prev_rule.size());
+            if (no_max) {
                 const uint32_t rec_rule_id = generate_symbol_id(rule_name);
-                if (i > 0 || no_max)
-                    rec_rule.push_back({ GRE_RULE_REF, no_max ? rec_rule_id : last_rec_rule_id });
+                rec_rule.push_back({ GRE_RULE_REF, rec_rule_id });
                 rec_rule.push_back({ GRE_ALT, 0 });
                 rec_rule.push_back({ GRE_END, 0 });
                 add_rule(rec_rule_id, rec_rule);
-                last_rec_rule_id = rec_rule_id;
+                rule.push_back({ GRE_RULE_REF, rec_rule_id });
+            } else if (n_opt > 0) {
+                while (links->size() < n_opt) {
+                    rec_rule.resize(prev_rule.size());
+                    const uint32_t rec_rule_id = generate_symbol_id(rule_name);
+                    if (!links->empty()) rec_rule.push_back({ GRE_RULE_REF, links->back() });
+                    rec_rule.push_back({ GRE_ALT, 0 });
+                    rec_rule.push_back({ GRE_END, 0 });
+                    add_rule(rec_rule_id, rec_rule);
+                    links->push_back(rec_rule_id);
+                }
+                rule.push_back({ GRE_RULE_REF, (*links)[n_opt - 1] });
             }
-            if (n_opt > 0) rule.push_back({ GRE_RULE_REF, last_rec_rule_id });
         } catch (const std::runtime_error& ex) {
             throw std::runtime_error("the repetition {" + std::to_string(min_times) + "," +
                                      (no_max ? std::string() : std::to_string(max_times)) + "}: " +
@@ -580,6 +601,7 @@ const char* GbnfParser::parse_rule(const char* src) {
 int GbnfParser::parse(const char* src, std::string* err) {
     if (!src) return RAD_E_INVAL;
     budget_used_ = 0;
+    rep_links_.clear();
     depth_       = 0;
     try {
         const char* pos = parse_space(src, true);

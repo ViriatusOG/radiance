@@ -151,19 +151,30 @@ constexpr uint32_t kSplitThinCap = 64u;
  * tuned at (the NT accumulators and K-step unroll are sized against it), so a compiler release
  * cannot change occupancy. Shapes with one or two waves per block are LDS-bound and use that
  * count. */
-constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bool i8) {
+constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bool i8,
+                            bool gated = false) {
     if (mw == 1u) return nt == 1u ? 8u : nt == 2u ? 4u : nt == 3u ? 3u : 2u;
     if (mw == 2u) return nt == 1u ? 12u : nt == 2u ? 8u : nt == 3u ? 5u : 4u;
     if (!i8) {
         if (fk == 128u)
             return nt == 1u ? 16u : nt == 2u ? (full ? 16u : 12u) : nt == 3u ? 10u
                  : (full && mw >= 8u) ? 10u : 9u;
-        return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? 9u : mw == 4u ? 7u : 8u;
+        /* The gated three-tile form at 8, not 9. At 9 waves' 168 registers its epilogue spilled
+         * 57 at the full tile (48 rows), which ran gate_up 51 % slower than 56 rows, and 10 below
+         * it, 70 with the LDS-staged scales. 8 waves leave 192, where it spills 9 and 10. The gated
+         * form is always MW 16, four waves a SIMD a block, so 8 and 9 both hold two blocks a WGP:
+         * no occupancy is lost. */
+        return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? (gated ? 8u : 9u)
+             : mw == 4u ? 7u : 8u;
     }
     if (fk == 128u)
         return nt == 1u ? 16u : nt == 2u ? (full ? 10u : 12u) : nt == 3u ? (full ? 9u : 10u)
              : full ? 7u : 9u;
-    if (nt == 1u) return 12u;
+    /* 10, not 12. The fold's LDS-staged scales (gemm_fp8a8_kernel) need a few more
+     * registers than 12 waves' 120 leave, and spilled. gfx12 allocates registers 24 at a time, so
+     * 11 waves leave 120 as well and 10 is the next step (144). No decode shape puts more than 8 of
+     * these waves on a SIMD, so the lower pin costs no occupancy. */
+    if (nt == 1u) return 10u;
     if (nt == 2u) return full ? 9u : mw == 4u ? 9u : 10u;
     if (nt == 3u) return full ? (mw == 16u ? 8u : 7u) : (mw == 4u ? 8u : 9u);
     return full ? (mw == 4u ? 5u : 6u) : (mw == 4u ? 7u : 8u);
@@ -252,10 +263,6 @@ __device__ __forceinline__ void gemm_fp8a8_body(
 
     const uint32_t sn = tid / kTPR, sk = (tid % kTPR) * kSeg;
 
-    // The B rows this lane owns, one per N tile (column `frag_c` of each of its NT accumulators,
-    // 16 apart). A per-B-row scale must be looked up for each, not just the first.
-    const uint32_t brow0 = n0 + wn + frag_c(lane);
-
     const uint8_t* bsrc = Bp + (size_t)(n0 + sn) * b_ld + sk;
     // A as fragments: a wave owns one 16-row weight tile, so its A operand for 64 k is this lane's
     // 32 bytes. `ksuper` is the plane's tile stride; `arow` is out of range only when N is not a
@@ -287,12 +294,76 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             afrag + (size_t)(arow * ksuper + st) * r4d_fp8::kTileBytes, alive && st < ksuper);
     }
 
+    /* The fold's scales are staged through LDS a K tile ahead, beside the B tile. The
+     * fold loaded them itself, after the next tile's prefetch had been issued; loads return in
+     * order, so each fold waited for that whole prefetch, twice a tile at FK = 256, and the "one
+     * tile ahead" overlapped nothing. Now the block's threads each load one weight-scale dword and
+     * one activation scale of tile c0+FK with its B prefetch (a few each only in the selftest's
+     * one- and two-wave pins) and store them at the top of the next pass with the B tile, so a fold
+     * reads LDS. Two registers a thread: holding a tile's scales a lane (8 + 2*NT registers)
+     * spilled at the decode shapes' register pins. Same values as before: bit-identical. A dead
+     * wave's fp8 block scale reads as 0 instead of the plane row past the end it used to read; its
+     * rows are never stored.
+     *
+     * A tile holds kFolds = FK / kBlock scale blocks, and the fold at `ks` uses block ks / kBlock
+     * of its tile. s_ws: I8, each wave's 16 bf16 row scales a block, [MW][kFolds][8] dwords
+     * (r4d_fp8_layout.cpp's tile-major plane); fp8, each wave's one bf16 block scale,
+     * [MW][kFolds]. s_as: each B row's f32 scale a block, [kFolds][FN]. */
+    constexpr uint32_t kFolds = (FK + kBlock - 1) / kBlock;
+    constexpr uint32_t kWS = I8 ? MW * kFolds * 8u : MW * kFolds;
+    constexpr uint32_t kAS = kFolds * FN;
+    constexpr uint32_t kWSPer = (kWS + MW * kWave - 1) / (MW * kWave);
+    constexpr uint32_t kASPer = (kAS + MW * kWave - 1) / (MW * kWave);
+    __shared__ __attribute__((aligned(16))) uint32_t s_ws[kWS];
+    __shared__ float s_as[kAS];
+    const uint32_t nkb8 = (cols + kBlock - 1) / kBlock;
+    auto load_ws = [&](uint32_t c, uint32_t i) -> uint32_t {
+        if (i >= kWS) return 0u;
+        if constexpr (I8) {
+            const uint32_t tr = (m0 + (i / (kFolds * 8u)) * 16u) / 16u;
+            const uint32_t kb = c / kBlock + (i / 8u) % kFolds;
+            return ((Full || tr * 16u < rows) && kb < nkb8)
+                ? ((const uint32_t*)Sa)[((size_t)tr * nkb8 + kb) * 8u + i % 8u] : 0u;
+        } else {
+            const uint32_t w = i / kFolds, kb = c / kBlock + i % kFolds;
+            const uint32_t wr = GATED ? ((w < kGHalf ? 0u : rows / 2u) + blockIdx.x * (FM / 2u)
+                                         + (w % kGHalf) * 16u)
+                                      : (m0 + w * 16u);
+            return ((Full || wr < rows) && kb < nkb8)
+                ? (uint32_t)((const uint16_t*)Sa)[(size_t)(wr / kBlock) * sa_ld + kb] : 0u;
+        }
+    };
+    auto load_as = [&](uint32_t c, uint32_t i) -> float {
+        if (i >= kAS) return 0.0f;
+        const uint32_t tok = n0 + i % FN, kb = c / kBlock + i / FN;
+        return ((Full || tok < nb) && kb < nkb8) ? ((const float*)Sb)[(size_t)tok * sb_ld + kb]
+                                                 : 0.0f;
+    };
+    uint32_t qws[kWSPer];
+    float qas[kASPer];
+    auto load_q = [&](uint32_t c) {
+#pragma unroll
+        for (uint32_t r = 0; r < kWSPer; ++r) qws[r] = load_ws(c, tid + r * MW * kWave);
+#pragma unroll
+        for (uint32_t r = 0; r < kASPer; ++r) qas[r] = load_as(c, tid + r * MW * kWave);
+    };
+    load_q(kbeg);
+    // The B rows this lane owns within the tile, one per N tile (column `frag_c` of each of its NT
+    // accumulators, 16 apart). A per-B-row scale must be looked up for each, not just the first.
+    const uint32_t bl0 = wn + frag_c(lane);
+
     for (uint32_t c0 = kbeg; c0 < kend; c0 += FK) {
 #pragma unroll
         for (uint32_t p = 0; p < kBP; ++p) {
             const uint32_t r = sn + p * kRPP;
             if (r < FN) stage8_store<FK>(s_b, r, sk, pb[p]);
         }
+#pragma unroll
+        for (uint32_t r = 0; r < kWSPer; ++r)
+            if (tid + r * MW * kWave < kWS) s_ws[tid + r * MW * kWave] = qws[r];
+#pragma unroll
+        for (uint32_t r = 0; r < kASPer; ++r)
+            if (tid + r * MW * kWave < kAS) s_as[tid + r * MW * kWave] = qas[r];
         __syncthreads();
         const uint32_t c1 = c0 + FK;
         if (c1 < kend) {
@@ -311,6 +382,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
                     afrag + (size_t)(arow * ksuper + st) * r4d_fp8::kTileBytes,
                     alive && st < ksuper);
             }
+            load_q(c1);
         }
 
 #pragma unroll
@@ -332,19 +404,16 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             // Gating it at the compile-time-known positions is legal and byte-identical but raises
             // the register live range of the fold; see libr4d/isa/README.md.
             if ((c0 + ks + kK) % kBlock == 0 || c0 + ks + kK >= kend) {
-                const uint32_t kb = (c0 + ks) / kBlock;
+                /* This tile's scale block for `ks`, staged with the tile. */
+                const uint32_t f = ks / kBlock < kFolds ? ks / kBlock : kFolds - 1u;
                 if constexpr (I8) {
                     // A is the int8 weight with a bf16 scale per row. A lane's eight accumulator
                     // slots are eight consecutive rows of one 16-row tile, adjacent in the
                     // tile-major [N/16][K/128][16] plane: one 16-byte load. B is the activation.
-                    const uint32_t nkb8 = (cols + kBlock - 1) / kBlock;
                     float wsr[8];
                     {
-                        const uint32_t tr = wrow0 / 16u;
-                        uint4 w8 = make_uint4(0u, 0u, 0u, 0u);
-                        if (Full || tr * 16u < rows)
-                            w8 = *(const uint4*)((const uint16_t*)Sa +
-                                                 ((size_t)tr * nkb8 + kb) * 16u + (lane >> 4) * 8u);
+                        const uint4 w8 =
+                            *(const uint4*)&s_ws[(wave * kFolds + f) * 8u + (lane >> 4) * 4u];
                         const uint32_t d[4] = { w8.x, w8.y, w8.z, w8.w };
 #pragma unroll
                         for (uint32_t t = 0; t < 8; ++t)
@@ -352,9 +421,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
                     }
 #pragma unroll
                     for (uint32_t j = 0; j < NT; ++j) {
-                        const uint32_t tok = brow0 + j * 16;
-                        const float s = (Full || tok < nb)
-                                            ? ((const float*)Sb)[(size_t)tok * sb_ld + kb] : 0.0f;
+                        const float s = s_as[f * FN + bl0 + j * 16u];
 #pragma unroll
                         for (uint32_t t = 0; t < 8; ++t) {
                             out[j][t] += acc_val<I8>(raw[j][t]) * (wsr[t] * s);
@@ -365,14 +432,10 @@ __device__ __forceinline__ void gemm_fp8a8_body(
                     // A is the weight: one bf16 scale for this wave's 16 rows, which sit in one
                     // scale row. B is the activation: one f32 scale per (token, 128-column block),
                     // one per lane per tile.
-                    const float ws =
-                        bscale(((const uint16_t*)Sa)[(size_t)(wrow0 / kBlock) * sa_ld + kb]);
+                    const float ws = bscale((uint16_t)s_ws[wave * kFolds + f]);
 #pragma unroll
                     for (uint32_t j = 0; j < NT; ++j) {
-                        const uint32_t tok = brow0 + j * 16;
-                        const float s = ws * ((Full || tok < nb)
-                                                  ? ((const float*)Sb)[(size_t)tok * sb_ld + kb]
-                                                  : 0.0f);
+                        const float s = ws * s_as[f * FN + bl0 + j * 16u];
 #pragma unroll
                         for (uint32_t t = 0; t < 8; ++t) {
                             out[j][t] += raw[j][t] * s;
@@ -382,8 +445,8 @@ __device__ __forceinline__ void gemm_fp8a8_body(
                 }
             }
         }
-        // Wait until every wave has finished reading before the tile is overwritten. The
-        // prefetched fragments become current.
+        // Wait until every wave has finished reading before the tile and its scales are
+        // overwritten. The prefetched fragments become current.
 #pragma unroll
         for (uint32_t p = 0; p < kAF; ++p) pf[p] = pfn[p];
         __syncthreads();
@@ -583,12 +646,54 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             const uint32_t rlo = m0, rhi = min(m0 + FM, rows);
             const float* const w0 = (const float*)Y;
             uint16_t* const cy = (uint16_t*)C;
-            for (uint32_t idx = tid; idx < (rhi - rlo) * nb; idx += MW * kWave) {
-                const uint32_t r = rlo + idx / nb, col = idx % nb;
-                const size_t o = (size_t)col * rows + r;
-                float acc = 0.0f;
-                for (uint32_t z = 0; z < gridDim.z; ++z) acc += w0[(size_t)z * rows * nb + o];
-                cy[o] = f32_to_bf16(acc);
+            /* Consecutive threads take consecutive weight rows, which are adjacent in a
+             * partial plane ([nb][rows]), four rows a thread as one 16-byte load and kFinU quads in
+             * flight at each z. The loop walked the token index fastest, `rows` floats apart, one
+             * element a thread at a time: a cache line a load and a round trip each, which at
+             * N = 512, M = 64 (four columns of blocks finishing 8,192 elements over four planes)
+             * was most of a 45 us call. Each element is still summed from 0.0f in ascending z:
+             * bit-identical. */
+            const uint32_t nr = rhi - rlo;
+            const size_t zs = (size_t)rows * nb;
+            if ((rows & 3u) == 0u && (nr & 3u) == 0u && ((uintptr_t)C & 7u) == 0u
+                && ((uintptr_t)Y & 15u) == 0u) {
+                constexpr uint32_t kFinU = 4;
+                const uint32_t nq = nr / 4u, total = nq * nb;
+                for (uint32_t b = tid; b < total; b += kFinU * MW * kWave) {
+                    size_t o[kFinU];
+                    float4 acc[kFinU];
+#pragma unroll
+                    for (uint32_t u = 0; u < kFinU; ++u) {
+                        const uint32_t idx = b + u * MW * kWave;
+                        o[u] = idx < total ? (size_t)(idx / nq) * rows + rlo + (idx % nq) * 4u : 0u;
+                        acc[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                    for (uint32_t z = 0; z < gridDim.z; ++z) {
+                        float4 v[kFinU];
+#pragma unroll
+                        for (uint32_t u = 0; u < kFinU; ++u)
+                            v[u] = b + u * MW * kWave < total ? *(const float4*)(w0 + z * zs + o[u])
+                                                              : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+                        for (uint32_t u = 0; u < kFinU; ++u) {
+                            acc[u].x += v[u].x; acc[u].y += v[u].y;
+                            acc[u].z += v[u].z; acc[u].w += v[u].w;
+                        }
+                    }
+#pragma unroll
+                    for (uint32_t u = 0; u < kFinU; ++u) {
+                        if (b + u * MW * kWave >= total) continue;
+                        *(uint2*)(cy + o[u]) = make_uint2(bf16x2_rne(acc[u].x, acc[u].y),
+                                                          bf16x2_rne(acc[u].z, acc[u].w));
+                    }
+                }
+            } else {
+                for (uint32_t idx = tid; idx < nr * nb; idx += MW * kWave) {
+                    const size_t o = (size_t)(idx / nr) * rows + rlo + idx % nr;
+                    float acc = 0.0f;
+                    for (uint32_t z = 0; z < gridDim.z; ++z) acc += w0[z * zs + o];
+                    cy[o] = f32_to_bf16(acc);
+                }
             }
         }
     }
@@ -598,7 +703,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
     Sc, Yb, q_ld, s_ld, y_ld, Bias, c_ld
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
           bool GATED = false, bool I8 = false, bool BIAS = false>
-__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8, GATED))
 void gemm_fp8a8_kernel(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
@@ -613,7 +718,7 @@ void gemm_fp8a8_kernel(
 }
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
           bool GATED = false, bool I8 = false, bool BIAS = false>
-__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8, GATED))
 void r4dchain_gemm_fp8a8(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,

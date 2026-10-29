@@ -1,5 +1,6 @@
 /* checkpoint.cpp -- see checkpoint.h. */
 #include "checkpoint.h"
+#include "ggml_planes.h"
 #include "rad_plugin.h"
 
 #include <nlohmann/json.hpp>
@@ -2499,6 +2500,26 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (dt == RAD_DT_INVALID) {
         out->why = std::string("'") + p0.name + "' is a GGUF " +
                    (gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block") + " tensor";
+        /* Q8_0, Q4_K and Q6_K become their planes when every piece is of that type and they join
+         * along rows, so each row of the weight is one source row of blocks; the loader still
+         * refuses them, since the blocks interleave what the planes hold apart. */
+        bool one_type = true;
+        for (const SrcTensor* pk : out->pieces) one_type = one_type && pk->ggml == p0.ggml;
+        RadEncoding enc;
+        if (!one_type) {
+            out->why = "its GGUF pieces are of different block types";
+        } else if (ggml_plane_encoding(p0.ggml, &enc)) {
+            if (out->pieces.size() > 1 && (d != 0 || out->rank < 2)) {
+                out->why = "its GGUF pieces are joined along a column, across their blocks";
+            } else {
+                out->imported = true;
+                out->ggml_blocks = true;
+                out->enc = enc;
+                out->why = std::string("it is a GGUF ") + gguf_dtype(p0.ggml)->name +
+                           " tensor, which rad-convert imports as its planes -- serve the "
+                           "container it writes";
+            }
+        }
     } else if (!same) {
         out->why = "its pieces are stored in different dtypes";
     } else if (p0.pbits) {
@@ -3392,6 +3413,31 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
                 }
             }
             base += N;
+        }
+        return RAD_OK;
+    }
+    if (w.ggml_blocks) {
+        /* GGUF blocks, split one row at a time into every plane's row: a call pays the whole row
+         * for the one plane it keeps, and rad-convert asks plane by plane. */
+        int64_t at[RAD_ENC_MAX_PLANES + 1] = { 0 };
+        for (int i = 0; i < w.enc.n_planes; ++i) {
+            int64_t qr = 0, qc = 0;
+            rad_enc_plane_dims(&w.enc.plane[i], 1, w.cols, &qr, &qc);
+            at[i + 1] = at[i] + rad_enc_row_bytes(w.enc.plane[i].dtype, qc);
+        }
+        std::vector<uint8_t> split((size_t)at[w.enc.n_planes]);
+        uint8_t* row[RAD_ENC_MAX_PLANES] = { nullptr };
+        for (int i = 0; i < w.enc.n_planes; ++i) row[i] = split.data() + at[i];
+        int64_t base = 0;
+        for (const SrcTensor* piece : w.pieces) {
+            const int64_t prows = piece->numel() / w.cols, rb = piece->bytes / prows;
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + prows); ++r) {
+                ggml_plane_row(piece->ggml, (const uint8_t*)piece->data + (r - base) * rb, w.cols,
+                               row);
+                std::memcpy(o, row[k], (size_t)(at[k + 1] - at[k]));
+                o += at[k + 1] - at[k];
+            }
+            base += prows;
         }
         return RAD_OK;
     }

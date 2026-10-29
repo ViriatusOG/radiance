@@ -38,7 +38,8 @@
  * first steps run at `size` divided by it and the latent is enlarged to `size` for the last
  * `upscale_refine_steps` (the model's default when absent; abi/rad_builder.h, RadVideoGenDecl).
  * The video object of an upscaled video says how it was made: the factor, the refine steps and the
- * small size (`upscale_from`).
+ * small size (`upscale_from`). Keyframes ride it: each is prepared at both sizes and pinned at the
+ * one the steps run at.
  *
  * The prompt is the model's template with `{prompt}` filled; the template is tokenised with its
  * special tokens and the prompt without, so a caller cannot write control tokens into it.
@@ -742,6 +743,23 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                                &canvas[i], &why) < 0)
                 return bad(m.name.c_str(), "'" + m.name + "' could not be decoded: " + why);
             pixels(m, { canvas[i] });
+            /* A latent upscale's first steps pin it at their own size, prepared the same way. */
+            if (r->upscale > 1.0) {
+                RadVideoGenDecl geo{};   /* video_small_size reads the size multiple only */
+                geo.size_multiple = info.size_multiple;
+                int32_t sw = 0, sh = 0;
+                gen::video_small_size(geo, r->width, r->height, r->upscale, &sw, &sh);
+                mm::Frame small;
+                if (deps_.mm->encoder_image_canvas((const uint8_t*)m.data.data(), m.data.size(),
+                                                   sw, sh,
+                                                   m.kind == gen::VideoRefMedia::LAST_FRAME ||
+                                                       first_center,
+                                                   &small, &why) < 0)
+                    return bad(m.name.c_str(), "'" + m.name + "' could not be decoded: " + why);
+                m.small_h = small.h;
+                m.small_w = small.w;
+                m.small_pixels.assign(small.rgb.begin(), small.rgb.end());
+            }
         }
     }
 

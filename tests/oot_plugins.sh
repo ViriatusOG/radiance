@@ -55,9 +55,11 @@ for d in "$S"/arch/*/ "$S"/plugin/*/; do
   [ -f "$d/CMakeLists.txt" ] && dirs="$dirs $(basename "$(dirname "$d")")/$(basename "$d")"
 done
 # The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
-# comparison below without it.
+# comparison below without it. Each declares the family it serves, so a tree built for one family
+# produces one of them: libr3d returns without a target when RAD_GPU_TARGETS holds no gfx11, and the
+# checks below compare the two builds of the same list, not a fixed list.
 devlibs=""
-for d in libr4d; do
+for d in libr4d libr3d; do
   [ -f "$S/$d/CMakeLists.txt" ] && [ -f "$B/radiance_home/kernels/$d.so" ] && devlibs="$devlibs $d"
 done
 [ -n "$HIPC" ] && dirs="$dirs $devlibs"

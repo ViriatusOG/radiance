@@ -121,10 +121,9 @@ struct KVGroupPlan {
         return runtime_tokens > 0 && block_size > 0
                    ? (runtime_tokens + block_size - 1) / block_size : 0;
     }
-    /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot). Set only for a
-     * trunk group of a model with no linear state. A drafter's window is recomputed by draft
-     * refill, and a model with linear state re-prefills a hit on a windowed trunk, so neither
-     * snapshot would be read. */
+    /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot), after any
+     * linear state. Set for a trunk group; a drafter's window is recomputed by draft refill, so
+     * its snapshot would not be read. */
     bool        win_snap = false;
 
     int64_t     n_blocks = 0;          /* paged groups: blocks the group addresses (its context) */

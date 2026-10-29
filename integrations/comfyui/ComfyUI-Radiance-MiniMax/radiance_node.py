@@ -347,8 +347,7 @@ class RadianceMiniMax(io.ComfyNode):
                 io.Combo.Input("latent_upscale", options=["off", "2", "4"], default="off",
                                advanced=True,
                                tooltip="run the early steps at 1/2 or 1/4 of the size, with a "
-                                       "container that has the latent upscaler; not with "
-                                       "keyframes"),
+                                       "container that has the latent upscaler"),
                 *images, *videos, *tracks, *audios,
                 io.Int.Input("timeout", default=1800, min=30, max=7200, step=30, advanced=True,
                              tooltip="seconds to wait for the job"),

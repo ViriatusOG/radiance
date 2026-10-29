@@ -1258,7 +1258,10 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  *                         encoder.
  *
  * `enc_kind` (RAD_ENC_*, rad_runtime.h) and `enc_slot`, the media's 1-based number within its kind,
- * say where the latents go. The media's shape is the plugin's to accept: rad_arch_encode_geom
+ * say where the latents go. A latent-upscaled request's keyframes, pinned on the grid its steps
+ * run on, are encoded at W' x H' before the prompt pass and again at W x H, into the same slots,
+ * after the VUPSCALE pass and before the first evaluation at W x H; references, in their own grid,
+ * are encoded once. The media's shape is the plugin's to accept: rad_arch_encode_geom
  * (below) refuses what the encoders cannot take, and the step's packed sequence with the encoded
  * media in it is the plugin's rad_arch_video_pack.
  *

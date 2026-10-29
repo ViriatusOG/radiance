@@ -87,11 +87,20 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
     verify_ = std::getenv("RADIANCE_DEBUG_TIER_VERIFY") != nullptr;
     verify_rep_ = verify_ && !leader_ && rep_bytes_ > 0;
 
+    /* A group whose blocks are shorter than an entry is listed once per block it holds there. */
+    size_t n_groups = 0;
+    for (size_t i = 0; i < gi_.size(); ++i) {
+        bool seen = false;
+        for (size_t j = 0; j < i && !seen; ++j) seen = gi_[j].g == gi_[i].g;
+        if (!seen) ++n_groups;
+    }
+    const std::string blocks =
+        n_groups != gi_.size() ? fmt(" in %zu blocks", gi_.size()) : std::string();
     char buf[400];
     std::snprintf(buf, sizeof buf,
-                  "kv tier transfer: %zu paged group(s), %s an entry%s%s%s, batches of %d through "
-                  "gather_rows/scatter_rows at u8",
-                  gi_.size(), humanb(entry_bytes_).c_str(),
+                  "kv tier transfer: %zu paged group(s), %s an entry%s%s%s%s, batches of %d "
+                  "through gather_rows/scatter_rows at u8",
+                  n_groups, humanb(entry_bytes_).c_str(), blocks.c_str(),
                   rep_bytes_ > 0 ? " (" : "",
                   rep_bytes_ > 0 ? humanb(rep_bytes_).c_str() : "",
                   rep_bytes_ > 0 ? " of it replicated on every rank and held once a slot)" : "",
@@ -143,7 +152,8 @@ int TierExec::slot_layout(const std::vector<const KVManager*>& ranks,
             return RAD_E_STATE;
         }
         L.rep_bytes += p0->bytes_per_block;
-        L.replicated.push_back(p0->name);
+        if (std::find(L.replicated.begin(), L.replicated.end(), p0->name) == L.replicated.end())
+            L.replicated.push_back(p0->name);
     }
     int64_t slot = L.rep_bytes;
     for (size_t i = 0; i < ranks.size(); ++i) {

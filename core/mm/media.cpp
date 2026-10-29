@@ -5,6 +5,7 @@
 #include "rad_internal.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 #ifdef RAD_HAVE_FFMPEG
@@ -25,6 +26,8 @@ namespace mm {
 #ifndef RAD_HAVE_FFMPEG
 
 bool decoder_available() { return false; }
+
+std::string decoder_version() { return "absent (built without libav*)"; }
 
 static int no_decoder(std::string* why) {
     if (why) *why = "this build has no media decoder: it was configured without libavformat / "
@@ -56,6 +59,14 @@ int decode_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>*,
 #else
 
 bool decoder_available() { return true; }
+
+std::string decoder_version() {
+    const unsigned v = avformat_version();
+    char b[48];
+    std::snprintf(b, sizeof(b), "libavformat %u.%u.%u", AV_VERSION_MAJOR(v), AV_VERSION_MINOR(v),
+                  AV_VERSION_MICRO(v));
+    return b;
+}
 
 namespace {
 

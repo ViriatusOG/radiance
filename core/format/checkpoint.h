@@ -282,6 +282,9 @@ struct CkptWeight {
      * from `pq_meta`. */
     bool        paro = false;
     std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale, pq_meta;
+    /* GGUF Q8_0, Q4_K or Q6_K blocks (also `imported`): ckpt_plane_rows splits each row's blocks
+     * into the planes of `enc` (ggml_planes.h), and ckpt_rows_f32 dequantises them. */
+    bool        ggml_blocks = false;
     /* A weight-normalised tensor (RAD_MAP_WNORM): `pieces` is its direction v alone, and every
      * element of v with first index i reads times wnorm_scale[i] = g_i / ||v_i||. Not trivial
      * (the values change), so a recipe rule stores it. */

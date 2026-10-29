@@ -109,6 +109,7 @@ struct HostFacts {
     std::string io_uring;            /* available | refused (why) | unknown */
     std::string cpu_governor, cpu_epp, cpu_driver;
     std::string runtime;             /* the device runtime's version, "" for none */
+    std::string media;               /* "libavformat <v>" / "absent (built without libav*)" */
 };
 
 struct Facts {

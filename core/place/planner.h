@@ -79,8 +79,9 @@ struct MoveUnit {
     Site    site = Site::Device;
     int32_t slab_slot = -1;
     bool    movable = false;     /* may the heat engine relocate it after load */
-    bool    host_forced = false; /* a placement flag put it in the pinned pool: the embedding's
-                                  * or the encoder tower's */
+    bool    pinned = false;      /* a decode-hot resident --expert-pin-top kept: heat never demotes it */
+    bool    host_forced = false; /* a placement flag put it in the pinned pool: the embedding's,
+                                  * the encoder tower's or the draft head's experts' */
 
     /* Placed before any strategy runs, so every assignment pass skips it and no VRAM total counts
      * it: the mapped tier, --embedding-placement ram and --vision-tower-placement ram. */
@@ -227,7 +228,14 @@ public:
      * both flags' weight bytes, as the tier totals count them; the pooled figures exclude it. */
     int64_t embedding_host_bytes = 0;
     int64_t tower_host_bytes = 0;
+    int64_t draft_host_bytes = 0;
     int64_t forced_host_used = 0;
+    /* --expert-profile and --expert-pin-top: the profile's units the planner pinned resident and the
+     * share threshold it derived from the fraction. Reported so the window can see what the decode
+     * set costs the card. */
+    int64_t pinned_units = 0;
+    int64_t profile_units = 0;
+    float   pin_threshold = 0.0f;
     /* --ngram-placement ram: RAM for the n-gram tables the load phase copies out of the mapping.
      * Every pool still sees them on the mapped tier. `ngram_copy_card` selects pinned memory a
      * device kernel reads over the link; otherwise locked memory the host gather reads. */
@@ -314,6 +322,8 @@ private:
     void pin_mapped(const Program& prog, Plan* p);
     int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
     int  pin_towers(const Config& cfg, Plan* p) const;
+    int  pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const;
+    void pin_hot(const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;
     int  assign(Plan* p);
@@ -349,6 +359,11 @@ struct WeightFootprint {
     int64_t experts = 0;   /* the elastic plane: what streams from host when it does not fit */
     int64_t expert_layer_max = 0;   /* the most expert bytes any one routed layer holds */
     int64_t expert_unit_max  = 0;   /* the largest expert unit's slot */
+    /* A draft head's routed experts (layers at meta.n_layers and above, when the program has a
+     * drafter): the part of `experts` a host-pinned --draft-expert-placement takes out of the host
+     * pool's room for the trunk, and the largest such unit. */
+    int64_t draft_experts    = 0;
+    int64_t draft_unit_max   = 0;
     /* Upper bound on an expert-tiered plan's spare slab: per expert slab class, the shadow slots,
      * staging ring and tail pad (Planner::assign_expert_tiered). Same weight budget as residents. */
     int64_t expert_spare     = 0;
@@ -399,6 +414,11 @@ int64_t file_stage_reserve(int64_t widest, bool routed);
  * all experts plus spares. A weight budget of statics plus this places every expert in VRAM or
  * the host pool. */
 int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room);
+
+/* The same floor once --draft-expert-placement host has taken the drafter's experts out of the
+ * plane the strategy places: the trunk's floor against the whole host room. The drafter's units
+ * share the trunk's slab classes, so no spare is added. With no drafter it is expert_vram_floor. */
+int64_t expert_vram_floor_draft_hosted(const WeightFootprint& wf, int64_t host_room);
 
 /* Checks that the plan and this rank's weights pool used the same split: Plan::vram_budget must
  * equal the pool Pools::configure allocated, or the slab and the pool disagree silently. Returns

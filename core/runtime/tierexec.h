@@ -46,8 +46,9 @@ namespace rad {
 class TierExec {
 public:
     ~TierExec();
-    /* `groups` is PrefixCache::cached_groups(): the paged groups an entry holds a block in, in the
-     * order of the entry's `blocks` vector. The staging layout is derived from them here only.
+    /* `groups` is PrefixCache::entry_groups(): the group of each block an entry holds, in the
+     * order of the entry's `blocks` vector (a group with blocks shorter than the entry is listed
+     * once per block). The staging layout is derived from them here only.
      * `max_batch` is the staging buffer in entries, `max_copy` the most entries per copy out and
      * `max_chain` the longest restore chain; the index buffers are sized from the last two. */
     int  configure(Registry* reg, KVManager* kv, IdleTiers* tiers,

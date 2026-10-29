@@ -146,6 +146,13 @@ private:
     uint32_t depth_       = 0;
     void     charge(uint64_t bytes);
 
+    /* The optional links of bounded repetitions, keyed by the repeated operand's elements:
+     * links[k - 1] is S'(k) ::= S S'(k-1) |, so every S{m,n} over the same S shares one chain and
+     * builds only the links past the longest it has (handle_repetitions). A JSON schema's
+     * `maxLength` bounds all repeat `char`, so a schema with many of them costs its longest bound
+     * once instead of the sum of them. */
+    std::map<std::vector<std::pair<uint32_t, uint32_t>>, std::vector<uint32_t>> rep_links_;
+
     uint32_t get_symbol_id(const char* src, size_t len);
     uint32_t generate_symbol_id(const std::string& base);
     void     add_rule(uint32_t id, const GbnfRule& rule);

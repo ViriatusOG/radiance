@@ -8226,10 +8226,12 @@ TEST(gemma3_without_fused_junctions_every_linear_quantises_into_what_it_reads) {
     CHECK(quant >= 2 * (int)m.layers.size());
 }
 
-/* Under a lossy --tp-wire the fused all-reduce junctions, which send the exact wire only, still
- * serve the steps whose message goes out exact anyway: a decode step's few rows fold every
- * junction's all-reduce in, while a prefill chunk above --tp-wire-min-kb keeps the lossy
- * all-reduce, unfused. Both families: the MXFP4 trunk's fp8 junction and a w4a8 trunk's int8 one. */
+/* Under a lossy --tp-wire a decode step's few rows, whose message goes out exact, fold every
+ * junction's all-reduce in. On the MXFP4 trunk a lossy step up to kAr6MaxRows (24) does too,
+ * through the fp8 junction's lossy twin (ar_rmsnorm_post_quant_fp8 at wire 6; TranslateGemma's
+ * 5376-wide row is whole 64-element groups, its last 512-element chunk padded); a taller one, like a
+ * prefill chunk, keeps the lossy all-reduce, unfused. A w4a8 trunk's int8 junction sends the exact
+ * wire only. Both families: the MXFP4 trunk's fp8 junction and a w4a8 trunk's int8 one. */
 TEST(gemma3_under_a_lossy_wire_small_steps_keep_the_fused_junction) {
     MetaKV mk = gemma3_meta();
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
@@ -8244,7 +8246,7 @@ TEST(gemma3_under_a_lossy_wire_small_steps_keep_the_fused_junction) {
             ctx.tp_wire_min_bytes = 128 * 1024;
             REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
             const gemma3::Model& m = gemma3::g_model[rank];
-            if (is_mx) CHECK(m.fuse_mx && m.fuse_mx_ar);
+            if (is_mx) CHECK(m.fuse_mx && m.fuse_mx_ar && m.fuse_mx_ar6);
             else       CHECK(!m.fuse_mx && m.fuse && m.fuse_ar);
             auto issued = [&](const RadCtx& c, std::initializer_list<const char*> names) {
                 int n = 0;
@@ -8263,6 +8265,27 @@ TEST(gemma3_under_a_lossy_wire_small_steps_keep_the_fused_junction) {
             CHECK_EQ(fused_pre, 0);
             /* Every junction the decode step fused is an all-reduce the prefill step issues alone. */
             CHECK_EQ(issued(*v[1], { "all_reduce" }), issued(*v[0], { "all_reduce" }) + fused_dec);
+            /* 24 rows (24 x 5376 x 2 bytes, above the floor): the MXFP4 trunk fuses the same junctions
+             * through the lossy twin, other op instances than the decode step's; the int8 one cannot. */
+            const auto mid = kit(b, {}, { 24 });
+            const auto vm = run_passes(b, gemma3::step, { mid.get() }, rank, 2);
+            CHECK_PASSES(b, vm);
+            const int fused_mid = issued(*vm[0], { "ar_rmsnorm_quant_i8", "ar_rmsnorm_post_quant_fp8" });
+            if (is_mx) {
+                CHECK_EQ(fused_mid, fused_dec);
+                CHECK_EQ(issued(*vm[0], { "all_reduce" }), issued(*v[0], { "all_reduce" }));
+                std::vector<int> dec_ids;
+                for (const RecIssue& i : v[0]->issues)
+                    if (const RecOp* o = b.op_of(i.op); o && o->op == "ar_rmsnorm_post_quant_fp8")
+                        dec_ids.push_back((int)i.op);
+                int shared = 0;
+                for (const RecIssue& i : vm[0]->issues)
+                    if (const RecOp* o = b.op_of(i.op); o && o->op == "ar_rmsnorm_post_quant_fp8")
+                        shared += std::find(dec_ids.begin(), dec_ids.end(), (int)i.op) != dec_ids.end();
+                CHECK_EQ(shared, 0);
+            } else {
+                CHECK_EQ(fused_mid, 0);
+            }
         }
 }
 

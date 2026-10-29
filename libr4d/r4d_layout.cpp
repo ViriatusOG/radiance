@@ -365,6 +365,7 @@ int w4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     WGeom g;
     int rc = wgeom(p, n_p, R4D_W4_GROUP, &g);
     if (rc != RAD_OK) return rc;
+    if (g.group != R4D_W4_GROUP) return RAD_E_DTYPE;
     if (g.K % R4D_W4_KPB) return RAD_E_SHAPE;
     const bool asym = w4_asym(p, n_p);
     const bool ok = asym ? (r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U8) ||
@@ -474,6 +475,7 @@ int w5_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     WGeom g;
     int rc = wgeom(p, n_p, R4D_W4_GROUP, &g);
     if (rc != RAD_OK) return rc;
+    if (g.group != R4D_W4_GROUP) return RAD_E_DTYPE;
     if (g.K % R4D_W4_KPB) return RAD_E_SHAPE;
     if (!w5_enc(enc, g.group)) return RAD_E_DTYPE;
     if (gout) *gout = g;
@@ -676,6 +678,7 @@ int w8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     WGeom g;
     int rc = wgeom(p, n_p, R4D_W8_GROUP, &g);
     if (rc != RAD_OK) return rc;
+    if (g.group != R4D_W8_GROUP) return RAD_E_DTYPE;
     if (g.K % R4D_W8_KPB) return RAD_E_SHAPE;
     if (!r4d_enc::affine(enc, RAD_I8, RAD_F16, 1, g.group)) return RAD_E_DTYPE;
     if (gout) *gout = g;
@@ -760,6 +763,7 @@ int w2_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     WGeom g;
     int rc = wgeom(p, n_p, R4D_W2_GROUP, &g);
     if (rc != RAD_OK) return rc;
+    if (g.group != R4D_W2_GROUP) return RAD_E_DTYPE;
     if (g.K % 128) return RAD_E_SHAPE;
     if (!(r4d_enc::affine(enc, RAD_U2, RAD_F16, 1, g.group, RAD_U8) ||
           r4d_enc::affine(enc, RAD_U2, RAD_F16, 1, g.group, RAD_U4))) return RAD_E_DTYPE;

@@ -1448,7 +1448,7 @@ static const RadOperandSpec oArRmsNormQuantFp8[] = {
 };
 
 /* ar_rmsnorm_post_quant_fp8: the same with a sandwich post-norm of the reduced sum before the add
- * (Gemma 3's junction, arch/gemma3), exact wire only. Its own op: an optional seventh operand on
+ * (Gemma 3's junction, arch/gemma3), on either wire. Its own op: an optional seventh operand on
  * ar_rmsnorm_quant_fp8 would break every plugin that issues that op's six. */
 static const RadOperandSpec oArRmsNormPostQuantFp8[] = {
     { "x",        RAD_OPD_INOUT,  0 },
@@ -3542,7 +3542,7 @@ static const RadOpSchema kSchemas[] = {
 
     SCHEMA("ar_rmsnorm_post_quant_fp8", pArRmsNormQuantFp8, oArRmsNormPostQuantFp8,
            "ar_rmsnorm_quant_fp8 with a post-norm of the reduced sum against w_post before the "
-           "residual add (a sandwich-norm junction), exact wire only, byte-identical to all_reduce, "
+           "residual add (a sandwich-norm junction), either wire, byte-identical to all_reduce, "
            "rmsnorm, rmsnorm_quant_fp8."),
     SCHEMA("ar_rmsnorm_quant_fp8", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
@@ -4704,30 +4704,39 @@ static const RadConstraint cGemmNt64[] = {
 static const RadConstraint cGemmNtTiled[] = {
     C_GE("M", 65), C_LE("M", 65536), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16"),
 };
+/* The dense integer kernels take their group from a build constant and read no `group` argument.
+ * A declaration at another group gets no kernel rather than a silent 128. */
 static const RadConstraint cGemmNtW4[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a16"),
 };
 /* w5a16 serves any M: the dispatcher takes rows past 64 as chunks of 64. */
 static const RadConstraint cGemmNtW5[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w5a16"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w5a16"),
 };
 static const RadConstraint cGemmNtW4Asym[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16_asym"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a16_asym"),
 };
 static const RadConstraint cGemmNtW4A8I8[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8i8_asym"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8i8_asym"),
 };
 static const RadConstraint cGemmNtW5A8I8[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w5a8i8"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w5a8i8"),
 };
 static const RadConstraint cGemmNtW2A8[] = {
-    C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w2a8"),
+    C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_W2_GROUP), C_IN("dtype", "w2a8"),
 };
 static const RadConstraint cGemmNtW8[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w8a16"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W8_GROUP), C_IN("dtype", "w8a16"),
 };
 static const RadConstraint cGemmNtW4A8[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8 w4a8_asym"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8 w4a8_asym"),
 };
 static const RadConstraint cGemmNtMxfp4A8[] = {
     C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
@@ -5053,11 +5062,13 @@ static const RadConstraint cDequantW4Bf16[] = {
  * K % (SK*group)). Its MAX_M of 32768 is not structural; as a skinny kernel with a tiled sibling
  * above 64, it takes the w4a8 row's band. */
 static const RadConstraint cGemmNtW8A8[] = {
-    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w8a8"),
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16),
+    C_EQ("group", R4D_W8_GROUP), C_IN("dtype", "w8a8"),
 };
 /* r4d_gemm_w4a8_tiled / _asym_tiled. Entry point: N % 256, K % group, M >= 1. */
 static const RadConstraint cGemmW4A8Tiled[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w4a8 w4a8_asym"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8 w4a8_asym"),
 };
 /* r4d_gemm_mxfp4a8_decode. Entry point: M <= 128, N % 16, K % 64, and N up to its counter block's
  * 36864. Above the skinny row by priority, so it takes the decode band; the skinny row keeps the
@@ -5108,13 +5119,15 @@ static const RadConstraint cGemmM2xfp4A8Tiled[] = {
 /* r4d_gemm_w8a8_tiled: the same kernel at radix 8. Its asym arm is not declared in r4d.h, so
  * `w8a8_asym` is absent from the dtype set. */
 static const RadConstraint cGemmW8A8Tiled[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w8a8"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256),
+    C_EQ("group", R4D_W8_GROUP), C_IN("dtype", "w8a8"),
 };
 /* r4d_gemm_w4a8_prefill. Entry point: N % BN and K % group, BN being the variant's block width
  * (256 except for the two 1024-thread arms). N % 256 is the default's condition; the shim refuses
  * a variant whose BN does not divide N (the per-call half of spec §2.1). */
 static const RadConstraint cGemmW4A8Prefill[] = {
-    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w4a8"),
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256),
+    C_EQ("group", R4D_W4_GROUP), C_IN("dtype", "w4a8"),
 };
 
 /* =================================================================================== tunables
@@ -7272,7 +7285,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "gdn prefill preamble: causal conv + qkv split + qk l2norm + gating + per-chunk cumsum "
   "[UNVALIDATED: DPP row_xmask rewrite never correctness-gated]",
   "conv width 4, head_k/head_v 128, chunk 64, varlen, conv state read and rewritten in place",
-  "bf16 x / weights / conv state / q,k,v out, fp32 a,b and gate/beta out",
+  "bf16 x / conv state / q,k,v out, bf16 or f32 weights, fp32 a,b and gate/beta out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvPrep), NOTUNE,
   nullptr, nullptr, r4d_rad_gdn_conv_prep },
@@ -7282,7 +7295,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "gdn decode conv: rolling speculative window over the conv state cache, writes q/k/v "
   "[UNVALIDATED: DPP row_xmask rewrite never correctness-gated]",
   "conv width 4, head_k/head_v 128, state cache width-1 + num_spec, read at accepted offset",
-  "bf16 x / weights / conv state / q,k,v out",
+  "bf16 x / conv state / q,k,v out, bf16 or f32 weights",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvUpdate), NOTUNE,
   nullptr, nullptr, r4d_rad_gdn_conv_update },
@@ -7311,7 +7324,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "workgroup convolves its key head's q and k and its value head's v into LDS, and the last "
   "workgroup of a key head to arrive rewrites that head's conv state",
   "head_k/head_v 128, conv width 4, a sequence's window at most 8 tokens, the fused row norm",
-  "bf16 x / conv weights / conv state / a,b / out; the state cache is f32 or f16. "
+  "bf16 x / conv state / a,b / out, bf16 or f32 conv weights; the state cache is f32 or f16. "
   "Byte-identical to gdn_conv_update followed by gdn_recurrent_update",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvRecurrentUpdate), NOTUNE,
@@ -8779,7 +8792,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "exactly 2 ranks; n a multiple of 8 and x unpitched, because x is the message and a block pushes "
   "its rows as 16B words; group 128; a block owns whole ROWS, so the block count is clamped to M; "
   "either wire, chosen by `wire` -- the rotated 6-bit payload additionally needs n to be a "
-  "multiple of 512, so that a chunk never straddles a row; residual and out_bf16 may be null",
+  "multiple of 64, so that a group never straddles a row (a row's last 512-element chunk may be partial); residual and out_bf16 may be null",
   "bf16 in, E4M3 out with an f32 scale per (row, 128 columns) and an optional bf16 out; codes "
   "taken over the BF16-ROUNDED norm output, and the reduced sum rounded to bf16 exactly as the "
   "standalone all-reduce of the SAME wire stores it -- byte-identical to the pair it replaces",
@@ -8796,7 +8809,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "back",
   "exactly 2 ranks; n a multiple of 128 (a rotation block cannot straddle a row) and x unpitched; "
   "group 128; a block owns whole ROWS, so the block count is clamped to M; either wire, chosen by "
-  "`wire` -- the rotated 6-bit payload additionally needs n to be a multiple of 512; residual and "
+  "`wire` -- the rotated 6-bit payload pads a row's partial last 512-element chunk; residual and "
   "out_bf16 may be null",
   "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out of the "
   "UNROTATED norm output; x and the residual are ar_rmsnorm_quant_fp8's bytes, and the codes "
@@ -8809,8 +8822,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 { "ar_rmsnorm_post_quant_fp8", "ar_rmsnorm_post_quant_fp8", "quant",
   "the two-rank all-reduce, a post-norm of the reduced sum, the residual add, RMS norm and "
   "block-scaled fp8 quantisation in one kernel: a sandwich-norm junction (Gemma 3)",
-  "exactly 2 ranks, the exact wire; n a multiple of 8 and x unpitched; group 128; a block owns whole "
-  "rows; the residual is required",
+  "exactly 2 ranks, either wire chosen by `wire` (the rotated 6-bit payload needs n a multiple of 64; "
+  "a row's last 512-element chunk may be partial); n a multiple of 8 and x unpitched; group 128; a "
+  "block owns whole rows; the residual is required",
   "bf16 in, E4M3 out with an f32 scale per (row, 128 columns); x receives the reduced sum",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cArRmsNormQuantFp8), ROW(tAr), nullptr,

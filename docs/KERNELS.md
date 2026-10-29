@@ -21,7 +21,7 @@ pass reached; the Rows nothing ran section lists the rest.
 | library | version | domain | rows | run | ops | graph | cases | pass | fail | worst rel_l2 | median us |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `libavx` | 0.1.0 | host | 100 | 42 of 100 | 100 of 147 | 43 of 43 | 734 | 734 | 0 | 9.01e-04 | 78.91 |
-| `libr4d` | 0.5.0 | device | 287 | 48 of 287 | 142 of 147 | 43 of 43 | 734 | 734 | 0 | 4.27e-03 | 12.78 |
+| `libr4d` | 0.5.0 | device | 291 | 48 of 291 | 142 of 147 | 43 of 43 | 734 | 734 | 0 | 4.27e-03 | 12.78 |
 | `libref` (oracle) | 0.1.0 | host | 123 | 42 of 123 | 123 of 147 | 43 of 43 | 734 | 734 | 0 | 0.00e+00 | - |
 
 Rows declaring an optional hook (tuning, fusion, weight layout):
@@ -34,7 +34,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 
 ## Rows nothing ran
 
-132 of 510 declared row(s) were reached by a case in this pass.
+132 of 514 declared row(s) were reached by a case in this pass.
 
 `libavx`: 58 row(s) not reached:
 
@@ -99,7 +99,7 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `avx_silu` | `silu` |
 | `avx_softmax` | `softmax` |
 
-`libr4d`: 239 row(s) not reached:
+`libr4d`: 243 row(s) not reached:
 
 | kernel | op |
 |---|---|

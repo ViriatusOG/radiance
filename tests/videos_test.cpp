@@ -680,6 +680,49 @@ TEST(fl2va_keyframes_feed_the_tower_and_pin_the_output_ends) {
     CHECK(g.tokens == want);
 }
 
+/* With a latent upscale each keyframe is prepared twice, the same way: at the canvas and at the
+ * small size the first steps pin it at. The tower still sees the canvas frame only. */
+TEST(fl2va_keyframes_are_prepared_at_an_upscales_small_size_too) {
+    FakeMultimodal mm;
+    mm.expand = { 900, 901 };
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 512;
+        gen.inf.upscale_max = 4.0;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" },
+               FormPart{ "size", "", "", "512x256" },
+               FormPart{ "task", "", "", "fl2va" },
+               FormPart{ "latent_upscale", "", "", "2" },
+               FormPart{ "first_frame", "f.png", "image/png", "PF" },
+               FormPart{ "last_frame", "l.png", "image/png", "PL" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(mm.n_pframe, 2);
+    REQUIRE_EQ(mm.cenc_covers.size(), (size_t)4);
+    CHECK(!mm.cenc_covers[0]);               /* first frame: stretched at both sizes */
+    CHECK(!mm.cenc_covers[1]);
+    CHECK(mm.cenc_covers[2]);                /* last frame: centre-cropped at both sizes */
+    CHECK(mm.cenc_covers[3]);
+    const gen::VideoRequest& g = gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)2);
+    for (const gen::VideoRefMedia& m : g.refs) {
+        CHECK_EQ(m.enc_w, 512);
+        CHECK_EQ(m.enc_h, 256);
+        CHECK_EQ(m.small_w, 256);
+        CHECK_EQ(m.small_h, 128);
+        CHECK_EQ(m.small_pixels.size(), (size_t)256 * 128 * 3);
+    }
+}
+
 /* A last frame alone is <Picture 1>: the number counts the pictures present, as ComfyUI's does.
  * fl2va (both ends) keeps first = 1, last = 2. */
 TEST(l2va_presents_its_sole_frame_as_picture_1) {

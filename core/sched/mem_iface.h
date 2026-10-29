@@ -172,7 +172,7 @@ struct IPrefixCache {
 
     /* Longest cached prefix, plus the checkpoint covering the linear state for a prefix of it.
      * `blocks_out` receives block ids per cached group, in cached_groups() order, for
-     * IKVManager::adopt. `cap`, when not null, ends the hit early (HitCap, core/mem/prefix.h). */
+     * IKVManager::adopt: n_attn_tokens over the group's own block size of them. `cap`, when not null, ends the hit early (HitCap, core/mem/prefix.h). */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
                             const HitCap* cap) const = 0;
     virtual const std::vector<int32_t>& cached_groups() const = 0;
@@ -187,10 +187,12 @@ struct IPrefixCache {
     /* Release the least recently used entries and their KV references. The scheduler tries this
      * before preempting a running request. */
     virtual int64_t evict(int64_t n_entries) = 0;
-    /* Free up to `n_blocks` for the reserve without losing anything a later turn needs. Unlike
+    /* Free up to `n_entries` for the reserve without losing anything a later turn needs. Unlike
      * evict(), it skips entries a live sequence still holds (no block would be freed) and entries
-     * whose only copy is in VRAM. Returns the number of blocks freed. */
-    virtual int64_t trim(int64_t n_blocks) = 0;
+     * whose only copy is in VRAM. An entry is one block in each cached group, or more in a group
+     * whose blocks are shorter than the entry (PrefixCache::blocks_per_entry). Returns the number
+     * of entries freed. */
+    virtual int64_t trim(int64_t n_entries) = 0;
 
     /* Drop every entry in every tier. Implementations with idle tiers must override this: there,
      * evict() keeps an entry whose host copy has landed. Returns the number of entries dropped. */

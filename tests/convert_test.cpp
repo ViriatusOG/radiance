@@ -6,11 +6,13 @@
  * checkpoint holds them, so one conversion writes a quantised and a copied weight of every kind.
  */
 #include "rad_test.h"
+#include "gguf_writer.h"
 #include "tiny_model.h"
 
 #include "format/encoding.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "text/tokenizer.h"
 
 #include <sys/stat.h>
 
@@ -756,6 +758,49 @@ TEST(a_recipe_or_flag_that_cannot_be_honoured_is_refused_before_writing) {
     }
 }
 
+/* A rule that declines a GGUF block tensor stops the run rather than keep the tensor's planes: the
+ * tiny LLaMA as a GGUF with its first attn_norm in Q8_0, under an `rtn` rule, which declines a
+ * rank-1 tensor. */
+TEST(a_rule_that_declines_a_gguf_block_tensor_is_an_error) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_gguf");
+    const tiny::Llama s;
+    const std::vector<ggufw::GKv> kvs = {
+        { "general.architecture", 8, 0, { "llama" } },
+        { "llama.block_count", 4, (double)s.layers, {} },
+        { "llama.embedding_length", 4, (double)s.hidden, {} },
+        { "llama.attention.head_count", 4, (double)s.heads, {} },
+        { "llama.attention.head_count_kv", 4, (double)s.kv_heads, {} },
+        { "llama.attention.key_length", 4, (double)s.head_dim, {} },
+        { "llama.feed_forward_length", 4, (double)s.ffn, {} },
+        { "llama.context_length", 4, (double)s.ctx, {} },
+        { "llama.vocab_size", 4, (double)s.vocab, {} },
+    };
+    std::vector<ggufw::GTensor> ts;
+    for (const auto& [name, t] : w.src) {
+        ggufw::GTensor g{ name, t.dtype == "F32" ? 0u : 30u, {}, t.bytes };
+        g.ne.assign(t.shape.rbegin(), t.shape.rend());
+        if (name == "model.layers.0.input_layernorm.weight") {
+            g.type = 8;
+            g.bytes.clear();
+            for (uint64_t b = 0; b < g.ne[0] / 32; ++b) {
+                g.bytes.insert(g.bytes.end(), { 0x00, 0x3C });   /* d = 1 in f16 */
+                g.bytes.insert(g.bytes.end(), 32, 1);
+            }
+        }
+        ts.push_back(std::move(g));
+    }
+    REQUIRE(ggufw::write_gguf(d / "llama.gguf", kvs, ts));
+    std::string log;
+    CHECK(convert(d / "llama.gguf",
+                  { "-o", d / "g.rad", "--recipe", w.recipe, "--quant",
+                    "blk.0.attn_norm.weight=rtn:codes=i8,group=32,scale=bf16" },
+                  &log) != 0);
+    CHECK(has(log, "(rtn) refuses it"));
+    CHECK(!exists(d / "g.rad"));
+}
+
 /* ================================================================== an int4 release */
 
 namespace {
@@ -921,6 +966,29 @@ TEST(an_fp8_kv_cache_declares) {
     CHECK_EQ(convert(w.ckpt, { "-o", d / "k.rad", "--recipe", w.recipe, "--kv-cache-dtype", "fp8" },
                      nullptr), 0);
     CHECK(exists(d / "k.rad"));
+}
+
+/* --chat-template bakes a template into the container's vocab section, for a release that ships
+ * none (DeepSeek's). Without the flag the container carries what the checkpoint carried. A missing
+ * file is refused, not silently skipped. */
+TEST(chat_template_flag_bakes_the_template) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_ct");
+    const std::string tmpl = d / "chat_template.jinja";
+    REQUIRE(tiny::write_text(tmpl, "{%- raw %}{{ messages }}{%- endraw %}\n\n"));
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "with.rad", "--recipe", w.recipe,
+                                 "--chat-template", tmpl }, &log), 0);
+    RadFile f;
+    REQUIRE_EQ(f.open((d / "with.rad").c_str()), RAD_OK);
+    VocabBuild vb;
+    REQUIRE_EQ(vocab_deserialize(f.base(), (uint64_t)f.size(), f.vocab().h, vb), RAD_OK);
+    CHECK_EQ(vb.chat_template, std::string("{%- raw %}{{ messages }}{%- endraw %}"));
+
+    std::string bad;
+    CHECK_EQ(convert(w.ckpt, { "-o", d / "bad.rad", "--recipe", w.recipe,
+                               "--chat-template", d / "absent.jinja" }, &bad), 1);
 }
 
 RAD_TEST_MAIN()

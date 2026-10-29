@@ -3908,4 +3908,224 @@ TEST(a_mover_gives_back_every_event_and_device_byte) {
     CHECK(vram1 - vram0 <= 2 * MiB + 4096);
 }
 
+/* ================================================================== the two placement flags
+ *
+ * --draft-expert-placement host pins a draft head's routed experts in the host pool before any
+ * strategy runs, so they fit beside a trunk that already fills the card. --expert-pin-top keeps
+ * the hottest fraction of the routed experts resident, so heat never demotes them. */
+
+/* A trunk of `trunk` routed layers and a draft head of `head` layers past it, `n` experts each. */
+void build_drafted(Fixture& f, int trunk, int head, int n, int64_t each) {
+    f.prog.meta.n_layers = (uint32_t)trunk;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 5;
+    build_moe_layers(f, trunk + head, n, each, 0);
+}
+
+TEST(draft_experts_pin_to_the_host_pool) {
+    Fixture f;
+    build_drafted(f, 2, 1, 4, 1 * MiB);
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 64;
+    c.draft_expert_placement = "host";
+    c.draft_expert_placement_given = true;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, trunk_vram = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        if (mu.layer >= 2) {
+            CHECK(mu.host_forced);
+            CHECK(mu.tier == Tier::HostPinned);
+            CHECK(mu.site == Site::DeviceZeroCopy);
+            CHECK(!mu.movable);
+            ++pinned;
+        } else if (mu.tier == Tier::VRAM) {
+            ++trunk_vram;
+        }
+    }
+    /* The head's four experts, and only those, are forced into the pool. */
+    CHECK_EQ(pinned, 4);
+    CHECK(trunk_vram > 0);
+    CHECK(p.draft_host_bytes >= 4 * MiB);
+    CHECK(p.report(f.prog).find("drafter") != std::string::npos);
+
+    /* The footprint agrees: the head is the part of the plane the flag takes out. */
+    WeightFootprint wf;
+    weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, false);
+    CHECK(wf.draft_experts >= 4 * MiB);
+    CHECK(wf.draft_experts < wf.experts);
+}
+
+TEST(draft_placement_auto_leaves_the_head_to_the_strategy) {
+    Fixture f;
+    build_drafted(f, 2, 1, 4, 1 * MiB);
+
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 1024;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.layer >= 2) CHECK(!mu.host_forced);
+    CHECK_EQ(p.draft_host_bytes, (int64_t)0);
+}
+
+TEST(draft_placement_host_refuses_a_model_with_no_drafter) {
+    Fixture f;
+    build_moe_layers(f, 2, 4, 1 * MiB, 0);
+
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 64;
+    c.draft_expert_placement = "host";
+    c.draft_expert_placement_given = true;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_INVAL);
+}
+
+TEST(draft_placement_host_refuses_when_the_pool_is_short) {
+    Fixture f;
+    build_drafted(f, 1, 1, 8, 4 * MiB);
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1;
+    c.draft_expert_placement = "host";
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_NOMEM);
+    CHECK(p.report(f.prog).find("DID NOT FIT") != std::string::npos);
+}
+
+TEST(expert_pin_top_keeps_the_hottest_resident) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, 0);
+
+    /* Expert e of each layer takes share e + 1, so the hottest are the high indices. */
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e) {
+            RadFileProfile r{};
+            r.layer = l;
+            r.expert = e;
+            r.share = (float)(e + 1);
+            prof.push_back(r);
+        }
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.25f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, hot_pinned = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        if (mu.pinned) {
+            CHECK(mu.tier == Tier::VRAM);
+            CHECK(!mu.movable);
+            ++pinned;
+            if (mu.expert >= 6) ++hot_pinned;
+        }
+    }
+    /* The top quarter of 16 experts: the two hottest of each layer. */
+    CHECK_EQ(pinned, 4);
+    CHECK_EQ(hot_pinned, 4);
+    CHECK(p.report(f.prog).find("pinned hot") != std::string::npos);
+}
+
+TEST(expert_pin_top_zero_pins_nothing) {
+    Fixture f;
+    build_moe_layers(f, 1, 4, 1 * MiB, 0);
+
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 1024;
+    c.expert_pin_top = 0.0f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    for (const MoveUnit& mu : p.units) CHECK(!mu.pinned);
+    CHECK_EQ(p.pinned_units, (int64_t)0);
+}
+
+TEST(a_pinned_resident_is_never_demoted) {
+    Fixture f;
+    build_moe_layers(f, 1, 4, 1 * MiB, 0);
+
+    std::vector<RadFileProfile> prof;
+    for (int e = 0; e < 4; ++e) {
+        RadFileProfile r{};
+        r.layer = 0;
+        r.expert = e;
+        r.share = (float)(e + 1);
+        prof.push_back(r);
+    }
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.5f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    /* Force one pinned unit and one cold unit onto the host, so the engine has a swap to make,
+     * and heat the cold one far above the pinned one. */
+    int32_t pinned_u = -1, cold_u = -1;
+    for (size_t u = 0; u < p.units.size(); ++u) {
+        if (p.units[u].pinned && pinned_u < 0) pinned_u = (int32_t)u;
+        if (p.units[u].expert == 0) cold_u = (int32_t)u;
+    }
+    CHECK(pinned_u >= 0 && cold_u >= 0);
+    p.units[(size_t)cold_u].tier = Tier::HostPinned;
+    p.units[(size_t)cold_u].movable = true;
+
+    HeatEngine h;
+    HeatParams hp;
+    hp.warmup_dispatches = 0;
+    CHECK_OK(h.init(p, hp));
+    const int32_t ids[] = {0};
+    const int32_t counts[] = {1000};
+    for (int i = 0; i < 8; ++i) h.observe_ids(0, ids, counts, 1);
+    Swap sw{};
+    if (h.pick(&sw)) CHECK(sw.demote != pinned_u);
+}
+
+TEST(the_draft_floor_charges_only_the_trunk) {
+    WeightFootprint wf;
+    wf.experts = 100;
+    wf.draft_experts = 30;
+    wf.expert_unit_max = 5;
+    wf.expert_spare = 10;
+    /* With the drafter hosted, the pool's room serves the trunk alone. */
+    const int64_t hosted = expert_vram_floor_draft_hosted(wf, 80);
+    const int64_t plain = expert_vram_floor(wf, 80);
+    CHECK(hosted < plain);
+    CHECK(hosted <= wf.experts - wf.draft_experts + wf.expert_spare);
+    /* No drafter: the two floors agree. */
+    wf.draft_experts = 0;
+    CHECK_EQ(expert_vram_floor_draft_hosted(wf, 80), expert_vram_floor(wf, 80));
+}
+
 RAD_TEST_MAIN()

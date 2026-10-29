@@ -1818,8 +1818,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
             ranks_[0]->tierx.report_pass(jobs, ok, rad_mono_ns());
             /* Rebind every entry that came back, not only the leading run: the tiers already
-             * marked each resident at its new blocks. */
-            const std::vector<int32_t>& cg = pc.cached_groups();
+             * marked each resident at its new blocks. A job's blocks are one per entry slot. */
+            const std::vector<int32_t>& cg = pc.entry_groups();
             for (size_t i = 0; i < jobs.size(); ++i) {
                 TierJob& j = jobs[i];
                 if (!ok[i]) { res = RestoreResult::Cut; continue; }

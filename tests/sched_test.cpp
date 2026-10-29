@@ -166,6 +166,10 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        /* The tests below were written for the nearest resume rule (a tail snapshot at the last
+         * quantum boundary, a hit at any snapshot or block); the exact rule's own tests set
+         * prefix_exact (--prefix-resume exact, the default). */
+        cfg.prefix_exact = false;
         /* Config::n_spec defaults to -1 (`auto`), which engine_bringup resolves; this fixture
          * skips that, and DraftController::configure refuses a negative depth. Speculation tests
          * set their own depth. */
@@ -795,6 +799,248 @@ TEST(a_span_needs_an_interval_grid) {
     CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
 }
 
+/* ================================================================== exact resume */
+/* --prefix-resume exact (the default): a hit resumes only where an idle server's cold prefill of
+ * the same prompt starts a chunk, and a prompt's tail snapshot is where its last chunk starts. A
+ * kernel may round a row differently at another chunk length (spec §17: the split-K count is
+ * chosen from M), so a hit is bit-identical to a cold run only when it recomputes the cold run's
+ * own chunks. */
+
+/* The chunk ends and checkpoints an idle server plans for an `L`-token prompt from `from`. */
+struct Cut { std::vector<int64_t> ends, ckpts; };
+static Cut cut_from(const Scheduler& s, int64_t from, int64_t L, int64_t budget) {
+    Cut c;
+    for (int64_t pos = from; pos < L;) {
+        int64_t ck = -1;
+        const int64_t n = s.plan_chunk(pos, L, budget, &ck);
+        if (n <= 0) break;
+        pos += n;
+        c.ends.push_back(pos);
+        if (ck > 0) c.ckpts.push_back(ck);
+    }
+    return c;
+}
+static std::vector<int64_t> ends_after(const Cut& c, int64_t from) {
+    std::vector<int64_t> v;
+    for (int64_t e : c.ends) if (e > from) v.push_back(e);
+    return v;
+}
+
+/* Which geometry: 0 the GDN hybrid at interval 256 / budget 512 (chunks split at the interval);
+ * 1 interval 1024 past a 512 budget; 2 a span of 2; 3 a sliding-window model with periodic
+ * snapshots; 4 the same, tip-only (no interval split); 5 full attention alone (no snapshots). */
+static void exact_fixture(Fixture& f, int kind) {
+    const bool window = kind == 3 || kind == 4, attn_only = kind == 5;
+    f.build(4096, 64, 512, 8192, window, !attn_only);
+    if (window) {
+        /* As the window tests above: drop the GDN hybrid's linear and conv groups and its scan. */
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);
+        f.prog.buffers.resize(1);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        if (kind == 4) f.cfg.checkpoint_policy = "tip-only";
+    }
+    if (kind == 1) f.cfg.checkpoint_interval = 1024;
+    if (kind == 2) f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+}
+
+TEST(exact_resume_grid_is_the_chunk_an_idle_prefill_cuts) {
+    struct Want { int kind; int64_t interval, grid, origin; };
+    for (const Want w : { Want{ 0, 256, 256, 0 }, Want{ 1, 1024, 512, 0 }, Want{ 2, 256, 512, 256 },
+                          Want{ 3, 256, 256, 0 }, Want{ 4, 256, 512, 0 }, Want{ 5, 0, 512, 0 } }) {
+        Fixture f;
+        exact_fixture(f, w.kind);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        CHECK(g.exact);
+        CHECK_EQ(g.checkpoint_interval, w.interval);
+        CHECK_EQ(g.grid, w.grid);
+        CHECK_EQ(g.grid_origin, w.origin);
+    }
+    /* Nearest, or no prefix cache: no grid, every position its own floor. */
+    for (int off = 0; off < 2; ++off) {
+        Fixture f;
+        exact_fixture(f, 0);
+        if (off) f.cfg.prefix_cache = false; else f.cfg.prefix_exact = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.geometry().exact);
+        CHECK_EQ(f.sch.geometry().grid_floor(300), 300);
+    }
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    const ChunkGeometry& g = f.sch.geometry();   /* 0, 256, 768, 1280, ... */
+    CHECK_EQ(g.grid_floor(255), 0);
+    CHECK_EQ(g.grid_floor(256), 256);
+    CHECK_EQ(g.grid_floor(767), 256);
+    CHECK_EQ(g.grid_floor(1000), 768);
+    CHECK(!g.on_grid(512));
+}
+
+/* An interval past the budget that is not a multiple of the budget's chunk would put the chunk
+ * after every checkpoint off the cold run's grid: exact rounds it up, with a warning that names
+ * both ways out; nearest keeps it. */
+TEST(exact_rounds_an_interval_off_the_chunk_up_to_a_multiple_of_it) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        f.build();                            /* quantum 64 */
+        f.cfg.checkpoint_interval = 768;      /* past the 512 budget, not a multiple of it */
+        f.cfg.prefix_exact = exact != 0;
+        log_set_level(Log::Error);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.geometry().checkpoint_interval, exact ? 1024 : 768);
+        if (exact) CHECK_EQ(f.sch.geometry().grid, 512);
+    }
+    /* A budget off the quantum chunks at the quantum below it: 500 -> 448, and the interval goes
+     * to the next multiple of 448. */
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/500);
+    f.cfg.checkpoint_interval = 1024;
+    f.cfg.prefix_exact = true;
+    log_set_level(Log::Error);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.geometry().checkpoint_interval, 1344);
+    CHECK_EQ(f.sch.geometry().grid, 448);
+    int64_t ck = -1;
+    CHECK_EQ(f.sch.plan_chunk(0, 5000, 500, &ck), 448);
+    CHECK_EQ(f.sch.plan_chunk(896, 5000, 500, &ck), 448);
+    CHECK_EQ(ck, 1344);
+}
+
+/* The tail snapshot is where the prompt's last chunk starts, a boundary an idle chunk already
+ * ends on: no extra step, and an exact repeat re-prefills that last chunk whole. */
+TEST(an_exact_tail_snapshot_is_where_the_last_chunk_starts) {
+    Fixture f;
+    exact_fixture(f, 1);                      /* interval 1024, chunks of 512 */
+    REQUIRE_EQ(f.start(), RAD_OK);
+    Cut c = cut_from(f.sch, 0, 1800, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1536, 1800 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536 }));
+    /* Its last chunk starting on the interval: that checkpoint is the tail's. */
+    c = cut_from(f.sch, 0, 1100, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1100 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024 }));
+    /* One ending on the grid: the last chunk is [1536, 2048), and its end is an interval. */
+    c = cut_from(f.sch, 0, 2048, 512);
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536, 2048 }));
+    /* Inside the first interval nothing (as before, cheap to prefill again). */
+    c = cut_from(f.sch, 0, 900, 512);
+    CHECK(c.ckpts.empty());
+    /* A step sharing its budget may straddle the tail: split there, the snapshot written. */
+    int64_t ck = -1;
+    CHECK_EQ(f.sch.plan_chunk(1400, 1800, 512, &ck), 136);
+    CHECK_EQ(ck, 1536);
+    /* A budget short of a quantum boundary past it leaves it for the next chunk. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 1800, 100, &ck), 64);
+    CHECK_EQ(ck, -1);
+
+    /* Nearest cuts the same prompt's last chunk at its last quantum boundary instead. */
+    Fixture n;
+    n.build();
+    n.cfg.checkpoint_interval = 1024;
+    REQUIRE_EQ(n.start(), RAD_OK);
+    c = cut_from(n.sch, 0, 1800, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1536, 1792, 1800 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1792 }));
+}
+
+/* The property itself, over every geometry and many prompt lengths: every checkpoint is on the
+ * grid and is a chunk start of the cold run of the prompt that wrote it and of any longer prompt
+ * it prefixes (an agent's next turn), and from it the hit cuts exactly the cold run's chunks. */
+TEST(an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks) {
+    for (int kind = 0; kind < 6; ++kind) {
+        Fixture f;
+        exact_fixture(f, kind);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        int checked = 0;
+        for (int64_t L = 100; L <= 3000; L += 37) {
+            const Cut cold = cut_from(f.sch, 0, L, 512);
+            for (int64_t c : cold.ckpts) {
+                CHECK(g.on_grid(c));
+                if (c >= L) continue;
+                CHECK(std::find(cold.ends.begin(), cold.ends.end(), c) != cold.ends.end());
+                CHECK(cut_from(f.sch, c, L, 512).ends == ends_after(cold, c));
+                for (int64_t L2 : { L + 1, L + 300, L + 1500 }) {
+                    const Cut cold2 = cut_from(f.sch, 0, L2, 512);
+                    CHECK(std::find(cold2.ends.begin(), cold2.ends.end(), c) != cold2.ends.end());
+                    CHECK(cut_from(f.sch, c, L2, 512).ends == ends_after(cold2, c));
+                }
+                ++checked;
+            }
+        }
+        CHECK(kind == 5 ? checked == 0 : checked > 20);
+    }
+    /* What nearest gives up: its tail snapshot at a 1000-token prompt's last quantum boundary
+     * (960) is no chunk start of the 1500-token turn after it, which a cold run cuts at 768 and
+     * 1024, so a hit there recomputes [960, 1024) as a chunk of its own. */
+    Fixture n;
+    n.build();
+    REQUIRE_EQ(n.start(), RAD_OK);
+    const Cut c1000 = cut_from(n.sch, 0, 1000, 512);
+    CHECK(std::find(c1000.ckpts.begin(), c1000.ckpts.end(), 960) != c1000.ckpts.end());
+    const Cut c1500 = cut_from(n.sch, 0, 1500, 512);
+    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 960) == c1500.ends.end());
+    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 768) != c1500.ends.end());
+    CHECK_EQ(cut_from(n.sch, 960, 1500, 512).ends.front(), 1024);
+}
+
+/* At admission: a hit at a snapshot resumes there (plan_chunk put it on the grid); a hit with no
+ * snapshot to resume from (full attention alone) steps back to the grid, the blocks above it
+ * left to the cache and recomputed in the cold run's chunk. */
+TEST(an_exact_hit_steps_back_to_the_grid_and_prefills_the_cold_chunks) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        exact_fixture(f, 5);                  /* chunks of 512, no snapshots */
+        f.cfg.prefix_exact = exact != 0;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.seed(784);                       /* 49 blocks */
+        const uint64_t a = f.submit(1300, 8);
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, exact ? 512 : 784);
+        CHECK_EQ(b->ctx_lens[0], exact ? 512 : 784);
+        CHECK_EQ(b->n_tok, 512);              /* [512, 1024) as the cold run, or [784, 1296) */
+        CHECK_EQ((int)f.kv.block_table(a, 0).size(), exact ? 64 : 81);
+        CHECK_EQ(f.sch.metrics().hit_cut_tokens, exact ? 272 : 0);
+    }
+    /* With snapshots the hit is at one: kept as is, restored from its slot. */
+    Fixture f;
+    exact_fixture(f, 1);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.pc.seed(1600);
+    f.pc.lin = 1536;                          /* a tail snapshot, on the 512 grid */
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1800, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 1536);
+    CHECK_EQ(b->n_tok, 264);                  /* the cold run's last chunk, whole */
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+}
+
+/* A cold prompt at the scheduler: the last chunk is not split at the end, and an exact repeat's
+ * hit at the tail snapshot is that chunk. */
+TEST(an_exact_cold_prefill_keeps_its_last_chunk_whole) {
+    Fixture f;
+    exact_fixture(f, 0);                      /* interval 256, chunks of 256 */
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.submit(1000, 1);
+    std::vector<int64_t> toks, ckpts;
+    for (int i = 0; i < 8; ++i) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        toks.push_back(b->n_tok);
+        for (int k = 0; k < b->n_checkpoints; ++k)
+            ckpts.push_back(b->ctx_lens[0] + b->checkpoint_tok[k] + 1);
+        f.commit_plain();
+    }
+    CHECK((toks == std::vector<int64_t>{ 256, 256, 256, 232 }));
+    CHECK((ckpts == std::vector<int64_t>{ 256, 512, 768 }));
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();
@@ -1115,6 +1361,123 @@ TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
     SchedMetrics m = f.sch.metrics();
     CHECK_EQ(m.attn_cached_tokens, 304);
     CHECK_EQ(m.linear_cached_tokens, 0);
+}
+
+/* The same model with the trunk's window in the checkpoint slot (KVGroupPlan::win_snap beside
+ * linear state, as DeepSeek-V4.1's sliding layers beside its compressor state): the hit resumes at
+ * the snapshot, which restores the linear state and the window together, and the cached group's
+ * blocks are adopted. Before, a model with linear state never put its window in the slot, so this
+ * clamp refused every hit on it. */
+TEST(a_hit_on_a_hybrid_whose_slot_carries_the_window_resumes_at_the_snapshot) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    const int32_t swa = 3;
+    f.kv.snap = { swa };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+
+    const uint64_t a = f.submit(300, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    CHECK_EQ(b->ctx_lens[0], 256);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+    CHECK_EQ(f.kv.block_table(a, 0)[0], f.pc.seeded[0][0]);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.linear_cached_tokens, 256);
+    CHECK_EQ(m.hit_cut_window, 0);
+
+    /* A hit with no snapshot under it still reuses nothing: the window has nowhere to come from. */
+    Fixture g;
+    g.build(4096, 64, 512, 4096, /*windowed=*/true);
+    g.kv.snap = { swa };
+    g.pc.groups = { 0 };
+    CHECK_OK(g.start());
+    g.pc.seed(304);
+    g.pc.lin = 0;
+    g.pc.src = -1;
+    const uint64_t c = g.submit(300, 8);
+    REQUIRE(g.sch.step() != nullptr);
+    CHECK_EQ(g.sch.find(c)->n_computed, 0);
+}
+
+/* A trunk group the cache does not index and no slot carries is a hole no snapshot fills: a full
+ * group left out (as a group at another block size was before the cache took every block size)
+ * refuses the hit even where the window is in the slot. */
+TEST(a_trunk_group_neither_cached_nor_in_the_slot_refuses_the_hit) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 16;
+    k.layers = { 3 };
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(300, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().hit_cut_window, 1);
+}
+
+/* Groups at two block sizes: a hit adopts each group's own blocks (the 8-token group twice as
+ * many), and the cache's reserve is asked for in entries, from the group furthest short. */
+TEST(a_hit_over_mixed_block_sizes_adopts_each_groups_own_blocks) {
+    Fixture f;
+    f.build(4096, 64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    const int32_t fine = 3;
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0, fine };
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().quantum % 16, 0ll);
+    f.pc.seed(304);                                   /* 19 blocks of 16, 38 of 8 */
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1000, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    const std::vector<int32_t> t0 = f.kv.block_table(a, 0), t1 = f.kv.block_table(a, fine);
+    CHECK_EQ((int)t0.size(), 32);                     /* 16 adopted + 16 for the 256-token chunk */
+    CHECK_EQ((int)t1.size(), 64);                     /* 32 adopted + 32 */
+    for (int i = 0; i < 16; ++i) CHECK_EQ(t0[(size_t)i], f.pc.seeded[0][(size_t)i]);
+    for (int i = 0; i < 32; ++i) CHECK_EQ(t1[(size_t)i], f.pc.seeded[1][(size_t)i]);
+}
+
+TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 64, 64);
+    f.pc.groups = { 0, 3 };
+    CHECK_OK(f.start());
+    f.pc.evict_grant = 1 << 20;
+    f.submit(160, /*max_tokens=*/1);                 /* 10 + 20 blocks, finishes on the first commit */
+    f.submit(176, /*max_tokens=*/64);                /* 11 + 22 each, still running after it */
+    f.submit(176, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.kv.held_blocks(0), 32ll);             /* 32 free against a reserve of 16 */
+    CHECK_EQ(f.kv.held_blocks(3), 64ll);             /* none free against 16: 8 entries of 2 */
+    f.commit_plain();
+    REQUIRE(f.pc.trims.size() == 1u);
+    CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without

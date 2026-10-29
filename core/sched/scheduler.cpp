@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 
 namespace rad {
 
@@ -97,9 +98,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             if (kv->block_tokens((int32_t)i) <= 0) continue;
             ++n_paged;
             const auto& cg = pc->cached_groups();
-            /* Snapshots are taken only where the trunk has a window to snapshot too
-             * (ChunkGeometry::window_ckpt); without them no drafter window rides in one. */
-            if (cfg.prefix_cache && geo_.window_ckpt && kv->window_snapshot((int32_t)i) &&
+            /* Snapshots are taken only on a checkpoint grid (ChunkGeometry::checkpoints()), the
+             * window's alone or beside linear state; without one no window rides in a slot. */
+            if (cfg.prefix_cache && geo_.checkpoints() && kv->window_snapshot((int32_t)i) &&
                 std::find(cg.begin(), cg.end(), (int32_t)i) == cg.end())
                 ++n_snap;
         }
@@ -110,19 +111,27 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     }
     /* The trunk's share: a paged group a trunk layer reads (a bound layer below the trunk's layer
      * count; a drafter borrows from base_layer up) that the cache does not index. Recomputing the
-     * tail cannot repair that hole; see scheduler.h. */
+     * tail cannot repair that hole; see scheduler.h. A windowed group is restored by a hit that
+     * resumes at a window snapshot (a checkpoint slot carries the trunk's window, with or without
+     * linear state beside it); any other such group refuses every hit. */
     hit_holes_trunk_ = false;
+    hit_needs_window_ = false;
     for (size_t i = 0; i < prog.kv_groups.size(); ++i) {
         if (kv->block_tokens((int32_t)i) <= 0) continue;
         bool trunk = false;
         for (int l : prog.kv_groups[i].layers) if (l < prog.meta.n_layers) { trunk = true; break; }
         if (!trunk) continue;
         const std::vector<int32_t>& cg = pc->cached_groups();
-        if (std::find(cg.begin(), cg.end(), (int32_t)i) == cg.end()) { hit_holes_trunk_ = true; break; }
+        if (std::find(cg.begin(), cg.end(), (int32_t)i) != cg.end()) continue;
+        if (prog.kv_groups[i].decl.kind == RAD_KV_WINDOW) hit_needs_window_ = true;
+        else hit_holes_trunk_ = true;
     }
     if (hit_holes_trunk_ && cfg.prefix_cache)
+        RAD_INFO("prefix cache: a trunk layer's paged group is neither prefix-cached nor carried "
+                 "by a checkpoint slot -- a hit re-prefills");
+    else if (hit_needs_window_ && cfg.prefix_cache)
         RAD_INFO("prefix cache: a trunk layer's windowed group is not prefix-cached -- a hit "
-                 "resumes from a window snapshot (a checkpoint slot) or re-prefills");
+                 "resumes from a window snapshot (a checkpoint slot)");
     if (cfg.prefill_interleave > 0)
         RAD_INFO("scheduler: --prefill-interleave %lld: after a prefill chunk that leaves its "
                  "prompt unfinished while other sequences decode, the next %lld steps carry "
@@ -470,14 +479,26 @@ void Scheduler::trim_prefix_cache() {
     if (!pc_ || !cfg_.prefix_cache) return;
     const std::vector<int32_t>& cg = pc_->cached_groups();
     if (cg.empty()) return;
-    const int32_t g = cg[0];
-    const int64_t total = kv_->total_blocks(g);
-    if (total <= 0) return;
-    const int64_t reserve = total / 4;              /* a quarter of the pool stays free */
-    /* Free against the carve, not free_blocks(): on an elastic pool free_blocks() is bounded by
-     * the live mark, so a pool that returned its unused top would read as nearly full and the
-     * trim would drain the cache for room the pool can grow back into. */
-    const int64_t short_by = reserve - (total - kv_->held_blocks(g));
+    /* An entry covers the lcm of the cached groups' blocks and holds that over a group's block of
+     * its blocks (PrefixCache::blocks_per_entry); the trim asks for entries, as many as the group
+     * furthest short needs. */
+    int64_t entry = 0;
+    for (int32_t g : cg) {
+        const int64_t bs = kvgeom_.g[(size_t)g].block_size;
+        if (bs > 0) entry = entry > 0 ? std::lcm(entry, bs) : bs;
+    }
+    int64_t short_by = 0;
+    for (int32_t g : cg) {
+        const int64_t total = kv_->total_blocks(g), bs = kvgeom_.g[(size_t)g].block_size;
+        if (total <= 0 || bs <= 0) continue;
+        const int64_t reserve = total / 4;          /* a quarter of the pool stays free */
+        /* Free against the carve, not free_blocks(): on an elastic pool free_blocks() is bounded
+         * by the live mark, so a pool that returned its unused top would read as nearly full and
+         * the trim would drain the cache for room the pool can grow back into. */
+        const int64_t blocks = reserve - (total - kv_->held_blocks(g));
+        const int64_t per = std::max<int64_t>(entry / bs, 1);
+        if (blocks > 0) short_by = std::max(short_by, (blocks + per - 1) / per);
+    }
     if (short_by > 0) (void)pc_->trim(short_by);
 }
 
@@ -850,7 +871,38 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 
     int64_t want = remaining < budget ? remaining : budget;
 
-    if (geo_.checkpoints()) {
+    if (geo_.checkpoints() && geo_.exact) {
+        /* --prefix-resume exact: checkpoints only where an idle cold prefill of this prompt starts
+         * a chunk (ChunkGeometry::grid), so a hit that resumes at one recomputes the cold run's
+         * own chunks. Splits as below at the interval and a span's end; the tail snapshot is at
+         * the start of the prompt's last chunk (tail_checkpoint), a boundary an idle chunk already
+         * ends on, so it costs a copy and no step. A step that shares the budget (another
+         * request, decode rows) may straddle it, and is split there. */
+        const int64_t I = geo_.checkpoint_interval;
+        const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
+        const int64_t next = periodic ? ((n_computed / I) + 1) * I : INT64_MAX;
+        int64_t far = next;
+        if (geo_.span > 1 && span_now_ && n_computed >= I && n_computed % I == 0)
+            far = n_computed + geo_.span * I;
+        if (n_computed + want > far)
+            want = far - n_computed;
+        else if (n_computed + want > next && n_computed + want < n_target)
+            want = (n_computed + want) / I * I - n_computed;
+        const int64_t tail = tail_checkpoint(n_target);
+        if (tail > n_computed && n_computed + want >= tail) {
+            want = tail - n_computed;
+            if (checkpoint_pos) *checkpoint_pos = tail;
+        } else if (periodic && (n_computed + want) % I == 0 && geo_.on_grid(n_computed + want)) {
+            if (checkpoint_pos) *checkpoint_pos = n_computed + want;
+        }
+        /* A request's own checkpoint (Request::checkpoint_at) as below, wherever it falls: the
+         * head the request shares with others resumes there by design. */
+        const int64_t keep = keep_at / geo_.quantum * geo_.quantum;
+        if (keep > n_computed && keep <= n_computed + want && keep <= n_target) {
+            want = keep - n_computed;
+            if (checkpoint_pos) *checkpoint_pos = keep;
+        }
+    } else if (geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
         if (geo_.window_ckpt && !geo_.window_periodic) {
@@ -934,6 +986,16 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 int64_t Scheduler::tail_checkpoint(int64_t target) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
+    if (geo_.exact) {
+        /* --prefix-resume exact: where the prompt's last chunk starts on the resume grid, so an
+         * exact repeat re-prefills that chunk as the cold run did, and an appended turn that chunk
+         * and what it added. A window snapshot keeps its margin below (next comment): the grid
+         * point under the end less a block. Past the first interval, as below. */
+        const int64_t margin = geo_.window_ckpt ? std::max<int64_t>(Q, 16) : 1;
+        const int64_t t = geo_.grid_floor(target - margin);
+        if (geo_.window_ckpt) return t >= I ? t : -1;
+        return t > I ? t : -1;
+    }
     const int64_t tail = target / Q * Q;
     /* A window snapshot is taken at the tail of any prompt of an interval or more, a block short
      * of the end: the next turn re-renders the last few tokens (the generation prompt is replaced
@@ -1136,6 +1198,20 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         if (reuse > last) reuse = last;
         if (reuse < 0) reuse = 0;
 
+        /* --prefix-resume exact: resume only on the grid an idle cold prefill chunks this prompt
+         * on (ChunkGeometry::grid), so the tokens recomputed below are cut into the cold run's own
+         * chunks. A snapshot is already on it (plan_chunk writes none off it, but for a request's
+         * own Request::checkpoint_at); a hit at a block (no snapshot needed) steps back to it. */
+        if (geo_.exact && reuse > 0 &&
+            !(geo_.checkpoints() && h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens)) {
+            const int32_t g = (int32_t)geo_.grid_floor(reuse);
+            if (g < reuse)
+                RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at %lld, on the "
+                          "%lld-token chunk grid (--prefix-resume exact)", (unsigned long long)r.id,
+                          (long long)reuse, (long long)g, (long long)geo_.grid);
+            reuse = g;
+        }
+
         /* A hit on a hybrid model needs a checkpoint. The adopted blocks cover the paged
          * attention groups, but nothing covers a recurrent group, whose state lives in a
          * per-sequence slot; skipping tokens also requires restoring that state (`ckpt_src`,
@@ -1158,9 +1234,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                       (unsigned long long)r.id, (long long)h.n_attn_tokens, (long long)reuse);
         }
         /* A window snapshot covers the trunk's windowed groups at the checkpoint only. The lookup
-         * clamped the hit to it (a window counts as state there), so a hit with a slot is exactly
-         * at a snapshot; one without is no hit. */
-        const bool win_hit = geo_.window_ckpt && kv_->has_window_snapshot() && reuse > 0 &&
+         * clamped the hit to it (a window counts as state there, and linear state beside it
+         * resumes there too), so a hit with a slot is exactly at a snapshot; one without is no
+         * hit. */
+        const bool win_hit = geo_.checkpoints() && kv_->has_window_snapshot() && reuse > 0 &&
                              h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens;
 
         /* Windowed-group clamp: the trunk's own KV includes a paged group the cache does not
@@ -1173,7 +1250,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          *
          * A drafter's own group (bound at base_layer and above) is not this clamp's business:
          * draft refill caps the hit so the recompute covers the drafter's window. */
-        if (reuse > 0 && hit_holes_trunk_ && !win_hit) {
+        if (reuse > 0 && (hit_holes_trunk_ || (hit_needs_window_ && !win_hit))) {
             reuse = 0;
             s.hit_cut = SchedReq::HitCut::Window;
             RAD_DEBUG("admit %llu: prefix hit %lld zeroed -- a trunk paged group is not "

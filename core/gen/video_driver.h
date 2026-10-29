@@ -16,9 +16,10 @@
  *   2. VENCODE or AENCODE of an admitted request's reference media, one per reference, so the
  *      video and audio VAE latents are in the lane's slots before its prompt runs.
  *   3. VCOND of an admitted request, so its steps can follow the current request's without a gap.
- *   4. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done.
- *      Requests are denoised one after another, not in turns: a pass is one request's whole
- *      sequence, so taking turns would only delay the first.
+ *   4. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done,
+ *      then its keyframes' VENCODEs at the full size (an upscaled request's keyframes are encoded
+ *      at the small size in 2). Requests are denoised one after another, not in turns: a pass is
+ *      one request's whole sequence, so taking turns would only delay the first.
  */
 #pragma once
 #include "video.h"
@@ -86,12 +87,15 @@ private:
         std::vector<float> pos;          /* [3, rows] */
         /* References and keyframes: their table (RadVideoGenBatch::ref_tab), the step's packed
          * sequence at the full size and at an upscale's small one (rows 0 without references),
-         * and the encode passes, one a media in order, `enc_next` the next to run. */
+         * and the encode passes, one a media in order, `enc_next` the next to run. The first
+         * `enc_pre` run before the prompt; the rest, an upscaled request's keyframes at the full
+         * size, run into the same slots once the upscale is done. */
         std::vector<int32_t> ref_tab;
         Pack                 pack, pack_small;
-        struct EncItem { int32_t kind, slot, ref; };   /* RAD_ENC_*, its number, its req->refs */
+        /* RAD_ENC_*, its number, its req->refs, and whether it is the media's small_pixels. */
+        struct EncItem { int32_t kind, slot, ref; bool small = false; };
         std::vector<EncItem> enc_q;
-        size_t               enc_next = 0;
+        size_t               enc_next = 0, enc_pre = 0;
         /* Latent upscaling: the evaluations at the small size (0: none), its geometry, rows and
          * positions, the factor the network is told, and whether the upscale has run. */
         int32_t       split = 0;
@@ -143,6 +147,7 @@ private:
     bool small_now(const Job& j) const { return j.split > 0 && !j.upscaled; }
     int  shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_t steps, std::string* why);
     int  plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::string* why) const;
+    int  plan_small_keys(Job& j, const VideoRequest& r, std::string* why) const;
     int  lay_out(const RadVideoGeom& g, const std::vector<int32_t>& tab, Pack* out,
                  std::string* why) const;
     int32_t predicted_chunks(double log_seconds, std::string* note) const;

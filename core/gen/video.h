@@ -98,6 +98,10 @@ struct VideoRefMedia {
     std::vector<float> enc_samples;
     int64_t            enc_n = 0;
     int32_t            enc_channels = 0;
+    /* A keyframe of a latent-upscaled request again at the small size, prepared as at the full
+     * one: the steps before the upscale pin it on their own grid. Empty otherwise. */
+    std::vector<float> small_pixels;
+    int32_t            small_h = 0, small_w = 0;
 };
 
 struct VideoRequest {

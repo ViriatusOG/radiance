@@ -310,6 +310,10 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
 // Rotation and amax close over a 64-element group, so the bytes are identical; the chunk size only
 // sets ownership. A chunk may not straddle a row (both ranks must agree on a block's bytes), and a
 // wave owns a whole chunk, so a smaller chunk employs more waves (see r4d_ar_ln_had_quant_i8.hip).
+// A row of whole 64-element groups that is not whole chunks (TranslateGemma's 5376 = 10.5 chunks)
+// ends in a partial chunk: its missing groups go out as zeros and are not stored back. Every real
+// group is the same 64 elements as in the flat message, so its bytes, and the sum, are the
+// standalone wire's; with whole chunks the mapping is the flat one.
 //
 // The reduced row goes back to global `x`, not LDS: unlike the int8 twin this norm needs no
 // in-place rotation, and pass two re-reads the row L1-hot as the standalone norm does.
@@ -372,11 +376,16 @@ __device__ __forceinline__ unsigned int arq_load_acq(const unsigned int* p) {
 
 // POST: a sandwich-norm junction (Gemma 3): the reduced sum is post-normed against `wp` before the
 // residual add, `v = bf16(sum * s1 * (wp + wadd))` with s1 the sum's own rms, as rmsnorm_quant_i8's
-// POST computes it. `x` still receives the reduced sum. Exact wire and a residual only.
+// POST computes it. `x` still receives the reduced sum. Either wire (the compressed one has already
+// stored the sum into `x`); a residual only.
 //
 // HI8: ar_rmsnorm_had_quant_i8g, pass two in norm_quant_row's rotated int8 form. The reduction and
 // the norm are untouched, so `x`, the residual and `y` are ar_rmsnorm_quant_fp8's bytes.
-template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false, bool HI8 = false>
+// PAD (wire 6 only): the row is whole 64-element groups but not whole chunks, so its last chunk is
+// padded and a chunk's elements are found by (row, chunk in row). Without it the flat index is the
+// element offset, the code a row of whole chunks has always run.
+template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false, bool HI8 = false,
+          bool PAD = false>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp,
@@ -393,7 +402,9 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     const int r0 = (int)(((long)b * M) / nb), r1 = (int)(((long)(b + 1) * M) / nb);
     /* Chunks per row and this block's window into the global chunk numbering, derived identically
      * on both ranks from (M, nb, n). */
-    const int cpr = WIRE ? (int)(n / ARQ_CE) : 0;
+    const int cpr = WIRE ? (int)(PAD ? (n + ARQ_CE - 1) / ARQ_CE : n / ARQ_CE) : 0;
+    const int gpr = (int)(n / ARQ_GROUP);   /* the real groups a row has; the rest of its last chunk pads */
+    (void)gpr;
     const int c00 = r0 * cpr, cpb = (r1 - r0) * cpr;
     const uint32_t lane = tid & (ARQ_WV - 1), wave = tid / ARQ_WV;
     const int lig = (int)(lane & (ARQ_LPG - 1)), gw = (int)(lane / ARQ_LPG);
@@ -430,8 +441,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     } else {
         /* Rotate, amax, quantise and pack straight into the peer's slot. A wave owns whole chunks,
          * so every lane emits ARQ_NWORD dwords per chunk and the flush is lane-uniform. No group is
-         * partial (n is whole chunks, a block owns whole rows), so the standalone kernel's `live`
-         * guard is unnecessary and every cross-lane stage is fully active. */
+         * partial (n is whole groups, a block owns whole rows), so every cross-lane stage is fully
+         * active; a group past the row's end (a partial last chunk) packs zeros. */
         for (int ci = (int)wave; ci < cpb; ci += (int)(THR / ARQ_WV)) {
             const int c = c00 + ci;
             unsigned int acc[ARQ_NWORD];
@@ -440,10 +451,18 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
 #pragma unroll
             for (int t = 0; t < ARQ_ITERS; ++t) {
                 const int g = c * ARQ_CG + t * ARQ_GPW + gw;
-                const long off = (long)g * ARQ_GROUP + (long)lig * ARQ_EPL;
                 float v[ARQ_EPL];
+                if constexpr (PAD) {
+                    const int cr = c / cpr, gr = (c - cr * cpr) * ARQ_CG + t * ARQ_GPW + gw;
+                    const bool live = gr < gpr;
+                    const long off = (long)cr * n + (long)gr * ARQ_GROUP + (long)lig * ARQ_EPL;
 #pragma unroll
-                for (int i = 0; i < ARQ_EPL; ++i) v[i] = bf2f(x[off + i]);
+                    for (int i = 0; i < ARQ_EPL; ++i) v[i] = live ? bf2f(x[off + i]) : 0.0f;
+                } else {
+                    const long off = (long)g * ARQ_GROUP + (long)lig * ARQ_EPL;
+#pragma unroll
+                    for (int i = 0; i < ARQ_EPL; ++i) v[i] = bf2f(x[off + i]);
+                }
                 arq_wht(v, lig);
                 float a = 0.0f;
 #pragma unroll
@@ -590,9 +609,18 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                          + (float)((int)(lsy & ARQ_MASK) + ARQ_QMIN) * lsc;
                 }
                 arq_wht(v, lig);
-                const long off = (long)g * ARQ_GROUP + (long)lig * ARQ_EPL;
+                if constexpr (PAD) {
+                    const int cr = c / cpr, gr = (c - cr * cpr) * ARQ_CG + gl;
+                    if (gr < gpr) {
+                        const long off = (long)cr * n + (long)gr * ARQ_GROUP + (long)lig * ARQ_EPL;
 #pragma unroll
-                for (int i = 0; i < ARQ_EPL; ++i) x[off + i] = f2bf(v[i]);
+                        for (int i = 0; i < ARQ_EPL; ++i) x[off + i] = f2bf(v[i]);
+                    }
+                } else {
+                    const long off = (long)g * ARQ_GROUP + (long)lig * ARQ_EPL;
+#pragma unroll
+                    for (int i = 0; i < ARQ_EPL; ++i) x[off + i] = f2bf(v[i]);
+                }
             }
         }
         /* Pass two reads all of `x`'s row; each wave wrote only its own chunks. */
@@ -610,13 +638,14 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
 
         (void)pr;
         float ss = 0.0f;
-        if constexpr (POST && WIRE == 0 && RES) {
+        if constexpr (POST && RES) {
             /* Pass one reduces and takes the sum's sum of squares; pass two post-norms it, adds it
              * into the stream and takes the stream's. Each thread reads back only its own columns. */
             float s1s = 0.0f;
             for (uint32_t i = tid; i < n; i += THR) {
-                const uint16_t a = f2bf(bf2f(xr[i]) + bf2f(pr[i]));
-                xr[i] = a;
+                uint16_t a;
+                if constexpr (WIRE == 0) { a = f2bf(bf2f(xr[i]) + bf2f(pr[i])); xr[i] = a; }
+                else                     { a = xr[i]; }
                 const float av = bf2f(a);
                 s1s += av * av;
             }
@@ -862,7 +891,7 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
                                    int nblocks, int nthreads, int drain, int acq, int wire,
                                    long loc_pack, long loc_scale_off, long wp, bool hi8) {
     if (!x || !w || !q || !s) return -1;
-    if (wp && (!res || wire != 0)) return -10;   // a post-norm needs the stream and the exact wire
+    if (wp && !res) return -10;                  // a post-norm needs the stream
     if (hi8 && wp) return -11;
     if (hi8 && (n % (int)kGroup)) return -12;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
@@ -871,8 +900,9 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
     // four columns (see norm_quant_row).
     if (n % 8) return -5;
     if (wire != 0 && wire != 6) return -7;
-    // A chunk may not straddle a row, or the ranks would disagree about a block's bytes.
-    if (wire == 6 && (n % ARQ_CE)) return -8;
+    // A group may not straddle a row, or the ranks would disagree about a block's bytes; a row's
+    // last chunk may be partial (its missing groups go out as zeros).
+    if (wire == 6 && (n % ARQ_GROUP)) return -8;
     if (wire == 6 && (!loc_pack || loc_scale_off <= 0)) return -9;
     if (!r_ld) r_ld = n;
     if (!y_ld) y_ld = n;
@@ -887,8 +917,9 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
     // The width must be r4d_act_threads', as for the standalone norm (it fixes the summation order).
     const int thr = nthreads ? nthreads : r4d_act_threads(M, n);
     if (thr != 256 && thr != 512 && thr != 1024) return -6;
-#define R4D_ARQ_H(wf, rs, T, W, PO, H)                                                           \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO, H>), dim3((uint32_t)nb),   \
+    const bool pad = wire == 6 && (n % ARQ_CE) != 0;
+#define R4D_ARQ_HP(wf, rs, T, W, PO, H, PD)                                                      \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO, H, PD>), dim3((uint32_t)nb), \
                        dim3(T), 0,                                                               \
                        (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res, (const void*)w,        \
                        (const void*)wp,                                                          \
@@ -898,12 +929,16 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
                        (long)loc_scale_off, M, (uint32_t)n,                                      \
                        (uint32_t)nkb, eps, wadd, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld, \
                        (uint32_t)s_ld, (int)slot_stride16, drain, acq, (unsigned)nbw)
+#define R4D_ARQ_H(wf, rs, T, W, PO, H)                                                           \
+    do { if (pad) R4D_ARQ_HP(wf, rs, T, W, PO, H, (W == 6));                                     \
+         else R4D_ARQ_HP(wf, rs, T, W, PO, H, false); } while (0)
 #define R4D_ARQ_P(wf, rs, T, W, PO) R4D_ARQ_H(wf, rs, T, W, PO, false)
 #define R4D_ARQ_T(wf, rs, T, W)                                                                  \
     do { if (hi8) R4D_ARQ_H(wf, rs, T, W, false, true);                                          \
          else R4D_ARQ_P(wf, rs, T, W, false); } while (0)
 #define R4D_ARQ_W(wf, rs, T)                                                                     \
-    do { if (wire == 6) R4D_ARQ_T(wf, rs, T, 6);                                                 \
+    do { if (wire == 6 && rs && wp) R4D_ARQ_P(wf, rs, T, 6, true);                               \
+         else if (wire == 6) R4D_ARQ_T(wf, rs, T, 6);                                            \
          else if (rs && wp) R4D_ARQ_P(wf, rs, T, 0, true);                                       \
          else R4D_ARQ_T(wf, rs, T, 0); } while (0)
 #define R4D_ARQ(wf, rs)                                                                          \
@@ -917,6 +952,7 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
 #undef R4D_ARQ_T
 #undef R4D_ARQ_P
 #undef R4D_ARQ_H
+#undef R4D_ARQ_HP
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 

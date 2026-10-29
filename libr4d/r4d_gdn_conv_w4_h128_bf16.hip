@@ -72,10 +72,10 @@ __device__ __forceinline__ bool r4d_has_init(const void* p, int i32, int n) {
   return i32 ? ((const int*)p)[n] != 0 : ((const unsigned char*)p)[n] != 0;
 }
 
-template <int HPB, int ABF16>
+template <int HPB, int ABF16, typename WT>
 __global__ __launch_bounds__(HPB * 32)
 void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
-                              const unsigned short* __restrict__ wgt,
+                              const WT* __restrict__ wgt,
                               const unsigned short* __restrict__ bias,
                               unsigned short* __restrict__ cstate,
                               long cs_seq, long cs_dim, long cs_tok,
@@ -150,7 +150,7 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
 #pragma unroll
   for (int c = 0; c < CP_DPL; ++c) {
 #pragma unroll
-    for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(wgt[(size_t)(d0 + c) * CP_W + i]);
+    for (int i = 0; i < CP_W; ++i) wt[i][c] = cp_tap(wgt[(size_t)(d0 + c) * CP_W + i]);
     bs[c] = bias ? bf2f(bias[d0 + c]) : 0.0f;
   }
 
@@ -241,7 +241,8 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
   }
 }
 
-extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
+template <typename WT>
+static int cp_prep_launch(
     const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
     long cs_seq, long cs_dim, long cs_tok, const void* cache_idx, long ci_stride,
     const void* has_init, int hi_i32,
@@ -256,8 +257,8 @@ extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
   const int nchunk_ub = (T + CP_BT - 1) / CP_BT + N;
   dim3 grid(nchunk_ub, units / hpb), blk(hpb * 32);
 #define CP_LAUNCH(P, AB)                                                                      \
-  hipLaunchKernelGGL((r4d_gdn_conv_prep_kernel<P, AB>), grid, blk, 0, (hipStream_t)stream,     \
-                     (const unsigned short*)x, xpitch, (const unsigned short*)wgt,            \
+  hipLaunchKernelGGL((r4d_gdn_conv_prep_kernel<P, AB, WT>), grid, blk, 0, (hipStream_t)stream, \
+                     (const unsigned short*)x, xpitch, (const WT*)wgt,                        \
                      (const unsigned short*)bias, (unsigned short*)cstate,                    \
                      cs_seq, cs_dim, cs_tok, (const int*)cache_idx, ci_stride,                \
                      has_init, hi_i32, a, b, ab_stride,                                     \
@@ -277,16 +278,44 @@ extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
   return (int)hipGetLastError();
 }
 
+extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, const void* cache_idx, long ci_stride,
+    const void* has_init, int hi_i32,
+    const void* a, const void* b, long ab_stride, int ab_is_bf16, const void* A_log,
+    const void* dt_bias, void* q, void* k, void* v, void* g, void* beta, const void* cu,
+    int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr, void* stream)
+{
+  return cp_prep_launch<unsigned short>(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim, cs_tok,
+                                        cache_idx, ci_stride, has_init, hi_i32, a, b, ab_stride,
+                                        ab_is_bf16, A_log, dt_bias, q, k, v, g, beta, cu, N, T, H,
+                                        Hg, K, V, width, softplus_thr, stream);
+}
+
+extern "C" int r4d_gdn_conv_prep_w4_h128_bf16_f32wgt(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, const void* cache_idx, long ci_stride,
+    const void* has_init, int hi_i32,
+    const void* a, const void* b, long ab_stride, int ab_is_bf16, const void* A_log,
+    const void* dt_bias, void* q, void* k, void* v, void* g, void* beta, const void* cu,
+    int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr, void* stream)
+{
+  return cp_prep_launch<float>(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim, cs_tok, cache_idx,
+                               ci_stride, has_init, hi_i32, a, b, ab_stride, ab_is_bf16, A_log,
+                               dt_bias, q, k, v, g, beta, cu, N, T, H, Hg, K, V, width,
+                               softplus_thr, stream);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Decode-time convolution. Same filter, but a step's tokens are a speculative window and the
 // state cache is a rolling buffer of width-1 + num_spec entries: a step reads its window starting
 // at the slot the last accepted token left, and rewrites the buffer shifted by one. Writes q, k
 // and v in their own layouts (no torch.cat for the recurrent kernel).
 // ---------------------------------------------------------------------------------------------
-template <int HPB>
+template <int HPB, typename WT>
 __global__ __launch_bounds__(HPB * 32)
 void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitch,
-                                const unsigned short* __restrict__ wgt,
+                                const WT* __restrict__ wgt,
                                 const unsigned short* __restrict__ bias,
                                 unsigned short* __restrict__ cstate,
                                 long cs_seq, long cs_dim, long cs_tok, int state_len_max,
@@ -312,15 +341,14 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
   const int unit = blockIdx.y * HPB + warp;
   const int d0 = unit * CP_HD + lane * CP_DPL;
 
-  // A channel's weights are CP_W contiguous shorts: one vector load per channel.
-  static_assert(CP_W == 4, "the weight load reads a channel's taps as one ushort4");
+  // A channel's weights are CP_W contiguous elements: one vector load per channel.
   float wt[CP_W][CP_DPL], bs[CP_DPL];
 #pragma unroll
   for (int c = 0; c < CP_DPL; ++c) {
-    const ushort4 w4 = *(const ushort4*)(wgt + (size_t)(d0 + c) * CP_W);
-    const unsigned short* ws = (const unsigned short*)&w4;
+    const cp_taps<WT> w4 = *(const cp_taps<WT>*)(wgt + (size_t)(d0 + c) * CP_W);
+    const WT* ws = (const WT*)&w4;
 #pragma unroll
-    for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(ws[i]);
+    for (int i = 0; i < CP_W; ++i) wt[i][c] = cp_tap(ws[i]);
     bs[c] = bias ? bf2f(bias[d0 + c]) : 0.0f;
   }
 
@@ -428,7 +456,8 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
 #undef CU_TOKEN_BODY
 }
 
-extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
+template <typename WT>
+static int cu_update_launch(
     const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
     long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
     long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
@@ -443,8 +472,8 @@ extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
   while (hpb > 1 && (long)N * (units / hpb) < 256) hpb >>= 1;
   dim3 grid(N, units / hpb), blk(hpb * 32);
 #define CU_LAUNCH(P)                                                                          \
-  hipLaunchKernelGGL((r4d_gdn_conv_update_kernel<P>), grid, blk, 0, (hipStream_t)stream,      \
-                     (const unsigned short*)x, xpitch, (const unsigned short*)wgt,            \
+  hipLaunchKernelGGL((r4d_gdn_conv_update_kernel<P, WT>), grid, blk, 0, (hipStream_t)stream,  \
+                     (const unsigned short*)x, xpitch, (const WT*)wgt,                        \
                      (const unsigned short*)bias, (unsigned short*)cstate, cs_seq, cs_dim,    \
                      cs_tok, state_len_max, (const int*)cache_idx, ci_stride,                 \
                      (const int*)num_accepted, (unsigned short*)q, (unsigned short*)k,        \
@@ -457,6 +486,28 @@ extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
   }
 #undef CU_LAUNCH
   return (int)hipGetLastError();
+}
+
+extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+    long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
+    int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream)
+{
+  return cu_update_launch<unsigned short>(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim, cs_tok,
+                                          state_len_max, cache_idx, ci_stride, num_accepted, q,
+                                          k, v, cu, N, H, Hg, K, V, width, max_query_len, stream);
+}
+
+extern "C" int r4d_gdn_conv_update_w4_h128_bf16_f32wgt(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+    long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
+    int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream)
+{
+  return cu_update_launch<float>(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim, cs_tok,
+                                 state_len_max, cache_idx, ci_stride, num_accepted, q, k, v, cu,
+                                 N, H, Hg, K, V, width, max_query_len, stream);
 }
 
 // ============================================================== the plugin ABI entry points
@@ -535,12 +586,16 @@ extern "C" int r4d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
     if (tb->dtype != ta->dtype) return R4D_NO(RAD_E_DTYPE);
     if (!ab_is_bf16 && ta->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
 
-    /* bf16 x, weights, conv state and q/k/v; fp32 A_log, dt_bias, g and beta. */
-    R4D_DT(x, RAD_BF16); R4D_DT(w, RAD_BF16); R4D_DT(cst, RAD_BF16);
+    /* bf16 x, conv state and q/k/v; bf16 or f32 weights (r4d_gdn_conv_tap.h); fp32 A_log,
+     * dt_bias, g and beta. */
+    R4D_DT(x, RAD_BF16); R4D_DT(cst, RAD_BF16);
     R4D_DT(q, RAD_BF16); R4D_DT(k, RAD_BF16); R4D_DT(v, RAD_BF16);
     R4D_DT(alog, RAD_F32); R4D_DT(dtb, RAD_F32); R4D_DT(g, RAD_F32); R4D_DT(beta, RAD_F32);
+    if (w->dtype != RAD_BF16 && w->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const auto prep = w->dtype == RAD_F32 ? r4d_gdn_conv_prep_w4_h128_bf16_f32wgt
+                                          : r4d_gdn_conv_prep_w4_h128_bf16;
 
-    return R4D_RAW(r4d_gdn_conv_prep_w4_h128_bf16(
+    return R4D_RAW(prep(
         x->data, (long)xpitch, w->data, b ? b->data : nullptr, cst->data,
         (long)cst->stride[0], (long)cst->stride[1], (long)cst->stride[2],
         cidx->data, (long)cidx->stride[0], hin ? hin->data : nullptr,
@@ -588,9 +643,12 @@ extern "C" int r4d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
     if (H == 0 || Hg == 0 || H % Hg) return R4D_NO(RAD_E_SHAPE);
     if (v->shape[0] != T || k->shape[0] != T) return R4D_NO(RAD_E_SHAPE);
 
-    /* bf16 x, weights, conv state and q/k/v, as in the prefill conv. */
-    R4D_DT(x, RAD_BF16); R4D_DT(w, RAD_BF16); R4D_DT(cst, RAD_BF16);
+    /* bf16 x, conv state and q/k/v, bf16 or f32 weights, as in the prefill conv. */
+    R4D_DT(x, RAD_BF16); R4D_DT(cst, RAD_BF16);
     R4D_DT(q, RAD_BF16); R4D_DT(k, RAD_BF16); R4D_DT(v, RAD_BF16);
+    if (w->dtype != RAD_BF16 && w->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const auto update = w->dtype == RAD_F32 ? r4d_gdn_conv_update_w4_h128_bf16_f32wgt
+                                            : r4d_gdn_conv_update_w4_h128_bf16;
 
     const int width = (int)r4d_geti_or(a, "conv_width", 4);
     /* state_len_max and max_query_len describe one window, so only one is free. The state cache
@@ -606,7 +664,7 @@ extern "C" int r4d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
     const long long mql = state_len_max - (width - 2);
     if (width < 2 || mql < 1) return R4D_NO(RAD_E_SHAPE);
 
-    return R4D_RAW(r4d_gdn_conv_update_w4_h128_bf16(
+    return R4D_RAW(update(
         x->data, (long)xpitch, w->data, b ? b->data : nullptr, cst->data,
         (long)cst->stride[0], (long)cst->stride[1], (long)cst->stride[2],
         (int)state_len_max, sidx->data, (long)sidx->stride[0],

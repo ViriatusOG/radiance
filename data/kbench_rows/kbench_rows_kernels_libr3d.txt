@@ -1,0 +1,36 @@
+# Kernel rows a replay of this fixture reaches (rad-kbench --coverage).
+# A row listed here and not reached fails the replay; regenerate with
+# --coverage-write when a row is added or deliberately retired.
+add_bf16
+attn_paged_fp8_decode
+cast_bf16_bf16
+dflash_select_bf16
+gated_quant_fp8_bf16
+gather_rows_bf16
+gemm_nt_bf16_m16
+gemm_nt_bf16_tiled
+gemm_nt_q_fp8a8_m16
+gemm_nt_q_fp8a8_tiled
+gemm_nt_q_gated_fp8a8
+kv_store_fp8
+layernorm_bf16
+quant_act_fp8_bf16
+quant_act_i8_bf16
+rmsnorm_bf16
+rmsnorm_quant_fp8_bf16
+rope_bf16
+row_topk_bf16
+sample_argmax_f32
+sample_dry_f32
+sample_logprobs_f32
+sample_mask_f32
+sample_minp_f32
+sample_penalties_f32
+sample_pick_f32
+sample_temp_f32
+sample_topk_f32
+sample_topp_f32
+sample_typical_f32
+sample_xtc_f32
+scatter_rows_bf16
+silu_mul_bf16

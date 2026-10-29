@@ -22,6 +22,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     tier_.assign(n, Tier::VRAM);
     busy_.assign(n, 0u);
     movable_.assign(n, 0u);
+    pinned_.assign(n, 0u);
     layer_of_.assign(n, -1);
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
@@ -61,6 +62,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
         layer_of_[u] = mu.layer;
         bytes_[u] = mu.bytes;
         movable_[u] = mu.movable ? 1u : 0u;
+        pinned_[u] = mu.pinned ? 1u : 0u;
         if (mu.movable) ++movable;
         if (mu.layer < 0) {
             if (mu.movable) other[(size_t)n_layer_].push_back((int32_t)u);
@@ -280,7 +282,9 @@ void HeatEngine::set_busy(int32_t unit, bool busy) {
 void HeatEngine::set_place(int32_t unit) {
     const size_t u = (size_t)unit, p = (size_t)pos_[u];
     const bool vram = tier_[u] == Tier::VRAM;
-    rank_as_[p] = (!movable_[u] || busy_[u]) ? 0u : vram ? 2u : 1u;
+    /* A pinned resident is never a candidate to leave the card: it ranks as off-device only, so a
+     * promotion can still target it but a demotion cannot. */
+    rank_as_[p] = (!movable_[u] || busy_[u] || (pinned_[u] && vram)) ? 0u : vram ? 2u : 1u;
     routed_as_[p] = vram ? 2u : 1u;
     miss_bytes_[p] = vram ? 0 : bytes_[u];
 }
@@ -330,6 +334,8 @@ bool HeatEngine::pick(Swap* out) const {
         const int32_t rc = l >= 0 ? res_count_[(size_t)l] : 0;
         const float h = heat_[(size_t)pos_[i]];
         if (tier_[i] == Tier::VRAM) {
+            /* A pinned resident never leaves the card, whatever its heat. */
+            if (pinned_[i]) continue;
             /* Colder wins; on a tie, take from the layer holding the most resident units. */
             if (cold[c] < 0 || h < cold_h[c] || (h == cold_h[c] && rc > cold_res[c])) {
                 cold[c] = (int32_t)i; cold_h[c] = h; cold_res[c] = rc;

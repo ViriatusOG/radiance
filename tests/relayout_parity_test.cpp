@@ -883,6 +883,52 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
     }
 }
 
+/* The dense integer kernels compile their group in and read no `group` argument, so a hook that
+ * accepted another one would hand the kernel planes it reads at 128. */
+TEST(a_dense_int_kernel_refuses_a_group_it_does_not_compute) {
+    NEED_LIBQUANT();
+    const int64_t N = 64, K = 256;
+    const std::vector<float> w = draw(N * K, 28);
+    auto rtn = [&](const char* codes, const char* zero, bool clamp, int64_t group) {
+        Opts g;
+        g.s("codes", codes).i("group", group).s("scale", "f16");
+        if (zero) g.s("zero", zero);
+        if (clamp) g.s("clamp", "sym");
+        Quantised q = quantise(quantizer("rtn"), g, "x", N, K, w);
+        CHECK_EQ(q.status, RAD_OK);
+        return q;
+    };
+    auto lay = [&](RadLayoutFn f, const char* dtype, int64_t group, const Quantised& q) {
+        Opts kp;
+        kp.i("N", N).i("K", K).i("group", group).s("dtype", dtype);
+        Selection s = select(q, N, K, { "codes" });
+        RadLayout L{};
+        return f(kp.data(), kp.n(), B, &q.enc, s.sel.data(), s.t.data(), (int)s.t.size(), &L);
+    };
+    const Quantised i4 = rtn("i4", nullptr, false, 64), u5 = rtn("u5", "u8", false, 64);
+    const Quantised i8 = rtn("i8", nullptr, true, 64), u2 = rtn("u2", "u8", false, 64);
+    CHECK_EQ(lay(r4d_rad_layout_w4, "w4a8", 64, i4), RAD_E_DTYPE);
+    CHECK_EQ(lay(r4d_rad_layout_w5, "w5a16", 64, u5), RAD_E_DTYPE);
+    CHECK_EQ(lay(r4d_rad_layout_w8a16, "w8a16", 64, i8), RAD_E_DTYPE);
+    CHECK_EQ(lay(r4d_rad_layout_w2a8, "w2a8", 64, u2), RAD_E_DTYPE);
+
+    /* llama.cpp's Q8_0 is this encoding, an f16 scale per 32 i8 codes; the w8 kernels would read
+     * it at 128. */
+    const RadQuantizerInfo* ggml = quantizer("ggml");
+    REQUIRE(ggml != nullptr);
+    Opts o;
+    o.s("type", "q8_0");
+    const Quantised q8 = quantise(ggml, o, "x", N, K, w);
+    REQUIRE_EQ(q8.status, RAD_OK);
+    CHECK_EQ(lay(r4d_rad_layout_w8a16, "w8a16", 32, q8), RAD_E_DTYPE);
+
+    const Quantised i4_128 = rtn("i4", nullptr, false, 128), i8_128 = rtn("i8", nullptr, true, 128);
+    const Quantised u2_128 = rtn("u2", "u8", false, 128);
+    CHECK_EQ(lay(r4d_rad_layout_w4, "w4a8", 128, i4_128), RAD_OK);
+    CHECK_EQ(lay(r4d_rad_layout_w8a16, "w8a16", 128, i8_128), RAD_OK);
+    CHECK_EQ(lay(r4d_rad_layout_w2a8, "w2a8", 128, u2_128), RAD_OK);
+}
+
 /* ParoQuant's rotation pairs are stored as they are, and refused at load when a stage is not a
  * pairing within its own group's 128 columns, which the rotate kernels would index out of bounds. */
 TEST(givens_pairs_are_stored_as_they_are_and_checked) {

@@ -391,6 +391,7 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
     };
     j.ref_tab.clear();
     j.enc_q.clear();
+    j.enc_pre = 0;
     if (r.refs.empty()) return RAD_OK;
     if (!pack_ || !enc_geom_)
         return no("this model conditions on no reference media");
@@ -466,6 +467,7 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
     }
     j.ref_tab[1] = (int32_t)keys.size() / 3;
     j.ref_tab.insert(j.ref_tab.end(), keys.begin(), keys.end());
+    j.enc_pre = j.enc_q.size();
     /* The prompt's vision pads: each picture's tokens, which ComfyUI modulates as video. */
     const size_t at = j.ref_tab.size();
     j.ref_tab.push_back(0);
@@ -510,6 +512,33 @@ int VideoDriver::lay_out(const RadVideoGeom& g, const std::vector<int32_t>& tab,
     return RAD_OK;
 }
 
+/* An upscaled request's keyframes, pinned on the grid its steps run on: encoded at the small size
+ * before the prompt, then at the full size into the same slots once the upscale is done. */
+int VideoDriver::plan_small_keys(Job& j, const VideoRequest& r, std::string* why) const {
+    const RadVideoGenDecl& d = decl_;
+    std::vector<Job::EncItem> q;
+    int32_t eg[kEncGeomCap];
+    for (const Job::EncItem& it : j.enc_q) {
+        if (it.kind != RAD_ENC_KEYFRAME) continue;
+        const VideoRefMedia& m = r.refs[(size_t)it.ref];
+        const int64_t in[4] = { m.enc_frames, m.small_h, m.small_w, 3 };
+        if (m.small_pixels.size() != (size_t)m.enc_frames * m.small_h * m.small_w * 3 ||
+            d.enc_ratio < 1 || m.small_h % d.enc_ratio || m.small_w % d.enc_ratio ||
+            m.small_h / d.enc_ratio != j.geom_small.lat_h ||
+            m.small_w / d.enc_ratio != j.geom_small.lat_w ||
+            enc_geom_(RAD_GEN_PASS_VENCODE, in, eg, kEncGeomCap) < 0) {
+            if (why) *why = "'" + m.name + "' has no picture at the latent upscale's small size "
+                            "the model's encoder takes";
+            return RAD_E_INVAL;
+        }
+        q.push_back({ it.kind, it.slot, it.ref, true });
+    }
+    j.enc_pre = q.size();
+    q.insert(q.end(), j.enc_q.begin(), j.enc_q.end());
+    j.enc_q = std::move(q);
+    return RAD_OK;
+}
+
 /* The request's shape at `chunks` long: its geometry, rows and positions, its schedule, the
  * upscale's split and what its ticket says it makes. Run at submit, and again for a request whose
  * length the model predicts once its VCOND pass has written the prediction. */
@@ -544,14 +573,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
     RAD_TRY(plan_refs(j, r, s.frames, why));
     j.pack = Pack{};
     j.pack_small = Pack{};
-    if (!j.ref_tab.empty()) {
-        /* A keyframe is pinned on the video's grid, which an upscale's small steps are not on. */
-        if (r.upscale > 1.0 && j.ref_tab[1] > 0)
-            return no("a keyframe pins a frame of the video at its size, and latent_upscale "
-                      "denoises a smaller one first: send the keyframe request without "
-                      "latent_upscale");
-        RAD_TRY(lay_out(j.geom, j.ref_tab, &j.pack, why));
-    }
+    if (!j.ref_tab.empty()) RAD_TRY(lay_out(j.geom, j.ref_tab, &j.pack, why));
     /* The schedule follows the upscale's split, which needs the small size first. */
     const bool upscaling = r.upscale > 1.0;
     const bool own_refine = upscaling && d.n_refine_rungs > 0;
@@ -610,6 +632,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
         if (positions_(RAD_VPOS_STEP, &j.geom_small, j.pos_small.data(), ns) != ns)
             return no("the model could not lay the small size out");
         if (!j.ref_tab.empty()) RAD_TRY(lay_out(j.geom_small, j.ref_tab, &j.pack_small, why));
+        if (!j.ref_tab.empty() && j.ref_tab[1] > 0) RAD_TRY(plan_small_keys(j, r, why));
         j.split = evals - refine;
         j.factor = (float)(((double)r.width / sw + (double)r.height / sh) / 2.0);
         r.ticket->small_width = sw;
@@ -935,18 +958,20 @@ const RadBatch* VideoDriver::next(int step) {
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (!j.admitted || j.failed || j.cond_done) continue;
-        if (j.enc_next < j.enc_q.size()) return build_encode(j, step);
+        if (j.enc_next < j.enc_pre) return build_encode(j, step);
     }
     /* 3. A prompt. */
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (j.admitted && !j.failed && !j.cond_done) return build_cond(j, step);
     }
-    /* 4. The oldest lane's next step, or its upscale once its small steps are done. */
+    /* 4. The oldest lane's next step, or its upscale once its small steps are done, and after it
+     * the keyframes again at the full size. */
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (!j.admitted || j.failed || !j.cond_done || j.step >= j.sched.steps) continue;
         if (small_now(j) && j.step == j.split) return build_upscale(j, step);
+        if (!small_now(j) && j.enc_next < j.enc_q.size()) return build_encode(j, step);
         return build_step(j, step);
     }
     return nullptr;
@@ -1189,9 +1214,12 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     const Job::EncItem& it = j.enc_q[j.enc_next];
     const VideoRefMedia& m = j.req->refs[(size_t)it.ref];
     const bool audio = it.kind == RAD_ENC_VAUDIO || it.kind == RAD_ENC_AUDIO;
+    /* A keyframe at an upscale's small size is the media's second picture. */
+    const std::vector<float>& pix = it.small ? m.small_pixels : m.enc_pixels;
+    const int32_t eh = it.small ? m.small_h : m.enc_h, ew = it.small ? m.small_w : m.enc_w;
     int32_t* gd = hptr<int32_t>(R_ENCG);
-    const int64_t in[4] = { audio ? m.enc_n : m.enc_frames, audio ? 0 : m.enc_h,
-                            audio ? 0 : m.enc_w, audio ? m.enc_channels : 3 };
+    const int64_t in[4] = { audio ? m.enc_n : m.enc_frames, audio ? 0 : eh, audio ? 0 : ew,
+                            audio ? m.enc_channels : 3 };
     const int64_t ng = enc_geom_(audio ? RAD_GEN_PASS_AENCODE : RAD_GEN_PASS_VENCODE, in, gd,
                                  kEncGeomCap);
     int64_t stage_frames = 0, stage_samples = 0;
@@ -1208,14 +1236,14 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
             std::memcpy(sm + c * stage_samples, m.enc_samples.data() + c * n, (size_t)n * 4);
         reg_[R_ENCSM].used = stage_samples * ch * 4;
     } else {
-        const int64_t nf = m.enc_frames, area = (int64_t)m.enc_h * m.enc_w * 3;
+        const int64_t nf = m.enc_frames, area = (int64_t)eh * ew * 3;
         stage_frames = ng > 23 ? gd[23] : 0;
         if (stage_frames < nf || stage_frames * area * 4 > reg_[R_ENCPX].bytes) {
             fail_locked(j, RAD_E_STATE, "'" + m.name + "' does not fit an encode pass");
             return nullptr;
         }
         float* px = hptr<float>(R_ENCPX);
-        std::memcpy(px, m.enc_pixels.data(), (size_t)(nf * area) * 4);
+        std::memcpy(px, pix.data(), (size_t)(nf * area) * 4);
         for (int64_t f = nf; f < stage_frames; ++f)
             std::memcpy(px + f * area, px + (nf - 1) * area, (size_t)area * 4);
         reg_[R_ENCPX].used = stage_frames * area * 4;
@@ -1238,8 +1266,8 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
         } else {
             V.enc_pixels = dptr<float>(ri, R_ENCPX);
             V.enc_frames = (int32_t)stage_frames;
-            V.enc_height = m.enc_h;
-            V.enc_width = m.enc_w;
+            V.enc_height = eh;
+            V.enc_width = ew;
         }
     }
     const int32_t kind = audio ? RAD_GEN_PASS_AENCODE : RAD_GEN_PASS_VENCODE;

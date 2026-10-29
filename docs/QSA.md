@@ -191,8 +191,10 @@ drops blocks.
 ## Checking
 
 There is deliberately no switch that forces dense attention above the bound, where it is not the
-model the checkpoint was trained as. libref implements only `qsa_block_key` of the QSA ops, so
-there is no whole-subsystem reference comparison. Changes are checked with:
+model the checkpoint was trained as. libref implements all five QSA ops — `ref_qsa_block_key`,
+`ref_qsa_score`, `ref_qsa_select`, `ref_qsa_tail_store`, `ref_qsa_work` (`libref/ref_qsa.cpp`) — so
+each device kernel has a row to compare against; what no oracle gives is the whole-subsystem
+comparison, a dense run against a sparse one above the bound. Changes are checked with:
 
 - **`r4d_selftest` oracles**: `qsa_block_key` and `qsa_score` against f64 evaluations,
   `qsa_work` and `qsa_tail_store` against a host walk of the batch, `qsa_select` against a host

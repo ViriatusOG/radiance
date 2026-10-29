@@ -89,6 +89,8 @@ std::string host_lines(const HostFacts& h, const RunFacts& r) {
     o += fmt("  runtime   %s | backend %s\n",
              h.runtime.empty() ? "no device runtime" : h.runtime.c_str(),
              r.host_backend ? "host (CPU)" : "device");
+    if (!h.media.empty())
+        o += fmt("  media     decoders %s\n", h.media.c_str());
     return o;
 }
 
@@ -224,6 +226,7 @@ std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Deci
     host["cpu_epp"]          = h.cpu_epp;
     host["cpu_driver"]       = h.cpu_driver;
     host["runtime"]          = h.runtime;
+    host["media"]            = h.media;
     J cards = J::array();
     for (const CardFacts& c : f.cards) {
         J e;

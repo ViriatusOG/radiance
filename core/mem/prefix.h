@@ -23,6 +23,12 @@
  *       interval (next_checkpoint_after()), so a checkpoint is always written, at the cost of an
  *       occasional short chunk.
  *
+ * Block sizes: an entry covers block_size() tokens, the lcm of the cached groups' block sizes, and
+ * holds block_size() / B blocks of a group whose blocks are B tokens. A model whose layers keep KV
+ * at different strides (a compressed group at one row per r tokens beside one per token) is cached
+ * in every group; a hit is then a multiple of every group's block. The chunk quantum is a multiple
+ * of every paged group's block (core/sched/geometry.cpp), so checkpoints land on entries.
+ *
  * Sizing: the cache holds a KV reference on every block it indexes, so pool demand scales with
  * live sessions, not running requests. Hit rate falls off a cliff with pool utilisation: intact
  * below about 75%, half gone by about 81%, and zero once the sessions no longer fit, because each
@@ -207,6 +213,8 @@ public:
      * make reserve_checkpoint refuse every checkpoint and lookups search the wrong stride. */
     int configure(const Config& cfg, KVManager* kv, int64_t checkpoint_interval);
     bool enabled() const { return enabled_; }
+    /* Tokens one entry covers: the lcm of the cached groups' block sizes. Hits, publishes and
+     * checkpoint keys are whole entries. */
     int64_t block_size() const { return block_size_; }
     int64_t checkpoint_interval() const { return interval_; }
     const std::vector<int32_t>& cached_groups() const { return groups_; }
@@ -214,6 +222,13 @@ public:
      * rows are addressed by the sequence's block ids, so entries stay in VRAM and are evicted
      * whole (docs/KV-STREAMING.md §4.1). */
     bool demotable() const { return demotable_; }
+    /* Blocks of cached_groups()[i] in one entry: block_size() over that group's block size. */
+    int64_t blocks_per_entry(size_t i) const { return i < per_.size() ? per_[i] : 0; }
+    /* The group of each block an entry holds, in the order of its block list (Entry::blocks,
+     * TierJob::blocks, rebind): cached_groups()[i] repeated blocks_per_entry(i) times. The idle
+     * tiers move an entry as these blocks, one per slot. Equal to cached_groups() when every
+     * cached group has the same block size. */
+    const std::vector<int32_t>& entry_groups() const { return entry_groups_; }
     std::string report() const;
 
     /* Overrides the policy configure() installed from Config::checkpoint_policy (custom policies,
@@ -222,12 +237,12 @@ public:
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
-    /* Longest cached prefix, in whole blocks, plus the checkpoint that covers the linear state
+    /* Longest cached prefix, in whole entries, plus the checkpoint that covers the linear state
      * for a prefix of it. `blocks_out`, when given, receives the block ids per cached group, in
-     * cached_groups() order, ready for KVManager::adopt().
+     * cached_groups() order, ready for KVManager::adopt(): blocks_per_entry(i) of them an entry.
      *
      * Never returns the whole prompt: one token must remain to compute a logit from, so a full
-     * hit is backed off by one block. `cap`, when given, ends the hit early (HitCap). `session`,
+     * hit is backed off by one entry. `cap`, when given, ends the hit early (HitCap). `session`,
      * when not 0, is the request being admitted: it takes over the snapshots on the chain it hit
      * (take_over). */
     CacheHit lookup(const std::vector<int32_t>& tokens,
@@ -235,7 +250,7 @@ public:
                     std::vector<std::vector<int32_t>>* blocks_out = nullptr,
                     const HitCap* cap = nullptr, uint64_t session = 0) const;
 
-    /* Publish the whole blocks a sequence just filled. `blocks[i]` is the block table of
+    /* Publish the whole entries a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */
     int insert(uint64_t session,
                const std::vector<int32_t>& tokens,
@@ -249,11 +264,12 @@ public:
      * idle tiers on, an entry whose host copy has landed moves to the host tier instead of being
      * forgotten; only one with no host copy is lost. */
     int64_t evict_lru(int64_t n_entries);
-    /* Free up to `n_blocks` pool blocks for the scheduler's reserve without losing anything a
-     * later turn could reuse. One oldest-first walk that skips entries a live sequence also holds
-     * and, with the tiers on, entries whose host copy has not landed yet. Pressure that cannot
-     * wait goes to evict_lru. Returns how many blocks went back. */
-    int64_t trim(int64_t n_blocks);
+    /* Give back up to `n_entries` entries' blocks for the scheduler's reserve without losing
+     * anything a later turn could reuse. One oldest-first walk that skips entries a live sequence
+     * also holds and, with the tiers on, entries whose host copy has not landed yet. Pressure
+     * that cannot wait goes to evict_lru. Returns how many entries went: each gave back
+     * blocks_per_entry(i) blocks of cached group i. */
+    int64_t trim(int64_t n_entries);
     /* Give up every VRAM copy that costs nothing to drop: host copy landed and no running sequence
      * reading it. Used when the memory has a better use (the expert slab's loan). Entries still
      * shared are retried after a sequence frees blocks. Returns how many entries left VRAM. */
@@ -288,23 +304,25 @@ public:
     std::vector<BlockHash> restorable_from(const std::vector<int32_t>& tokens,
                                            const std::vector<MMContentKey>& mm,
                                            int64_t fit = INT64_MAX, bool* cut = nullptr) const;
-    /* Entries a restore can place now: free blocks against the carve, the least over the cached
-     * groups. Lent blocks count, since KVManager::reserve_blocks recalls the loan for them. */
+    /* Entries a restore can place now: free blocks against the carve over the blocks an entry
+     * takes in the group, the least over the cached groups. Lent blocks count, since
+     * KVManager::reserve_blocks recalls the loan for them. */
     int64_t restore_room() const;
     /* Room for a restore of this prompt's chain: trim(), sparing the chain itself (its blocks
      * would only have to come back too) and every chain a waiting request holds (hold()), whose
      * next attempt would restore it again. Only entries whose host copy has landed leave VRAM,
-     * so nothing is lost; with no host tier it takes nothing. */
+     * so nothing is lost; with no host tier it takes nothing. In entries, as trim(). */
     int64_t trim_for(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
-                     int64_t n_blocks);
+                     int64_t n_entries);
 
     /* The tiers lost the bytes. Erases the entry without releasing blocks: an off-device entry
      * owns none, and its recorded ids now belong to other sequences. Installed as
      * IdleTiers::set_drop_sink. */
     void drop_offdevice(const BlockHash& key);
 
-    /* A restore finished and the entry's blocks now live at these ids. The restore's raw
-     * reservations (KVManager::reserve_block) become cache-held references. */
+    /* A restore finished and the entry's blocks now live at these ids, one per entry_groups()
+     * slot. The restore's raw reservations (KVManager::reserve_block) become cache-held
+     * references. */
     int rebind(const BlockHash& key, const std::vector<int32_t>& blocks);
 
 
@@ -404,7 +422,8 @@ public:
 
 private:
     struct Entry {
-        std::vector<int32_t> blocks;    /* one per cached group, in groups_ order */
+        /* blocks_per_entry(i) per cached group, in groups_ order: entry_groups_[k] owns blocks[k] */
+        std::vector<int32_t> blocks;
         std::vector<int32_t> tokens;    /* the block's token ids, compared on hit */
         /* On the LRU exactly while the cache holds the blocks; `lru` is valid only then. An
          * off-device entry owns no block, so eviction must not reach it. */
@@ -438,14 +457,19 @@ private:
                                      int64_t n_blocks) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
     /* trim(), leaving the entries in `spare` (when given) where they are. */
-    int64_t trim_sparing(int64_t n_blocks,
+    int64_t trim_sparing(int64_t n_entries,
                          const std::unordered_set<BlockHash, BlockHashHash>* spare);
     /* A live sequence also holds one of this entry's blocks, so releasing it frees nothing. */
     bool shared_with_live(const Entry& e) const;
     /* Whether `e` holds the block_size_ token ids at `src`, so a hash collision is a miss. */
     bool same_tokens(const Entry& e, const int32_t* src) const;
-    /* Gives the entry's block in every group back to the KV manager. */
+    /* Gives the entry's blocks in every group back to the KV manager. */
     void release_blocks(const Entry& e);
+    /* Takes the cache's reference on the blocks of entry `b` of a sequence's tables `bt` (one per
+     * cached group) into `out`, entry_groups_ order; on a refusal releases exactly what it took
+     * and returns false. */
+    bool retain_entry(const std::vector<std::vector<int32_t>>& bt, int64_t b,
+                      std::vector<int32_t>* out);
     /* Retire one snapshot: free its slot and tell the tiers. The session index is left to the
      * caller. */
     void retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator it);
@@ -474,6 +498,8 @@ private:
     int64_t     interval_ = 0;
     std::vector<int32_t> groups_;         /* paged groups this cache indexes */
     bool demotable_ = false;              /* the host tier can hold every group in an entry */
+    std::vector<int32_t> per_;            /* blocks of groups_[i] an entry holds */
+    std::vector<int32_t> entry_groups_;   /* the group of each of an entry's blocks */
     bool        has_linear_ = false;
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;

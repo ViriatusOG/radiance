@@ -54,8 +54,7 @@ and at least 256, an aspect of at most 4:1 and an area of at most 1344x768, so 7
 console. Every task takes every size.
 
 `latent_upscale` (advanced) runs the early steps at half or a quarter of the size and the rest
-at full size, with a container converted with the latent upscaler. The keyframe tasks do not take
-it.
+at full size, with a container converted with the latent upscaler. Every task takes it.
 
 ## Outputs
 

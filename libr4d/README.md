@@ -31,10 +31,10 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `attn_decode_h256_gqa6_fp8kv` / `..._bf16kv` | the same geometry, split-KV, `q_len * gqa` ≤ 64 |
 | `attn_decode_h256_gqa6_scratch_bytes` / `attn_decode_h128_gqa4_scratch_bytes` | bytes of split-KV scratch a launch needs; ask before allocating, since the split count is chosen from the geometry |
 | `attn_vit_h72_bf16` | dense non-causal vision-encoder attention, head_dim 72 native, varlen over images |
-| `gdn_conv_prep_w4_h128_bf16` | the GDN prefill preamble in one kernel: causal conv (width 4, silu, with its state cache), q/k/v split, qk l2norm, gating and the per-chunk gate cumsum |
+| `gdn_conv_prep_w4_h128_bf16` / `..._f32wgt` | the GDN prefill preamble in one kernel: causal conv (width 4, silu, with its state cache), q/k/v split, qk l2norm, gating and the per-chunk gate cumsum |
 | `gdn_kkt_solve_k128_c64_bf16` | `A = (I + strict_lower(diag(beta) K K^T e^dg))^-1` per chunk of 64: the gram and its triangular inverse, without the fp32 gram reaching memory |
 | `gdn_chunk_scan_k128_v128_c64_bf16` | gated-delta-net chunked scan: WY recompute, state recurrence and output in one kernel; head_k 128, head_v 128, chunk 64 |
-| `gdn_conv_update_w4_h128_bf16` | the same convolution for a decode step: a rolling speculative window over the conv state cache, writing q/k/v directly |
+| `gdn_conv_update_w4_h128_bf16` / `..._f32wgt` | the same convolution for a decode step: a rolling speculative window over the conv state cache, writing q/k/v directly |
 | `gdn_recurrent_update_k128_v128_bf16_fp32state` | the decode-time recurrent delta-rule update against the paged fp32 state cache, gating and qk l2norm included |
 | `gdn_gated_rmsnorm_h128_bf16` | gated RMS norm over a 128-channel row, `out = rms(x) . w . act(z)` |
 | `ar_oneshot_2rank_exact` | one-shot push all-reduce over P2P, exactly 2 ranks, exact bf16/fp16/fp32 |

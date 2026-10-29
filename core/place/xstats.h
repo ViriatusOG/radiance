@@ -210,4 +210,11 @@ private:
     std::mutex              file_mu_;     /* one write at a time */
 };
 
+/* --expert-profile FILE: the planner's ranking, from a radiance-expert-stats JSON's `decode`
+ * counts. One entry per (layer, expert) with a positive count, its share that count over the
+ * layer's decode selections, so a layer's hottest expert ranks above another layer's merely busy
+ * one. `n_trunk` is the file's trunk layer count, or -1 where it names none. Returns RAD_E_IO on a
+ * missing or unreadable file and RAD_E_INVAL on one that is not this format. */
+int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, int32_t* n_trunk);
+
 }  /* namespace rad */

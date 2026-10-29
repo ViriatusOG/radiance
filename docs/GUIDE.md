@@ -52,6 +52,7 @@ driver. [`DOCKER.md`](DOCKER.md) covers it, with compose files per model.
 | Optional | ROCm with `hipcc`, for AMD device kernels; without it you get the host backend. Set `ROCM_PATH` if ROCm is not at `/opt/rocm` |
 | With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM there. On a card whose BAR is smaller than its VRAM they stay in pinned host memory and every dispatch reads them over the link: on R9700s, Qwen3.8-27B fp8 decode steps take 0.4-1.8% longer at `--tp 1` and 2 than with the arguments in VRAM. Peer access needs the large BAR too, so at `--tp 2` and above such a card takes the collectives through host memory (§4.7) |
 | Optional | OpenMP, used by the host kernel libraries if present |
+| Optional | `libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` (ffmpeg 6+), for image, video and audio input. The probe is `RAD_WITH_FFMPEG` (`ON` fatal, `OFF` off, default `AUTO`): built without them the engine boots normal, serves text, and refuses every image/video/audio part with HTTP 500 — the configure log is the only warning (`radiance: no libavformat ...`). `GET /diagnostics` shows `media decoders` |
 | Optional | `clang++` (or ROCm's), for `tests/r4d_emu` when the C++ compiler is g++; CMake 3.25+ for `CMakePresets.json` |
 | Shell harnesses | `curl` and `jq` |
 
@@ -91,6 +92,27 @@ cmake -S . -B build -G Ninja
 cmake --build build -j
 ctest --test-dir build -L fast -j8 --output-on-failure
 ```
+
+A ROCm SDK installed outside `/opt/rocm` — a userspace SDK tree under a virtualenv, a core-only
+system install — needs more than `ROCM_PATH`: hipcc is found, then device compilation dies inside
+`cuda_wrappers/cmath` with `Could not find standard C++ header 'cmath'`, because ROCm's clang
+does not pick up the distro gcc's libstdc++ headers on its own. The flags that make it work:
+
+```sh
+ROCM=/path/to/_rocm_sdk_devel   # the SDK root (the venv's site-packages/_rocm_sdk_devel)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DRAD_HIPCC=$ROCM/bin/hipcc \
+  -DCMAKE_HIP_COMPILER=$ROCM/llvm/bin/clang++ \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT=$ROCM \
+  -DCMAKE_HIP_FLAGS="--rocm-path=$ROCM --rocm-device-lib-path=$ROCM/lib/llvm/amdgcn/bitcode --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15"
+export LD_LIBRARY_PATH=$ROCM/lib:$LD_LIBRARY_PATH
+```
+
+`--gcc-install-dir` takes the distro gcc's directory (the installed gcc-15's; after a distro gcc
+upgrade it must be repointed, and the configure cached in `build/CMakeCache.txt` reset with
+`-c`). The device-lib path is where the SDK tree keeps `amdgcn/bitcode` (under `lib/llvm/` in a
+userspace SDK, `$ROCM/amdgcn/bitcode` in a core system install). The flags are not needed for a
+full `/opt/rocm` install, and `DOCKER.md`'s container sidesteps them.
 
 ### 1.3 Check that it works
 
@@ -498,6 +520,7 @@ dequantisation where the architecture's kernels read another form, and NVFP4 alw
 | `compressed-tensors` with an `nvfp4-pack-quantized` config group (`weights`: 4-bit float, group 16) | `fp4_e2m1*f32[1x16]` | the packed e2m1 codes beside an f32 scale per 16 of K, `weight_scale / weight_global_scale`: the global scale is a divisor, as compressed-tensors' dequantise and vLLM read it. Each piece keeps its own global, so a fused gate\|up reads both exactly. No kernel serves NVFP4, so every NVFP4 weight takes a recipe rule (`data/recipes/q38-27b-nvfp4-df2.recipe` makes it MXFP4) |
 | `compressed-tensors` whose config groups are all `float-quantized` with 8-bit `float` weights | `fp8_e4m3*<scale>[1x*]` or `[RxC]` | nothing is imported: each `X.weight` reads stock as FP8 with `X.weight_scale` beside it, one scale a row (`[N, 1]` or `[N]`, the channel strategy) or a block plane; a per-tensor scale (`[1]`) is written once a row, so it is imported rather than byte for byte. The quantisation is still the tool's, so the family's quantised plugin serves it |
 | `modelopt` (NVIDIA ModelOpt) with `quant_algo` `NVFP4`, `FP8`, or `MIXED_PRECISION` whose `quantized_layers` are each NVFP4 (group 16) or FP8 (e.g. ukisai's Swift 1.5 27B NVFP4) | NVFP4: `fp4_e2m1*f32[1x16]`; FP8: `fp8_e4m3*f32[1x*]` | NVFP4: `X.weight` (U8 `[N, K/2]`, the even k in the low nibble) beside an f32 scale per 16 of K, `float(X.weight_scale) * X.weight_scale_2`: ModelOpt's second level multiplies, where compressed-tensors' global scale divides. FP8: `X.weight` E4M3 with its one f32 `X.weight_scale`, written once a row. `X.input_scale` (a static activation scale) is not read: activations are quantised from their own values. Any other algorithm is refused by name. No kernel serves NVFP4, and none an FP8 scale per tensor, so both take recipe rules (`data/recipes/q38-27b-modelopt-nvfp4.recipe`) |
+| GGUF `Q8_0`, `Q4_K` and `Q6_K` tensors (a GGUF file, not a `quantization_config`) | `i8*f16[1x32]`, `affine:codes=u4[1x1],scale=u6[1x32],scale.1=f16[1x256],min=u6[1x32],min.1=f16[1x256]` and `i6*i8[1x16]*f16[1x256]` | the blocks split into their planes, bit for bit; a rule re-quantises from the exact dequantisation. Not served as they stand: the loader refuses them with the hint to serve the container `rad-convert` writes |
 
 The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
 A mixed-precision release (NVFP4 MLPs beside FP8 or bf16 linears, the usual NVFP4 layout) reads
@@ -1169,6 +1192,31 @@ instructions in front of a different text, as a translation service sends its pi
 snapshot lets it skip at least 256 tokens of that head, the request takes one where the head
 ends, at the cost of one chunk split, and the requests after it resume there. A conversation's
 next turn has only its own earlier turn past that point, so it splits nothing extra.
+
+A prefix hit answers exactly as the same prompt prefilled cold, by default
+(`--prefix-resume exact`). A kernel can round a row differently at another chunk
+length (the fp8 GEMM's split-K count is chosen from `M`, spec §17), so a hit that
+recomputes its tail in other chunks than a cold prefill can flip a near-tie in
+greedy text. The hit therefore resumes only where an idle server's cold prefill of
+that prompt starts a chunk: every `--max-num-batched-tokens` tokens (rounded down
+to the chunk quantum), or every `--checkpoint-interval` when that is smaller. A
+prompt's tail snapshot is taken where its last chunk starts, a boundary the chunk
+already ends on, so it costs a copy and no step. An exact repeat re-prefills the
+cold run's last chunk; an appended turn, that chunk and what the turn added: up to
+one chunk more than `--prefix-resume nearest`, which resumes at the deepest
+snapshot or block and splits a prompt's last chunk at its last quantum boundary.
+The interval must be a multiple of the chunk when it is larger; otherwise it is
+rounded up, and startup says so:
+
+  ```
+  --checkpoint-interval 6144 resolves to 8192: --prefix-resume exact needs it a multiple of the
+  4096-token prefill chunk (--max-num-batched-tokens 4096) ...
+  ```
+
+It is an idle-server property, as greedy batching is: a prefill that shares its
+steps with other requests or decode rows (`--busy-prefill-chunk`,
+`--prefill-interleave`) is cut differently, and a request's own checkpoint
+(`/v1/systemone`'s shared head) resumes where it was asked.
 
 **One prefill sequence in two pieces.** At two ranks, on `qwen35_fp8` (and `qwen35_w8a8`, built
 from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk with the
@@ -1924,6 +1972,7 @@ by 0.002-0.003 nats.
 | `--prefill-span N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `--max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; the startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
+| `--prefix-resume MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |
 | `--no-prefix-cache` | prefix cache on | disable prefix caching |
 
 **Parallel**
@@ -3118,7 +3167,8 @@ workflow, and is otherwise read off the parts:
 - **Keyframes**: a `first_frame` (`i2va`), a `last_frame` (`l2va`) or both (`fl2va`), each an image
   pinned at that end of the video. The first frame is stretched to the video's size, or, with
   `"first_frame_mode": "center"`, scaled to cover it and cropped at the centre; the last frame is
-  always cropped. A keyframe request takes no `latent_upscale`: the pins are on the video's own grid.
+  always cropped. With `latent_upscale` each keyframe is prepared at both sizes and pinned on the
+  grid the steps run on (below).
 - **Reference media** (`ref2va`): `ref_image_1` .. `ref_image_9`, `ref_video_1` .. `ref_video_3`, each
   video with an optional soundtrack `ref_video_audio_N` of its own number, and `ref_audio_1` ..
   `ref_audio_3`, numbered from 1 without gaps. Pictures and video frames are fitted into 256 x 256
@@ -3157,7 +3207,9 @@ upscaler, re-noised, and the last **`upscale_refine_steps`** run at the full siz
 and 12 of the base model's 49 by default). The steps at the small size cost a fraction of a
 full-size step's, so most of the time goes to the refinement. The video object of an upscaled
 video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
-size. Reference media ride it unchanged; keyframes do not (above).
+size. Reference media ride it unchanged. Keyframes ride it too: each is encoded at the small size
+before the prompt and again at the full size after the upscale, into the same slot, so every step
+pins it on its own grid.
 
 ```sh
 curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{

@@ -205,6 +205,10 @@ void usage() {
         "      --imatrix F      llama.cpp imatrix: the expert-popularity profile, the column\n"
         "                       importances handed to each quantiser, and the weighting of the\n"
         "                       error report\n"
+        "      --chat-template F  a jinja template baked as the container's chat template,\n"
+        "                       overriding the checkpoint's own (or its absence). A release that\n"
+        "                       ships none (DeepSeek's) needs one, or /v1/chat/completions answers\n"
+        "                       501. Trailing newlines are stripped\n"
         "      --set K=V        a metadata key, seen by declare AND written into the container,\n"
         "                       so a convert-time choice that must also hold at serve time is\n"
         "                       stated once. Repeatable\n"
@@ -274,7 +278,7 @@ int for_row_pieces(int64_t n, bool parallel, std::string* why, F fn) {
 }  /* namespace */
 
 int main(int argc, char** argv) {
-    std::string in, out, arch_override, home = rad_home(), tokjson, imat_path, draft_dir;
+    std::string in, out, arch_override, home = rad_home(), tokjson, imat_path, draft_dir, chat_tmpl;
     std::string tokjson2, config_dir;
     std::vector<std::string> add_files;
     std::vector<std::string> hierarchy = rad_hierarchy_from_env();
@@ -318,6 +322,7 @@ int main(int argc, char** argv) {
         else if (a == "--add")       add_files.push_back(next("--add"));
         else if (a == "--config")    config_dir = next("--config");
         else if (a == "--imatrix")   imat_path = next("--imatrix");
+        else if (a == "--chat-template") chat_tmpl = next("--chat-template");
         else if (a == "--set") {
             const std::string kv = next("--set");
             const size_t eq = kv.find('=');
@@ -665,8 +670,10 @@ int main(int argc, char** argv) {
             const RadQuantWeight qw = quant_weight(L, nullptr);
             const int st = L.rule->q->encoding(L.rule->params.data(), (int)L.rule->params.size(),
                                                &qw, &L.enc);
-            if (st == RAD_E_UNSUPPORTED && (L.src.trivial || L.src.imported)) {
-                /* declined (e.g. a norm under a matrix pattern): keep as is */
+            if (st == RAD_E_UNSUPPORTED &&
+                (L.src.trivial || (L.src.imported && !L.src.ggml_blocks))) {
+                /* declined (e.g. a norm under a matrix pattern): keep as is. Not a GGUF block
+                 * tensor: keeping its planes would hide that the rule did not apply. */
                 L.rule = nullptr;
                 L.enc = L.src.enc;
             } else if (st != RAD_OK) {
@@ -1038,6 +1045,12 @@ int main(int argc, char** argv) {
     } else {
         RAD_ERR("a safetensors checkpoint carries no vocab and there is no tokenizer.json beside "
                 "it. Pass --tokenizer tokenizer.json.");
+        w.abort();
+        return 1;
+    }
+    /* The operator's template replaces whatever the checkpoint carried (or lacked), so a release
+     * that ships none still bakes a container that serves /v1/chat/completions. */
+    if (!chat_tmpl.empty() && read_chat_template_path(chat_tmpl.c_str(), vb) < 0) {
         w.abort();
         return 1;
     }

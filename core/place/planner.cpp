@@ -12,6 +12,7 @@
 #include "planner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <set>
@@ -101,6 +102,21 @@ int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room) {
     if (wf.experts <= 0) return 0;
     const int64_t all = wf.experts + wf.expert_spare;
     return std::min(all, std::max<int64_t>(all + 2 * wf.expert_unit_max - host_room, 0));
+}
+
+/* A draft head's routed experts, pinned in the host pool before any strategy runs, leave the trunk
+ * the whole of `host_room`. The card then holds only the trunk's floor against that room. The
+ * drafter's units share the trunk's slab classes, so the spare the trunk's floor already reserves
+ * covers them; with no trunk experts the drafter is the whole plane and pinning it leaves the card
+ * nothing to hold. */
+int64_t expert_vram_floor_draft_hosted(const WeightFootprint& wf, int64_t host_room) {
+    if (wf.draft_experts <= 0) return expert_vram_floor(wf, host_room);
+    const int64_t trunk = wf.experts - wf.draft_experts;
+    if (trunk <= 0) return 0;
+    WeightFootprint t = wf;
+    t.experts = trunk;
+    t.draft_experts = 0;
+    return expert_vram_floor(t, host_room);
 }
 
 int plan_check_weights_pool(const Plan& p, int64_t pool_bytes) {
@@ -226,6 +242,14 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
             layer_experts[mu.layer] += b;
             out->expert_unit_max = std::max(out->expert_unit_max, b);
             expert_strides.insert(b);
+            /* A draft head's routed experts: layers at meta.n_layers and above, and only when the
+             * program declares a drafter. The trunk's own layers stay in the elastic plane a
+             * strategy places; --draft-expert-placement host takes this part out of it. */
+            if (prog.drafter.kind != RAD_DRAFT_NONE && prog.meta.n_layers > 0 &&
+                mu.layer >= (int32_t)prog.meta.n_layers) {
+                out->draft_experts += b;
+                out->draft_unit_max = std::max(out->draft_unit_max, b);
+            }
         }
         else                     out->statics += b;
         if (mu.layer >= 0 && !mu.mapped) out->layer_unit_max = std::max(out->layer_unit_max, b);
@@ -667,7 +691,7 @@ int Planner::assign_expert_tiered(Plan* p) {
         Cost k;
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
-            if (mu.access != RAD_ACCESS_CONDITIONAL) continue;
+            if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
             mu.tier = Tier::VRAM;
             mu.site = Site::Device;
             mu.reason = "fits in vram";
@@ -679,7 +703,7 @@ int Planner::assign_expert_tiered(Plan* p) {
 
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
-            if (mu.access != RAD_ACCESS_CONDITIONAL) continue;
+            if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
             if (k.residents < cap && k.used + mu.slot_bytes <= room) {
                 k.used += mu.slot_bytes;
                 ++k.residents;
@@ -1027,6 +1051,100 @@ int Planner::pin_towers(const Config& cfg, Plan* p) const {
     return RAD_OK;
 }
 
+/* --draft-expert-placement host: a draft head's routed experts (layers at meta.n_layers and above,
+ * and only when the program declares a drafter) go to the pinned host pool before any strategy
+ * runs. The card reads them in place at the DeviceZeroCopy site, the same way it reads a pooled
+ * expert, so a drafter's experts fit beside a trunk that already fills the card instead of the
+ * strategy having to make room for them on it. They are not movable: heat never promotes a draft
+ * expert onto the card and into the trunk's slab. */
+int Planner::pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const {
+    if (cfg.draft_expert_placement != "host") return RAD_OK;
+    if (prog.drafter.kind == RAD_DRAFT_NONE || prog.meta.n_layers == 0) {
+        if (cfg.draft_expert_placement_given) {
+            RAD_ERR("placement: --draft-expert-placement host: this model declares no draft head");
+            p->notes.push_back("--draft-expert-placement host: no draft head to place");
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    const int32_t trunk = (int32_t)prog.meta.n_layers;
+    auto draft = [&](const MoveUnit& mu) {
+        return mu.expert >= 0 && mu.layer >= trunk && mu.tier != Tier::Mapped && !mu.host_forced;
+    };
+    int64_t need = 0, n = 0, widest = 0;
+    for (const MoveUnit& mu : p->units)
+        if (draft(mu)) { need += mu.slot_bytes; widest = std::max(widest, mu.slot_bytes); ++n; }
+    if (!n) {
+        RAD_ERR("placement: --draft-expert-placement host: the draft head declares no routed "
+                "experts");
+        p->notes.push_back("--draft-expert-placement host: no drafter experts to place");
+        return RAD_E_STATE;
+    }
+    if (need > p->host_budget) {
+        RAD_ERR("placement: --draft-expert-placement host: the drafter's experts need %s of the "
+                "pinned host pool and %s of it is left%s", humanb(need).c_str(),
+                humanb(p->host_budget).c_str(),
+                p->file_stage_reserve ? " after the file tier's staging" : "");
+        p->notes.push_back(fmt("--draft-expert-placement host: the drafter's experts (%s) do not "
+                               "fit the host pool", humanb(need).c_str()));
+        return RAD_E_NOMEM;
+    }
+    for (MoveUnit& mu : p->units) {
+        if (!draft(mu)) continue;
+        p->host_budget -= mu.slot_bytes;
+        p->draft_host_bytes += mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "--draft-expert-placement host; read over the link in place";
+    }
+    RAD_INFO("placement: the drafter's experts, %lld units (%s, widest %s), in the pinned host "
+             "pool, read in place (--draft-expert-placement host)", (long long)n,
+             humanb(need).c_str(), humanb(widest).c_str());
+    return RAD_OK;
+}
+
+/* --expert-pin-top F: the hottest fraction of the routed experts, ranked by the profile the planner
+ * was given (the container's, or --expert-profile's decode counts), stay resident. They are marked
+ * unmovable, so the heat engine never demotes them and the decode-hot set stops paying the host
+ * pool's PCIe read. The cut keeps the hottest ceil(F * n), and a tie at the cut stays movable: the
+ * threshold is the share just below the hot set, and only a share strictly above it pins. Runs
+ * after the strategy, which has already put the hot set in VRAM; a hot unit the strategy had to
+ * leave on the host is left there and counted, since pinning it would need VRAM the card does not
+ * have. */
+void Planner::pin_hot(const Config& cfg, Plan* p) const {
+    if (cfg.expert_pin_top <= 0.0f) return;
+    std::vector<float> shares;
+    for (const MoveUnit& mu : p->units)
+        if (mu.expert >= 0 && mu.tier != Tier::Mapped) shares.push_back(mu.profile_share);
+    if (shares.empty()) return;
+    std::sort(shares.begin(), shares.end());
+    /* The cut sits after the coldest (1 - F) of the plane, so the hottest F are pinned. A tie at
+     * the cut stays movable: the threshold is the share just below the hot set, and only a share
+     * strictly above it pins. */
+    const double keep = (double)cfg.expert_pin_top * (double)shares.size();
+    const size_t hot = keep <= 0.0 ? 0 : std::min(shares.size(), (size_t)std::ceil(keep));
+    const float threshold = hot == 0 ? shares.back() + 1.0f
+                                     : shares[shares.size() - hot] - 1.0f;
+    p->pin_threshold = threshold;
+    p->profile_units = (int64_t)shares.size();
+    int64_t pinned = 0, left = 0;
+    for (MoveUnit& mu : p->units) {
+        if (mu.expert < 0 || mu.tier == Tier::Mapped || mu.host_forced) continue;
+        if (mu.profile_share <= threshold) continue;
+        if (mu.tier != Tier::VRAM) { ++left; continue; }
+        mu.pinned = true;
+        mu.movable = false;
+        ++pinned;
+    }
+    p->pinned_units = pinned;
+    RAD_INFO("placement: --expert-pin-top %.4g pins %lld of %lld routed experts resident (share "
+             "above %.4g); %lld of the hot set had no VRAM slot and stay where the strategy put "
+             "them", (double)cfg.expert_pin_top, (long long)pinned, (long long)shares.size(),
+             (double)threshold, (long long)left);
+}
+
 /* ------------------------------------------------------------------ plan */
 int Planner::plan(Plan* out) {
     if (!out || !in_.program || !in_.config) return RAD_E_INVAL;
@@ -1054,6 +1172,13 @@ int Planner::plan(Plan* out) {
     /* Before build_classes and assign: mapped units get no class and no budget. */
     pin_mapped(prog, out);
     build_classes(out);
+
+    /* After build_classes: a unit's slot_bytes is its class's stride, and the pins below charge
+     * the host pool that. Before it the charge would be zero and the pool would not hold them. */
+    int hrc = pin_embedding(prog, cfg, out);
+    const int trc = pin_towers(cfg, out);
+    if (hrc >= 0) hrc = trc;
+    if (hrc >= 0) hrc = pin_draft_experts(prog, cfg, out);
 
     /* Charge the file tier's staging pool (RAD_PLACE_FILE_STAGE_SLOTS) before anything is placed
      * in the host pool, or the fill could exhaust it and the mover refuse the plan. Sized from the
@@ -1087,14 +1212,14 @@ int Planner::plan(Plan* out) {
         }
     }
 
-    /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
-    int hrc = pin_embedding(prog, cfg, out);
-    const int trc = pin_towers(cfg, out);
-    if (hrc >= 0) hrc = trc;
+    /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. The pins ran above,
+     * once slot_bytes was known. */
 
     int rc = assign(out);
     enforce_op_site_agreement(prog, out);
     schedule_prefetch(out);
+    /* After the strategy: it has put the hot set in VRAM, and pinning marks those resident. */
+    pin_hot(cfg, out);
     finish(prog, out);
     return hrc < 0 ? hrc : rc;
 }
@@ -1222,6 +1347,13 @@ std::string Plan::report(const Program& prog) const {
     if (tower_host_bytes)
         s += fmt("  encoder tower %12s  %12s   (--vision-tower-placement ram, pinned, read in place)\n",
                  "-", humanb(tower_host_bytes).c_str());
+    if (draft_host_bytes)
+        s += fmt("  drafter       %12s  %12s   (--draft-expert-placement host, pinned, read in place)\n",
+                 "-", humanb(draft_host_bytes).c_str());
+    if (pinned_units)
+        s += fmt("  pinned hot    %12s  %12lld   (--expert-pin-top: resident, heat never demotes them, "
+                 "share above %.4g of %lld)\n", "-", (long long)pinned_units, (double)pin_threshold,
+                 (long long)profile_units);
     if (ngram_copy_bytes)
         s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, %s, filled at load)\n",
                  "-", humanb(ngram_copy_bytes).c_str(),

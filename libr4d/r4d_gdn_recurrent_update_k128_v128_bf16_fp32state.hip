@@ -37,6 +37,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <type_traits>
 #include <utility>
 
 #define RU_K   128              // head_k
@@ -187,9 +188,11 @@ __device__ __forceinline__ float ru_act(float z, int kind) {
 // channels and resets the counter (no waiting). A value head's v channels have one reader and are
 // rewritten by it. Two launches sharing a counter block must not overlap; blocks are keyed on
 // (stream, output), as split_ctr in r4d_gemm_fp8a8.hip.
+//
+// CV is also the weight's type: 1 bf16, 2 f32, read as gdn_conv_update reads it.
 struct RuConv {
   const unsigned short* x; long xpitch;   // the projection's [q | k | v] columns, row pitch
-  const unsigned short* w;                // [conv_dim, R4D_GDN_CONV_W]
+  const void* w;                          // [conv_dim, R4D_GDN_CONV_W], bf16 or f32 (CV)
   const unsigned short* b;                // [conv_dim] or null
   unsigned short* cs;                     // the conv state cache
   long cs_seq, cs_dim, cs_tok;
@@ -293,13 +296,15 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       const int off = naccept ? naccept[n] - 1 : 0;
       const int ca = tid < RU_K ? hk * RU_K + tid : (Hg + hk) * RU_K + (tid - RU_K);
       const int cb = (2 * Hg + hv) * RU_V + tid;
+      using CWT = std::conditional_t<CV == 2, float, unsigned short>;
+      const CWT* const cw = (const CWT*)cv.w;
       const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
 #pragma unroll
       for (int t = 0; t < RU_CVT; ++t)
         if (t < T) cxa[t] = xr[(size_t)t * cv.xpitch + ca];
       {
-        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)ca * CW);
-        cwa[0] = bf2f(w4.x); cwa[1] = bf2f(w4.y); cwa[2] = bf2f(w4.z); cwa[3] = bf2f(w4.w);
+        const cp_taps<CWT> w4 = *(const cp_taps<CWT>*)(cw + (size_t)ca * CW);
+        cwa[0] = cp_tap(w4.x); cwa[1] = cp_tap(w4.y); cwa[2] = cp_tap(w4.z); cwa[3] = cp_tap(w4.w);
         if (cv.b) cba = bf2f(cv.b[ca]);
       }
       spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
@@ -309,8 +314,8 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 #pragma unroll
         for (int t = 0; t < RU_CVT; ++t)
           if (t < T) cxb[t] = xr[(size_t)t * cv.xpitch + cb];
-        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)cb * CW);
-        cwb[0] = bf2f(w4.x); cwb[1] = bf2f(w4.y); cwb[2] = bf2f(w4.z); cwb[3] = bf2f(w4.w);
+        const cp_taps<CWT> w4 = *(const cp_taps<CWT>*)(cw + (size_t)cb * CW);
+        cwb[0] = cp_tap(w4.x); cwb[1] = cp_tap(w4.y); cwb[2] = cp_tap(w4.z); cwb[3] = cp_tap(w4.w);
         if (cv.b) cbb = bf2f(cv.b[cb]);
         spb = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)cb * cv.cs_dim;
 #pragma unroll
@@ -864,7 +869,7 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
 
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
-// factor-block bounds are as in ru_update_launch.
+// factor-block bounds are as in ru_update_launch. `w_f32` is the conv weight's type.
 static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void* b, long ab_stride,
                                     const void* A_log, const void* dt_bias, void* state,
                                     long st_slot, long st_head, void* o, void* oq, void* os,
@@ -872,7 +877,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                                     long sidx_stride, const void* nacc, const void* z,
                                     long z_pitch, const void* nw, float neps, int nact, int N,
                                     int H, int Hg, float scale, float thr, int state_fp16,
-                                    RadStream stream, int oq_i8, bool anc) {
+                                    RadStream stream, int oq_i8, bool anc, bool w_f32) {
   if (anc && sidx_stride < 6) return RAD_E_SHAPE;
   if (anc && sidx_stride * RU_FSTR > st_head) return RAD_E_SHAPE;
   const int sdt = state_fp16 ? 1 : 0;
@@ -880,11 +885,11 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const long flood = (long)N * slots_written * st_slot * (sdt ? 2 : 4);
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
-#define RC_LAUNCH(NTC, ANCC, SDTC)                                                            \
-  do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
-  while (0)
-#define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC)                                                     \
-  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1>),       \
+#define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
+  do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                       \
+       else       RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
+#define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
+  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC>),     \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
@@ -892,11 +897,14 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                      (const int*)sidx, sidx_stride, (const int*)nacc,                          \
                      (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg,   \
                      scale, thr, cv)
-#define RC_PICKNT(ANCC, SDTC) \
-  do { if (nt) RC_LAUNCH(1, ANCC, SDTC); else RC_LAUNCH(0, ANCC, SDTC); } while (0)
-#define RC_PICKANC(SDTC) \
-  do { if (anc) RC_PICKNT(1, SDTC); else RC_PICKNT(0, SDTC); } while (0)
-  if (sdt) RC_PICKANC(1); else RC_PICKANC(0);
+#define RC_PICKNT(ANCC, SDTC, CVC) \
+  do { if (nt) RC_LAUNCH(1, ANCC, SDTC, CVC); else RC_LAUNCH(0, ANCC, SDTC, CVC); } while (0)
+#define RC_PICKANC(SDTC, CVC) \
+  do { if (anc) RC_PICKNT(1, SDTC, CVC); else RC_PICKNT(0, SDTC, CVC); } while (0)
+#define RC_PICKSDT(CVC) \
+  do { if (sdt) RC_PICKANC(1, CVC); else RC_PICKANC(0, CVC); } while (0)
+  if (w_f32) RC_PICKSDT(2); else RC_PICKSDT(1);
+#undef RC_PICKSDT
 #undef RC_PICKANC
 #undef RC_PICKNT
 #undef RC_LAUNCH
@@ -1082,9 +1090,10 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     const long long ab_stride = r4d_row_pitch(ta);
     if (ab_stride < 0 || r4d_row_pitch(tb) != ab_stride) return R4D_NO(RAD_E_STRIDE);
 
-    R4D_DT(x, RAD_BF16); R4D_DT(cw, RAD_BF16); R4D_DT(cb, RAD_BF16); R4D_DT(cst, RAD_BF16);
+    R4D_DT(x, RAD_BF16); R4D_DT(cb, RAD_BF16); R4D_DT(cst, RAD_BF16);
     R4D_DT(ta, RAD_BF16); R4D_DT(tb, RAD_BF16); R4D_DT(o, RAD_BF16); R4D_DT(z, RAD_BF16);
     R4D_DT(alog, RAD_F32); R4D_DT(dtb, RAD_F32); R4D_DT(nw, RAD_F32);
+    if (cw->dtype != RAD_BF16 && cw->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (state->dtype != RAD_F32 && state->dtype != RAD_F16) return R4D_NO(RAD_E_DTYPE);
     if (oq) {
         if (oq->dtype != RAD_F8E4M3 && oq->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
@@ -1113,7 +1122,7 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
 
     RuConv cv{};
     cv.x = (const unsigned short*)x->data;  cv.xpitch = (long)xpitch;
-    cv.w = (const unsigned short*)cw->data; cv.b = cb ? (const unsigned short*)cb->data : nullptr;
+    cv.w = cw->data; cv.b = cb ? (const unsigned short*)cb->data : nullptr;
     cv.cs = (unsigned short*)cst->data;
     cv.cs_seq = (long)cst->stride[0]; cv.cs_dim = (long)cst->stride[1];
     cv.cs_tok = (long)cst->stride[2];
@@ -1128,5 +1137,5 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         os ? (long)r4d_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0);
+        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, cw->dtype == RAD_F32);
 }

@@ -659,6 +659,10 @@ same path runs. Trivial means served as stored:
   `fp4_e2m1*e8m0[1x32]`, byte for byte;
 - GGUF `F32`, `F16` and `BF16`.
 
+A GGUF `Q8_0`, `Q4_K` or `Q6_K` tensor is not trivial, because its blocks interleave what the planes
+of §4.1 hold apart. `rad-convert` imports it without a recipe as those planes, bit for bit, and the
+loader refuses it with that hint. Other GGUF block types are dequantised for a recipe or refused.
+
 **A torch.save file beside the safetensors is read as data** (`core/format/torch_zip.h`), for a
 model part that ships only that way (Fish Audio drama-3's `codec.pth`): its tensors join the
 namespace under `<stem>.`. The zip's stored entries are mapped, and its pickle is read by a machine
@@ -697,7 +701,9 @@ A rule names an algorithm (`rtn`, `gptq`, `cast`); its options name the grid (`c
 `group` or `block`, `scale`, a second level `scale2`, `zero`, `rule`) and the transform
 (`transform=fwht128`) (§4.5). First match wins, so a protected expert's `cast` rule sits above the
 rule every other expert takes. A quantiser that declines a weight (`rtn` declines a rank-1 tensor)
-leaves it to the checkpoint's encoding, so a broad pattern need not exclude every norm.
+leaves it to the checkpoint's encoding, so a broad pattern need not exclude every norm. A GGUF block
+tensor is the exception: a rule that declines it is an error, since keeping its planes would hide
+that the rule did not apply.
 
 `--recipe FILE` names a file and `--quant 'PATTERN=QUANTISER:k=v,...'` adds rules ahead of it.
 `$NAME` in an option is read from the environment.
@@ -1053,6 +1059,21 @@ token when it sits at `i * block_size`. This engine changes two things:
 
 On a model with sliding-window attention and no linear state, a checkpoint snapshots the window
 behind a prompt's tail instead, and chunks are not split at the interval.
+
+**Exact resume.** A hit recomputes the tokens past where it resumes, and a kernel can round a row
+differently at another chunk length (§17), so a hit is bit-identical to a cold run of the same
+prompt only if it recomputes the cold run's own chunks. With `--prefix-resume exact` (the default)
+a hit resumes only on the grid an idle server's cold prefill chunks on: the budget's chunk
+(`--max-num-batched-tokens` rounded down to the quantum), or the interval where chunks split at it
+and it is the smaller, times the span from the second interval on. Every snapshot the scheduler
+writes is on that grid: interval checkpoints (the interval, when past the chunk, is rounded up to a
+multiple of it), and the prompt's tail snapshot, which is taken where its last chunk starts rather
+than at its last quantum boundary. That boundary is one the cold chunk already ends on, so the tail
+snapshot costs no extra step; an exact repeat re-prefills the last chunk, an appended turn that
+chunk and its own tokens, up to one chunk more than `--prefix-resume nearest` (the deepest snapshot
+or block). A hit with no snapshot to resume from (full attention) steps back to the grid. The
+property holds for a prefill alone in its steps; one sharing its steps with other work is cut
+differently, as greedy text under batching already differs (§17).
 
 Snapshots are large (at a 2048-token interval a 128K session on Qwen3.5-27B is 64 checkpoints,
 about 9 GiB), so retention is budgeted. Retention keeps the session tip, which an appending agent
@@ -1642,7 +1663,8 @@ It does not give bit-exactness. The fp8 GEMM's split-K finisher sums in index or
 repeats, but the split count is chosen from `M`, so a row computed at `M = 1` and at `M = 8` can
 differ in the last bits. A speculative decode can therefore diverge from a non-speculative one on a
 near-tie, and a request at a different batch position can take a different reduction order. Nothing
-pins it (§19.7).
+pins it (§19.7). A prefix hit is held to the cold run's chunks (§7.3, exact resume), so on an idle
+server it repeats the cold run's output.
 
 ---
 

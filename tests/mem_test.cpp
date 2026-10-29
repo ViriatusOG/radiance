@@ -30,6 +30,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
 #include <unistd.h>
@@ -1827,21 +1828,24 @@ TEST(kv_window_snapshot_rows_and_seed) {
     kv.free_sequence(2);
 }
 
-/* A window is snapshotted only where a hit resumes from it: the trunk's window in a model without
- * linear state. With linear state a hit on a windowed trunk re-prefills, and a drafter's window is
- * recomputed by draft refill, so a window section there would be copied and never read. */
+/* A window is snapshotted only where a hit resumes from it: the trunk's window, with or without
+ * linear state beside it. A drafter's window is recomputed by draft refill, so a window section
+ * there would be copied and never read. */
 TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
     KVGroupInfo w = paged_group("swa", RAD_KV_WINDOW, 2, 16, { 6 }, 64);
     const Config cfg = small_config();
-    {   /* beside linear state: the slot holds only the state */
+    {   /* beside linear state: the slot holds the state, then the window. Without the window a
+         * hit could not resume on such a model at all (the scheduler refuses a trunk hole). */
         std::vector<KVGroupInfo> g = hybrid_groups();
         g.push_back(w);
         Pools p;
         CHECK_OK(configure_pools(p, cfg));
         KVManager kv;
         CHECK_OK(kv.configure(g, cfg, p.kv()));
-        CHECK(!kv.has_window_snapshot());
-        CHECK_EQ(kv.checkpoint_bytes(), 16384ll);
+        CHECK(kv.has_window_snapshot());
+        const KVGroupPlan* wp = kv.plan(3);
+        REQUIRE(wp && wp->win_snap);
+        CHECK_EQ(kv.checkpoint_bytes(), 16384ll + wp->window_blocks * wp->bytes_per_block);
     }
     {   /* a drafter's own window over a full-attention trunk */
         std::vector<KVGroupInfo> g = hybrid_groups(/*with_linear=*/false);
@@ -2419,6 +2423,222 @@ TEST(checkpoint_interval_must_be_a_block_multiple) {
     CHECK_OK(f.kv.configure(hybrid_groups(true), f.cfg, f.pools.kv()));
     /* It would never produce a hit, so it is refused. */
     CHECK_EQ(f.pc.configure(f.cfg, &f.kv, f.cfg.checkpoint_interval), RAD_E_INVAL);
+}
+
+/* ================================================================== mixed block sizes
+ *
+ * A model can keep KV at different strides: DeepSeek-V4's compressed attention stores one row per
+ * r tokens (a block of r) beside groups at one row a token. The cache indexes every such group at
+ * the lcm of their blocks, an entry holding lcm / B blocks of a B-token group, so a hit ends on a
+ * block of each and adopt() takes every group. Leaving the finer groups out left the trunk a hole
+ * the scheduler refuses every hit for.
+ */
+static KVGroupInfo gdn_group(std::vector<int32_t> layers) {
+    KVGroupInfo k;
+    k.name = "gdn";
+    k.decl.kind = RAD_KV_LINEAR;
+    k.decl.dtype = RAD_F32;
+    k.decl.n_head_kv = 4;
+    k.decl.state_dim[0] = 16;
+    k.decl.state_dim[1] = 16;
+    k.layers = std::move(layers);
+    return k;
+}
+
+/* Handles: 1 = the coarse group (`a`-token blocks), 2 = the fine one (`b`), 3 = linear state. */
+static std::vector<KVGroupInfo> mixed_groups(int64_t a, int64_t b, bool with_linear) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    g.push_back(paged_group("coarse", RAD_KV_FULL, 2, a, { 0, 1 }));
+    g.push_back(paged_group("fine", RAD_KV_FULL, 1, b, { 2 }));
+    if (with_linear) g.push_back(gdn_group({ 3, 4 }));
+    return g;
+}
+
+static std::vector<int32_t> head(const std::vector<int32_t>& v, int64_t n) {
+    return std::vector<int32_t>(v.begin(), v.begin() + std::min<int64_t>(n, (int64_t)v.size()));
+}
+
+TEST(a_cache_over_mixed_block_sizes_indexes_every_group_at_their_lcm) {
+    for (const auto& ab : { std::pair<int64_t, int64_t>{ 2, 1 }, { 2, 4 }, { 16, 2 } }) {
+        const int64_t a = ab.first, b = ab.second, L = std::lcm(a, b);
+        Fixture f;
+        REQUIRE_EQ(f.build_groups(mixed_groups(a, b, false)), RAD_OK);
+        REQUIRE(f.pc.enabled());
+        CHECK_EQ(f.pc.block_size(), L);
+        CHECK(f.pc.cached_groups() == (std::vector<int32_t>{ 1, 2 }));
+        CHECK_EQ(f.pc.blocks_per_entry(0), L / a);
+        CHECK_EQ(f.pc.blocks_per_entry(1), L / b);
+        std::vector<int32_t> eg;
+        for (int64_t k = 0; k < L / a; ++k) eg.push_back(1);
+        for (int64_t k = 0; k < L / b; ++k) eg.push_back(2);
+        CHECK(f.pc.entry_groups() == eg);
+        /* Named once in the report, and nothing left out. */
+        CHECK(f.pc.report().find("not cached") == std::string::npos);
+        CHECK(f.pc.report().find("blocks an entry") != std::string::npos);
+        const int64_t free1 = f.kv.free_blocks(1), free2 = f.kv.free_blocks(2);
+
+        /* 101 tokens publish their whole entries: 96 or 100 of them. */
+        const auto p = tok_run(300, 101);
+        const int64_t whole = 101 / L * L;
+        publish(f, 1, p, 101);
+        CHECK_EQ(f.pc.size(), whole / L);
+        const std::vector<int32_t> t1 = f.kv.block_table(1, 1), t2 = f.kv.block_table(1, 2);
+        for (int64_t k = 0; k < whole / a; ++k) CHECK_EQ(f.kv.block_refcount(1, t1[(size_t)k]), 2);
+        for (int64_t k = 0; k < whole / b; ++k) CHECK_EQ(f.kv.block_refcount(2, t2[(size_t)k]), 2);
+        /* The partial block past the last entry is the sequence's alone. */
+        if ((int64_t)t2.size() > whole / b) CHECK_EQ(f.kv.block_refcount(2, t2[(size_t)(whole / b)]), 1);
+
+        /* A longer prompt hits every published entry, with each group's own blocks. */
+        auto longer = p;
+        for (int i = 0; i < 40; ++i) longer.push_back(900 + i);
+        std::vector<std::vector<int32_t>> got;
+        CHECK_EQ(f.pc.lookup(longer, {}, &got).n_attn_tokens, (int32_t)whole);
+        REQUIRE_EQ(got.size(), 2u);
+        CHECK(got[0] == head(t1, whole / a));
+        CHECK(got[1] == head(t2, whole / b));
+        /* A full hit backs off one entry, and a divergence ends the hit on the entry below it. */
+        CHECK_EQ(f.pc.lookup(head(p, whole), {}).n_attn_tokens, (int32_t)(whole - L));
+        auto edited = p;
+        edited[37] += 5000;
+        CHECK_EQ(f.pc.lookup(edited, {}).n_attn_tokens, (int32_t)(37 / L * L));
+
+        /* The hit adopts in every group, and the blocks are shared, not copied. */
+        CHECK_OK(f.kv.add_sequence(2));
+        for (size_t i = 0; i < 2; ++i)
+            CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[i], got[i], whole));
+        CHECK_OK(f.kv.ensure(2, (int64_t)longer.size()));
+        CHECK_EQ(f.kv.block_refcount(2, t2[0]), 3);
+        CHECK(head(f.kv.block_table(2, 2), whole / b) == head(t2, whole / b));
+        f.kv.free_sequence(1);
+        f.kv.free_sequence(2);
+        CHECK_EQ(f.kv.block_refcount(1, t1[0]), 1);
+        CHECK_EQ(f.pc.unshared_tokens(), whole);
+
+        /* Eviction takes the deepest entry: its blocks in both groups go back together. */
+        const int64_t e1 = f.kv.free_blocks(1), e2 = f.kv.free_blocks(2);
+        CHECK_EQ(f.pc.evict_lru(1), 1ll);
+        CHECK_EQ(f.kv.free_blocks(1), e1 + L / a);
+        CHECK_EQ(f.kv.free_blocks(2), e2 + L / b);
+        CHECK_EQ(f.pc.lookup(longer, {}).n_attn_tokens, (int32_t)(whole - L));
+        CHECK_EQ(f.pc.unshared_tokens(), whole - L);
+        /* trim() counts entries too. */
+        CHECK_EQ(f.pc.trim(2), 2ll);
+        CHECK_EQ(f.kv.free_blocks(1), e1 + 3 * (L / a));
+        CHECK_EQ(f.kv.free_blocks(2), e2 + 3 * (L / b));
+        /* A restore's room is in entries: the group shortest of whole entries decides. */
+        const int64_t room = std::min((f.kv.total_blocks(1) - f.kv.held_blocks(1)) / (L / a),
+                                      (f.kv.total_blocks(2) - f.kv.held_blocks(2)) / (L / b));
+        CHECK_EQ(f.pc.restore_room(), room);
+        f.pc.clear();
+        CHECK_EQ(f.kv.free_blocks(1), free1);
+        CHECK_EQ(f.kv.free_blocks(2), free2);
+    }
+}
+
+/* A publish whose tables are short of an entry's blocks in one group is refused whole, and one
+ * that cannot take a reference in a later group gives back what it took in the earlier ones. */
+TEST(a_mixed_publish_short_of_a_groups_blocks_is_refused_and_takes_nothing) {
+    Fixture f;
+    REQUIRE_EQ(f.build_groups(mixed_groups(2, 1, false)), RAD_OK);
+    const auto p = tok_run(40, 32);
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 32));
+    std::vector<std::vector<int32_t>> bt = { f.kv.block_table(1, 1), f.kv.block_table(1, 2) };
+    std::vector<std::vector<int32_t>> shorter = bt;
+    shorter[1].resize(31);                           /* 16 entries need 32 one-token blocks */
+    CHECK_EQ(f.pc.insert(1, p, {}, shorter, 32), RAD_E_INVAL);
+    CHECK_EQ(f.pc.size(), 0ll);
+    /* A free block in the fine group cannot be retained: the entry is unwound. */
+    std::vector<std::vector<int32_t>> bad = bt;
+    int32_t loose = -1;
+    CHECK_OK(f.kv.reserve_block(2, &loose));
+    f.kv.release_block(2, loose);                    /* back on the free list */
+    bad[1][1] = loose;
+    CHECK_EQ(f.pc.insert(1, p, {}, bad, 32), RAD_E_STATE);
+    CHECK_EQ(f.kv.block_refcount(1, bt[0][0]), 1);
+    CHECK_EQ(f.kv.block_refcount(2, bt[1][0]), 1);
+    CHECK_OK(f.pc.insert(1, p, {}, bt, 32));
+    CHECK_EQ(f.kv.block_refcount(2, bt[1][0]), 2);
+}
+
+/* Checkpoints are keyed on the entry grid: the chain at the lcm of the blocks, as the scheduler's
+ * binding builds it (PCBinding::prefix_hash). A position off the grid has no key. */
+TEST(a_checkpoint_over_mixed_blocks_sits_on_the_entry_grid) {
+    for (const auto& ab : { std::pair<int64_t, int64_t>{ 2, 1 }, { 2, 4 } }) {
+        const int64_t L = std::lcm(ab.first, ab.second);
+        Fixture f;
+        f.cfg.checkpoint_slots = 4;
+        REQUIRE_EQ(f.build_groups(mixed_groups(ab.first, ab.second, true)), RAD_OK);
+        CHECK_EQ(f.pc.checkpoint_interval(), 64ll);
+        const auto prompt = tok_run(7000, 202);
+        publish(f, 1, prompt, 202);
+        const std::vector<BlockHash> hs = chain_of(prompt, (int)L);
+        const int64_t tail = 198 / L * L;
+        for (int64_t pos : { (int64_t)64, tail }) {
+            int32_t slot = -1;
+            CHECK_OK(f.pc.reserve_checkpoint(1, pos, hs[(size_t)(pos / L - 1)], &slot));
+            f.pc.commit_checkpoint(hs[(size_t)(pos / L - 1)]);
+        }
+        auto longer = prompt;
+        for (int i = 0; i < 30; ++i) longer.push_back(80000 + i);
+        CacheHit h = f.pc.lookup(longer, {});
+        CHECK_EQ(h.n_attn_tokens, (int32_t)(202 / L * L));
+        CHECK_EQ(h.n_linear_tokens, (int32_t)tail);
+        CHECK(h.checkpoint_slot >= 0);
+        /* Diverging below the tail resumes at the interval snapshot. */
+        auto edited = prompt;
+        edited[150] += 9;
+        CHECK_EQ(f.pc.lookup(edited, {}).n_linear_tokens, 64);
+        /* Off the grid: refused. */
+        int32_t slot = -1;
+        CHECK_EQ(f.pc.reserve_checkpoint(1, L + 1, hs[0], &slot), RAD_E_INVAL);
+
+        /* The scheduler's binding keys a snapshot on the same chain. */
+        PCBinding<PrefixCache> bind(&f.pc);
+        Request r;
+        r.id = 5;
+        r.prompt = longer;
+        CHECK_OK(bind.reserve_checkpoint(r, 128, &slot));
+        bind.commit_checkpoint(r, 128);
+        auto at128 = prompt;
+        for (size_t k = 130; k < at128.size(); ++k) at128[k] += 7;
+        CHECK_EQ(f.pc.lookup(at128, {}).n_linear_tokens, 128);
+    }
+}
+
+/* The interval must be a multiple of an entry; the chunk quantum, which the engine rounds it to,
+ * is a multiple of every paged group's block and so of the lcm. */
+TEST(a_mixed_cache_refuses_an_interval_off_its_entry_grid) {
+    Fixture f;
+    f.cfg.checkpoint_interval = 66;                  /* a multiple of 2, not of lcm(2, 4) */
+    f.cfg.checkpoint_slots = 2;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.configure(mixed_groups(2, 4, true), f.cfg, f.pools.kv()));
+    log_set_level(Log::Error);
+    CHECK_EQ(f.pc.configure(f.cfg, &f.kv, f.cfg.checkpoint_interval), RAD_E_INVAL);
+    log_set_level(Log::Info);
+    CHECK_OK(f.pc.configure(f.cfg, &f.kv, 68));
+    CHECK_EQ(f.pc.block_size(), 4ll);
+}
+
+/* A model with linear state beside a trunk window and groups at two strides (DeepSeek-V4.1's
+ * shape): the cache indexes both full groups, and the window rides in the checkpoint slot after
+ * the state, so a hit resumes at a snapshot with nothing left out. */
+TEST(a_hybrid_with_a_window_and_mixed_blocks_leaves_only_the_window_to_the_slot) {
+    Fixture f;
+    f.cfg.checkpoint_slots = 4;
+    std::vector<KVGroupInfo> g = mixed_groups(2, 1, true);
+    g.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 5 }, 64));     /* handle 4 */
+    REQUIRE_EQ(f.build_groups(g), RAD_OK);
+    CHECK(f.kv.has_window_snapshot());
+    const KVGroupPlan* w = f.kv.plan(4);
+    REQUIRE(w && w->win_snap);
+    CHECK_EQ(f.kv.checkpoint_bytes(),
+             f.kv.plan(3)->bytes_per_state + w->window_blocks * w->bytes_per_block);
+    CHECK(f.pc.cached_groups() == (std::vector<int32_t>{ 1, 2 }));
+    CHECK_EQ(f.pc.block_size(), 2ll);
+    CHECK(f.pc.report().find("a checkpoint slot carries its window") != std::string::npos);
 }
 
 /* ================================================================== retention */
@@ -4994,24 +5214,26 @@ static void scribble(Fixture& f) {
 
 /* The number of entries whose blocks in `now` hold, in every cached group and layer, exactly what
  * their blocks in `was` held before the move: this rank's own bytes, and for a replicated group
- * rank 0's, the one copy the slot holds. */
+ * rank 0's, the one copy the slot holds. An entry is blocks_per_entry(gi) blocks of group gi. */
 static int64_t same_bytes(Fixture& f, int rank, const std::vector<std::vector<int32_t>>& was,
                           const std::vector<std::vector<int32_t>>& now) {
     const std::vector<int32_t>& cg = f.pc.cached_groups();
     int64_t good = 0;
-    for (size_t k = 0; k < was[0].size(); ++k) {
+    const int64_t n = (int64_t)was[0].size() / f.pc.blocks_per_entry(0);
+    for (int64_t e = 0; e < n; ++e) {
         bool ok = true;
         for (size_t gi = 0; gi < cg.size() && ok; ++gi) {
             const KVGroupPlan* p = f.kv.plan(cg[gi]);
             if (p->zero) continue;
             const int r = p->replicated ? 0 : rank;
-            const int64_t frag = p->layer_bytes_per_block();
-            for (int64_t l = 0; l < p->n_layers && ok; ++l) {
-                const unsigned char* row =
-                    (const unsigned char*)p->base + l * p->layer_stride() + now[gi][k] * frag;
-                for (int64_t i = 0; i < frag && ok; ++i)
-                    ok = row[i] == pat(r, cg[gi] * 16 + l, was[gi][k], i);
-            }
+            const int64_t frag = p->layer_bytes_per_block(), per = f.pc.blocks_per_entry(gi);
+            for (int64_t k = e * per; k < (e + 1) * per && ok; ++k)
+                for (int64_t l = 0; l < p->n_layers && ok; ++l) {
+                    const unsigned char* row = (const unsigned char*)p->base +
+                                               l * p->layer_stride() + now[gi][(size_t)k] * frag;
+                    for (int64_t i = 0; i < frag && ok; ++i)
+                        ok = row[i] == pat(r, cg[gi] * 16 + l, was[gi][(size_t)k], i);
+                }
         }
         good += ok;
     }
@@ -5059,6 +5281,9 @@ struct TransferCase {
     bool replicated = false;
     bool alike = false;
     bool verify = false;
+    /* The key cache at 8-token blocks: an entry is one attention block and two key blocks, and
+     * the slot, the staging entry and the jobs all go by the entry's blocks. */
+    bool mixed = false;
 };
 static void run_transfer(const TransferCase& tc) {
     const int world = tc.world;
@@ -5085,11 +5310,14 @@ static void run_transfer(const TransferCase& tc) {
          * replicated attention group, which leaves that rank's own window empty. */
         if (zero_last && r == world - 1) groups[tc.replicated ? 2 : 1].zero = true;
         if (tc.replicated) groups[1].replicated = true;
+        if (tc.mixed) groups[2].block_size = 8;
         REQUIRE_EQ(fx.back()->build_groups(groups), RAD_OK);
     }
     Fixture& f = *fx[0];
-    const std::vector<int32_t>& cg = f.pc.cached_groups();
-    REQUIRE_EQ(cg.size(), 2u);
+    REQUIRE_EQ(f.pc.cached_groups().size(), 2u);
+    /* One group per block an entry holds (PrefixCache::entry_groups), as bringup passes them. */
+    const std::vector<int32_t>& cg = f.pc.entry_groups();
+    REQUIRE_EQ(cg.size(), tc.mixed ? 3u : 2u);
     /* The slot as bringup lays it out: a replicated group once at the front, then each rank's own
      * window following the previous ones. Checked against the plain sums here. */
     std::vector<const KVManager*> kvs;
@@ -5146,6 +5374,7 @@ static void run_transfer(const TransferCase& tc) {
     REQUIRE_EQ(f.pc.lookup(prompt, {}, &hit).n_attn_tokens, 320);
     const std::vector<std::vector<int32_t>> was = hit;
     CHECK(was[0][0] != was[1][0]);
+    CHECK_EQ((int64_t)was[1].size(), tc.mixed ? 40ll : 20ll);
     for (int r = 0; r < world; ++r) fill(*fx[(size_t)r], r, tc.alike);
 
     /* ---- out ---- */
@@ -5232,6 +5461,24 @@ TEST(a_conversation_restored_from_host_is_byte_identical_in_new_blocks) {
 TEST(each_rank_restores_its_own_window_of_a_shared_slot) {
     run_transfer({ 2, /*fragment=*/false });
     run_transfer({ 2, /*fragment=*/true });
+}
+/* An entry over groups at different block sizes moves as its blocks: one attention block and two
+ * key-cache blocks a slot, each through its own staging window, and every byte comes back. With a
+ * replicated attention group beside a zero rank the windows still stay apart. */
+TEST(an_entry_over_mixed_block_sizes_moves_through_the_tiers_block_by_block) {
+    TransferCase tc;
+    tc.mixed = true;
+    for (int world : { 1, 2 })
+        for (bool fragment : { false, true }) {
+            tc.world = world;
+            tc.fragment = fragment;
+            run_transfer(tc);
+        }
+    tc.world = 3;
+    tc.fragment = false;
+    tc.zero_last = true;
+    tc.replicated = true;
+    run_transfer(tc);
 }
 TEST(a_rank_with_a_zero_group_moves_only_its_own_groups) {
     run_transfer({ 3, /*fragment=*/false, /*zero_last=*/true });
@@ -6410,6 +6657,81 @@ TEST(a_checkpoint_carries_the_window_page_by_page_and_skips_the_padding) {
     int64_t moved = 0;
     for (int64_t i = 0; i < kv.checkpoint_bytes(); ++i) moved += blob[i] != 0x3C;
     CHECK_EQ(moved, 0ll);
+    rad_stream_destroy(st);
+}
+
+/* Linear state, a conv window and a trunk window in one slot, as on DeepSeek-V4.1: the state
+ * section first in plan order, then the window pages, and a restore puts each back where it
+ * belongs -- the state into the resumed sequence's slots, the pages into its seeded blocks. */
+TEST(a_checkpoint_carries_linear_state_and_the_window_together) {
+    if (!host_backend_or_skip("the hybrid checkpoint round trip")) return;
+    Fixture f;
+    f.cfg.checkpoint_slots = 4;
+    std::vector<KVGroupInfo> g = hybrid_conv_groups();
+    g.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 7, 8 }, 64));   /* handle 4 */
+    REQUIRE_EQ(f.build_groups(g), RAD_OK);
+    const KVGroupPlan* w = f.kv.plan(4);
+    REQUIRE(w && w->win_snap && f.kv.has_window_snapshot());
+    const int64_t state = f.kv.plan(G_GDN)->bytes_per_state + f.kv.plan(G_CV)->bytes_per_state;
+    const int64_t page = w->bytes_per_block, lb = w->layer_bytes_per_block();
+    REQUIRE_EQ(f.kv.checkpoint_bytes(), state + w->window_blocks * page);
+    auto block = [&](int64_t l, int32_t b) {
+        return (unsigned char*)w->base + l * w->layer_stride() + b * lb;
+    };
+    for (int64_t l = 0; l < w->n_layers; ++l)
+        for (int32_t b = 0; b < (int32_t)w->n_blocks; ++b)
+            for (int64_t i = 0; i < lb; ++i) block(l, b)[i] = pat(7, l, b, i);
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 400));
+    const std::vector<int32_t> a = slots_of(f.kv, 1);
+    fill_states(f.kv, 0);
+    std::vector<int32_t> rows;
+    REQUIRE(f.kv.window_rows(1, 400, &rows));
+    int32_t ck = -1;
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&ck), RAD_OK);
+    unsigned char* blob = (unsigned char*)f.kv.checkpoint_ptr(ck);
+    std::memset(blob, 0x5A, (size_t)f.kv.checkpoint_bytes());
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_OK(f.kv.checkpoint_save(a.data(), (int)a.size(), ck, st, &rows));
+    CHECK_OK(rad_stream_sync(st));
+    int64_t off = 0, wrong = 0;
+    for (int32_t gi : { (int32_t)G_GDN, (int32_t)G_CV }) {
+        const KVGroupPlan* p = f.kv.plan(gi);
+        const int64_t sl = p->bytes_per_state / p->n_layers;
+        for (int64_t l = 0; l < p->n_layers; ++l, off += sl)
+            for (int64_t i = 0; i < sl; ++i) wrong += blob[off + i] != pat(0, gi * 16 + l, a[(size_t)gi], i);
+    }
+    CHECK_EQ(off, state);
+    for (int64_t j = 0; j < w->window_blocks; ++j)
+        for (int64_t l = 0; l < w->n_layers; ++l)
+            for (int64_t i = 0; i < lb; ++i) {
+                const unsigned char want = rows[(size_t)j] >= 0 ? pat(7, l, rows[(size_t)j], i) : 0x5A;
+                wrong += blob[state + j * page + l * lb + i] != want;
+            }
+    CHECK_EQ(wrong, 0ll);
+
+    /* Back into a fresh sequence: its state slots take A's copy 0, its seeded window the pages. */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.seed_window(2, 400));
+    CHECK_OK(f.kv.ensure(2, 432, 400));              /* the chunk after the hit, as admit_one */
+    const std::vector<int32_t> b = slots_of(f.kv, 2);
+    REQUIRE(b[(size_t)G_GDN] >= 0 && b[(size_t)G_CV] >= 0);
+    std::vector<int32_t> rows2;
+    REQUIRE(f.kv.window_rows(2, 400, &rows2));
+    for (int64_t l = 0; l < w->n_layers; ++l)
+        for (int32_t r : rows2) if (r >= 0) std::memset(block(l, r), 0xEE, (size_t)lb);
+    CHECK_OK(f.kv.checkpoint_restore(b.data(), (int)b.size(), ck, st, &rows2));
+    CHECK_OK(rad_stream_sync(st));
+    CHECK_EQ(states_wrong(f.kv, 0, b, a), 0ll);
+    wrong = 0;
+    for (size_t j = 0; j < rows2.size(); ++j) {
+        if (rows2[j] < 0) continue;
+        for (int64_t l = 0; l < w->n_layers; ++l)
+            for (int64_t i = 0; i < lb; ++i) wrong += block(l, rows2[j])[i] != pat(7, l, rows[j], i);
+    }
+    CHECK_EQ(wrong, 0ll);
     rad_stream_destroy(st);
 }
 

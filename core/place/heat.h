@@ -210,6 +210,9 @@ private:
     std::vector<Tier>    tier_;
     std::vector<uint8_t> busy_;
     std::vector<uint8_t> movable_;
+    /* --expert-pin-top: a decode-hot resident the planner marked unmovable is never a demotion
+     * candidate, even where a later pass made its unit movable again. */
+    std::vector<uint8_t> pinned_;
     std::vector<int32_t> layer_of_;
     /* Bit 0: promoted before. Bit 1: demoted before. Feeds the readmit counters. */
     std::vector<uint8_t> ever_;

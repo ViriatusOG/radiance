@@ -36,6 +36,11 @@ struct FrameRGBA {
 /* Whether this build has a decoder. */
 bool decoder_available();
 
+/* "libavformat <version>" when the decoder is built in, "absent (built without libav*)"
+ * when it is not: one string for the startup report and /diagnostics, so a media 500 can be
+ * read off the report instead of bisected. */
+std::string decoder_version();
+
 /* The first frame of an image (or of anything with a video stream). Refuses a source over
  * `max_pixels`, which bounds what a request can make the server allocate before any resize. */
 int decode_image(const uint8_t* data, size_t n, int64_t max_pixels, Frame* out, std::string* why);

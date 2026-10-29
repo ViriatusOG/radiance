@@ -142,6 +142,7 @@ struct Plugin {
     void (*pin_gather)(int) = nullptr;
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
+    void (*pin_hc_dec)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -212,6 +213,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gather_pin_form", &pl->pin_gather);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
+    okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -4146,9 +4148,10 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  *
  * The key heads' conv state must have moved, so the check is sensitive. The anchor form runs in a
  * child process, as in gdn_recurrent_anchor. `i8` runs both at int8 codes and also holds the pair's
- * codes to quant_act_i8g over its `o`. */
+ * codes to quant_act_i8g over its `o`. `f32w` hands the fold the conv weight in f32, as a GGUF
+ * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change. */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
-                              bool i8 = false) {
+                              bool i8 = false, bool f32w = false) {
     const RadKernelInfo* rf = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
     const RadKernelInfo* rc = find(pl, "gdn_conv_update_w4_h128_bf16");
     const RadKernelInfo* rr = find(pl, "gdn_recurrent_update_k128_v128_bf16_fp32state");
@@ -4175,7 +4178,8 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     const std::vector<uint16_t> hw = bf((size_t)(conv_dim * W), 0.5f);
     const std::vector<uint16_t> hcs = bf((size_t)(CSLOTS * conv_dim * SL), 1.0f);
     std::vector<float> hst((size_t)(SSLOTS * H * V * K)), halog((size_t)H), hdtb((size_t)H),
-                       hnw((size_t)V);
+                       hnw((size_t)V), hwf(hw.size());
+    for (size_t i = 0; i < hw.size(); ++i) hwf[i] = h_bf16(hw[i]);
     for (auto& e : hst) e = 0.1f * rnd();
     for (int64_t h = 0; h < H; ++h) { halog[(size_t)h] = -2.0f + 0.25f * (float)h;
                                       hdtb[(size_t)h]  = -1.0f + 0.5f * (float)h; }
@@ -4196,6 +4200,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     void* d_in = dev(nullptr, in_b);
     void* d_ab = dev(nullptr, (size_t)(Td * 2 * H) * 2);
     void* d_w = dev(hw.data(), hw.size() * 2);
+    void* d_wf = dev(hwf.data(), hwf.size() * 4);
     void* d_alog = dev(halog.data(), halog.size() * 4);
     void* d_dtb = dev(hdtb.data(), hdtb.size() * 4);
     void* d_nw = dev(hnw.data(), hnw.size() * 4);
@@ -4224,6 +4229,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     const RadTensor ta = view(d_ab, RAD_BF16, Td, H, 2 * H, 0);
     const RadTensor tb = view(d_ab, RAD_BF16, Td, H, 2 * H, H);
     const RadTensor tw = T(d_w, RAD_BF16, { conv_dim, W });
+    const RadTensor tfw = f32w ? T(d_wf, RAD_F32, { conv_dim, W }) : tw;
     const RadTensor tal = T(d_alog, RAD_F32, { H }), tdt = T(d_dtb, RAD_F32, { H });
     const RadTensor tnw = T(d_nw, RAD_F32, { V });
     const RadTensor tci = T(d_cidx, RAD_I32, { N }), tsi = T(d_sidx, RAD_I32, { N, COLS });
@@ -4269,7 +4275,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
             e = run(rr, { tq, tk, tv, ta, tb, tal, tdt, st(0), tsi, tna, tcu, tz, tnw, to(0),
                           toq(0), tos(0) }, pr);
         if (e != RAD_OK) { why = "pair rc=" + std::to_string(e); break; }
-        e = run(rf, { tx, tw, none, cs(1), tci, ta, tb, tal, tdt, st(1), tsi, tna, tcu, tz, tnw,
+        e = run(rf, { tx, tfw, none, cs(1), tci, ta, tb, tal, tdt, st(1), tsi, tna, tcu, tz, tnw,
                       to(1), toq(1), tos(1) }, pf);
         if (e != RAD_OK) { why = "fold rc=" + std::to_string(e); break; }
 
@@ -4316,6 +4322,8 @@ static void gdn_conv_fold(const Plugin& pl) {
     const char* row = "gdn_conv_recurrent_update_k128_v128_bf16";
     const char* nmp = "gdn_conv_recurrent_update is byte-identical to the pair, per_candidate";
     const char* nma = "gdn_conv_recurrent_update is byte-identical to the pair, anchor";
+    const char* nmf = "gdn_conv_recurrent_update over an f32 conv weight is byte-identical to the "
+                      "pair over its bf16 twin, per_candidate";
     if (sel(row)) {
         gdn_conv_fold_run(pl, nmp, "per_candidate");
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update is byte-identical to the pair at int8 "
@@ -4323,6 +4331,174 @@ static void gdn_conv_fold(const Plugin& pl) {
                           "per_candidate", true);
     }
     if (sel(row) || sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
+    if (sel(row) || sel(nmf)) gdn_conv_fold_run(pl, nmf, "per_candidate", false, true);
+}
+
+/* gdn_conv_prep and gdn_conv_update over an f32 weight, as a GGUF stores ssm_conv1d, against the
+ * same weight in bf16.
+ *
+ * The weight's values are bf16's, so both forms widen to the same taps and every byte a row writes
+ * must match: q, k and v, g and beta at prefill, and the conv state. Both runs start from identical
+ * copies of the cache and from outputs poisoned with 0xFF, so an element the f32 instance never
+ * writes is caught even where the bf16 one misses it as well. Prefill has two sequences seeded
+ * from their cached history, one over two chunks, and a one-token sequence without; decode has
+ * uneven windows and read offsets, sequence 1 at slot 0. The cache must have moved, and an f16
+ * weight is refused. */
+static void gdn_conv_f32_weight(const Plugin& pl) {
+    const struct { const char* row; const char* nm; bool prep; } forms[] = {
+        { "gdn_conv_prep_w4_h128_bf16",
+          "gdn_conv_prep over an f32 weight is byte-identical to its bf16 twin", true },
+        { "gdn_conv_update_w4_h128_bf16",
+          "gdn_conv_update over an f32 weight is byte-identical to its bf16 twin", false },
+    };
+    for (const auto& f : forms) {
+        if (!sel(f.row) && !sel(f.nm)) continue;
+        const RadKernelInfo* r = find(pl, f.row);
+        if (!r) { ok(f.nm, false, "row absent"); continue; }
+
+        const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 3, W = 4, MQ = 4, CSLOTS = 3;
+        const int64_t xdim = 2 * Hg * K + H * V;
+        /* Prefill reads W - 1 taps of history from a W-deep slot; decode rolls a W - 2 + MQ one. */
+        const int64_t SL = f.prep ? W : W - 2 + MQ;
+        const int32_t plen[N] = { 70, 1, 57 }, dlen[N] = { 4, 1, 3 };
+        const int32_t slot[N] = { 2, 0, 1 }, nacc[N] = { 2, 1, 3 };
+        const uint8_t init[N] = { 1, 0, 1 };
+        int64_t Tn = 0;
+        std::vector<int32_t> cu(1, 0);
+        for (int64_t n = 0; n < N; ++n) {
+            Tn += f.prep ? plen[n] : dlen[n];
+            cu.push_back((int32_t)Tn);
+        }
+
+        uint32_t seed = 0x2f37c0d5u;
+        auto rnd = [&seed]() {
+            seed = st_mix32(seed + 0x9e3779b9u);
+            return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f;
+        };
+        auto bf = [&](size_t n, float s) {
+            std::vector<uint16_t> v(n);
+            for (auto& e : v) e = h_to_bf16(s * rnd());
+            return v;
+        };
+        const std::vector<uint16_t> hw = bf((size_t)(xdim * W), 0.5f), hb = bf((size_t)xdim, 0.25f);
+        const std::vector<uint16_t> hx = bf((size_t)(Tn * xdim), 1.0f);
+        const std::vector<uint16_t> hab = bf((size_t)(Tn * 2 * H), 1.0f);
+        const std::vector<uint16_t> hcs = bf((size_t)(CSLOTS * xdim * SL), 1.0f);
+        std::vector<float> hwf(hw.size()), halog((size_t)H), hdtb((size_t)H);
+        for (size_t i = 0; i < hw.size(); ++i) hwf[i] = h_bf16(hw[i]);
+        for (int64_t h = 0; h < H; ++h) { halog[(size_t)h] = -2.0f + 0.25f * (float)h;
+                                          hdtb[(size_t)h]  = -1.0f + 0.5f * (float)h; }
+
+        auto dev = [](const void* h, size_t bytes) {
+            void* d = dalloc(bytes);
+            if (d && h) st_memcpy(d, h, bytes, hipMemcpyHostToDevice);
+            return d;
+        };
+        const size_t cs_b = hcs.size() * 2, qk_b = (size_t)(Tn * Hg * K) * 2,
+                     v_b = (size_t)(Tn * H * V) * 2, g_b = (size_t)(Tn * H) * 4;
+        void* d_x = dev(hx.data(), hx.size() * 2);
+        void* d_ab = dev(hab.data(), hab.size() * 2);
+        void* d_b = dev(hb.data(), hb.size() * 2);
+        void* d_w[2] = { dev(hw.data(), hw.size() * 2), dev(hwf.data(), hwf.size() * 4) };
+        void* d_alog = dev(halog.data(), halog.size() * 4);
+        void* d_dtb = dev(hdtb.data(), hdtb.size() * 4);
+        void* d_slot = dev(slot, sizeof(slot));
+        void* d_nacc = dev(nacc, sizeof(nacc));
+        void* d_init = dev(init, sizeof(init));
+        void* d_cu = dev(cu.data(), cu.size() * 4);
+        void* d_cs[2]; void* d_q[2]; void* d_k[2]; void* d_v[2]; void* d_g[2]; void* d_beta[2];
+        for (int i = 0; i < 2; ++i) {
+            d_cs[i] = dev(hcs.data(), cs_b);
+            d_q[i] = dev(nullptr, qk_b); d_k[i] = dev(nullptr, qk_b); d_v[i] = dev(nullptr, v_b);
+            d_g[i] = dev(nullptr, g_b); d_beta[i] = dev(nullptr, g_b);
+        }
+        if (!d_x || !d_cu || !d_cs[1] || !d_beta[1]) { ok(f.nm, false, "hipMalloc"); continue; }
+        for (int i = 0; i < 2; ++i) {
+            st_memset(d_q[i], 0xFF, qk_b); st_memset(d_k[i], 0xFF, qk_b);
+            st_memset(d_v[i], 0xFF, v_b);  st_memset(d_g[i], 0xFF, g_b);
+            st_memset(d_beta[i], 0xFF, g_b);
+        }
+
+        /* a and b_gate are column views of one [Tn, 2H] row, as the block lays them out. */
+        auto view = [](void* base, int64_t rows, int64_t cols, int64_t pitch, int64_t col0) {
+            RadTensor t = T((char*)base + (size_t)col0 * 2, RAD_BF16, { rows, cols });
+            t.stride[0] = pitch;
+            return t;
+        };
+        auto ops = [&](int i, uint32_t wdt) {
+            const RadTensor tx = T(d_x, RAD_BF16, { Tn, xdim }), tb = T(d_b, RAD_BF16, { xdim });
+            const RadTensor tw = T(d_w[i], wdt, { xdim, W });
+            const RadTensor tcs = T(d_cs[i], RAD_BF16, { CSLOTS, xdim, SL });
+            const RadTensor tcu = T(d_cu, RAD_I32, { N + 1 }), tsl = T(d_slot, RAD_I32, { N });
+            const RadTensor tq = T(d_q[i], RAD_BF16, { Tn, Hg, K }),
+                            tk = T(d_k[i], RAD_BF16, { Tn, Hg, K }),
+                            tv = T(d_v[i], RAD_BF16, { Tn, H, V });
+            if (!f.prep)
+                return std::vector<RadTensor>{ tx, tw, tb, tcs, tsl, T(d_nacc, RAD_I32, { N }), tcu,
+                                               tq, tk, tv };
+            return std::vector<RadTensor>{
+                tx, tw, tb, T(d_alog, RAD_F32, { H }), T(d_dtb, RAD_F32, { H }), tcs, tcu,
+                view(d_ab, Tn, H, 2 * H, 0), view(d_ab, Tn, H, 2 * H, H), tsl,
+                T(d_init, RAD_U8, { N }), tq, tk, tv, T(d_g[i], RAD_F32, { Tn, H }),
+                T(d_beta[i], RAD_F32, { Tn, H }) };
+        };
+        std::vector<RadParam> ps = f.prep
+            ? std::vector<RadParam>{ PI("M", Tn), PI("head_k", K), PI("head_v", V),
+                                     PI("chunk", 64), PI("conv_width", W) }
+            : std::vector<RadParam>{ PI("q_len", MQ), PI("head_k", K), PI("head_v", V),
+                                     PI("conv_width", W) };
+        auto run = [&](std::vector<RadTensor> ts) {
+            RadArgs a; std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            const int rc_ = r->launch(&a, (RadStream) nullptr);
+            return rc_ != RAD_OK ? rc_ : (st_stream_sync(nullptr) != hipSuccess ? -1000 : RAD_OK);
+        };
+        auto fetch = [](void* d, size_t b) {
+            std::vector<uint8_t> h(b);
+            st_memcpy(h.data(), d, b, hipMemcpyDeviceToHost);
+            return h;
+        };
+
+        std::string why;
+        for (int i = 0; i < 2 && why.empty(); ++i) {
+            const int e = run(ops(i, i ? RAD_F32 : RAD_BF16));
+            if (e != RAD_OK) why = std::string(i ? "f32" : "bf16") + " rc=" + std::to_string(e);
+        }
+        struct Out { const char* what; void* a; void* b; size_t n; size_t es; };
+        std::vector<Out> outs = { { "q", d_q[0], d_q[1], qk_b, 2 },
+                                  { "k", d_k[0], d_k[1], qk_b, 2 },
+                                  { "v", d_v[0], d_v[1], v_b, 2 },
+                                  { "conv_state", d_cs[0], d_cs[1], cs_b, 2 } };
+        if (f.prep) {
+            outs.push_back({ "g", d_g[0], d_g[1], g_b, 4 });
+            outs.push_back({ "beta", d_beta[0], d_beta[1], g_b, 4 });
+        }
+        for (const Out& o : outs) {
+            if (!why.empty()) break;
+            const std::vector<uint8_t> A = fetch(o.a, o.n), B = fetch(o.b, o.n);
+            size_t diff = 0, poisoned = 0;
+            for (size_t j = 0; j < o.n; ++j) diff += A[j] != B[j];
+            for (size_t j = 0; j < o.n; j += o.es) {
+                size_t ff = 0;
+                for (size_t e = 0; e < o.es; ++e) ff += B[j + e] == 0xFF;
+                poisoned += ff == o.es;
+            }
+            if (diff)
+                why = std::string(o.what) + " differs in " + std::to_string(diff) + " of " +
+                      std::to_string(o.n) + " bytes";
+            else if (poisoned)
+                why = std::string(o.what) + ": " + std::to_string(poisoned) + " elements unwritten";
+        }
+        if (why.empty() && fetch(d_cs[1], cs_b) == std::vector<uint8_t>(
+                               (const uint8_t*)hcs.data(), (const uint8_t*)hcs.data() + cs_b))
+            why = "the conv state never moved";
+        if (why.empty()) {
+            const int e = run(ops(1, RAD_F16));
+            if (e != RAD_E_DTYPE) why = "an f16 weight gave rc=" + std::to_string(e);
+        }
+        ok(f.nm, why.empty(), why);
+    }
 }
 
 /* The gated norm's gate as a column slice, which one pitch cannot describe.
@@ -17914,6 +18090,129 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
                    : "the int8 run changed" + bad);
 }
 
+/* The gated residual's read at its decode kernels, byte for byte: the launcher's rule (kernels A and
+ * B as one grid at one to seven rows, the tiled up-mix pipelined from eight) against the kernels it
+ * replaced, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
+ * one-grid form keys its counters on it). The two forms must dispatch different kernels, so a pin
+ * that is ignored cannot pass by comparing a form with itself. */
+static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule "
+                               "byte-identical to the previous kernels", (long long)M,
+                               i8 ? "int8" : "E4M3");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.pin_hc_dec || !pl.record) { skip(nm.c_str(), "no r4d_hc_read_pin_decode"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0xD1B54A32D192ED03ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; };
+    Out out[2];
+    for (int form = 0; form < 2; ++form) {
+        pl.pin_hc_dec(form);
+        st_memset(d_x, 0, xb); st_memset(d_q, 0, qb); st_memset(d_qs, 0, sb);
+        st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb); st_memset(d_inj, 0, ib);
+        const void* fns[16] = {};
+        pl.record(fns, 16);
+        const int rc = r->launch(&a, (RadStream)hs);
+        const int nd = pl.record(nullptr, 0);
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("%s rc=%d", form ? "the previous kernels" : "the rule", rc));
+            pl.pin_hc_dec(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        out[form].fns.assign(fns, fns + (nd < 16 ? nd : 16));
+        auto get = [&](std::vector<uint8_t>& v, void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[form].x, d_x, xb); get(out[form].inj, d_inj, ib); get(out[form].q, d_q, qb);
+        get(out[form].qs, d_qs, sb); get(out[form].rq, d_rq, qb); get(out[form].rs, d_rs, sb);
+    }
+    pl.pin_hc_dec(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    if (out[0].x != out[1].x)     bad += " x";
+    if (out[0].inj != out[1].inj) bad += " inj";
+    if (out[0].q != out[1].q)     bad += " q";
+    if (out[0].qs != out[1].qs)   bad += " qs";
+    if (out[0].rq != out[1].rq)   bad += " rq";
+    if (out[0].rs != out[1].rs)   bad += " rs";
+    int64_t nz = 0;
+    for (uint8_t v : out[0].q) nz += v != 0;
+    const bool distinct = out[0].fns != out[1].fns;
+    ok(nm.c_str(), bad.empty() && nz > (int64_t)qb / 2 && distinct,
+       !bad.empty() ? "differs in" + bad
+       : !distinct  ? std::string("both forms dispatched the same kernels")
+                    : fmt("%lld of %zu codes non-zero; %zu and %zu launches", (long long)nz, qb,
+                          out[0].fns.size(), out[1].fns.size()));
+}
+
 /* The gated residual's read at a prefill chunk: hc_read_e4m3 at Qwen3.8-Flash-Next's shape (n
  * 2560, four streams, lowrank 320, inject gains, the fp8 twin and its rotated twin). Several
  * launches at prefill, so also a harness for libr4d/isa/trace.sh. Random codes, small positive
@@ -18024,11 +18323,20 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
                                          "the wide kernels", "the PF2 kernels" };
     std::vector<Out> outs;
+    std::vector<int> ran;   /* the form each of `outs` came from */
     for (int form = f_lo; form <= f_hi; ++form) {
         if (pl.pin_hc) pl.pin_hc(form);
         st_memset(d_x, 0, xb); st_memset(d_inj, 0, ib); st_memset(d_q, 0, qb);
         st_memset(d_qs, 0, sb); st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb);
         const int rc = r->launch(&a, rst);
+        /* A pinned form refusing the shape is not a failure: the wide kernels serve only the wide
+         * row tile, so from 8 rows up to it --perfhc times the decode tiles' kernels alone. The
+         * first form (the decode tiles') must serve. */
+        if (rc == RAD_E_SHAPE && pl.pin_hc && form > f_lo) {
+            skip(fmt("%s prefill form '%s' at M=%lld", rn, kForm[form], (long long)M).c_str(),
+                 "not served at this row count");
+            continue;
+        }
         if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
             ok(fmt("%s prefill form '%s' at M=%lld is served", rn, kForm[form],
                    (long long)M).c_str(), false, fmt("rc=%d", rc));
@@ -18043,6 +18351,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
         get(o.x, d_x, xb); get(o.inj, d_inj, ib); get(o.q, d_q, qb);
         get(o.qs, d_qs, sb); get(o.rq, d_rq, qb); get(o.rs, d_rs, sb);
         outs.push_back(std::move(o));
+        ran.push_back(form);
     }
     /* Form f against the decode tiles' kernels, outs[0]. */
     auto same = [&](size_t f, const char* what) {
@@ -18061,11 +18370,10 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
            bad.empty() && nz > qb / 2, bad.empty() ? fmt("%zu of %zu codes non-zero", nz, qb)
                                                    : "differs in" + bad);
     };
-    for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[f_lo + (int)f]);
+    for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[ran[f]]);
 
     if (timed) {
-        for (int form = f_lo; form <= f_hi; ++form) {
-            if (pl.pin_hc) pl.pin_hc(form);
+        auto time_now = [&](const char* label) {
             hipEvent_t w0, w1;
             st_ev_create(&w0); st_ev_create(&w1);
             st_ev_record(w0, hs);
@@ -18081,8 +18389,21 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
             const double flop = 2.0 * (double)M * (double)HN * (double)(2 * lr + hc);
             std::printf("%s at M=%lld (n %lld, hc %lld, lowrank %lld, inject, fp8 twin + "
                         "rotated), %s: %.1f us a call, %.1f TFLOP/s\n", rn, (long long)M,
-                        (long long)n, (long long)hc, (long long)lr, kForm[form], us,
+                        (long long)n, (long long)hc, (long long)lr, label, us,
                         flop / (us * 1e6));
+        };
+        for (const int form : ran) {
+            if (pl.pin_hc) pl.pin_hc(form);
+            time_now(kForm[form]);
+        }
+        /* The decode kernels against the ones they replaced (r4d_hc_read_pin_decode), under the
+         * launcher's prefill rule. */
+        if (pl.pin_hc_dec && f8) {
+            if (pl.pin_hc) pl.pin_hc(0);
+            pl.pin_hc_dec(1);
+            time_now("the previous decode kernels");
+            pl.pin_hc_dec(0);
+            time_now("the launcher's rule");
         }
     }
     if (pl.pin_hc) pl.pin_hc(0);
@@ -20254,6 +20575,27 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
         };
         perf_row(pl, "gemm_fp8a8_nt_m16", ts, ps, d_w, wbytes, copies, bytes, iters);
         perf_row(pl, "gemm_fp8a8_tiled", ts, ps, d_w, wbytes, copies, bytes, iters);
+        /* The gated row, at a gate_up shape: N is the gate and up rows together, as the engine
+         * fuses them, and the output is their quantised SiLU product, N / 2 wide. It refuses a
+         * shape the split rule would split. */
+        if (N % 256 == 0 && K % 256 == 0 && M <= 64) {
+            const int64_t nout = N / 2, gkb = nout / 128;
+            void* d_gq = dalloc((size_t)M * nout);
+            void* d_gs = dalloc((size_t)M * gkb * 4);
+            void* d_gy = dalloc((size_t)M * nout * 2);
+            if (!d_gq || !d_gs || !d_gy) {
+                std::printf("  %-22s hipMalloc failed\n", "gemm_fp8a8_gated_nt_m16");
+            } else {
+                perf_row(pl, "gemm_fp8a8_gated_nt_m16",
+                         { T(d_q, RAD_F8E4M3, { M, K }), T(d_qs, RAD_F32, { M, sk }),
+                           T(d_w, RAD_F8E4M3, { N, K }), T(d_s, RAD_BF16, { sn, sk }),
+                           T(d_gq, RAD_F8E4M3, { M, nout }), T(d_gs, RAD_F32, { M, gkb }),
+                           T(d_gy, RAD_BF16, { M, nout }) },
+                         { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                           PS("dtype", "fp8a8"), PS("act", "silu") },
+                         d_w, wbytes, copies, bytes, iters);
+            }
+        }
     }
 
     /* The lm head, a decode GEMM too. Its weight is [N][K + 2*nkb] E4M3 with each row's bf16
@@ -25142,6 +25484,23 @@ struct ArThread {
     int64_t spitch = 0;
 };
 
+/* Whether every rank device a collective case is about to use can reach every other directly.
+ * The engine carries this fact (device.p2p, RAD_FACT_P2P) and selects around its absence; a card
+ * count is not enough. hipDeviceCanAccessPeer answers it without a kernel: on a box with the IOMMU
+ * off the peer path is absent, the enable call throws `enable_peer: invalid device ordinal`, and
+ * init returns RAD_E_DEVICE — a skip line, like the card-count gates, not a failure. */
+static bool ar_peer_path_ok(const std::vector<int>& devs, int world) {
+    if (world < 2 || (int)devs.size() < world) return false;
+    for (int a = 0; a < world; ++a)
+        for (int b = 0; b < world; ++b) {
+            if (a == b) continue;
+            int can = 0;
+            if (hipDeviceCanAccessPeer(&can, devs[a], devs[b]) != hipSuccess) return false;
+            if (!can) return false;
+        }
+    return true;
+}
+
 static void ar_worker(ArThread* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
     std::vector<RadParam> ps = {
@@ -25179,6 +25538,7 @@ static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs, const ch
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
 
     /* 8192 fp32 elements: whole 16-byte pushes, small enough to exercise the handshake rather
      * than the link. */
@@ -25290,6 +25650,7 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs, co
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
     std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
     ta.join();
@@ -25314,6 +25675,7 @@ static void ar_two_rank_late(const Plugin& pl, const std::vector<int>& devs, con
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     pl.pin_late_push(1);
     ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
     std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
@@ -25402,6 +25764,7 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
 
     const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
     ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel };
@@ -25493,6 +25856,7 @@ static void ar_wide_rank(const Plugin& pl, const std::vector<int>& devs, const c
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     const int64_t numel = 8192;
     const std::string w = std::to_string(world);
     std::vector<ArThread> t;
@@ -25787,6 +26151,7 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     using Run = ArPatternRun;
     /* The three-rank list walks the UNEVEN split (words % 3 of 0, 1 and 2); the four- and
      * eight-rank rows cannot be given one -- cArTsExact4/cArTsExact8/cArTi8Ts4 constrain numel so
@@ -25869,6 +26234,7 @@ static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, con
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if ((int)devs.size() < W) { skip(name, "needs 8 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, W)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     /* bf16: 72 elements are 9 words, 8 are one; 8256 is 1032 words, 4196352 is 524544. Without
      * weights the words must divide by eight. */
     const std::vector<ArPatternRun> uneven = {
@@ -26476,6 +26842,7 @@ static void ar_lane_forms(const Plugin& pl, const std::vector<int>& devs, const 
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     struct Run { bool coded; int pat; const char* dtype; std::vector<int64_t> sizes; int oop; };
     /* 1024: one wave a shard; 1055744: 1031 waves, an odd split over the blocks; 524352: bf16
      * outside the coded form; 46137344: the feed-forward reduce at an 8192-token chunk. */
@@ -26610,6 +26977,7 @@ static void ar_wide_ti8(const Plugin& pl, const std::vector<int>& devs, const ch
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     /* 32768 is under the 128 KiB floor and 65544 is not whole groups (at four ranks, not whole
      * SHARD groups -- the 4-rank wire tiles numel by 128): both exact. The rest are
      * lossy: 65536 sits ON the floor (2048 groups, % 3 = 2), then 2048 x 2048 / 2049 / 2050 rows
@@ -26980,6 +27348,7 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     struct Shape { int64_t M, n, hc, top_k; const char* act; bool scratch; };
     std::vector<Shape> shapes;
     if (!want_gather) {
@@ -27279,6 +27648,7 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
         skip(name, world == 4 ? "needs 4 gfx1201 cards" : "needs 2 gfx1201 cards");
         return;
     }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     /* Only the four-rank P2P row ends the engine's link hold; the host twin and the two-rank rows
      * leave it alone. */
     const bool releases = world == 4 && !nm_ends_with(name, "_host");
@@ -29518,6 +29888,7 @@ static void device_phase(const Plugin& pl) {
         }
         gdn_recurrent_anchor(pl);
         gdn_conv_fold(pl);
+        gdn_conv_f32_weight(pl);
         if (sel("gdn_gated_rmsnorm_h128_bf16")) {
             const RadKernelInfo* r = find(pl, "gdn_gated_rmsnorm_h128_bf16");
             if (!r) ok("gdn_gated_rmsnorm_h128_bf16", false, "row absent");
@@ -30734,6 +31105,10 @@ static void device_phase(const Plugin& pl) {
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
             for (int64_t m : { 700, 2048 }) hc_read_i8(pl, m, true, 3);
         }
+        /* The decode kernels against the ones they replaced: each one-grid instantiation (1 to 7
+         * rows) and the tiled up-mix at both of its row tiles. */
+        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64 })
+            for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
     }
     if (sel("hc_read_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "
@@ -31179,8 +31554,8 @@ static void usage(void) {
                 "             given byte offsets in a safetensors file, compared with a host\n"
                 "             reference over the same bytes. An offset is 8 + <header length, a\n"
                 "             u64 at byte 0> + the tensor's own data_offsets[0].\n"
-                "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
-                "             weight bandwidth each reaches.\n"
+                "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape (the gated row with\n"
+                "             N a gate_up's width) and print the weight bandwidth each reaches.\n"
                 "  --perfwpa N K M [iters] [pb1]:  the int5 and int4 x int8 tiled GEMMs (gemm_w5a8i8_tiled,\n"
                 "             gemm_w4a8i8_tiled), warmed, min / median time and a hash of the output.\n"
                 "  --perfmxd N K M [iters]:  the dense MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
@@ -31197,8 +31572,9 @@ static void usage(void) {
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
-                "             prefill-tile form (PF2 from M=512) compared byte for byte and timed\n"
-                "             as one op each;\n"
+                "             prefill-tile form that serves M (the wide kernels at the wide tile,\n"
+                "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
+                "             then the previous decode kernels against the launcher's rule;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
                 "             every timed launch (256 empties this card's L2 and last level) and\n"

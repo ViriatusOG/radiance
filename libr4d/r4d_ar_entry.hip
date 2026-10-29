@@ -351,11 +351,13 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
-     * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the scales 1/64, so half
-     * the message plus a thirty-second plus a page is ample. */
+     * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the f32 scales 1/32 of
+     * it, laid out from half the slot; a row padded to whole 512-element chunks
+     * (ar_rmsnorm_quant_fp8) adds up to 7 groups' scales a row, so the scales get a sixteenth
+     * (enough for any row of 512 or more) plus a page. ar_rmsnorm_quant checks the fit. */
     if (in->dtype != 2) {
         R4D_TRY("ar_ipc_alloc(locpack)",
-            lp = r4d_ar_ipc_alloc(in->slot_bytes / 2 + in->slot_bytes / 32 + 4096, 0,
+            lp = r4d_ar_ipc_alloc(in->slot_bytes / 2 + in->slot_bytes / 16 + 4096, 0,
                                   handle, &hlen));
     }
 
@@ -1353,11 +1355,18 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     if (wire != 0 && wire != 6) return RAD_E_INVAL;
     if (wire == 6) {
         const int ce = r4d_ar_rmsnorm_quant_fp8_chunk_elems();
-        if (ce <= 0 || K % ce) return RAD_E_SHAPE;
+        /* Whole 64-element groups a row; the last 512-element chunk may be partial (padded). */
+        if (ce <= 0 || K % 64) return RAD_E_SHAPE;
         /* This rank's packed-half side buffer exists for every bf16 instance; missing means a
          * broken init. */
         if (!in->locpack) return RAD_E_STATE;
-        if (wpo) return RAD_E_UNSUPPORTED;   // the post-norm is the exact wire's only
+        /* The padded message must fit: payload (3/4 byte an element) in the peer slot's half and
+         * in locpack's, the bf16 scales in the slot's other half, the f32 ones in locpack after
+         * half the slot (its allocation: a sixteenth of the slot plus a page). */
+        const long long chunks = M * ((K + ce - 1) / ce), groups = chunks * (ce / 64);
+        if (chunks * (ce * 6 / 8) > in->slot_bytes / 2 || groups * 2 > in->slot_bytes / 2 ||
+            groups * 4 > in->slot_bytes / 16 + 4096)
+            return RAD_E_SHAPE;
     }
 
     R4dArCfg cfgv;

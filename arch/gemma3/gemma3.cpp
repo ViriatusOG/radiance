@@ -828,6 +828,17 @@ struct G3Junction {
     }
 };
 
+/* The tallest step that takes the fp8 junction's lossy twin (G3JunctionFP8::op_ar6); a taller one
+ * keeps the standalone lossy all-reduce, unfused. The fused kernel gives each block one row, so past
+ * a few sequences the standalone all-reduce, spread over more blocks, wins despite its extra
+ * launches. TranslateGemma-27B MXFP4 + DFlash2 at tp 2 on 2x R9700, --tp-wire wht6, production's
+ * flags (--draft-short-from 8), greedy, aggregate tok/s, two rounds, limit never / 16 / 24 / any:
+ * 2 streams (16 rows) 350.7 346.2 / 371.8 367.7 / 370.4 367.0 / 357.7 356.0; 3 (24 rows) 455.8
+ * 451.2 / 455.1 454.2 / 462.8 460.6 / 437.3 436.8; 4 (32 rows) 553.7 553.6 / 557.9 554.2 / 553.9
+ * 560.2 / 521.0 523.0; 8 (32 rows, the short block) 717.4 718.0 / 717.2 720.5 / 716.7 720.8 /
+ * 662.4 661.9. One stream's 8 rows go out exact under the default --tp-wire-min-kb (op_ar). */
+constexpr int64_t kAr6MaxRows = 24;
+
 /* ---- the MXFP4 trunk's junction (libr4d `rmsnorm_quant_fp8`): the add of the branch `x` into
  * the stream `res`, the next block's norm and its E4M3 quantiser, in one op. It has no post-norm
  * slot (rmsnorm_quant_i8's w_post is Gemma 4's), so the branch's post-norm runs just before it:
@@ -836,18 +847,20 @@ struct G3Junction {
 struct G3JunctionFP8 {
     rad_op     op = 0;
     /* At two ranks: the branch's all-reduce and post-norm folded in front
-     * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. The kernel
-     * sends the exact wire only, so under --tp-wire it is declared all the same and taken by the
-     * steps whose message goes out exact anyway (ar_wire_is_exact: a decode step of a few rows,
-     * under --tp-wire-min-kb); a wider step keeps the lossy all-reduce, unfused. */
-    rad_op     op_ar = 0;
+     * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. `op_ar` sends
+     * the exact wire, taken by the steps whose message goes out exact (ar_wire_is_exact: a decode
+     * step of a few rows, under --tp-wire-min-kb); `op_ar6` the rotated 6-bit one, declared under a
+     * lossy --tp-wire and taken by the steps above that up to kAr6MaxRows, byte-identical to the
+     * standalone lossy all-reduce, rmsnorm and rmsnorm_quant_fp8 it replaces. */
+    rad_op     op_ar = 0, op_ar6 = 0;
+    Geom       gm{};
     rad_buf    x = 0, res = 0, q = 0, s = 0;
     rad_weight w = 0, wp = 0;
     int64_t    n = 0;
 
     int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
                 const G3Linear& into, rad_weight wp_ = 0) {
-        x = x_; res = res_; w = w_; wp = wp_; q = into.q8; s = into.s8; n = g.n_embd;
+        x = x_; res = res_; w = w_; wp = wp_; q = into.q8; s = into.s8; n = g.n_embd; gm = g;
         if (!into.mx || into.shared_in || !q || !s || !w) return RAD_E_INVAL;
         if (!rad_op_declared(b, "rmsnorm_quant_fp8")) return RAD_OK;
         op = RAD_OP(b, "rmsnorm_quant_fp8",
@@ -870,14 +883,33 @@ struct G3JunctionFP8 {
                 const rad_buf wa[4] = { x, q, s, res };
                 rad_op_reads (b, op_ar, rd, 2);
                 rad_op_writes(b, op_ar, wa, 4);
+                /* The lossy twin where that wire is reachable and the row is whole 64-element
+                 * groups (the kernel pads a partial last 512-element chunk). */
+                if (!g.wire_exact && n % 64 == 0) {
+                    const RadParam p6[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
+                                            RAD_F64("eps", g.eps), RAD_INT("group", RAD_FP8_BLOCK),
+                                            RAD_INT("world_size", g.world), RAD_STR("dtype", g.dtype),
+                                            RAD_F64("wadd", g.wadd), RAD_INT("wire", 6) };
+                    op_ar6 = rad_decl_op(b, "ar_rmsnorm_post_quant_fp8", p6,
+                                         (int)(sizeof p6 / sizeof p6[0]), ws, 2);
+                    if (op_ar6) {
+                        rad_op_reads (b, op_ar6, rd, 2);
+                        rad_op_writes(b, op_ar6, wa, 4);
+                    }
+                }
             }
         }
         return RAD_OK;
     }
+    /* The fused op for a T-row step's wire, or 0 when its all-reduce stays standalone. */
+    rad_op ar_op(int64_t T) const {
+        if (op_ar && ar_wire_is_exact(gm, T)) return op_ar;
+        return T <= kAr6MaxRows ? op_ar6 : 0;
+    }
     /* x, residual?, w -> q, scale, out_bf16?[, w_post]: the bf16 normed copy is not wanted. */
     void step(RadCtx* c, int64_t T, bool with_ar = false) const {
         if (with_ar)
-            RAD_ISSUE_N(c, op_ar, T, brows(x, T), brows(res, T), RAD_W(w), brows(q, T), brows(s, T),
+            RAD_ISSUE_N(c, ar_op(T), T, brows(x, T), brows(res, T), RAD_W(w), brows(q, T), brows(s, T),
                         RAD_NONE, RAD_W(wp));
         else
             RAD_ISSUE_N(c, op, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
@@ -935,6 +967,7 @@ struct Model {
     G3JunctionFP8 jf0{};
     bool       fuse_mx = false;   /* the MXFP4 trunk's junctions (G3JunctionFP8) */
     bool       fuse_mx_ar = false;   /* ... each with the all-reduce and post-norm folded in */
+    bool       fuse_mx_ar6 = false;  /* ... on the lossy wire too (G3JunctionFP8::op_ar6) */
     bool       fuse_ar = false;
 
     /* The DFlash2 drafter and the trunk taps it reads, only when the container carries one and
@@ -1346,6 +1379,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ar = lay.jf_am.op_ar != 0 && (l + 1 >= g.n_layer || lay.jf_ma.op_ar != 0);
         }
         m.fuse_mx_ar = ar;
+        bool ar6 = ar;
+        for (int64_t l = 0; ar6 && l < g.n_layer; ++l) {
+            const Layer& lay = m.layers[(size_t)l];
+            ar6 = lay.jf_am.op_ar6 != 0 && (l + 1 >= g.n_layer || lay.jf_ma.op_ar6 != 0);
+        }
+        m.fuse_mx_ar6 = ar6;
     }
     /* ---- the weight reads beside the decode all-reduces, at more than one rank;
      * --weight-prefetch off declares none. */
@@ -1674,8 +1713,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
         for (size_t li = 0; li < m.layers.size(); ++li) {
             const Layer& l = m.layers[li];
             const bool last = li + 1 == m.layers.size();
-            /* Per step: the fused junction sends the exact wire only (G3JunctionFP8::op_ar). */
-            const bool far = m.fuse_mx_ar && ar_wire_is_exact(m.g, T);
+            /* Per step: the fused junction takes the step's all-reduce on the exact wire
+             * (G3JunctionFP8::op_ar), and on the lossy one up to kAr6MaxRows where every junction
+             * declared its twin (op_ar6). */
+            const bool far = m.fuse_mx_ar &&
+                             (ar_wire_is_exact(m.g, T) || (m.fuse_mx_ar6 && T <= kAr6MaxRows));
             l.attn.step(c, batch, true, true, far);
             prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
             if (!far) l.attn.post(c, T);
