@@ -82,6 +82,15 @@ bool write_tiny_laya(const std::string& dir, uint64_t seed) {
     lin("act_head.2.weight", 2, A);
     bias("act_head.2.bias", 2);
     ts.push_back(tiny::noise("temperature", { 3 }, r, 0.0f, 1.0f, "F32"));
+    /* f16, as the release and laya's trainer save it, so the convert's rounding to bf16 is tested. */
+    for (tiny::Tensor& t : ts) {
+        if (t.dtype != "BF16") continue;
+        const int64_t n = tiny::numel(t.shape);
+        std::vector<uint8_t> h((size_t)n * 2);
+        for (int64_t i = 0; i < n; ++i) rad_store_f32(h.data(), RAD_F16, i, rad_load_f32(t.bytes.data(), RAD_BF16, i));
+        t.bytes = std::move(h);
+        t.dtype = "F16";
+    }
     if (!tiny::write_safetensors(dir + "/model.safetensors", ts)) return false;
 
     nlohmann::ordered_json root;

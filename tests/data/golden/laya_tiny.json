@@ -1,5 +1,5 @@
 {
- "weights_fnv": "230e9131e87efe05",
+ "weights_fnv": "e1a5d79faebbea22",
  "laya_commit": "fe9a6c3502",
  "requests": [
   {
@@ -120,7 +120,7 @@
      "confidence": 0.0081,
      "answer_confidence": 0.3787,
      "action": {
-      "act_probability": 0.6045
+      "act_probability": 0.6046
      }
     },
     "tone": {

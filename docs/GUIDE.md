@@ -2851,8 +2851,7 @@ runs the encoder and head in the `laya` plugin (`arch/laya`), on the embedding p
 every question of a request in one step, each answered in its pooled row.
 
 ```sh
-rad-convert /srv/models/laya-typed-decisions -o laya-typed-decisions.rad --set decision.type=laya \
-    --recipe data/recipes/laya-bf16.recipe
+rad-convert /srv/models/laya-typed-decisions -o laya-typed-decisions.rad --set decision.type=laya
 radiance --model laya-typed-decisions.rad --port 8000
 ```
 
@@ -2860,8 +2859,9 @@ rad-convert reads the release's folders: `encoder/config.json` for the geometry,
 `rl_agent_config.json` for the sequence budget and the fitted temperatures, and `tokenizer/`. The
 checkpoint's `config.json` already says `model_type: laya`, so `--set decision.type=laya` is
 optional. A checkpoint as the `laya` package downloads it, with no `config.json` of its own,
-converts the same way. The release ships f16 weights, and the recipe rounds the linears and tables
-to bf16, which is how the release computes them on a card.
+converts the same way. The release ships f16 weights. rad-convert rounds the linears and tables to
+bf16 itself, which is how the release computes them on a card, and records the rule in the
+container's recipe.
 
 The request and the response are the same as d1's above. What differs:
 

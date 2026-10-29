@@ -123,6 +123,23 @@ int clef_metadata(const std::string& in, const std::string& config_dir, const Ch
     return 0;
 }
 
+/* The rounding every Laya checkpoint needs: the release ships f16 (laya.train saves .half()), and
+ * the laya plugin reads its linears and tables in bf16, as the release computes them on a card.
+ * Norms and biases are declared f32, an exact widening of f16, so no rule names them. */
+const char* const kLayaBf16 =
+    "token_embd.weight          cast dtype=bf16\n"
+    "type_emb.weight            cast dtype=bf16\n"
+    "scorer.fc1.weight          cast dtype=bf16\n"
+    "scorer.fc2.weight          cast dtype=bf16\n"
+    "blk.*.attn_qkv.weight      cast dtype=bf16\n"
+    "blk.*.attn_out.weight      cast dtype=bf16\n"
+    "blk.*.ffn_in_gate.weight   cast dtype=bf16\n"
+    "blk.*.ffn_down.weight      cast dtype=bf16\n"
+    "head.*.attn_qkv.weight     cast dtype=bf16\n"
+    "head.*.attn_out.weight     cast dtype=bf16\n"
+    "head.*.ffn_up.weight       cast dtype=bf16\n"
+    "head.*.ffn_down.weight     cast dtype=bf16\n";
+
 /* Laya (a checkpoint whose config.json says model_type laya, or --set decision.type=laya): the
  * release keeps its parts in folders, so the encoder's geometry comes from encoder/config.json,
  * the head's settings from rl_agent_config.json and the vocabulary from tokenizer/. The plugin
@@ -605,6 +622,15 @@ int main(int argc, char** argv) {
         (meta.arch == "laya" || (dt && !std::strcmp(dt, "laya"))) &&
         laya_metadata(in, config_dir, meta, &tokjson) < 0)
         return 1;
+    /* f16 to bf16 rounds, so it is a recipe's rule (spec §4.4). Every Laya checkpoint needs the same
+     * rules, so they follow any the caller gave, and the container records them with the rest. */
+    if (meta.arch == "laya") {
+        std::string why;
+        if (recipe.add_text(kLayaBf16, "laya's f16 to bf16 (built in)", &why) < 0) {
+            RAD_ERR("%s", why.c_str());
+            return 1;
+        }
+    }
     /* The quantisation descriptor (which selects the plugin pair) is derived from
      * quantization_config, so a --set of it re-derives the descriptor. E.g. a bf16 checkpoint
      * whose recipe writes Qwen's block fp8 targets qwen35_fp8 by setting what that release
