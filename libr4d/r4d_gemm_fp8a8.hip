@@ -726,11 +726,6 @@ void gemm_8a8_prefill_kernel(const uint8_t* __restrict__ A, const float* __restr
         bn = r / gm;
     }
     const uint32_t m0 = bm * kPBM, n0 = bn * kPBN;
-    // The last band costs a whole band however few of its rows are live (676 rows cost what 768
-    // do). When every row the upper four waves own lies past M, they leave here, before the first
-    // barrier, which then waits only for the waves still running; the lower four stage rows 0..63
-    // themselves (threads 0..127) and write every s_as entry, so nothing they read is theirs.
-    if (wa == 1u && m0 + kPTA * 16u >= M) return;
     const uint32_t ksuper = K / kSuperK, nkb = K / kBlock;
 
     // Staging: two threads a row, 32 bytes each. Rows past M re-read row M-1, and every load is

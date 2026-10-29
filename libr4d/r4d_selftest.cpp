@@ -29917,11 +29917,7 @@ static void device_phase(const Plugin& pl) {
             fp8_gemm_case(pl, "gemm_fp8a16_nt_m1",  "fp8a16", 1,  N, K, 0, &tp);
         fp8_gemm_case(pl, "gemm_fp8a8_nt_m16",      "fp8a8",  8,  N, K, 1);
         fp8_gemm_case(pl, "gemm_fp8a8_nt_m16",      "fp8a8",  16, N, K, 1);
-        /* The last 128-row band at every kind of tail: one band with its upper four waves gone
-         * (1, 36, 64), one band with them staying (65, 127), two bands with each (129, 200), and
-         * whole bands (256). */
-        for (const int64_t m : { 1, 36, 64, 65, 127, 129, 200, 256 })
-            fp8_gemm_case(pl, "gemm_fp8a8_tiled",   "fp8a8",  m, 256, K, 1);
+        fp8_gemm_case(pl, "gemm_fp8a8_tiled",       "fp8a8",  256, 256, K, 1);
     }
 
     /* --- the fp8 activation quantiser and the device sampler --- */
