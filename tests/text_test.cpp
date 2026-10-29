@@ -1659,6 +1659,38 @@ const std::vector<const char*>& gemma_decoded() {
     return v;
 }
 
+const char* const kMmbertLike = R"JSON({"added_tokens": [{"id": 0, "content": "<pad>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 3, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 4, "content": "<mask>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}, {"id": 5, "content": "<start_of_turn>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 6, "content": "<end_of_turn>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}, "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}, "post_processor": {"type": "TemplateProcessing", "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<eos>", "type_id": 0}}], "pair": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<eos>", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}, {"SpecialToken": {"id": "<eos>", "type_id": 1}}], "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}, "<eos>": {"id": "<eos>", "ids": [1], "tokens": ["<eos>"]}}}, "decoder": {"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}]}, "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false, "vocab": {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3, "<mask>": 4, "<start_of_turn>": 5, "<end_of_turn>": 6, "<0x00>": 7, "<0x01>": 8, "<0x02>": 9, "<0x03>": 10, "<0x04>": 11, "<0x05>": 12, "<0x06>": 13, "<0x07>": 14, "<0x08>": 15, "<0x09>": 16, "<0x0A>": 17, "<0x0B>": 18, "<0x0C>": 19, "<0x0D>": 20, "<0x0E>": 21, "<0x0F>": 22, "<0x10>": 23, "<0x11>": 24, "<0x12>": 25, "<0x13>": 26, "<0x14>": 27, "<0x15>": 28, "<0x16>": 29, "<0x17>": 30, "<0x18>": 31, "<0x19>": 32, "<0x1A>": 33, "<0x1B>": 34, "<0x1C>": 35, "<0x1D>": 36, "<0x1E>": 37, "<0x1F>": 38, "<0x20>": 39, "<0x21>": 40, "<0x22>": 41, "<0x23>": 42, "<0x24>": 43, "<0x25>": 44, "<0x26>": 45, "<0x27>": 46, "<0x28>": 47, "<0x29>": 48, "<0x2A>": 49, "<0x2B>": 50, "<0x2C>": 51, "<0x2D>": 52, "<0x2E>": 53, "<0x2F>": 54, "<0x30>": 55, "<0x31>": 56, "<0x32>": 57, "<0x33>": 58, "<0x34>": 59, "<0x35>": 60, "<0x36>": 61, "<0x37>": 62, "<0x38>": 63, "<0x39>": 64, "<0x3A>": 65, "<0x3B>": 66, "<0x3C>": 67, "<0x3D>": 68, "<0x3E>": 69, "<0x3F>": 70, "<0x40>": 71, "<0x41>": 72, "<0x42>": 73, "<0x43>": 74, "<0x44>": 75, "<0x45>": 76, "<0x46>": 77, "<0x47>": 78, "<0x48>": 79, "<0x49>": 80, "<0x4A>": 81, "<0x4B>": 82, "<0x4C>": 83, "<0x4D>": 84, "<0x4E>": 85, "<0x4F>": 86, "<0x50>": 87, "<0x51>": 88, "<0x52>": 89, "<0x53>": 90, "<0x54>": 91, "<0x55>": 92, "<0x56>": 93, "<0x57>": 94, "<0x58>": 95, "<0x59>": 96, "<0x5A>": 97, "<0x5B>": 98, "<0x5C>": 99, "<0x5D>": 100, "<0x5E>": 101, "<0x5F>": 102, "<0x60>": 103, "<0x61>": 104, "<0x62>": 105, "<0x63>": 106, "<0x64>": 107, "<0x65>": 108, "<0x66>": 109, "<0x67>": 110, "<0x68>": 111, "<0x69>": 112, "<0x6A>": 113, "<0x6B>": 114, "<0x6C>": 115, "<0x6D>": 116, "<0x6E>": 117, "<0x6F>": 118, "<0x70>": 119, "<0x71>": 120, "<0x72>": 121, "<0x73>": 122, "<0x74>": 123, "<0x75>": 124, "<0x76>": 125, "<0x77>": 126, "<0x78>": 127, "<0x79>": 128, "<0x7A>": 129, "<0x7B>": 130, "<0x7C>": 131, "<0x7D>": 132, "<0x7E>": 133, "<0x7F>": 134, "<0x80>": 135, "<0x81>": 136, "<0x82>": 137, "<0x83>": 138, "<0x84>": 139, "<0x85>": 140, "<0x86>": 141, "<0x87>": 142, "<0x88>": 143, "<0x89>": 144, "<0x8A>": 145, "<0x8B>": 146, "<0x8C>": 147, "<0x8D>": 148, "<0x8E>": 149, "<0x8F>": 150, "<0x90>": 151, "<0x91>": 152, "<0x92>": 153, "<0x93>": 154, "<0x94>": 155, "<0x95>": 156, "<0x96>": 157, "<0x97>": 158, "<0x98>": 159, "<0x99>": 160, "<0x9A>": 161, "<0x9B>": 162, "<0x9C>": 163, "<0x9D>": 164, "<0x9E>": 165, "<0x9F>": 166, "<0xA0>": 167, "<0xA1>": 168, "<0xA2>": 169, "<0xA3>": 170, "<0xA4>": 171, "<0xA5>": 172, "<0xA6>": 173, "<0xA7>": 174, "<0xA8>": 175, "<0xA9>": 176, "<0xAA>": 177, "<0xAB>": 178, "<0xAC>": 179, "<0xAD>": 180, "<0xAE>": 181, "<0xAF>": 182, "<0xB0>": 183, "<0xB1>": 184, "<0xB2>": 185, "<0xB3>": 186, "<0xB4>": 187, "<0xB5>": 188, "<0xB6>": 189, "<0xB7>": 190, "<0xB8>": 191, "<0xB9>": 192, "<0xBA>": 193, "<0xBB>": 194, "<0xBC>": 195, "<0xBD>": 196, "<0xBE>": 197, "<0xBF>": 198, "<0xC0>": 199, "<0xC1>": 200, "<0xC2>": 201, "<0xC3>": 202, "<0xC4>": 203, "<0xC5>": 204, "<0xC6>": 205, "<0xC7>": 206, "<0xC8>": 207, "<0xC9>": 208, "<0xCA>": 209, "<0xCB>": 210, "<0xCC>": 211, "<0xCD>": 212, "<0xCE>": 213, "<0xCF>": 214, "<0xD0>": 215, "<0xD1>": 216, "<0xD2>": 217, "<0xD3>": 218, "<0xD4>": 219, "<0xD5>": 220, "<0xD6>": 221, "<0xD7>": 222, "<0xD8>": 223, "<0xD9>": 224, "<0xDA>": 225, "<0xDB>": 226, "<0xDC>": 227, "<0xDD>": 228, "<0xDE>": 229, "<0xDF>": 230, "<0xE0>": 231, "<0xE1>": 232, "<0xE2>": 233, "<0xE3>": 234, "<0xE4>": 235, "<0xE5>": 236, "<0xE6>": 237, "<0xE7>": 238, "<0xE8>": 239, "<0xE9>": 240, "<0xEA>": 241, "<0xEB>": 242, "<0xEC>": 243, "<0xED>": 244, "<0xEE>": 245, "<0xEF>": 246, "<0xF0>": 247, "<0xF1>": 248, "<0xF2>": 249, "<0xF3>": 250, "<0xF4>": 251, "<0xF5>": 252, "<0xF6>": 253, "<0xF7>": 254, "<0xF8>": 255, "<0xF9>": 256, "<0xFA>": 257, "<0xFB>": 258, "<0xFC>": 259, "<0xFD>": 260, "<0xFE>": 261, "<0xFF>": 262, "a": 263, "b": 264, "c": 265, "d": 266, "e": 267, "f": 268, "g": 269, "h": 270, "i": 271, "j": 272, "k": 273, "l": 274, "m": 275, "n": 276, "o": 277, "p": 278, "q": 279, "r": 280, "s": 281, "t": 282, "u": 283, "v": 284, "w": 285, "x": 286, "y": 287, "z": 288, "▁": 289, "\n": 290, "\t": 291, "H": 292, "T": 293, ".": 294, ",": 295, "!": 296, "?": 297, "é": 298, "'": 299, "he": 300, "ll": 301, "hell": 302, "hello": 303, "▁w": 304, "or": 305, "▁wor": 306, "ld": 307, "▁world": 308, "▁t": 309, "▁th": 310, "▁the": 311, "▁c": 312, "▁ca": 313, "▁cat": 314, "▁▁": 315, "▁▁▁▁": 316, "\n\n": 317, "th": 318, "the": 319, "in": 320, "ing": 321, "ed": 322, "▁a": 323, "▁hello": 324, "He": 325, "Hell": 326, "Hello": 327, "ém": 328, "oj": 329, "oji": 330}, "merges": [["h", "e"], ["l", "l"], ["he", "ll"], ["hell", "o"], ["▁", "w"], ["o", "r"], ["▁w", "or"], ["l", "d"], ["▁wor", "ld"], ["▁", "t"], ["▁t", "h"], ["▁th", "e"], ["▁", "c"], ["▁c", "a"], ["▁ca", "t"], ["▁", "▁"], ["▁▁", "▁▁"], ["\n", "\n"], ["▁", "the"], ["t", "h"], ["th", "e"], ["i", "n"], ["in", "g"], ["e", "d"], ["▁", "a"], ["▁", "hello"], ["H", "e"], ["He", "ll"], ["Hell", "o"], ["é", "m"], ["o", "j"], ["oj", "i"]]}})JSON";
+
+const std::vector<EncodeGolden>& mmbert_goldens() {
+    static const std::vector<EncodeGolden> v = {
+        { "hello", { 324 }, { 2, 324, 1 } },
+        { " hello", { 324 }, { 2, 324, 1 } },
+        { "hello world", { 324, 308 }, { 2, 324, 308, 1 } },
+        { "hello  world", { 324, 289, 308 }, { 2, 324, 289, 308, 1 } },
+        { "the cat", { 309, 300, 314 }, { 2, 309, 300, 314, 1 } },
+        { "\nthe\n\ncat", { 289, 290, 282, 300, 317, 265, 263, 282 }, { 2, 289, 290, 282, 300, 317, 265, 263, 282, 1 } },
+        { "  leading", { 289, 289, 274, 267, 263, 266, 321 }, { 2, 289, 289, 274, 267, 263, 266, 321, 1 } },
+        { "trailing  ", { 309, 280, 263, 271, 274, 321, 289, 289 }, { 2, 309, 280, 263, 271, 274, 321, 289, 289, 1 } },
+        { "a\tb", { 323, 291, 264 }, { 2, 323, 291, 264, 1 } },
+        { "\xc3\xa9moji \xf0\x9f\x98\x80", { 289, 328, 330, 289, 247, 166, 159, 135 }, { 2, 289, 328, 330, 289, 247, 166, 159, 135, 1 } },
+        { "x<eos>y", { 289, 286, 1, 289, 287 }, { 2, 289, 286, 1, 289, 287, 1 } },
+        { "<start_of_turn>user\nhello<end_of_turn>", { 5, 289, 283, 281, 267, 280, 290, 303, 6 }, { 2, 5, 289, 283, 281, 267, 280, 290, 303, 6, 1 } },
+        { "Hello, world!", { 289, 327, 295, 308, 296 }, { 2, 289, 327, 295, 308, 296, 1 } },
+        { "   ", { 289, 289, 289 }, { 2, 289, 289, 289, 1 } },
+        { "th the thee", { 310, 309, 300, 309, 300, 267 }, { 2, 310, 309, 300, 309, 300, 267, 1 } },
+        { "\xe6\x97\xa5\xe6\x9c\xac", { 289, 237, 158, 172, 237, 163, 179 }, { 2, 289, 237, 158, 172, 237, 163, 179, 1 } },
+        { "zz  zz   zz", { 289, 288, 288, 289, 289, 288, 288, 289, 289, 289, 288, 288 }, { 2, 289, 288, 288, 289, 289, 288, 288, 289, 289, 289, 288, 288, 1 } },
+        { "<mask> the", { 4, 309, 300 }, { 2, 4, 309, 300, 1 } },
+        { "<bos>hello", { 2, 324 }, { 2, 2, 324, 1 } },
+        { "", {  }, { 2, 1 } },
+        { " the cat", { 309, 300, 314 }, { 2, 309, 300, 314, 1 } },
+        { "  two  leading", { 289, 309, 285, 277, 289, 289, 274, 267, 263, 266, 321 }, { 2, 289, 309, 285, 277, 289, 289, 274, 267, 263, 266, 321, 1 } },
+        { " ", { 289 }, { 2, 289, 1 } },
+        { "x\n the", { 289, 286, 290, 309, 300 }, { 2, 289, 286, 290, 309, 300, 1 } },
+    };
+    return v;
+}
+
 const std::vector<std::pair<const char*, const char*>>& metaspace_special_fixtures() {
     static const std::vector<std::pair<const char*, const char*>> v = {
         { "first", R"JSON({"added_tokens": [{"id": 0, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "[INST]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false}, "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false, "vocab": {"<s>": 0, "[INST]": 1, "▁": 2, "H": 3, "i": 4, "▁H": 5, "Hi": 6, "▁Hi": 7, "<unk>": 8}, "merges": [["▁", "H"], ["H", "i"], ["▁H", "i"]]}})JSON" },
@@ -1810,6 +1842,30 @@ TEST(pre_tokenizers_split_as_huggingface) {
  * (EmbeddingGemma pools over that <eos>). Encoded with and without special tokens and decoded,
  * against HuggingFace on spaces, newlines, tabs, byte fallback (an emoji, CJK), special tokens in
  * the text and the empty string. */
+/* mmBERT's shape (Laya's multilingual checkpoint): the Gemma normaliser turns spaces into U+2581,
+ * then Metaspace(always, split) prepends U+2581 only to text that does not already start with it.
+ * Prepending it again gave " hello" a lone U+2581 token ahead of "U+2581hello". */
+TEST(a_metaspace_after_a_space_replacing_normaliser_encodes_as_huggingface) {
+    VocabBuild vb;
+    REQUIRE(parse_tokenizer_json_buf(kMmbertLike, "mmbert_like", vb) >= 0);
+    auto v = std::make_shared<Vocab>();
+    vb.bos = 2;
+    vb.eos = 1;
+    REQUIRE(v->load(std::move(vb)) >= 0);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    for (const EncodeGolden& g : mmbert_goldens()) {
+        std::vector<int32_t> plain;
+        CHECK_OK(t.encode(g.text, plain, /*add_special=*/false, /*parse_special=*/true));
+        CHECK(plain == g.ids);
+        if (plain != g.ids) {
+            std::string got;
+            for (int32_t id : plain) got += std::to_string(id) + ",";
+            fprintf(stderr, "    \"%s\": %s\n", g.text, got.c_str());
+        }
+    }
+}
+
 TEST(the_gemma_shaped_tokenizer_encodes_as_huggingface) {
     VocabBuild vb;
     REQUIRE(parse_tokenizer_json_buf(kGemmaLike, "gemma_like", vb) >= 0);

@@ -1030,7 +1030,9 @@ void apply_bytelevel(Pieces& p, const TokEncoder::Step& st, bool defer, EncodeSc
 
 /* `at_start`: the words are the text's first segment. HuggingFace's "first" scheme prepends only
  * there (a segment after a special token has a non-zero original offset); "always" prepends to
- * every segment. */
+ * every segment. Either prepends only to a word that does not already start with the replacement
+ * once its spaces are replaced: a space, or the replacement itself, which a normaliser before this
+ * step (mmBERT's and Gemma's Replace " " -> U+2581) has already written. */
 void apply_metaspace(std::vector<std::string>& words, const VocabStep& s, bool at_start) {
     const std::string rep = s.arg0.empty() ? std::string(k_metaspace) : s.arg0;
     const int64_t prepend = s.iarg;            /* 0 never, 1 first, 2 always */
@@ -1039,7 +1041,8 @@ void apply_metaspace(std::vector<std::string>& words, const VocabStep& s, bool a
     for (size_t i = 0; i < words.size(); ++i) {
         std::string& w = words[i];
         if (prepend == 2 || (prepend == 1 && i == 0 && at_start)) {
-            if (w.empty() || w.compare(0, 1, " ") != 0) w.insert(0, " ");
+            if (w.empty() || (w.compare(0, 1, " ") != 0 && w.compare(0, rep.size(), rep) != 0))
+                w.insert(0, " ");
         }
         replace_all(w, " ", rep);
     }
