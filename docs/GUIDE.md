@@ -2088,7 +2088,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
 | `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API; needs an image model (Qwen-Image 2.1), else 501 (§5.6) |
-| `POST /v1/systemone` | Decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; LiquidAI's d1, or Cloudflare's clef and clef-flash with their joint head on the card; needs a container converted as one, else 501 (§5.13). `POST /v1/decisions` is the same endpoint under LiteLLM's name |
+| `POST /v1/systemone` | Decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; LiquidAI's d1, Cloudflare's clef and clef-flash with their joint head on the card, or Convai Innovations' Laya; needs a container converted as one, else 501 (§5.13). `POST /v1/decisions` is the same endpoint under LiteLLM's name |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
@@ -2839,6 +2839,43 @@ under LiteLLM's name. What differs:
 
 Against clef's own head on the CPU reference, on a tiny model with random weights
 (`tests/clef_decision_test.cpp`): worst probability difference 0.0004.
+
+#### Laya
+
+Convai Innovations' Laya checkpoints (`laya`, `laya-typed-decisions` on ModernBERT-large, and
+`laya-multilingual` on mmBERT-base) are encoder decision models. Laya reads one sequence a
+question, `[CLS] <type> question: <instructions> [SEP] [MASK] option ... [SEP] <state> [SEP]`, and
+scores each option at its `[MASK]` with a small head after the encoder. radiance builds those
+sequences in the server (`core/server/laya.cpp`, a rewrite of the `laya` package's own code) and
+runs the encoder and head in the `laya` plugin (`arch/laya`), on the embedding path: no KV cache,
+every question of a request in one step, each answered in its pooled row.
+
+```sh
+rad-convert /srv/models/laya-typed-decisions -o laya-typed-decisions.rad --set decision.type=laya
+radiance --model laya-typed-decisions.rad --port 8000
+```
+
+rad-convert reads the release's folders: `encoder/config.json` for the geometry,
+`rl_agent_config.json` for the sequence budget and the fitted temperatures, and `tokenizer/`. The
+checkpoint's `config.json` already says `model_type: laya`, so `--set decision.type=laya` is
+optional. A checkpoint as the `laya` package downloads it, with no `config.json` of its own,
+converts the same way.
+
+The request and the response are the same as d1's above. What differs:
+
+- A state longer than the room a question leaves is cut, as the `laya` package cuts it: to its
+  start, or to its end for a list of turns. `usage` reports the cut with the package's own keys:
+  `state_tokens`, `state_tokens_dropped`, `truncated` and `truncated_questions`.
+- `confidence` is the package's: 1 minus the normalised entropy for choice and score. The fitted
+  temperatures are clamped to [0.5, 5], as the package clamps them.
+- A choice has at most 255 options, and options that do not fit the sequence answer 400.
+- `state` must be a non-empty string or JSON value. Pictures answer 501, and `/v1/embeddings`
+  answers 501 (the pooled row holds option logits, not a vector).
+- `GET /v1/models` reports `"decision": "laya"` in the model's capabilities.
+
+Against the `laya` package's own `Agent.predict` on the CPU reference, on a tiny model with random
+weights (`tests/laya_decision_test.cpp`): every `usage` field equal, worst probability difference
+0.0162 (0.0266 on a score's expected level).
 
 ### 5.14 Speech to text
 

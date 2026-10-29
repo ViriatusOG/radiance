@@ -275,6 +275,11 @@ TEST(a_laya_checkpoint_converts_without_flags_and_another_is_refused) {
     std::string log;
     CHECK_EQ(tiny::run({ RAD_E2E_CONVERT, ck, "-o", dir / "plain.rad" }, engine_env(), &log, 300), 0);
     CHECK(log.find("laya     ") != std::string::npos);
+    /* As laya's own loader downloads a checkpoint: no config.json of its own. */
+    REQUIRE_EQ(std::remove((ck + "/config.json").c_str()), 0);
+    log.clear();
+    CHECK_EQ(tiny::run({ RAD_E2E_CONVERT, ck, "-o", dir / "no-config.rad" }, engine_env(), &log, 300), 0);
+    CHECK(log.find("encoder 3 x 64, head 2 layers") != std::string::npos);
 
     const std::string other = dir / "qwen";
     REQUIRE_EQ(mkdir(other.c_str(), 0755), 0);

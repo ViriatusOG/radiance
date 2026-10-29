@@ -571,7 +571,16 @@ int main(int argc, char** argv) {
     /* ---------------------------------------------------------------- source */
     Checkpoint ck;
     if (!config_dir.empty()) ck.set_meta_dir(config_dir);
+    /* A Laya checkpoint as laya's own loader downloads it carries no config.json of its own, only
+     * encoder/config.json beside rl_agent_config.json: the geometry is the encoder's, the
+     * architecture laya (laya_metadata reads the rest). */
+    struct stat in_st{};
+    const bool laya_dir = config_dir.empty() && stat(in.c_str(), &in_st) == 0 && S_ISDIR(in_st.st_mode) &&
+                          !file_exists(in + "/config.json") && file_exists(in + "/rl_agent_config.json") &&
+                          file_exists(in + "/encoder/config.json");
+    if (laya_dir) ck.set_meta_dir(in + "/encoder");
     if (ck.open(in) < 0) return 1;
+    if (laya_dir) ck.meta().arch = "laya";
     for (const std::string& f : add_files) {
         if (ck.add_file(f) < 0) return 1;
         RAD_INFO("added    %s", f.c_str());
