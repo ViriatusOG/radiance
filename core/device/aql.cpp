@@ -3644,6 +3644,43 @@ void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
     return p;
 }
 
+/* Locks [p, p + len) in pieces of at most kPinPiece for every card, each mapped on the cards at
+ * its host address. On failure sets the device error for `who` (asked for `bytes`), unlocks what
+ * was locked and returns false; the mapping stays the caller's to unmap. */
+bool lock_pieces(char* p, int64_t len, int64_t bytes, std::vector<hsa_agent_t>& cards,
+                 const char* who) {
+    const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
+    int done = 0;
+    for (; done < pieces; ++done) {
+        const int64_t off = (int64_t)done * kPinPiece;
+        const int64_t n = std::min(kPinPiece, len - off);
+        void* on_card = nullptr;
+        const hsa_status_t st = hsa_amd_memory_lock_to_pool(p + off, (size_t)n, cards.data(),
+                                                            (int)cards.size(), G().host_fine, 0,
+                                                            &on_card);
+        if (st != HSA_STATUS_SUCCESS) {
+            device_set_error("%s(%s): locking piece %d of %d (%s at +%s): %s", who,
+                             humanb(bytes).c_str(), done + 1, pieces, humanb(n).c_str(),
+                             humanb(off).c_str(), hsa_why(st));
+            break;
+        }
+        if (on_card != p + off) {
+            ++done;
+            device_set_error("%s(%s): piece %d of %d is mapped on the cards at %p, not "
+                             "at its host address %p, so the pieces are not one range there, "
+                             "although the kernel driver reports the SVM API that maps a lock in "
+                             "place",
+                             who, humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
+            break;
+        }
+    }
+    if (done < pieces) {
+        for (int i = 0; i < done; ++i) (void)hsa_amd_memory_unlock(p + (int64_t)i * kPinPiece);
+        return false;
+    }
+    return true;
+}
+
 void* pin_pieces(int64_t bytes) {
     std::vector<hsa_agent_t> cards;
     for (const Dev& d : G().dev) cards.push_back(d.agent);
@@ -3672,33 +3709,61 @@ void* pin_pieces(int64_t bytes) {
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
 
-    const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
-    int done = 0;
-    for (; done < pieces; ++done) {
-        const int64_t off = (int64_t)done * kPinPiece;
-        const int64_t n = std::min(kPinPiece, len - off);
-        void* on_card = nullptr;
-        const hsa_status_t st = hsa_amd_memory_lock_to_pool(p + off, (size_t)n, cards.data(),
-                                                            (int)cards.size(), G().host_fine, 0,
-                                                            &on_card);
-        if (st != HSA_STATUS_SUCCESS) {
-            device_set_error("rad_dev_alloc(%s): locking piece %d of %d (%s at +%s): %s",
-                             humanb(bytes).c_str(), done + 1, pieces, humanb(n).c_str(),
-                             humanb(off).c_str(), hsa_why(st));
-            break;
-        }
-        if (on_card != p + off) {
-            ++done;
-            device_set_error("rad_dev_alloc(%s): piece %d of %d is mapped on the cards at %p, not "
-                             "at its host address %p, so the pieces are not one range there, "
-                             "although the kernel driver reports the SVM API that maps a lock in "
-                             "place",
-                             humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
-            break;
-        }
+    if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
+        ::munmap(p, (size_t)len);
+        return nullptr;
     }
-    if (done < pieces) {
-        for (int i = 0; i < done; ++i) (void)hsa_amd_memory_unlock(p + (int64_t)i * kPinPiece);
+    std::lock_guard<std::mutex> lk(g_pinned_mu);
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    return p;
+}
+
+/* pin_pieces over a shared file mapping instead of private anonymous memory: the pages are the
+ * file's (a tmpfs file other processes map too) and the lock takes them in place. The file maps
+ * onto a 2 MiB boundary inside a reservation made with one alignment extra, then the ends are
+ * trimmed. MADV_HUGEPAGE is advised but shmem follows shmem_enabled, not it. A tmpfs page is
+ * swappable until the lock pins it, so MLOCK_ONFAULT keeps the pages in memory meanwhile; a
+ * refusal (the memlock limit) costs only that. */
+void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
+    std::vector<hsa_agent_t> cards;
+    for (const Dev& d : G().dev) cards.push_back(d.agent);
+    if (!svm_in_place()) {
+        device_set_error("rad_dev_map_file(%s): a file range is pinned in place only through the "
+                         "kernel driver's SVM API, which this host lacks, so ram=DIR needs it",
+                         humanb(bytes).c_str());
+        return nullptr;
+    }
+
+    const int64_t align = RAD_ALIGN_POOL;
+    const int64_t len = align_up(bytes, 4096);
+    void* m = ::mmap(nullptr, (size_t)(len + align), PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) {
+        device_set_error("rad_dev_map_file(%s): mmap: %s", humanb(bytes).c_str(),
+                         std::strerror(errno));
+        return nullptr;
+    }
+    const uintptr_t lo = (uintptr_t)m;
+    const uintptr_t at = (lo + (uintptr_t)align - 1) & ~((uintptr_t)align - 1);
+    if (::mmap((void*)at, (size_t)len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+               (off_t)foff) == MAP_FAILED) {
+        device_set_error("rad_dev_map_file(%s): mmap of the file at +%s: %s", humanb(bytes).c_str(),
+                         humanb(foff).c_str(), std::strerror(errno));
+        ::munmap(m, (size_t)(len + align));
+        return nullptr;
+    }
+    if (at > lo) ::munmap(m, at - lo);
+    if (lo + (uintptr_t)align > at) ::munmap((void*)(at + (uintptr_t)len), lo + (uintptr_t)align - at);
+    char* const p = (char*)at;
+
+    if (len >= ((int64_t)2 << 20)) (void)::madvise(p, (size_t)len, MADV_HUGEPAGE);
+    (void)::madvise(p, (size_t)len, MADV_DONTFORK);
+    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
+        RAD_WARN("device: the shared file range %p (%s) could not be locked against swap (mlock2: "
+                 "%s)", (void*)p, humanb(len).c_str(), std::strerror(errno));
+    prefer_numa_node(p, len, current_card_numa_node());
+
+    if (!lock_pieces(p, len, bytes, cards, "rad_dev_map_file")) {
         ::munmap(p, (size_t)len);
         return nullptr;
     }
@@ -3759,6 +3824,17 @@ void* a_alloc(int64_t bytes, int kind) {
     }
     void* p = pin_pieces(bytes);
     note_alloc(p, bytes, kind);
+    return p;
+}
+
+void* a_map_file(int fd, int64_t foff, int64_t bytes) {
+    if (fd < 0 || foff < 0 || bytes <= 0) {
+        device_set_error("rad_dev_map_file(%d, %lld, %lld): a file, a non-negative offset and a "
+                         "positive size are needed", fd, (long long)foff, (long long)bytes);
+        return nullptr;
+    }
+    void* p = pin_pieces_file(bytes, fd, foff);
+    note_alloc(p, bytes, RAD_MEM_HOST_MAPPED);
     return p;
 }
 
@@ -3842,6 +3918,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_hip_host_ptr = hip->host_ptr;
         g_hip_device_ptr = hip->device_ptr;
         g_aql.alloc = a_alloc;
+        g_aql.map_file = a_map_file;
         g_aql.free = a_free;
         g_aql.host_ptr = a_host_ptr;
         g_aql.device_ptr = a_device_ptr;

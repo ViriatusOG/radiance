@@ -4007,8 +4007,8 @@ RadModelMeta lfm2_meta(int n_kv = 4) {
 std::vector<std::string> lfm2_layer_ops(bool attention) {
     std::vector<std::string> v = { "rmsnorm" };
     if (attention) {
-        for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm", "rmsnorm", "rope",
-                               "rope", "attn_paged", "kv_store", "gemm_nt" })
+        for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm_rows", "rmsnorm_rows",
+                               "rope_rows", "rope_rows", "attn_paged", "kv_store", "gemm_nt" })
             v.push_back(s);
     } else {
         for (const char* s : { "gemm_nt", "mul", "causal_conv1d", "mul", "gemm_nt" })
@@ -4043,12 +4043,14 @@ TEST(lfm2_declares_the_checkpoints_own_schedule) {
     for (const auto& bd : b.binds)
         CHECK_EQ(bd.second, bd.first == 2 ? (rad_kvgroup)1 : (rad_kvgroup)2);
 
-    /* A plain RMSNorm at the checkpoint's epsilon, NeoX over the whole head. */
+    /* A plain RMSNorm at the checkpoint's epsilon, NeoX over the whole head; the head norms and
+     * rope ask for the rows forms (their prefill row counts are what those forms are for). */
     const RecOp* norm = find_op(b, "rmsnorm");
     CHECK_NEAR(pflt(norm, "eps"), 1e-5, 1e-9);
     CHECK_EQ(param(norm, "wadd") ? pflt(norm, "wadd") : 0.0, 0.0);
-    CHECK_EQ(pstr(find_op(b, "rope"), "mode"), "neox");
-    CHECK_EQ(pint(find_op(b, "rope"), "rotary_dim"), 16);
+    REQUIRE(find_op(b, "rmsnorm_rows") != nullptr);
+    CHECK_EQ(pstr(find_op(b, "rope_rows"), "mode"), "neox");
+    CHECK_EQ(pint(find_op(b, "rope_rows"), "rotary_dim"), 16);
     CHECK_EQ(pint(find_op(b, "attn_paged"), "gqa"), 4);
     CHECK_EQ(pint(find_op(b, "causal_conv1d"), "width"), 3);
 
@@ -4163,6 +4165,85 @@ TEST(lfm2_issues_the_convolution_once_per_half_of_a_mixed_step) {
         }
     }
     CHECK_EQ(convs, 6);   /* three conv layers, two halves each */
+}
+
+TEST(lfm2_fp8_fuses_the_conv_gate_into_the_quantiser) {
+    /* A block-fp8 LFM2 whose linears are all whole 128-blocks: 128 hidden, 128 query/key/value,
+     * 256 ffn. The convolution gate's multiply and the quantiser the out projection reads become
+     * one op where gate_quant_fp8 is served; without it, the pair is unchanged. */
+    RadModelMeta meta = lfm2_meta();
+    meta.n_embd = 128; meta.n_head = 4; meta.n_head_kv = 4; meta.head_dim = 32;
+    meta.n_ff = 256;
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    auto encs = [&](RadBuilder& b) {
+        for (const char* s : { "conv_in.", "conv_out.", "attn_q.", "attn_k.", "attn_v.",
+                               "attn_output.", "ffn_gate_up.", "ffn_down." })
+            b.encs.push_back({ s, fp8 });
+    };
+
+    /* A bf16 model keeps the plain mul: the candidate is a block-fp8 producer only. */
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+        CHECK_EQ(count_op(b, "gate_quant_fp8"), 0);
+    }
+
+    for (int how = 0; how < 2; ++how) {
+        RadBuilder b;
+        encs(b);
+        if (how == 0) b.undeclared.insert("gate_quant_fp8");
+        else          b.refuse.insert("gate_quant_fp8");
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(lfm2_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        int resolved = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gate_quant_fp8" && o.resolved) ++resolved;
+        CHECK_EQ(resolved, 0);
+        CHECK_EQ(count_op(b, "quant_act_fp8"), 4);   /* three conv mixers + the attention output */
+        CHECK_EQ(count_op(b, "mul"), 6);             /* gate_in and gate_out per conv layer */
+    }
+
+    RadBuilder b;
+    encs(b);
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(lfm2_bf16::declare(&b, &meta, &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "gate_quant_fp8"), 3);       /* the three convolution layers */
+    CHECK_EQ(count_op(b, "quant_act_fp8"), 1);        /* only the attention output remains */
+    CHECK_EQ(count_op(b, "mul"), 3);                  /* gate_in alone */
+    const RecOp* gq = find_op(b, "gate_quant_fp8");
+    REQUIRE(gq != nullptr);
+    CHECK_EQ(pstr(gq, "act"), std::string("none"));
+    CHECK_EQ(pint(gq, "n"), 128);
+    CHECK_EQ((int)gq->reads.size(), 2);
+    CHECK_EQ((int)gq->writes.size(), 2);               /* codes and scales; no bf16 product */
+
+    /* Decode (one row) and a 32-row chunk: the fused op carries both, and its gate is the C
+     * third of the [B|C|x] row while the value it scales is the convolution output. */
+    auto buf_id = [&](const char* name) -> rad_buf {
+        for (size_t j = 0; j < b.bufs.size(); ++j)
+            if (b.bufs[j].name == name) return (rad_buf)(j + 1);
+        return 0;
+    };
+    for (const auto& k : { kit(b, { 1 }, {}), kit(b, {}, { 32 }) }) {
+        const auto v = run_passes(b, lfm2_bf16::step, { k.get() });
+        CHECK_PASSES(b, v);
+        const std::vector<std::string> ops = issued_ops(b, *v[0]);
+        CHECK_EQ(count_issued(ops, "gate_quant_fp8"), 3);
+        CHECK_EQ(count_issued(ops, "quant_act_fp8"), 1);
+        int seen = 0;
+        for (const RecIssue& i : v[0]->issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "gate_quant_fp8" || seen++) continue;
+            REQUIRE(i.opd.size() == 5);  /* Optional BF16 output still occupies its schema slot. */
+            CHECK_EQ(i.opd[0].offset, (int64_t)128);   /* C in [B|C|x] */
+            CHECK_EQ(i.opd[0].cols, (int64_t)128);
+            CHECK_EQ(i.opd[1].handle, buf_id("conv_out"));
+            CHECK_EQ(i.opd[2].handle, buf_id("conv_out.q"));
+            CHECK_EQ(i.opd[3].handle, buf_id("conv_out.s"));
+        }
+        CHECK_EQ(seen, 3);
+    }
 }
 
 /* ==================================================================== LFM2-VL's tower */
@@ -4705,8 +4786,8 @@ TEST(the_gemma4_e4b_form_replicates_kv_heads_at_four_ranks) {
 
 /* A double-wide MLP is per layer: layers 0..7 declare gate_up [2F, E] and down [E, F] with F =
  * intermediate_size, layers 8..11 [4F, E] and [E, 2F], and every activation op carries its layer's
- * width. The shared `gate_up` and `ffn` buffers hold the widest layer, so a narrow layer's slice
- * keeps the wide row pitch. */
+ * width. The narrow layers use the `gate_up` and `ffn` buffers and the wide ones `gate_up_wide`
+ * and `ffn_wide`, each at its own row width. */
 TEST(a_gemma4_e2b_form_declares_the_double_wide_layers) {
     RadBuilder b;
     RadModelMeta meta = gemma4_e2b_meta();
@@ -7120,6 +7201,52 @@ TEST(gemma4_31b_dflash2_folds_both_passes_prologues) {
     }
 }
 
+/* The block-16 DFlash2 drafter (the DBloom fine-tune) as a tree: its query pass also runs at its
+ * short block of 8 rows (rad_drafter_short_block), whose selector grows a 7-node tree at an anchor
+ * stride of 8, beside its own block's 15 at 16; a block it has no ops for fails the step. A
+ * 7-node tree over the block-16 drafter (--num-speculative-tokens 7) declares the same short
+ * block. At block 8 the drafter declares none. */
+TEST(gemma4_31b_dflash2_block16_tree_runs_its_short_block) {
+    for (int b16 = 0; b16 < 3; ++b16)
+        for (int world : { 1, 4 }) {
+            G431Df2 f;
+            for (size_t i = 0; i < f.keys.size(); ++i)
+                if (!std::strcmp(f.keys[i], "draft.block_size")) f.vals[i] = b16 ? "16" : "8";
+            const int64_t own = b16 == 2 ? 7 : b16 ? 15 : 7;   /* the tree's nodes */
+            const RadModelMeta meta = f.meta();
+            RadBuilder b;
+            g431df2_encs(b, true);
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_tok = 2048;
+            ctx.max_spec = (int)own;
+            ctx.draft_tree = 1;
+            REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+            REQUIRE(b.drafter_parents != 0);
+            CHECK_EQ(b.drafter_short, b16 ? 8 : 0);
+            const int64_t full = b16 ? 16 : 8;
+            std::vector<int64_t> blocks = { full };
+            if (b16) blocks.push_back(8);
+            for (int64_t rows : blocks) {
+                const auto qry = query_pass(b, 2, rows, rows - 1);
+                const auto v = run_passes(b, gemma4_bf16::step, { qry.get() }, 0, world);
+                REQUIRE(steps_ok(v));
+                int64_t nodes = -1, stride = -1, n_tree = 0;
+                for (const RecIssue& is : v[0]->issues)
+                    if (const RecOp* o = b.op_of(is.op); o && o->op == "dflash_tree") {
+                        nodes = pint(o, "nodes");
+                        stride = pint(o, "anchor_stride");
+                        ++n_tree;
+                    }
+                CHECK_EQ(n_tree, 1);
+                CHECK_EQ(nodes, std::min<int64_t>(own, rows - 1));
+                CHECK_EQ(stride, rows);
+            }
+            const auto qbad = query_pass(b, 2, 4, 3);
+            const auto vb = run_passes(b, gemma4_bf16::step, { qbad.get() }, 0, world);
+            CHECK(!vb[0]->step_fail.empty());
+        }
+}
+
 /* DFlash2's query pass issues each residual add with the norm after it, as one add_rmsnorm where it
  * resolves: after every attention (the feed-forward norm) and every feed-forward (the next layer's
  * attention norm, after the last the final norm), ten on the 31B's five layers, no add left and
@@ -7703,9 +7830,104 @@ TEST(qwen35_fp8_declares_fp8_linears_and_the_fused_output_gate) {
         if (o.resolved) CHECK(o.uses_declared);
     for (const auto& w : b.weights)
         if (!w.d.source) CHECK(find_map(b, w.name) != nullptr);
+    /* The lfm2-only rows are that model's own declarations: nothing here names one, so every op
+     * resolves to the row it always did (gemm_nt keeps its band, rmsnorm and rope their launches). */
+    for (const auto& o : b.ops) {
+        CHECK(o.op != "gemm_nt_q_short");
+        CHECK(o.op != "gemm_nt_q_gated_wide");
+        CHECK(o.op != "rmsnorm_rows");
+        CHECK(o.op != "rope_rows");
+    }
     /* No speculation: no head, no drafter. */
     CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_NONE);
     CHECK(find_b(b, "mtp_x") == nullptr);
+}
+
+/* On an MXFP4 trunk the feed-forward's gated fold (gate_up, silu_mul and down's quantiser in one
+ * launch) is declared over 1..16 rows, libr4d's gated_gemv (1..8) and part of gated_gemv_wide's
+ * (9..64) band: a verify step of one or two sequences at speculation 7 (8 or 16 rows) issues it
+ * once a layer at the step's height and no gated_quant_fp8; a taller one (24..64 rows) the unfused
+ * gate_up and gated_quant_fp8. */
+TEST(qwen35_fp8_mxfp4_feed_forward_folds_verify_steps_up_to_16_rows) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    const int L = 8;
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        b.encs = { { "blk.", mx } };
+        RadBuildCtx ctx = spec_ctx(rank, 2, 7);
+        ctx.max_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+        int folds = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q_gated_mx" && !o.w.empty() &&
+                b.weights[o.w[0] - 1].name.rfind("blk.", 0) == 0) {
+                ++folds;
+                CHECK_EQ(pstr(&o, "act"), std::string("silu"));
+                CHECK_EQ(param(&o, "M")->ihi, 16);
+            }
+        CHECK_EQ(folds, L);
+        for (int n = 1; n <= 8; ++n) {
+            const auto k = kit(b, std::vector<int>((size_t)n, 8), {});
+            const auto v = run_passes(b, qwen35_fp8::step, { k.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> ops = issued_ops(b, *v[0]);
+            const bool fold = 8 * n <= 16;
+            int gated = 0;
+            for (size_t i = 0; i < ops.size(); ++i)
+                if (ops[i] == "gemm_nt_q_gated_mx") {
+                    ++gated;
+                    CHECK_EQ(v[0]->issues[i].n, 8 * n);
+                }
+            CHECK_EQ(gated, fold ? L : 0);
+            CHECK_EQ(count_issued(ops, "gated_quant_fp8"), fold ? 0 : L);
+        }
+    }
+}
+
+/* At two ranks each delta-net layer reads its out-projection into the on-die cache beside the decode
+ * recurrent update (GdnFP8::op_pf_out): a `prefetch` of the whole projection, issued right before
+ * the update on steps of up to four decode sequences and 32 rows, none on a step of five or more
+ * sequences, on a prompt's rows or at one rank. */
+TEST(qwen35_fp8_reads_the_delta_net_out_projection_beside_its_decode_update) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    const int n_gdn = 6;
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        b.encs = { { "blk.", mx } };
+        RadBuildCtx ctx = spec_ctx(0, world, 7);
+        ctx.max_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+        int declared = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "prefetch" && o.w.size() == 1 &&
+                b.weights[o.w[0] - 1].name.find("ssm_out") != std::string::npos) {
+                ++declared;
+                CHECK_EQ(pint(&o, "bytes"), (int64_t)8 << 20);
+            }
+        CHECK_EQ(declared, world > 1 ? n_gdn : 0);
+
+        /* (decode sequences, rows each, prompt rows) -> whether the reads go */
+        struct Case { int seqs, rows, prompt; bool reads; };
+        for (const Case& cs : { Case{ 1, 8, 0, true }, Case{ 2, 8, 0, true }, Case{ 4, 8, 0, true },
+                                Case{ 4, 1, 0, true }, Case{ 5, 4, 0, false }, Case{ 8, 4, 0, false },
+                                Case{ 0, 0, 64, false }, Case{ 2, 8, 64, false } }) {
+            const auto k = kit(b, std::vector<int>((size_t)cs.seqs, cs.rows),
+                               cs.prompt ? std::vector<int>{ cs.prompt } : std::vector<int>{});
+            const auto v = run_passes(b, qwen35_fp8::step, { k.get() }, 0, world);
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> ops = issued_ops(b, *v[0]);
+            int updates = 0, beside = 0;
+            for (size_t i = 0; i < ops.size(); ++i)
+                if (ops[i] == "gdn_conv_recurrent_update" || ops[i] == "gdn_recurrent_update") {
+                    ++updates;
+                    if (i > 0 && ops[i - 1] == "prefetch") ++beside;
+                }
+            CHECK_EQ(updates, cs.seqs ? n_gdn : 0);
+            CHECK_EQ(beside, cs.reads && world > 1 ? n_gdn : 0);
+        }
+    }
 }
 
 /* Every engine step the dense fp8 model runs lints clean at one and two ranks, the MTP head's
@@ -10467,7 +10689,7 @@ struct ArchCases {
             qwen35_fp8::step, 3, {}, 0x20ab9ed24e409329ull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0xd12381e7e3ede24dull);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x5b52afb1706a954eull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
             qwen35_fp8::step, 7, {}, 0x365e4cbb415ac284ull);
@@ -10476,7 +10698,7 @@ struct ArchCases {
             qwen35_w8a8::step, 7, {}, 0x742a596708bbda1dull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x7b7a1b301de20c1eull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x93b6390d30e59953ull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x4c7e42e71f167042ull);
@@ -10507,7 +10729,7 @@ struct ArchCases {
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
         add("lfm2_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return lfm2_bf16::declare(b, &lfm, &c); },
-            lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
+            lfm2_bf16::step, 0, {}, 0x5bce917918dbd478ull);
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
             gemma4_bf16::step, 0, {}, 0x2ba2f4943031468full);
@@ -11223,7 +11445,7 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 4, 0, 0x780814049d36bebcull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x0723ed824fef82d4ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xc56a518087e3f4b4ull, 0xa7ec3cf6252cd441ull },
-        { "qwen35_fp8", 2, 1, 0x61d309383f96b1acull, 0xbf359de7b8a6322cull },
+        { "qwen35_fp8", 2, 1, 0x6e644b3d13bac619ull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0x7a9330e0da08f97cull, 0x2b5989b2a6dbc7dfull },
         { "qwen35moe_fp8", 2, 0, 0x3a2761e9546797f1ull, 0x4a597c66b5868eeeull },
     };

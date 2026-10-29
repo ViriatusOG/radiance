@@ -197,3 +197,27 @@ __device__ __forceinline__ void r4d_archk_wait(unsigned int* my_flags, unsigned 
     __builtin_amdgcn_s_sleep(2);
   }
 }
+
+// ---- The host mailbox's one read. A host twin's slots are pinned host memory (r4d_ar_entry.hip),
+// which the card reads past every cache over its own link, so reading the slot for the check and
+// again for the reduce crosses the link twice: at --p2p off a prefill all-reduce's reads doubled
+// (#323). Such an instance also has a mirror of its slots in this rank's VRAM, `md` bytes from
+// them (`stage` - my_scratch; 0 over P2P, where the slots are VRAM already). The re-hash reads each
+// word through r4d_archk_keep, which also stores it into the mirror, and once the check passes the
+// kernel moves its slot pointers onto the mirror (r4d_archk_moved) for the reduce. Only this block
+// writes and reads its words of the mirror, and the check's barriers order the two; a failed try's
+// copy is overwritten by the next.
+template <typename V>
+__device__ __forceinline__ V r4d_archk_keep(const V* p, long md) {
+  const V v = *p;
+  if (md) *reinterpret_cast<V*>(reinterpret_cast<uintptr_t>(p) + md) = v;
+  return v;
+}
+template <typename V>
+__device__ __forceinline__ const V* r4d_archk_moved(const V* p, long md) {
+  return reinterpret_cast<const V*>(reinterpret_cast<uintptr_t>(p) + md);
+}
+// The offset of an instance's mirror from its slots, from the launcher's `stage` (0: none).
+__device__ __forceinline__ long r4d_archk_md(long stage, const void* my_scratch) {
+  return stage ? stage - (long)reinterpret_cast<uintptr_t>(my_scratch) : 0;
+}

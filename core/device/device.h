@@ -135,6 +135,14 @@ extern "C" int64_t rad_xp_behind(int device);
 extern "C" void*   rad_dev_alloc_uncached(int64_t bytes);
 extern "C" void    rad_dev_free_uncached(void* p);
 
+/* [foff, foff + bytes) of the open file `fd`, mapped MAP_SHARED and pinned for every card as a
+ * RAD_MEM_HOST_MAPPED allocation is: one range at the same address on host and cards. For a table
+ * that engines on separate cards share through a tmpfs file (format/table_share.h). `foff` is a
+ * multiple of 2 MiB and the file holds the whole range. Freed with rad_dev_free(p,
+ * RAD_MEM_HOST_MAPPED), which unpins and unmaps and leaves the file alone. Null with the reason in
+ * rad_dev_last_error() on a backend without it or a failure. */
+extern "C" void*   rad_dev_map_file(int fd, int64_t foff, int64_t bytes);
+
 /* A gate on a stream: the stream stops at the point rad_stream_gate enqueues and goes on once the
  * host calls rad_gate_open. Everything enqueued behind the gate meanwhile is then ready at once, so
  * the device runs it back to back however long the host took to submit it. For timing a batch of
@@ -339,6 +347,9 @@ struct DeviceBackend {
 
     /* ---- rad_event_dma; null on a backend with no DMA queue. */
     int     (*event_dma)(RadEvent e, RadStream s, uint32_t** word);
+
+    /* ---- see rad_dev_map_file. Null on a backend with no pinned host memory to map a file into. */
+    void*   (*map_file)(int fd, int64_t foff, int64_t bytes);
 };
 
 

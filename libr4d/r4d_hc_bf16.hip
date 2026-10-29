@@ -17,6 +17,8 @@
 //
 // `x` depends on all of `d`, so no workgroup can produce a channel of `x` before every column of
 // `d` exists. The kernel boundary serves as the grid-wide barrier, without cooperative launch.
+// For a small decode step (E4M3, hc 4, n 2560, up to seven rows), hc_read_fused_kernel runs A and
+// B as one grid instead, its B blocks waiting on a ticket-ordered counter (see that kernel's note).
 //
 // Weight traffic, not arithmetic, decides the decomposition. At Qwen3.8-Flash-Next's shape
 // (n 2560, hc 4, LR 320) each mixing matrix is 6.55 MB and there are 96 connections: 1.27 GB per
@@ -207,9 +209,10 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
     return acc;
 }
 
-/* hc8_dot_down for two rows of W_down at once, one read of N from LDS feeding both. A
- * wave owning two columns (four rows of a decode step) read the 20 KB vector once per column, and
- * kernel A's dots were LDS-bound. Each row's sum is the same fmaf sequence as hc8_dot_down's. */
+/* hc8_dot_down for two rows of W_down at once, one read of N from LDS feeding both, so a wave
+ * owning two columns (four rows of a decode step) reads the 20 KB vector once rather than once per
+ * column; kernel A's dots are LDS-bound. Each row's sum is the same fmaf sequence as
+ * hc8_dot_down's. */
 __device__ __forceinline__ float hc8_dot16n(const float* nf, uint4 c) {
     float wf[16];
     e4m3x8(c.x, c.y, wf);
@@ -320,9 +323,8 @@ __device__ __forceinline__ void hc8_up_load(const unsigned char* __restrict__ wr
 /* RPT rows of W_up with the same quarter against RG rows of `d`: each value of `d` read from LDS
  * feeds RPT products, and `d` sits in LDS as the bf16 it is, sixteen values in two 16-byte reads
  * (the quarter, its group and lr are multiples of 16 by r4d_hc8::group_ok, and the base is aligned).
- * Read as floats a value at a time, the dot was a chain of LDS round trips: 7.4 of the 22.8 us at
- * four rows with every byte cache-resident. Each (row, r) accumulates the same fmaf sequence on the
- * same values as hc8_dot_up. */
+ * Read as floats a value at a time, the dot would be a chain of LDS round trips. Each (row, r)
+ * accumulates the same fmaf sequence on the same values as hc8_dot_up. */
 template <int RG, int RPT>
 __device__ __forceinline__ void hc8_up_dot_rows(const unsigned short* __restrict__ sdh, long lr,
                                                 const Hc8UpQuarter* o, int q4,
@@ -373,7 +375,7 @@ __device__ __forceinline__ float wave_sum(float v) { return r4d_wave_sum(v); }
 
 /* A barrier that orders LDS only. __syncthreads() fences at workgroup scope, which in
  * WGP mode on gfx12 waits for every outstanding global load: a load issued for the next pass of a
- * K loop could not stay in flight across it, and a software-pipelined loop ran as serially as the
+ * K loop cannot stay in flight across it, so a software-pipelined loop runs as serially as the
  * plain one. Where a barrier guards only LDS tiles, this one leaves global loads in flight. */
 __device__ __forceinline__ void hc_lds_barrier() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
@@ -882,9 +884,9 @@ constexpr long kHcReadAStaticLds = (long)(kWaves * kHcMax + kHcMax) * (long)size
  * Flash-Next's shape). Thread t's elements of `h` are then t + e * kThreads for e < HCP * PER, the
  * stream being e / PER, so every one of them and of the norm weight can be loaded before the first
  * is used: one round trip from the cache instead of one per stream for the sums of squares and
- * again for N, the ten-odd dependent latencies that set the decode step's time here (the kernel
- * ran 8.3 us at one row with every byte cache-resident). The sums and N take the same values in
- * the same order, so the output is bit-identical to the loops below. */
+ * again for N. Those ten-odd dependent latencies, not bytes, set the kernel's time at decode. The
+ * sums and N take the same values in the same order, so the output is bit-identical to the loops
+ * below. */
 template <bool F8, int HCP = 0, int PER = 0>
 __device__ __forceinline__ void hc_read_a_body(const unsigned short* __restrict__ h, const float* __restrict__ w,
                       const void* __restrict__ downv, long dld,
@@ -896,7 +898,7 @@ __device__ __forceinline__ void hc_read_a_body(const unsigned short* __restrict_
                       unsigned xpub) {
     /* 16-byte aligned, for the 16-byte LDS reads of the dots. The dynamic region starts
      * after the kernel's static LDS, which in hc_read_fused_kernel is not a multiple of 16; a
-     * misaligned base ran the fused form's A blocks three times slower at four rows. */
+     * misaligned base makes the fused form's A blocks three times slower at four rows. */
     extern __shared__ __attribute__((aligned(16))) unsigned short sN[];   /* [hc * n], transposed per 256-element chunk */
     __shared__ float s_part[kWaves][kHcMax];
     __shared__ float s_scale[kHcMax];
@@ -1289,14 +1291,14 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
     const int  ipb = kBR / hc;                      /* channels this workgroup owns */
     const long i0  = (long)bx * ipb;
 
-    /* Every load this kernel makes before its first barrier, issued together. At
-     * decode it is a chain of dependent latencies, not a stream of bytes (12 us at four rows with
-     * every byte cache-resident). `d` goes first, all of a thread's share at once (lr is at most
-     * two thread strides here), since loads return in order and `d` is what the barrier waits on;
-     * then this thread's quarter row of W_up, which does not depend on `d`; then, when one mix item
-     * a thread covers the block's (RG * ipb <= the thread count, always at hc 4), the hc values N
-     * of its channel from `h`, the norm gain and kernel A's scales. Same values, same order:
-     * bit-identical. */
+    /* Every load this kernel makes before its first barrier, issued together: at decode the
+     * kernel is a chain of dependent latencies, not a stream of bytes. `d` goes first, all of a
+     * thread's share at once (lr is at most two thread strides here), since loads return in order
+     * and `d` is what the barrier waits on; then this thread's quarter row of W_up, which does not
+     * depend on `d`; then, when one mix item a thread covers the block's (RG * ipb <= the thread
+     * count, always at hc 4), the hc values N of its channel from `h`, the norm gain and kernel
+     * A's scales. Only the issue order moves; the arithmetic sees the same values in the same
+     * order, so the result is bit-identical. */
     constexpr int kDStage = 2;
     const bool dpre = lr <= (long)kDStage * kThreads;
     unsigned short dv[RG][kDStage];                 /* bf16 bits; the E4M3 dot keeps them as is */
@@ -1325,7 +1327,7 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
     const bool one = RG * ipb <= kThreads;
     float Npre[kHcMax];
     if constexpr (WAIT) {
-        /* The fused form (hc_read_fused_kernel): `h` and the gain now, kernel A's half after it. */
+        /* The fused form (hc_read_fused_kernel): `h` and the gain here, kernel A's half after it. */
         float hv[kHcMax], wv[kHcMax];
         const int  rl = one && tid < RG * ipb ? tid / ipb : 0, ii = tid - rl * ipb;
         const long r  = r0 + rl < rows ? r0 + rl : rows - 1;
@@ -1475,9 +1477,9 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
     if (r >= rows) return;
     const long base = (i0 / kUpTB) * kUpTB;
     const unsigned short* const xr = x + r * xrow + base;
-    /* A lane's four channels, read once for the amax, the codes and the rotation (it
-     * read the group three times, each a dependent round trip at the end of the step's chain). The
-     * amax is over the same 128 values and max is exact, so this is bit-identical. */
+    /* A lane's four channels, read once for the amax, the codes and the rotation; separate reads
+     * would each be a dependent round trip at the end of the step's chain. The amax is over the
+     * same 128 values and max is exact, so the result is bit-identical. */
     static_assert(kUpTB == 4 * kWave, "a lane holds four channels of the group");
     float v[4];
 #pragma unroll
@@ -1598,10 +1600,9 @@ static inline int hc_up_launch(const RadTensor* up, long uld, bool f8, const uns
 }
 
 /* Rows of W_up a thread (hc_up_mix_kernel's RPT), where the wider workgroup's channels
- * still divide a scale group and the width. Two, measured at Flash-Next's shape (rad-kbench, cold,
- * the fused form at one, two and four rows): one row 18.4 / 18.9 / 20.6 us, two 17.0 / 17.8 /
- * 20.4; four, before the bf16 dot, lost to two at every count (27.0 us at four rows, past the
- * registers). */
+ * still divide a scale group and the width. Two: at Flash-Next's shape (cold caches, the fused
+ * form at one, two and four rows) two beats one at every row count, and four runs past the
+ * register budget and loses to two. */
 constexpr int kUpRpt = 2;
 static inline int hc_up_rpt(bool f8, int hc, long n) {
     int rpt = f8 ? kUpRpt : 1;
@@ -1611,20 +1612,18 @@ static inline int hc_up_rpt(bool f8, int hc, long n) {
     return rpt;
 }
 
-/* hc_up_mix_kernel's launch: hc_up's row group; counter slots are (rows / rg) row groups of
- * n / kUpTB scale groups. */
-/* ============================================================== the previous decode kernels
+/* ============================================================== the two-grid decode kernels
  *
- * hc_read's decode kernels as they were before the one-grid form and the pipelined tiled up-mix:
- * kernel A, then the up-mix kernel in a second launch, and the tiled up-mix with its K passes in
- * sequence. Kept verbatim behind r4d_hc_read_pin_decode(1) so r4d_selftest can compare the
- * current forms with them byte for byte and --perfhc can time both from one build. */
+ * hc_read's decode path as two launches: kernel A, then the up-mix kernel in a second launch, and
+ * the tiled up-mix with its K passes unpipelined. r4d_hc_read_pin_decode(1) selects them, so
+ * r4d_selftest can compare the served forms against them byte for byte and --perfhc can time both
+ * from one build. They are the reference for that comparison; keep them as they are. */
 static int g_hc_decode_form = 0;
 
 template <bool F8>
 __global__ __launch_bounds__(kThreads)
 __attribute__((amdgpu_waves_per_eu(F8 ? 9 : 1, F8 ? 9 : 16)))
-void hc_read_a_prev_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+void hc_read_a_2grid_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
                       const void* __restrict__ downv, long dld,
                       const unsigned short* __restrict__ injw,
                       unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
@@ -1767,7 +1766,7 @@ void hc_read_a_prev_kernel(const unsigned short* __restrict__ h, const float* __
 
 template <int RG, bool F8, bool I8 = false>
 __global__ __launch_bounds__(kThreads)
-void hc_up_mix_prev_kernel(const void* __restrict__ upv, long uld,
+void hc_up_mix_2grid_kernel(const void* __restrict__ upv, long uld,
                       const unsigned short* __restrict__ dbuf,
                       const unsigned short* __restrict__ h, const float* __restrict__ w,
                       const float* __restrict__ scalein,
@@ -1877,7 +1876,7 @@ void hc_up_mix_prev_kernel(const void* __restrict__ upv, long uld,
     }
 }
 
-static inline int hc_up_mix_prev_launch(const RadTensor* up, long uld, bool f8, bool i8,
+static inline int hc_up_mix_2grid_launch(const RadTensor* up, long uld, bool f8, bool i8,
                                         const unsigned short* dbuf,
                                         const unsigned short* h, const float* w, const float* scale,
                                         unsigned short* x, unsigned char* q, float* qs,
@@ -1892,7 +1891,7 @@ static inline int hc_up_mix_prev_launch(const RadTensor* up, long uld, bool f8, 
     const unsigned lds = (unsigned)(rg * lr * sizeof(float));
     const void* upp = up->data;
 #define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
-    emit_rc = R4D_EMIT(stream, (hc_up_mix_prev_kernel<RG_, F8_, I8_>), grid, dim3(kThreads), lds,     \
+    emit_rc = R4D_EMIT(stream, (hc_up_mix_2grid_kernel<RG_, F8_, I8_>), grid, dim3(kThreads), lds,     \
                        upp, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, (long)rows, (long)n,  \
                        hc,                                                                        \
                        (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
@@ -1914,6 +1913,8 @@ static inline int hc_up_mix_prev_launch(const RadTensor* up, long uld, bool f8, 
     return emit_rc;
 }
 
+/* hc_up_mix_kernel's launch: hc_up's row group; counter slots are (rows / rg) row groups of
+ * n / kUpTB scale groups. */
 static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool i8,
                                    const unsigned short* dbuf,
                                    const unsigned short* h, const float* w, const float* scale,
@@ -1924,7 +1925,7 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool 
                                    long long srow, long long rqrow, long long rsrow, float wadd,
                                    RadStream stream) {
     if (g_hc_decode_form == 1)
-        return hc_up_mix_prev_launch(up, uld, f8, i8, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr,
+        return hc_up_mix_2grid_launch(up, uld, f8, i8, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr,
                                      rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd,
                                      stream);
     int emit_rc = RAD_OK;
@@ -2598,11 +2599,10 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
 
     /* At the decode tile (RT 32, E4M3, lr a whole number of passes) the K loop is
      * software-pipelined: a pass issues the next pass's loads before staging its own from
-     * registers, and the mix's operands are loaded with the first pass, where each pass waited
-     * on its own loads. Addresses are computed once, nothing branches and the barriers order LDS
-     * only (hc_lds_barrier), so the waits stay partial. 17.8 -> 16.6 us at 32 rows (rad-kbench,
-     * cold): the kernel is bound less by memory than by its staging, barriers and WMMA. The staged
-     * values are the loop's own, in the same order: bit-identical. */
+     * registers, and the mix's operands are loaded with the first pass. Addresses are computed
+     * once, nothing branches and the barriers order LDS only (hc_lds_barrier), so the waits stay
+     * partial; the kernel is bound less by memory than by its staging, barriers and WMMA. The
+     * staged values are the loop's own, in the same order: bit-identical. */
     constexpr int  kAPer = RT * (kTKT / 8) / kThreads, kBPer = NT * (kTKT / 8) / kThreads;
     constexpr int  kNPer = RT * NT / kThreads;
     constexpr bool kPipe = F8 && RT == 32 && kAPer == 1 && kBPer * kThreads == NT * (kTKT / 8)
@@ -2767,10 +2767,10 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
 
     /* The rotated codes need a whole wave per row, while the codes below use kThreads / RT threads
      * per row, so the rotation walks the tile's rows a wave at a time first. */
-    /* Both finishers below load what they read before using any of it -- the
-     * rotation every row of the wave's, the codes a thread's four-channel runs -- where they
-     * walked rows and channels a dependent load at a time; the codes' amax is over the same 128
-     * values. The tail of this kernel is one block's chain, so these were its links. Bit-identical. */
+    /* Both finishers below load what they read before using any of it (the rotation every row
+     * of the wave's, the codes a thread's four-channel runs) rather than one dependent load at a
+     * time, since the tail of this kernel is one block's latency chain. The codes' amax is over
+     * the same 128 values, so the result is bit-identical. */
     if (rq) {
         const long gb = (i0 / kUpTB) * kUpTB;
         constexpr int kRPW = (RT + kWaves - 1) / kWaves;   /* rows a wave */
@@ -2819,11 +2819,11 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
     }
 }
 
-/* The tiled up-mix as it was before its K passes were pipelined (see the previous decode
- * kernels above; r4d_hc_read_pin_decode(1)). */
+/* The tiled up-mix with its K passes unpipelined, for r4d_hc_read_pin_decode(1) (see the
+ * two-grid decode kernels above). */
 template <int RT, int NT, bool F8, bool I8 = false>
 __global__ __launch_bounds__(kThreads)
-void hc_up_mix_tiled_prev_kernel(const void* __restrict__ upv, long uld,
+void hc_up_mix_tiled_2grid_kernel(const void* __restrict__ upv, long uld,
                             const unsigned short* __restrict__ dbuf,
                             const unsigned short* __restrict__ h, const float* __restrict__ w,
                             const float* __restrict__ scalein,
@@ -3246,7 +3246,7 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
                    rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd)
 #define HC_UM_CASE3(RT_, F8_, I8_)                                                               \
     do {                                                                                         \
-        if (g_hc_decode_form == 1) HC_UM_K((hc_up_mix_tiled_prev_kernel<RT_, kTNT, F8_, I8_>));   \
+        if (g_hc_decode_form == 1) HC_UM_K((hc_up_mix_tiled_2grid_kernel<RT_, kTNT, F8_, I8_>));   \
         else                       HC_UM_K((hc_up_mix_tiled_kernel<RT_, kTNT, F8_, I8_>));        \
     } while (0)
 #define HC_UM_CASE(RT_, F8_)                                                                     \
@@ -4812,7 +4812,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
              inj ? (unsigned short*)inj->data : nullptr, scale, (long)rows, (long)n, (int)hc,     \
              (long)lr, (long)ta, (long)hrow, (long)irow, eps, wadd)
     if (g_hc_decode_form == 1)
-        emit_rc = f8 ? HC_READ_A(hc_read_a_prev_kernel<true>) : HC_READ_A(hc_read_a_prev_kernel<false>);
+        emit_rc = f8 ? HC_READ_A(hc_read_a_2grid_kernel<true>) : HC_READ_A(hc_read_a_2grid_kernel<false>);
     else if (pre) emit_rc = HC_READ_A((hc_read_a_kernel<true, 4, 10>));
     else          emit_rc = f8 ? HC_READ_A(hc_read_a_kernel<true>) : HC_READ_A(hc_read_a_kernel<false>);
 #undef HC_READ_A

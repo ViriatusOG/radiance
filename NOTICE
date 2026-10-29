@@ -22,14 +22,21 @@ Written by Deadcode, with contributions from:
   through w4a16_asym, and the Ornith-1.5-122B compose files
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
-  coupling with its cooperative verify (--draft-coupling)
+  coupling with its cooperative verify (--draft-coupling), the W4A8 prefill's tail scale read, and
+  the ISA instruments' VGPR granule, back-edge count and fail-closed parse
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
   wire, the diagnosis of the three-rank lossy-wire crash, cardclock.py, --busy-prefill-chunk, curl,
   jq and a CA bundle in the image with hfget.sh under its busybox, rad-export, --prefill-interleave,
   runtime LoRA adapters served beside the base model and picked per request, and the prefix cache's
-  reserved snapshots held until their save lands
+  reserved snapshots held until their save lands, --expert-stats, imatrix entries in llama.cpp's
+  spelling, typed tool-call argument tags, a chat template refused at load when it cannot render,
+  rad-chatparse --request, a draft head's routed experts in host memory (--draft-expert-placement
+  host) and decode-hot residency (--expert-profile, --expert-pin-top), prefix hits over KV groups
+  of different block sizes and a hybrid's window in the checkpoint slot, --prefix-resume exact, and
+  DeepSeek-V4.1-Flash's conversion from its release (the Engram tables, the fused imatrix, the
+  UD-IQ1_S recipe and rad-convert --chat-template)
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
@@ -42,8 +49,10 @@ Written by Deadcode, with contributions from:
   drafters), the embedding scale rounded as Hugging Face rounds it, block drafters' drafts
   accepted on the card, z-lab's DFlash drafter drafting on after a prefix-cache hit and the 31B's
   GPTQ calibration tap, and for speculation the MTP head's first draft read up to where it sits, no
-  step queued behind one that ends its requests, and a step's tokens streamed before the drafter's
-  passes end
+  step queued behind one that ends its requests, a step's tokens streamed before the drafter's
+  passes end, a block drafter's proposals verified as a tree, the 31B's block-16 DFlash2 tree with
+  its short block under load, a block drafter's window carried in the window snapshot, and window
+  snapshots from short prompts
 - redxherring: --model taking a Hugging Face repo id
 - Smellyyyy: the idea behind --prefill-interleave
 - gearwave00001: /v1/messages as Claude Code sends it
@@ -64,7 +73,11 @@ Written by Deadcode, with contributions from:
   (--draft-short-from), the f16 delta-net state cache, the two-rank all-reduce checking a peer's push
   has landed, the MXFP4 decode gate_up folded with its activation and fp8 quantiser, the head-256
   split-KV decode attention, weight reads beside the decode all-reduces (--weight-prefetch), the
-  head-256 prefill attention's KV split for small launches, and the GUIDE's two engines on one pair
+  head-256 prefill attention's KV split for small launches, the GUIDE's two engines on one pair,
+  DFlash2's coupled acceptance at T > 0, the prefix cache's snapshot at a head prompts share,
+  tip-only's snapshot a drafter window below the tip, Gemma 3's fused all-reduce junction on the
+  lossy wire, the three-wave verify's split by depth, and the delta net's out-projection read
+  beside its decode recurrent update
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
   linears' operands directly
@@ -75,8 +88,10 @@ Written by Deadcode, with contributions from:
   name the opener opens, GLM-5.3-Flash's vision tower and processor, its decode at a few rows and
   its DSA indexer split over the ranks, a host-tier restore that makes room as pressure does, KV
   groups every rank holds kept once a host slot, the eight-rank two-shot in ring order, the MLA
-  row form (--tp-attn-split rows), DELETE /sessions, and the dispatch stamps of a played pass with
-  stampgaps.py
+  row form (--tp-attn-split rows), DELETE /sessions, the dispatch stamps of a played pass with
+  stampgaps.py, one n-gram table for engines on separate cards (--ngram-placement ram=DIR), GGUF
+  Q8_0, Q4_K and Q6_K tensors imported as their planes, the dense integer rows at the group they
+  compute, and the GDN conv kernels on an f32 weight
 - John McDonough: GLM-5.3-Flash -- its plugin, its blocks (mHC streams, KDA, the DSA indexer and
   sparse latent attention, f32-scaled FP8 and MXFP4 experts under sigmoid routing) and their
   reference and AVX ops -- a Quark export's block-FP8 layers, the signed QSA ranking, the
@@ -86,18 +101,32 @@ Written by Deadcode, with contributions from:
   rotation
 - C_Tamas: control vectors, loaded when the deployment asks and applied as a per-layer residual
   projection, KV streaming for a context bigger than VRAM (--kv-resident), and the dashboard's
-  request history
+  request history, KV streaming traffic and one-unit KV meter
 - J-Nova: Unlimited-OCR, and Sage-A1.5 with its vision tower and its DFlash2 drafter
 - thekk1: the fp8 QK and PV legs of the h256 prefill attention (--attn-prefill-fp8)
-- lortht: Krea 2's rebalance of the text taps and its presets, and MiniMax-H3's modulation rows
+- lortht: Krea 2's rebalance of the text taps and its presets, MiniMax-H3's modulation rows, and
+  keyframes carried through a latent upscale
 - Quackster: cards with a small PCI BAR, their kernel arguments kept in host memory
 - farcryjohn: periodic window snapshots that let an edited prompt reuse its prefix
 - gostar: snapshot-backed prefix KV kept across recomputes, and Tencent's Hy-Memory (HYV3) -- its
-  BF16, FP8 and GGUF adapters, its KV scales, and its native sectioned tool calls
+  BF16, FP8 and GGUF adapters, its KV scales, its native sectioned tool calls, and its W4 decode
+  (the per-128 I4 expert packing, the one-row W4/W5 epilogue and the fused prologue and folds)
 - launch80_assets: tuning collectives as the exchange they serve at the served configuration, the
   per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch
 - hugypufy: M2XFP4 -- its quantiser, its GEMMs and its linears in the Qwen3.8 trunk and the DFlash2
   drafter -- and the ParoQuant M2XFP4 import
+- steki: Gemma 4 E2B's per-layer MLP width and the bf16 descriptor for Google's E2B/E4B
+  directories, nomic-embed-text-v2-moe (the nomicbert plugin), its config key aliases and
+  RAD_MAP_TRANSPOSE honouring src_index, an f32 source narrowed to a bf16 declaration at load, and
+  the snapshot store's floor ahead of --host-headroom-mib
+- griffin-warrior: the kernel report's consistency checks and coverage header, collective selftest
+  cases skipped without a peer path, the build's media capability in the diagnostics, and the
+  GUIDE's ROCm SDK and ffmpeg notes
+- nickreese: GBNF bounded-repetition chains shared across identical operands
+- Dad_Vibes: hc_read's decode kernels as one grid, its tiled up-mix pipelined and its one-grid
+  wait trapping past its deadline, and gemm_fp8a8's narrow form with its scales staged through LDS
+  and its gated three-tile form at 8 waves
+- RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

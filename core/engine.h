@@ -33,6 +33,7 @@
 #include "text/tokenizer.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "format/table_share.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -230,7 +231,7 @@ private:
                                 int64_t host_late);
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
-     * over the link (`card`). */
+     * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too. */
     int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                    std::string* why);
     /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
@@ -240,6 +241,9 @@ private:
      * the ranks that read them are gone. */
     std::vector<TableCopy> table_copies_;
     std::vector<void*> card_copies_;
+    /* The files behind the card copies made under --ngram-placement ram=DIR. Closed after the
+     * copies are freed, because the holder that leaves last deletes the file. */
+    std::vector<TableShare> table_shares_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
@@ -268,6 +272,9 @@ private:
         /* The ids' copy recorded tok_end_ ahead of the drafter's passes: collect_step waits for
          * it alone, and the step loop for step_end_ after the commit. */
         bool                  early = false;
+        /* [n_seq][RAD_SCHED_MAX_SPEC] on a tree step (StepPlan::spec_is_tree): each entry's
+         * accepted nodes in commit order (accept_tree's path). Empty on a chain step. */
+        std::vector<int32_t> path;
     };
 
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
@@ -308,6 +315,12 @@ private:
      * Written by the scheduler thread while the ranks are parked, read by them during the step,
      * consumed by collect_step. */
     std::vector<std::pair<int32_t, TokenScores*>> score_rows_;
+    /* A scored step (RadBatch::score_only): the plugin ran no lm_head, and the candidates' logits
+     * come from the hidden rows and the head table's rows at `score_ids_` (every scored row's
+     * candidates, sorted and unique), both read back into `score_host`. */
+    bool                 score_only_ = false;
+    std::vector<int32_t> score_ids_;
+    int64_t              score_embd_ = 0;
     int  stage_scored_rows(const StepPlan& plan, const StepOut& so);
     int  issue_scored_rows(Rank& r);
     int  collect_scored_rows();
@@ -341,7 +354,9 @@ private:
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
     int  collect_issue(StepOut& so, bool fence = false);
     int  collect_step(const RadBatch* b, StepOut& so);
-    int  row_logprobs(StepOut& so, int32_t row, int32_t token);
+    /* `row`'s logprobs for `token`, filed at `at` (default `row`): a tree verify emits a token from
+     * its parent node's row but files it as the entry's j-th emitted token. */
+    int  row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at = -1);
     /* The step's end on the card: after its last draft pass and the host readbacks, before the
      * step issued ahead. The engine waits on this event, not the stream, so the card runs the
      * next step while the host commits this one. */
@@ -375,10 +390,12 @@ private:
      * string because RadDrafterDecl::name points into the Program. */
     RadDrafterDecl       drafter_{};
     std::string          drafter_name_;
-    /* The block drafter's shorter block (rad_drafter_short_block), 0 when it has none or
-     * --draft-short-from is 0. */
+    /* The block drafter's shorter block (rad_drafter_short_block), 0 when it has none or will not
+     * run it (--draft-short-from 0, or auto for a chain). */
     int64_t              drafter_short_ = 0;
     bool                 short_on_ = false;     /* the short block runs now (block_shape) */
+    /* --draft-short-from resolved at bring-up (auto: 0 for a chain, 2 for a tree). */
+    int64_t              short_from_ = 0;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
@@ -475,11 +492,33 @@ private:
      * both behind the step before its readback and finish_block_drafter publishes the proposals
      * after the commit, so the step can be issued ahead. */
     bool block_drafting() const;
+    /* RadBuildCtx::draft_tree for every declare: decided once in declare() from the plugin's probe
+     * (RadArchProbe::tree_pays). */
+    bool draft_tree_ = false;
     int  block_pass(const RadBatch* db, const char* what, int step);
+    /* A program's block drafter rides its window in the window snapshot: it stores its context
+     * in the context pass right behind the trunk step, and the snapshot is saved after that. Only
+     * where the trunk's window is snapshotted at all (window_snapshots): a full-attention trunk
+     * takes no snapshot for a drafter's window alone. */
+    bool drafter_window_snap(const Program& p) const {
+        return cfg_.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.depth > 0 &&
+               window_snapshots(p, cfg_);
+    }
+    /* The drafter's window rides in the window snapshot (KVManager::drafter_window_snapshot), so
+     * the checkpoint save waits for its context pass (save_checkpoints). */
+    bool drafter_snap_ = false;
+    int  save_checkpoints();
+    /* A tree drafter (rad_drafter_tree), driven on the card only: ADV_BTAKE takes its parents,
+     * ADV_COMPACT moves the accepted path's K and V after the acceptance, and ADV_CTXTREE stages
+     * the context pass by that path. */
+    bool    tree_ = false;
+    rad_buf tree_parents_ = 0;
+    int     tree_compact(int rows);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
     /* The block and proposal count this step's query pass runs at: the drafter's own, or its short
-     * block once --draft-short-from sequences decode, back to its own only two below. */
+     * block once --draft-short-from sequences decode, back to its own two below or at one sequence
+     * (Scheduler::short_block_on). */
     void block_shape(int* block, int* steps);
     /* Handed from issue_block_drafter to finish_block_drafter and issue_ahead: the drafting rows,
      * in the query pass's order, and how many there are (0 when no query pass ran). */

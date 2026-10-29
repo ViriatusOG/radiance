@@ -101,6 +101,21 @@ TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_E_INVAL);
 }
 
+/* --draft-short-from takes a count, 0 for never, or auto (the default): the engine resolves auto to
+ * never for a chain and to two decoding sequences for a tree drafter. */
+TEST(draft_short_from_takes_a_count_never_or_auto) {
+    Config c;
+    CHECK_EQ(c.draft_short_from, -1ll);
+    CHECK_OK(parse({ "--draft-short-from", "4" }, &c));
+    CHECK_EQ(c.draft_short_from, 4ll);
+    CHECK_OK(parse({ "--draft-short-from", "0" }, &c));
+    CHECK_EQ(c.draft_short_from, 0ll);
+    CHECK_OK(parse({ "--draft-short-from", "auto" }, &c));
+    CHECK_EQ(c.draft_short_from, -1ll);
+    CHECK_EQ(parse_fresh({ "--draft-short-from", "-2" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-short-from", "some" }), RAD_E_INVAL);
+}
+
 /* KL mode records or scores, never both, and requires that direction's inputs. Guessing between
  * them could make a quantised model the reference. */
 TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
@@ -790,6 +805,25 @@ TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
     }
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
+}
+
+/* ram=DIR is ram whose pinned copy is a shared file in DIR; a later plain placement drops the
+ * directory, and no other tier takes one. */
+TEST(the_ngram_table_takes_a_directory_for_a_shared_ram_copy) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.ngram_share_dir.empty());
+    Config s;
+    CHECK_EQ(parse({ "--ngram-placement", "ram=/tmp/x" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK_EQ(s.ngram_share_dir, std::string("/tmp/x"));
+    CHECK_EQ(parse({ "--ngram-placement", "ram=/tmp/x", "--ngram-placement", "ram" }, &s), RAD_OK);
+    CHECK(s.ngram_placement == TablePlacement::Ram);
+    CHECK(s.ngram_share_dir.empty());
+    Config c;
+    for (const char* bad : { "ram=", "vram=/tmp/x", "disk=/tmp/x", "auto=/tmp/x" })
+        CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--embedding-placement", "ram=/tmp/x" }, &c), RAD_E_INVAL);
 }
 
 /* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text

@@ -4063,7 +4063,7 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
     static const Grid kGrids[] = {
         { "w2a8", RAD_U2, 0, 1 },         { "w4a8_asym", RAD_U4, 0, 1 },
         { "w4a16_asym", RAD_U4, 2, 1 },   { "w4a16_asym", RAD_U4, 2, 2 },
-        { "w4a16_asym", RAD_U4, 3, 1 },   /* BF16 input, oracle is the former F16 cast */
+        { "w4a16_asym", RAD_U4, 3, 1 },   /* BF16 input, narrowed to F16 as the cast kernel does */
         { "w5a16", RAD_U5, 2, 1 },        { "w5a16", RAD_U5, 2, 3 },
         { "w4a8i8_asym", RAD_U4, 1, 1 },  { "w4a8i8_asym", RAD_U4, 1, 2 },
         { "w5a8i8", RAD_U5, 1, 1 },       { "w5a8i8", RAD_U5, 1, 3 },

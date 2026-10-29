@@ -831,12 +831,10 @@ struct G3Junction {
 /* The tallest step that takes the fp8 junction's lossy twin (G3JunctionFP8::op_ar6); a taller one
  * keeps the standalone lossy all-reduce, unfused. The fused kernel gives each block one row, so past
  * a few sequences the standalone all-reduce, spread over more blocks, wins despite its extra
- * launches. TranslateGemma-27B MXFP4 + DFlash2 at tp 2 on 2x R9700, --tp-wire wht6, production's
- * flags (--draft-short-from 8), greedy, aggregate tok/s, two rounds, limit never / 16 / 24 / any:
- * 2 streams (16 rows) 350.7 346.2 / 371.8 367.7 / 370.4 367.0 / 357.7 356.0; 3 (24 rows) 455.8
- * 451.2 / 455.1 454.2 / 462.8 460.6 / 437.3 436.8; 4 (32 rows) 553.7 553.6 / 557.9 554.2 / 553.9
- * 560.2 / 521.0 523.0; 8 (32 rows, the short block) 717.4 718.0 / 717.2 720.5 / 716.7 720.8 /
- * 662.4 661.9. One stream's 8 rows go out exact under the default --tp-wire-min-kb (op_ar). */
+ * launches. TranslateGemma-27B MXFP4 + DFlash2 at tp 2 on 2x R9700 (--tp-wire wht6,
+ * --draft-short-from 8, greedy): fusing raises aggregate throughput by 1-6% up to 24 rows and
+ * lowers it by 6-8% at 32. One stream's 8 rows go out exact under the default --tp-wire-min-kb
+ * (op_ar). */
 constexpr int64_t kAr6MaxRows = 24;
 
 /* ---- the MXFP4 trunk's junction (libr4d `rmsnorm_quant_fp8`): the add of the branch `x` into
@@ -848,10 +846,10 @@ struct G3JunctionFP8 {
     rad_op     op = 0;
     /* At two ranks: the branch's all-reduce and post-norm folded in front
      * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. `op_ar` sends
-     * the exact wire, taken by the steps whose message goes out exact (ar_wire_is_exact: a decode
-     * step of a few rows, under --tp-wire-min-kb); `op_ar6` the rotated 6-bit one, declared under a
-     * lossy --tp-wire and taken by the steps above that up to kAr6MaxRows, byte-identical to the
-     * standalone lossy all-reduce, rmsnorm and rmsnorm_quant_fp8 it replaces. */
+     * the exact wire, for the steps whose message goes out exact (ar_wire_is_exact: a decode step
+     * of a few rows, under --tp-wire-min-kb). `op_ar6` sends the rotated 6-bit one: declared under
+     * a lossy --tp-wire, it takes the steps above that up to kAr6MaxRows and is byte-identical to
+     * the standalone lossy all-reduce, rmsnorm and rmsnorm_quant_fp8 it replaces. */
     rad_op     op_ar = 0, op_ar6 = 0;
     Geom       gm{};
     rad_buf    x = 0, res = 0, q = 0, s = 0;
@@ -883,8 +881,8 @@ struct G3JunctionFP8 {
                 const rad_buf wa[4] = { x, q, s, res };
                 rad_op_reads (b, op_ar, rd, 2);
                 rad_op_writes(b, op_ar, wa, 4);
-                /* The lossy twin where that wire is reachable and the row is whole 64-element
-                 * groups (the kernel pads a partial last 512-element chunk). */
+                /* The lossy twin, under a lossy wire and for a row of whole 64-element groups
+                 * (the kernel pads a partial last 512-element chunk). */
                 if (!g.wire_exact && n % 64 == 0) {
                     const RadParam p6[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
                                             RAD_F64("eps", g.eps), RAD_INT("group", RAD_FP8_BLOCK),

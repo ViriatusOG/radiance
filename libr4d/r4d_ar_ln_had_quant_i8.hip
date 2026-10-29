@@ -125,7 +125,7 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
     int4* peer_base, const int4* my_base,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     int M, int K, int slot_stride16, int drain, int acq,
-    float eps, float wadd, float rnorm, unsigned int nbw) {
+    float eps, float wadd, float rnorm, unsigned int nbw, long stage) {
   constexpr int VPL = HAD / 32, NW = THR / 32;
   constexpr int MAXB = R4D_ARN_MAXVALS / VPL;
   extern __shared__ float lds[];
@@ -146,6 +146,7 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   const unsigned int sq = s_seq;
   int4* ps = peer_base + (size_t)s_slot * slot_stride16;
   const int4* ms = my_base + (size_t)s_slot * slot_stride16;
+  const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
 
   // WIRE == 6 only. The slot is split as in the standalone compressed all-reduce: packed symbols
   // from the base, bf16 group scales from halfway. Chunk indices are global over the [M, K]
@@ -263,7 +264,8 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, sq, [&](unsigned int& h) {
     if constexpr (WIRE == 0) {
       const int wpr = K >> 3;
-      for (int k = r0 * wpr + tid; k < r1 * wpr; k += THR) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+      for (int k = r0 * wpr + tid; k < r1 * wpr; k += THR)
+        h += r4d_archk_u4(r4d_archk_keep(&ms[k], md), 4u * (unsigned)k);
     } else {
       for (int ci = wave; ci < cpb; ci += NW) {
         const int c = c00 + ci;
@@ -271,25 +273,32 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
         const unsigned int cd = (unsigned)c * (ARN_CBYTES / 4);
 #pragma unroll
         for (int w4 = 0; w4 + 4 <= ARN_NWORD; w4 += 4)
-          h += r4d_archk_u4(*(const uint4*)(pb + w4 * 4 * ARN_WV + lane * 16),
+          h += r4d_archk_u4(r4d_archk_keep((const uint4*)(pb + w4 * 4 * ARN_WV + lane * 16), md),
                             cd + (unsigned)(w4 * ARN_WV + lane * 4));
         if constexpr (ARN_NWORD % 4 >= 2) {
-          const uint2 u = *(const uint2*)(pb + (ARN_NWORD & ~3) * 4 * ARN_WV + lane * 8);
+          const uint2 u =
+              r4d_archk_keep((const uint2*)(pb + (ARN_NWORD & ~3) * 4 * ARN_WV + lane * 8), md);
           const unsigned int e = cd + (unsigned)((ARN_NWORD & ~3) * ARN_WV + lane * 2);
           h += r4d_archk_mix(u.x, e) + r4d_archk_mix(u.y, e + 1u);
         }
         if constexpr (ARN_NWORD % 2 == 1)
-          h += r4d_archk_mix(*(const unsigned int*)(pb + (ARN_NWORD - 1) * 4 * ARN_WV + lane * 4),
+          h += r4d_archk_mix(
+              r4d_archk_keep((const unsigned int*)(pb + (ARN_NWORD - 1) * 4 * ARN_WV + lane * 4), md),
                              cd + (unsigned)((ARN_NWORD - 1) * ARN_WV + lane));
 #pragma unroll
         for (int t = 0; t < ARN_ITERS; ++t) {
           const int gl = t * ARN_GPW + gw;
-          if (lig == 0) h += r4d_archk_mix(m_sc[c * ARN_CG + gl], R4D_ARCHK_U16 + (unsigned)(c * ARN_CG + gl));
+          if (lig == 0)
+            h += r4d_archk_mix(r4d_archk_keep(&m_sc[c * ARN_CG + gl], md),
+                               R4D_ARCHK_U16 + (unsigned)(c * ARN_CG + gl));
         }
       }
     }
   });
 
+  ms = r4d_archk_moved(ms, md);
+  m_pay = r4d_archk_moved(m_pay, md);
+  m_sc = r4d_archk_moved(m_sc, md);
   // The peer's rows are now in my scratch, in the same [M, K] layout as X.
   const __hip_bfloat16* P = (const __hip_bfloat16*)ms;
 
@@ -475,7 +484,8 @@ void r4d_ar_ln_had_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
                             long seq_ctrs, long slot_stride16,
                             long x, long residual, long wgain, long out_bf16, long q, long s,
                             int M, int K, int had, float eps, float wadd,
-                            long stream, int nblocks, int nthreads, int drain, int acq, int wire) {
+                            long stream, int nblocks, int nthreads, int drain, int acq, int wire,
+                            long stage) {
   if (K % 16) throw std::runtime_error("r4d ar_ln_had_quant_i8: K must be a multiple of 16");
   if (M < 1) throw std::runtime_error("r4d ar_ln_had_quant_i8: M must be positive");
   if (had < 2 || (had & (had - 1))) throw std::runtime_error(
@@ -509,7 +519,7 @@ void r4d_ar_ln_had_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
     (__hip_bfloat16*)residual, (const __hip_bfloat16*)wgain, (__hip_bfloat16*)out_bf16, \
     (signed char*)q, (float*)s, (int4*)peer_scratch, (const int4*)my_scratch, \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, M, K, (int)slot_stride16, \
-    drain, acq, eps, wadd, rn, (unsigned)nbw)
+    drain, acq, eps, wadd, rn, (unsigned)nbw, stage)
 #define R4D_ARN_T(H, W, R) switch (thr) { \
     case 128: R4D_ARN_LAUNCH(H, 128, W, R); break; \
     case 256: R4D_ARN_LAUNCH(H, 256, W, R); break; \

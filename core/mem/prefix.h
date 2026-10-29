@@ -127,6 +127,10 @@ public:
      * of the store. The base applies select() to its own output one checkpoint at a time, which
      * is cheap only for a policy that keeps few. */
     virtual int64_t held(int64_t ctx, int64_t interval) const;
+    /* Tokens before the tip a hit must be able to end at: a drafter whose KV the cache does not
+     * hold recomputes that much of the prompt's tail (Scheduler::init, HitCap). 0: none. A policy
+     * that would otherwise keep nothing that deep keeps one snapshot there. */
+    virtual void set_floor(int64_t) {}
 };
 
 /* Keep the tip and, at every scale S = interval x 2^k, the shallowest checkpoint in the tip's
@@ -146,12 +150,18 @@ private:
     int64_t interval_;
 };
 
-/* The two ends of the trade, for comparison. */
+/* The two ends of the trade, for comparison. tip-only under a drafter floor also keeps the deepest
+ * snapshot at or below tip - floor: without it a refill-capped hit finds nothing to end on, keeps
+ * the whole hit, and the request decodes with no drafts (8 sessions of 22k tokens: 5 ran
+ * unspeculated, decode 424-521 t/s against 738-754 under geometric backoff). */
 class KeepTipOnly final : public CheckpointPolicy {
 public:
     const char* name() const override { return "tip-only"; }
     void select(const std::vector<int64_t>& positions, std::vector<int64_t>* keep) const override;
-    int64_t held(int64_t, int64_t) const override { return 1; }
+    int64_t held(int64_t, int64_t) const override { return floor_ > 0 ? 2 : 1; }
+    void set_floor(int64_t tokens) override { floor_ = tokens > 0 ? tokens : 0; }
+private:
+    int64_t floor_ = 0;
 };
 class KeepAll final : public CheckpointPolicy {
 public:
@@ -174,6 +184,9 @@ std::unique_ptr<CheckpointPolicy> make_checkpoint_policy(const std::string& name
  * the room is a hard bound. */
 constexpr int64_t kCheckpointSlotsFloor = 8;
 
+/* The least --host-headroom-mib is reduced to for a store's floor (host_reserve_for_floor). */
+constexpr int64_t kHostReserveFloor = (int64_t)1 << 30;
+
 struct CheckpointSlots {
     int64_t per_seq = 0;      /* snapshots a sequence is given */
     int64_t want = 0;         /* --max-num-seqs x per_seq */
@@ -181,9 +194,27 @@ struct CheckpointSlots {
     enum class Bound { Want, Share, Room } bound = Bound::Want;
 };
 
+/* What --checkpoint-slots auto wants before any byte budget applies: the policy's hold for one
+ * --max-model-len session plus one for its running turn, for each of --max-num-seqs. */
+int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
+                              int64_t interval);
+
 CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t max_seqs,
                                       int64_t ctx, int64_t interval, int64_t slot_bytes,
                                       int64_t share_bytes, int64_t room_bytes);
+
+/* The reserve to charge a store whose floor `need_bytes` must fit. `room_bytes` is what the host
+ * can pin with `margin_bytes` (--host-headroom-mib) held free; it is what the engine measures, not
+ * what a model or a KV encoding is assumed to cost.
+ *
+ * The reserve is a courtesy to the system -- the process's unpooled allocations, the load's
+ * staging windows, the page cache -- and a store that turns prefix reuse on or off outranks it: a
+ * store too small for one snapshot re-prefills the whole conversation on every turn, while the
+ * reserve it displaced is memory the host would merely have kept. So the reserve gives back
+ * exactly the shortfall, never below kHostReserveFloor, and never above the margin asked for.
+ * It answers `margin_bytes` unchanged whenever the floor already fits, so a host with room to
+ * spare never sees the reserve move. */
+int64_t host_reserve_for_floor(int64_t need_bytes, int64_t room_bytes, int64_t margin_bytes);
 
 /* ------------------------------------------------------------------ a release */
 /* What PrefixCache::release_session took out and what it left. Blocks are left for three
@@ -234,6 +265,8 @@ public:
     /* Overrides the policy configure() installed from Config::checkpoint_policy (custom policies,
      * tests). Call after configure(), which would undo it. */
     void set_policy(std::unique_ptr<CheckpointPolicy> p);
+    /* The drafter's refill window (CheckpointPolicy::set_floor), held across set_policy. */
+    void set_drafter_floor(int64_t tokens);
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
@@ -424,7 +457,7 @@ private:
     struct Entry {
         /* blocks_per_entry(i) per cached group, in groups_ order: entry_groups_[k] owns blocks[k] */
         std::vector<int32_t> blocks;
-        std::vector<int32_t> tokens;    /* the block's token ids, compared on hit */
+        std::vector<int32_t> tokens;    /* the entry's token ids, compared on hit */
         /* On the LRU exactly while the cache holds the blocks; `lru` is valid only then. An
          * off-device entry owns no block, so eviction must not reach it. */
         bool in_lru = false;
@@ -530,6 +563,7 @@ private:
     }
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;
+    int64_t drafter_floor_ = 0;
     mutable Stats stats_;
     std::string report_;
 };

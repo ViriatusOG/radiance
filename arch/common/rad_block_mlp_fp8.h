@@ -52,9 +52,9 @@ struct MlpFP8 {
     rad_op     op_ar = 0, op_add = 0;
     /* gate_up with the gate and quantiser in its epilogue, so the [M, 2*n_ff] bf16 product is
      * never written (unfused, the extra launch and second pass are a sizeable decode cost).
-     * Declared beside the pair, not instead of it: the fold is the narrow tile's epilogue and
-     * serves M <= 64, so prefill chunks take the pair. Byte-identical, as r4d_selftest and
-     * ref_test check. */
+     * Declared beside the pair, not instead of it: the narrow fold serves M <= 64, so prefill
+     * chunks take the pair -- unless the model asked for `wide_fold`, whose row serves every M.
+     * Byte-identical, as r4d_selftest and ref_test check. */
     rad_op     op_gated = 0;
     int64_t    gated_rows = 0;
     /* The next block absorbs this block's closing all-reduce, so this one must not issue it.
@@ -67,9 +67,13 @@ struct MlpFP8 {
     /* `fold`: a predecessor's delta is still in `w.h.x` and this norm does its residual add
      * (false for the first block of a chain). `add_out`: issue the trailing add here. See
      * rad_fp8.h. */
+    /* `wide_fold`: declare the gated fold over the whole prompt (gemm_nt_q_gated_wide, whose row
+     * serves every M) rather than the narrow row's 64-row band. Set by a model that runs whole
+     * prompts through the fold; every other caller keeps the band and the pair past it. */
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
                  const Src& src, bool fold = false, bool add_out = true,
-                 int ar_in = kArNone, bool ar_out_ = false, double swiglu_limit = 0);
+                 int ar_in = kArNone, bool ar_out_ = false, double swiglu_limit = 0,
+                 bool wide_fold = false);
     void step(RadCtx* c, const RadBatch* batch) const;
     /* The block over the first `T` rows of its buffers (see MoeFP8::step_rows). */
     void step_rows(RadCtx* c, int64_t T) const { slice(c, T, 0, T); }
@@ -93,7 +97,7 @@ struct MlpFP8 {
 
 inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
                            const Src& src, bool fold, bool add_out,
-                           int ar_in, bool ar_out_, double swiglu_limit) {
+                           int ar_in, bool ar_out_, double swiglu_limit, bool wide_fold) {
     g = geom; w = wire; layer = l;
     ar_out = ar_out_;
 
@@ -120,9 +124,9 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                swiglu_limit));
 
     /* The fold: decl_gated_fold (an fp8a8 tile) for block-fp8 weights, decl_gated_fold_mx for plain
-     * MXFP4 at one to eight rows. Other gate_up encodings (M2XFP4 included), and a clamped
-     * (swiglu_limit) product, take the pair. Over int8 codes only a host kernel would take it, which
-     * would pin the layer's weights to the host. */
+     * MXFP4 at one to 16 rows (eight where K is short). Other gate_up encodings (M2XFP4 included),
+     * and a clamped (swiglu_limit) product, take the pair. Over int8 codes only a host kernel would
+     * take it, which would pin the layer's weights to the host. */
     const bool fold_ok = swiglu_limit <= 0 && !gate_up.f32_scale;
     if (fold_ok && !gate_up.bf16 && !gate_up.mx && !gate_up.m2x && !gate_up.paro5 && !gate_up.w4 &&
         !gate_up.i8)
@@ -131,7 +135,7 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                    gq_ffn.want_x
                                        ? std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s, w.ffn.x }
                                        : std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s },
-                                   &gated_rows);
+                                   &gated_rows, wide_fold);
     else if (fold_ok && gate_up.mx && !gate_up.paro)
         op_gated = decl_gated_fold_mx(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
                                       gate_up.wref, { w.h.q, w.h.s },

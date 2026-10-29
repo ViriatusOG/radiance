@@ -38,6 +38,7 @@
  */
 #include "server.h"
 #include "server_priv.h"
+#include "oai.h"
 
 #include "mm/processor.h"
 #include "mm/resample.h"
@@ -658,8 +659,12 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
 
     auto handle = [&](const std::string& msg, bool binary) {
         if (binary) return append_pcm((const uint8_t*)msg.data(), msg.size(), nullptr);
-        const ojson j = ojson::parse(msg, nullptr, /*allow_exceptions=*/false);
-        if (j.is_discarded() || !j.is_object() || !j.contains("type") || !j["type"].is_string())
+        /* Bounded like a request body: 2 MiB of brackets is a legal WebSocket frame, and the
+         * recursive teardown of a deep tree would take the whole process down with it. */
+        bool over = false, deep = false;
+        const ojson j = parse_json_bounded(msg, 0, &over, &deep);
+        if (j.is_discarded() || over || deep || !j.is_object() || !j.contains("type") ||
+            !j["type"].is_string())
             return error("invalid_request_error", "invalid_json",
                          "a client event is a JSON object with a string `type`", "", nullptr);
         const std::string type = j["type"].get<std::string>();

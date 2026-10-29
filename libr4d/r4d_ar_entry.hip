@@ -99,6 +99,8 @@ int rv_barrier(int world) {
 struct ArInst {
     int  rank = 0, world = 0;
     long my_scratch = 0, my_flags = 0, my_seq = 0, locpack = 0;
+    /* A 2-rank host-mailbox instance's VRAM mirror of its slots, 0 otherwise (r4d_ar_seq.h). */
+    long my_stage = 0;
     long peer_scratch[R4D_MAX_PEERS] = { 0 };
     long peer_flags  [R4D_MAX_PEERS] = { 0 };
     long slot_bytes = 0;      /* per-slot capacity, 16-byte aligned                  */
@@ -350,6 +352,17 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         }
         sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
+    /* A host mailbox is read over the link past every cache, so the 2-rank kernels' push check
+     * copies what it reads into this VRAM mirror for the reduce, crossing the link once
+     * (r4d_ar_seq.h). Coarse-grained: only this rank's kernels touch it, each block its own words.
+     * The wide family has no push check and reads its slots once. Host-memory slots free the same
+     * VRAM over P2P, so the mirror keeps the footprint where the P2P instance has it. */
+    long stg = 0;
+    if (host && world == 2) {
+        R4D_TRY("ar_ipc_alloc(stage)",
+            stg = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen));
+    }
+
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
      * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the f32 scales 1/32 of
      * it, laid out from half the slot; a row padded to whole 512-element chunks
@@ -365,6 +378,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->my_flags   = fl;
     in->my_seq     = sq;
     in->locpack    = lp;
+    in->my_stage   = stg;
     in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     {
@@ -475,6 +489,7 @@ void release(ArInst* in) {
     }
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
+    r4d_ar_ipc_free(in->my_stage);
     delete in;
 }
 
@@ -799,7 +814,7 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
         r4d_ar_gather_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                             in->my_seq, in->slot16, c.inp, c.out, c.numel, in->dtype, in->rank,
                             (long)row, (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain,
-                            c.acq, (long)dpitch, (long)spitch));
+                            c.acq, (long)dpitch, (long)spitch, in->my_stage));
     return RAD_OK;
 }
 
@@ -869,7 +884,8 @@ extern "C" int r4d_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) {
         r4d_ar_oneshot_2rank_exact(c.in->peer_scratch[0], c.in->my_scratch,
                                    c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                    c.in->slot16, c.inp, c.out, c.numel, c.in->dtype,
-                                   (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq));
+                                   (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                                   c.in->my_stage));
     return RAD_OK;
 }
 
@@ -911,7 +927,8 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
             r4d_ar_oneshot_2rank_exact(c.in->peer_scratch[0], c.in->my_scratch,
                                        c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                        c.in->slot16, c.inp, c.out, c.numel, c.in->dtype,
-                                       (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq));
+                                       (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                                       c.in->my_stage));
         return RAD_OK;
     }
 
@@ -928,7 +945,8 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
                                   c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                   c.in->locpack, c.in->slot_bytes, c.in->slot_bytes / 2,
                                   c.inp, c.out, c.numel, c.in->dtype,
-                                  (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq));
+                                  (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                                  c.in->my_stage));
     return RAD_OK;
 }
 
@@ -1283,7 +1301,7 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
                                r4d_addr(q), r4d_addr(sc),
                                (int)M, (int)K, (int)had, eps, wadd,
                                (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq,
-                               wire));
+                               wire, in->my_stage));
     return RAD_OK;
 }
 
@@ -1404,7 +1422,7 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
               r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
               (int)rp, (int)yp, (int)qp, (int)sp,
               (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-              in->locpack, in->slot_bytes / 2)
+              in->locpack, in->slot_bytes / 2, in->my_stage)
         : r4d_ar_rmsnorm_quant_fp8(
               in->peer_scratch[0], in->my_scratch,
               in->peer_flags[0], in->my_flags, in->my_seq,
@@ -1412,7 +1430,7 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
               r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
               (int)rp, (int)yp, (int)qp, (int)sp,
               (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-              in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
+              in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0, in->my_stage);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1491,7 +1509,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
         v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc), (int)M,
         (int)K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
-        cfgv.acq);
+        cfgv.acq, in->my_stage);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1672,7 +1690,7 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
             r4d_addr(ew), r4d_addr(so), sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L,
             (long)ye_ld, (long)ew_ld, (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig,
             (long)(uintptr_t)s, nblocks, R4D_AR_WHT6_FUSED_THREADS, cfgv.drain, cfgv.acq,
-            early, early ? in->gate_ctr : 0L);
+            early, early ? in->gate_ctr : 0L, in->my_stage);
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
@@ -1687,7 +1705,7 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
         (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-        early ? in->gate_ctr : 0L);
+        early ? in->gate_ctr : 0L, in->my_stage);
     if (rc != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
@@ -1803,7 +1821,7 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
             in->locpack, in->slot_bytes, in->slot_bytes / 2, r4d_addr(y), r4d_addr(inj),
             r4d_addr(h), (long)M, (long)n, (long)hc, (long)irow, (long)hrow, 0L, 0L, 0L, 0L, 0L,
             0L, 0L, 0L, 0L, 0L, 0L, (long)(uintptr_t)s, nblocks, R4D_AR_WHT6_FUSED_THREADS,
-            cfgv.drain, cfgv.acq, early, early ? in->gate_ctr : 0L);
+            cfgv.drain, cfgv.acq, early, early ? in->gate_ctr : 0L, in->my_stage);
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
@@ -1816,7 +1834,7 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
                         nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, early,
-                        early ? in->gate_ctr : 0L));
+                        early ? in->gate_ctr : 0L, in->my_stage));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 

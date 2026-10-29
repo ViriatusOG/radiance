@@ -262,6 +262,24 @@ struct FakeKV : IKVManager {
             if (geom.g[i].paged && rows_for((int)i, n) > total[i]) return false;
         return true;
     }
+    bool can_grow(uint64_t id, int64_t n) const override {
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return false;
+        const Seq& q = it->second;
+        if (n <= q.n) return true;
+        for (size_t i = 0; i < gs.size(); ++i) {
+            if (geom.g[i].paged) {
+                int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
+                if (need > 0 && need > (int64_t)freelist[i].size()) return false;
+            } else if (!geom.g[i].paged && q.state[i] < 0 && state_free[i].empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+    int64_t available_blocks(int32_t g) const override {
+        return g >= 0 && g < (int32_t)freelist.size() ? (int64_t)freelist[(size_t)g].size() : 0;
+    }
 
     const std::vector<int32_t>& block_table(uint64_t id, int32_t g) const override {
         auto it = seqs.find(id);
@@ -363,6 +381,7 @@ struct FakePC : IPrefixCache {
     FakeKV* kv = nullptr;
     int32_t attn = 0, lin = 0, src = -1;
     int32_t branch_at = 0;       /* CacheHit::branch_at, as the real cache reports it */
+    int64_t drafter_floor = -1;  /* set_drafter_floor's last value, -1 never called */
     int32_t next_slot = 0;
     int32_t reserved = 0;
     int64_t evicted = 0, ckpt_evicted = 0;
@@ -427,6 +446,7 @@ struct FakePC : IPrefixCache {
         return h;
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
+    void set_drafter_floor(int64_t tokens) override { drafter_floor = tokens; }
 
     /* What the scheduler published and asked to be evicted, recorded rather than acted on: these
      * tests check that the scheduler publishes before it frees and evicts before it preempts, not

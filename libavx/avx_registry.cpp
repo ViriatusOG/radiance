@@ -296,6 +296,11 @@ static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out")
 };
+/* attn_paged with a tree verify's parents (RadBatch::spec_parent, rad_drafter_tree). */
+static const RadOperandSpec oAttnPagedTree[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
+};
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
 static const RadParamSpec pAttnDense[]   = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
@@ -879,6 +884,13 @@ static const RadParamSpec pDflashSelect[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                  OPD("anchor"), WGT("pred"), WGT("succ"),
                                                  OUT("tokens") };
+static const RadParamSpec pDflashTree[]      = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
+                                                 P_INT("rank"), P_INT("n_vocab"),
+                                                 P_INTO("anchor_stride"), P_INT("nodes"),
+                                                 P_F64O("temp"), P_STR("dtype") };
+static const RadOperandSpec oDflashTree[]    = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
+                                                 OUT("tokens"), OUT("parents") };
 /* DFlash2's grouped convolution, as libref declares it. */
 static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
                                             P_INT("group_size"), P_INT("NG"), P_INT("block_size"),
@@ -1057,6 +1069,11 @@ static const RadOpSchema kSchemas[] = {
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "paged causal / sliding-window attention, any query length, online-softmax so one pass over the "
   "cache suffices." },
+{ "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
+  "attn_paged over a tree verify (rad_drafter_tree): spec_parent is -2 for an ordinary causal row, "
+  "else the row's parent's index within its sequence's rows (-1 for the block's first). Inside the "
+  "block such a row sees itself and its ancestors only; its window is measured from the block's "
+  "first position plus its depth." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
   "(`window_right`)." },
@@ -1390,6 +1407,11 @@ static const RadOpSchema kSchemas[] = {
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
   "`hp` absent is a plane of ones." },
+{ "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
+  "dflash_select's lattice grown best-first into a tree of `nodes` nodes: each taken node's "
+  "children are the valid candidates at the next position with log probability parent + "
+  "log_softmax(score / temp); each round takes the largest untaken child, ties to the first "
+  "pushed. tokens and parents list the taken nodes in order, a parent as its node index." },
 };
 
 /* ================================================================== the kernel table
@@ -1676,6 +1698,10 @@ ROW("avx_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged)),
+ROW("avx_attn_paged_tree", "attn_paged_tree", "attn",
+    "paged causal / sliding-window attention with a tree verify block (spec_parent)",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_tree)),
 SIMPLE("avx_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        L(attn_dense)),
 SIMPLE("avx_attn_cross", "attn_cross", "attn",
@@ -1977,6 +2003,9 @@ SIMPLE("avx_dflash_conv", "dflash_conv", "draft",
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),
+SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
+       "DFlash2's candidate lattice grown best-first into a tree",
+       "i32 candidates, tokens and parents, float unary and codebooks", L(dflash_tree)),
 };
 
 /* ================================================================== plugin exports */

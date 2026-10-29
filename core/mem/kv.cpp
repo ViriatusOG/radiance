@@ -272,11 +272,15 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     for (const auto& p : plans_) if (p.stateful()) checkpoint_bytes_ += p.bytes_per_state;
     /* Then the window behind a checkpoint, after the linear state (see has_window_snapshot). A
      * trunk's window rides in the slot whether or not linear state is beside it: a hit resumes at
-     * a snapshot either way, and without the window there it could not resume at all. */
+     * a snapshot either way, and without the window there it could not resume at all. A drafter's
+     * window rides there only on a model without linear state (set_drafter_window_snapshot). */
+    bool has_state = false;
+    for (const auto& p : plans_) has_state = has_state || p.stateful();
     for (size_t i = 1; i < plans_.size(); ++i) {
         KVGroupPlan& p = plans_[i];
-        p.win_snap = p.kind == RAD_KV_WINDOW && p.window_blocks > 0 &&
-                     !p.runtime_win && !groups[i].drafter;
+        p.drafter = groups[i].drafter;
+        p.win_snap = p.kind == RAD_KV_WINDOW && p.window_blocks > 0 && !p.runtime_win &&
+                     (!groups[i].drafter || (snap_drafter_ && !has_state));
         if (p.win_snap && !p.zero && p.n_layers > 0)
             window_ck_bytes_ += p.window_blocks * p.bytes_per_block;
     }
@@ -980,6 +984,36 @@ bool KVManager::can_ever_fit(int64_t n_tokens) const {
          * states, so a bare `else` would refuse every sequence. */
         if (p.paged())         { if (blocks_for(p.index, n_tokens) > p.n_blocks) return false; }
         else if (p.stateful()) { if (p.n_states < 1) return false; }
+    }
+    return true;
+}
+
+/* Read-only counterpart of ensure(): can `seq` grow to n_tokens without taking blocks from
+ * another sequence? Used by the scheduler's preempted-prefill admission gate, which must not
+ * reserve anything or it would perturb the very pool it is trying to protect. */
+bool KVManager::can_grow(uint64_t id, int64_t n_tokens) const {
+    const Seq* s = find(id);
+    if (!s) return false;
+    if (n_tokens <= s->n_tokens) return true;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const auto& p = plans_[g];
+        if (p.paged()) {
+            const int64_t first = s->first_block_pos[g] / p.block_size;
+            const int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            int64_t need = want - (int64_t)s->blocks[g].size();
+            if (need < 0) need = 0;
+            /* ensure() takes one copy-on-write block for a partially filled block; include it
+             * here so the gate does not admit a sequence that then has to steal from another. */
+            if (s->n_tokens > 0 && s->n_tokens % p.block_size != 0) {
+                const int64_t bi = s->n_tokens / p.block_size - first;
+                if (bi >= 0 && bi < (int64_t)s->blocks[g].size() &&
+                    refcount_[g][(size_t)s->blocks[g][(size_t)bi]] > 1)
+                    ++need;
+            }
+            if (need > available_blocks((int32_t)g)) return false;
+        } else if (p.stateful() && s->state[g] < 0) {
+            if (free_states_[g].empty()) return false;
+        }
     }
     return true;
 }

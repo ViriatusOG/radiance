@@ -1,76 +1,67 @@
-/* r3d_gemm_fp8a16_nt_m1.hip -- the same skinny shape against a block-scaled weight.
+/* r3d_gemm_fp8a16_nt_m1.hip -- the skinny GEMM shape (M <= 16) against a block-scaled weight.
  *
- *   y[M,N] = a[M,K] @ b[N,K]^T, b stored as E4M3 codes with one f32 scale per (pb1 x pb2) block,
- *   f32 accumulate, narrowed once by the store. `a_scale`, when present, means the activation is
- *   coded too -- quant_act_fp8's E4M3 codes with one f32 per (row, group) -- which is the fp8a8
- *   form the row table names `fp8a8`.
+ *   y[M,N] = a[M,K] @ b[N,K]^T, b stored as E4M3 codes with one scale (bf16 or f32) per
+ *   (pb1 x pb2) block, f32 accumulate, narrowed once by the store. When `a_scale` is present the
+ *   activation is coded too (quant_act_fp8's E4M3 codes, one f32 per (row, group)): the row
+ *   table's `fp8a8` form.
  *
- * RDNA3 has no fp8 instruction: the builtins are declared for gfx11 and die at instruction
- * selection. So the codes are decoded in software, and the decode is free of cost in the sense
- * that matters here: E4M3 is four exponent and three mantissa bits, f16 is five and ten, so
- * e4m3x2_to_f16x2 is EXACT and the dot2 multiplies the numbers the checkpoint means. Nothing is
- * rounded between the code and the product, which is why this row's output is libref's to the bit
- * at sk = 1 and not merely inside fp8 quantisation noise.
+ * RDNA3 has no fp8 instructions (the builtins are declared for gfx11 but fail at instruction
+ * selection), so the codes are decoded in software. E4M3 has four exponent and three mantissa
+ * bits and f16 five and ten, so e4m3x2_to_f16x2 is exact and the dot2 multiplies the checkpoint's
+ * values. Nothing is rounded between code and product, so at sk = 1 the output matches libref bit
+ * for bit.
  *
  * ---- the lane map --------------------------------------------------------------------------
  *
- * The same as r3d_gemm_bf16_nt_m16's: lane l owns the output (m = l % MT, n = n0 + l / MT) for the
- * template's MT = ceil(M) in {1,2,4,8,16}, walks k ascending and holds its own accumulator. One
- * difference is forced by the format, and it is the one that makes this kernel what it is: a lane
- * consumes sixteen codes per step, because that is what sixteen bytes are, and sixteen bytes is
- * one global_load_b128. Eight dot2 per step, so the weight stream is one 16-byte load per eight
- * matrix instructions -- the decode (eight v_perms and shifts, exact) sits between them and is the
- * reason this kernel's rate is not the bf16 row's.
+ * As in r3d_gemm_bf16_nt_m16: lane l owns the output (m = l % MT, n = n0 + l / MT), MT being M
+ * rounded up to {1,2,4,8,16}, walks k ascending and holds its own accumulator. The difference is
+ * that a lane consumes sixteen codes per step, one global_load_b128, feeding eight dot2. The decode
+ * (eight v_perms and shifts) sits between load and dot2, so this kernel runs slower than the bf16
+ * row.
  *
- * A lane owns one (m, n) pair, so a lane owns one scale per block: `n / pb1` picks b_scale's row
- * and the block index picks its column, and both are hoisted out of the block's sixteen-element
- * steps. The activation's scale, when the activation is coded, is `m`'s row at the same block
- * index. Lanes sharing an n agree on it, which is why no lane-to-lane exchange is needed.
+ * Each lane owns one (m, n) pair and so one scale per block: `n / pb1` picks b_scale's row and the
+ * block index its column, both hoisted out of the block's steps. A coded activation's scale is
+ * `m`'s row at the same block index. No lane-to-lane exchange is needed.
  *
  * ---- where the scale multiplies -------------------------------------------------------------
  *
- * ref_gemm.h's quant_tile, and quant_dot beside it, is the spec, and the order it writes is the
- * order this kernel runs:
+ * The order is ref_gemm.h's quant_tile (and quant_dot beside it):
  *
  *     for gi ascending:  sub = 0
- *                        for k in the group, ascending:  sub += a[k] * b[k]     (from the CODES)
+ *                        for k in the group, ascending:  sub += a[k] * b[k]     (from the codes)
  *                        acc = acc + (sub * sa) * sb
  *
  * with sa = a_scale[m][gi] or 1, and sb = b_scale[n / pb1][gi]. The scale multiplies the finished
- * block, once, at the block's end -- not every product: scaling each product is equal in exact
- * arithmetic and differs in the last bits, which moves an fp8 code and so moves a token. And
- * `(sub * sa) * sb` is an order, not a formula: the parentheses are libref's, and the products are
- * summed from the raw codes with no scale folded into them. This kernel accumulates a block's
- * sub-sum into a register of its own, so the bracketing is the reference's, and the widening is
- * exact, so at sk = 1 the output is bit-identical to it.
+ * block sub-sum once, not every product: scaling each product is equal in exact arithmetic but
+ * differs in the last bits, which can move an fp8 code and so a token. The parentheses in
+ * `(sub * sa) * sb` are libref's and must be kept. Each block's sub-sum has its own register, so
+ * the bracketing matches the reference.
  *
  * ---- the activation ---------------------------------------------------------------------------
  *
- * Staged in LDS per block of the weight's K, widened on the way in: bf16 -> f16 for fp8a16, E4M3 ->
- * f16 for fp8a8, both exact. One row of a is M <= 16 elements wide per k, so a staged block is
- * MT * 128 values, 4.25 KiB at MT = 16, and the pitch is 68 dwords: 68 mod 32 = 4, so a
- * ds_read_b128's eight lanes land on banks four apart, and 272 bytes a row keeps the 16-byte reads
- * aligned. The weight is not staged: with M <= 16 a staged tile has 32/MT readers, so staging
- * trades a wave's worth of L1 residency for a round trip through LDS and buys nothing.
+ * Staged in LDS per scale block of K and widened exactly on the way in: bf16 -> f16 for fp8a16,
+ * E4M3 -> f16 for fp8a8. A staged block is MT * 128 values (4.25 KiB at MT = 16). The pitch is 68
+ * dwords: 68 mod 32 = 4 puts a ds_read_b128's eight lanes on banks four apart, and 272 bytes per
+ * row keeps the 16-byte reads aligned. The weight is not staged: with M <= 16 a staged tile has
+ * only 32/MT readers, so a round trip through LDS gains nothing over L1.
  *
  * ---- split-K --------------------------------------------------------------------------------
  *
- * `sk` contiguous slices, one per blockIdx.y, each writing its f32 partial to `scratch` and a
- * second kernel adding them per output in ascending slice order. Each partial is a chain of
- * `(sub * sa) * sb` terms over its own slices of blocks, so at sk = 1 the chain is libref's
- * exactly; sk > 1 brackets the block terms by slice, which is the split's doing and agrees to the
- * last bits. Legality is K % (sk * group) == 0 -- a slice that ends mid-block cannot apply that
- * block's scale -- which is the row's gemm_tune_valid rule, unit = group.
+ * `sk` contiguous slices, one per blockIdx.y, each writing its f32 partial to `scratch`; a second
+ * kernel adds them per output in ascending slice order. sk = 1 is libref's chain exactly; sk > 1
+ * brackets the block terms by slice and agrees to the last bits. A split is legal when
+ * K % (sk * group) == 0, because a slice that ends mid-block cannot apply that block's scale (the
+ * row's gemm_tune_valid rule, unit = group).
  *
  * ---- `nt` -----------------------------------------------------------------------------------
  *
- * No transposed load on this ISA and no cache field on a global load. nt = 1 issues the weight
- * reads through an address-space-1 pointer, which lowers to global_load_b128 with no cache
- * modifier and no swizzle; nt = 0 issues the same 16-byte reads through the generic pointer. The
- * axis measures the two lowerings, and on this card it measures the same stream twice.
+ * This ISA has no transposed load and no cache field on a global load. nt = 1 issues the weight
+ * reads through an address-space-1 pointer (global_load_b128, no cache modifier, no swizzle);
+ * nt = 0 issues the same 16-byte reads through the generic pointer. On this card both lowerings
+ * stream the same.
  */
 
-#include <hip/hip_runtime.h>          // __forceinline__, which r3d_codecs.h's R3D_HD spells
+#include <hip/hip_runtime.h>          // __forceinline__, which r3d_codecs.h's R3D_HD uses
 
 #include "r3d.h"
 #include "r3d_common.h"
@@ -83,12 +74,12 @@ namespace {
 constexpr int kBlockThreads = 256;
 constexpr int kWaves        = kBlockThreads / kWave;
 constexpr int kMTMax        = 16;
-constexpr int kStep         = 16;      // codes a lane takes per step: one 16-byte load
-constexpr int kAPitch       = 68;      // dwords a staged activation row (128 values + 4)
+constexpr int kStep         = 16;      // codes per lane step: one 16-byte load
+constexpr int kAPitch       = 68;      // dwords per staged activation row (128 values + 4)
 constexpr int kGroupMax     = 128;     // the stage is sized for one 128-wide block per row
 
-/* A slice is legal when it is a whole number of scale blocks, so the split ladder is capped by
- * the scratch hook's widest split and stepped by the block the weight carries. */
+/* A slice must be a whole number of scale blocks. The ladder is capped by the scratch hook's
+ * widest split. */
 int pick_sk(long long K, int group, int maxsk)
 {
     static const int kLadder[] = { 16, 8, 4, 2, 1 };
@@ -116,11 +107,9 @@ __device__ __forceinline__ uint32_t ldg_u8(const uint8_t* p)
 
 /* The weight's 16 codes as eight f16 pairs, exact.
  *
- * e4m3x2_to_f16x2 decodes the TWO codes in a dword's low half, so a 16-byte load -- four dwords,
- * sixteen codes -- is eight decodes, each fed the 16-bit pair it wants: the pairs straddle the
- * dwords, four dwords in, eight pairs out. Feeding the codec whole dwords decodes eight codes and
- * leaves the rest of the step multiplying registers that were never written, which is the quiet
- * version of this bug: the answer comes back a fraction of its size, not a NaN. */
+ * e4m3x2_to_f16x2 decodes only the two codes in a dword's low half, so a 16-byte load (four
+ * dwords) is eight decodes, each fed one 16-bit pair. Feeding it whole dwords would decode only
+ * eight of the sixteen codes and silently shrink the result. */
 __device__ __forceinline__ void codes_to_f16x8(const r3d_u32x4 c, uint32_t* w)
 {
     const uint32_t d[4] = { c.x, c.y, c.z, c.w };
@@ -129,8 +118,8 @@ __device__ __forceinline__ void codes_to_f16x8(const r3d_u32x4 c, uint32_t* w)
         w[j] = e4m3x2_to_f16x2((d[j >> 1] >> (16 * (j & 1))) & 0xffffu);
 }
 
-/* y[M,N] = a[M,K] @ dequant(b)[N,K]^T. `A8` is the fp8a8 form: a carries E4M3 codes and a_scale
- * carries one f32 per (row, block); without it a is bf16 and read directly. */
+/* y[M,N] = a[M,K] @ dequant(b)[N,K]^T. `A8` is the fp8a8 form: a is E4M3 codes and a_scale one
+ * f32 per (row, block); otherwise a is bf16. */
 template <int MT, bool A8, bool NT, bool SPLIT>
 __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
     const uint8_t* __restrict__ A, const float* __restrict__ AScale,
@@ -155,10 +144,9 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
     const int kend = kbeg + kslab < K ? kbeg + kslab : K;
 
     const uint8_t* w = B + (size_t)n_real * K;
-    /* b_scale is the container's `weight_scale_inv`, and the op's shape hook writes it bf16 for the
-     * whole quantised family -- `o.t(f32s ? RAD_F32 : RAD_BF16, {nb, kb})`; f32 belongs to the
-     * separate `fp8a8f32` spelling. Both are read here; bf16 widens to f32 exactly, since every
-     * bf16 value is representable in f32, so the widening is free and the products are unchanged. */
+    /* b_scale is the container's `weight_scale_inv`: bf16 for the whole quantised family (the shape
+     * hook's `o.t(f32s ? RAD_F32 : RAD_BF16, {nb, kb})`), f32 under the separate `fp8a8f32`
+     * dtype. Both are read; bf16 widens to f32 exactly. */
     const size_t bsrow = (size_t)(n_real / pb1) * nkb;
     const float* bsF = bs16 ? nullptr : (const float*)BScale + bsrow;
     const uint16_t* bsH = bs16 ? (const uint16_t*)BScale + bsrow : nullptr;
@@ -166,15 +154,15 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
 
     float acc = 0.0f;
 
-    /* One scale block per round: stage the block's activation, walk the block's k, fold the block's
-     * scale in at the end. `kb` is the block's first k, which is where the scales are indexed. */
+    /* One scale block per iteration: stage the block's activation, walk its k, apply its scale at
+     * the end. `kb` is the block's first k. */
     for (int kb = kbeg; kb < kend; kb += group) {
         const int gl = std::min(group, kend - kb);
         const int gi = kb / group;
 
-        /* Stage gl elements of MT activation rows, widened to f16 pairs. Eight values a unit: a
-         * 16-byte load for a bf16 row, an 8-byte one for a coded row, which is why the coded row's
-         * pitch check is eight, not sixteen. A row past M re-reads the last real row. */
+        /* Stage gl elements of MT activation rows, widened to f16 pairs. Eight values per unit: a
+         * 16-byte load for a bf16 row, an 8-byte one for a coded row. A row past M re-reads the
+         * last real row. */
         constexpr int kUnit = 8;
         const int nu = (gl + kUnit - 1) / kUnit;
         for (int i = (int)tid; i < MT * nu; i += (int)blockDim.x) {   // see the m16 unit's note on wv
@@ -183,7 +171,7 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
             const int cnt = std::min(kUnit, gl - c);
             uint32_t* dst = s_a + (size_t)r * kAPitch + c / 2;
             if constexpr (A8) {
-                const uint8_t* src = A + (size_t)rr * a_ld + kb + c;      // codes: bytes and elements agree
+                const uint8_t* src = A + (size_t)rr * a_ld + kb + c;      // codes: one byte per element
                 for (int e = 0; e < cnt; e += 8) {
                     const uint8_t* sp = src + e;
                     uint32_t q[2];
@@ -206,8 +194,8 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
                         if (e + 2 * t < gl) dst[e / 2 + t] = p[t];
                 }
             } else {
-                /* A is a byte pointer here because the coded form codes it: cast first, then the
-                 * row and k offsets are ELEMENT offsets, which for bf16 is twice the byte count. */
+                /* A is a byte pointer (for the coded form): cast first, so the row and k offsets
+                 * are bf16 element offsets. */
                 const uint16_t* src = (const uint16_t*)A + (size_t)rr * a_ld + kb + c;
                 for (int e = 0; e < cnt; e += 8) {
                     uint32_t p[4];
@@ -248,10 +236,9 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
             sub = dot4_f16x4(a1.x, a1.y, b[4], b[5], sub);
             sub = dot4_f16x4(a1.z, a1.w, b[6], b[7], sub);
         }
-        /* The last partial block, when K is not a whole block: ascending, two k at a time, each
-         * code decoded on its own. The launcher refuses a K that is not a multiple of the block
-         * (a ragged block would read past the scale plane), so this is a shape the kernel carries
-         * for completeness and the row never issues. */
+        /* A partial block's tail, ascending, two k at a time. The launcher refuses a K that is not
+         * a multiple of the block (a ragged block would read past the scale plane), so this loop
+         * does not run. */
         for (int k = gf; k < gl; k += 2) {
             const uint32_t aw = ap[k / 2];
             const uint32_t c0 = ldg_u8(w + kb + k);
@@ -259,9 +246,9 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
             const uint32_t pw = e4m3x2_to_f16x2(c0 | (c1 << 8));
             sub = dot2_f16x2(aw, pw, sub);
         }
-        group_barrier();                 // the next block's stage must not race this one's reads
+        group_barrier();                 // the next block's stage must not race these reads
 
-        /* The block's finished sub-sum, scaled once, in libref's parentheses. */
+        /* The block's sub-sum, scaled once, in libref's parentheses. */
         const float sa = A8 ? as[gi] : 1.0f;
         acc = acc + (sub * sa) * (bs16 ? bf16_to_f32(bsH[gi]) : bsF[gi]);
     }
@@ -275,9 +262,8 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_kernel(
     }
 }
 
-/* The split reduction, the m16 unit's, in the same order: v = ((p0 + p1) + p2) + ... ascending by
- * slice, then one narrowing. Ascending slice order is libref's ascending sum only at sk = 1; past
- * that the block terms are bracketed by slice, which is the split's cost and is stated as such. */
+/* The split reduction, as in the m16 unit: v = ((p0 + p1) + p2) + ... ascending by slice, then one
+ * narrowing. */
 __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_reduce(
     const float* __restrict__ Part, uint16_t* __restrict__ Y, int M, int N, int y_ld, int sk)
 {
@@ -300,12 +286,12 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_q_reduce(
  *   a_scale  [M][ceil(K/group)]  f32, or 0
  *   b        [N][K]        E4M3 codes, row-major, k contiguous
  *   b_scale  [ceil(N/pb1)][ceil(K/pb2)]  bf16 (the container's weight_scale_inv) or f32, block-major
- *   y        [M][N]        bf16, `y_ld` elements a row (0 = N)
+ *   y        [M][N]        bf16, `y_ld` elements per row (0 = N)
  *
  * `group` is the code group along K (pb2, the checkpoint's block width); `pb1` the rows sharing a
- * scale row (0 = group). `sk` splits K (0 = the widest legal), `nt` the weight load's lowering,
- * `scratch` the f32 partial arena, sk * M * N * 4 bytes, required when the split is on. Returns 0,
- * -1 a null pointer, -2 a shape it does not serve, -3 a pitch it cannot read, -4 HIP failed. */
+ * scale row (0 = group). `sk` splits K (0 = the widest legal), `nt` picks the weight load's
+ * lowering, `scratch` is the f32 partial arena, sk * M * N * 4 bytes, required when sk > 1. Returns
+ * 0, -1 a null pointer, -2 an unsupported shape, -3 an unreadable pitch, -4 HIP failed. */
 extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, long y, int M,
                                     int N, int K, int group, int pb1, int pb2, int a_ld, int y_ld,
                                     int sk, int nt, long scratch, int bs_dt, long stream)
@@ -316,7 +302,7 @@ extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, 
     if (group <= 0) group = R3D_FP8_BLOCK;
     if (pb1 <= 0) pb1 = group;
     if (pb2 == 0) pb2 = group;
-    if (pb2 != group) return -2;                    // one block: the K block IS the code group
+    if (pb2 != group) return -2;                    // the K block is the code group
     if (group > kGroupMax) return -2;
     if (group % kStep) return -2;                   // a block must be whole lane steps
     if (K % group) return -2;                       // a ragged block reads past the scale plane
@@ -372,20 +358,6 @@ extern "C" int r3d_gemm_nt_q_fp8_ex(long a, long a_scale, long b, long b_scale, 
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-/* The declaration in r3d.h carries no scale dtype, and the weight's block scales are bf16 for the
- * whole quantised family (see the entry above), so the family needs a second spelling. `_ex` adds
- * `bs_dt`, the b_scale plane's RadDataType: RAD_BF16 reads it as bf16, anything else -- 0 included
- * -- reads it as f32, which is exactly what the entry below, and every caller written before the
- * bf16 discovery, asks for. The shim takes the dtype off the operand and calls `_ex`; the old entry
- * forwards, so a raw caller of the old name sees the behaviour it was written against. */
-extern "C" int r3d_gemm_nt_q_fp8(long a, long a_scale, long b, long b_scale, long y, int M, int N,
-                                 int K, int group, int pb1, int pb2, int a_ld, int y_ld, int sk,
-                                 int nt, long scratch, long stream)
-{
-    return r3d_gemm_nt_q_fp8_ex(a, a_scale, b, b_scale, y, M, N, K, group, pb1, pb2, a_ld, y_ld, sk,
-                                nt, scratch, RAD_F32, stream);
-}
-
 /* ============================================================== the plugin ABI entry point
  *
  * gemm_nt_q's operands are [a, a_scale, b, b_scale, y, a_sum?, b_ref?] and its parameters M, N, K,
@@ -396,9 +368,8 @@ enum { Q_A = 0, Q_ASCALE, Q_B, Q_BSCALE, Q_Y, Q_ASUM, Q_BREF };
 static int dt_f32(const RadTensor* t) { return r3d_is_f32(t) ? RAD_OK : RAD_E_DTYPE; }
 static int dt_bf16(const RadTensor* t) { return r3d_is_bf16(t) ? RAD_OK : RAD_E_DTYPE; }
 
-/* The trace latch for this file: distinct GEMM shapes, printed once each. A static array and a
- * counter, no lock -- the flag is a diagnostic and a doubled line is a cosmetic cost, a lock in
- * the served path is not. */
+/* The trace latch: distinct GEMM shapes, printed once each. A static array and a counter, no lock:
+ * the trace is a diagnostic, and a duplicated line is cheaper than a lock on the served path. */
 struct GemmPlanKey { long long M, N, K; unsigned a_rank, as_rank; long long a_ld, y_ld; };
 
 static bool gemm_plan_once(long long M, long long N, long long K, unsigned a_rank,
@@ -422,13 +393,11 @@ extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
     const RadTensor* BS = r3d_opt(a, Q_BSCALE);
     const RadTensor* Y  = r3d_opt(a, Q_Y);
     if (!A || !B || !BS || !Y) return R3D_NO(RAD_E_INVAL);
-    /* The schemes this kernel decodes: E4M3 codes on the weight, bf16 activations (fp8a16) or
-     * E4M3 codes with their own scale (fp8a8). E5M2 has no decoder here. */
+    /* E4M3 weight codes with bf16 activations (fp8a16) or E4M3 activation codes with their own
+     * scale (fp8a8). E5M2 has no decoder here. */
     if (!r3d_is_e4m3(B)) return R3D_NO(RAD_E_DTYPE);
-    /* The weight's block scales are bf16 for the whole quantised family -- the shape hook's
-     * `o.t(f32s ? RAD_F32 : RAD_BF16, {nb, kb})` is the container's `weight_scale_inv`, and f32 is
-     * the separate `fp8a8f32` spelling, which no row here claims (those bands stay with the
-     * reference). Accept both; the kernel widens bf16 -> f32 at the load, exactly and for free. */
+    /* Block scales are bf16 in the quantised family; f32 is the separate `fp8a8f32` dtype, which no
+     * row here claims. Both are accepted; the kernel widens bf16 exactly at the load. */
     const bool bs16 = r3d_is_bf16(BS);
     if (!bs16 && !r3d_is_f32(BS)) return R3D_NO(RAD_E_DTYPE);
     R3D_NEED(dt_bf16(Y));
@@ -448,8 +417,8 @@ extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
     const long long M = nel / N;                       // never from the `M` parameter
     if (M < 1 || M > kMTMax) return R3D_NO(RAD_E_SHAPE);
 
-    /* The block geometry, and the disagreement libref refuses: `group` is what the selector
-     * matched on, and pb2 is the checkpoint's, and they describe the same bytes. */
+    /* The block geometry. `group` is what the selector matched and pb2 the checkpoint's block
+     * width; they describe the same bytes, and libref refuses a disagreement. */
     const long long group = r3d_geti_or(a, "group", R3D_FP8_BLOCK);
     const long long pb1 = r3d_geti_or(a, "pb1", group), pb2 = r3d_geti_or(a, "pb2", group);
     if (group != R3D_FP8_BLOCK) return R3D_NO(RAD_E_SHAPE);
@@ -460,8 +429,8 @@ extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
     if (r3d_numel(A) < M * K || r3d_numel(B) < N * K) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(BS) < nrowb * nkb) return R3D_NO(RAD_E_SHAPE);
     if (AS && r3d_numel(AS) < M * nkb) return R3D_NO(RAD_E_SHAPE);
-    /* `a_sum` removes an activation zero point this grid does not have, and `b_ref` is an mxfp4
-     * scale reference: libref refuses both beside these schemes (gemm_ntq_impl), so we do. */
+    /* `a_sum` removes an activation zero point this grid lacks, and `b_ref` is an mxfp4 scale
+     * reference; libref refuses both with these schemes (gemm_ntq_impl). */
     if (r3d_opt(a, Q_ASUM)) return R3D_NO(RAD_E_UNSUPPORTED);
     if (r3d_opt(a, Q_BREF)) return R3D_NO(RAD_E_UNSUPPORTED);
 
@@ -479,14 +448,10 @@ extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
     if ((a8 && (a_ld % 8)) || (!a8 && (a_ld % 8))) return R3D_NO(RAD_E_STRIDE);
     if (!r3d_aligned(A->data, 16) || !r3d_aligned(B->data, 16)) return R3D_NO(RAD_E_ALIGN);
 
-    /* The plan's own numbers for the M<=16 band, under RAD_R3D_TRACE=1 and once per distinct
-     * shape -- the same instrument the tiled row carries, in the row that serves the short steps.
-     * It lives here because the served collapse begins at 15 prompt tokens, a step the tiled shim
-     * never sees: the ladder's numbers below 17 are M=5..16 and the tiled row's line cannot speak
-     * for them. M is derived off the activation's output the way the row derives it (line 430:
-     * numel(y)/N, never the `M` parameter), and nothing is read that the checks above did not
-     * already require. With the flag unset this is one cached getenv and a return: no copy, no
-     * latch slot, no new operand read, no syscall. */
+    /* Under RAD_R3D_TRACE, print the plan's numbers once per distinct shape for the M <= 16 band,
+     * which the tiled row's trace does not cover. M is numel(y)/N as above, and nothing is read
+     * beyond what the checks already required. With the flag unset this is one cached getenv and
+     * a return. */
     if (r3d_trace_on() && gemm_plan_once(M, N, K, A->rank, AS ? AS->rank : 0u, a_ld, y_ld)) {
         std::fprintf(stderr, "[r3d] plan: gemm M=%lld (band M<=%d) N=%lld K=%lld group=%lld "
                      "a rank=%u numel=%lld stride=[%lld,%lld] pitch=%lld rows=%lld "

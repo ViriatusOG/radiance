@@ -35,7 +35,20 @@ struct StepSlot {
     int32_t acc;      /* drafts the last verify step accepted */
     /* The next verify step's input tokens: the bonus token, then the draft head's proposals. */
     int32_t tok[1 + RAD_SCHED_MAX_SPEC];
-    int32_t pad[3];
+    /* A tree drafter's proposal (rad_drafter_tree): par[j] is the parent of node j + 1, a node
+     * index in [0, j], where node 0 is the bonus token tok[0] and node j + 1 is tok[j + 1].
+     * `ntree` is the number of nodes it describes, written by ADV_BTAKE from the drafter's
+     * parents plane; 0 means tok[1..] is a chain. */
+    int32_t par[RAD_SCHED_MAX_SPEC];
+    int32_t ntree;
+    /* The last verify's accepted root path: path[t] is the node committed (t + 1)-th, so the
+     * committed tokens are tok[path[0]], tok[path[1]], ... and the step's anchor sits at
+     * ctx - 1 - npath. ADV_COMPACT moves those nodes' K and V from where the verify stored them
+     * (its row index) to where they belong (their depth), and ADV_CTXTREE positions the
+     * drafter's context rows by it. 0 after a chain verify, which needs neither. */
+    int32_t npath;
+    int32_t path[RAD_SCHED_MAX_SPEC];
+    int32_t pad[2];
 };
 
 enum AdvMode : int32_t {
@@ -47,6 +60,26 @@ enum AdvMode : int32_t {
     /* A block drafter (RAD_DRAFT_BLOCK) on the card: */
     ADV_BLOCK  = 6,   /* before the query pass: the anchor at the committed end, then the masks */
     ADV_BTAKE  = 7,   /* after it: its `round` proposals into the state, behind the bonus token */
+    /* A tree drafter (rad_drafter_tree), whose verify rows are a tree rather than a chain: */
+    ADV_CTXTREE = 8,  /* before the context pass: the accepted path's rows at their depth, the
+                       * rejected rows stored nowhere */
+};
+
+/* The most paged KV groups one ADV_COMPACT moves (the trunk's sliding and global groups and a
+ * drafter's own, with room). */
+enum { kAdvMaxPools = 6 };
+
+/* One paged group's cache on one rank, as ADV_COMPACT addresses it: `n_layers` caches of
+ * [n_blocks, n_head, block_size, row_bytes] bytes, `layer_stride` apart from `base`
+ * (core/runtime/kvbind.cpp composes that shape). `grp` indexes the batch's AdvGroup array, whose
+ * block table maps a position to a block. */
+struct AdvPool {
+    char*   base;
+    int64_t layer_stride;
+    int32_t n_layers;
+    int32_t n_head;
+    int32_t row_bytes;
+    int32_t grp;
 };
 
 /* One KV group, as the builder stages it for this build. Offsets are bytes into the rank's slab,
@@ -112,12 +145,31 @@ struct AdvanceArgs {
      * position of those rows, 0 or 1 past the committed position. Zero for every other head. */
     int32_t shared_kv = 0;
     int32_t rot_shift = 0;
+    /* A tree drafter (rad_drafter_tree). ADV_BTAKE: the proposal's parents plane, row i's from
+     * i * src_pitch as the tokens are; null for a chain drafter. */
+    const int32_t* par = nullptr;
+    /* ADV_TRUNK: RadBatch::spec_parent [n_tok] in the slab, or -1 when the build stages none.
+     * A tree row's entry is its parent's row within the sequence's block (-1 for the bonus
+     * token); every other row's is -2, an ordinary causal row. */
+    int64_t parent_off = -1;
+    /* ADV_COMPACT: every paged group's cache on this rank. */
+    AdvPool pool[kAdvMaxPools] = {};
+    int32_t n_pool = 0;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */
 int step_advance(const AdvanceArgs& a, RadStream s);
 
+/* ADV_COMPACT, after ADV_ACCEPT on a tree verify and before anything reads the trunk's cache: for
+ * every row whose StepSlot holds an accepted path, move the K and V each path node's verify row
+ * stored (at the anchor's position + its row index) to its committed position (+ its depth), in
+ * every pool of `a`, every layer and every head. A separate kernel from the advance because it
+ * moves bytes across the whole cache rather than patching a row's few integers. */
+int step_compact(const AdvanceArgs& a, RadStream s);
+
 }  /* namespace rad */
 
 /* The launcher in advance.hip: one kernel onto `stream` through hipLaunchKernel. */
 extern "C" int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream);
+/* And ADV_COMPACT's. */
+extern "C" int rad_step_compact_launch(const rad::AdvanceArgs* args, void* stream);

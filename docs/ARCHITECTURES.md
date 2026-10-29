@@ -16,7 +16,7 @@ plugin claims.
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
-| `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
+| `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert, or Qwen's FP8 release as it ships |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
@@ -345,8 +345,11 @@ Architecture tests cover geometry, GGUF tensor maps, dense-to-MoE scheduling, TP
 and FP32 combine order; checkpoint tests cover Q4_K/Q6_K block decoding. Numerical parity against Tencent/llama.cpp
 remains untested.
 
-See [HYV3 W4 decode optimizations](benchmarks/hyv3-w4-decode.md) for affected paths,
-historical measurements, validation limits and the remaining benchmark/quality gates.
+Decode on the full-GPTQ W4 model, TP1 on one R9700 (10,030-token prompt, 2,000 generated tokens,
+greedy, no drafter): 76.6 tok/s before the per-128 I4 expert packing, the one-row W4/W5 epilogue,
+the in-GEMM BF16 narrowing, the fused Q/K norm + RoPE + KV store and the residual and shared-expert
+folds; 109.6 tok/s with them, prefill unchanged (7,876 to 7,927 tok/s). The answer is byte-identical,
+and on an eight-document teacher-forced corpus the two builds agree at every top-1 (mean KL 7.6e-8).
 
 ## `qwen35_w8a8`
 
@@ -414,6 +417,13 @@ plugin reads each weight's encoding from the container and declares the op that 
 - the lm_head: whatever a `logits_gemm` kernel reads;
 - bf16: every norm gain, `A_log`, `dt_bias`, `conv1d`, `in_proj_a` and `in_proj_b` (48 rows is not
   a whole scale block), the router, `shared_expert_gate` and `embed_tokens`.
+
+Qwen's own `Qwen3.8-Flash-Next-FP8` converts without a recipe too. Its `quantization_config`
+(`quant_method: fp8`, no `fmt`) is block-scaled E4M3, descriptor `fp8_e4m3`; no `qwen4exp` plugin
+claims it, so each weight is read as it ships and this plugin serves it: the routed experts (MTP
+head's included) at block FP8 with their bf16 `weight_scale_inv`, the n-gram table's 128 FP8
+shards under its one `ngram_embedding.weight_scale`, and every other weight bf16. A recipe applies
+to it as to the bf16 checkpoint, with each FP8 weight read through its scales.
 
 **The attention cache takes `--kv-cache-dtype fp8_v4` or `k6_v4`.** The QSA layers' cache (and the
 MTP head's layer, which shares it) is then declared at head_dim 200 or 176, a token's quantised row
@@ -872,9 +882,9 @@ text      12 layers, hidden 768, ffn 3072, vocab 250048, 12 heads of 64, type vo
           mean over every real token, cast to the f32 pooled buffer; the server L2-normalises
 ```
 
-The block order is the one the verified variant uses: attention on the raw stream, then LN1, the
-feed-forward on LN1's output, then LN2 over that output plus the feed-forward's. The checkpoint's
-shared `experts.bias` is not applied, and the plugin does not map it. A container that sets
+Block order: attention on the raw stream, then LN1, the feed-forward on LN1's output, then LN2
+over that output plus the feed-forward's. The checkpoint's shared `experts.bias` is not applied,
+and the plugin does not map it. A container that sets
 `prenorm`, `causal`, interleaved, partial or scaled rotary, a gelu variant, renormalised routing
 or a shared expert is refused at declare.
 
@@ -895,10 +905,10 @@ reads a bf16 table. The token embedding, linears, router and expert tables are b
 | `blk.N.ffn_exp_w2.E.weight` (odd N) | `encoder.layers.N.mlp.experts.mlp.w2` | [768, 3072] | slice E, transpose |
 | not declared (odd N) | `encoder.layers.N.mlp.experts.bias` | [768] | not mapped |
 
-The checkpoint stores `w1` and `w2` as one stacked tensor each, `[24576, 768]`; `E` takes the
-expert's dim-0 slice, and `w2` is transposed to `[768, 3072]` for the grouped GEMM. Every expert
-has two group slots, one for each projection. Nothing else is mapped: there is no final norm, no
-pooler, no position table and no output head.
+The checkpoint stores `w1` and `w2` as one stacked tensor each, `[24576, 768]`; expert `E` is rows
+`[E * 3072, (E + 1) * 3072)`, and `w2`'s block is transposed to `[768, 3072]` for the grouped GEMM.
+Every expert has two group slots, one for each projection. Nothing else is mapped: there is no
+final norm, no pooler, no position table and no output head.
 
 **The recipe.** The checkpoint is f32 (1.9 GB).
 
@@ -907,15 +917,14 @@ rad-convert <checkpoint dir> --recipe data/recipes/nomic-embed-v2-moe-bf16.recip
     -o nomic-embed-v2-moe-bf16.rad
 ```
 
-It takes 3.5 s and writes a 959 MB container (907 MiB of weights). The checkpoint directory must
-contain `tokenizer.json`. The recipe casts the token embedding, the token-type table, the
-attention, dense MLP and expert weights to bf16 and leaves the norms and biases f32.
+It writes a 959 MB container (907 MiB of weights). The checkpoint directory must contain
+`tokenizer.json`. The recipe casts the token embedding, the token-type table, the attention,
+dense MLP and expert weights to bf16 and leaves the norms and biases f32.
 
-**Verified.** 20 texts against a pure-float32 reference: mean cosine 0.99995, min 0.99983 on a
-gfx1201 card, with libavx and libref the same to 4 decimals. Against a Q6_K quantisation of the
-same model the mean is 0.9944 (min 0.990); the Q8_0 one agrees with the reference at 0.9994, so
-the Q6_K quantisation is the outlier, about 0.006 off the true model, and stored vectors from a
-Q6_K server drift by about that much.
+**Verified.** On 20 texts against a pure-float32 reference, on a gfx1201 card: mean cosine
+0.99995, min 0.99983; libavx and libref agree with it to 4 decimals. Against the same reference a
+Q8_0 quantisation of the model scores a mean of 0.9994 and a Q6_K one 0.9944 (min 0.990), so
+vectors stored from a Q6_K server differ by about 0.006.
 
 **Measured.** On one gfx1201 card, short texts take 2 ms a request at one client, 3854 requests/s
 at 64 concurrent clients and 4400 texts/s for a batch of 32 in one request; a 1354-character text

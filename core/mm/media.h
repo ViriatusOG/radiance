@@ -36,9 +36,9 @@ struct FrameRGBA {
 /* Whether this build has a decoder. */
 bool decoder_available();
 
-/* "libavformat <version>" when the decoder is built in, "absent (built without libav*)"
- * when it is not: one string for the startup report and /diagnostics, so a media 500 can be
- * read off the report instead of bisected. */
+/* "libavformat <version>" when the decoder is built in, "absent (built without libav*)" when it
+ * is not: one string for the startup report and /diagnostics, so a build that refuses every media
+ * part shows it there. */
 std::string decoder_version();
 
 /* The first frame of an image (or of anything with a video stream). Refuses a source over

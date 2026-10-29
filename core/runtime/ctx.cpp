@@ -929,7 +929,7 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
  * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 400,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 408,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -957,7 +957,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     mix((uint64_t)b->n_checkpoints);   mix((uint64_t)b->n_seq_decode);
     mix((uint64_t)b->n_tok_decode);    mix((uint64_t)b->max_q_len_decode);
     mix((uint64_t)b->max_q_len_prefill); mix((uint64_t)b->n_draft_out); mix((uint64_t)b->n_ahead);
-    mix((uint64_t)b->rope_mixed);      ptr(b->rope_pos);
+    mix((uint64_t)b->rope_mixed);      ptr(b->rope_pos);  mix((uint64_t)b->score_only);
     ptr(b->token_ids);  ptr(b->positions);  ptr(b->cu_seqlens);    ptr(b->seq_ids);
     ptr(b->out_ids);    ptr(b->q_lens);     ptr(b->ctx_lens);      ptr(b->num_accepted);
     ptr(b->spec_parent); ptr(b->checkpoint_tok); ptr(b->checkpoint_slot); ptr(b->draft_out_ids);
@@ -1396,7 +1396,9 @@ void Ctx::flush_issued() {
     for (size_t r = 0; r < unflushed_.size(); ++r) {
         const uint32_t i = unflushed_[r];
         if (i < plans_.size() && i < program_->ops.size() && plans_[i].issued)
-            program_->ops[i].issued = true;
+            /* /graph reads this same bool from the HTTP thread: an atomic_ref store keeps that
+             * pair a relaxed exchange rather than a data race (ctx.h OpInfo::issued). */
+            std::atomic_ref<bool>(program_->ops[i].issued).store(true, std::memory_order_relaxed);
         else
             unflushed_[w++] = i;
     }

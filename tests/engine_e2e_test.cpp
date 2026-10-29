@@ -205,6 +205,14 @@ struct World {
     std::string qwen35_spec;
     /* Qwen3-ASR: an audio tower over a Qwen3 decoder, served from the checkpoint. */
     std::string qwen3asr;
+    /* The 31B's shape at toy sizes (five sliding layers and a global one, a 64-token window) with
+     * a DFlash2 drafter on a 64-token window (tiny_model.h: DFlash2), converted as
+     * data/recipes/gemma4-31b-dense-bf16-w4a8-df2.recipe converts the 31B: served by gemma4_bf16,
+     * the trunk w4a8 and the drafter block fp8. */
+    std::string g31, g31_draft, g31_df2;
+    /* The same with a 1024-token window, the 31B's own: a snapshot at 512-1023 lies inside it and
+     * holds every row from position 0. */
+    std::string g31w, g31w_df2;
     std::string corpus;        /* six documents, two sharing a 300-token head; 1820 tokens */
     std::string corpus_short;  /* four documents, 760 tokens */
     std::string corpus_tiny;   /* two documents, 300 tokens, for libref's slow fp8 GEMMs */
@@ -230,8 +238,13 @@ struct World {
         gemma4_kv = dir / "gemma4_kv";
         qwen35_spec = dir / "qwen35_spec";
         qwen3asr = dir / "qwen3asr";
+        g31 = dir / "g31";
+        g31_draft = dir / "g31_draft";
+        g31_df2 = dir / "g31_df2.rad";
+        g31w = dir / "g31w";
+        g31w_df2 = dir / "g31w_df2.rad";
         for (const std::string* d : { &qwen35, &lfm2, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
-                                      &qwen35_spec, &qwen3asr, &llama_int4 })
+                                      &qwen35_spec, &qwen3asr, &llama_int4, &g31, &g31_draft, &g31w })
             if (mkdir(d->c_str(), 0755) != 0) return;
         tiny::Qwen35 qkv;
         qkv.head_dim = 128;
@@ -242,6 +255,17 @@ struct World {
         gkv.head_dim = 64;
         gkv.global_kv_heads = 2;
         gkv.global_head_dim = 128;
+        tiny::Gemma4 g31s;
+        g31s.layers = 6;
+        g31s.interval = 6;
+        g31s.hidden = 256;
+        g31s.ffn = 512;
+        g31s.heads = 2;
+        g31s.head_dim = 128;
+        g31s.global_head_dim = 256;
+        g31s.window = 64;
+        tiny::Gemma4 g31ws = g31s;
+        g31ws.window = 1024;
         if (!tiny::write_qwen35(qwen35, {}) || !tiny::write_lfm2(lfm2, {}) ||
             !tiny::write_gemma4(gemma4, {}) || !tiny::write_llama(llama, {}) ||
             !tiny::write_qwen35(qwen35_kv, qkv) || !tiny::write_gemma4(gemma4_kv, gkv) ||
@@ -253,7 +277,9 @@ struct World {
                               std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaI8HeadRule) ||
             !tiny::write_llama_ct_int4(llama_int4, {}, true) ||
             !tiny::write_text(dir / "llama_int4.recipe", tiny::kInt4ImportRecipe) ||
-            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe))
+            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe) ||
+            !tiny::write_gemma4(g31, g31s) || !tiny::write_gemma4(g31w, g31ws) ||
+            !tiny::write_dflash2(g31_draft, {}))
             return;
 
         tiny::Rng r(11);
@@ -280,6 +306,22 @@ struct World {
         for (const auto& [out, recipe, ckpt] : kConverts) {
             const int st = tiny::run({ RAD_E2E_CONVERT, *ckpt, "-o", out, "--recipe",
                                        dir / recipe },
+                                     engine_env(), &convert_log);
+            if (st != 0) {
+                fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(convert_log).c_str());
+                return;
+            }
+        }
+        std::string recipes = __FILE__;
+        recipes = recipes.substr(0, recipes.find_last_of('/')) + "/../data/recipes/";
+        /* Checked against libref, which serves it here: a card's library serves none of these
+         * toy shapes. */
+        for (const auto& [ckpt, out] : { std::pair<std::string, std::string>{ g31, g31_df2 },
+                                         std::pair<std::string, std::string>{ g31w, g31w_df2 } }) {
+            const int st = tiny::run({ RAD_E2E_CONVERT, ckpt, "--draft-model", g31_draft, "-o", out,
+                                       "--recipe", recipes + "gemma4-31b-dense-bf16-w4a8-df2.recipe",
+                                       "--set", "quantization_config.quant_method=compressed-tensors",
+                                       "--kernels", "libref" },
                                      engine_env(), &convert_log);
             if (st != 0) {
                 fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(convert_log).c_str());
@@ -768,13 +810,13 @@ TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
 TEST(the_coupling_flag_refuses_what_it_cannot_serve_at_startup) {
     World& w = world();
     REQUIRE(w.ok);
-    /* qwen35's tiny checkpoint declares no draft head: no serial chain to couple. The spechub
+    /* qwen35's tiny checkpoint declares no draft head: no chain to couple. The spechub
      * kernels are loaded beside libref, so the refusal is the drafter's shape and not a missing
      * coupling kernel. */
     const Ran on = radiance(w.qwen35, { "--kernels", "libref,spechub", "--draft-coupling", "on" },
                             {}, 120);
-    const std::string want = "--draft-coupling on requires the linear serial draft chain "
-                             "(RAD_DRAFT_SERIAL with depth > 0)";
+    const std::string want = "--draft-coupling on requires a linear draft chain (a serial head or "
+                             "a block drafter with a coupled walk, depth > 0)";
     if (on.status == 0 || on.status == 124 || !has(on.log, want))
         fprintf(stderr, "    --draft-coupling on exited %d:\n%s\n", on.status,
                 tail(on.log, 20).c_str());
@@ -1790,6 +1832,144 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
         CHECK((*r)["completion_probabilities"] == cold["completion_probabilities"]);
     }
     CHECK_EQ(s.stop(), 0);
+}
+
+/* What a -v server's block drafter proposed ("drafter 'dflash2': sequence N proposes t1 .. tk"),
+ * by request in the order they were sent: the server numbers requests consecutively, and the
+ * first one proposes in every case below. Read after stop(), so every line is in. */
+std::vector<std::vector<std::string>> proposals(const std::string& log, size_t n_req) {
+    std::map<uint64_t, std::vector<std::string>> by_id;
+    static const std::string kSeq = ": sequence ", kProp = " proposes";
+    for (size_t at = log.find(kProp); at != std::string::npos; at = log.find(kProp, at + 1)) {
+        const size_t sol = log.rfind('\n', at) + 1, eol = log.find('\n', at);
+        const size_t s = log.find(kSeq, sol);
+        if (s == std::string::npos || s > at || log.find("drafter '", sol) > s) continue;
+        const uint64_t id = std::strtoull(log.c_str() + s + kSeq.size(), nullptr, 10);
+        by_id[id].push_back(log.substr(at, eol == std::string::npos ? std::string::npos : eol - at));
+    }
+    std::vector<std::vector<std::string>> out(n_req);
+    if (by_id.empty()) return out;
+    const uint64_t first = by_id.begin()->first;
+    for (size_t i = 0; i < n_req; ++i) {
+        auto it = by_id.find(first + i);
+        if (it != by_id.end()) out[i] = it->second;
+    }
+    return out;
+}
+
+/* A block drafter after a prefix hit, on the tiny 31B with its DFlash2 drafter: a follow-up turn
+ * and a repeat of a prompt each resume from the window snapshot taken at the earlier prompt's tail,
+ * and add fewer tokens than the drafter's 64-token window. The drafter's window rides in that
+ * snapshot, saved behind the drafter's context pass, so the hit is kept whole, and the drafter
+ * drafts from the first decode step and proposes, draft by draft, what a cold run's does. Without
+ * its window in the snapshot the hit leaves a hole in the drafter's own cache, and draft refill
+ * ends it at an interval snapshot at least that window before the prompt's end, recomputing what
+ * the hit had cached: the drafts are a cold run's, but the hit is not whole. With the snapshot
+ * saved before the context pass, it would propose from rows that pass had not yet written; the
+ * drafts would differ and, rejected, change no token. The warm server runs --prefix-resume
+ * nearest, which takes the tail snapshot a block short of the prompt's end; exact takes it where
+ * the prompt's last chunk starts, more than the drafter's window short here. */
+TEST(a_block_drafter_after_a_prefix_hit_proposes_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> first = prompt_ids(41, 300), repeat = prompt_ids(43, 200);
+    std::vector<int32_t> follow = first;
+    json warm[2], cold[2];
+    std::vector<std::vector<std::string>> warm_p, cold_p;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7",
+                                           "--checkpoint-interval", "64", "--max-num-seqs", "4",
+                                           "--prefix-resume", "nearest", "-v" }));
+        for (int32_t t : tokens_of(post(s.port, "/completion", completion(first, 16))))
+            follow.push_back(t);
+        for (int32_t t : prompt_ids(42, 8)) follow.push_back(t);
+        (void)post(s.port, "/completion", completion(repeat, 16));
+        warm[0] = post(s.port, "/completion", completion(follow, 24));
+        warm[1] = post(s.port, "/completion", completion(repeat, 24));
+        CHECK_EQ(s.stop(), 0);
+        warm_p = proposals(s.output(), 4);
+    }
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache",
+                                           "--max-num-seqs", "4", "-v" }));
+        cold[0] = post(s.port, "/completion", completion(follow, 24));
+        cold[1] = post(s.port, "/completion", completion(repeat, 24));
+        CHECK_EQ(s.stop(), 0);
+        cold_p = proposals(s.output(), 2);
+    }
+    /* The warm server's third and fourth requests are the cold one's first and second. */
+    const char* what[2] = { "follow-up turn", "repeated prompt" };
+    const int64_t n_prompt[2] = { (int64_t)follow.size(), (int64_t)repeat.size() };
+    for (int i = 0; i < 2; ++i) {
+        const int64_t cached = timing(warm[i], "cache_n");
+        /* Whole: draft refill would end the hit at least the drafter's 64-token window short. */
+        const bool whole = cached > n_prompt[i] - 64;
+        const int64_t d = timing(warm[i], "draft_n"), dc = timing(cold[i], "draft_n");
+        const std::vector<std::string>& wp = warm_p[(size_t)i + 2];
+        const std::vector<std::string>& cp = cold_p[(size_t)i];
+        if (!(whole && dc > 0 && d == dc && wp == cp))
+            fprintf(stderr, "    %s: %lld of %lld tokens cached, %lld drafted (cold %lld), %zu "
+                    "proposals (cold %zu), %s\n", what[i], (long long)cached,
+                    (long long)n_prompt[i], (long long)d, (long long)dc, wp.size(), cp.size(),
+                    wp == cp ? "the same" : "not the same");
+        CHECK(whole);
+        CHECK(dc > 0);
+        CHECK_EQ(d, dc);
+        CHECK(wp == cp);
+        CHECK(tokens_of(warm[i]) == tokens_of(cold[i]));
+    }
+}
+
+/* A prompt resumed from a window snapshot, on the tiny 31B: gemma4_bf16 declares the sliding layers
+ * windowed, and the cache does not index them (arch/gemma4's tiny model declares them full and takes
+ * no snapshot). A 600-token prompt takes a snapshot a block short of its end at the default
+ * 2048-token interval, and a longer prompt that shares it resumes there: the sliding layers from
+ * the snapshot, the global ones from the cached blocks, the rest of the prompt as a prefill from the
+ * snapshot. The reply, and every probability in it, equals a cold run's; so does a repeat of the
+ * longer prompt, which resumes from its own snapshot. Under a 64-token window the snapshot holds the
+ * window behind its position, and under a 1024-token one (the 31B's) every row from 0; with the
+ * drafter off and on. The snapshot floor (Scheduler::kWindowSnapshotMin) is --prefix-resume
+ * nearest's: under exact, a prompt shorter than one prefill chunk takes no tail snapshot. */
+TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> a = prompt_ids(51, 600);
+    std::vector<int32_t> b = a;
+    for (int32_t t : prompt_ids(52, 60)) b.push_back(t);
+    for (const std::string* model : { &world().g31_df2, &world().g31w_df2 }) {
+        for (const char* spec : { "0", "7" }) {
+            json cold;
+            {
+                Server s;
+                REQUIRE(s.start(*model, { "--num-speculative-tokens", spec, "--no-prefix-cache" }));
+                cold = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+                CHECK_EQ(s.stop(), 0);
+            }
+            Server s;
+            REQUIRE(s.start(*model, { "--num-speculative-tokens", spec,
+                                      "--prefix-resume", "nearest" }));
+            (void)post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+            const json shared = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+            const json again = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+            const int64_t c1 = timing(shared, "cache_n"), c2 = timing(again, "cache_n");
+            /* The snapshot sits at Scheduler::kWindowSnapshotMin (512) or above. */
+            const bool same = tokens_of(shared) == tokens_of(cold) &&
+                              tokens_of(again) == tokens_of(cold) &&
+                              shared["completion_probabilities"] == cold["completion_probabilities"] &&
+                              again["completion_probabilities"] == cold["completion_probabilities"];
+            if (!(c1 >= 512 && c1 < 600 && c2 > c1 && same))
+                fprintf(stderr, "    %s, %s drafts: cached %lld then %lld, %s a cold run's\n",
+                        model->c_str(), spec, (long long)c1, (long long)c2,
+                        same ? "equal to" : "NOT equal to");
+            CHECK(c1 >= 512);
+            CHECK(c1 < 600);
+            CHECK(c2 > c1);
+            REQUIRE(cold.contains("completion_probabilities"));
+            CHECK_EQ(tokens_of(cold).size(), (size_t)24);
+            CHECK(same);
+            CHECK_EQ(s.stop(), 0);
+        }
+    }
 }
 
 /* The row a running server's /diagnostics reports for `option`, or null. */

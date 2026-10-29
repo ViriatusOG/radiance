@@ -1,48 +1,46 @@
 /* r3d_model_bf16.hip -- the small ops the engine issues between the GEMMs: the norms, the
- * elementwise arithmetic, the activations, cast, softmax, the embedding gather, gather_rows and
- * scatter_rows, rope and the KV store. Every one of them needs a device launch, because the
- * engine's buffers live in VRAM and `rad_issue` refuses an op with no launch for its operands'
- * domain: on an RDNA3 card this unit is the difference between a model that runs and one that does
- * not (R3D_CONTRACT, "What libr3d is").
+ * elementwise arithmetic, the activations, cast, softmax, embed_lookup, gather_rows and
+ * scatter_rows, rope and kv_store, plus the fused silu_mul and rmsnorm_quant_fp8. Each needs a
+ * device launch because the engine's buffers live in VRAM and `rad_issue` refuses an op with no
+ * launch for its operands' domain; without this unit no model runs on an RDNA3 card (R3D_CONTRACT,
+ * "What libr3d is").
  *
- * The arithmetic is libref's -- the oracle every row is checked against at kbench -- and each
- * kernel names the ref function it must equal, its operation order and its rounding points:
+ * The arithmetic is libref's, the oracle every row is checked against by kbench, and each kernel
+ * names the ref function it must equal, its operation order and its rounding points:
  *
- *   * every reduction accumulates in f32 and only the store narrows, RTNE (r3d_codecs.h is
- *     rad_plugin.h's rounders restated for device code, bit for bit);
- *   * a row's sum is taken over lanes covering consecutive elements, butterflies in the order a
- *     `__shfl_xor` loop runs and wave partials added in wave order: `block_sum` in r3d_common.h,
- *     so the bracketing is the one the contract fixes and not a per-thread accident;
- *   * bf16 is kept in whole registers from load to store (`ldg_u16`) and a lane that owns two
- *     consecutive columns stores them as one dword through `bf16x2_rne` -- gfx11 has no
- *     v_cvt_pk_bf16_f32, so the pack is two software roundings and a v_perm_b32;
- *   * no FMA and no reassociation: -ffp-contract=off is on every HIP source (libr3d/CMakeLists.txt)
- *     and the expressions below are written in the reference's order, with the temporaries the
- *     reference has;
- *   * a negative index -- token id, gather row, KV slot -- is padding: a zero row, or no store.
- *     It is not clamped to zero, which would duplicate row 0 across every padding row.
+ *   * every reduction accumulates in f32 and only the store narrows, RTNE (r3d_codecs.h restates
+ *     rad_plugin.h's rounders for device code, bit for bit);
+ *   * a row's sum is taken over lanes covering consecutive elements with `block_sum`
+ *     (r3d_common.h), so the bracketing is the one the contract fixes;
+ *   * bf16 stays in whole registers from load to store (`ldg_u16`), and a lane that owns two
+ *     consecutive columns stores them as one dword through `bf16x2_rne` (gfx11 has no
+ *     v_cvt_pk_bf16_f32, so the pack is two software roundings and a v_perm_b32);
+ *   * no FMA and no reassociation: -ffp-contract=off is on every HIP source (CMakeLists.txt), and
+ *     expressions follow the reference's order and temporaries;
+ *   * a negative index (token id, gather row, KV slot) is padding: a zero row, or no store. It is
+ *     not clamped to zero, which would copy row 0 into every padding row.
  *
- * One deliberate divergence from ref, the same one libr4d states: ref validates its index arrays
- * on the host and refuses an id at or past the row count. A kernel cannot do that without a copy
- * and a sync on the step path, so a row count is an argument and an out-of-range id takes the
- * padding path (zero row, no store) instead of faulting. kv_store's slot bound is the one place
- * the reference has an argument the launcher does not (see below).
+ * One deliberate divergence from ref, shared with libr4d: ref validates its index arrays on the
+ * host and refuses an id at or past the row count. A kernel cannot do that without a copy and a
+ * sync on the step path, so the row count is an argument and an out-of-range id takes the padding
+ * path instead of faulting. kv_store's slot bound is the one place the reference has an argument
+ * the launcher does not (see below).
  *
  * `expf`, `powf` and `sincosf` are the accurate forms, not the `__` approximations: rope positions
  * reach 262144, past __sincosf's argument reduction, and libref evaluates every transcendental in
- * double and rounds once (libref's ref_exp/ref_pow/ref_sin/ref_cos/ref_erf). None of these
- * paths is the step's bottleneck, so the difference between libm and a device routine -- a few
- * ULP of f32, against the 1/256 of a bf16 store -- is the whole of the tolerance.
+ * double and rounds once (ref_exp/ref_pow/ref_sin/ref_cos/ref_erf). The few f32 ULP between libm
+ * and a device routine are the whole tolerance, far below a bf16 store's 1/256, and none of these
+ * paths is a step bottleneck.
  *
- * No fusion: `rmsnorm_add` and the gated quantisers are separate entry points the architecture
- * plugin selects (spec §2.3), and live in other units.
+ * `rmsnorm_add` and the gated quantisers are separate entry points the architecture plugin selects
+ * (spec §2.3), in other units.
  *
- * Two layers per op, as r3d.h states: a launcher that takes pointers as longs and geometry as
- * ints, checks what a `__global__` cannot, computes the grid and issues one kernel on the stream it
- * was handed; and the shim the row table names, which reads the operands with r3d_args.h, takes
- * the dtype from the tensor and the row count from the operand, and returns a RAD status. Neither
- * allocates, neither synchronises. A launcher returns 0 or -1 (null), -2 (extent), -3 (pitch),
- * -4 (the HIP launch failed); a shim maps any non-zero code to RAD_E_DEVICE.
+ * Two layers per op, as r3d.h states: a launcher that takes pointers as longs and geometry as ints,
+ * checks what a `__global__` cannot, computes the grid and issues one kernel on the given stream;
+ * and the shim the row table names, which reads the operands with r3d_args.h, takes the dtype and
+ * row count from the tensors and returns a RAD status. Neither allocates or synchronises. A
+ * launcher returns 0, or -1 (null), -2 (extent), -3 (pitch), -4 (HIP launch failed); a shim maps
+ * any non-zero code to RAD_E_DEVICE.
  */
 
 #include "r3d.h"
@@ -60,18 +58,17 @@ constexpr uint32_t kThreads = 256;   // eight wave32s: the wide row, the hidden 
 constexpr uint32_t kNarrow  = 32;    // one wave32: the narrow row, a head of a QK norm
 constexpr uint32_t kNarrowN = 256;   // a row this narrow is a wave's, eight columns a lane
 
-/* The workgroup a row gets: one wave for the rows a wave already covers -- an attention head, a
- * KV head, a QK norm, where a 256-thread group would spend three quarters of its lanes on a
- * barrier -- and 256 for everything wider. */
+/* The workgroup a row gets: one wave for rows a wave covers (an attention head, a KV head, a QK
+ * norm), where 256 threads would leave three quarters of the lanes waiting at a barrier, and 256
+ * for anything wider. */
 static inline int row_threads(int n) { return n <= (int)kNarrowN ? (int)kNarrow : (int)kThreads; }
 
 /* ================================================================== the seams every kernel here
  * shares
  *
- * A whole-register store beside r3d_common.h's whole-register load. The dword form is the pair
- * store; the caller has already proved the address even, in elements, from a base alignment of 4.
- * The address-space cast is r3d_common.h's own, a C-style cast to the qualified type:
- * reinterpret_cast refuses to change address spaces.
+ * Whole-register stores to match r3d_common.h's whole-register loads. The dword form is the pair
+ * store; the caller has proved the address even, in elements, from a base alignment of 4. The
+ * address-space casts are C-style because reinterpret_cast cannot change address spaces.
  */
 typedef uint32_t __attribute__((address_space(1))) *r3d_gu32;
 typedef float    __attribute__((address_space(1))) *r3d_gf32;
@@ -88,10 +85,9 @@ __device__ __forceinline__ void stg_i32(int32_t* p, int32_t v) { *(r3d_gi32)p = 
 __device__ __forceinline__ void stg_i64(int64_t* p, int64_t v) { *(r3d_gi64)p = v; }
 __device__ __forceinline__ uint16_t ldg_u16_at(const uint16_t* p, uint32_t i) { return (uint16_t)ldg_u16(p + i); }
 
-/* The max across a workgroup, in the shape block_sum has: a wave butterfly and one LDS round trip.
- * The order is free -- a max is associative, commutative and idempotent, so softmax's maximum is
- * the one reduction whose bracketing cannot change the answer -- and every wave has to reach the
- * LDS before any thread reads it, which is what the barrier inside is for. */
+/* The max across a workgroup, shaped like block_sum: a wave butterfly and one LDS round trip. Max is
+ * associative, commutative and idempotent, so the bracketing cannot change the result. The barrier
+ * inside makes every wave's partial visible before any thread reads it. */
 template <int NTHREADS>
 __device__ __forceinline__ float block_max(float v, float* lds) {
     constexpr int NWAVES = NTHREADS / kWave;
@@ -109,14 +105,12 @@ __device__ __forceinline__ float block_max(float v, float* lds) {
 /* ================================================================== one element, any dtype
  *
  * cast, fill, gather_rows, scatter_rows, embed_lookup and kv_store are one kernel over several
- * dtypes, because their dtype is a runtime value in the launcher's argument list. These are
- * the reference's ld_dt and st_dt over libr3d's dtype codes, and they are deliberately as
- * expensive -- one switch per element, "the price of being generic" in ref's own words. None of
- * them is a matmul; none of them reads one element per FLOP.
+ * dtypes because the dtype is a runtime launcher argument. These are the reference's ld_dt and
+ * st_dt over libr3d's dtype codes, with one switch per element; none of these ops is compute-bound.
  *
- * The integer stores round to nearest even, saturate, and store NaN as 0 (sat_round, the
- * reference's): wrapping an overflowing activation into a plausible small number is the failure
- * this library has to catch, not hide.
+ * The integer stores round to nearest even, saturate, and store NaN as 0 (the reference's
+ * sat_round): wrapping an overflowing activation into a plausible small number would hide the
+ * error.
  */
 __device__ __forceinline__ float sat_round(float v, float lo, float hi) {
     if (v != v) return 0.0f;
@@ -196,10 +190,10 @@ __device__ __forceinline__ int dt_bytes(int dt) {
     }
 }
 
-/* The activation, off libref's act_* set. The reference evaluates the transcendental in double
- * and rounds once to f32 (libref's ref_exp/ref_erf); the device's accurate expf/erff are a
- * few ULP of f32 away, and the store to bf16 keeps 8 mantissa bits. gelu is the exact erf form --
- * "gelu" means this in libref, and the tanh approximation has to be asked for by name. */
+/* The activation, from libref's act_* set. The reference evaluates the transcendental in double and
+ * rounds once to f32 (ref_exp/ref_erf); the device's accurate expf/erff are a few f32 ULP away, and
+ * the bf16 store keeps 8 mantissa bits. gelu is the exact erf form, as "gelu" means in libref; the
+ * tanh approximation is a separate op name. */
 template <int ACT>
 __device__ __forceinline__ float act_of(float x) {
     if constexpr (ACT == R3D_ACT_SIGMOID) return 1.0f / (1.0f + expf(-x));
@@ -215,14 +209,14 @@ __device__ __forceinline__ float act_of(float x) {
  *   s  = 1 / sqrt(ss/n + eps)
  *   y[i] = x[i] * s * (w ? w[i] + wadd : 1) * mult
  *
- * The mean is over the last n of the row and the gain rides every row. An absent gain is the
- * constant 1 -- the shim refuses `wadd` without one, as ref does -- and the gain's dtype is read
- * off the operand (WDT: R3D_DT_BF16, R3D_DT_F32, R3D_DT_N for none), because a checkpoint that
- * stores its gains in f32 (a QK-norm's, an audio tower's) is read as it is. Forming 1+w in bf16
- * first loses 0.3% per channel, which is why `wadd` is added in f32 here.
+ * The mean is over the last n of the row and the gain applies to every row. An absent gain is the
+ * constant 1 (the shim refuses `wadd` without one, as ref does). The gain's dtype is read off the
+ * operand (WDT: R3D_DT_BF16, R3D_DT_F32, or R3D_DT_N for none), so a checkpoint that stores f32
+ * gains (a QK norm's, an audio tower's) is read as stored. `wadd` is added in f32 because forming
+ * 1+w in bf16 first loses 0.3% per channel.
  *
  * `mult` scales the normed row before its one rounding, for a residual branch weighted by a
- * constant (Gemma 4's audio feed-forward uses 0.5); 1 leaves the product chain alone.
+ * constant (e.g. 0.5 in Gemma 4's audio feed-forward); 1 leaves the product unchanged.
  */
 template <int THR, int WDT, int F32>
 __global__ __launch_bounds__(THR) void rmsnorm_kernel(
@@ -266,14 +260,14 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
 }
 
 /* ================================================================== layernorm
- * Two passes -- the mean, then the squared deviations about that
- * mean -- and not one pass of E[x^2] - E[x]^2, which cancels badly when the mean is large against
- * the spread. Biased variance (divide by n), as transformers use. The store is the third pass:
+ * Two passes, the mean and then the squared deviations about it, rather than E[x^2] - E[x]^2,
+ * which cancels badly when the mean is large against the spread. Biased variance (divide by n), as
+ * transformers use. The store is the third pass:
  *
  *   y[i] = ((x[i] - mean) * s * w[i]) + b[i]
  *
- * with `b` optional and the gain bf16 (the launcher has no gain dtype; libref reads w's through
- * its own dtype, so an f32 gain is refused by the shim, not read as bf16).
+ * `b` is optional. The gain is bf16 only (the launcher has no gain dtype), so the shim refuses an
+ * f32 gain rather than reading it as bf16.
  */
 template <int THR>
 __global__ __launch_bounds__(THR) void layernorm_kernel(
@@ -316,14 +310,14 @@ __global__ __launch_bounds__(THR) void layernorm_kernel(
  *   if (div != 1) s = round_to_y(s) / div;            two roundings, y's dtype
  *   y[i] = round_to_y(s)
  *
- * `div` is the last sum of a mean taken pairwise -- (b0+b1+b2)/3, as a vocoder averages its
- * residual blocks -- and the sum is narrowed before it is divided because the unfused pair stores
- * it. 1 is the plain sum.
+ * `div` is the last step of a mean taken pairwise, (b0+b1+b2)/3 as a vocoder averages its residual
+ * blocks; the sum is narrowed before the divide because the unfused pair stores it. 1 is the plain
+ * sum.
  *
- * The broadcast: b carrying exactly n elements rides every row (`bcast`, which the shim sets off
- * the operand's element count, as ref does); nothing else broadcasts, so a shape bug cannot pass
- * as a plausible number. The f32 pair narrows nothing on the way (round_dt(f32) is the identity),
- * and `y` may be `a`: every element is read by the thread that writes it.
+ * Broadcast: a b of exactly n elements applies to every row (`bcast`, set by the shim from the
+ * operand's element count, as ref does). Nothing else broadcasts, so a shape bug cannot pass as a
+ * plausible number. The f32 leg narrows nothing (round_dt(f32) is the identity), and `y` may alias
+ * `a`: every element is read by the thread that writes it.
  */
 template <int THR, int MUL, int PAIR, int F32>
 __global__ __launch_bounds__(THR) void binary_kernel(
@@ -364,10 +358,9 @@ __global__ __launch_bounds__(THR) void binary_kernel(
 }
 
 /* ================================================================== cast
- * `from`/`to` are the selector's; the bytes are what the tensors say,
- * which is what ref reads and what this kernel does. An integer pair goes straight through, so a
- * token id above 2^24 survives an i64 -> i32 copy; everything else widens to f32 and narrows once
- * on the way out. One switch per element: cast is a bandwidth op between stages, not a hot loop.
+ * `from`/`to` select the row; the kernel moves the dtypes the tensors carry, as ref does. An integer
+ * pair goes straight through, so a token id above 2^24 survives an i64 -> i32 copy; everything else
+ * widens to f32 and narrows once. One switch per element: cast is a bandwidth op, not a hot loop.
  */
 template <int THR>
 __global__ __launch_bounds__(THR) void cast_kernel(
@@ -384,9 +377,8 @@ __global__ __launch_bounds__(THR) void cast_kernel(
 }
 
 /* ================================================================== silu / gelu / sigmoid
- * unary: one element, one activation, one narrowing by the store.
- * The three are one kernel with the activation as a template argument, because libr3d's rows serve
- * all three and the body differs by one expression. */
+ * unary: one element, one activation, one narrowing by the store. The activation is a template
+ * argument because the three bodies differ by one expression. */
 template <int THR, int ACT, int PAIR, int F32>
 __global__ __launch_bounds__(THR) void unary_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld,
@@ -418,14 +410,14 @@ __global__ __launch_bounds__(THR) void unary_kernel(
 }
 
 /* ================================================================== act_mul
- * y = act(a) * b, with the activation narrowed to y's dtype first,
- * because the unfused pair stores it -- the rounding is the contract, not a detail:
+ * y = act(a) * b, with the activation narrowed to y's dtype first because the unfused pair stores
+ * it; that rounding is part of the contract:
  *
  *   v = act(a[i]);  y[i] = round_to_y( round_to_y(v) * b[i] )
  *
  * `a` and `b` are the two halves of a fused projection, so each has its own pitch. The shims serve
- * silu, gelu (the exact erf form) and sigmoid; gelu_tanh and quick_gelu are libref's other two
- * kActs entries and are refused, so the row's constraints state which gated MLPs reach this card.
+ * silu, gelu (the exact erf form) and sigmoid; gelu_tanh and quick_gelu, libref's other two kActs
+ * entries, are refused.
  */
 template <int THR, int ACT, int PAIR>
 __global__ __launch_bounds__(THR) void act_mul_kernel(
@@ -450,12 +442,12 @@ __global__ __launch_bounds__(THR) void act_mul_kernel(
 }
 
 /* ================================================================== silu_mul
- * y[i] = silu(gate_up[i]) * gate_up[n + i], over ONE fused operand:
- * the gate is the first half, which is the order rad-convert fuses gate and up into one weight in.
+ * y[i] = silu(gate_up[i]) * gate_up[n + i] over one fused operand whose first half is the gate,
+ * the order rad-convert fuses gate and up in.
  *
- * Nothing is narrowed between the activation and the product. act_mul rounds the activation to y's
- * dtype first because it replaces an unfused pair that stored it; silu_mul is the fused pair, so
- * its product is the f32 activation times the f32 up, rounded once by the store.
+ * Nothing is narrowed between the activation and the product: act_mul rounds the activation
+ * because its unfused pair stores it, while silu_mul is the fused op, so the f32 activation times
+ * the f32 up is rounded once by the store.
  */
 template <int THR, int PAIR>
 __global__ __launch_bounds__(THR) void silu_mul_kernel(
@@ -477,24 +469,23 @@ __global__ __launch_bounds__(THR) void silu_mul_kernel(
 }
 
 /* ================================================================== rmsnorm_quant_fp8
- * The residual add, the norm, and the E4M3 quantiser of the result in one
- * pass, so the normalised activation never goes back to VRAM. The arithmetic of the quantiser is
- * r3d_quant_fp8.hip's, and `q8_group` before it, bit for bit: `sc = amax * (1.0f /
- * 448.0f)` (the reciprocal MULTIPLIED), `inv = 1.0f / sc`, the codes `v * inv` clamped to +-448 by
- * comparisons and not by fminf/fmaxf (those replace a NaN with the bound; a NaN activation encodes
- * as the format's NaN), and a group whose amax is zero takes scale 1.
+ * The residual add, the norm and the E4M3 quantiser in one pass, so the normalised activation is
+ * never written back to VRAM. The quantiser arithmetic is r3d_quant_fp8.hip's and `q8_group`'s,
+ * bit for bit: `sc = amax * (1.0f / 448.0f)` (the reciprocal multiplied), `inv = 1.0f / sc`, codes
+ * `v * inv` clamped to +-448 by comparisons rather than fminf/fmaxf (which would replace a NaN with
+ * the bound; a NaN activation encodes as the format's NaN), and scale 1 for an all-zero group.
  *
- * Two properties of ref's order are load-bearing and are kept:
- *   the residual sum is STORED (narrowed to bf16) before the variance reads it, so the norm is over
- *   the bf16 sum. That is what makes this the `add` + `rmsnorm` pair and not `rmsnorm_add`, which
- *   normalises the unrounded sum;
- *   the quantiser codes the bf16 normalised value, not the f32 one -- `out_bf16`, when asked for,
- *   holds exactly the bytes the codes were taken over.
+ * Two properties of ref's order are kept:
+ *   the residual sum is stored (narrowed to bf16) before the variance reads it, so the norm is over
+ *   the bf16 sum. That makes this the `add` + `rmsnorm` pair, not `rmsnorm_add`, which normalises
+ *   the unrounded sum;
+ *   the quantiser codes the bf16 normalised value, not the f32 one, so `out_bf16` holds exactly the
+ *   values the codes were taken over.
  *
- * A group is a wave at a time, four consecutive columns a lane per 128 columns, so the amax is a
- * register max plus one wave butterfly (a maximum is exact in any order) and the codes leave as
- * dwords. The normalised row is RECOMPUTED in the second pass from the same operands -- hot in L2,
- * and it keeps the row's length out of LDS, which is what lets one workgroup take a 5120-column row.
+ * A wave takes one group at a time, four consecutive columns a lane per 128 columns, so the amax
+ * is a register max plus one wave butterfly (a maximum is exact in any order) and the codes are
+ * stored as dwords. The second pass recomputes the normalised row from the same operands (hot in
+ * L2), which keeps the row out of LDS and lets one workgroup take a 5120-column row.
  */
 template <int THR, int GROUP, int WDT>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
@@ -538,9 +529,8 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
         for (uint32_t j = 0; j < kNChunk; ++j) {
             for (uint32_t c = 0; c < 4u; ++c) {
                 const uint32_t i = base + j * kChunk + c;
-                /* The gain's dtype is the checkpoint's, read off the operand -- WDT, the plain
-                 * rmsnorm's leg: the gains are read as stored, and the op's `dtype` names the
-                 * ACTIVATION, never the weight. */
+                /* The gain is read in the checkpoint's dtype (WDT, as in plain rmsnorm); the op's
+                 * `dtype` names the activation, never the weight. */
                 const float gain = (!w ? 1.0f
                                   : WDT == R3D_DT_F32 ? ldg_f32((const float*)w + i)
                                                       : bf16_to_f32(ldg_u16_at((const uint16_t*)w, i)))
@@ -580,11 +570,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
  *   e   = exp(x[i] - mx);  y[i] = e;  sum += e            ascending
  *   inv = 1 / sum;         y[i] = y[i] * inv              read back from y
  *
- * The maximum is subtracted first (a 60-nat row overflows f32's exp otherwise); the denominator is
- * the ascending sum, which is what `block_sum` brackets. The kernel keeps `e` in a register
- * between the two passes, which is exact: ref reads it back from an f32 plane, and an f32 store
- * and load round nothing. The shim therefore requires y to be f32 -- a bf16 y would round `e`
- * before the multiply and ref would not, and libref itself casts f32 to f32 for this op.
+ * The maximum is subtracted first (a row spanning 60 nats would overflow f32's exp otherwise); the
+ * denominator is the ascending sum `block_sum` brackets. `e` is stored to y and read back for the
+ * multiply, as ref does, which is exact for an f32 plane. The shim therefore requires an f32 y: a
+ * bf16 y would round `e` before the multiply where ref does not.
  */
 template <int THR>
 __global__ __launch_bounds__(THR) void softmax_kernel(
@@ -609,14 +598,12 @@ __global__ __launch_bounds__(THR) void softmax_kernel(
 }
 
 /* ================================================================== scale / fill
- * scale is y = x * s, s one scalar; fill is y = v over the whole
- * plane, and both narrow once, at the store.
+ * scale is y = x * s with s one scalar; fill is y = v over the whole plane. Both narrow once, at
+ * the store.
  *
- * scale's scalar is the op's [1] weight plane, in device memory, and the kernel reads it: a launch
- * may not copy device memory to the host, and ref reads the same single value because its operands
- * are host planes. Every lane loads the same address, so it is one uniform load per block; the
- * product is taken in f32 and the store narrows, which is ref's `x * s` with round_dt(f32) as the
- * store.
+ * scale's scalar is the op's [1] weight plane in device memory, and the kernel reads it because a
+ * launch may not copy device memory to the host. Every lane loads the same address, one uniform
+ * load per block; the product is taken in f32 and narrowed by the store, as ref's `x * s`.
  */
 template <int THR, int PAIR, int F32>
 __global__ __launch_bounds__(THR) void scale_kernel(
@@ -661,14 +648,13 @@ __global__ __launch_bounds__(THR) void fill_kernel(void* __restrict__ y, uint32_
  *   i0, i1 = (i, i + rot/2) neox, (2i, 2i + 1) gptj
  *   h[i0]  = x0*c - x1*s ;  h[i1] = x0*s + x1*c           each narrowed once
  *
- * The pair lives in one thread, so the in-place store needs no exchange. `scale` is the position
- * scale and divides the position, as ref's rope_pos does (the value that multiplies the rotated
- * pair is YaRN's magnitude, and the shims refuse YaRN, so the magnitude is 1).
+ * The pair lives in one thread, so the in-place store needs no exchange. `scale` divides the
+ * position, as in ref's rope_pos (the factor on the rotated pair is YaRN's magnitude, which is 1
+ * because the shims refuse YaRN).
  *
- * The frequency is recomputed per pair, not built in a plane: powf runs once per pair per head,
- * off the step's critical path, and no scratch is allocated. nfreq == rot/2 always, so no pair
- * sits past the ladder (ref zeroes inv[] past nfreq for the proportional ladder it supports and
- * libr3d refuses).
+ * The frequency is recomputed per pair rather than built in a plane: one pow per pair per head,
+ * off the critical path, with no scratch. nfreq == rot/2 always, so no pair lies past the ladder
+ * (ref zeroes inv[] past nfreq only for the proportional ladder, which libr3d refuses).
  */
 template <int THR, int GPTJ>
 __global__ __launch_bounds__(THR) void rope_kernel(
@@ -683,10 +669,10 @@ __global__ __launch_bounds__(THR) void rope_kernel(
 
     for (uint32_t j = threadIdx.x; j < total; j += THR) {
         const uint32_t h = j / half, i = j - h * half;
-        /* ref's ladder: `1.0f / ref_pow(theta, (float)(2i) / den)`, and ref_pow is the double pow
-         * narrowed once. powf here would put the reciprocal a ULP off, and at position 262144 a
-         * ULP of a frequency is a hundredth of a radian of rotation -- the ladder is the one place
-         * in this kernel where f32 is not enough. The angle itself stays f32, as ref's is. */
+        /* ref's ladder: `1.0f / ref_pow(theta, (float)(2i) / den)`, with ref_pow the double pow
+         * narrowed once. powf would put the reciprocal a ULP off, and at position 262144 a ULP of a
+         * frequency is about 0.01 rad of rotation, so the ladder is computed in double. The angle
+         * stays f32, as in ref. */
         const float inv = 1.0f / (float)std::pow((double)theta, (double)((float)(2 * i) / (float)rot));
         float s, c;
         sincosf(p * inv, &s, &c);
@@ -709,14 +695,13 @@ __global__ __launch_bounds__(THR) void rope_kernel(
  *   cache[base + (hd + d)*sd]    = v[t*v_ld + j] * v_inv
  *
  * k and v rows are not dense: a de-interleaved projection gives [tokens, kv_heads, head_dim], and
- * otherwise they are a column slice of the fused QKV plane -- 2560 wide against a 256-wide row for
- * 16 heads and 2 kv heads. Deriving the stride from the shape would read every token after the
+ * otherwise they are a column slice of the fused QKV plane (a 256-wide slice of a 2560-wide row for
+ * 16 heads and 2 kv heads). Deriving the stride from the shape would read every token after the
  * first from the wrong rows, so the pitch is an argument.
  *
- * k_inv and v_inv are the reciprocal of the reader's descales and are 1 for every cache that is
- * not fp8, so the multiply below is exact -- and for the fp8 cache it is the divide ref does, in
- * the one place where a reciprocal costs nothing: a value times 1/scale against ref's
- * `ldt(k,..) * ks` differs by at most the rounding of the reciprocal, far under the fp8 code step.
+ * k_inv and v_inv are the reciprocals of the reader's descales, and 1 for every non-fp8 cache, so
+ * the multiply is exact there. For the fp8 cache a value times 1/scale differs from ref's result by
+ * at most the reciprocal's rounding, far below the fp8 code step.
  */
 template <int THR>
 __global__ __launch_bounds__(THR) void kv_store_kernel(
@@ -726,9 +711,8 @@ __global__ __launch_bounds__(THR) void kv_store_kernel(
     int64_t sd, int64_t slot_max) {
     const uint32_t t = blockIdx.x;
     const int32_t s = ldg_i32(sm + t);
-    /* A negative slot is padding and a slot at or past the cache's own span names a block the
-     * cache does not have: ref refuses such a launch on the host, where it can see the block
-     * count, and a kernel that has read the slot can only drop it. A slot lost, not a step lost. */
+    /* A negative slot is padding. A slot at or past the cache's span names a block the cache does
+     * not have; ref refuses such a launch on the host, and the kernel drops the slot. */
     if (s < 0 || (int64_t)s >= slot_max) return;
     const int64_t blk = (int64_t)s / (int64_t)block_size, off = (int64_t)s % (int64_t)block_size;
 
@@ -753,15 +737,15 @@ __global__ __launch_bounds__(THR) void kv_store_kernel(
  *   id = tok[m] - vocab_offset
  *   x[m][i] = (0 <= id < n_vocab) ? wte[id*w_ld + i] * wscale * mult : 0
  *
- * A negative id, or one at or past the table, is a zero row: padding's row, and in the
- * vocab-parallel split another rank's token -- summing the ranks reconstructs x. ref validates the
- * ids on the host when the table is whole and the world is one rank; a kernel cannot, so the table
- * bound is an argument and an out-of-range id writes zeros.
+ * A negative id, or one at or past the table, gives a zero row: padding, or in the vocab-parallel
+ * split another rank's token, so summing the ranks reconstructs x. ref validates the ids on the
+ * host when the table is whole and there is one rank; a kernel cannot, so the table bound is an
+ * argument.
  *
- * The table's dtype is the launcher's `dt`: bf16, f16, f32, or E4M3 codes with the table's one
- * scale in `wscale` (embed_lookup_q's byte plane, whose scale is a parameter because quantising
- * the table sees the whole table and the gather sees one row). `mult` is Gemma's sqrt(hidden),
- * applied after the scale, so with wscale 1 the product is ref's single rounding.
+ * The table's dtype is the launcher's `dt`: bf16, f16, f32, or E4M3 codes with the table's single
+ * scale in `wscale` (embed_lookup_q's byte plane; the scale is a parameter because it is computed
+ * over the whole table while the gather sees one row). `mult` is Gemma's sqrt(hidden), applied
+ * after the scale, so with wscale 1 the product is ref's single rounding.
  */
 template <int THR>
 __global__ __launch_bounds__(THR) void embed_lookup_kernel(
@@ -789,18 +773,18 @@ __global__ __launch_bounds__(THR) void embed_lookup_kernel(
 }
 
 /* ================================================================== gather_rows / scatter_rows
- * y[r] = x[idx[r]] and x[idx[r]] = v[r], rows of n, and a row move
- * with no arithmetic: ld_elem/st_elem is the identity for bf16, f16, f32, i32 and i64, and the
- * fp8 code round trip is exact (every code decodes and re-encodes to itself).
+ * y[r] = x[idx[r]] and x[idx[r]] = v[r] over rows of n: a row move with no arithmetic. ld_elem /
+ * st_elem is the identity for bf16, f16, f32, i32 and i64, and the fp8 code round trip is exact
+ * (every code decodes and re-encodes to itself).
  *
- * A negative index is padding: gather writes a zero row, scatter writes nothing -- an unsampled row
- * of a step, a slot with no counterpart. An index at or past the operand's row count takes the
- * same path, where ref refuses the launch (see the file header).
+ * A negative index is padding (an unsampled row, a slot with no counterpart): gather writes a zero
+ * row, scatter writes nothing. An index at or past the operand's row count takes the same path,
+ * where ref refuses the launch (see the file header).
  *
  * scatter_rows' destination is INOUT and the write is partial: unnamed rows keep their contents,
- * because the destination is often a pool other sequences are in. Its indices must be distinct --
- * RAD_OPD_F_IDX_UNIQUE says so in the schema -- since two rows landing on one destination have no
- * defined winner in parallel, and an op whose oracle and kernel may disagree is not checkable.
+ * because the destination is often a pool shared with other sequences. Indices must be distinct
+ * (RAD_OPD_F_IDX_UNIQUE in the schema): two rows landing on one destination have no defined
+ * winner, so the oracle and the kernel could disagree.
  */
 template <int THR>
 __global__ __launch_bounds__(THR) void gather_rows_kernel(
@@ -809,10 +793,9 @@ __global__ __launch_bounds__(THR) void gather_rows_kernel(
     const uint32_t m = blockIdx.x;
     const int32_t r = ldg_i32(idx + m);
     char* __restrict__ yr = (char*)y + (size_t)m * y_ld * (size_t)es;
-    /* A negative index is padding and an index at or past the source plane is one libref refuses on
-     * the host, where it can read the plane. Both take the zero row: reading x past its end is the
-     * failure this bound exists to stop. `src_rows` 0 says the caller had no plane count, which is a
-     * shim bug, not a bound. */
+    /* A negative index is padding, and an index at or past the source plane is one libref refuses
+     * on the host; both take the zero row, so x is never read past its end. `src_rows` 0 means the
+     * caller supplied no row count (a shim bug) and disables the bound. */
     if (r < 0 || (src_rows > 0 && (int64_t)r >= src_rows)) {
         for (uint32_t i = threadIdx.x; i < n; i += THR) st_elem(dt, yr, i, 0.0f);
         return;
@@ -827,8 +810,8 @@ __global__ __launch_bounds__(THR) void scatter_rows_kernel(
     uint32_t v_ld, uint32_t x_ld, int dt, int32_t es, int64_t dst_rows) {
     const uint32_t m = blockIdx.x;
     const int32_t r = ldg_i32(idx + m);
-    /* A negative index is padding, one at or past the destination plane is libref's refused step:
-     * dropped, so no row of x is written outside the plane. `dst_rows` 0 is unchecked. */
+    /* A negative index is padding, and one at or past the destination plane is a step libref
+     * refuses; both are dropped, so nothing is written outside the plane. `dst_rows` 0 is unchecked. */
     if (r < 0 || (dst_rows > 0 && (int64_t)r >= dst_rows)) return;
     const char* __restrict__ vr = (const char*)v + (size_t)m * v_ld * (size_t)es;
     char* __restrict__ xr = (char*)x + (size_t)r * x_ld * (size_t)es;
@@ -945,10 +928,9 @@ extern "C" int r3d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps,
 
 /* The fused add + norm + E4M3 quantiser. `res` is the residual plane, INOUT, and 0 when the op has
  * no residual; `ob` is the optional bf16 copy of exactly what was quantised. `group` is the
- * quantiser's block and must divide n: a partial group needs the zero-padded store the standalone
- * quantiser writes, and this row's band is a checkpoint whose block divides its hidden width.
- * Pitches are in elements of their own operand; `s_ld` in scales, so a dense scale plane is n/group.
- * 0, -1, -2, -3, -4. */
+ * quantiser's block and must divide n: a partial group would need the standalone quantiser's
+ * zero-padded store. Pitches are in elements of their own operand, `s_ld` in scales (dense is
+ * n/group). Returns 0, -1, -2, -3 or -4. */
 extern "C" int r3d_rmsnorm_quant_fp8(long x, long res, long w, long q, long s, long ob, int M,
                                      int n, int group, float eps, float wadd, int x_ld, int res_ld,
                                      int ob_ld, int q_ld, int s_ld, int wdt, long stream) {
@@ -1179,7 +1161,7 @@ extern "C" int r3d_act_mul_bf16(long gate, long up, long y, int M, int n, int g_
 }
 
 /* y = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate and the up share one plane, so one pitch
- * carries both halves: `gu_ld` is the FUSED row's pitch (>= 2n), `y_ld` the output's. */
+ * carries both halves: `gu_ld` is the fused row's pitch (>= 2n), `y_ld` the output's. */
 extern "C" int r3d_silu_mul_bf16(long gate_up, long y, int M, int n, int gu_ld, int y_ld,
                                  long stream) {
     if (!gate_up || !y) return -1;
@@ -1188,7 +1170,7 @@ extern "C" int r3d_silu_mul_bf16(long gate_up, long y, int M, int n, int gu_ld, 
     if (!y_ld) y_ld = n;
     if (gu_ld < 2 * n || y_ld < n) return -3;
     const int thr = row_threads(n);
-    const int pair = row_pair(y, n, gu_ld, y_ld);   /* n even puts the up half on a 2-byte boundary */
+    const int pair = row_pair(y, n, gu_ld, y_ld);   /* n even keeps the up half pair-aligned */
 #define R3D_SM(THR, PAIR)                                                                         \
     R3D_KLAUNCH(R3D_KNAME(silu_mul_kernel<THR, PAIR>), dim3((uint32_t)M), dim3(THR),             \
                 (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)gate_up,             \
@@ -1276,8 +1258,8 @@ extern "C" int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head
     if (!(theta > 0.0f) || !std::isfinite(theta)) return -2;
     if (!qkv_ld) qkv_ld = (n_head + 2 * n_head_kv) * head_dim;
     if (qkv_ld < (n_head + 2 * n_head_kv) * head_dim) return -3;
-    /* rope is a per-head-of-64-pairs op: one wave covers a token's rope heads when the head is
-     * narrow, and 256 threads take the wide ones. */
+    /* One wave covers a token's rope pairs when there are at most 256 of them; 256 threads take
+     * more. */
     const int gptj = mode == R3D_ROPE_GPTJ;
     const int thr = (n_head + n_head_kv) * (rot / 2) <= 256u ? (int)kNarrow : (int)kThreads;
     R3D_ROPE2(thr, M, stream, (uint16_t*)(uintptr_t)qkv, (const int32_t*)(uintptr_t)pos,
@@ -1301,9 +1283,9 @@ extern "C" int r3d_kv_store(long k, long v, long sm, long kv, int M, int head_di
     if (!v_ld) v_ld = n_head_kv * head_dim;
     if (k_ld < n_head_kv * head_dim || v_ld < n_head_kv * head_dim) return -3;
     if (sb < 0 || sh < 0 || so < 0 || sd <= 0) return -3;
-    /* The cache's span, as r3d_shape_kv_store sizes it: M tokens need ceil(M/block_size) blocks,
-     * and the shape adds two so a step that resolves its slots before the next block is written
-     * has somewhere to put them. Keep the two formulas in step. */
+    /* Default cache span, matching r3d_shape_kv_store: M tokens need ceil(M/block_size) blocks, plus
+     * two so a step that resolves its slots before the next block is written has room. Keep the two
+     * formulas in step. */
     if (slot_max <= 0)
         slot_max = (long long)((M + block_size - 1) / block_size + 2) * block_size;
     const int thr = row_threads(n_head_kv * head_dim);
@@ -1366,21 +1348,20 @@ extern "C" int r3d_scatter_rows(long v, long idx, long x, int M, int n, int v_ld
 
 /* ================================================================== the plugin ABI entry points
  *
- * Unpacking RadArgs and deriving the pitches belongs to the kernel library (r3d_args.h). The
- * kernels take raw pointers and one pitch per operand, so anything unpitched must be tight
- * (spec §2.1). Before each launch a shim checks:
+ * The shims unpack RadArgs and derive the pitches (r3d_args.h). The kernels take raw pointers and
+ * one pitch per operand, so anything unpitched must be tight (spec §2.1). Before each launch a
+ * shim checks:
  *
- *   * the dtype, off the operand: a row's `dtype` constraint is a necessary condition on the
- *     geometry, not a promise about the tensors, and an f32 operand read as bf16 is a value the
-  *     geometry checks will not catch;
+ *   * the dtype, off the operand: a row's `dtype` constraint is a necessary condition, not a
+ *     promise about the tensors, and an f32 operand read as bf16 passes every geometry check;
  *   * the row pitch, r3d_rows_pitch(): elements, or -1 (RAD_E_STRIDE) for a strided inner axis;
  *   * the row count, off the operand, never the `M` parameter: `M` is ranged, so the args carry
  *     the band's upper bound;
- *   * the parameters, with libref's defaults, and the forms the kernels cannot match -- refused
- *     with RAD_E_UNSUPPORTED so the row's constraints can state the band and a model that needs
- *     the refused form is not routed here at all.
+ *   * the parameters, with libref's defaults. Forms the kernels cannot match are refused with
+ *     RAD_E_UNSUPPORTED, and the row's constraints keep models that need them from being routed
+ *     here.
  *
- * Every refusal goes through R3D_NO(), so a run with RAD_R3D_TRACE set says which line said no.
+ * Every refusal goes through R3D_NO(), so with RAD_R3D_TRACE set each refusal prints its line.
  */
 
 static inline int dt_bf16(const RadTensor* t) { return r3d_is_bf16(t) ? RAD_OK : RAD_E_DTYPE; }
@@ -1394,8 +1375,8 @@ static inline int dt_same(const RadTensor* a, const RadTensor* b) {
 
 #define R3D_NEED(x) do { const int _s = (x); if (_s != RAD_OK) return R3D_NO(_s); } while (0)
 
-/* A launcher's return: 0 is RAD_OK, anything else is a device failure -- the arguments were the
- * shim's to check, and it checked them. */
+/* A launcher's return: 0 is RAD_OK and anything else is a device failure, because the shim has
+ * already checked the arguments. */
 static inline int r3d_launch_ok(int rc) { return rc == 0 ? RAD_OK : R3D_NO(RAD_E_DEVICE); }
 
 /* ------------------------------------------------------------------ rmsnorm */
@@ -1407,8 +1388,7 @@ extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
     const RadTensor* w = r3d_opt(a, RMS_W);
     const RadTensor* y = r3d_opt(a, RMS_Y);
     if (!x || !y) return R3D_NO(RAD_E_INVAL);
-    /* The row's dtype band is bf16 or f32, and the two legs are the same two passes: an f32
-     * checkpoint's residual stream normalizes without a store that narrows. */
+    /* bf16 or f32, the same two passes; the f32 leg's store narrows nothing. */
     const bool f32 = r3d_is_f32(x) && r3d_is_f32(y);
     if (!f32) {
         R3D_NEED(dt_bf16(x));
@@ -1418,8 +1398,7 @@ extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
     const float wadd = (float)r3d_getf(a, "wadd", 0.0);
     const float mult = (float)r3d_getf(a, "mult", 1.0);
     const float eps = (float)r3d_getf(a, "eps", 1e-6);
-    /* `wadd` without a gain is refused, as ref does: 1 + wadd of a gain that does not exist is a
-     * constant scale wearing a norm's name. */
+    /* `wadd` without a gain is refused, as ref does: it would be a constant scale, not a norm. */
     if (!w && wadd != 0.0f) return R3D_NO(RAD_E_INVAL);
     /* The gain's dtype comes off the gain: bf16, f32, or none. */
     int wdt = R3D_DT_N;
@@ -1449,10 +1428,9 @@ extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ rmsnorm_quant_fp8
- * The residual add, the norm and the E4M3 quantiser in one launch: {x, residual?, w, q, scale,
- * out_bf16?} with {M, n, eps, group, dtype, wadd?}, libref's. The row's reason to exist is the
- * traffic: the normalised row is written once as codes and one bf16 copy, not written as bf16 and
- * read back by a separate quantiser.
+ * The residual add, the norm and the E4M3 quantiser in one launch: libref's {x, residual?, w, q,
+ * scale, out_bf16?} with {M, n, eps, group, dtype, wadd?}. The normalised row is written once, as
+ * codes and an optional bf16 copy, instead of as bf16 read back by a separate quantiser.
  */
 extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* x = r3d_opt(a, 0);
@@ -1463,17 +1441,15 @@ extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* ob = r3d_opt(a, 5);
     if (!x || !w || !q || !sc) return R3D_NO(RAD_E_INVAL);
     R3D_NEED(dt_bf16(x));
-    /* The gain comes in the dtype the checkpoint stores it in -- bf16 or f32, read off the operand.
-     * The band's `dtype` is the activation's: a checkpoint that stores its gains as f32 is read as
-     * it is, and a shim that dtype-checks the weight against the activation band serves one
-     * checkpoint and refuses the next. The kernel's WDT leg is the plain rmsnorm's. */
+    /* The gain is read in the dtype the checkpoint stores it in, bf16 or f32. The band's `dtype` is
+     * the activation's, so checking the weight against it would refuse checkpoints with f32 gains. */
     int wdt = R3D_DT_N;
     if (r3d_is_bf16(w)) wdt = R3D_DT_BF16;
     else if (r3d_is_f32(w)) wdt = R3D_DT_F32;
     else return R3D_NO(RAD_E_DTYPE);
-    /* `residual` is validated below, where the flag that makes it read is read. `out_bf16` is
-     * checked because this kernel WRITES it, so it is required of the row that asks for it (the
-     * reference writes it when the operand is there) and absent when the slot carries no bytes. */
+    /* `residual` is validated below, under the flag that makes it read. `out_bf16` is checked only
+     * when its slot carries bytes, since the kernel then writes it (as the reference does whenever
+     * the operand is present). */
     if (r3d_has(ob)) R3D_NEED(dt_bf16(ob));   /* no bytes = the plan asked for no bf16 copy */
     if (r3d_dt_code(q->dtype) != R3D_DT_U8) return R3D_NO(RAD_E_DTYPE);   // E4M3 codes
     R3D_NEED(dt_f32(sc));
@@ -1481,17 +1457,15 @@ extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const long long n = r3d_geti_or(a, "n", w->rank ? r3d_dim(w, (int)w->rank - 1) : 0);
     const long long group = r3d_geti_or(a, "group", 0);
     if (n <= 0 || group <= 0) return R3D_NO(RAD_E_SHAPE);
-    /* A wave covers a group, four columns a lane per 128 columns, and a partial group is the
-     * standalone quantiser's zero-padded store. A checkpoint whose block divides its hidden width
-     * is the band this row is for. */
+    /* A wave covers a group, four columns a lane per 128 columns; a partial group would need the
+     * standalone quantiser's zero-padded store. */
     if (group != 128 && group != 256 && group != 512) return R3D_NO(RAD_E_UNSUPPORTED);
     if (n % group) return R3D_NO(RAD_E_UNSUPPORTED);
     const float eps = (float)r3d_getf(a, "eps", 1e-6);
     const float wadd = (float)r3d_getf(a, "wadd", 0.0);
-    /* The reference reads `residual` under `wadd` and nowhere else, and so do we -- checked here,
-     * after the flag, and REQUIRED by it. The engine hands the slot a tensor even when the band
-     * says wadd=0, in any dtype; a row that validates an operand the op will not read is a row
-     * that refuses a checkpoint. */
+    /* The reference reads `residual` only under `wadd`, and so does this check. The engine binds
+     * the slot even when wadd=0, in any dtype, so validating it unconditionally would refuse valid
+     * checkpoints. */
     if (wadd != 0.0f) {
         if (!r3d_has(res)) return R3D_NO(RAD_E_INVAL);
         R3D_NEED(dt_bf16(res));
@@ -1531,8 +1505,8 @@ extern "C" int r3d_rad_layernorm(const RadArgs* a, RadStream s) {
     R3D_NEED(dt_bf16(w));
     R3D_NEED(dt_bf16(y));
     if (b) {
-        /* libref reads a bias in any float dtype; the kernel reads bf16 (the launcher has one
-         * dtype for gain and bias), so an f32 bias is refused, not read wrong. */
+        /* libref reads a bias in any float dtype; the kernel reads bf16 only (one dtype for gain
+         * and bias), so an f32 bias is refused rather than misread. */
         if (!r3d_is_bf16(b)) return R3D_NO(RAD_E_DTYPE);
         R3D_NEED(dt_bf16(b));
     }
@@ -1555,8 +1529,8 @@ extern "C" int r3d_rad_layernorm(const RadArgs* a, RadStream s) {
 
 /* ------------------------------------------------------------------ add / mul
  * The broadcast rule is libref's, read off the operand: a `b` of exactly n elements against more
- * than one row rides every row, and nothing else broadcasts. `div` is `add`'s only (mul's schema
- * has no div key), and a zero, NaN or infinity is refused -- the reference refuses it too. */
+ * than one row applies to every row, and nothing else broadcasts. Only `add` has `div` (mul's
+ * schema has no div key); zero, NaN and infinity are refused, as by the reference. */
 static int binary_shim(const RadArgs* a, RadStream s, int mul) {
     const RadTensor* A = r3d_opt(a, 0);
     const RadTensor* B = r3d_opt(a, 1);
@@ -1653,8 +1627,8 @@ static int unary_shim(const RadArgs* a, RadStream s, int act) {
         R3D_NEED(dt_bf16(x));
         R3D_NEED(dt_bf16(y));
     }
-    /* Only silu has an f32 leg in r3d.h (the vocoder's f32 branch is the one that asked for it);
-     * an f32 gelu or sigmoid is refused, not served by the bf16 kernel. */
+    /* Only silu has an f32 leg in r3d.h; an f32 gelu or sigmoid is refused rather than run through
+     * the bf16 kernel. */
     if (f32 && act != R3D_ACT_SILU) return R3D_NO(RAD_E_UNSUPPORTED);
 
     const long long n = r3d_geti_or(a, "n", r3d_numel(y));
@@ -1686,9 +1660,8 @@ extern "C" int r3d_rad_sigmoid(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ act_mul
- * libref's kActs order is silu, gelu, gelu_tanh, sigmoid, quick_gelu; libr3d's rows serve silu,
- * gelu and sigmoid, and the other two are refused with RAD_E_UNSUPPORTED so the row's constraints
- * state which gated MLPs reach an RDNA3 card. */
+ * libref's kActs are silu, gelu, gelu_tanh, sigmoid and quick_gelu. libr3d serves silu, gelu and
+ * sigmoid and refuses the other two with RAD_E_UNSUPPORTED. */
 extern "C" int r3d_rad_act_mul(const RadArgs* a, RadStream s) {
     const RadTensor* A = r3d_opt(a, 0);
     const RadTensor* B = r3d_opt(a, 1);
@@ -1725,9 +1698,9 @@ extern "C" int r3d_rad_act_mul(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ silu_mul
- * y[i] = silu(gate_up[i]) * gate_up[n + i]: libref's {gate_up, y} operands and its {M, n, dtype}
- * schema. A distinct op from act_mul -- the llama MLP emits it, and act_mul takes two operands --
- * so a model asking for silu_mul is not served by the act_mul_silu row.
+ * y[i] = silu(gate_up[i]) * gate_up[n + i]: libref's {gate_up, y} operands and {M, n, dtype}
+ * schema. The llama MLP emits it; it is a distinct op from act_mul (which takes two operands), so
+ * the act_mul_silu row does not serve it.
  */
 extern "C" int r3d_rad_silu_mul(const RadArgs* a, RadStream s) {
     const RadTensor* gu = r3d_opt(a, 0);
@@ -1740,7 +1713,7 @@ extern "C" int r3d_rad_silu_mul(const RadArgs* a, RadStream s) {
     if (n <= 0) return R3D_NO(RAD_E_SHAPE);
     long long M = 0, Mgu = 0;
     const long long y_ld = r3d_rows_pitch(y, n, &M);
-    const long long gu_ld = r3d_rows_pitch(gu, 2 * n, &Mgu);   /* the FUSED row is 2n wide */
+    const long long gu_ld = r3d_rows_pitch(gu, 2 * n, &Mgu);   /* the fused row is 2n wide */
     if (y_ld < 0 || gu_ld < 0) return R3D_NO(RAD_E_STRIDE);
     if (!row_count_ok(M) || Mgu < M) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(gu) < M * 2 * n) return R3D_NO(RAD_E_SHAPE);   // ref's own bound on the plane
@@ -1750,9 +1723,9 @@ extern "C" int r3d_rad_silu_mul(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ softmax
- * f32, as ref spells it: the reference casts to f32, computes, and casts back, and the intermediate
- * `e` is read back from an f32 plane. A bf16 y would round that intermediate and the kernel cannot
- * match ref with ref's own arithmetic, so it is refused rather than served at a tolerance. */
+ * f32 only: the reference casts to f32, computes and casts back, reading the intermediate `e` back
+ * from an f32 plane. A bf16 y would round that intermediate, so it is refused rather than served at
+ * a tolerance. */
 extern "C" int r3d_rad_softmax(const RadArgs* a, RadStream s) {
     const RadTensor* x = r3d_opt(a, 0);
     const RadTensor* y = r3d_opt(a, 1);
@@ -1774,8 +1747,8 @@ extern "C" int r3d_rad_softmax(const RadArgs* a, RadStream s) {
 
 /* ------------------------------------------------------------------ scale
  * y = x * s. `s` is the op's [1] weight plane: the shim checks its dtype and that it has an
- * element, and the kernel reads the value. The launcher cannot take the number by value, because
- * reading a device plane on the host is a copy and a sync, and a row is neither. */
+ * element, and the kernel reads the value, because reading a device plane on the host needs a copy
+ * and a sync. */
 extern "C" int r3d_rad_scale(const RadArgs* a, RadStream s) {
     const RadTensor* x = r3d_opt(a, 0);
     const RadTensor* sc = r3d_opt(a, 1);
@@ -1828,14 +1801,12 @@ extern "C" int r3d_rad_fill(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ rope
- * In place, so operand 0 is the row's INOUT: the shim checks it is writable (the role says it is;
- * a null data is the row's bug, and is RAD_E_INVAL) and that head_dim and rot are even.
+ * In place, so operand 0 is INOUT (a null data is RAD_E_INVAL); head_dim and rot must be even.
  *
- * What the shim refuses, and why: the multi-component modes (mrope, imrope, axial) need a
- * [C, M] position plane and per-section ladders; the proportional ladder (`ladder=head`) pairs
- * across the whole head; YaRN and Llama 3 rescale the ladder. Each changes the angles, not the
- * arithmetic, and the kernel has the plain rotary -- so each is RAD_E_UNSUPPORTED, the row's
- * constraints say so, and a model that needs one is not routed to this card's row.
+ * Refused with RAD_E_UNSUPPORTED: the multi-component modes (mrope, imrope, axial), which need a
+ * [C, M] position plane and per-section ladders; the proportional ladder (`ladder=head`), which
+ * pairs across the whole head; and YaRN and Llama 3, which rescale the ladder. Each changes the
+ * angles, not the arithmetic, and the kernel implements only the plain rotary.
  */
 extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     const RadTensor* qkv = r3d_opt(a, 0);
@@ -1888,14 +1859,13 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ kv_store
- * The cache is INOUT: only the mapped slots are touched and every other slot must survive. Its
- * strides are read off the operand (the reference's kv_view): a rank-4 cache carries them; the
- * flat [blocks, kv_heads, block_size, 2*head_dim] form derives them.
+ * The cache is INOUT: only the mapped slots are written. Its strides are read off the operand (the
+ * reference's kv_view): a rank-4 cache carries them, and the flat
+ * [blocks, kv_heads, block_size, 2*head_dim] form derives them.
  *
- * ref also refuses a slot naming a block past the cache (RAD_E_SHAPE), which the shim cannot do
- * before the launch: the slots are in device memory. The bound travels as `slot_max`, the slot span
- * of the cache the shapes hook sizes, and the kernel drops a slot at or past it -- a slot lost,
- * not a step lost.
+ * ref also refuses a slot naming a block past the cache (RAD_E_SHAPE), which the shim cannot check
+ * before the launch because the slots are in device memory. The bound travels as `slot_max` and
+ * the kernel drops a slot at or past it.
  */
 extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
     const RadTensor* k = r3d_opt(a, 0);
@@ -1942,12 +1912,11 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
     if (T <= 0 || Mk < T || Mv < T) return R3D_NO(RAD_E_SHAPE);
     if (!row_count_ok(T)) return R3D_NO(RAD_E_SHAPE);
 
-    /* The cache's span, in slots: the pool's own plane, NOT this step's. A step that adopts a
-     * prefix writes its tail into the blocks the table names, and those sit at the allocator's
-     * GLOBAL indices -- a 4-token tail placed at block 3 is slots 48..51, past any bound built
-     * from T. A bound built from the step's own span is no bound for the tail's slots, so the
-     * pool's plane is the true bound: a slot at or past it names memory the cache does not have,
-     * and the kernel drops it there. */
+    /* The cache's span in slots comes from the pool's own plane, not from this step. A step that
+     * adopts a prefix writes its tail into the blocks the table names, at the allocator's global
+     * indices (a 4-token tail in block 3 starts at slot 48), which a bound derived from T would
+     * reject. A slot at or past the plane's span names memory the cache does not have and is
+     * dropped by the kernel. */
     long long slot_max;
     if (kv->rank == 4) {
         slot_max = (long long)r3d_dim(kv, 0) * block_size;
@@ -1957,17 +1926,19 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
         slot_max = el / (2 * head_dim);
     }
 
-    if (std::getenv("RAD_R3D_TRACE"))   /* the write side, spoken: where this step's KV lands. A
-                                     * tail that names slots of an adopted block writes over the
-                                     * shared prefix, and this line is the one that says so. */
+    /* Diagnostic, when RAD_R3D_TRACE is set: synchronises the device and prints
+     * "[r3d] kvstore: T=<tokens> kvbase=<cache ptr> slots=<first 8 slot ids>", showing where this
+     * step's KV lands (a tail naming slots of an adopted block overwrites the shared prefix). */
+    if (r3d_trace_on())
     {
         (void)hipDeviceSynchronize();
         int slots[8];
-        if (hipMemcpy(slots, (const void*)(uintptr_t)r3d_addr(sm), 8 * sizeof(int),
+        const int n_print = T < 8 ? (int)T : 8;
+        if (hipMemcpy(slots, (const void*)(uintptr_t)r3d_addr(sm), (size_t)n_print * sizeof(int),
                       hipMemcpyDeviceToHost) == hipSuccess) {
             std::fprintf(stderr, "[r3d] kvstore: T=%lld kvbase=%p slots=", (long long)T,
                          (const void*)(uintptr_t)r3d_addr(kv));
-            for (int c = 0; c < 8 && (long long)c < T; ++c)
+            for (int c = 0; c < n_print; ++c)
                 std::fprintf(stderr, "%s%d", c ? " " : "", slots[c]);
             std::fprintf(stderr, "\n");
         }
@@ -1980,10 +1951,10 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
 }
 
 /* ------------------------------------------------------------------ embed_lookup
- * tokens are i32 (the engine's token ids), the table's dtype is the launcher's `dt`, and x is
- * bf16 -- a table in any other float dtype, or an E4M3 table whose scale arrives as a tensor
- * (embed_lookup_q's operand), is refused: one scale per gathered row is a device read the step
- * path cannot do, which is why the op's schema carries `wscale` as a parameter. */
+ * tokens are i32 (the engine's token ids), the table's dtype is the launcher's `dt`, and x is bf16.
+ * A table in any other float dtype is refused, as is an E4M3 table whose scale arrives as a tensor
+ * (embed_lookup_q's operand): a per-row scale read is a device read the step path cannot do, which
+ * is why the op's schema carries `wscale` as a parameter. */
 extern "C" int r3d_rad_embed_lookup(const RadArgs* a, RadStream s) {
     const RadTensor* tok = r3d_opt(a, 0);
     const RadTensor* wte = r3d_opt(a, 1);

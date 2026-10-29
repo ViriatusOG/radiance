@@ -119,7 +119,12 @@ typedef struct RadBatch {
     /* Speculative window (spec §10). n_spec == 0 for an ordinary decode step. */
     int            n_spec;             /* draft tokens per sequence this step */
     const int32_t* num_accepted;       /* [n_seq] device, from the previous verify */
-    const int32_t* spec_parent;        /* [n_tok] device, tree layout; null for a linear chain */
+    /* [n_tok] device; null for a linear chain. A tree verify (rad_drafter_tree): -2 marks an
+     * ordinary causal row; any other entry is a node of its sequence's verify block and names its
+     * parent by row within the sequence's rows (cu_seqlens), -1 for the block's first row, every
+     * parent before its child. Inside its block such a row attends to itself and its ancestors
+     * only (docs/OPS.md, attn_paged_tree). */
+    const int32_t* spec_parent;
 
     /* The draft pass. 0 is an ordinary step that runs the trunk; non-zero runs only the draft
      * head, and the sign gives the kind:
@@ -290,6 +295,16 @@ typedef struct RadBatch {
      * position tables per grid) reads them here; they live as long as the pass. */
     const int32_t* enc_seg_h;
     const int32_t* enc_seg_w;
+
+    /* ================================================ scored steps */
+
+    /* Non-zero when every row the sampler wants is a scored row (a /v1/systemone question: the raw
+     * logits at a few candidate ids, the sampled token discarded) and the program declared where
+     * the core finds the hidden rows and the head (rad_declare_scores). The plugin then skips its
+     * lm_head and leaves `rad_declare_scores`' hidden buffer holding the gathered, final-normed
+     * rows; the core computes the candidates' logits itself. Zero on every other step, and always
+     * for a program that declared no scores. Appended; an older plugin never sees it set. */
+    int32_t score_only;
 
     /* ---- appended in ABI 32 (a request's words for the plugin) */
     /* Integer words a request hands the plugin whole (Request::plugin_words), for a head that

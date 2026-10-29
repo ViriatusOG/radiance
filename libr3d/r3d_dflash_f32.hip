@@ -1,62 +1,48 @@
-/* r3d_dflash_f32.hip -- DFlash2's candidate walk, `dflash_select`, on the card.
+/* r3d_dflash_f32.hip -- DFlash2's candidate walk, `dflash_select`.
  *
  * A block-diffusion drafter proposes every position of a block in one backbone pass, so position
- * l+1 is not conditioned on what the drafter chose at l. This op restores that dependence: it walks
- * the `steps` positions in order and, at each, picks the candidate that maximises
+ * l+1 is not conditioned on the drafter's choice at l. This op restores that dependence: it walks
+ * the `steps` positions in order and at each picks the candidate that maximises
  *
  *     score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * hp[l][r] * succ[cand[l, c]][r]
  *
- * where pid(0) is the anchor -- the token the target just committed, read at
- * `anchor[m * anchor_stride]` -- and pid(l) is the walk's own previous pick, `cand[l-1, chosen]`.
- * `hp` absent is a plane of ones, which drops the trilinear form to a low-rank bigram (DSpark's
- * Markov head). libref's `ref_dflash_select` is the law, and this file transcribes its arithmetic
- * and its order.
+ * where pid(0) is the anchor (the token the target just committed, at `anchor[m * anchor_stride]`)
+ * and pid(l) is the walk's previous pick, `cand[l-1, chosen]`. With `hp` absent it is a plane of
+ * ones and the form reduces to a low-rank bigram (DSpark's Markov head). This file transcribes the
+ * arithmetic and order of libref's `ref_dflash_select`.
  *
- * ============================== why it is a kernel and not a GEMM ==============================
+ * Parallelism. The walk is serial in l, because step l's predecessor is the pick of step l-1;
+ * scoring the whole [steps, K, K] edge tensor up front would compute K times the edges read. The
+ * sequences and, within a step, the K candidates are parallel: a block takes `256 / top_k`
+ * sequences, each lane scores one (sequence, candidate) edge, and one lane per sequence takes the
+ * argmax. Each step costs two LDS round trips (scores out, pick back).
  *
- * The walk is serial in l: the predecessor of step l is not known until step l-1 has been decided,
- * so the [steps, K, K] edge tensor cannot be scored in advance -- scoring it computes K times the
- * edges that are ever read. What is parallel is the sequences (M of them) and, inside a step, the K
- * candidates. So a block takes `256 / top_k` sequences and gives each lane one (sequence,
- * candidate) pair: the lane runs the rank sum for its own edge, in the reference's order, and one
- * lane per sequence scans the K scores and takes the pick. The loop over `steps` stays serial, with
- * the two LDS round trips per step (the scores out, the pick back) that the dependence requires.
+ * Cost. At the band (steps=7, top_k=16, rank=256, M=256) a walk is 7 * 16 * 256 = 28672 terms, and
+ * the op is a gather over `succ` [n_vocab, rank]: 66.8 MiB of codebook, of which the walk reads
+ * M * steps * K = 28672 rows (about 14.7 MiB) plus one predecessor row per step. There is no
+ * arithmetic to hide the gather behind, so a tree reduction gains nothing and would break the
+ * agreement below.
  *
- * The rank sum is the whole cost: at the band (steps=7, top_k=16, rank=256, M=256) a walk is
- * 7 * 16 * 256 = 28672 fused terms, and the bytes it touches are the K successor rows a step reads,
- * 16 * 512 B of bf16, so the op is a gather over `succ` [n_vocab, rank] -- 66.8 MiB of codebook at
- * the band, of which the walk reads M * steps * K = 28672 rows, about 14.7 MiB, plus one
- * predecessor row a step. There is no arithmetic to hide that behind, which is why the sum is a
- * plain ascending chain and not a tree: a tree buys nothing here and costs the agreement.
+ * Agreement with the reference is bit-exact:
  *
- * ============================== agreement, and where this file declines ==============================
- *
- * Bit-exact by construction, not by tolerance:
- *
- *   - the rank sum is `sc = unary; for (i = 0; i < rank; ++i) sc += ax[i] * succ[i];` -- ascending
- *     in r, one accumulator, no reduction, no tree, with `-ffp-contract=off` so no FMA fusion
- *     changes the rounding of a term;
- *   - `ax[i] = pred[pid][i] * hp[l][i]` is rounded to f32 before it meets `succ`, because the
- *     reference writes it into a float array first (and with `hp` absent it is `pred * 1.0f`, which
- *     is the same value);
+ *   - the rank sum is `sc = unary; for (i = 0; i < rank; ++i) sc += ax[i] * succ[i];`, ascending in
+ *     r, one accumulator, with `-ffp-contract=off` so no FMA changes a term's rounding;
+ *   - `ax[i] = pred[pid][i] * hp[l][i]` is rounded to f32 before it meets `succ`, as the reference
+ *     stores it in a float array first (with `hp` absent, `pred * 1.0f` is the same value);
  *   - the argmax is a strict `>` over c ascending, so the earliest candidate wins a tie and a NaN
- *     never displaces the incumbent -- the reference's loop, statement for statement;
- *   - a predecessor outside the vocabulary contributes zero, and a candidate outside it is scored
- *     by `unary` alone: both are the reference's tests (`pid >= 0 && pid < nv`, `tok >= 0 &&
- *     tok < nv`), and both are why padding rows -- a shard's unused rows, a block shorter than
- *     `steps` -- are legal inputs;
- *   - the pick of step l is written to `tokens[m, l]` and becomes pid(l+1) unchanged, including
- *     when it is out of range for the codebooks.
+ *     never displaces the incumbent;
+ *   - a predecessor outside the vocabulary contributes zero and a candidate outside it is scored by
+ *     `unary` alone (the reference's `pid >= 0 && pid < nv`, `tok >= 0 && tok < nv`), so padding
+ *     rows (a shard's unused rows, a block shorter than `steps`) are legal inputs;
+ *   - the pick of step l is written to `tokens[m, l]` and becomes pid(l+1) unchanged, even when it
+ *     is out of range for the codebooks.
  *
- * Declines, all of them the shim's, none reachable from a row that carries the constraints its row
- * states: a codebook (`pred`, `succ`, `hp`) that is not bf16, because this is the bf16
- * instantiation -- the band's `dtype` is the codebooks' width and a row asks for bf16 (RAD_E_DTYPE);
- * `unary` that is not f32, `cand`/`anchor`/`tokens` that are not i32, exactly as the schema's
- * operand list types them (RAD_E_DTYPE); a codebook whose rows are not contiguous -- the gather is
- * `token * rank + r` and a row stride inside the row is not that (RAD_E_STRIDE); `top_k` above 256,
- * which is one lane a candidate and no more candidates than lanes (RAD_E_UNSUPPORTED); and a `cand`
- * plane that describes more sequences than the band's `M`, which is `band_rows` refusing and is
- * RAD_E_SHAPE, not a truncation.
+ * The shim refuses, none of it reachable from a row whose constraints hold: a codebook (`pred`,
+ * `succ`, `hp`) or band `dtype` other than bf16, the one instantiation (RAD_E_DTYPE); `unary` not
+ * f32 or `cand`/`anchor`/`tokens` not i32, as the schema types them (RAD_E_DTYPE); a codebook whose
+ * rows are not contiguous, since the gather is `token * rank + r` (RAD_E_STRIDE); `top_k` above
+ * 256, one lane per candidate (RAD_E_UNSUPPORTED); a `cand` plane describing more sequences than
+ * the band's `M` (RAD_E_SHAPE, not a truncation).
  */
 
 #include "r3d.h"
@@ -72,8 +58,8 @@ namespace {
 constexpr uint32_t kThr = 256;              /* 8 waves: the block's (sequence, candidate) lanes */
 constexpr uint32_t kKMax = kThr;            /* one lane a candidate, so top_k <= 256 */
 
-/* Whole-register loads of the planes the walk gathers through. bf16 is a 16-bit load and the
- * library's codec, which is the same decode libref's `ldt` performs. */
+/* Whole-register loads of the planes the walk gathers through. bf16 is a 16-bit load decoded with
+ * the library's codec, the same decode as libref's `ldt`. */
 __device__ __forceinline__ int32_t ldg_i32(const int32_t* p) {
     return (int32_t)ldg_u32((const uint32_t*)p);
 }
@@ -81,10 +67,10 @@ __device__ __forceinline__ float ldg_f32(const float* p) { return *(const float*
 __device__ __forceinline__ uint16_t ldg_u16(const uint16_t* p) { return *(const uint16_t*)p; }
 
 /* ------------------------------------------------------------------ the walk
-
- * `per` sequences per block, `K` candidates per sequence, so lane (s, c) owns the edge
- * (sequence s, candidate c) of the step in hand. `hp` may be null: then the `hp` factor is 1.0f,
- * exactly as the reference's `(hp ? ldt(hp, ...) : 1.0f)` writes it. */
+ *
+ * `per` sequences per block, `K` candidates per sequence; lane (s, c) owns the edge
+ * (sequence s, candidate c) of the current step. `hp` may be null, and the factor is then 1.0f, as
+ * in the reference's `(hp ? ldt(hp, ...) : 1.0f)`. */
 __global__ __launch_bounds__(kThr) void dflash_select_kernel(
     const int32_t* __restrict__ cand, const float* __restrict__ un,
     const uint16_t* __restrict__ hp, const int32_t* __restrict__ anc,
@@ -100,13 +86,13 @@ __global__ __launch_bounds__(kThr) void dflash_select_kernel(
     const uint32_t c = threadIdx.x - s * K;             /* the candidate this lane scores */
     const uint32_t seq0 = blockIdx.x * per + s;
     /* A block of 256 lanes holds ceil(256 / K) sequences and the last group can be partial. A lane
-     * with no sequence replays the last real one: it reaches every __syncthreads() and its stores
-     * are suppressed, and the loads it performs are in range because the sequence it replays is. */
+     * with no sequence replays the last real one, so it reaches every __syncthreads() and its loads
+     * stay in range; its stores are suppressed. */
     const uint32_t seq = seq0 < M ? seq0 : M - 1;
     const bool mine = seq0 < M;
 
-    /* pid(0): the anchor, at `m * anchor_stride` in a flat plane. The reference reads it through
-     * `ld_int`, so a negative id is a legal "no predecessor" and not an error. */
+    /* pid(0): the anchor, at `m * anchor_stride` in a flat plane. As in the reference (`ld_int`),
+     * a negative id means "no predecessor", not an error. */
     int32_t pid = ldg_i32(anc + (size_t)seq * (size_t)astr);
     const bool has_hp = (hp != nullptr);
 
@@ -116,9 +102,8 @@ __global__ __launch_bounds__(kThr) void dflash_select_kernel(
         const int32_t  tok = ldg_i32(cand + cb + c);
         float sc = ldg_f32(un + (size_t)r * (size_t)un_ld + c);
 
-        /* A predecessor outside the vocabulary contributes nothing; a candidate outside it is
-         * scored by `unary` alone. Both tests are the reference's, and both are why a shard's
-         * padding rows and a block shorter than `steps` are legal inputs. */
+        /* Out-of-vocabulary predecessor: no contribution. Out-of-vocabulary candidate: `unary`
+         * alone. See the header. */
         const bool have_p = pid >= 0 && (uint32_t)pid < nv;
         const bool have_s = tok >= 0 && (uint32_t)tok < nv;
         if (have_s) {
@@ -126,8 +111,7 @@ __global__ __launch_bounds__(kThr) void dflash_select_kernel(
             const uint16_t* sp = succ + (size_t)tok * (size_t)succ_ld;
             const uint16_t* hpb = hp + (size_t)r * (size_t)hp_ld;
             for (uint32_t i = 0; i < R; ++i) {
-                /* ax[i], rounded to f32 where the reference writes it into its float array, and
-                 * then the ascending chain. 1.0f for a missing hp is the reference's own factor. */
+                /* ax[i] is rounded to f32 before the multiply, as in the reference. */
                 const float ax = have_p
                     ? bf16_to_f32(ldg_u16(pp + i)) * (has_hp ? bf16_to_f32(ldg_u16(hpb + i)) : 1.0f)
                     : 0.0f;
@@ -138,8 +122,7 @@ __global__ __launch_bounds__(kThr) void dflash_select_kernel(
         __syncthreads();
 
         if (c == 0) {
-            /* The reference's argmax: strict `>`, c ascending, so the earliest candidate wins a
-             * tie and a NaN never takes the lead from a number. */
+            /* Strict `>`, c ascending: the earliest candidate wins a tie, a NaN never leads. */
             uint32_t best_c = 0;
             float best_s = -INFINITY;
             for (uint32_t j = 0; j < K; ++j) {
@@ -157,9 +140,8 @@ __global__ __launch_bounds__(kThr) void dflash_select_kernel(
 
 /* ------------------------------------------------------------------ shim helpers */
 
-/* The plane's row pitch, from the plane: `rows` is its row count and `ld` the pitch a row's
- * elements start at, K apart. A rank-1 plane is a run of rows K apart, which is what the
- * reference's rowoff does for one. */
+/* The plane's row count (`rows`) and row pitch (`ld`) for rows of K elements. A rank-1 plane is a
+ * run of rows K apart, as the reference's rowoff treats it. */
 static inline int rows_pitch(const RadTensor* t, long long K, long long* rows, long long* ld) {
     const long long p = r3d_rows_pitch(t, K, rows);
     if (p < 0) return RAD_E_STRIDE;
@@ -201,7 +183,7 @@ static inline int r3d_launch_status(int rc) {
  *   anchor  [M*anchor_stride] i32, the token each walk starts from, at m*anchor_stride
  *   pred    [n_vocab][rank]   bf16, the predecessor codebook
  *   succ    [n_vocab][rank]   bf16, the successor codebook the walk gathers with its picks
- *   tokens  [M][steps]        i32, out: the accepted prefix, one pick a step
+ *   tokens  [M][steps]        i32, out: the accepted prefix, one pick per step
  *
  * 0, -1 null, -2 bad extent, -3 pitch, -4 the HIP launch failed. No allocation, no synchronisation.
  */
@@ -237,10 +219,10 @@ extern "C" int r3d_dflash_select(long cand, long unary, long hp, long anchor, lo
 /* ================================================================== shim
  *
  * libref's operand list is {cand, unary, hp?, anchor, pred, succ, tokens} and its parameter list is
- * {M, steps, top_k, rank, n_vocab, anchor_stride?, dtype}. Sequences come from `cand` -- the plane
- * holds M * steps * top_k ids -- through `band_rows`, so a plane describing more sequences than the
- * band's M is refused, not truncated. `rank` and `n_vocab` fall back to the predecessor codebook's
- * own shape, as the reference's do, and `anchor_stride` defaults to 1.
+ * {M, steps, top_k, rank, n_vocab, anchor_stride?, dtype}. The sequence count comes from `cand`
+ * (M * steps * top_k ids), with the band's M as a ceiling: a plane describing more sequences is
+ * refused, not truncated. `rank` and `n_vocab` default to the predecessor codebook's shape, as in
+ * the reference, and `anchor_stride` to 1.
  */
 extern "C" int r3d_rad_dflash_select(const RadArgs* a, RadStream stream) {
     const RadTensor* cand = r3d_opt(a, 0);
@@ -269,7 +251,7 @@ extern "C" int r3d_rad_dflash_select(const RadArgs* a, RadStream stream) {
     if (K > (long long)kKMax) return R3D_NO(RAD_E_UNSUPPORTED);
     if (steps > 0x7fffffffLL / (K * 256) ) return R3D_NO(RAD_E_SHAPE);
 
-    /* Sequences from the plane, the band as a ceiling -- band_rows refuses, it does not truncate. */
+    /* Sequences from the plane, the band as a ceiling. */
     const long long all = steps * K;
     if (all <= 0 || r3d_numel(cand) % all) return R3D_NO(RAD_E_SHAPE);
     const long long M = r3d_numel(cand) / all;

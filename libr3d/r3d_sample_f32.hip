@@ -1,95 +1,62 @@
 /* r3d_sample_f32.hip -- the sampler: the two full-vocabulary reductions, the candidate set, the
  * seeded draw and the four narrowing stages.
  *
- * The arithmetic is libref's, transcribed -- the reference's sampler is the law and the ORDER of
- * its passes is the point. `abi/rad_sample.h` is the wire format: every scalar (`temp`, `top_k`,
- * `top_p`, `min_p`, `typical_p`, `xtc_*`, `seed`, `pos`, the flags, the history window) is DATA, one
- * 96-byte row per sampled position, because a parameter is geometry and frozen at declare, and two
- * rows of one batch with different top_p must resolve to one kernel. `param_rows` below is that
- * check, and it is the dtype check libref states: the plane is 32-bit words, and a 16-bit view
- * passes a byte-count test and then misreads every row.
+ * The arithmetic is libref's, transcribed, including the order of its passes. `abi/rad_sample.h`
+ * is the wire format: every scalar (`temp`, `top_k`, `top_p`, `min_p`, `typical_p`, `xtc_*`, `seed`,
+ * `pos`, the flags, the history window) is data, one 96-byte row per sampled position, because a
+ * parameter is geometry frozen at declare and two rows of one batch with different top_p must
+ * resolve to one kernel. The params plane must be 32-bit words (see params_ok).
  *
- * ============================== what has to agree, and with what ==============================
+ * ============================== reproducibility ==============================
  *
- * The draws must REPRODUCE, so the summation order is transcription and not performance:
+ * Draws must reproduce, so summation order is transcribed, not chosen for speed:
  *
- *   - A MAX is order-free and every max here is a strict `>`, which is also how NaN is kept out:
- *     libref's `if (v > mx) mx = v` over -infinity never adopts a NaN, and the butterfly merges with
- *     the same strict comparison, so a NaN in a row of logits cannot become the max anywhere.
- *   - A SUM of f32 is not order-free. libref's `sum` (the pick, the narrowing stages) runs
- *     over the candidates in INDEX order, and the CDF scan below it accumulates in index order too.
- *     So the exps are computed in parallel -- each is a separate value, order-free -- and the
- *     accumulation is serial on one lane, in index order, exactly as written. That is the whole
- *     design of the candidate kernels: parallel values, serial sums.
- *   - The draw is specified in the ABI, not left to a library: splitmix64 over
- *     `seed * 0x9E3779B97F4A7C15 + pos`, top 24 bits over 2^24. Integer arithmetic, so it is the
- *     same number here as on the host. Independent draws at one position are independent streams:
- *     the pick XORs the seed with RAD_SAMPLE_KEY_PICK (0), XTC's firing coin with RAD_SAMPLE_KEY_XTC.
- *   - `ref_exp`/`ref_log` are `(float)std::exp((double)x)` and `(float)std::log((double)x)`, and
- *     they are transcribed as double calls rounded once to f32. There is no fp8-style hardware
- *     shortcut to take: an f32 exp2 (`v_exp_f32`) is a couple of ulps away, and a `u < cum`
- *     comparison sitting on an ulp boundary changes the drawn token, which is a fixture failure even
- *     when the distribution is right. Consumer RDNA3 fp64 is 1:64, so this is the slow path and the
- *     candidate set is where it shows: it costs time, not agreement. The device's
- *     `(float)exp((double)x)` and `(float)log((double)x)` are bit-identical to glibc's over
- *     a million points in [-100, 100] (0 of 2^20 differ), while `expf` differs from the host's
- *     `expf` in 5.7% of them by 1 ulp -- the double call is not only the law, it is the only one
- *     of the two that reproduces the recording.
+ *   - Every max is a strict `>`, order-free, and keeps NaN out: libref's `if (v > mx) mx = v` from
+ *     -infinity never adopts a NaN, and the butterfly merges the same way.
+ *   - An f32 sum is not order-free. libref's sums (the pick, the narrowing stages) and the CDF scan
+ *     run over the candidates in index order, so exps are computed in parallel and accumulated
+ *     serially on one lane in index order: parallel values, serial sums.
+ *   - The draw is specified by the ABI: splitmix64 over `seed * 0x9E3779B97F4A7C15 + pos`, top 24
+ *     bits over 2^24, integer arithmetic, so device and host agree. Independent draws at one
+ *     position XOR the seed with a key: RAD_SAMPLE_KEY_PICK (0) for the pick, RAD_SAMPLE_KEY_XTC for
+ *     XTC's coin.
+ *   - `ref_exp`/`ref_log` are `(float)std::exp((double)x)` and `(float)std::log((double)x)`, as in
+ *     the reference. On gfx1102 the device's double exp/log match glibc's bit for bit over 2^20
+ *     points in [-100, 100], while `expf` differs from the host's by 1 ulp on 5.7% of them, and a
+ *     `u < cum` comparison on an ulp boundary changes the drawn token. Consumer RDNA3 runs fp64 at
+ *     1:64, which the candidate set (1024 exponentials a row) can afford. The attention unit, at
+ *     millions of exponentials a layer, uses a 0.5-ulp polynomial instead.
  *
- * This is where the law is affordable, and it is why this file and the attention unit differ. Here
- * the widest softmax is the candidate set: 1024 exponentials a row, 2 per lane, and the whole op is
- * half a millisecond a step at the band. Attention at the prefill band is 17 M exponentials a layer
- * on the same 1:64 fp64, and there the law cannot be paid, so that unit ships a 0.5-ulp polynomial
- * and says so. A sampler that draws a different token than the recording is wrong at any speed, so
- * this unit keeps the double call and the switch stays off.
+ * ============================== one-pass top-k ==============================
  *
- * ============================== the top-k, and why it is one pass ==============================
+ * libref selects with `topk_next`: R scans of the row, each taking the largest value strictly below
+ * the last pick, ties to the lower column. That is a sort by (-value, +column), so one pass keeping
+ * the best R in that order yields the same R pairs in the same order. At N=130560, R=16, M=1792
+ * this reads the row once instead of sixteen times. The pass is bound by accepted inserts into
+ * each lane's list, not by memory; filtering against a block-wide threshold instead of each lane's
+ * own tail would cut the inserts about tenfold.
  *
- * libref selects with `topk_next`: R scans of the row, each taking the largest
- * value strictly below the last pick, ties to the LOWER column. Read as a whole that is a sort by
- * (-value, +column), and the rule `v == *pv && i <= *pi` is exactly "the next one within a run of
- * equal values" -- so one pass that keeps the best R by that order produces the same R pairs, in the
- * same order, with the same tie-breaks. At the band's row (N=130560, R=16, bf16, M=1792) the
- * reference scans the row sixteen times: 7.0 GB of traffic. This file scans it once: 468 MB.
+ * The per-lane list is at most 64 deep, and the merge keeps the best 64 of two lists. Almost every
+ * element costs one comparison against the lane's last entry (about 12% clear it at 510 elements a
+ * lane). 64 covers R=16, a 64-wide candidate set and practical top_k values; a larger k takes
+ * ceil(k/64) passes, carrying the chain's state, so the answer is the same at any k.
  *
- * At the band (M=1792, N=130560, R=16) the one pass is 22.0 ms bf16, 22.4 ms f32, i.e. 21 GB/s and
- * 42 GB/s: the same time for half the bytes, so the pass is not bound by the plane, it is bound by
- * the accepted inserts (~55 sifts a lane at 510 elements a lane, POOL steps each). The traffic is 15x
- * lower than the reference's and the headroom is in the insert, not in the load; a lane that filtered
- * against a block-wide threshold instead of its own tail would take ~5 sifts a lane and land near the
- * 2 ms the bandwidth floor allows. The number is stated so it is not read as the memory system's
- * answer.
- *
- * One pass needs a per-lane list, and a list costs comparisons, so it is 64 deep and the merge keeps
- * the best 64 of two lists: a lane's test against its 64th best is ONE comparison for almost every
- * element (only ~12% of a row's elements clear it at 510 elements a lane), and the deep comparisons
- * happen only for the elements that enter. Sixty-four covers R=16, the selftest's 64-wide candidate
- * set, and every top_k a request asks for in practice. Deeper is not free and is not silent:
- * `r3d_sample_topk` and `r3d_row_topk` take ceil(k/64) passes when the row asks for more, and each
- * pass is one more read of the row. That is the reference's own chain, so the answer is the same one
- * at any k; only the time is the reference's.
- *
- * The chain's QUIRK is transcribed too, because kbench compares the plane. `topk_next` seeds its
- * scan with `best_i < 0 ||`, so the first element it examines becomes the best even when it is a
- * NaN, and after that `v > best_v` is false for everything: a row whose FIRST logit is NaN yields R
- * identical (NaN, 0) slots, not a hole. To reproduce that the 64-deep pool is re-scanned by ONE lane
- * in ascending column order with the literal chain -- the pool provably contains every element the
- * chain can ever pick (a pick is in the global top-64, so it is in its own lane's top-64), and the
- * chain's comparisons are only exact when the scan order is the row's.
+ * The chain's quirk is transcribed too, because kbench compares the plane: `topk_next` seeds its
+ * scan with `best_i < 0 ||`, so the first element becomes the best even when it is a NaN, and
+ * nothing displaces it. A row whose first logit is NaN yields R identical (NaN, 0) slots. The
+ * kernels test the first element for that case explicitly.
  *
  * ============================== shape ==============================
  *
- * One block a row everywhere: at the band a row of 130560 f32 is 510 KiB and M is 2048, so the whole
- * plane is 1 GiB and these are the memory-bound kernels of the library -- argmax and top-k each read
- * 1 GiB, temp reads and writes 2 GiB. A row of the candidate set is 1024 f32 and the work is the
- * transcendentals, so the same shape costs nothing and buys the serial order for free. The candidate
- * stages keep their probabilities in LDS (2 * 1024 floats), which is what makes typical's O(n^2)
+ * One block a row everywhere. At the band a row is 130560 f32 (510 KiB) and M is 2048, so argmax
+ * and top-k each read 1 GiB and temp reads and writes 2 GiB: these are memory-bound. A candidate
+ * row is at most 1024 f32 and the work is transcendentals, so the same shape costs nothing and
+ * gives the serial order for free; the stages keep the row in LDS, which makes typical's O(n^2)
  * distance scan affordable.
  *
- * Single rank. `vocab_off` is read where libref reads it (`row_topk`'s reported ids, `sample_topk`'s
- * `pairs` plane) and the pair planes are written as the shape hooks describe them, because kbench
- * fills and compares them. There is no all-gather here and no merge kernel: `sample_merge_topk` is
- * declined by libref's own shape hook and rank 0 has nothing to merge.
+ * Single rank. `vocab_off` is applied where libref applies it (`row_topk`'s reported ids,
+ * `sample_topk`'s `pairs` plane), and the pair planes are written as the shape hooks describe them.
+ * There is no merge kernel: libref's own shape hook declines `sample_merge_topk`.
  */
 
 #include "r3d.h"
@@ -106,31 +73,18 @@ constexpr uint32_t kThreads = 256;          /* 8 waves */
 constexpr uint32_t kWave    = 32;
 constexpr uint32_t kWaves   = kThreads / kWave;
 
-/* The candidate pool's depth, and the widest candidate set the narrowing stages carry in LDS.
- * 1024 candidates is the engine's declared buffer width; two f32 arrays of it is 8 KiB of 64 KiB. */
+/* The candidate pool's depth, and the widest candidate set the narrowing stages carry in LDS (the
+ * engine's declared buffer width). */
 constexpr int kPool = 64;
 constexpr int kCandMax = 1024;
 
-/* The double call and the single rounding to f32 ARE the law: libref's oracle
- * is glibc's double exp and log, and the f32 result of a double-accurate implementation agrees with
- * it for every input but a double-rounding tie. */
-/* The two transcendentals, and the A/B switch. The law is libref's `(float)std::exp((double)x)`,
- * and on this card the device's double `exp`/`log` are BIT-IDENTICAL to glibc's (0 of 2^20 points
- * in [-100, 100] differ, both functions), so the law is reproducible here and the draw is the
- * recording's. `expf` is not: it moves 5.7% of inputs by 1 ulp relative to the host's, which is
- * under a bit-exact fixture. -DR3D_EXP_F32 swaps both for the f32 hardware path, so the cost of the
- * law can be measured in kbench; nothing in the shipped build uses it, and the flips it causes are
- * reported with it. */
-#ifdef R3D_EXP_F32
-__device__ __forceinline__ float ref_exp(float x) { return expf(x); }
-__device__ __forceinline__ float ref_log(float x) { return logf(x); }
-#else
+/* The reference's transcendentals: a double call rounded once to f32 (see the file header), so the
+ * draws are the reference's. */
 __device__ __forceinline__ float ref_exp(float x) { return (float)exp((double)x); }
 __device__ __forceinline__ float ref_log(float x) { return (float)log((double)x); }
-#endif
 
 /* abi/rad_sample.h's draw, verbatim: splitmix64 over (seed * golden + pos), top 24 bits as a float
- * in [0, 1) -- exactly f32's mantissa, so no double anywhere. */
+ * in [0, 1). 24 bits fit f32's mantissa exactly. */
 __device__ __forceinline__ uint64_t splitmix64(uint64_t z) {
     z += 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -142,17 +96,8 @@ __device__ __forceinline__ float uniform01(uint64_t seed, uint64_t pos) {
     return (float)(uint32_t)(z >> 40) * (1.0f / 16777216.0f);
 }
 
-/* The params row, as the kernels see it. 96 bytes, a multiple of 8, so row m is 8-byte aligned in a
- * plane of words and the u64 seed and pos load as one instruction. */
-struct Params {
-    const RadSampleParams* p;
-    __device__ __forceinline__ const RadSampleParams& operator[](uint32_t m) const {
-        return p[m];
-    }
-};
-
-/* A block-wide maximum with a strict `>`, which is the comparison libref writes and the reason a NaN
- * is never the max: a wave butterfly, then the wave partials. `lds` holds kWaves floats. */
+/* A block-wide maximum: a wave butterfly of fmaxf, then the wave partials. fmaxf drops a NaN, so a
+ * NaN is never the result. `lds` holds kWaves floats. */
 __device__ __forceinline__ float block_max(float v, float* lds) {
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     v = wave_max(v);                                   /* a butterfly of fmaxf: drops a NaN */
@@ -166,28 +111,18 @@ __device__ __forceinline__ float block_max(float v, float* lds) {
 
 /* ------------------------------------------------------------------ sample_argmax
  *
- * The law: the largest logit, ties to the LOWER column, because greedy and top-1 have to
- * agree. The scan's rule is `bi < 0 || v > best`: strict, so the first of a run wins, and a NaN is
- * never adopted -- except as the row's very first element, which the seed of the scan adopts. The
- * parallel form is the same total order: take the right candidate only when it is strictly better
- * (larger, or equal with a lower column), which is associative, so the butterfly and the serial scan
- * agree, and a NaN in `best` is never displaced by anything.
+ * The largest logit, ties to the lower column, so greedy and top-1 agree. The reference's scan is
+ * `bi < 0 || v > best`: strict, so the first of a run wins, and a NaN is adopted only as the row's
+ * first element. The parallel form uses the same total order, which is associative, so the
+ * butterfly and the serial scan agree.
  */
 struct Best { float v; uint32_t i; };
 
-/* The scan's law, made associative. `best_take(a, b)` keeps `a` unless `b` is strictly better --
- * larger, or equal with a lower column -- and `b.i == kNone` is "nothing examined yet". The
- * reference's serial scan seeds with `bi < 0 ||` and then moves only on a strict `>`, which is the
- * same total order, so a butterfly of this and a scan of that agree on every input. */
+/* `best_take(a, b)` keeps `a` unless `b` is strictly better (larger, or equal with a lower column);
+ * `b.i == 0xffffffff` means nothing examined yet. */
 __device__ __forceinline__ Best best_take(Best a, Best b) {
     const bool better = (b.v > a.v) || (b.v == a.v && b.i < a.i);
     return (b.i != 0xffffffffu && better) ? b : a;
-}
-
-/* A max with a strict `>` over the block, NaN dropped: `fmaxf` is the drop, and libref's
- * `if (v > mx) mx = v` from -infinity never adopts a NaN either. */
-__device__ __forceinline__ float block_max_strict(float v, float* lds) {
-    return block_max(v != v ? -INFINITY : v, lds);
 }
 
 __global__ __launch_bounds__(kThreads) R3D_WAVES(8) void sample_argmax_kernel(
@@ -223,9 +158,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(8) void sample_argmax_kernel(
         Best t{ red[0], redi[0] };
 #pragma unroll
         for (uint32_t w = 1; w < kWaves; ++w) t = best_take(t, Best{ red[w], redi[w] });
-        /* topk_next's seed, and nothing else: the first element the reference examines becomes its
-         * best even when it is a NaN, and no finite value can displace a NaN afterwards, so a row
-         * that opens with a NaN reports column 0. Every other NaN the scan walks past. */
+        /* topk_next's seed: a row whose first element is NaN reports column 0 (see the file
+         * header); every other NaN is skipped. */
         const float x0 = ldg_f32(lr);
         tok[row] = (int32_t)(x0 != x0 ? 0u : t.i);
     }
@@ -233,10 +167,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(8) void sample_argmax_kernel(
 
 /* ------------------------------------------------------------------ sample_temp
  *
- * The law: `inv = 1/t` computed once per row, then every logit multiplied -- by the
- * reciprocal, not divided, and only when the row is sampled at all: `!(t > 0) || t == 1` leaves the
- * row exactly as it was, bit for bit, which is what makes temp 1.0 and temp 0.0 (greedy) no-ops the
- * kernel has to keep. The write is in place: logits are an INOUT operand.
+ * `inv = 1/t` once per row, then every logit multiplied by it (not divided), in place. A row with
+ * `!(t > 0) || t == 1` is left bit-exact, so temp 1.0 and temp 0.0 (greedy) are no-ops.
  */
 __global__ __launch_bounds__(kThreads) R3D_WAVES(8) void sample_temp_kernel(
     float* __restrict__ lg, const RadSampleParams* __restrict__ pr, uint32_t n, uint32_t lg_ld) {
@@ -255,8 +187,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(8) void sample_temp_kernel(
 
 /*   lg     [M][n_vocab] f32, INOUT for temp, read-only for argmax; `lg_ld` elements a row (0 = n)
  *   tok    [M]          i32
- *   params [M]          24 words a row; argmax does not read it, and libref's shape hook describes
- *                       it anyway, so the operand is there and unchecked, as libref leaves it.
+ *   params [M]          24 words a row; argmax does not read it (libref describes it anyway)
  *
  * 0, -1 null, -2 bad extent, -3 pitch that does not describe the operand, -4 the HIP launch failed.
  * No allocation, no synchronisation. */
@@ -290,20 +221,16 @@ extern "C" int r3d_sample_temp(long lg, long params, int M, int n_vocab, long lo
 
 /* ================================================================== the top-k pool
  *
- * One lane's share of a row, kept as the 64 best by (value descending, column ascending) -- the
- * order `topk_next` walks. Two rules make it one pass and make it exact:
+ * One lane's share of a row, kept as the POOL best by (value descending, column ascending), the
+ * order `topk_next` walks.
  *
- *   - the order is a STRICT total order, so a merge of two such lists is a merge of two sorted
- *     lists and keeps the first 64 of the union, which is what the reference's R scans converge on;
- *   - the list lives in registers, so insertion is a 64-step sift with STATIC indices (compare, and
- *     swap when the newcomer is better) and never a dynamic index, which would spill the array to
- *     private memory. The sift costs 64 compares per INSERTED element, and elements are inserted
- *     only after a single compare against the lane's 64th best -- about one element in eight at the
- *     band's 510 columns a lane -- so the amortised cost is a few comparisons a column.
+ *   - The order is strict and total, so merging two lists keeps the first POOL of the union.
+ *   - The list lives in registers, so insertion is a POOL-step sift with static indices; a dynamic
+ *     index would spill the array to private memory. Only elements that beat the lane's last entry
+ *     (one compare) are sifted.
  *
- * Slots the row never filled hold (-INFINITY, 0xffffffff): lower than any real value, and higher
- * than any real column, so a real -infinity logit (a masked one) beats a pad and the extraction
- * stops at the first pad.
+ * Unfilled slots hold (-INFINITY, 0xffffffff): below any real value and above any real column, so a
+ * real -infinity logit (a masked one) beats a pad and extraction stops at the first pad.
  */
 namespace {
 
@@ -314,27 +241,23 @@ __device__ __forceinline__ bool pool_better(float av, uint32_t ai, float bv, uin
     return av > bv || (av == bv && ai < bi);
 }
 
-/* Insert (v, i) into a lane's register list. POOL is the list depth, which is the width of a pass:
- * the sift is POOL steps and the merges are POOL-wide. The band asks for 16 (a router's top_k) and
- * a candidate set for 64; carrying 64 through a router row costs four times the sift and returns
- * the same 16 pairs.
+/* Insert (v, i) into a lane's register list. POOL is the list depth and the width of a pass, so a
+ * router's top_k of 16 uses a 16-deep pool rather than paying for 64.
  *
- * `pv`/`pi` carry the pick chain: an element at or above the last pick has been picked already, and
- * within a run of equal values only columns after the last pick are still candidates --
- * `topk_next`'s two skips, in its order. */
+ * `pv`/`pi` carry the pick chain across passes: an element above the last pick, or equal to it at
+ * or before its column, was already picked (`topk_next`'s two skips, in its order). */
 template <int POOL>
 __device__ __forceinline__ void pool_insert(float v, uint32_t i, float pv, uint32_t pi,
                                             float* lv, uint32_t* li) {
-    if (v != v) return;                          /* the scan walks past a NaN (its first element is
-                                                    handled by the caller, as the reference's is) */
+    if (v != v) return;                          /* skip NaN; the caller handles a NaN first element */
     if (v > pv) return;                          /* picked on an earlier pass */
     if (v == pv && i <= pi) return;              /* the last pick, or one before it */
-    if (!pool_better(v, i, lv[POOL - 1], li[POOL - 1])) return;   /* the fast path: one compare */
+    if (!pool_better(v, i, lv[POOL - 1], li[POOL - 1])) return;   /* fast path: one compare */
 
     float cv = v;
     uint32_t ci = i;
 #pragma unroll
-    for (int j = 0; j < POOL; ++j) {            /* the sift: every index a compile-time constant */
+    for (int j = 0; j < POOL; ++j) {            /* the sift, static indices */
         if (pool_better(cv, ci, lv[j], li[j])) {
             const float tv = lv[j]; const uint32_t ti = li[j];
             lv[j] = cv; li[j] = ci; cv = tv; ci = ti;
@@ -342,26 +265,22 @@ __device__ __forceinline__ void pool_insert(float v, uint32_t i, float pv, uint3
     }
 }
 
-/* The best 64 of the union of two lists, in the pool's order.
+/* The best POOL of the union of two lists, in the pool's order.
  *
- * A[j] and B[j] are descending, so C[j] = the better of A[j] and B[kPool-1-j] is a bitonic sequence
- * that already contains the top 64 of the union, and a bitonic sort of 64 in registers is six
- * passes of 32 compare-exchanges with static strides -- no dynamic index, no spill, 448 compares.
- * Both lanes of a shuffle pair compute the same result, which is what makes a butterfly of this
- * operation a wave reduction. */
+ * A and B are descending, so C[j] = the better of A[j] and B[POOL-1-j] is a bitonic sequence
+ * holding the union's top POOL; a bitonic sort in registers with static strides finishes it without
+ * spilling. Both lanes of a shuffle pair compute the same result, so a butterfly of merges is a
+ * wave reduction. */
 template <int POOL>
 __device__ __forceinline__ void pool_merge(const float* av, const uint32_t* ai,
                                            const float* bv, const uint32_t* bi,
                                            float* ov, uint32_t* oi) {
-#define R3D_POOL_GET(X, J)                                                                          \
-    const float x##v = r3d_xor_lane<J>(X[0]); (void)x##v
 #pragma unroll
     for (int j = 0; j < POOL; ++j) {
         const int r = POOL - 1 - j;
         if (pool_better(av[j], ai[j], bv[r], bi[r])) { ov[j] = av[j]; oi[j] = ai[j]; }
         else                                        { ov[j] = bv[r]; oi[j] = bi[r]; }
     }
-#undef R3D_POOL_GET
 #pragma unroll
     for (int k = POOL; k > 1; k >>= 1) {
 #pragma unroll
@@ -370,8 +289,8 @@ __device__ __forceinline__ void pool_merge(const float* av, const uint32_t* ai,
             for (int j = 0; j < POOL; ++j) {
                 const int o = j ^ h;
                 if (o <= j) continue;
-                /* Descending everywhere: the whole array is one descending run, so the direction of
-                 * every compare-exchange is "the larger value to the lower index". */
+                /* One descending run: every compare-exchange moves the better entry to the lower
+                 * index. */
                 if (pool_better(ov[o], oi[o], ov[j], oi[j])) {
                     const float tv = ov[j]; const uint32_t ti = oi[j];
                     ov[j] = ov[o]; oi[j] = oi[o]; ov[o] = tv; oi[o] = ti;
@@ -381,8 +300,7 @@ __device__ __forceinline__ void pool_merge(const float* av, const uint32_t* ai,
     }
 }
 
-/* One lane's pass over its columns of a row. STEP is 1 (scalar) or 4 (a vector load a step); LD
- * reads one column. */
+/* One lane's pass over its columns of a row. STEP is 1 (scalar) or 4 (one vector load a step). */
 template <int XDT, int STEP, int POOL>
 __device__ __forceinline__ void pool_scan(const void* __restrict__ x, uint32_t n, uint32_t x_ld,
                                           float pv, uint32_t pi, float* lv, uint32_t* li) {
@@ -399,7 +317,7 @@ __device__ __forceinline__ void pool_scan(const void* __restrict__ x, uint32_t n
                 pool_insert<POOL>(bf16_to_f32((uint16_t)(hi & 0xffffu)), 4 * w + 2, pv, pi, lv, li);
                 pool_insert<POOL>(bf16_to_f32((uint16_t)(hi >> 16)),     4 * w + 3, pv, pi, lv, li);
             }
-            for (uint32_t c = nw * 4 + tid; c < n; c += kThreads)   /* the row's odd tail, once */
+            for (uint32_t c = nw * 4 + tid; c < n; c += kThreads)   /* the row's tail */
                 pool_insert<POOL>(bf16_to_f32((uint16_t)ldg_u16(p + c)), c, pv, pi, lv, li);
         } else {
             for (uint32_t c = tid; c < n; c += kThreads)
@@ -426,10 +344,8 @@ __device__ __forceinline__ void pool_scan(const void* __restrict__ x, uint32_t n
 }
 
 /* One pass over the row: every lane's list, a wave butterfly of merges, the eight wave lists in
- * LDS, and the block's 64 best in LDS at [kWaves*kPool, ...). Returns how many are real (pads
- * stop it). */
-/* The block's 64 best are left in LDS at [kWaves*kPool, ...): the extraction that follows walks
- * them with a runtime index, and a runtime index into a register array is a spill. */
+ * LDS, and the block's POOL best left in LDS at [kWaves*POOL, ...) (in LDS because the extraction
+ * walks them with a runtime index). Returns how many are real. */
 template <int POOL>
 __device__ __forceinline__ uint32_t pool_pass(const void* __restrict__ x, uint32_t n,
                                               uint32_t x_ld, int xdt, int vec,
@@ -471,7 +387,7 @@ __device__ __forceinline__ uint32_t pool_pass(const void* __restrict__ x, uint32
     __syncthreads();
 
     uint32_t nout = 0;
-    if (threadIdx.x == 0) {                        /* the eight lists, merged with cursors */
+    if (threadIdx.x == 0) {                        /* merge the eight wave lists with cursors */
         uint32_t cur[kWaves];
 #pragma unroll
         for (int w = 0; w < kWaves; ++w) cur[w] = 0;
@@ -492,19 +408,14 @@ __device__ __forceinline__ uint32_t pool_pass(const void* __restrict__ x, uint32
     return nout;
 }
 
-/* The pool, in LDS: the eight wave lists, then the block's. */
 }  /* namespace */
 
 /* ================================================================== row_topk
  *
- * The law: exact per-row top-R, descending, ties to the lower column, with `vocab_off`
- * added to every reported id and the optional [M, R, 2] pair plane an all-gather moves (an int32 id
- * in the first f32 slot, the value in the second, id -1 for a slot the row could not fill).
- *
- * The reference calls `topk_next` R times, a full scan each time; the pool above produces the same
- * R pairs from one scan, because the pool's order IS the chain's order. A row that wants more than
- * 64 costs ceil(R/64) scans and carries the chain's state across them, so the answer is the same at
- * any R and only the time is the reference's.
+ * Exact per-row top-R, descending, ties to the lower column, with `vocab_off` added to every
+ * reported id, and the optional [M, R, 2] pair plane an all-gather moves (an int32 id's bits in the
+ * first f32 slot, the value in the second, id -1 for an unfilled slot). One scan per POOL entries
+ * (see the file header).
  */
 namespace {
 
@@ -523,22 +434,24 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void row_topk_kernel(
     int32_t* __restrict__ ir = idx + (size_t)row * idx_ld;
     float* __restrict__ pr = pairs ? pairs + (size_t)row * pairs_ld : nullptr;
 
-    /* topk_next's seed of the scan: the first element it looks at becomes the best even as a NaN,
-     * and nothing displaces a NaN, so a row that opens with one reports (0, NaN) in every slot.
-     * Stated once, here, rather than buried in the pool's comparisons. */
+    /* topk_next's seed: a row whose first element is NaN reports (0, NaN) in every slot. */
     if (threadIdx.x == 0)
         st[0] = XDT == 0 ? bf16_to_f32((uint16_t)ldg_u16((const uint16_t*)x + (size_t)row * x_ld))
                          : ldg_f32((const float*)x + (size_t)row * x_ld);
     __syncthreads();
-    if (st[0] != st[0] && threadIdx.x == 0) {
-        for (uint32_t r = 0; r < k; ++r) {
-            ir[r] = (int32_t)vocab_off;
-            vr[r] = st[0];
-            if (pr) {
-                int32_t bits = (int32_t)vocab_off;
-                float v = st[0];
-                __builtin_memcpy(&pr[2 * r], &bits, 4);
-                pr[2 * r + 1] = v;
+    /* The test reads shared memory after the barrier, so the whole block takes the same branch
+     * and none of it reaches the pool passes' barriers. */
+    if (st[0] != st[0]) {
+        if (threadIdx.x == 0) {
+            for (uint32_t r = 0; r < k; ++r) {
+                ir[r] = (int32_t)vocab_off;
+                vr[r] = st[0];
+                if (pr) {
+                    int32_t bits = (int32_t)vocab_off;
+                    float v = st[0];
+                    __builtin_memcpy(&pr[2 * r], &bits, 4);
+                    pr[2 * r + 1] = v;
+                }
             }
         }
         return;
@@ -552,8 +465,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void row_topk_kernel(
         __syncthreads();
         const uint32_t nout = pool_pass<POOL>(x, n, x_ld, XDT, vec, pv, pi, lds_v, lds_i);
         if (threadIdx.x == 0) {
-            /* Only the first `nout` entries of the block list were written this pass; what sits past
-             * them is last pass's list, so the count, not the pad sentinel, bounds the copy. */
+            /* Only the first `nout` block entries were written this pass (the rest are stale), so
+             * the count, not the pad sentinel, bounds the copy. */
             const uint32_t room = (k - done < POOL) ? k - done : (uint32_t)POOL;
             const uint32_t take = nout < room ? nout : room;
             uint32_t j = 0;
@@ -582,18 +495,12 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void row_topk_kernel(
             s2[1] = nout == 0 ? k : done + take;
         }
         __syncthreads();
-#ifdef R3D_POOL_TRACE
-        if (threadIdx.x == 0)
-            printf("    [pool] n=%u done=%u nout=%u take=%u pv=%g pi=%u -> pv=%g pi=%u done=%u\n",
-                   n, done, nout, (uint32_t)0, pv, pi, st[1], s2[0], s2[1]);
-#endif
         pv = st[1]; pi = s2[0]; done = s2[1];
     }
 }
 
-/* One row's top_k: the request's, clamped to the buffer, whole width when absent, none when the row
- * is greedy (its token is sample_argmax's, and a stage that wrote it candidates would be a bug the
- * pick cannot see). */
+/* One row's top_k: the request's, clamped to the buffer; the whole width when absent; none for a
+ * greedy row, whose token is sample_argmax's. */
 __device__ __forceinline__ uint32_t row_k(const RadSampleParams& sp, uint32_t n_cand) {
     if (sp.flags & RAD_SP_GREEDY) return 0;
     const int32_t k = sp.top_k;
@@ -654,14 +561,13 @@ extern "C" int r3d_row_topk(long x, long idx, long val, long pairs, int M, int N
 
 /* ================================================================== sample_topk
  *
- * The law: the row's top_k largest logits into the fixed-width candidate set, descending,
- * ties to the lower token id, with `cand_idx` -1 and `cand_val` -infinity for a hole. Two things
- * here are not in row_topk: the width is the BUFFER's (a declare-time bound), the row's top_k only
- * narrows within it -- top_k 40 in a 1024-wide buffer is 40 candidates and 984 holes -- and a greedy
- * row takes none, because its token is sample_argmax's and the pick must not overwrite it.
+ * The row's top_k largest logits into the fixed-width candidate set, descending, ties to the lower
+ * token id, with `cand_idx` -1 and `cand_val` -infinity for a hole. Unlike row_topk, the width is
+ * the buffer's (a declare-time bound) and the row's top_k narrows within it (top_k 40 in a 1024-wide
+ * buffer is 40 candidates and 984 holes), and a greedy row takes none.
  *
- * `cand_val` carries LOGITS, not probabilities: every narrowing stage takes its own softmax over the
- * set, which is what lets the stages compose in any order.
+ * `cand_val` carries logits, not probabilities: each narrowing stage takes its own softmax over the
+ * set, so the stages compose in any order.
  */
 template <int POOL>
 __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
@@ -679,8 +585,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
     float* __restrict__ vr = cv + (size_t)row * cv_ld;
     int32_t* __restrict__ pp = pairs ? pairs + (size_t)row * pairs_ld : nullptr;
 
-    /* The whole buffer is written every step: a hole is a value the later stages test for, and a
-     * stale candidate from the previous step would be drawn. */
+    /* The whole buffer is written every step, since a stale candidate from the previous step would
+     * be drawn. */
     auto hole = [&](uint32_t r) {
         ir[r] = -1;
         vr[r] = -INFINITY;
@@ -706,8 +612,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
         __syncthreads();
         const uint32_t nout = pool_pass<POOL>(lg, n_vocab, lg_ld, 1, vec, pv, pi, lds_v, lds_i);
         if (threadIdx.x == 0) {
-            /* Only the first `nout` entries of the block list were written this pass; what sits past
-             * them is last pass's list, so the count, not the pad sentinel, bounds the copy. */
+            /* As in row_topk: `nout` bounds the copy. */
             const uint32_t room = (k - done < POOL) ? k - done : (uint32_t)POOL;
             const uint32_t take = nout < room ? nout : room;
             uint32_t j = 0;
@@ -716,7 +621,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
                 if (col == kPadCol) break;
                 const float v = lds_v[kBlk + j];
                 const int32_t id = (int32_t)(col + (uint32_t)vocab_off);
-                ir[done + j] = (int32_t)col;      /* cand_idx is LOCAL: it indexes this row of logits */
+                ir[done + j] = (int32_t)col;      /* cand_idx is local to this row of logits */
                 vr[done + j] = v;
                 if (pp) { pp[2 * (done + j)] = id; pp[2 * (done + j) + 1] = *(const int32_t*)&v; }
                 pv = v; pi = col;
@@ -734,8 +639,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void sample_topk_kernel(
 
 /*   lg      [M][n_vocab] f32; `lg_ld` a row (0 = n_vocab)
  *   params  [M]          24 words a row
- *   ci      [M][n_cand]  i32, LOCAL columns, -1 for a hole
- *   cv      [M][n_cand]  f32, the LOGIT, -infinity with the hole
+ *   ci      [M][n_cand]  i32, local columns, -1 for a hole
+ *   cv      [M][n_cand]  f32, the logit, -infinity with the hole
  *   pairs   [M][2*n_cand] i32, optional: (global id, logit bits), 0xffffffff for a hole
  *
  * The candidate width is ci's last dimension, as libref takes it; the row's top_k only narrows
@@ -771,65 +676,20 @@ extern "C" int r3d_sample_topk(long lg, long params, long ci, long cv, long pair
 
 /* ================================================================== the narrowing stages and the draw
  *
- * One block a row of the candidate set, the row in LDS (five arrays of n_cand f32 at the band's
- * 1024 is 20 KiB of the 64 KiB), and the division of labour the arithmetic asks for:
+ * One block a row of the candidate set, the row in LDS (five arrays of up to 1024 f32, 20 KiB):
  *
- *   - the max is a butterfly of strict `>`: libref's `if (v > mx) mx = v` from -infinity, so a
- *     candidate at -infinity (a hole, or a grammar-masked token at the set's tail) is never the max
- *     and a NaN never is;
- *   - exp(v - mx) is one value per candidate, so the wave computes them all, in parallel, into LDS;
- *   - every SUM that follows is libref's loop, in index order, on lane 0. The normaliser, the top-p
- *     prefix, the entropy and the inverse-CDF scan are all order-sensitive f32 accumulations, and
- *     the draw is decided by the last of them. A parallel prefix sum would round differently, and a
- *     draw that rounds differently is a different token: this is the law, so the loop stays serial.
- *     It is 1024 adds, half a microsecond; the transcendentals it waits on are the cost, and they
- *     are already out of the loop.
+ *   - the max is libref's strict `if (v > mx) mx = v` from -infinity, so a hole, a masked
+ *     candidate at -infinity and a NaN are never the max;
+ *   - exp(v - mx) is computed for all candidates in parallel into LDS;
+ *   - every sum (the normaliser, the top-p prefix, the entropy, the inverse-CDF scan) is libref's
+ *     loop in index order on lane 0. A parallel prefix sum would round differently and could draw a
+ *     different token; the serial loop is 1024 adds, small next to the transcendentals.
  *
- * A greedy row is left alone by every stage, as the reference leaves it, which is the same rule
- * that keeps its token the argmax's.
+ * Every stage leaves a greedy row alone, as the reference does.
  */
 namespace {
 
 enum { ST_TOPP = 0, ST_MINP = 1, ST_TYPICAL = 2, ST_XTC = 3, ST_PICK = 4 };
-
-__device__ __forceinline__ void cand_load(uint32_t n_cand, const int32_t* __restrict__ ir,
-                                          const float* __restrict__ vr, int32_t* __restrict__ ci,
-                                          float* __restrict__ cv) {
-    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads) {
-        ci[i] = ir[i];
-        cv[i] = vr[i];
-    }
-}
-
-__device__ __forceinline__ void cand_write(uint32_t n_cand, int32_t* __restrict__ ir,
-                                           float* __restrict__ vr, const int32_t* __restrict__ ci,
-                                           const float* __restrict__ cv) {
-    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads) {
-        ir[i] = ci[i];
-        vr[i] = cv[i];
-    }
-}
-
-/* exp(v[i] - mx) for every live candidate, in parallel. A dropped candidate gets 0, which is what
- * the reference's loops contribute for it (they skip it, and a 0 is inert in every sum below). */
-__device__ __forceinline__ void cand_exp(uint32_t n_cand, const int32_t* __restrict__ ci,
-                                         const float* __restrict__ cv, float mx,
-                                         float* __restrict__ ev) {
-    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads)
-        ev[i] = (ci[i] >= 0) ? ref_exp(cv[i] - mx) : 0.0f;
-}
-
-__device__ __forceinline__ float lane0_sum(uint32_t n_cand, const float* __restrict__ ev,
-                                           uint32_t* out) {
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (uint32_t i = 0; i < n_cand; ++i) sum += ev[i];
-        out[0] = (uint32_t)(uintptr_t)0;
-        ((float*)out)[0] = sum;
-    }
-    __syncthreads();
-    return ((float*)out)[0];
-}
 
 /* A minimum to match, for typical's cut: the smallest qualifying distance. */
 __device__ __forceinline__ float block_min(float v, float* lds) {
@@ -867,8 +727,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void narrow_kernel(
     for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads) { s_ci[i] = ir[i]; s_cv[i] = vr[i]; }
     __syncthreads();
 
-    /* mx over live candidates with a strict `>` from -infinity: a hole, a masked tail at -infinity
-     * and a NaN are all excluded, exactly as the reference's loop excludes them. */
+    /* mx over live candidates with a strict `>` from -infinity, excluding holes, masked candidates
+     * and NaN, as the reference's loop does. */
     float mine = -INFINITY;
     for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads)
         if (s_ci[i] >= 0 && s_cv[i] > mine) mine = s_cv[i];
@@ -927,9 +787,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void narrow_kernel(
                 if (s_ci[i] < 0) continue;
                 if (s_ev[i] * inv >= th) { cnt += 1.0f; last = (float)i; }
             }
-            /* Count and last are a sum and a maximum: both order-free, which is why this stage needs
-             * no serial loop. Candidates above the threshold are re-tested below, from the same
-             * values in `s_ev`. */
+            /* Count and last index are order-free (a sum of small integers and a max), so no serial
+             * loop is needed; candidates are re-tested below from the same `s_ev`. */
             const float n_above = block_sum<kThreads>(cnt, red);
             const float hi = block_max(last, red);
             if (n_above < 2.0f) return;           /* needs two to exclude all but the least likely */
@@ -939,8 +798,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void narrow_kernel(
                 if (s_ev[i] * inv >= th) { s_ci[i] = -1; s_cv[i] = -INFINITY; }
             }
             __syncthreads();
-        } else if (STAGE == ST_TYPICAL) {         /* typical: the pick must not fall through here,
-                                                   * it needs s_ev to still hold the exponentials */
+        } else if (STAGE == ST_TYPICAL) {         /* overwrites s_ev with log(q); only the pick
+                                                   * reads s_ev afterwards, and it never runs this */
             const float p = sp.typical_p;
             if (!(p < 1.0f) || !(p > 0.0f)) return;
             for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads)
@@ -962,7 +821,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void narrow_kernel(
             __syncthreads();
             /* The smallest distance whose mass reaches p. A lane owns one candidate's distance and
              * sums the mass at or below it in index order; ties are kept, so the set may overshoot
-             * p and does not depend on the candidate order. */
+             * p but does not depend on candidate order. */
             float cut = INFINITY;
             for (uint32_t c = threadIdx.x; c < n_cand; c += kThreads) {
                 if (!(s_q[c] > 0.0f)) continue;
@@ -1004,8 +863,8 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(4) void narrow_kernel(
 }  /* namespace */
 
 /*   ci      [M][n_cand] i32, INOUT: -1 marks a dropped candidate
- *   cv      [M][n_cand] f32, INOUT: the LOGIT, -infinity with a drop
- *   params  [M]         24 words a row -- the stage's own scalar, the seed and the pos
+ *   cv      [M][n_cand] f32, INOUT: the logit, -infinity with a drop
+ *   params  [M]         24 words a row: the stage's own scalar, the seed and the pos
  *
  * The set is not re-sorted: it arrives descending from sample_topk and the stages skip holes. A
  * greedy row is left exactly as it was. 0, -1, -2, -3, -4. */
@@ -1056,10 +915,9 @@ extern "C" int r3d_sample_pick(long ci, long cv, long params, long tok, int M, i
 
 /* ================================================================== the plugin ABI
  *
- * Nine shims, one per op. What a row's dtype is, the tensor says; what a row's geometry is, the
- * operand says; `M` is the band's ceiling and never the row count, which is numel(x)/n_vocab. The
- * params plane is checked the way libref checks it -- a 32-bit dtype and enough bytes for M rows --
- * and contiguous, because the kernels index it flat, as libref does.
+ * Nine shims, one per op. Dtypes come from the tensors and geometry from the operands; `M` is the
+ * band's ceiling, never the row count. The params plane is checked as libref checks it (a 32-bit
+ * dtype and enough bytes for M rows) and must be contiguous, since the kernels index it flat.
  */
 
 #define R3D_NEED(expr) do { const int r3d_s = (expr); if (r3d_s) return R3D_NO(r3d_s); } while (0)
@@ -1079,9 +937,8 @@ static inline int sp_is_word(const RadTensor* t) {
     return t && (t->dtype == RAD_U32 || t->dtype == RAD_I32 || t->dtype == RAD_F32);
 }
 
-/* param_rows: the params operand is a byte blob of [M, 24] words. The dtype test
- * is not decoration -- a 16-bit view of the plane passes a byte-count check and then misreads every
- * row, so a stage would sample with the top half of one row's temp and the bottom of the next. */
+/* The params plane: [M, 24] words. The dtype test matters: a 16-bit view passes a byte-count check
+ * and then misreads every row. */
 static inline int params_ok(const RadTensor* t, long long M) {
     if (!t || !t->data) return RAD_E_INVAL;
     if (!sp_is_word(t)) return RAD_E_DTYPE;
@@ -1159,8 +1016,7 @@ extern "C" int r3d_rad_sample_argmax(const RadArgs* a, RadStream stream) {
     if (rows <= 0 || rows > 0x7fffffffLL || n_vocab > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(tk) < rows) return R3D_NO(RAD_E_SHAPE);
     if (!r3d_contig(tk) || !r3d_aligned(r3d_p(tk), 4)) return R3D_NO(RAD_E_SHAPE);
-    /* The kernel reads no scalar from the params plane, so a missing one is not a refusal: argmax is
-     * the row every greedy request needs, and libref describes the operand without reading it. */
+    /* argmax reads nothing from params, so a missing plane is not a refusal. */
     if (pr && pr->data) R3D_NEED(params_ok(pr, rows));
     return r3d_launch_status(r3d_sample_argmax(r3d_addr(lg), r3d_addr(tk), (int)rows, (int)n_vocab,
                                               lg_ld, (long)(uintptr_t)stream));
@@ -1199,7 +1055,7 @@ extern "C" int r3d_rad_sample_topk(const RadArgs* a, RadStream stream) {
     if (!r3d_aligned(r3d_p(ci), 4) || !r3d_aligned(r3d_p(cv), 4)) return R3D_NO(RAD_E_ALIGN);
 
     const long long n_vocab = r3d_geti_or(a, "n_vocab", r3d_dim(lg, (int)lg->rank - 1));
-    /* The width is the buffer's, the declare-time bound: the row's top_k narrows inside it. */
+    /* The width is the buffer's declare-time bound; the row's top_k narrows inside it. */
     const long long n_cand = r3d_dim(ci, (int)ci->rank - 1);
     if (n_vocab <= 0 || n_cand <= 0 || n_cand > kCandMax) return R3D_NO(RAD_E_SHAPE);
     long long rows = 0, cirows = 0, cvrows = 0, prows = 0;
@@ -1244,10 +1100,7 @@ static inline int cand_row_ok(const RadArgs* a, const RadTensor* ci, const RadTe
     const long long ci_ld = r3d_rows_pitch(ci, n_cand, &cirows);
     const long long cv_ld = r3d_rows_pitch(cv, n_cand, &cvrows);
     if (ci_ld < 0 || cv_ld < 0) return RAD_E_STRIDE;
-    /* The step's rows are the operand's row count. The band key `M` is the plan's ceiling, never a
-     * source of row count: the plane decides the rows, and `M` is checked only as the upper bound
-     * the plan promised not to exceed. Preferring the key over the plane would refuse a step that
-     * fits the band. */
+    /* The step's rows come from the operand; the band key `M` is only checked as an upper bound. */
     const long long rows = cirows;
     if (rows <= 0 || rows > 0x7fffffffLL) { r3d_trace_desc("ci", ci);
         if (r3d_trace_on())

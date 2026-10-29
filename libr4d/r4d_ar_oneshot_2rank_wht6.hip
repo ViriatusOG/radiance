@@ -11,10 +11,11 @@
 void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                                long seq_ctrs, long loc_pack, long slot_stride_bytes,
                                long scale_off_bytes, long inp, long out, long n_elem, long dtype,
-                               long stream, long nblocks, long nthreads, long drain, long acq) {
+                               long stream, long nblocks, long nthreads, long drain, long acq,
+                               long stage) {
   r4d_ar_wht6_launch(peer_scratch, my_scratch, peer_flags, my_flags, seq_ctrs, loc_pack,
                      slot_stride_bytes, scale_off_bytes, inp, out, n_elem, dtype, stream, nblocks,
-                     nthreads, drain, acq);
+                     nthreads, drain, acq, stage);
 }
 
 // Block cap of both all-reduce kernels (the flag array is sized from it).
@@ -74,7 +75,7 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
     const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n, int hc,
     long irow, long hrow, int n_groups, int n_chunks, long slot_stride_bytes,
     long scale_off_bytes, int drain, int acq, unsigned int nbw, R4dArGather G, int rows_max,
-    long long* gate, unsigned int* gate_ctr) {
+    long long* gate, unsigned int* gate_ctr, long stage) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   const int lane = tid & (WAVE - 1), wid = tid / WAVE, nwarp = nt / WAVE;
   const int lig = lane & (LPG - 1), gw = lane / LPG;
@@ -83,8 +84,9 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
   const unsigned int s = s_seq;
-  const Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
-                               slot_stride_bytes, scale_off_bytes);
+  Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
+                         slot_stride_bytes, scale_off_bytes);
+  const long md = r4d_archk_md(stage, my_scratch);   // the host mailbox's VRAM mirror
 
   const int cpb = (n_chunks + nb - 1) / nb;                 // block b owns chunks [c0,c1)
   const int c0 = b * cpb; int c1 = c0 + cpb; if (c1 > n_chunks) c1 = n_chunks;
@@ -147,8 +149,9 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
   wht6_handshake(peer_flags, my_flags, b, s, tid, drain, acq);
   r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, s, [&](unsigned int& h) {
     for (int c = c0 + wid; c < c1; c += nwarp)
-      wht6_rehash_chunk<CG>(h, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc);
+      wht6_rehash_chunk<CG>(h, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc, md);
   });
+  w.moved(md);
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   for (int c = c0 + wid; c < c1; c += nwarp)
@@ -161,7 +164,7 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
                          long irow, long hrow, long ye, long ew, long sorted, long sh, long sg,
                          long ye_ld, long ew_ld, long sh_ld, long sg_ld, long top_k, long sig,
                          long stream_i, long nblocks, long nthreads, long drain, long acq,
-                         long gate, long gate_ctr) {
+                         long gate, long gate_ctr, long stage) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if ((M * n) % GROUP) return -1;
@@ -207,7 +210,7 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, \
     (unsigned short*)h, (int)n, (int)hc, irow, hrow, n_groups, n_chunks, slot_stride_bytes, \
     scale_off_bytes, (int)drain, (int)acq, (unsigned)R4D_AR_MAX_BLOCKS, G, rows_max, \
-    (long long*)gate, (unsigned int*)gate_ctr)
+    (long long*)gate, (unsigned int*)gate_ctr, stage)
   if (gather) LF(true, kWht6FusedCG);
   else LF(false, kWht6FusedCG);
 #undef LF

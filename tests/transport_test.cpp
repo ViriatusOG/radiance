@@ -261,7 +261,9 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     REQUIRE(s.srv->port() > 0);
     s.sched.hang = false;
     s.sched.reply = "ok";
-    auto ask = [&](const std::string& req) { return ::ask(s, req); };
+    auto ask = [&](const std::string& req, bool head_only = false) {
+        return ::ask(s, req, head_only);
+    };
     for (const char* h : { "", "Authorization: Bearer wrong\r\n", "X-Api-Key: wrong\r\n",
                            "Authorization: k\r\n", "Authorization: Basic k\r\n" }) {
         const Reply r = ask(get("/v1/models", h));
@@ -279,6 +281,16 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     }
     for (const char* p : { "/health", "/v1/health", "/ping", "/", "/dashboard" })
         CHECK_EQ(ask(get(p)).status, 200);
+    /* The page says what bounds it: a CSP that lets its own script talk only to this origin and
+     * keeps it out of a frame, and a type no browser may second-guess — the last on every
+     * response, refusals included. */
+    const Reply page = ask(get("/"));
+    CHECK(has(page.header("Content-Security-Policy"), "frame-ancestors 'none'"));
+    CHECK(has(page.header("Content-Security-Policy"), "connect-src 'self'"));
+    CHECK_EQ(page.header("X-Frame-Options"), std::string("DENY"));
+    CHECK_EQ(page.header("X-Content-Type-Options"), std::string("nosniff"));
+    CHECK_EQ(ask(get("/stats", "Authorization: Bearer k\r\n")).header("X-Content-Type-Options"),
+             std::string("nosniff"));
     CHECK_EQ(ask(get("/metrics")).status, 401);
     CHECK_EQ(ask(get("/stats")).status, 401);
     CHECK_EQ(ask(post("/tokenize", R"({"prompt":"a"})")).status, 401);
@@ -298,6 +310,19 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     const Reply big = ask("POST /v1/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
                           "Content-Length: 100000000\r\n\r\n");
     CHECK_EQ(big.status, 401);
+    /* The exemption is a closed set of decoded paths and methods. Paths that only reach a
+     * guarded route after the router's own matching (empty segments collapse there, dot segments
+     * resolve nowhere) pay the key; and so does any method on an exempt path that no route
+     * answers, so the exemption can never ride a future mutating route. */
+    for (const char* p : { "//stats", "/%2Fstats", "/dashboard/../sessions", "/stats/", "/Stats",
+                           "/stats;x", "/health//", "//health", "/HEALTH" })
+        CHECK_EQ(ask(get(p)).status, 401);
+    CHECK_EQ(ask("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n").status, 401);
+    CHECK_EQ(ask("DELETE /health HTTP/1.1\r\nHost: t\r\n\r\n").status, 401);
+    /* POST /ping is the health-check convention and stays exempt, as every read on an exempt
+     * path does. */
+    CHECK_EQ(ask("POST /ping HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n").status, 200);
+    CHECK_EQ(ask("HEAD / HTTP/1.1\r\nHost: t\r\n\r\n", /*head_only=*/true).status, 200);
 }
 
 /* A refusal the transport writes itself on an Anthropic path (the key gate's 401, a body over

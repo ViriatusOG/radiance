@@ -1,14 +1,12 @@
 /* r3d_args.h -- how a libr3d entry point reads its arguments.
  *
- * There is no adapter layer. An entry point takes `(const RadArgs*, RadStream)` and returns a
- * status, the same RadLaunchFn contract every other plugin implements; an out-of-tree author can
- * write the same kernel without an adapter they could not reach.
+ * An entry point takes `(const RadArgs*, RadStream)` and returns a status, the RadLaunchFn
+ * contract every plugin implements; there is no adapter layer. This header holds the shared
+ * helpers for reading parameters, finding operands and testing contiguity, mostly one line over
+ * rad_abi.h.
  *
- * This header holds the shared helpers: reading a parameter, finding an operand, testing
- * contiguity. Most are one line over rad_abi.h.
- *
- * Nothing here includes r3d.h or HIP: host translation units (the row table, the shape hooks)
- * include it too, so those tables compile and can be checked without ROCm.
+ * Nothing here includes r3d.h or HIP, so host translation units (the row table, the shape hooks)
+ * can include it and compile without ROCm.
  */
 #ifndef R3D_ARGS_H
 #define R3D_ARGS_H
@@ -23,8 +21,7 @@
 
 /* ================================================================== parameter access
  *
- * Forwards to rad_abi.h's static inline helpers, the ones a third-party plugin gets, keeping
- * libr3d's spelling at its call sites. */
+ * Forwards to rad_abi.h's static inline helpers under libr3d's names. */
 static inline int r3d_geti(const RadArgs* a, const char* k, long long* out) {
     return rad_args_geti(a, k, out);
 }
@@ -37,10 +34,10 @@ static inline const char* r3d_gets(const RadArgs* a, const char* k) {
     return rad_args_gets(a, k);
 }
 
-/* A float parameter is RAD_P_F64 (rad_types.h, docs/OPS.md "The four rules"), so `dval` arrives
- * and the step path runs no strtod. Deliberately laxer than rad_args_getf_or: string and integer
- * spellings are still read, because a tool or selftest may call a launch directly with no declare
- * to enforce the type. */
+/* A float parameter is RAD_P_F64 (rad_types.h, docs/OPS.md "The four rules"), so the step path
+ * reads `dval` without strtod. Deliberately laxer than rad_args_getf_or: string and integer forms
+ * are accepted because a tool or selftest may call a launch directly, with no declare to enforce
+ * the type. */
 static inline double r3d_getf(const RadArgs* a, const char* k, double dflt) {
     if (!a || !k) return dflt;
     for (int i = 0; i < a->n_p; ++i) {
@@ -57,10 +54,9 @@ static inline double r3d_getf(const RadArgs* a, const char* k, double dflt) {
     return dflt;
 }
 
-/* An enumerated parameter: `act` is "silu" or "sigmoid", not 0 or 1, so a --debug-graph dump says
- * what runs; the mapping to libr3d's integer lives in the shim. Returns -1 for an unknown name,
- * which every caller turns into RAD_E_INVAL. `alt` is libr3d's own integer spelling of the same
- * key, consulted only when the name is absent. */
+/* An enumerated parameter: `act` is "silu" or "sigmoid" rather than 0 or 1, so a --debug-graph dump
+ * names what runs. Returns -1 for an unknown name, which callers turn into RAD_E_INVAL. `alt` is an
+ * integer-valued key for the same choice, read only when the named key is absent. */
 static inline int r3d_act_code(const RadArgs* a, const char* key, const char* alt, int dflt) {
     if (const char* s = r3d_gets(a, key)) {
         if (!std::strcmp(s, "silu") || !std::strcmp(s, "swish")) return 0;
@@ -84,25 +80,20 @@ static inline const char* r3d_pgets(const RadParam* p, int n_p, const char* k) {
 
 /* ================================================================== operand access
  *
- * An absent optional operand is a null RadTensor.data (rad_abi.h). r3d_opt() returns null both
- * past the end and for a present-but-null operand, so an optional test is one pointer test. For a
- * required operand the caller turns null into RAD_E_INVAL: it is a bug in the issue, not a shape
- * the kernel declines.
+ * An absent optional operand has a null RadTensor.data (rad_abi.h). For a required operand the
+ * caller turns null into RAD_E_INVAL: it is an issue bug, not a shape the kernel declines.
  */
 static inline const RadTensor* r3d_opt(const RadArgs* a, int i) { return rad_arg_in(a, i); }
 
-/* An optional operand the plan carries a slot for, with no bytes behind it, is ABSENT -- it is not a
- * dtype problem. The engine hands the slots of an op's optional operands as descriptors with a null
- * `data` when the graph did not bind one, and a shim that dtype-checks such a descriptor would refuse
- * a band the op never reads -- `rmsnorm_quant_fp8` answering E_DTYPE to a band whose dtype is fine,
- * for an empty `out_bf16` slot. Every test of an optional operand goes through here; a bare `if (t)`
- * is the bug. */
+/* Whether an optional operand is present. The engine passes an unbound optional operand as a
+ * descriptor with null `data`, so a bare `if (t)` is wrong: a shim that dtype-checks such a
+ * descriptor refuses a call that never reads it (e.g. an empty `out_bf16` slot of
+ * `rmsnorm_quant_fp8`). Every test of an optional operand goes through here. */
 static inline bool r3d_has(const RadTensor* t) { return t && t->data; }
 
 static inline const void* r3d_p(const RadTensor* t) { return t ? t->data : nullptr; }
 
-/* The same for an operand a kernel writes, so an output cast reads as one rather than as a pointer
- * laundered through `long`. */
+/* The same for an operand a kernel writes. */
 static inline void* r3d_wp(const RadTensor* t) { return t ? t->data : nullptr; }
 static inline long r3d_addr(const RadTensor* t) { return t ? (long)(uintptr_t)t->data : 0L; }
 
@@ -118,8 +109,8 @@ static inline long long r3d_stride(const RadTensor* t, int i) {
 
 static inline long long r3d_numel(const RadTensor* t) { return rad_tensor_numel(t); }
 
-/* [rows..., K] flattened to (M, K). Every per-row kernel in libr3d owns whole rows (one workgroup
- * per row), so the leading axes are only a row count. The GEMM makes the same fold explicitly. */
+/* [rows..., K] flattened to (M, K). Every per-row kernel owns whole rows (one workgroup per row),
+ * so the leading axes are only a row count. */
 static inline int r3d_rows_of(const RadTensor* t, long long* M, long long* K) {
     if (!t || t->rank < 1) return RAD_E_SHAPE;
     *K = t->shape[t->rank - 1];
@@ -128,10 +119,9 @@ static inline int r3d_rows_of(const RadTensor* t, long long* M, long long* K) {
     return (*M >= 1 && *K >= 1) ? RAD_OK : RAD_E_SHAPE;
 }
 
-/* Dense row-major over the whole tensor. libr3d's entry points take at most one pitch, so
- * everything else must be tight, and the shim checks it. This is the "necessary condition only"
- * boundary of spec §2.1: the constraint table settles geometry, contiguity is a property of the
- * call. */
+/* Dense row-major over the whole tensor. Entry points take at most one pitch, so everything else
+ * must be tight, and the shim checks it: per spec §2.1 the constraint table settles geometry while
+ * contiguity is a property of the call. */
 static inline int r3d_contig(const RadTensor* t) { return rad_tensor_is_contiguous(t); }
 
 /* Contiguous in every axis but the leading one, whose stride is the row pitch libr3d takes as an
@@ -150,10 +140,10 @@ static inline long long r3d_row_pitch(const RadTensor* t) {
 /* [rows..., n] read as (rows, n): the leading axes are a row count and only the last is
  * structural. Returns the pitch in elements, or -1.
  *
- * A column slice must refuse. k out of a fused [tok, 2*kv_dim] projection, read as
+ * A column slice is refused. k out of a fused [tok, 2*kv_dim] projection, read as
  * [tok*n_head_kv, head_dim] for a per-head norm, has rows `n` apart within a token and a buffer row
- * apart between tokens; no single pitch describes that, and the leading stride would make the
- * consumer read most heads from garbage. So the trailing axes must cover the whole row. */
+ * apart between tokens; no single pitch describes that, and using the leading stride would read
+ * most heads from the wrong place. So the trailing axes must cover the whole row. */
 static inline long long r3d_rows_pitch(const RadTensor* t, long long n, long long* rows) {
     if (!t || t->rank < 1 || n <= 0) return -1;
     const long long nel = rad_tensor_numel(t);
@@ -191,10 +181,10 @@ static inline int r3d_aligned(const void* p, unsigned bytes) {
 
 /* ================================================================== which check refused
  *
- * A shim refuses in many places with the same few codes, so the engine's report names the kernel
- * and geometry but not the failing condition. R3D_NO() wraps a refusal and prints its own line when
- * RAD_R3D_TRACE is set; otherwise it is the bare return plus one cached-flag load on a path that is
- * failing anyway. */
+ * A shim refuses in many places with the same few codes, and the engine's report names the kernel
+ * and geometry but not the failing condition. R3D_NO() wraps a refusal and, when RAD_R3D_TRACE is
+ * set to a value other than "0", prints "[r3d] file:line refused -> code" to stderr. The variable
+ * is read once and cached; unset, the cost is one flag load on a refusal path. */
 static inline int r3d_trace_on(void) {
     static int on = -1;
     if (on < 0) { const char* e = std::getenv("RAD_R3D_TRACE"); on = (e && *e && *e != '0'); }
@@ -206,9 +196,10 @@ static inline int r3d_refused(int code, const char* file, int line) {
 }
 #define R3D_NO(code) r3d_refused((code), __FILE__, __LINE__)
 
-/* The descriptor we were handed, printed when we decline one. A stride refusal that names no stride
- * is a refusal the reader has to reproduce, and reproducing it costs a probe cycle: the engine binds
- * rank, shape and strides in ELEMENTS, and the shape it binds is the step's, not the band's. */
+/* Under RAD_R3D_TRACE, prints a refused descriptor's dtype, rank, shape, strides and data pointer.
+ * The engine binds shape and strides in elements, and the shape is the step's, not the band's.
+ * R3D_STR refuses with RAD_E_STRIDE and, under the same flag, prints the reason and two named
+ * values. */
 static inline void r3d_trace_desc(const char* what, const RadTensor* t) {
     if (!r3d_trace_on()) return;
     if (!t) { std::fprintf(stderr, "[r3d] %s: (absent)\n", what); return; }
@@ -229,8 +220,8 @@ static inline void r3d_trace_desc(const char* what, const RadTensor* t) {
 
 /* ================================================================== dtype helpers
  *
- * A row's `dtype` constraint is a necessary condition on the geometry, not a promise about the
- * tensors: the shim reads the dtype off the operand, and these are the tests it reads it with. */
+ * A row's `dtype` constraint is a necessary condition, not a promise about the tensors, so the
+ * shim tests each operand's dtype with these. */
 static inline int r3d_is_bf16(const RadTensor* t) { return t && t->dtype == RAD_BF16; }
 static inline int r3d_is_f16(const RadTensor* t) { return t && t->dtype == RAD_F16; }
 static inline int r3d_is_f32(const RadTensor* t) { return t && t->dtype == RAD_F32; }
@@ -258,12 +249,12 @@ static inline int r3d_dt_named(uint32_t dt, const char* name) {
 
 /* ================================================================== libr3d's constants
  *
- * Restated here because r3d_rows.cpp and r3d_shapes.cpp are host code built without ROCm and cannot
+ * Defined here because r3d_rows.cpp and r3d_shapes.cpp are host code built without ROCm and cannot
  * include r3d.h, and because a .rad container records them in its layout tag. */
 enum {
     R3D_WAVE = 32,
-    /* The activation quantiser's group: the width a scale covers along n. 128 is the WEIGHT
-     * scale's block width and therefore a property of the checkpoint, not a knob. */
+    /* The activation quantiser's group: the width a scale covers along n. It equals the weight
+     * scale's block width, a property of the checkpoint, not a knob. */
     R3D_ACT_GROUP = 128,
     /* Block-scaled fp8, on both axes: the checkpoint's `quantization_config.weight_block_size`,
      * which the bytes on disk follow. The entry points reject a mismatch. */
@@ -272,23 +263,20 @@ enum {
     R3D_W8_GROUP = 128,
     /* The largest N a dot2 GEMM's per-lane accumulator grid spans in one wave. */
     R3D_NTILE = 16,
-    /* The operand count of `gemm_nt_q` (a, a_scale, b, b_scale, y, a_sum, b_ref). The shape hook
-     * builds the whole list at once and needs a name for its length; the schema in r3d_rows.cpp is
-     * the authority, and rad-kbench checks the two against each other. */
+    /* The operand count of `gemm_nt_q` (a, a_scale, b, b_scale, y, a_sum, b_ref), used by the shape
+     * hook. The schema in r3d_rows.cpp is authoritative; rad-kbench checks the two agree. */
     R3D_GEMM_Q_NOPERAND = 7
 };
 
 /* ================================================================== libr3d's tunables
  *
- * The knobs the row table declares, exposed so `rad-tune` can walk them and `--debug-graph` can
- * name the pick (spec §15). The chosen point comes back appended to RadArgs::p, so a launch reads
- * it with r3d_geti_or like any other parameter; these structs are how a launch reads several at
- * once, with the row's defaults where a caller supplied none.
+ * The knobs the row table declares, so `rad-tune` can search them and `--debug-graph` can name the
+ * choice (spec §15). The chosen point is appended to RadArgs::p; these structs read several knobs
+ * at once, with the row's defaults where a caller supplied none.
  *
- * sk == 0 means "choose the largest legal split count at issue". Split-K requires
- * K % (sk * group) == 0, so no fixed default is legal at every shape, and an illegal default would
- * make an untuned install fail rather than run slowly. The sentinel is resolved in one place, in
- * the GEMM unit.
+ * sk == 0 means "the largest legal split count at issue". Split-K requires K % (sk * group) == 0,
+ * so no fixed default is legal at every shape, and an illegal default would make an untuned install
+ * fail. The GEMM unit resolves the sentinel.
  */
 struct R3dGemmCfg { int wv, sk, kb, nt; };   /* waves a block, split-K, K slab, non-temporal loads */
 struct R3dSplitCfg { int splits; };          /* split-KV segments; 0 is the kernel's own law */
@@ -297,10 +285,10 @@ struct R3dTopkCfg { int rc, nch; };          /* candidates a chunk keeps, chunk 
 extern "C" {
 /* -- the tuned configuration (r3d_rows.cpp) --
  *
- * The core picked a point in the space the row declared and appended it to RadArgs::p. These read
- * it back, falling to the axis's default (defined once, in the RadTunable table) when a caller
- * supplied none, so a checker with no tuned key runs what an untuned install runs. They cannot
- * fail: the loader refuses a plugin whose default is not one of the axis's values. */
+ * Read the point the core appended to RadArgs::p, falling back to each axis's default (defined in
+ * the RadTunable table) when none was supplied, so a caller without a tuned key runs what an
+ * untuned install runs. They cannot fail: the loader refuses a plugin whose default is not one of
+ * the axis's values. */
 void r3d_cfg_gemm (const RadArgs*, struct R3dGemmCfg*);
 void r3d_cfg_split(const RadArgs*, struct R3dSplitCfg*);
 void r3d_cfg_topk (const RadArgs*, struct R3dTopkCfg*);

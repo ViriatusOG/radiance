@@ -1344,6 +1344,18 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("attn_paged", operand, out);
 }
 
+/* attn_paged's operands and its tree's parents, each row an ordinary causal one (-2): a drawn
+ * plane would name parents that are not a tree. */
+int ref_attn_paged_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 8) return ref_attn_paged_shape(p, n_p, operand, out);
+    const int64_t M = gi(p, n_p, "q_len", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    for (int i = 0; i < 8; ++i) o.skip();
+    o.t_idx({ M }, 0, -2, 0);                        /* spec_parent */
+    return o.finish("attn_paged_tree", operand, out);
+}
+
 int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -2114,6 +2126,30 @@ int ref_dflash_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_BF16, { nv, R });                      /* succ */
     o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);  /* tokens */
     return o.finish("dflash_select", operand, out);
+}
+
+/* dflash_select's operands, then `nodes` tokens and parents a sequence. */
+int ref_dflash_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M     = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t K     = gi(p, n_p, "top_k", 0);
+    const int64_t R     = gi(p, n_p, "rank", 0);
+    const int64_t nv    = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr  = gi(p, n_p, "anchor_stride", 1);
+    const int64_t N     = gi(p, n_p, "nodes", steps);
+    if (M <= 0 || steps <= 0 || K <= 0 || R <= 0 || nv <= 0 || astr <= 0 || N <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    Opd o;
+    o.t_idx_dt((uint32_t)RAD_I32, { rows, K }, nv, -1, 0);   /* cand */
+    o.t((uint32_t)RAD_F32, { rows, K });                     /* unary */
+    o.t((uint32_t)RAD_BF16, { rows, R });                    /* hp */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);  /* anchor */
+    o.t((uint32_t)RAD_BF16, { nv, R });                      /* pred */
+    o.t((uint32_t)RAD_BF16, { nv, R });                      /* succ */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, N }, nv, -1, 0);      /* tokens */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, N }, N + 1, -1, 0);   /* parents */
+    return o.finish("dflash_tree", operand, out);
 }
 
 /* ================================================================== gated delta net

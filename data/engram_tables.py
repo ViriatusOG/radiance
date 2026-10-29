@@ -15,8 +15,8 @@ rest U64 in the GGUF, which the core reads as I64):
   engram.head_vocab_sizes   I64 [n_engram_layers * (max_ngram - 1) * n_heads]
   engram.head_offsets       I64 [same]   (absolute row offsets into the joined table)
 
-The deepseek41 plugin reads them under these names when the checkpoint is the release
-(arch/deepseek41 ckpt_name). Reads config.json and tokenizer.json only (small).
+The deepseek41 architecture plugin, which this tree does not include, reads them under these names
+when the checkpoint is the release. Reads config.json and tokenizer.json only (small).
 
 usage: python3 data/engram_tables.py RELEASE_DIR OUT.safetensors
 """

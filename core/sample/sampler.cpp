@@ -3,6 +3,7 @@
  */
 #include "sampler.h"
 #include "gbnf.h"
+#include "../sched/draft.h"   /* RAD_SCHED_MAX_SPEC */
 
 #include <algorithm>
 #include <chrono>
@@ -618,8 +619,8 @@ int Sampler::accept_token(uint64_t req_id, int32_t token) {
 }
 
 /* A constraining grammar does not rule out speculation: build_step masks draft position i
- * against the state after drafts 0..i-1 and then rewinds. Only a backend that cannot rewind is
- * refused. */
+ * against the state after drafts 0..i-1 (on a tree, after row i's ancestors) and then rewinds.
+ * Only a backend that cannot rewind is refused. */
 bool Sampler::allows_speculation(uint64_t req_id) const {
     auto it = seqs_.find(req_id);
     if (it == seqs_.end() || !it->second.grammar) return true;
@@ -729,7 +730,13 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
          * `dead` is not a failure: a draft the grammar forbids will be rejected at verification
          * and every later position discarded, so masking stops for the rest of the window. */
         GrammarBackend* gr = st && st->grammar ? st->grammar.get() : nullptr;
-        const bool walk = gr && n_pos > 1;
+        /* A tree (rad_drafter_tree) is walked per row instead: row k's prefix is its ancestors,
+         * not drafts 0..k-1, so each row pushes the committed state, advances over its own path,
+         * is masked, and rolls back. A refused ancestor kills that row only: verification never
+         * reaches it, while a sibling's path may still be admissible. */
+        const int32_t* tpar = r->draft_parent;
+        const bool walk = gr && n_pos > 1 && !tpar;
+        const bool walk_tree = gr && n_pos > 1 && tpar;
         if (walk) gr->push_state();
         bool dead = false;
 
@@ -746,10 +753,38 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 st->think.push(sp.reasoning, r->output[st->think_seen]);
             think = st->think;
         }
+        const ReasoningCount think0 = think;
 
         for (int k = 0; k < n_pos; ++k) {
+            /* Row k's drafts before it: 0..k-1 on a chain, its ancestors (root first) on a tree. */
+            int32_t anc[RAD_SCHED_MAX_SPEC];
+            int32_t dk = 0;
+            if (tpar) {
+                int32_t chain[RAD_SCHED_MAX_SPEC];
+                for (int32_t j = k; j > 0 && dk < RAD_SCHED_MAX_SPEC;) {
+                    chain[dk++] = j;
+                    int32_t pj = tpar[j - 1];
+                    j = (pj < 0 || pj >= j) ? j - 1 : pj;
+                }
+                for (int32_t t = 0; t < dk; ++t) anc[t] = r->draft[chain[dk - 1 - t] - 1];
+            } else {
+                for (; dk < k; ++dk) anc[dk] = r->draft[dk];
+            }
             if (walk && k > 0 && !dead && gr->accept_token(r->draft[k - 1]) < 0) dead = true;
-            if (budget && k > 0) think.push(sp.reasoning, r->draft[k - 1]);
+            bool row_dead = false;   /* a tree row whose path the grammar refuses */
+            bool pushed   = false;
+            if (walk_tree && dk > 0) {
+                RAD_TRY(gr->push_state());
+                pushed = true;
+                for (int32_t t = 0; t < dk && !row_dead; ++t)
+                    row_dead = gr->accept_token(anc[t]) < 0;
+            }
+            if (budget && tpar) {
+                think = think0;
+                for (int32_t t = 0; t < dk; ++t) think.push(sp.reasoning, anc[t]);
+            } else if (budget && k > 0) {
+                think.push(sp.reasoning, r->draft[k - 1]);
+            }
             const int64_t row = n_seq_++;
             /* Row k verifies draft k against the state its round left. A row with no bound state
              * (the bonus row, a greedy row, an uncoupled step) gets a zeroed one, and the verify
@@ -781,8 +816,9 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
 
             p.seed = sp.seed;
             /* Output position: draft position k is token n_out + k, so its draw is the same with
-             * or without speculation. */
-            p.pos = (uint64_t)(n_out + k);
+             * or without speculation. On a tree it is the row's depth: siblings share a prefix
+             * length, hence a coordinate, hence the target's draw there. */
+            p.pos = (uint64_t)(n_out + dk);
 
             p.temp        = sp.temp;
             p.top_p       = sp.top_p;
@@ -857,14 +893,14 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
              * this span, so the reference's update order holds at a verify: position k sees the
              * drafts before it, as the processor would after emitting them. */
             if (pen || dry || ngram) {
-                const int64_t len  = n_total + k;
+                const int64_t len  = n_total + dk;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
                 for (int64_t i = 0; i < take; ++i) {
                     const int64_t src = len - take + i;
                     h[i] = src < n_prompt ? r->prompt[(size_t)src]
                          : src < n_total  ? r->output[(size_t)(src - n_prompt)]
-                                          : r->draft[src - n_total];
+                                          : anc[src - n_total];
                 }
                 p.hist_len = (int32_t)take;
                 if (pen) p.flags |= RAD_SP_PENALTY;
@@ -874,7 +910,7 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 if (ngram && take >= sp.ngram_ban_n) any_ngram_ = true;
             }
 
-            if (gr && !dead && gr->constrains()) {
+            if (gr && !dead && !row_dead && gr->constrains()) {
                 uint32_t* dst = mask_stage_ + row * mask_words_;
                 int s;
                 /* Mask cost, reported at Debug per 256 masks (mean and worst). It runs on the
@@ -914,8 +950,9 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 }
                 if (s < 0 && k > 0) {
                     /* At a draft position this only means a draft is wrong; verification
-                     * rejects at or before here, so stop masking the rest of the window. */
-                    dead = true;
+                     * rejects at or before here, so stop masking the rest of the window. On a
+                     * tree only this row's path is wrong; its siblings are masked on. */
+                    if (!tpar) dead = true;
                 } else if (s < 0) {
                     /* A dead grammar fails its request, not the step: an error status would stop
                      * the step loop for every client. The row stays unmasked and the engine
@@ -939,6 +976,7 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                     }
                 }
             }
+            if (pushed) RAD_TRY(gr->rollback());   /* back to the committed state for the next row */
 
             if (budget && think.inside() && think.body >= sp.thinking_budget)
                 force_close(p, row, sp.reasoning.close);

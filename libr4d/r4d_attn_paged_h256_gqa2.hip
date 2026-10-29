@@ -45,6 +45,13 @@ extern "C" int r4d_attn_decode_h256_gqa2_qld_fp8kv(const R4DArgs* a, hipStream_t
 extern "C" int r4d_attn_decode_h256_gqa2_qld_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD, 1>(a, s);
 }
+// ...and a tree verify's mask (O_TREE, attn_paged_qrow_tree), again its own instances.
+extern "C" int r4d_attn_decode_h256_gqa2_qld_tree_fp8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_TREE, 0>(a, s);
+}
+extern "C" int r4d_attn_decode_h256_gqa2_qld_tree_bf16kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_TREE, 1>(a, s);
+}
 
 // ---- prefill ---------------------------------------------------------------------------------
 // The h256/gqa6 prefill option set but at K prefetch 4 (P_OPT there is 3954187); O_KWIDE is valid

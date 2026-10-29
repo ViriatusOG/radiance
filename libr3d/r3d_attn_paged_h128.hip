@@ -1,10 +1,10 @@
-/* r3d_attn_paged_h128.hip -- paged attention at head_dim 128, the two bands MiniCPM5-2B declares.
+/* r3d_attn_paged_h128.hip -- paged attention at head_dim 128, decode and prefill bands.
  *
  *     out[tok, h, :] = softmax_j( scale * q[tok, h, :] . K[j, h/gqa, :] ) . V[j, h/gqa, :]
  *
- * over a paged cache, in libref's order. The order is the point of the file: a
- * tolerance on an attention output is not where a summation-order difference hides, so this kernel
- * keeps the chain the reference writes, and says out loud where it cannot.
+ * over a paged cache, in libref's order. A tolerance on an attention output can hide a
+ * summation-order difference, so the kernel keeps the reference's chain and states where it
+ * departs from it.
  *
  * ============================== the layout ==============================
  *
@@ -12,32 +12,28 @@
  *
  * A slot's K is 128 elements and V the 128 after it, so a key's row is a 512-byte pair and both
  * halves are 16-byte aligned at every slot. `block_table[seq, j / block_size]` names the block
- * holding key j; the fixture *draws* its entries over [0, max_blocks), so ids repeat and one block
- * serves several keys. A negative entry is an unmapped block and hides its key -- the engine's
- * allocator frees a sequence by writing -1 into rows it is done with, so the kernel keeps the test
- * even though the fixture never sets it. `seqused[seq]` is the sequence's TOTAL key count, this
- * step's query rows included, so query row i of a len_s-row step sits at absolute position
- * `seqused[s] - len_s + i`. One kernel serves decode (q_len 1), a speculative verify (q_len 7) and a
- * prefill chunk (q_len 2048).
+ * holding key j; ids may repeat, so one block can serve several keys. A negative entry is an
+ * unmapped block and hides its keys (the engine's allocator frees a sequence by writing -1 into
+ * its rows). `seqused[seq]` is the sequence's total key count, this step's query rows included, so
+ * query row i of a len_s-row step sits at absolute position `seqused[s] - len_s + i`. One kernel
+ * serves decode (q_len 1), a speculative verify (q_len 7) and a prefill chunk (q_len 2048).
  *
  * ============================== the ragged batch ==============================
  *
- * A step's sequences do not have to contribute the same number of query rows. `cu_seqlens`, when
- * the caller has it, is [n_seq + 1] of i32 with cu[0] == 0 and cu[n_seq] == the query plane's row
- * count, and sequence s owns the rows [cu[s], cu[s+1]) -- `len_s = cu[s+1] - cu[s]` rows, whose
- * positions run from `seqused[s] - len_s`. That is libref's reading and not a local invention:
- * its shape hook (`cu[n_seq] == rows`, `q_len = cus ? 0 : rows / n_seq`) and its walk, where
- * the row's sequence, its length and its index within the sequence come from the descriptor and the
- * position from the sequence's own length. So `q_len` is a PER-SEQUENCE number in the reference and
- * in this file; the total row count is the plane's, and a ragged batch has no q_len at all.
+ * Sequences may contribute different numbers of query rows. `cu_seqlens`, when present, is
+ * [n_seq + 1] i32 with cu[0] == 0 and cu[n_seq] == the query plane's row count; sequence s owns
+ * rows [cu[s], cu[s+1]), `len_s = cu[s+1] - cu[s]` of them, at positions from `seqused[s] - len_s`.
+ * This is libref's reading (its shape hook: `cu[n_seq] == rows`, `q_len = cus ? 0 : rows / n_seq`;
+ * its walk takes each row's sequence, length and index from the descriptor). So `q_len` is a
+ * per-sequence number; the total row count is the plane's, and a ragged batch has no q_len.
  *
- * One grid covers a ragged batch because the clamp the width section documents is per sequence: a
- * tile is `ceil(len_s / rows_per_tile)` tiles for sequence s, and the slots of its last tile past
- * `len_s` compute a duplicate that stores nothing. The rows are laid out by `map_seq`, which walks
- * the descriptor once a workgroup -- a rectangular batch is the same walk with len_s = q_len and
- * cu[s] = s * q_len, so there is one mapping, one mask, one walk and one store for both forms.
- * The causal mask, the window, the block-table walk and the descales all key off the sequence the
- * row belongs to, exactly as the reference's `s = seq_of(cus, n_seq, tok)` keys them.
+ * One grid covers a ragged batch because the clamp described under "the width of a workgroup" is
+ * per sequence: sequence s gets `ceil(len_s / rows_per_tile)` tiles, and its last tile's slots past
+ * `len_s` compute a duplicate that stores nothing. `map_seq` lays out the rows by walking the
+ * descriptor once per workgroup; a rectangular batch is the same walk with len_s = q_len and
+ * cu[s] = s * q_len, so both forms share one mapping, mask, walk and store. The causal mask, the
+ * window, the block-table walk and the descales all key off the row's sequence, as the reference's
+ * `s = seq_of(cus, n_seq, tok)` does.
  *
  * ============================== the mask ==============================
  *
@@ -46,192 +42,154 @@
  *   window > 0   causal: additionally pos - j < window; non-causal: |pos - j| < window, the
  *                two-sided reading libref's prose and libr4d's window kernel both state.
  *
- * A masked key is skipped, never scored to -inf: the denominator gets exactly the terms the
- * reference has, and a row with no visible key stores zeros, which is libref's `mx == -INFINITY`
- * case and every other kernel in the project.
+ * A masked key is skipped, never scored to -inf, so the denominator has exactly the reference's
+ * terms; a row with no visible key stores zeros (libref's `mx == -INFINITY` case).
  *
  * ============================== the tile ==============================
  *
  * An output row is (query row, query head): 128 dims, one f32 chain per dim. A lane owns one output
- * row, exactly as the skinny GEMM rows do, and for the same reason -- a lane's chain over keys is
- * the reference's chain, and no cross-lane reduction touches the denominator. A wave32 is 32 output
- * rows, and they must be 32 rows that read the same KV, which fixes the mapping:
+ * row, as in the skinny GEMM rows: the lane's chain over keys is the reference's, and no cross-lane
+ * reduction touches the denominator. A wave's 32 output rows must read the same KV, which fixes the
+ * mapping:
  *
  *     kh = blockIdx.y      h = kh * GQA + (lane & (GQA-1))      tok = base + (lane >> lg GQA)
  *
- * so a wave is the GQA query heads of one KV head over 32/GQA query rows -- 8 heads x 4 rows at
- * gqa = 8. Every lane of a wave then reads the same cache row at the same moment, which makes every
- * cache read in this file an LDS broadcast (one `ds_read_b128` serves the wave) and makes the paged
- * walk a per-wave event rather than a per-lane one. A workgroup is WAVES waves = WAVES x 32 threads
- * = WAVES x (32/GQA) query rows of one sequence, one KV head: 16 rows at gqa 8 with four waves.
- * WAVES is a template parameter and the launcher picks it -- see "the width of a workgroup" below.
+ * A wave is the GQA query heads of one KV head over 32/GQA query rows (8 heads x 4 rows at gqa 8).
+ * Every lane of a wave reads the same cache row at the same moment, so every cache read is an LDS
+ * broadcast (one `ds_read_b128` serves the wave) and the paged walk is per wave, not per lane. A
+ * workgroup is WAVES waves = WAVES x (32/GQA) query rows of one sequence and one KV head: 16 rows
+ * at gqa 8 with four waves. WAVES is a template parameter chosen by the launcher (see below).
  *
- * Rows per cache read is 32. It is also the ceiling the register file sets: a lane carrying a second
- * output row needs 2 x 64 VGPRs of widened query and 2 x 128 of f32 accumulator, 384, over the 256
- * that four waves a SIMD allows. So the traffic is what gqa and the register file say it is.
+ * 32 rows per cache read is also the register-file ceiling: a second output row per lane needs
+ * 2 x 64 VGPRs of widened query and 2 x 128 of f32 accumulator, 384, over the 256 that four waves a
+ * SIMD allow.
  *
  * ============================== the width of a workgroup ==============================
  *
- * A row slot whose row is past its sequence's length computes a clamped duplicate: the walk, the
- * tile and the store all run for it and the result is dropped. At the decode band's q_len = 7 with
- * gqa = 8 a four-wave workgroup carries 16 row slots for 7 rows -- twice the walk for half the
- * outputs. So the launcher picks the narrowest workgroup that carries the caller's q_len (pick_waves:
- * one wave to 32/GQA rows, two to 64/GQA, four above), and prefill keeps four because its q_len is the
- * whole chunk. At the decode band that is two waves: 512 workgroups of 64 threads, 7 of 8 slots used.
- * A ragged batch has no one q_len to pick on: the launcher picks on the average sequence
- * (`ceil(rows / n_seq)`), which is a performance choice and nothing else -- the tile width moves
- * duplicate rows between tiles, never a result, and no host code reads the descriptor.
+ * A row slot past its sequence's length computes a clamped duplicate: the walk, the tile and the
+ * store run and the result is dropped. At q_len = 7 with gqa = 8 a four-wave workgroup carries 16
+ * slots for 7 rows, twice the walk for half the outputs. So the launcher picks the narrowest
+ * workgroup that carries the caller's q_len (pick_waves: one wave up to 32/GQA rows, two up to
+ * 64/GQA, four above); prefill keeps four because its q_len is the whole chunk. A ragged batch is
+ * picked on the average sequence (`ceil(rows / n_seq)`); the width only moves duplicate rows
+ * between tiles, never a result.
  *
- * Measured on the card: medians of 15 per-launch event times, both widths in one session, so the
- * clock drifts together (both read the prefill band at 44.9):
+ * The tile is the same 8 KiB at every width, so the cache traffic is unchanged and the gain comes
+ * from the duplicated rows. The kernel is issue-starved at the decode bands (about 15% of the
+ * SIMD's VALU slots at 256 sequences, under 4% at eight), and its cost follows how many waves a
+ * workgroup brings to each barrier: at q_len 7, gqa 8, two waves take about half the time of four.
+ * The width is a run-time choice because it is the main lever on this op.
  *
- *     decode 256 x 7 @4096       294.7 ms -> 158.4 ms   -46%
- *     decode 256 x 7 @4096 sp4   268.0 ms -> 128.4 ms   -52%
- *     decode   8 x 7 @2048 sp8     4.33 ->   2.06 ms    -53%
- *     decode   1 x 7 @4096 sp8     4.27 ->   3.97 ms     -7%
- *     prefill 2048 x 2048         44.95 ->  44.78 ms     the path is unchanged
+ * ============================== levers that do not help ==============================
  *
- * The tile is the same 8 KiB at every width, so nothing about the cache traffic changes; the win is
- * the duplicated rows, and the reason it is this large is the one the counters show: the kernel
- * issues 15% of the SIMD's slots at the band (SQ_INSTS_VALU 4.5G against 30G of capacity,
- * SQ_INSTS_LDS 769M) and 3.7% at eight sequences. Halving the arithmetic on a kernel that is
- * stalling is not supposed to buy 46%; it does, and that says the stall is a function of how many
- * waves a workgroup has to bring to a barrier -- two arriving is not twice as cheap as four, it is
- * four times cheaper. The width is a run-time choice because it is the only lever on this op that
- * moves the band.
+ * Each of these changed nothing measurable on the decode and prefill bands:
  *
- * ============================== measured, and not the answer ==============================
+ *   s_setprio 1 around the consume leg of the walk (`s_setprio` takes an immediate, not an SGPR).
  *
- * Four things that look like they should work, each measured to not (medians of 15 per-launch
- * hipEventElapsedTime, A/B in one process), so the next reader does not spend an hour on them:
+ *   R3D_WAVES(2) to lift the scalar-register ceiling: the bf16 variants report sgpr_count 107 and
+ *   about 98 spilled SGPRs at both 4 and 2 waves a SIMD. The compute-shader scalar budget does not
+ *   follow waves/SIMD the way the VGPR budget does.
  *
- *   s_setprio 1 around the consume leg of the walk, 0 after: |delta| <= 0.7% on the bands. The
- *   knob is fine -- `s_setprio` takes an immediate, not an SGPR, so `s_setprio %0` will not link --
- *   but priority does not move this op.
+ *   __noinline__ on the stage leg: spills drop to 72 and a 160-byte private frame appears. Note:
+ *   while the bf16 variants spill SGPRs, a kernel in this TU that also needs a private segment
+ *   fails to launch ("the operation cannot be performed in the present state").
  *
- *   R3D_WAVES(2) to lift the scalar-register ceiling: the bf16 arms report sgpr_count 107 and
- *   sgpr_spill_count ~98 at BOTH 4 and 2 waves a SIMD, and the timings do not move. The
- *   compute-shader scalar budget is not set by waves/SIMD the way the VGPR one is, so this is not
- *   a lever for the spills.
- *
- *   __noinline__ on the stage leg: the spills drop (98 -> 72) and a 160-byte private frame
- *   appears, timings unchanged. The spills are a load-safety matter, not a time matter: while the
- *   bf16 arms spill SGPRs, a kernel in this TU that also needs a private segment fails to launch
- *   with "the operation cannot be performed in the present state".
- *
- *   A two-stage pipeline -- two tiles, the next block's global loads issued before the current
- *   block is consumed, one barrier a block instead of two: a wash on the bands. The walk's
- *   per-block structure is the cost, and the two legs do not overlap at all -- the workgroup's
- *   width is the lever.
+ *   A two-stage pipeline (two tiles, the next block's loads issued before the current one is
+ *   consumed, one barrier a block instead of two): the per-block structure is the cost and the
+ *   legs do not overlap; the workgroup width is the lever.
  *
  * ============================== the walk ==============================
  *
- * block_size = 16, so keys advance 16 at a time and one step stages a block of the KV head: 16 slots
- * x 128 elements, K and V, widened to f16 pairs on the way in, 4 KiB each. The four waves of a
- * workgroup share the stage, so a block of cache is one global read per workgroup per pass, and the
- * walk costs 8 KiB of the 64 KiB of LDS. The second pass re-reads the same blocks; a sequence's
- * cache for one KV head is ctx x 256 B, which at 4096 keys is 1 MiB, so the second pass is an L2
- * hit and the card's DRAM sees each byte once.
+ * block_size = 16, so one step stages a block of the KV head: 16 slots x 128 elements, K and V,
+ * widened to f16 pairs on the way in, 4 KiB each. The waves of a workgroup share the stage, so a
+ * block is one global read per workgroup per pass, and the walk uses 8 KiB of the 64 KiB of LDS.
+ * The second pass re-reads the same blocks; one KV head's cache is ctx x 256 B (1 MiB at 4096
+ * keys), so the second pass hits L2 and DRAM sees each byte once.
  *
- * The mask sits where the geometry puts it: a wave's query rows are consecutive, so at gqa 8 its
- * four positions span 3 and its diagonals lie in one 16-key block, two at a block boundary. Blocks
- * entirely below the wave's minimum position are walked with no mask code at all; the one or two
- * diagonal blocks test `j <= pos` per lane; blocks past the wave's maximum position are not walked.
- * In a 2048-token causal prefill that is one masked block in sixty-four.
+ * A wave's query rows are consecutive, so at gqa 8 its four positions span 3 and its diagonals lie
+ * in one 16-key block, or two at a block boundary. Blocks entirely below the wave's minimum
+ * position need no mask; the one or two diagonal blocks test `j <= pos` per lane; blocks past the
+ * wave's maximum position are not walked. In a 2048-token causal prefill that is one masked block
+ * in sixty-four.
  *
  * ============================== the two passes ==============================
  *
- * The reference is two-pass: pass one every visible key's score and the maximum; pass two, ascending
- * keys, `w = exp(score - max)`, `sum += w`, `acc[d] += w * v[d]`, then `acc * (1/sum)` and one
- * narrowing at the store. Online softmax -- the flash form, rescaling a running accumulator by
- * `exp(m_old - m_new)` -- brackets the denominator and every acc[d] differently, so it is not in
- * this file. Keeping the scores as the reference does costs a workspace of jcap floats a row: 32
- * rows x 4096 keys = 512 KiB a wave against 64 KiB of LDS. So the two passes are two walks, and
- * pass two recomputes the scores it needs -- same order, same operands, bit-identical the second
- * time. QK is paid twice and the op costs half again what keeping the scores would; that is the
- * price of the reference's parentheses.
+ * The reference is two-pass: pass one finds every visible key's score and the maximum; pass two,
+ * ascending keys, computes `w = exp(score - max)`, `sum += w`, `acc[d] += w * v[d]`, then
+ * `acc * (1/sum)` and one narrowing at the store. Online (flash) softmax, rescaling a running
+ * accumulator by `exp(m_old - m_new)`, brackets the denominator and every acc[d] differently, so it
+ * is not used. Keeping the scores would need jcap floats a row (32 rows x 4096 keys = 512 KiB a
+ * wave against 64 KiB of LDS), so pass two recomputes them with the same order and operands,
+ * bit-identical. QK is paid twice, about 1.5x the cost of keeping the scores.
  *
  * QK is 64 `v_dot2acc_f32_f16` a key a lane over widened f16 pairs, ascending d. A dot2 folds a
- * pair's two products into the accumulator in one rounding where the reference rounds per product,
- * so a lane's score chain brackets the reference's: the same one-ulp departure the bf16 GEMM row
- * documents, on a fraction of a percent of outputs, one bf16 store ulp each.
+ * pair's two products into the accumulator with one rounding where the reference rounds per
+ * product: the same one-ulp departure the bf16 GEMM row documents, on a fraction of a percent of
+ * outputs, one bf16 ulp each.
  *
  * P . V is 128 f32 multiply-accumulates a key a lane, `acc[d] += w * v[d]` with -ffp-contract=off,
- * which is the reference's expression with vds already folded into the staged V. dot2 cannot do this
- * leg in this layout: w is a per-lane scalar and the accumulation is per dim, so the only route to
- * the matrix path is to fold w into V -- and w is f32, so every weight of the sum would be read to
- * 11 bits, a ~1e-4 relative change on the output that survives the bf16 store as a few percent of
- * outputs moved one ulp. It is a third of the instruction count, and it is not the default; the
- * numbers this unit is measured with are the f32 leg's.
+ * the reference's expression with vds folded into the staged V. dot2 cannot do this leg here: w is
+ * a per-lane f32 scalar and the accumulation is per dim, so dot2 would need w folded into V at f16,
+ * reading every weight to 11 bits (about 1e-4 relative, a few percent of outputs one ulp off after
+ * the bf16 store). That variant is a third of the instructions and is not used.
  *
  * ============================== exp ==============================
  *
- * `ref_exp` is `(float)std::exp((double)x)`: the reference's exponent is correctly rounded to f32
- * through a double. RDNA3 has no vector f64 -- double is soft-float, hundreds of cycles a call, and
- * a call per key per lane is the whole kernel. The device libm's `expf` is a ~1-ulp polynomial and
- * `__expf` is two orders of magnitude worse. `exp_ref` is a software expf: two-term range reduction
- * against a split ln2, a degree-8 polynomial, and 2^k assembled in the integer domain (no libm call
- * in the hot path). It is the only place in this library where an explicit `__fmaf_rn` is allowed,
- * and the rule it is an exception to is the no-FMA rule: that rule exists because libref's
- * expressions contain no FMA and a contracted multiply-add changes the order of rounding in
- * arithmetic we are required to reproduce. Here the thing we must reproduce is a *function* libref
- * computes in double precision on hardware that has f64 and this card does not. The polynomial's
- * FMA is arithmetic we chose, scoped to this helper, to get the closest legal transcription of that
- * function; it contracts no expression the reference wrote.
+ * `ref_exp` is `(float)std::exp((double)x)`, correctly rounded to f32 through a double. RDNA3 has
+ * no vector f64 (soft-float double costs hundreds of cycles a call), the device libm's `expf` is a
+ * ~1-ulp polynomial and `__expf` is two orders of magnitude worse. `exp_ref` is a software expf:
+ * two-term range reduction against a split ln2, a degree-8 polynomial, and 2^k assembled in the
+ * integer domain. It is the only place in this library where an explicit `__fmaf_rn` is allowed.
+ * The no-FMA rule exists because libref's expressions contain no FMA; here the target is a
+ * function libref computes in double, and the polynomial's FMAs are local to this helper and
+ * contract no expression the reference wrote.
  *
- * `exp(0)` is exactly 1.0: k is 0, the reduction leaves r exactly 0, and the polynomial's constant
- * term passes through untouched. The argument here is always <= 0 (the max is taken over the same
- * set the exponentials are taken of), so the domain that matters is x <= 0. Below -103.98 the
- * result is under f32's smallest subnormal and the helper returns 0; the reference's
- * `(float)exp(-100)` is a denormal of order 3.7e-44, and a term that small added to a denominator
- * of order 1 is not a change of any kind, let alone one that survives a bf16 store -- which is the
- * reason the flush is legal and not an approximation to defend. Between -103.98 and -87.3 the
- * result is subnormal, and the helper reaches it by one hardware multiply by 2^-126, so it is
- * rounded the way the hardware rounds and not by hand.
+ * `exp(0)` is exactly 1.0: k is 0, r is exactly 0, and the polynomial's constant term passes
+ * through. The argument is always <= 0 (the max is over the same set), so only x <= 0 matters.
+ * Below -103.98 the result is under f32's smallest subnormal and the helper returns 0; the
+ * reference's value there is of order 1e-44, which cannot change a denominator of order 1 or
+ * survive a bf16 store. Between -103.98 and -87.3 the result is formed by one hardware multiply by
+ * 2^-126, which the hardware flushes to zero (see exp_ref).
  *
  * ============================== split-KV ==============================
  *
- * The decode entry takes `splits`: a sequence's blocks are cut into slices of a whole number of
- * blocks, each slice accumulating its own (acc[128], sum, max) into scratch, and a second kernel
- * combines the slices before the single narrowing. Combining needs the slices' maximum, so each
- * slice's partial is rescaled by `exp(m_slice - M)`: the denominator becomes
- * `sum = Σ_slices sum_s * exp(m_s - M)`, ascending in slice, and every term arrives as
- * `exp(s - m_s) * exp(m_s - M)` where the reference has `exp(s - M)`. Both are last-bit at the f32
- * level -- ~2 ulp per term, ~1 ulp on the sum -- and both vanish under the bf16 store except on
- * outputs sitting on a rounding boundary. The row's prose says `splits > 1` is not bit-identical to
- * the reference and `splits = 1` is.
+ * The decode entry takes `splits`: a sequence's blocks are cut into slices of whole blocks, each
+ * accumulating its own (acc[128], sum, max) into scratch, and a second kernel combines the slices
+ * before the single narrowing. Each slice is rescaled by `exp(m_slice - M)` with M the slices'
+ * maximum: the denominator becomes the sum over slices of `sum_s * exp(m_s - M)`, ascending in
+ * slice, and every term arrives as `exp(s - m_s) * exp(m_s - M)` where the reference has
+ * `exp(s - M)`. That is about 2 f32 ulp per term and 1 on the sum, visible after the bf16 store
+ * only on outputs at a rounding boundary. `splits > 1` is not bit-identical to the reference;
+ * `splits = 1` is.
  *
  * `splits` is a maximum, resolved per sequence from its own `seqused`: `nslice = ceil(nblk /
  * ceil(nblk / splits))` with nblk the sequence's block count, so a short sequence uses fewer slices
- * and there is no per-sequence legality check to fail. `nslice` is recomputed by the reducer from
- * the same two numbers, so the partials need no header beyond (acc, sum, max).
+ * and there is no per-sequence legality check. The reducer recomputes `nslice` from the same two
+ * numbers, so a partial needs no header beyond (acc, sum, max).
  *
  * ============================== what the shims refuse ==============================
  *
- * head_dim other than 128 (`RAD_E_SHAPE`; this file is named for it); a cache dtype other than bf16
- * and fp8_e4m3 -- an f32 cache has no dot2 path, and u8/u4/int8 codes are not this cache form
- * (`RAD_E_DTYPE`); a query dtype other than bf16 or f16, and an out dtype that is not the query's
- * (`RAD_E_DTYPE`); gqa outside {1,2,4,8} or not dividing n_head (the wave's head split is a shift);
- * block_size other than 16 (the stage is sized for one); q_len < 1 in a rectangular batch, and a
- * row count < 1 in a ragged one; a row count that does not fit the plane's 32-bit row indexing
- * (num_seqs * q_len, or cu[n_seq], past 2^31); a q, kv or out stride that puts a slot's halves off
- * a 16-byte boundary, or a row pitch that is not a multiple of 8; a `cu_seqlens` that is not i32
- * (`RAD_E_DTYPE` -- the kernel reads int, and the fix is an i32 plane, which is what the op
- * describes), is not contiguous (`RAD_E_STRIDE`), is not [n_seq + 1] (`RAD_E_SHAPE`), or is not
- * 4-byte aligned (`RAD_E_ALIGN`); descales attached to a bf16 cache, which the reference ignores
- * and this kernel refuses rather than drops, and an fp8 cache missing them (`RAD_E_SHAPE`); an
- * output shorter than rows * n_head * head_dim; and a scratch arena too small for the partials the
- * requested `splits` needs, which the launcher answers by lowering `splits` to what the arena
- * holds, down to 1, which needs none.
+ * head_dim other than 128 (`RAD_E_SHAPE`); a cache dtype other than bf16 and fp8_e4m3 (an f32 cache
+ * has no dot2 path, and u8/u4/int8 codes are not this cache form; `RAD_E_DTYPE`); a query dtype
+ * other than bf16, and an out dtype that is not the query's (`RAD_E_DTYPE`); gqa outside {1,2,4,8}
+ * or not dividing n_head (the wave's head split is a shift); block_size other than 16 (the stage is
+ * sized for it); q_len < 1 in a rectangular batch, and a row count < 1 in a ragged one; a row count
+ * past 2^31 (num_seqs * q_len, or cu[n_seq]), since row indexing is 32-bit; a q, kv or out stride
+ * that puts a slot's halves off a 16-byte boundary, or a row pitch that is not a multiple of 8; a
+ * `cu_seqlens` that is not i32 (`RAD_E_DTYPE`; the kernel reads int), not contiguous
+ * (`RAD_E_STRIDE`), not [n_seq + 1] (`RAD_E_SHAPE`) or not 4-byte aligned (`RAD_E_ALIGN`); descales
+ * attached to a bf16 cache, which the reference ignores and this kernel refuses rather than drops,
+ * and one descale plane without the other (`RAD_E_SHAPE`); an output shorter than
+ * rows * n_head * head_dim. A scratch arena too small for the requested `splits` is not refused:
+ * the shim lowers `splits` until the partials fit, down to 1, which needs none.
  *
  * What the descriptor carries that the host cannot see is clamped, not refused, because a launcher
- * reads no device memory: cu[0] == 0, monotonicity and cu[n_seq] == the plane's row count are the
- * description's promises (the reference's shape hook states all three), and the kernel's answer to each
- * is the reference's own. Rows past the plane are dropped (`row_ok` tests the plane's row count, so
- * a descriptor that runs long cannot write outside `out`); a segment with cu[s+1] <= cu[s] has no
- * tiles and contributes no rows, which is the reference's `if (qlen <= 0) return;`
- * (the reference's walk); and rows under cu[0] belong to sequence 0 with a negative index into its
- * query, which is what `seq_of` gives them.
+ * reads no device memory. cu[0] == 0, monotonicity and cu[n_seq] == the plane's row count are the
+ * description's promises (the reference's shape hook states all three), and the kernel handles each
+ * violation as the reference does: rows past the plane are dropped (`row_ok` tests the plane's row
+ * count, so a long descriptor cannot write outside `out`); a segment with cu[s+1] <= cu[s] has no
+ * tiles and contributes no rows (the reference's `if (qlen <= 0) return;`); and rows under cu[0]
+ * belong to sequence 0 with a negative index into its query, as `seq_of` assigns them.
  */
 #include "r3d.h"
 #include "r3d_common.h"
@@ -243,56 +201,49 @@
 
 #include <cmath>
 #include <cstddef>   /* size_t, in the arena indexing and the shim's scratch sizing */
-#include <cstdio>    /* the device print, behind the budget; the shims already use std::fprintf */
-#include <cstdlib>   /* std::getenv / std::atoi, in the arming */
+#include <cstdio>    /* std::fprintf, the RAD_R3D_TRACE lines */
+#include <cstdlib>   /* std::getenv / std::atoi, RAD_R3D_TRACE and RAD_R3D_DEV */
 
 /* ================================================================== the device record ring
  *
- * THE LAW. A kernel that calls device `printf` is given an extra implicit argument --
- * `hidden_hostcall_buffer` -- and the engine's AQL dispatcher does not provide it, so a kernel that
- * prints is UNDISPATCHABLE BY THE ENGINE: the instrument is not merely silent, the row is refused,
- * and a gate that hipLaunches by hand cannot see it. The kernel therefore writes; it does not speak.
- * The shim drains the ring to stderr, which is a host facility and costs the kernel nothing.
+ * Diagnostic instrument, enabled by RAD_R3D_TRACE with its record budget from RAD_R3D_DEV (default
+ * 64): thread 0 of workgroup (0,0,0) of each attn_kernel launch writes one DevRec describing what
+ * the launch was handed, and the shim prints the records to stderr as "[r3d dev] L=... ctx=...
+ * ids=..." lines.
  *
- * Four plugin-owned device globals, and nothing else is added to the kernel: the launch parameters
- * are fixed, `RadArgs` is the row's ABI and the plan builds it, so a field cannot join it (and `abi/`
- * is untouched). The kernel owns these; the shim resolves them with `hipGetSymbolAddress` (once,
- * cached) and, ONLY under `RAD_R3D_TRACE`, writes the budget with `hipMemcpyToSymbol`.
+ * The kernel writes to memory rather than calling device `printf`: a printing kernel takes an
+ * implicit `hidden_hostcall_buffer` argument that the engine's AQL dispatcher does not provide, so
+ * the engine could not dispatch it at all.
  *
- *     r3d_dev_budget    records left to write; 0 -- its initial value -- means record nothing
- *     r3d_dev_launches  launches seen, incremented once per launch by the same thread that records
+ * Four plugin-owned device globals hold the state, because neither the launch parameters nor
+ * `RadArgs` (the row's ABI) can take a new field. The shim writes the budget with
+ * `hipMemcpyToSymbol` only under RAD_R3D_TRACE:
+ *
+ *     r3d_dev_budget    records left to write; 0, the initial value, means record nothing
+ *     r3d_dev_launches  launches seen, incremented once per launch by the recording thread
  *     r3d_dev_widx      the ring's write index, bumped once per record written
- *     r3d_dev_ring      kDevRing records, a fixed struct, 216 bytes each: 55 KiB, allocated once
+ *     r3d_dev_ring      kDevRing records of 216 bytes each, 55 KiB
  *
- * Why they exist: the engine's recorded pass plays a decode step by writing queue packets, and a
- * play never reaches a plugin shim. The shim is not in the path of a played step. The kernel is. So
- * the kernel writes down what it was handed: the step's `ctx` as the row reads it off `seqused`, the
- * block ids as the walk reads them off the table, the operand addresses baked into the packet, and
- * three content folds -- the query row, the K row of the FIRST block the row walks, the K row of the
- * LAST one -- so a block whose BYTES move underneath a step is visible: the adopted prefix whose
- * recycled block still holds the previous tenant's KV, and the address slip that serves fluent,
- * plausible, wrong text.
+ * The record is written by the kernel because a step replayed from the engine's recorded pass only
+ * writes queue packets and never calls the shim. A record holds the step's `ctx` as read from
+ * `seqused`, the block ids the walk reads from the table, the operand addresses in the packet, and
+ * three content folds (the query row, and the K rows of the first and last blocks the row walks),
+ * so a block whose contents or address change underneath a step is visible.
  *
- * A played step's record is written on the device and printed at the NEXT shim call, so a served
- * log's lines land one step behind the step they describe. The
- * record's own `L` and `ctx` restore the order, and the shim's plan line quotes the same counter, so
- * the gap between the two prints is the played pass, measured.
+ * A replayed step's record is printed at the next shim call, one step late; the record's `L` and
+ * `ctx`, and the counter the shim's plan line quotes, restore the order.
  *
- * Inert when the flag is unset: the budget is 0, so a launch pays one uniform scalar load of a
- * global and one not-taken branch, on one thread of one workgroup, plus the atomic increment of the
- * counter. The bound is decremented with `atomicSub` -- 16 CUs cannot record 16 copies of one launch
- * -- and the counter is `atomicAdd` before it, so a launch counted is a launch that ran, played ones
- * included. The ring is bounded (kDevRing slots): a harness that arms more than the ring holds loses
- * records, never the count, and the shim says so on one line.
+ * Cost with the flag unset: a launch pays one atomic increment of the counter, one atomic decrement
+ * of the budget and a not-taken branch, on one thread of one workgroup. The budget is decremented
+ * atomically so several workgroups cannot record copies of one launch. A full ring drops records
+ * but keeps counting, and the shim reports the loss on one line.
  *
- * The counter counts every `attn_kernel` launch, budget or not. It does NOT count the split-KV
- * reduce: that kernel is a second launch of a step's work, not a step. */
+ * The counter counts every `attn_kernel` launch, budget or not, but not the split-KV reduce. */
 enum { kDevRing = 256, kDevIds = 8 };
 
-/* One launch, as the launch saw it. A fixed plain-old struct: no pointers, no float, no padding the
- * reader has to guess. The ids are the row's first kDevIds columns -- `block_size` 16 and a served
- * ladder's 21 to 33 token contexts make that two columns, so the whole row fits -- and `idsum` folds
- * every column, so a 4096-token context still has one comparable number for its row. */
+/* One launch's record: a fixed plain struct with no pointers, floats or padding. `b` holds the
+ * row's first kDevIds table columns (two columns cover a short context at block_size 16), and
+ * `idsum` folds every column so a long context still yields one comparable number. */
 struct DevRec
 {
     unsigned long long L;                        /* the launch's own ordinal                */
@@ -307,10 +258,8 @@ struct DevRec
 extern "C" __device__ int r3d_dev_budget = 0;
 extern "C" __device__ unsigned long long r3d_dev_launches = 0ULL;
 extern "C" __device__ unsigned r3d_dev_widx = 0u;
-/* `= {}` is load-bearing: an uninitialised `__device__` variable emits no host-side symbol, and
- * the engine's loader dlopens the plugin with the symbol live, so it stops with
- * `undefined symbol: r3d_dev_ring` before a single row is declared. The zero fill is the device
- * side's init, and it is what the flag-unset state is. */
+/* `= {}` is required: an uninitialised `__device__` variable emits no host-side symbol, and the
+ * loader's dlopen then fails with `undefined symbol: r3d_dev_ring` before any row is declared. */
 extern "C" __device__ DevRec r3d_dev_ring[kDevRing] = {};
 
 
@@ -329,27 +278,23 @@ constexpr int kPartStride = kHeadDim + 4;      // acc[128], sum, max, pad -- 528
 
 /* ------------------------------------------------------------------ exp */
 
-/* exp(x) narrowed to f32, as close to `(float)std::exp((double)x)` as an ALU with no f64 gets.
+/* exp(x) narrowed to f32, as close to `(float)std::exp((double)x)` as an ALU without f64 gets.
  *
- * Measured against `(float)std::exp((double)x)` over 1.31M points of [-100, 0] and the boundary
- * cases: every point is within one f32 ulp, 76.1% bit-identical (the device libm's expf is 94.0%
- * identical and no better in ulps), exp(0) is exactly 1. The tail below 2^-126 -- x under about
- * -87.3 -- comes out zero, not subnormal: the scaling multiply that assembles the subnormal is
- * flushed by the hardware. That is invisible at the store, which is where the reference is
- * compared: a weight of 1e-38 next to a maximum weight of exactly 1 cannot move an accumulator, and
- * the bf16 store has no resolution at that ratio.
+ * Against `(float)std::exp((double)x)` over 1.31M points of [-100, 0] and the boundary cases,
+ * every point is within one f32 ulp and 76.1% are bit-identical (the device libm's expf: 94.0%, no
+ * better in ulps); exp(0) is exactly 1. Below 2^-126 (x under about -87.3) the result is zero, not
+ * subnormal, because the hardware flushes the scaling multiply. That is invisible at the store: a
+ * weight of 1e-38 beside a maximum weight of 1 cannot move an accumulator.
  *
- * Reduce by ln2 against a two-term constant: k = rn(x / ln2), r = x - k*LN_HI - k*LO with LN_HI the
- * high 24 bits of ln2 and LO what is left. A single-term reduction is what makes the naive version
- * 1.5 ulp -- k*ln2 is not representable, and the subtraction's cancellation is the whole error
- * budget. |r| <= 0.35, where a degree-8 polynomial reaches ~0.55 ulp, then 2^k by exponent
- * assembly. */
+ * Reduction by ln2 against a two-term constant: k = rn(x / ln2), r = x - k*LN_HI - k*LN_LO with
+ * LN_HI the high 24 bits of ln2. A single-term reduction costs 1.5 ulp, since k*ln2 is not
+ * representable and the subtraction's cancellation dominates the error. |r| <= 0.35, where a
+ * degree-8 polynomial reaches ~0.55 ulp, then 2^k by exponent assembly. */
 __device__ __forceinline__ float exp_ref(float x)
 {
-    /* Above the overflow point the reference's own double path yields +inf, so this one must too;
-     * a NaN in, a NaN out. Both cases are outside the softmax's reach (the argument is a score
-     * minus the row's maximum, never positive), and are here so the function is an exp, not a
-     * softmax helper with an undefined edge. */
+    /* Above the overflow point the reference's double path yields +inf, and so does this; NaN in,
+     * NaN out. Neither occurs in the softmax (the argument is never positive); they keep the
+     * function a true exp. */
     if (!(x < 88.7228390525719f))
         return x == x ? __int_as_float(0x7f800000) : __int_as_float(0x7fc00000);
     if (x < -103.9720770839916f) return 0.0f;                  /* under the subnormals: see header */
@@ -390,44 +335,40 @@ struct Args {
     uint16_t*       out;
     float*          part;              /* split-KV partials */
 
-    /* Strides are elements, and 32-bit: a cache is blocks x kv_heads x 16 x 256 elements, a row
+    /* Strides are 32-bit, in elements: a cache is blocks x kv_heads x 16 x 256 elements, a row
      * pitch is n_head x head_dim, a block table pitch is max_blocks, and the launcher checks that
-     * each fits. Every address in this kernel is a 64-bit base plus a 32-bit product, and the
-     * register allocator is out of scalar registers long before it is out of vector ones -- the
-     * wavefront runs in compute-shader mode, where a scalar spill is not a slow path, it is a
-     * kernel the runtime refuses to load. */
+     * each fits. Every address is a 64-bit base plus a 32-bit product because scalar registers run
+     * out first: in compute-shader mode a scalar spill is not a slow path but a kernel the runtime
+     * refuses to load. */
     int sb, sh, so, sd;                /* cache strides */
     int q_rs, o_rs;                    /* row pitches; the head stride is head_dim */
-    int bt_rs;   /* the block table row pitch, in entries: the tensor own stride */
-    int bt_cs;   /* its column stride: 1 for every dense table the engine builds */                         /* block table pitch */
+    int bt_rs;   /* the block table row pitch, in entries: the tensor's own stride */
+    int bt_cs;   /* its column stride: 1 for every dense table the engine builds */
     int n_seq, q_len, rows, n_head, kv_heads, causal, window, jcap, splits, q16, waves;
     float scale;
-    DevRec* trace_buf;               /* one record slot, a plain hipMalloc buffer: the device
-                                       * globals are stubs in a dlopened plugin, the buffer is not */
+    DevRec* trace_buf;               /* RAD_R3D_TRACE: one record slot in a hipMalloc buffer, which
+                                       * the engine process reads back reliably, unlike a dlopened
+                                       * plugin's device globals */
 };
 
 __device__ __forceinline__ long long ld_ix(const int* p, size_t i) { return p[i]; }
 
 /* ------------------------------------------------------------------ the row map
  *
- * One map for both batch forms. With a descriptor, sequence s owns the query rows [cu[s], cu[s+1])
- * -- `len_s` rows, the row's index within the sequence `i = row - cu[s]`, its absolute position
+ * One map for both batch forms. With a descriptor, sequence s owns query rows [cu[s], cu[s+1]):
+ * `len_s` rows, the row's index within the sequence `i = row - cu[s]`, its absolute position
  * `seqused[s] - len_s + i`. Without one, the same walk with len_s = q_len and cu[s] = s * q_len,
- * which is the reference's own rectangular reading, not a parallel implementation
- * of it.
+ * the reference's rectangular reading.
  *
  * A grid row is resolved by subtracting each sequence's tile count from blockIdx.x until the
- * remainder fits: n_seq int loads and n_seq subtractions, once per workgroup, against a walk of
- * nblk blocks with two barriers each. The descriptor is device memory and a launcher reads none of
- * it, so the grid is sized on the bound in `launch` and a grid row past the batch's last tile comes
- * back with tile < 0 and leaves, having staged nothing.
+ * remainder fits: n_seq loads and subtractions once per workgroup, against a walk of nblk blocks
+ * with two barriers each. The launcher reads no device memory, so the grid is sized on a bound and
+ * a grid row past the batch's last tile gets tile < 0 and returns without staging.
  *
  * `start` is the sequence's first dense row and `i0` the row its positions count from. They differ
- * only when cu[0] > 0: the reference's `seq_of` hands rows under cu[0] to sequence
- * 0 with a negative index into its query, and that is transcribed rather than refused because a
- * descriptor that does not start at 0 is a caller's arithmetic slip, not a geometry this kernel has
- * to be wider than. Both are 32-bit: they index rows of a plane whose element offsets the launcher
- * has already checked fit in 31 bits. */
+ * only when cu[0] > 0: the reference's `seq_of` assigns rows under cu[0] to sequence 0 with a
+ * negative index into its query, and that is reproduced rather than refused. Both are 32-bit: the
+ * launcher has checked that the plane's element offsets fit in 31 bits. */
 struct RowMap { int s, tile, start, i0, len, span; };
 
 __device__ __forceinline__ RowMap map_seq(const Args& A, const int tpb, int g)
@@ -439,15 +380,12 @@ __device__ __forceinline__ RowMap map_seq(const Args& A, const int tpb, int g)
         const int start = (s == 0 && c0 > 0) ? 0 : c0;
         const int nr = c1 - start;
         const int nt = nr > 0 ? (nr + tpb - 1) / tpb : 0;      /* tpb is a template constant */
-        /* TWO counts that are easy to conflate. `len` is the sequence's query length,
-         * cu[s+1] - cu[s], and it is what the positions count from (the reference: qlen, and
-         * pos = ctx - qlen + i). `span` is the number of rows this sequence's TILES carry,
-         * cu[s+1] - start, and the two differ by exactly cu[0] on sequence 0 of a descriptor that
-         * does not start at row 0: `start` reaches below cu[0] because seq_of hands those rows to
-         * sequence 0 with a negative index, so the tiles must cover `span` rows, and only `len` of
-         * them are inside the sequence. The store below is checked against the span and the
-         * positions against the length: bounding the tile slots by `len` drops the last cu[0]
-         * rows of the QUERY PLANE -- a silent, partial, in-bounds shortfall. */
+        /* `len` is the sequence's query length, cu[s+1] - cu[s], which the positions count from
+         * (the reference's qlen; pos = ctx - qlen + i). `span` is the rows this sequence's tiles
+         * carry, cu[s+1] - start; the two differ by cu[0] on sequence 0 when the descriptor does
+         * not start at row 0, because `start` then reaches below cu[0]. Stores are bounded by the
+         * span and positions by the length; bounding the tiles by `len` would silently drop the
+         * last cu[0] rows of the query plane. */
         if (g < nt) return RowMap{ s, g, start, c0, c1 - c0, nr };
         if (s + 1 >= n) return RowMap{ s, -1, start, c0, c1 - c0, nr };  /* past the batch's tiles */
         g -= nt;
@@ -455,8 +393,8 @@ __device__ __forceinline__ RowMap map_seq(const Args& A, const int tpb, int g)
     return RowMap{ n - 1, -1, 0, 0, 0, 0 };
 }
 
-/* The same walk for a row, not a tile: which sequence owns dense query row `r`. The reducer needs
- * it because a partial is indexed by (row, head) and its slice count is the SEQUENCE's block count. */
+/* The same walk for a row rather than a tile: which sequence owns dense query row `r`. The reducer
+ * needs it because a partial's slice count is the sequence's block count. */
 __device__ __forceinline__ int seq_of_row(const Args& A, int r)
 {
     const int n = A.n_seq;
@@ -469,11 +407,10 @@ __device__ __forceinline__ int seq_of_row(const Args& A, int r)
 
 /* ------------------------------------------------------------------ staging */
 
-/* Sixteen E4M3 codes -- one 16-byte load, the aligned unit a slot's 128-byte half divides into -- as
- * eight f16 pairs, descaled on the way. A code is exact in f16, so a power-of-two descale (every real
- * cache scale) costs a multiply and no rounding at all; a general descale is rounded once, toward
- * zero by the packing instruction, where the reference keeps it in f32. The bf16 path has no descale,
- * so it has no rounding to report. */
+/* Sixteen E4M3 codes (one 16-byte load, the aligned unit a slot's 128-byte half divides into) as
+ * eight f16 pairs, descaled on the way. A code is exact in f16, so a power-of-two descale (every
+ * real cache scale) costs a multiply and no rounding; a general descale is rounded once, toward
+ * zero by the packing instruction, where the reference keeps f32. The bf16 path has no descale. */
 __device__ __forceinline__ void codes16_to_f16x8(const uint8_t* p, float s, uint32_t* w)
 {
     const r3d_u32x4 c = *(const __attribute__((address_space(1))) r3d_u32x4*)(const void*)p;
@@ -491,17 +428,13 @@ __device__ __forceinline__ void codes16_to_f16x8(const uint8_t* p, float s, uint
 
 /* Stage one block of one KV head: 16 slots x 128 elements, K and V, widened to f16 pairs.
  *
- * A slot's halves are 512 bytes apart and each 256 of them, so a bf16 chunk of 8 elements is 16
- * bytes and lands on a 16-byte boundary; an E4M3 chunk of 16 codes is 16 bytes and lands there too.
- * A chunk of 8 codes is 8 bytes and does not -- a misaligned 16-byte load on this hardware returns
- * garbage, which is the whole difference between the two chunk sizes below. 128 threads, one chunk of
- * K and one of V each for the cache, two each for the bf16: 256 chunks of 16 bytes a half, 8 KiB of
- * tile, two loads and two stores a thread.
+ * A slot's halves are 256 bytes each, so an 8-element bf16 chunk is 16 bytes on a 16-byte boundary,
+ * and so is a 16-code E4M3 chunk. An 8-code chunk would be 8 bytes, and a misaligned 16-byte load
+ * returns wrong data on this hardware; hence the two chunk sizes. The tile is 8 KiB; at 128 threads
+ * each thread moves one K and one V chunk for fp8, two of each for bf16.
  *
  * Every offset is 32-bit and the launcher has checked that the whole cache fits in 2^31 elements:
- * the wavefront runs in compute-shader mode, where a scalar spill is not a slow path but a kernel the
- * runtime refuses to load, and 64-bit index arithmetic across a loop like this one is what fills the
- * scalar bank. */
+ * 64-bit index arithmetic in this loop would exhaust the scalar registers (see Args). */
 template <bool FP8, int NTH>
 __device__ __forceinline__ void stage(Args const& A, uint32_t* sK, uint32_t* sV, int blk, int kh,
                                       float kds, float vds, int tid)
@@ -509,7 +442,7 @@ __device__ __forceinline__ void stage(Args const& A, uint32_t* sK, uint32_t* sV,
     constexpr int kC = FP8 ? 16 : 8;                            /* elements a 16-byte chunk */
     constexpr int kCPH = kHeadDim / kC;                         /* chunks a half, a slot */
     constexpr int kChunks = kBlock * kCPH;                      /* 128 code chunks, 256 bf16 */
-    constexpr int kIter = kChunks / NTH;   /* bf16: 8, 4, 2 at a wave, two, four */
+    constexpr int kIter = kChunks / NTH;   /* bf16: 8, 4, 2 at one, two, four waves */
     static_assert(kIter * NTH == kChunks, "the stage must divide into whole per-thread trips: "
                                                "a bounds check inside the unrolled loop keeps the "
                                                "loop from unrolling, and the loop-invariant operands "
@@ -565,25 +498,17 @@ __device__ __forceinline__ float score_of(const uint32_t* qf, const uint32_t* kp
     return dot * scale;
 }
 
-/* ------------------------------------------------------------------ the launch's own voice
+/* ------------------------------------------------------------------ the launch record
  *
- * Two content folds and one line, printed from ONE thread of ONE workgroup of a launch.
+ * `fold64` is FNV-1a over 64-bit words (multiply and xor per word, no float arithmetic, nothing a
+ * compiler could contract), so a host-side checker can recompute it exactly. It is order-sensitive,
+ * so the same elements read at a wrong (e.g. layer-major) offset fold to a different value.
  *
- * `fold64` is FNV-1a over 64-bit words -- multiply, xor, per word; no float arithmetic, no
- * reduction that a compiler could contract. The spelling is exact and the board's host-side fold
- * copies it byte for byte, because a hash the driver cannot recompute is a number nobody can check.
- * It is order-sensitive by construction (a permuted row is a different hash), which is the property
- * that makes the layer-major addressing slip visible: the same 128 elements read at a layer-major
- * offset fold to something else.
- *
- * The words are the row's OWN bytes, read as the walk reads them: the query row at
- * `q + row * q_rs` for head 0 -- head 0 is the first head of kv-head 0, and 128 bf16 elements are
- * the 32 words -- and the K row of the block the walk names FIRST, at `blk * sb + kh * sh +
- * slot * so`, the same arithmetic `stage()` uses (this file has no `slot_of` helper; `slot_k_off`
- * spells it out here so the print prints it). 128 elements are 16 words of E4M3 codes and 32 of
- * bf16. Both rows are 16-byte aligned: the shim checks a 16-aligned cache, query and output base
- * and a row pitch that is a multiple of 8 elements, and the header's layout note puts a slot's K on
- * a 16-byte boundary at every slot.
+ * The words are the row's own bytes, read as the walk reads them: the query row at
+ * `q + row * q_rs` for head 0 (32 words of bf16), and the K row of a block the walk names, at
+ * `blk * sb + kh * sh + slot * so`, the same arithmetic as `stage()` (`slot_k_off`): 16 words of
+ * E4M3 or 32 of bf16. Both are 16-byte aligned: the shim checks 16-aligned cache, query and output
+ * bases and a row pitch that is a multiple of 8 elements.
  */
 __device__ __forceinline__ unsigned long long fold64(const void* p, int words)
 {
@@ -598,44 +523,35 @@ __device__ __forceinline__ long long slot_k_off(const Args& A, int blk, int kh, 
     return (long long)blk * A.sb + (long long)kh * A.sh + (long long)slot * A.so;
 }
 
-/* One record per launch, from block (0,0,0), thread 0, into the ring. `noinline` on purpose: the
- * walk's register budget is the scarcest thing in this file (see the stride note on Args -- a scalar
- * spill is a kernel the runtime refuses to load), and a writer that a traced run runs once a launch
- * must not be inlined into the middle of the mapping code that every launch runs.
+/* One record per launch, from block (0,0,0), thread 0, into the ring. `noinline` keeps the writer
+ * out of the mapping code every launch runs, because the kernel's register budget is the scarcest
+ * resource here (see Args).
  *
- * This function reads memory, so its bounds are the subject. THREE reads, three bounds:
+ * Its three reads are bounded:
  *
- *   the query row      bound: the PLANE's row count `A.rows`, the same bound the kernel checks
- *                      before it stores (`M.start + tok < A.rows`, in the caller). `row` is the
- *                      caller's clamped row index: the grid is sized on a bound, so a tile can name
- *                      rows the plane does not have, and `row_ok` says whether this one is real. A
- *                      band key (`q_len`) and the sequence's length are bounds on the SHAPE the shim
- *                      accepted, not on the plane, and the clamp exists because the grid exceeds
- *                      them; reading through a band key is the out-of-bounds this guard kills. A tile
- *                      the batch has no rows for records `qh=0, rowok=0` -- the record says it did
- *                      not read, and `L` still counts the launch.
- *   the table's row    bound: the columns the WALK can name, ceil(jcap / block_size), where
- *                      jcap = min(ctx, bt_cols * block_size), so a column under it is a column the
- *                      shim proved when it sized the table from the tensor (row pitch plus bt_cols
- *                      columns fit, at the table's own pitches), and the row is `M.s * bt_rs` with
- *                      `M.s` a sequence index the mapping clamped.
- *   the cache          bound: a block id is one the table names, and the shim insists every index
- *                      the walk can reach is inside the cache's plane (`0 <= id < num_blocks`, plus
- *                      the dense-stride requirement). The fold reads the slot-0 K row of kv-head 0 at
- *                      the offset `stage()` computes, kHeadDim elements: 256 bytes of bf16, 128 of
- *                      fp8, both inside a slot's 2*kHeadDim. A negative id -- an unmapped slot prints
- *                      -1 -- folds to 0 and is not dereferenced. */
+ *   the query row      by the plane's row count `A.rows`, the bound the store uses. `row` is the
+ *                      caller's clamped row index and `row_ok` says whether it is real; a band key
+ *                      (`q_len`) or the sequence's length bounds the shape, not the plane, so
+ *                      reading through one could leave the plane. A tile with no rows records
+ *                      `qh=0, rowok=0`, and `L` still counts the launch.
+ *   the table row      by the columns the walk can name, ceil(jcap / block_size) with
+ *                      jcap = min(ctx, bt_cols * block_size), which the shim proved the table
+ *                      covers; the row is `M.s * bt_rs` with `M.s` a clamped sequence index.
+ *   the cache          by block ids the table names; the shim requires every index the walk can
+ *                      reach to be inside the cache plane (`0 <= id < num_blocks`, dense strides).
+ *                      The fold reads kv-head 0's slot-0 K row at the `stage()` offset, kHeadDim
+ *                      elements (256 bytes bf16, 128 fp8), inside a slot's 2*kHeadDim. A negative
+ *                      id (an unmapped block, printed -1) folds to 0 and is not dereferenced. */
 template <bool FP8>
 __device__ __noinline__ void dev_record(const Args& A, const RowMap& M, long long row, bool row_ok,
                                         long long ctx, int jend_all, long long pos)
 {
-    /* A launch that runs is a launch that is counted, budget or not: this is the number that stops
-     * the decode steps of a request being inferred from shim lines. */
+    /* Every launch that runs is counted, budget or not. */
     const unsigned long long n = atomicAdd(&r3d_dev_launches, 1ULL) + 1ULL;
-    /* The bound, decremented atomically, so 16 CUs cannot record 16 copies of one launch. A caller
-     * that armed 3 gets 3 records, wherever in the run they fall. The buffer channel bypasses the
-     * bound: it is one slot per launch, drained at the launch, and the budget is a device global
-     * that the engine process cannot arm. */
+    /* The budget is decremented atomically, so several workgroups cannot record copies of one
+     * launch; a caller that armed 3 gets 3 records. The buffer channel bypasses the budget: it is one
+     * slot per launch, read back at the launch, and the engine process cannot arm the device
+     * global. */
     if (!A.trace_buf && atomicSub(&r3d_dev_budget, 1) <= 0) return;
 
     DevRec r;
@@ -654,15 +570,15 @@ __device__ __noinline__ void dev_record(const Args& A, const RowMap& M, long lon
     const int cols = (A.jcap + kBlock - 1) / kBlock;      /* <= bt_cols, by jcap's bound */
     const long long r0 = (long long)M.s * A.bt_rs;
     r.ncols = cols;
-    unsigned long long is = 14695981039346656037ULL;      /* the fold64 basis, so a sum of ids is a
-                                                           * fold of them, spelled the same way */
+    unsigned long long is = 14695981039346656037ULL;      /* fold64's basis: idsum is an FNV-1a
+                                                           * fold of the ids */
     for (int c = 0; c < cols; ++c) {
         const int b = (int)ld_ix(A.bt, (size_t)r0 + (size_t)c * (size_t)A.bt_cs);
         is = (is * 1099511628211ULL) ^ (unsigned long long)(unsigned int)b;
         if (c < kDevIds) r.b[c] = b;
     }
-    for (int c = cols; c < kDevIds; ++c) r.b[c] = -2;     /* a column the row does not have. -2 is
-                                                           * not -1, which is an unmapped block */
+    for (int c = cols; c < kDevIds; ++c) r.b[c] = -2;     /* a column the row does not have; -1
+                                                           * means an unmapped block */
     r.idsum = (long long)is;
 
     /* The query row, under the plane's bound, named above. */
@@ -670,13 +586,12 @@ __device__ __noinline__ void dev_record(const Args& A, const RowMap& M, long lon
     r.rowok = q_ok ? 1 : 0;
     r.qh = q_ok ? fold64(A.q + row * (long long)A.q_rs, kHeadDim / 4) : 0ULL;
 
-    /* The head K row of the first block the row WALKS, and of the last block it walks. The walk's
-     * extent is `jend_all = min(ctx, A.jcap)` keys, so the blocks it visits are `ceil(jend_all /
-     * kBlock)` — NOT the table's `cols`: the table row is the plane's full capacity (64 columns at
-     * a 4096 cap) and its far columns are `-1` for a short context, a fold of which is a fold of
-     * nothing. `ncols` and `idsum` keep the whole table row — that is the census — while `kh`,
-     * `khL`, `slot0`, `slotL` and `bL` are the walk's two ends: the head of an adopted prefix and
-     * the tail the step is writing, where a recycled block shows up. */
+    /* The K rows of the first and last blocks the row walks. The walk covers
+     * `jend_all = min(ctx, A.jcap)` keys, so it visits ceil(jend_all / kBlock) blocks, not the
+     * table's `cols`: the table row spans the plane's full capacity and its far columns are -1 for
+     * a short context. `ncols` and `idsum` cover the whole table row; `kh`, `khL`, `slot0`, `slotL`
+     * and `bL` describe the walk's two ends, the head of an adopted prefix and the tail being
+     * written, where a recycled block shows up. */
     const int walk_cols = (jend_all + kBlock - 1) / kBlock;
     const int b0 = walk_cols > 0 ? r.b[0] : -2;
     const int blast = walk_cols > 0
@@ -688,17 +603,15 @@ __device__ __noinline__ void dev_record(const Args& A, const RowMap& M, long lon
     r.kh  = b0 < 0 ? 0ULL : (FP8 ? fold64(A.kv8 + k0, kHeadDim / 8) : fold64(A.kv + k0, kHeadDim / 4));
     r.khL = (kL == 0) ? 0ULL
           : (FP8 ? fold64(A.kv8 + kL, kHeadDim / 8) : fold64(A.kv + kL, kHeadDim / 4));
-    r.spare = blast;                                          /* the id the last fold is of, printed */
+    r.spare = blast;                                          /* printed as bL */
     r.spare2 = cols; r.spare3 = 0;
 
-    /* One slot, claimed by one atomic. Past the ring's end a record is counted and dropped: the
-     * counter keeps the truth, and the shim prints one line saying how many were lost. The struct is
-     * filled in a local and copied in one statement so the writer is one block of stores; a drain
-     * runs at a shim call, after the engine has synced the step, so it reads slots that are written
-     * whole. */
+    /* One slot, claimed by one atomic. Past the ring's end a record is counted and dropped, and the
+     * shim reports the loss. The record is built in a local and copied in one statement; the drain
+     * runs at a shim call after the engine has synced the step, so it reads whole records. */
     const unsigned w = atomicAdd(&r3d_dev_widx, 1u);
     if (w < (unsigned)kDevRing) r3d_dev_ring[w] = r;
-    if (A.trace_buf) A.trace_buf[0] = r;   /* the engine-process channel: no symbol between us */
+    if (A.trace_buf) A.trace_buf[0] = r;   /* read back by launch() */
 }
 
 /* One wave's work: GQA heads x 32/GQA rows, over its slice of one sequence's blocks, for one KV
@@ -718,10 +631,9 @@ void attn_kernel(const Args A)
     const int tid = (int)threadIdx.x;
     const int wave = tid >> 5, lane = tid & 31;
     const RowMap M = map_seq(A, ROWSB, (int)blockIdx.x);
-    /* A grid row the batch has no tiles for (the grid is sized on a bound), and a sequence with no
-     * rows (cu[s+1] <= cu[s], the reference's `qlen <= 0`), stage nothing and store nothing. A
-     * sequence that starts past the query plane -- a descriptor running beyond the operand -- is
-     * nobody's rows: the plane's row count is the bound the store is checked against below. */
+    /* Nothing to do for a grid row past the batch's tiles (the grid is sized on a bound), a
+     * sequence with no rows (cu[s+1] <= cu[s], the reference's `qlen <= 0`), or a sequence that
+     * starts past the query plane (a descriptor running beyond the operand). */
     if (M.tile < 0 || M.len <= 0 || M.start >= A.rows) return;
     const int s = M.s;
     const int tile = M.tile;
@@ -732,13 +644,12 @@ void attn_kernel(const Args A)
     const int tb = tile * ROWSB + wave * TOKS;        /* the wave's first row of the sequence */
     const int tok = tb + (lane >> LG);                /* this lane's, counted inside the sequence */
     /* A row the operands do not have: past the rows this sequence's tiles carry (the last tile of
-     * any sequence, and every tile of a short one in a ragged step), or past the query plane (a
-     * descriptor that runs long). Both are the clamp the width section documents. The bound is the
-     * SPAN, not the length: with cu[0] > 0 the span reaches below cu[0], and the rows there are
-     * the reference's rows too (seq_of gives them to sequence 0), so they are stored. */
+     * any sequence, every tile of a short one), or past the query plane (a long descriptor). The
+     * bound is the span, not the length: with cu[0] > 0 the span reaches below cu[0], and those
+     * rows belong to sequence 0 in the reference too, so they are stored. */
     const bool row_ok = tok < M.span && M.start + tok < A.rows;
-    /* The clamp target is a row that EXISTS: the wave's first row if the sequence has one, else its
-     * last, and never past the plane. An idle lane loads a real query row so the walk stays
+    /* The clamp target is a row that exists: the wave's first row if the sequence has one, else its
+     * last, never past the plane. An idle lane loads a real query row so the walk stays
      * branch-free; it never stores. */
     int tclamp = tb < M.span ? tb : M.span - 1;
     if (M.start + tclamp >= A.rows) tclamp = A.rows - 1 - M.start;
@@ -751,31 +662,18 @@ void attn_kernel(const Args A)
     const long long ib = (long long)M.start - M.i0;
     const long long pos = ctx - M.len + tok + ib;
 
-    /* THE LAUNCH WRITES. The shim is not in the path of a played step -- a play writes queue
-     * packets and never calls `rad_arch_step` (the recorded pass's packet path) -- and this kernel
-     * is, so the row writes down what the row was
-     * handed: `ctx` off `seqused`, the block ids off the table at the table's own pitches, the six
-     * operand addresses baked into the packet, and three content folds. ONE thread of ONE workgroup
-     * (`blockIdx.z` is the split-KV slice: one launch, not `splits` of them), gated on a global the
-     * shim writes only under `RAD_R3D_TRACE`. With the flag unset the gate is one load of a zero
-     * global and a not-taken branch, and the launch records nothing. It does not printf: a kernel
-     * that does takes the implicit `hidden_hostcall_buffer`, which the AQL backend does not supply,
-     * and the row stops being dispatchable at all (see the ring's header).
-     *
-     * Placed HERE, before the query is widened and long before the walk, so the record covers the
-     * launch even when the walk's rows are all clamped -- which is why the writer's own read of the
-     * query row is bounded by the PLANE's rows and not by the band key, and why a clamped tile
-     * records `qh=0 rowok=0` -- and so the writer's registers are live over the fewest live values
-     * in the kernel. */
+    /* RAD_R3D_TRACE device record (see "the device record ring"): one thread of one workgroup
+     * (`blockIdx.z` is the split-KV slice, so this is once per launch), gated on the budget global.
+     * It sits before the query is widened and the walk starts, so the record covers launches whose
+     * rows are all clamped and the writer overlaps the fewest live values. */
     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
         dev_record<FP8>(A, M, row, row_ok, ctx, jend_all, pos);
 
-    /* The WORKGROUP's bounds, not the wave's. The stage is one tile shared by the four waves, so
-     * every wave of a workgroup must walk exactly the same blocks: a range narrowed to a wave's own
-     * four positions makes the waves stage different blocks over the same LDS, and the last writer
-     * per 16-byte chunk wins -- a corrupted tile that looks like a numerical error. The positions of
-     * a workgroup's 4 x TOKS consecutive rows span 4 x TOKS - 1, and keys past the last are nobody's;
-     * a window cuts the front off as well. The mask that this widens past is per lane and free. */
+    /* The workgroup's bounds, not the wave's. All waves share one staged tile, so they must walk
+     * exactly the same blocks; a range narrowed to one wave's positions would make waves stage
+     * different blocks into the same LDS and corrupt the tile. A workgroup's ROWSB consecutive rows
+     * span ROWSB - 1 positions and keys past the last are unused; a window also trims the front.
+     * The per-lane mask handles the rest. */
     const int gb = tile * ROWSB;
     const long long wmin = ctx - M.len + gb + ib;
     const long long wmax = wmin + ROWSB - 1;
@@ -804,9 +702,8 @@ void attn_kernel(const Args A)
     const float kds = A.kds ? A.kds[(size_t)s * A.kv_heads + kh] : 1.0f;
     const float vds = A.vds ? A.vds[(size_t)s * A.kv_heads + kh] : 1.0f;
 
-    /* The query row, widened once and kept for both walks: 64 dwords, the lane's own 256 bytes, the
-     * eight heads of a token contiguous in memory. An idle lane loads its wave's first row so the
-     * registers hold something and the walk stays branch-free; it never stores. */
+    /* The query row, widened once and kept for both walks: 64 dwords, the lane's 256 bytes. An idle
+     * lane loads its clamped row (see above) and never stores. */
     uint32_t qf[kPairs];
     {
         const uint16_t* qp = A.q + row * (long long)A.q_rs + h * kHeadDim;
@@ -877,17 +774,12 @@ void attn_kernel(const Args A)
         }
     }
 
-    /* A row slot past its sequence's length, or past the query plane, is a clamped duplicate: it
-     * computed a walk, and it stores nothing -- the partial store included, which needs the same
-     * test BEFORE it. A padding row's `row` clamps to a REAL row, so an unguarded partial store
-     * puts a second writer into (row, h, slice) -- inside the declared arena, so no bounds check
-     * sees it -- and the two writers' 132-float records interleave: a slot can end with one lane's
-     * acc and another lane's (sum, max). The reduce then rescales a full slice's accumulator by
-     * the other lane's maximum, the combined sum comes out thousands of times too small, and
-     * `1/sum` hands back a power of two where a logit belongs. The mechanism needs a padding row
-     * -- q_len < 32/gqa -- so a band that fills its waves (q_len 7 at gqa 8) has none. The slots a
-     * padding row leaves unwritten are exactly the slots the reduce does not read: its index runs
-     * to `nrows * n_head`, over real rows only. */
+    /* A row slot past its sequence's length or the query plane is a clamped duplicate and stores
+     * nothing, partial store included. Its `row` clamps to a real row, so an unguarded partial store
+     * would add a second writer to (row, h, slice), inside the arena where no bounds check sees it;
+     * the two 132-float records would interleave, the reduce would rescale one lane's accumulator by
+     * another lane's maximum, and the output would be badly wrong. The reduce reads only real rows
+     * (`nrows * n_head`), so slots a padding row leaves unwritten are never read. */
     if (!row_ok) return;
 
     if (SPLIT) {
@@ -969,17 +861,15 @@ void attn_reduce(const Args A, long long nrows)
 
 /* ================================================================== launchers
  *
- * Both entries take raw addresses and extents, in the library's style, and both assume the dense
- * layouts the shim has just checked: the cache at [blocks, kv_heads, 16, 256], a block table whose
- * row pitch is exactly ceil(max_ctx / block_size), seqused one i32 a sequence. That is what the
- * signatures carry, so the shims refuse anything they cannot describe with it -- a strided cache, a
- * wider block table, an i64 index plane.
+ * Both entries take raw addresses and extents and assume the dense layouts the shim has checked:
+ * the cache at [blocks, kv_heads, 16, 256] and seqused one i32 a sequence. The shims refuse
+ * anything else (a strided cache, an i64 index plane). The block table's columns and strides are
+ * arguments.
  *
- * `cu` is the ragged query descriptor, and with it `q_len` changes meaning: it is the query PLANE's
- * row count, the total, which the descriptor's cu[num_seqs] states and libref reads off the tensor
- * (`rows = numel(q) / (q_heads * head_dim)`, `cu[n_seq] == rows`). Absent, it
- * keeps its per-sequence meaning and the total is num_seqs * q_len. No entry reads the plane: the
- * grid is sized on a bound, and the kernel does the walking.
+ * With `cu` (the ragged descriptor), `q_len` is the query plane's total row count, which
+ * cu[num_seqs] states and libref reads off the tensor (`rows = numel(q) / (q_heads * head_dim)`);
+ * without it, `q_len` is per sequence and the total is num_seqs * q_len. No entry reads the
+ * descriptor: the grid is sized on a bound and the kernel does the walking.
  */
 #define R3D_NEED(cond) do { if (!(cond)) return R3D_NO(RAD_E_SHAPE); } while (0)
 
@@ -1005,16 +895,14 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
     if (!q || !kv || !bt || !seqused) return -1;
 
     const int kv_heads = n_head / gqa;
-    /* Two counts that must not be conflated. The CACHE holds
-     * ceil(max_ctx / block_size) blocks, which bounds the byte offset of a slot address. The TABLE
-     * has `bt_cols` columns, and the engine sizes it to the step: a five-token prompt with nothing
-     * behind it is one block, a table of [n_seq, 1]. The walk is bounded by the TABLE --
-     * the reference takes max_blocks from `bt->shape[last]`, the row pitch from
-     * `stride[rank-2]` and the column stride from `stride[rank-1]`, and jend = min(ctx, max_blocks *
-     * block_size) -- so a context longer than the table has columns is truncated by the reference,
-     * which is the oracle, and by us, to the same keys. */
+    /* Two different counts. The cache holds ceil(max_ctx / block_size) blocks, which bounds a slot
+     * address. The table has `bt_cols` columns, sized by the engine to the step (a five-token prompt
+     * with nothing behind it is a [n_seq, 1] table). The walk is bounded by the table, as in the
+     * reference (max_blocks from `bt->shape[last]`, row pitch `stride[rank-2]`, column stride
+     * `stride[rank-1]`, jend = min(ctx, max_blocks * block_size)), so a context longer than the
+     * table is truncated to the same keys. */
     const int cache_blocks = (max_ctx + block_size - 1) / block_size;
-    if (bt_cols < 1 || bt_rs < 1 || bt_cs < 1) return -2;   /* RAD_E_STRIDE, said where the shim sees it */
+    if (bt_cols < 1 || bt_rs < 1 || bt_cs < 1) return -2;   /* the shim refuses this first, RAD_E_STRIDE */
 
     A.q = (const uint16_t*)(uintptr_t)q;
     A.kv = kv_dt == RAD_BF16 ? (const uint16_t*)(uintptr_t)kv : nullptr;
@@ -1042,25 +930,25 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
     A.causal = causal ? 1 : 0; A.window = window;
     A.jcap = max_ctx;
     if ((long long)bt_cols * block_size < max_ctx) A.jcap = bt_cols * block_size;
-    if (r3d_trace_on())   /* the walk's reach is a number the shim can print: a context that
-                                     * comes back short is a table narrower than the sequence, and
-                                     * that is a plan fact, not a kernel fact */
+    /* RAD_R3D_TRACE: the table geometry and the walk's reach (jcap). A short jcap means the table
+     * is narrower than the sequence, a plan fact rather than a kernel one. */
+    if (r3d_trace_on())
         std::fprintf(stderr, "[r3d] attn: q_len %d rows %ld n_seq %d bs %d bt cols %d pitch %d "
                              "cstride %d max_ctx %d -> jcap %d\n", q_len, rows, num_seqs,
                      block_size, bt_cols, bt_rs, bt_cs, max_ctx, A.jcap);
-    {   /* the record's slot, for the engine process: a plain buffer the kernel can write and the
-         * shim can read back, no symbol table between them. Inert when the flag is unset. */
+    {   /* RAD_R3D_TRACE: a one-record hipMalloc buffer the kernel writes and launch() reads back,
+         * allocated on first traced use. Null when the flag is unset. */
         static void* g_trace_buf = nullptr;
         A.trace_buf = nullptr;
         if (r3d_trace_on() && !g_trace_buf)
             (void)hipMalloc(&g_trace_buf, sizeof(DevRec));
         if (g_trace_buf) A.trace_buf = (DevRec*)g_trace_buf;
     }
-    if (r3d_trace_on())   /* the device's own view, at the launch: the table row, the
-                                     * seqused, the KV base, and the first block's bytes -- the
-                                     * four things a wrong answer can come from, spoken together.
-                                     * The sync is the price: the staging may ride the engine's
-                                     * stream, and a read on the default stream is unordered to it. */
+    /* RAD_R3D_TRACE: synchronise the device and print, for up to 4 sequences, the first 16 block
+     * table entries ("[r3d] devstate s=.. bt=..") and seqused with the KV base, then the first
+     * block id. The device sync is needed because staging may run on the engine's stream, and a
+     * copy on the default stream is unordered with it. */
+    if (r3d_trace_on())
     {
         (void)hipDeviceSynchronize();
         const char* kvb = A.kv8 ? (const char*)A.kv8 : (const char*)A.kv;
@@ -1083,16 +971,12 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
         if (kvb &&
             hipMemcpy(&first, (const char*)A.bt, sizeof(int), hipMemcpyDeviceToHost) == hipSuccess &&
             first >= 0) {
-            /* The block's bytes are spoken by address only: a D2H of the cache base page faults
-             * the engine process where the kernel's own read is fine, so the content check stays
-             * with the board, and the table + base are what the served run speaks. */
-            std::fprintf(stderr, "[r3d] devstate first_block=%d (content not read: see the board)\n",
+            /* Only the block id is printed: a D2H copy from the cache base faults in the engine
+             * process even where the kernel's own read is fine. */
+            std::fprintf(stderr, "[r3d] devstate first_block=%d (block content not read)\n",
                          first);
         }
     }
-    /* The table bounds the walk, as in the reference: a context with more blocks than the
-     * table has columns stops at the table, which is what the reference does and therefore
-     * what the fixture and the served numbers say. */
     A.scale = scale > 0.0f ? scale : 1.0f / std::sqrt((float)kHeadDim);
     A.splits = splits > 0 ? splits : 1;
     A.waves = waves;
@@ -1101,16 +985,12 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
     return 0;
 }
 
-/* The narrowest workgroup that carries the caller's q_len. A wave carries 32 / gqa query rows, and
- * a row slot whose row is past q_len computes a clamped duplicate: at the decode band's q_len = 7
- * with gqa = 8 a four-wave workgroup spends 9 of its 16 row slots on duplicates, twice the walk for
- * half the outputs. The tile is the same 8 KiB at every width -- 16 tokens a block, staged once per
- * workgroup -- so a narrower workgroup is the same cache read spread over more workgroups, and
- * 512 -> 1024 of them is the fill the counters say the op is short of (15% issue at the band,
- * 3.7% at eight sequences, where splits=8 buys 3.6x). Prefill keeps four waves: its q_len is the
- * whole chunk, every slot is used, and a smaller workgroup would only re-read the cache.
- * The accumulation order does not depend on the width: the softmax sum is over keys, ascending,
- * inside one lane, and the rows a wave holds are the same rows shifted by wave * TOKS. */
+/* The narrowest workgroup that carries the caller's q_len (see "the width of a workgroup"). A wave
+ * carries 32 / gqa query rows, and a slot past q_len computes a clamped duplicate. The tile is the
+ * same 8 KiB at every width, so a narrower workgroup spreads the same cache reads over more
+ * workgroups, the occupancy the op lacks at decode. Prefill keeps four waves: its q_len is the
+ * whole chunk and every slot is used. The accumulation order does not depend on the width: the
+ * softmax sum is over keys, ascending, inside one lane. */
 int pick_waves(int q_len, int gqa)
 {
     const int rows = 32 / (gqa > 0 ? gqa : 1);
@@ -1118,30 +998,25 @@ int pick_waves(int q_len, int gqa)
     return w <= 1 ? 1 : (w <= 2 ? 2 : 4);      /* the ladder the grid is cut on: 1, 2, 4 */
 }
 
-/* The rows one sequence of a batch contributes, as well as a host can know them: the plane's row
- * count over the sequence count, rounded up. With a descriptor the true lengths are device memory
- * and a launcher reads none of it, so this is what the width and the split count are picked on for a
- * ragged step. Both choices move duplicated row slots and grid blocks; neither can move a result,
- * which is why the average is legal as a proxy and a per-sequence length is not needed. */
+/* The rows per sequence as a host can know them: the plane's row count over the sequence count,
+ * rounded up. With a descriptor the true lengths are device memory, so the width and split count of
+ * a ragged step are picked on this average. Both choices only move duplicated row slots and grid
+ * blocks, never a result. */
 int avg_rows(int rows, int num_seqs) { return num_seqs > 0 ? (rows + num_seqs - 1) / num_seqs : rows; }
 
-/* Every width the ladder can return, at every gqa, must be instantiated and dispatched: pick_waves
- * is `ceil(q_len / (32/gqa))` clamped to the ladder, so gqa = 4 asks for W = 4 at q_len > 16,
- * gqa = 2 at q_len > 32, gqa = 1 at q_len > 64 -- and the prefill entry passes kWaves = 4
- * unconditionally. The launcher dispatches through `if constexpr (waves_ok<...>::value)`, so a
- * missing instantiation compiles the kernel call out: the entry returns RAD_OK, hipGetLastError()
- * is clean, and the output plane keeps what the caller put there. A silent no-op is the worst
- * failure a kernel row can have: the engine reads its own input back as the attention output. The
- * gate therefore asserts the whole ladder, at every gqa -- every width it admits is a width some
- * q_len can ask for. */
+/* Every width pick_waves can return must be instantiated at every gqa: gqa = 4 asks for W = 4 at
+ * q_len > 16, gqa = 2 at q_len > 32, gqa = 1 at q_len > 64, and the prefill entry always passes
+ * kWaves = 4. The launcher dispatches through `if constexpr (waves_ok<...>::value)`, so a missing
+ * instantiation silently compiles the launch out: the entry returns RAD_OK and the output keeps
+ * whatever the caller put there. waves_ok therefore admits the whole ladder. */
 template <int GQA, int W> struct waves_ok {
     static const bool value = (W == 1) || (W == 2) || (W == 4);
 };
 
 int tok_per_block(int gqa, int waves) { return waves * (32 / (gqa > 0 ? gqa : 1)); }
 
-/* The decode entry's `splits`, when the caller asked for the widest legal: enough workgroups to
- * fill the card (16 CUs x two workgroups at four waves a SIMD) and no more, on a doubling ladder. */
+/* The decode entry's `splits` when the caller asked for the widest legal: enough workgroups to fill
+ * a 16-CU card (two workgroups a CU at four waves a SIMD) and no more, on a doubling ladder. */
 int pick_splits(int tiles, int num_seqs, int kv_heads)
 {
     const long long blocks = (long long)tiles * num_seqs * kv_heads;
@@ -1150,7 +1025,7 @@ int pick_splits(int tiles, int num_seqs, int kv_heads)
     return sp;
 }
 
-static void dev_speak(const DevRec& r);   /* the record, spoken; defined with the ring below */
+static void dev_speak(const DevRec& r);   /* prints a DevRec; defined with the ring below */
 
 int launch(const Args& A, long out, long stream)
 {
@@ -1160,12 +1035,12 @@ int launch(const Args& A, long out, long stream)
     const int waves = A.waves > 0 ? A.waves : kWaves;
     const int tpb = tok_per_block(gqa, waves);
     /* The grid's row count. Rectangular: every sequence has the same tile count, so the product is
-     * exact and is the grid. Ragged: the tile count is
-     * sum_s ceil(len_s / tpb), which lives in device memory, so the launch uses the bound
+     * exact. Ragged: the tile count sum_s ceil(len_s / tpb) is in device memory, so the launch uses
+     * the bound
      *     sum_s ceil(len_s / tpb)  <=  ceil(rows / tpb) + n_seq - 1
-     * (ceil(x) + ceil(y) <= ceil(x + y) + 1, inducted over the sequences), and `map_seq` sends a grid
-     * row past the last tile straight home. The slack is at most n_seq - 1 empty workgroups, and an
-     * empty one stages nothing: it reads n_seq descriptor entries and returns. */
+     * (ceil(x) + ceil(y) <= ceil(x + y) + 1, by induction over the sequences), and `map_seq`
+     * returns early for a grid row past the last tile. The slack is at most n_seq - 1 empty
+     * workgroups, each reading n_seq descriptor entries and returning. */
     const int tiles = A.cu ? (A.rows + tpb - 1) / tpb + A.n_seq - 1
                            : (A.q_len + tpb - 1) / tpb * A.n_seq;
     dim3 grid((unsigned)tiles, (unsigned)A.kv_heads,
@@ -1181,13 +1056,10 @@ int launch(const Args& A, long out, long stream)
 #define R3D_ATTN_SEL(GQAV, WAVESV)                                             \
     do {                                                                       \
         if constexpr (waves_ok<GQAV, WAVESV>::value) {                          \
-            /* `sel` is three bits, and all eight combinations are reachable: a single-sequence     \
-             * causal decode picks splits 4 on its own (pick_splits(1, 1, 8) = 4), so sel 6 and 7   \
-             * are the engine's most common split shape. Each combination needs its own arm: a      \
-             * causal-with-splits launch routed into the non-causal instantiation takes its maximum \
-             * over keys the row must not see, the softmax loses its top weight to a future key,   \
-             * and the reduce amplifies the loss into a 1/sum of the wrong size. All eight arms    \
-             * exist. */                                                                        \
+            /* `sel` is three bits and all eight combinations are reachable (a single-sequence    \
+             * causal decode picks splits 4 itself: pick_splits(1, 1, 8) = 4). Each needs its own   \
+             * arm: a causal split launch routed to the non-causal instantiation would take its     \
+             * maximum over keys the row must not see. */                                           \
             if (sel == 0) R3D_ATTN(false, false, false, GQAV, WAVESV);         \
             else if (sel == 1) R3D_ATTN(true, false, false, GQAV, WAVESV);     \
             else if (sel == 2) R3D_ATTN(false, true, false, GQAV, WAVESV);     \
@@ -1207,13 +1079,11 @@ int launch(const Args& A, long out, long stream)
     } while (0)
 
     const int sel = (fp8 ? 1 : 0) | (causal ? 2 : 0) | (A.splits > 1 ? 4 : 0);
-    /* The flag is cleared HERE, after the arguments are staged and before the chevron, and read
-     * straight back after it. `hipGetLastError()` reports the first error raised since it was last
-     * cleared, so a check that does not clear first attributes to this launch whatever the process
-     * raised before it: in a served process, the op that ran last. A synchronous launch clears a
-     * pending asynchronous error before the check, so `HIP_LAUNCH_BLOCKING=1` hides a
-     * misattribution of exactly this kind. A healthy step refused by a symptom it did not cause is
-     * the failure mode; the launch is not. */
+    /* Clear the error flag here, after the arguments are staged and before the chevron, and read
+     * it right after. `hipGetLastError()` reports the first error since it was last cleared, so
+     * without the clear this launch would be blamed for an earlier op's error.
+     * HIP_LAUNCH_BLOCKING=1 hides this kind of misattribution, because a synchronous launch clears a
+     * pending asynchronous error before the check. */
     (void)hipGetLastError();
     switch (gqa) {
     case 1: R3D_ATTN_GQA(1); break;
@@ -1227,8 +1097,8 @@ int launch(const Args& A, long out, long stream)
     {
         const hipError_t ke = hipGetLastError();
         if (ke != hipSuccess) {
-            /* A launch failure names what it saw: the error, the grid, the workgroup and the width
-             * the launcher chose. */
+            /* Under RAD_R3D_TRACE, a launch failure prints the error, the grid, the workgroup
+             * size and the chosen width. */
             if (r3d_trace_on())
                 std::fprintf(stderr, "[r3d] attn: %s on the attn launch: grid (%u, %u, %u) block "
                                      "%d waves %d gqa %d splits %d rows %d n_seq %d jcap %d\n",
@@ -1238,7 +1108,7 @@ int launch(const Args& A, long out, long stream)
         }
     }
 
-    if (B.trace_buf) {   /* the record, spoken at the launch that wrote it: one sync, under the flag */
+    if (B.trace_buf) {   /* RAD_R3D_TRACE: sync the stream and print this launch's record */
         (void)hipStreamSynchronize(st);
         DevRec rec;
         if (hipMemcpy(&rec, (const void*)B.trace_buf, sizeof rec, hipMemcpyDeviceToHost) == hipSuccess)
@@ -1249,7 +1119,7 @@ int launch(const Args& A, long out, long stream)
         const long long rows = A.rows;              /* the plane's rows: cu[n_seq], or n_seq * q_len */
         const long long total = rows * A.n_head;
         dim3 rg((unsigned)((total + 3) / 4));
-        (void)hipGetLastError();                                /* the same rule, the same reason */
+        (void)hipGetLastError();                                /* clear first, as above */
         R3D_KLAUNCH(attn_reduce, rg, dim3(128), st, B, rows);
         const hipError_t re = hipGetLastError();
         if (re != hipSuccess) {
@@ -1271,11 +1141,10 @@ extern "C" int r3d_attn_decode_h128(long q, long kv, long bt, long seqused, long
                                     int window, int causal, float scale, int kv_dt, long q_ld,
                                     long out_ld, int splits, long scratch, long stream)
 {
-    /* `cu` is the ragged query descriptor and it is served: with it, `q_len` is the query plane's
-     * row count (see the launchers' header) and the rows per sequence are cu[s+1] - cu[s]. The
-     * width and the split count are picked on the average sequence, because the descriptor is on the
-     * device and this function reads no device memory -- both numbers choose how many row slots are
-     * duplicated, and neither touches a result. */
+    /* With `cu` (the ragged descriptor) `q_len` is the query plane's row count (see the launchers'
+     * header) and a sequence's rows are cu[s+1] - cu[s]. The width and split count are picked on
+     * the average sequence because the descriptor is device memory; both only change how many row
+     * slots are duplicated, never a result. */
     if (splits < 0) return -2;
     if (gqa <= 0 || n_head <= 0 || n_head % gqa) return -2;
     if (cu && num_seqs <= 0) return -2;
@@ -1300,15 +1169,12 @@ extern "C" int r3d_attn_prefill_h128(long q, long kv, long bt, long seqused, lon
                                      long q_ld, long out_ld, long scratch, long stream)
 {
     (void)scratch;                       /* the prefill kernel has no split pass, so no partials */
-    /* The width is kWaves with a descriptor or without one. A rectangular prefill's q_len is the
-     * whole chunk, so every slot of a four-wave workgroup is used; a ragged step's rows are laid
-     * out by the same workgroup, and the width that matters on a step with only a few rows in it is
-     * how many waves the GPU gets, not how many slots go unused. A 5-row step at gqa 8 is one
-     * workgroup per KV head: two waves is 2 x 2 wavefronts over 16 CUs, four waves is 2 x 4, and
-     * the measured 5-row launch at 2048 keys is 16.7 ms at four waves against 19.3 at two, with the
-     * duplicate slots costing nothing because a wave walks its tile once whatever rows it carries.
-     * A step whose rows are one per sequence is a decode step and goes to the decode entry, which
-     * picks its width on the average sequence -- that is where a narrow workgroup is the win. */
+    /* Four waves with or without a descriptor. A rectangular prefill's q_len is the whole chunk, so
+     * every slot is used. For a ragged step with few rows the number of waves on the GPU matters
+     * more than unused slots: a 5-row step at gqa 8 is one workgroup per KV head, and four waves run
+     * faster than two (16.7 vs 19.3 ms at 2048 keys), since a wave walks its tile once whatever rows
+     * it carries. A step with one row per sequence is a decode step and goes to the decode entry,
+     * where a narrow workgroup pays. */
     Args A;
     const int waves = kWaves;
     const int e = fill(A, q, kv, bt, seqused, k_desc, v_desc, cu, cu ? q_len : 0, num_seqs,
@@ -1332,32 +1198,22 @@ enum { P_Q = 0, P_KV = 1, P_BT = 2, P_SU = 3, P_KDS = 4, P_VDS = 5, P_CU = 6, P_
 
 /* ---- arming the device record ring ----------------------------------------------------------
  *
- * The kernel's four globals (`r3d_dev_budget`, `r3d_dev_launches`, `r3d_dev_widx`, `r3d_dev_ring`)
- * are plugin-owned, at file scope, `extern "C"` so the names are the ones the code object carries.
- * `RadArgs` is the row's ABI and the plan builds it, so nothing joins it; the kernel's launch
- * parameters are fixed, so nothing joins them. The shim's whole instrument surface is therefore four
- * symbols:
+ * The ring's four globals are plugin-owned, at file scope, and `extern "C"` so the code object
+ * carries these names. The shim's interface to them, all under RAD_R3D_TRACE:
  *
- *   hipGetSymbolAddress, once, cached            -- the counter, for the plan line to quote
- *   hipMemcpyToSymbol of the budget, under RAD_R3D_TRACE ONLY -- 0 means the kernel records nothing
- *   hipMemcpy of the ring, under RAD_R3D_TRACE   -- the drain: the records to stderr, host-side
- *   hipMemcpyToSymbol of the write index         -- the drain's reset, so a record is spoken once
+ *   hipGetSymbolAddress of the budget, once  -- checks the symbol resolves before arming
+ *   hipMemcpyToSymbol of the budget          -- RAD_R3D_DEV records (default 64; 0 records nothing)
+ *   hipMemcpyFromSymbol of the counter       -- quoted on the plan line as `dev_launches=`
+ *   hipMemcpyFromSymbol of the ring          -- the drain: records printed as "[r3d dev]" lines
+ *   hipMemcpyToSymbol of the write index     -- the drain's reset, so each record prints once
  *
- * The budget is re-written on every traced call, not once per process, and `RAD_R3D_DEV` is its
- * size (default 64). Re-arming is one 4-byte copy under a flag that already does four device reads
- * a line, and it buys the property the board needs: a harness can arm exactly -- arm 3, launch 10,
- * count 3 -- between launches, with the kernel untouched. The last write wins, so a served ladder
- * re-arms at every prefill and the budget never runs dry mid-request.
+ * The drain and the arming run on every traced shim call, drain first. The budget is rewritten on
+ * each call, so a caller can arm an exact count between launches (arm 3, launch 10, get 3) and
+ * the last write wins. A replayed step makes no shim call, so its records print at the next call,
+ * one step late; `L` and `ctx` restore the order.
  *
- * The drain runs on every traced call too, BEFORE the arming: it speaks the records the kernel has
- * written since the last call. For a played step there is no shim call in between, so its lines land
- * at the next step's shim call, one step behind the step they describe. The record's `L` and `ctx`
- * restore the order, and the plan line's `dev_launches=` quote is the counter the kernel itself ran,
- * so the two prints of one step line up and the gap between them is the played pass, measured.
- *
- * Inert when the flag is unset: `dev_ring_drain` and `dev_trace_arm` return before the runtime call,
- * the budget keeps its initial 0, and every kernel gates on it. Nothing here is on the served path
- * at all: the shim calls them from inside its existing `r3d_trace_on()` arm.
+ * With the flag unset, `dev_ring_drain` and `dev_trace_arm` return before any runtime call and the
+ * budget stays 0.
  */
 enum { kDevPrintDefault = 64 };
 
@@ -1379,11 +1235,10 @@ void* g_dev_launches = nullptr;
 
 unsigned long long dev_launch_count()
 {
-    /* `hipMemcpyFromSymbol`, not `hipGetSymbolAddress` + `hipMemcpy`: the arming's
-     * `hipMemcpyToSymbol` resolves the stub the runtime owns, and in the engine process a
-     * `hipGetSymbolAddress` on a dlopened plugin's symbol can hand back an address the kernel's
-     * module does not write to -- the read is a copy of the initial value, forever. The same stub
-     * resolution the arming uses is the one the read must use. */
+    /* `hipMemcpyFromSymbol`, not `hipGetSymbolAddress` + `hipMemcpy`: in the engine process
+     * `hipGetSymbolAddress` on a dlopened plugin's symbol can return an address the kernel's module
+     * does not write, so the read would only ever see the initial value. The read must resolve the
+     * symbol the same way the arming's `hipMemcpyToSymbol` does. */
     unsigned long long n = 0;
     (void)hipMemcpyFromSymbol(&n, HIP_SYMBOL(r3d_dev_launches), sizeof n);
     return n;
@@ -1392,9 +1247,9 @@ unsigned long long dev_launch_count()
 void* g_dev_widx = nullptr;
 void* g_dev_ring = nullptr;
 
-/* One record, spoken. The format is the line the board parses: the same field names in the same
- * order, `ids=` the row's columns, `kh` the fold of the FIRST block it walks and `khL` the fold of
- * the LAST, `idsum` a fold of every column so a long row is one comparable number. */
+/* Prints one record as a "[r3d dev] L=... ids=... idsum=..." line; the field names and order are
+ * a format log tooling parses. `kh` folds the first block walked, `khL` the last, and `idsum` every
+ * table column. */
 static void dev_speak(const DevRec& r)
 {
     std::fprintf(stderr, "[r3d dev] L=%llu dec=%d n_seq=%d rows=%d q_len=%d s=%d len=%d span=%d "
@@ -1412,16 +1267,13 @@ static void dev_speak(const DevRec& r)
                  r.rowok);
 }
 
-/* The ring, spoken. The drain is a D2H of at most kDevRing records (55 KiB) on a traced call: one
- * sync per shim call, under the flag only. The index is the kernel's own, so the drain can never
- * read past what the kernel wrote, and the reset is to 0, not to a moving base: a record is spoken
- * exactly once, and the counter -- which the drain does not touch -- is the launch census. */
+/* Copies at most kDevRing records (55 KiB) from the ring and prints them, then resets the write
+ * index to 0 so each record prints once. The index is the kernel's own, so the drain never reads
+ * past what the kernel wrote. The launch counter is not touched. */
 void dev_ring_drain()
 {
     if (!r3d_trace_on()) return;
-    /* The reads go through `hipMemcpyFromSymbol`, the same stub resolution the arming's
-     * `hipMemcpyToSymbol` uses (see `dev_launch_count`): in the engine process a
-     * `hipGetSymbolAddress` on a dlopened plugin's symbol is not the address the kernel writes. */
+    /* Read through `hipMemcpyFromSymbol` for the reason given at `dev_launch_count`. */
     unsigned w = 0;
     if (hipMemcpyFromSymbol(&w, HIP_SYMBOL(r3d_dev_widx), sizeof w) != hipSuccess) return;
     if (w == 0) return;
@@ -1431,19 +1283,18 @@ void dev_ring_drain()
         return;
     for (unsigned i = 0; i < keep; ++i) dev_speak(buf[i]);
     if (w > keep)
-        std::fprintf(stderr, "[r3d dev] ring: %u records written, %u kept, %u counted and dropped "
-                             "-- the counter is the truth\n", w, keep, w - keep);
+        std::fprintf(stderr, "[r3d dev] ring: %u records written, %u kept, %u counted and dropped\n", w, keep, w - keep);
     const unsigned zero = 0u;
     (void)hipMemcpyToSymbol(HIP_SYMBOL(r3d_dev_widx), &zero, sizeof zero);
 }
 
 void dev_trace_arm()
 {
-    if (!r3d_trace_on()) return;                   /* the gate: with the flag unset, nothing here */
+    if (!r3d_trace_on()) return;                   /* RAD_R3D_TRACE unset: no-op */
     int want = kDevPrintDefault;
     if (const char* e = std::getenv("RAD_R3D_DEV")) {
         const int v = std::atoi(e);
-        if (v > 0) want = v;                       /* a harness arms exactly; 0 disables */
+        if (v > 0) want = v;                       /* an exact count; 0 disables */
         else if (v == 0) want = 0;
     }
     static bool said = false;
@@ -1458,33 +1309,26 @@ void dev_trace_arm()
 }
 
 
-/* ---- the plan line: the one number a launcher has never been able to read ----------------------
+/* ---- the plan line ----------------------------------------------------------------------------
  *
- * `cu_seqlens` is device memory -- the header's rule is that a launcher reads none of it -- and the
- * walk's bound is a single value inside it: `cu[0]`. The served descriptors start at row 0. Under
- * RAD_R3D_TRACE=1 this stops being an inference: the shim copies the descriptor's `n_seq + 1` i32
- * and prints them, once per shape.
+ * Under RAD_R3D_TRACE, prints one "[r3d] plan:" line per distinct shape: the batch geometry, the
+ * walk's reach (jcap), the chosen width and splits, `seqused[0]`, the operand addresses, the
+ * kernel's launch counter, the descriptor (`cu[0]`, `cu[n_seq]`, all of it when n_seq + 1 <= 8) and
+ * the first row of the block table. The launcher never reads `cu_seqlens`, so this is the only
+ * place its contents are visible.
  *
- * Inert when the flag is unset. Everything below sits behind `r3d_trace_on()`, the cached flag load
- * `R3D_NO` already pays on a path that is failing anyway: no copy, no latch, no syscall, and no
- * operand the served path did not already touch.
+ * Every read is bounded. The descriptor holds exactly `n_seq + 1` ints (checked by the shim) and
+ * the copy is capped at `kCuPrint`, with the last entry read separately when the plane is wider.
+ * `seqused` is read for its first int only. The descriptor is read only after `r3d_has(CU)`, and
+ * `SU->data` is required at the top of the shim. `hipMemcpyDefault` works for VRAM and host-mapped
+ * planes alike.
  *
- * The reads, all of them bounded. The descriptor's plane holds exactly `n_seq + 1` ints -- the shim
- * has proved `r3d_numel(CU) == n_seq + 1` above -- and the copy is capped at `kCuPrint` of them,
- * with the LAST entry taken by its own one-int read when the plane is wider, so the printed total is
- * the total and nothing past the plane is touched. `seqused` is read for ONE int, its first, because
- * `ctx` is `seqused[0]` and a plan line that cannot say where the walk bounds is
- * half a line. A null pointer is never dereferenced: the descriptor is read only after `r3d_has(CU)`
- * said it carries bytes, and `SU->data` was required at the top of the shim. `hipMemcpyDefault` is
- * placement-agnostic, so the same line prints for a vram plane and for a host-mapped one.
- *
- * The latch is keyed on the shape -- n_seq, the plane's rows, the kernel's q_len, the table's
- * columns -- because the engine calls this shim once a layer a step and 42 identical lines are
- * noise. It is a plain static array with no lock: the worst a race can do here is print a shape
- * twice, and nothing at all when the flag is off. */
+ * The latch is keyed on the shape (n_seq, the plane's rows, the kernel's q_len, the table's
+ * columns) because the shim runs once a layer a step. It is a plain static array with no lock: a
+ * race can at worst print a shape twice. */
 enum { kCuPrint = 64, kPlanShapes = 512 };
 
-/* RAD_R3D_TRACE=2 is the same instrument with ctx in the shape key (see plan_once). Read once. */
+/* RAD_R3D_TRACE=2: the same plan line with ctx added to the shape key (see plan_once). Read once. */
 bool r3d_trace_wide()
 {
     static int wide = -1;
@@ -1495,12 +1339,10 @@ bool r3d_trace_wide()
     return wide != 0;
 }
 
-/* The shape key: n_seq, the plane's rows, the kernel's q_len, the table's
- * columns. `ctx` rides along ONLY under RAD_R3D_TRACE=2, which is the wide form of the same
- * instrument: a serving engine's requests all share the shape (rows 1, one sequence, 128 columns)
- * and differ only in how deep the context has grown, so with the narrow key the block table prints
- * once for the FIRST request and the requests that matter -- the ones after six blocks are in play
- * -- never print. The default (=1) is the narrow key. */
+/* The plan line's shape key: n_seq, the plane's rows, the kernel's q_len, the table's columns and,
+ * under RAD_R3D_TRACE=2 only, `ctx`. Serving requests usually share one shape and differ only in
+ * context depth, so the narrow key prints the block table once, for the first request; the wide
+ * key prints again as the context grows. */
 struct PlanKey { long long n_seq, rows, q_len, cols, ctx; };
 
 bool plan_once(long long n_seq, long long rows, long long q_len, long long cols, long long ctx,
@@ -1531,8 +1373,7 @@ void plan_line(bool decode, const RadTensor* Q, const RadTensor* KV, const RadTe
     if (r3d_p(SU) && hipMemcpy(&ctx0, r3d_p(SU), sizeof(int), hipMemcpyDefault) == hipSuccess)
         ctx = ctx0;
 
-    /* The latch lives here, after the one-int ctx read, because the wide key is keyed on it. This
-     * whole function is called only under the flag, so the served path pays none of it. */
+    /* The latch comes after the ctx read because the wide key includes ctx. */
     if (!plan_once(n_seq, rows, q_len, bt_cols, ctx, by_ctx)) return;
 
     std::fprintf(stderr,
@@ -1542,24 +1383,17 @@ void plan_line(bool decode, const RadTensor* Q, const RadTensor* KV, const RadTe
                  r3d_has(CU) ? (unsigned)CU->rank : 0u, r3d_has(CU) ? r3d_numel(CU) : 0LL, ctx,
                  bt_cols, bt_rs, max_ctx, jcap, waves, splits);
 
-    /* The ADDRESSES the launch bakes. The engine captures this step into a graph after two eager
-     * decode steps -- one request generating twelve tokens calls this shim for the prefill and for
-     * two decode steps, and for nothing after that -- and a replay re-runs the kernels with the
-     * ARGUMENTS frozen at capture. The planes a step reads are named by address in those arguments,
-     * so if a later request's plan lives at different addresses, a replay is reading the earlier
-     * request's planes and no per-row fixture, ladder or descriptor print can see it. `%p` of the
-     * five operands this step reads and the one it writes, nothing dereferenced. */
+    /* The addresses the launch bakes into its arguments. A replayed graph re-runs the kernels with
+     * the arguments frozen at capture, so if a later request's planes live at other addresses the
+     * replay reads the earlier request's planes. Printed with `%p`, nothing dereferenced. */
     std::fprintf(stderr, " q=%p kv=%p bt=%p cu=%p su=%p out=%p part=%p",
                  r3d_p(Q), r3d_p(KV), r3d_p(BT), r3d_p(CU), r3d_p(SU), r3d_p(O), scratch);
 
-    /* The kernel's own launch counter, quoted on the shim's line so the two prints of one step line
-     * up: the shim sees a served request's prefill and its first two decode steps, the kernel sees
-     * every one, and the gap between the two numbers IS the played pass. One 8-byte device read,
-     * under the flag, on a line that is already reading three planes. */
+    /* The kernel's own launch counter, so the shim's line and the kernel's records line up; the
+     * shim sees only eagerly issued steps, the kernel every launch. One 8-byte device read. */
     std::fprintf(stderr, " dev_launches=%llu", (unsigned long long)dev_launch_count());
 
-    if (!r3d_has(CU)) {           /* an absent optional operand is ABSENT, not a refusal: the
-                                     rectangular step is the common case and it says so */
+    if (!r3d_has(CU)) {           /* no descriptor: a rectangular step */
         std::fprintf(stderr, " cu=absent (rectangular)");
     } else {
         int cuh[kCuPrint];
@@ -1583,13 +1417,10 @@ void plan_line(bool decode, const RadTensor* Q, const RadTensor* KV, const RadTe
         }
     }
 
-    /* The block table's own entries for the row this step walks. The walk's arithmetic -- which
-     * block holds key j -- is the one part of the plan this file cannot check from the descriptor,
-     * and a reused block id inside one row, or an id the cache does not have, is invisible to every
-     * per-row fixture (the drivers deal their ids from a shuffled pool, so they cannot produce the
-     * first). Bounded three ways: at most `kCuPrint` columns of ONE row, only columns the shim has
-     * already proved the plane covers (the reach check above), and row 1's first entry only when
-     * there is a row 1. A -1 is an unmapped block and prints as -1, which is what the kernel sees. */
+    /* The block table entries of the first row the step walks: a reused block id inside one row,
+     * or an id the cache does not have, is otherwise invisible. Bounded to `kCuPrint` columns of row
+     * 0, only columns the shim proved the plane covers, plus row 1's first entry when there is a
+     * row 1. An unmapped block prints as -1, as the kernel sees it. */
     if (r3d_has(BT)) {
         const int take = (int)(bt_cols < kCuPrint ? bt_cols : kCuPrint);
         int bth[kCuPrint];
@@ -1628,11 +1459,9 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     const RadTensor* CU = r3d_opt(a, P_CU);
     if (!Q || !KV || !BT || !SU || !O) return R3D_NO(RAD_E_INVAL);
     if (!Q->data || !KV->data || !BT->data || !SU->data || !O->data) return R3D_NO(RAD_E_INVAL);
-    /* `cu_seqlens` present is a ragged batch, and this file serves it: the row map, the positions,
-     * the mask and the walk all key off the sequence a row belongs to, which is what the descriptor
-     * says it is (see "the ragged batch" in the header). The descriptor is device memory, so what
-     * the shim can check here is its shape and dtype; what it cannot see -- cu[0] == 0, monotonicity,
-     * cu[n_seq] == the plane's row count -- the kernel clamps, exactly as libref's row loop does. */
+    /* `cu_seqlens` present means a ragged batch (see "the ragged batch" in the header). The shim
+     * can check the descriptor's shape and dtype; what it cannot see (cu[0] == 0, monotonicity,
+     * cu[n_seq] == the plane's row count) the kernel clamps, as libref's row loop does. */
     const bool ragged = r3d_has(CU);
 
     const int head_dim = (int)r3d_geti_or(a, "head_dim", r3d_dim(Q, (int)Q->rank - 1));
@@ -1643,29 +1472,24 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     const int window = (int)r3d_geti_or(a, "window", 0);
     const float scale = (float)r3d_getf(a, "scale", 0.0);
 
-    /* The kernel's f16 query path is written -- `A.q16` makes the widening a copy -- but the
-     * launcher's signature carries one dtype slot, `kv_dt`, and it is the cache's, so the shim has
-     * no way to tell the kernel that q is f16: the flag would sit at zero and the kernel would
-     * widen f16 codes as bf16, a 2^9 scale error, not a rounding difference. Refused until `q_dt`
-     * joins the signature. A row set that widens `q_dtype` to "bf16 f16" must land with that
-     * parameter. */
+    /* The kernel has an f16 query path (`A.q16`), but the launcher's only dtype argument, `kv_dt`,
+     * is the cache's, so the shim cannot tell the kernel that q is f16 and it would widen f16 as
+     * bf16. f16 queries are refused until a `q_dt` argument exists; widening the row's `q_dtype` to
+     * "bf16 f16" requires it. */
     if (Q->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
     if (O->dtype != Q->dtype) return R3D_NO(RAD_E_DTYPE);
     if (KV->dtype != RAD_BF16 && KV->dtype != RAD_F8E4M3) return R3D_NO(RAD_E_DTYPE);
     if (BT->dtype != RAD_I32 || SU->dtype != RAD_I32) return R3D_NO(RAD_E_DTYPE);
     const bool quant = KV->dtype == RAD_F8E4M3;
-    /* A quantised cache with no descale plane is a cache with scale 1.0, not a refused geometry.
-     * The reference reads the planes only when they are there:
+    /* A quantised cache without descale planes has scale 1.0. The reference reads the planes only
+     * when present:
      *   const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
      *   const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
-     * and says it in prose ("the scales are the reader's descales, default 1.0").
-     * The op's operand description describes both planes as ABSENT, so a fixture that draws this
-     * op hands every implementation null descales; refusing them is refusing the case class. The
-     * kernel already carries the null through and widens at 1.0 (`A.kds ? ... : 1.0f`). */
+     * and the op's operand description marks both optional, so the kernel carries the null through
+     * (`A.kds ? ... : 1.0f`). */
     const bool kgiven = KDS && KDS->data, vgiven = VDS && VDS->data;
     if (!quant && (kgiven || vgiven))
-        return R3D_NO(RAD_E_SHAPE);   /* a bf16 cache has no scales: the caller believes something
-                                         the op does not have, and dropping that quietly is worse */
+        return R3D_NO(RAD_E_SHAPE);   /* a bf16 cache has no scales; refused, not ignored */
     if (quant && kgiven && !r3d_is_f32(KDS)) return R3D_NO(RAD_E_DTYPE);
     if (quant && vgiven && !r3d_is_f32(VDS)) return R3D_NO(RAD_E_DTYPE);
 
@@ -1683,8 +1507,7 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     const long long n_seq = r3d_numel(SU);
     if (n_seq < 1 || n_seq > 65536) return R3D_NO(RAD_E_SHAPE);
     /* The descriptor is [n_seq + 1] i32, contiguous: the kernel reads it with int indices, so an
-     * i64 plane is not a wider form of the same operand, it is the wrong operand, and the fix is the
-     * plane the op's description names. `seqused` is read the same way and is checked below. */
+     * i64 plane is refused rather than misread. `seqused` is checked the same way below. */
     if (ragged) {
         if (CU->dtype != RAD_I32) { r3d_trace_desc("cu_seqlens", CU); return R3D_NO(RAD_E_DTYPE); }
         if (!r3d_contig(CU)) { r3d_trace_desc("cu_seqlens", CU); return R3D_NO(RAD_E_STRIDE); }
@@ -1698,12 +1521,10 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     if (!r3d_head_rows(O, kHeadDim, &ot, &oh, &old) || oh != n_head) { r3d_trace_desc("out", O);
         return R3D_NO(RAD_E_STRIDE); }
     if (qld % 8 || old % 8) return R3D_NO(RAD_E_STRIDE);
-    /* Rows per sequence: the plane's row count divided by the sequence count when the batch is
-     * rectangular, and nothing at all when it is ragged -- the reference's `q_len = cus ? 0 :
-     * rows / n_seq` (the reference's reading), with the plane's row count (its `rows`, and the number a
-     * descriptor's cu[n_seq] equals) carried to the launcher as the row count. A ragged batch is not
-     * required to divide: 5 rows over 3 sequences is the case the engine sends, and `qt % n_seq` is
-     * exactly the shape it arrives in. */
+    /* Rows per sequence: the plane's row count over the sequence count for a rectangular batch.
+     * For a ragged one the reference's `q_len = cus ? 0 : rows / n_seq` applies, and the plane's
+     * row count (which cu[n_seq] equals) is passed as the row count. A ragged batch need not divide
+     * evenly (5 rows over 3 sequences is a normal shape). */
     if (qt < 1) return R3D_NO(RAD_E_SHAPE);
     if (qt > 2147483000LL) return R3D_NO(RAD_E_SHAPE);   /* the kernel's row index is 32-bit */
     if (!ragged && qt % n_seq) return R3D_NO(RAD_E_SHAPE);
@@ -1720,13 +1541,12 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     /* The cache is dense and the launcher assumes it: a slot's halves must land on a 16-byte
      * boundary at every slot, so the cache's strides have to be the dense ones. */
     if (!r3d_contig(KV)) { r3d_trace_desc("kv", KV); return R3D_NO(RAD_E_STRIDE); }
-    /* The table is the engine's, sized to the step, so its geometry comes from the tensor and not
-     * from the band: `max_blocks` is the TABLE's columns, the row pitch is `stride[rank-2]` and the
-     * column stride `stride[rank-1]` (the reference's table read). A five-token prompt carries
-     * [n_seq, 1]: one block per sequence, because nothing is behind it. What the shim insists on is
-     * that every index the walk can reach is inside the plane -- the last row's pitch plus the last
-     * column it can name: a contiguity check asks for a table as wide as the cache and refuses a
-     * step the engine sends. */
+    /* The table is the engine's, sized to the step, so its geometry comes from the tensor: the
+     * columns are `shape[last]`, the row pitch `stride[rank-2]` and the column stride
+     * `stride[rank-1]` (the reference's table read). A five-token prompt carries [n_seq, 1]. The
+     * shim requires that every index the walk can reach (the last row's pitch plus the last column)
+     * is inside the plane; a contiguity check would demand a table as wide as the cache and refuse
+     * steps the engine sends. */
     const long long bt_cols = BT->rank >= 2 ? r3d_dim(BT, (int)BT->rank - 1) : (n_seq ? r3d_numel(BT) / n_seq : 0);
     const long long bt_rs   = BT->rank >= 2 ? BT->stride[BT->rank - 2] : bt_cols;
     const long long bt_cs   = BT->rank >= 2 ? BT->stride[BT->rank - 1] : 1;
@@ -1743,20 +1563,17 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
 
     int splits = decode ? (int)r3d_geti_or(a, "splits", 0) : 1;
     if (splits < 0) return R3D_NO(RAD_E_SHAPE);
-    /* The width the launcher will cut the grid on. A ragged batch has no per-sequence length to pick
-     * on -- the descriptor is on the device -- so the average sequence decides, as it does in the
-     * entry itself. It moves duplicated row slots between tiles and no result. */
+    /* The width the launcher will use; a ragged batch is picked on the average sequence, as in the
+     * entry itself. */
     const long long per = ragged ? (rows + n_seq - 1) / n_seq : q_len;
     const int waves = pick_waves((int)per, gqa);
     const int tiles = (int)((per + tok_per_block(gqa, waves) - 1) / tok_per_block(gqa, waves));
     if (splits == 0) splits = decode ? pick_splits(tiles, (int)n_seq, kv_heads) : 1;
     if (splits > 64) splits = 64;
     if (splits > 1) {
-        /* The arena the engine offers is the bound: halve the split count until the partials fit,
-         * down to 1, which needs none -- and one slice is the whole walk in one block, the same
-         * keys in the same order, so it is not a degraded answer, it is the answer without the
-         * optimisation. A row that refuses a band because an optimisation has no room is a row that
-         * tells the user to go away; the number is the same either way. */
+        /* Halve the split count until the partials fit the arena the engine offers, down to 1,
+         * which needs none. One slice is the same keys in the same order, so a smaller count
+         * changes speed, not the result, and the band is never refused for lack of scratch. */
         for (;;) {
             if (splits <= 1) { splits = 1; break; }
             const long long need = qt * n_head * (long long)splits * kPartStride * 4;
@@ -1769,15 +1586,10 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
                                                             (long long)splits * kPartStride * 4));
     }
 
-    /* The plan line: what the descriptor actually says, once per shape, under the flag only. The
-     * `q_len` printed is the one the kernel is given -- 0 with a descriptor, the per-sequence length
-     * without one (the reference's reading) -- and `rows` is the plane's row count, which is what
-     * cu[n_seq] is required to equal. Printed AFTER every check: a refused step's shape is the
-     * refusal lines' business, not this one's. */
-    /* The kernel is the one instrument that a played step runs through: its records sit in the ring
-     * until a shim call drains them, so drain FIRST -- the records written since the last call, the
-     * played steps included -- and THEN arm the budget this launch will spend, under the flag only
-     * (both functions gate themselves on the same cached load). */
+    /* Trace output, all under RAD_R3D_TRACE and after every check (a refused step is reported by
+     * the refusal lines). The ring is drained first, printing records written since the last call
+     * (replayed steps included), then re-armed for this launch. The plan line's `q_len` is the
+     * kernel's (0 with a descriptor) and `rows` is the plane's row count. */
     dev_ring_drain();
     dev_trace_arm();
 
@@ -1786,9 +1598,8 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
                   n_seq, rows, ragged ? 0LL : q_len, bt_cols, bt_rs, bt_cs, block_size, max_ctx,
                   waves, splits, r3d_trace_wide());
 
-    /* The entries take the descriptor's row count where a rectangular batch has its per-sequence
-     * length: `rows` is the plane's, which is what cu[n_seq] equals and what libref counts off the
-     * tensor, and `q_len` is the per-sequence length only when there is no descriptor. */
+    /* With a descriptor the entries take the plane's row count where a rectangular batch passes
+     * its per-sequence length. */
     const int e = decode
         ? r3d_attn_decode_h128(r3d_addr(Q), r3d_addr(KV), r3d_addr(BT), r3d_addr(SU),
                                r3d_addr(KDS), r3d_addr(VDS), r3d_addr(CU), r3d_addr(O), (int)n_seq,

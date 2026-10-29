@@ -27,6 +27,7 @@
  */
 #include "server.h"
 #include "server_priv.h"
+#include "oai.h"
 #include "text_split.h"
 
 #include "gen/audio.h"
@@ -279,8 +280,12 @@ bool Server::speech_stream_loop(SpeechSession& s, WsConn& ws) {
                   "session.close");
             return false;
         }
-        const json j = json::parse(msg, nullptr, /*allow_exceptions=*/false);
-        if (j.is_discarded() || !j.is_object() || !j.contains("type") || !j["type"].is_string()) {
+        /* Bounded like a request body: a deep bracket nest is a legal frame, and tearing its
+         * tree down recurses once per level. */
+        bool over = false, deep = false;
+        const json j = parse_json_bounded(msg, 0, &over, &deep);
+        if (j.is_discarded() || over || deep || !j.is_object() || !j.contains("type") ||
+            !j["type"].is_string()) {
             error("a client message is a JSON object with a string `type`");
             return false;
         }

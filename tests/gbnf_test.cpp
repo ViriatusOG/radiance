@@ -1434,9 +1434,9 @@ TEST(gbnf_a_length_bound_past_two_thousand_is_held_exactly) {
 }
 
 /* Bounded repetitions of one operand share one chain of links, so a schema's many length bounds
- * cost its longest once rather than their sum. 200 properties at `maxLength: 4000` were 200 chains,
- * past the compile budget (a tool schema like that is refused in full); shared, they compile, and
- * every bound, short or long, string or array, is still held exactly. */
+ * cost its longest once rather than their sum. 200 properties at `maxLength: 4000` as 200 chains
+ * would exceed the compile budget; shared, they compile, and every bound, short or long, string
+ * or array, is held exactly. */
 TEST(gbnf_bounds_over_one_operand_share_their_links) {
     auto bv = bpe_like(59, 1500);
     std::string props = R"("a":{"type":"string","maxLength":4000},"b":{"type":"string","maxLength":7},)"

@@ -246,12 +246,17 @@ static int attn_paged_prefill(const RadArgs* a, [[maybe_unused]] RadStream strea
     return RAD_OK;
 }
 
+/* attn_paged_tree's ninth operand, `spec_parent` (rad_drafter_tree), is read here too, as libref
+ * reads it: -2 an ordinary causal row; else the row's parent's index within its sequence's rows
+ * (-1 for the block's first). Inside the block such a row sees itself and its ancestors only, and
+ * its window is measured from the block's first position plus its depth. */
 AVX_KERNEL(attn_paged) {
     if (a->n_t < 8) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
     const RadTensor* kdes = rad_arg_in(a, 4);
     const RadTensor* vdes = rad_arg_in(a, 5);
     const RadTensor* cus  = rad_arg_in(a, 6);
+    const RadTensor* tpar = a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
     if (!q->data || !kv->data || !bt->data || !su->data || !o->data) return RAD_E_INVAL;
 
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
@@ -294,7 +299,7 @@ AVX_KERNEL(attn_paged) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     /* Uniform long queries take the panel form; ragged (cus) inputs stay here. */
-    if (!cus && q_len >= 32) return attn_paged_prefill(a, stream);
+    if (!cus && q_len >= 32 && !tpar) return attn_paged_prefill(a, stream);
     /* Work units are (token, kv-head) groups: the gqa query rows of a group share every key and
      * value row, so each is widened once for gqa dots/axpys. Per-row arithmetic is unchanged. */
     const int64_t total = rows * kv_heads;
@@ -317,6 +322,25 @@ AVX_KERNEL(attn_paged) {
         if (qlen <= 0) continue;
         const int64_t ctx = ldi(su, offlin(su, s));
         const int64_t pos = ctx - qlen + i;
+        /* A tree row: its ancestors inside the block (a bit per row) and its depth. */
+        const int64_t base = ctx - qlen;
+        bool tree = false;
+        uint64_t tmask = 0;
+        int64_t tdep = 0;
+        if (tpar) {
+            int64_t pj = ldi(tpar, offlin(tpar, tok));
+            if (pj != -2 && i < 64) {
+                tree  = true;
+                tmask = 1ull << i;
+                for (int64_t at = i; pj >= 0 && pj < at; ) {
+                    tmask |= 1ull << pj;
+                    ++tdep;
+                    at = pj;
+                    pj = ldi(tpar, offlin(tpar, tok - i + pj));
+                }
+            }
+        }
+        const int64_t wpos = tree ? base + tdep : pos;
         const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
         const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
 
@@ -393,8 +417,9 @@ AVX_KERNEL(attn_paged) {
 
         for (int64_t j = 0; j < ctx; ++j) {
             if (causal ? (j > pos) : (j >= ctx)) continue;
+            if (tree && j >= base && !((tmask >> (j - base)) & 1)) continue;
             if (window > 0) {
-                const int64_t d = pos - j;
+                const int64_t d = wpos - j;
                 if (causal ? (d >= window) : (d >= window || d <= -window)) continue;
             }
             if (j / block_size >= max_blocks) break;   /* past the block table's width */
@@ -720,6 +745,14 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
     return true;
 }
 #endif
+
+/* attn_paged with its tree operand present, which attn_paged reads (see there). Refused without
+ * one, and for a non-causal layer. */
+AVX_KERNEL(attn_paged_tree) {
+    if (a->n_t < 9 || !rad_arg_in(a, 8)) return RAD_E_INVAL;
+    if (p_int(a, "causal", 1) != 1) return RAD_E_UNSUPPORTED;
+    return AVX_FN(avx_attn_paged)(a, stream);
+}
 
 /* ------------------------------------------------------------------ attn_dense */
 /* Unpaged, unquantised attention (vision towers): `cu_seqlens` bounds one image or attention

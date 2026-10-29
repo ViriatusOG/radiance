@@ -1,15 +1,13 @@
-/* r3d_launch.h -- the two lines a libr3d unit needs to launch a kernel.
+/* r3d_launch.h -- kernel launch macros for libr3d units.
  *
- * R3D_KLAUNCH is the triple-chevron form, which the engine services on its own queues because the
- * stream it hands a launch is the one hipLaunchKernel accepts (docs/PLUGIN.md §5). It is written as
- * a macro so a test can define it and drive the same sources through a host SIMT emulator; a build
- * does not, and gets the chevron.
+ * R3D_KLAUNCH is the triple-chevron launch on the stream the engine hands the entry point, which is
+ * a stream hipLaunchKernel accepts (docs/PLUGIN.md §5). It is a macro so a test can redefine it and
+ * run the same sources through a host SIMT emulator.
  *
- * R3D_DYN_LDS declares a kernel's dynamic LDS, sized by the launch: `extern __shared__` in a build.
- * RDNA3 gives a workgroup the same 64 KiB RDNA4 does, so a tile sized for libr4d fits here too.
+ * R3D_DYN_LDS declares a kernel's dynamic LDS, sized by the launch. RDNA3 gives a workgroup 64 KiB,
+ * as RDNA4 does, so a tile sized for libr4d fits.
  *
- * R3D_KNAME names a kernel in a context where commas would split a macro argument, the way
- * HIP_KERNEL_NAME does for hipLaunchKernelGGL.
+ * R3D_KNAME wraps a kernel name that contains commas, like HIP_KERNEL_NAME.
  */
 #ifndef R3D_LAUNCH_H
 #define R3D_LAUNCH_H

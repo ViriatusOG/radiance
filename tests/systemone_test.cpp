@@ -326,6 +326,7 @@ TEST(the_endpoint_answers_only_for_a_declared_d1) {
         if (!*type) { CHECK_EQ(res.status, 501); continue; }
         REQUIRE(res.status == 200);
         const json j = json::parse(res.body);
+        CHECK_EQ(j["model"].get<std::string>(), "d1");
         CHECK_NEAR(j["answers"]["q"]["noul"].get<double>(), 0.75, 1e-6);
         CHECK_EQ(j["answers"]["c"]["choice"].get<std::string>(), "one");
         CHECK_EQ(j["usage"]["output_tokens"].get<int>(), 0);

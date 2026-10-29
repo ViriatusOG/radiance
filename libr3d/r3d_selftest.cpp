@@ -1,57 +1,45 @@
 /* r3d_selftest -- dump the libr3d row table, cross-check it, and prove every row links and runs.
  *
  * A transcription error in a constraint table stays invisible until a model silently picks the
- * wrong kernel, and a codec one bit out on a subnormal shows up as a percentage of a perplexity. So
- * the table is printed in full and checked against itself:
+ * wrong kernel, so the table is printed and checked against itself:
  *
- *   - every row's `op` has a schema declared by this plugin, or nothing can select it;
- *   - every constraint key is a declared parameter of that op. libr3d's constraints and libref's
- *     schemas are one vocabulary, and a key renamed in only one place yields a row that matches
- *     nothing;
+ *   - every row's `op` has a schema declared by this plugin;
+ *   - every constraint key is a declared parameter of that op (a key renamed in one place only
+ *     yields a row that matches nothing);
  *   - names are unique, launches exist, an init has a fini, a tunable's default is one of its
- *     values (the loader refuses a plugin whose default it cannot launch, and it is better to hear
- *     it here), and no row carries a `layout`, `relayout` or `unrelayout` hook: libr3d repacks
- *     nothing (r3d_rows.cpp explains why, and a hook appearing means a container format only this
- *     plugin can read has crept in);
- *   - every `opd_shape` describes as many operands as its schema declares, for a spread of
- *     geometries, with positive extents.
+ *     values (the loader refuses a plugin otherwise), and layout hooks appear only on the
+ *     joined-weight rows, always with their relayout writer;
+ *   - every `opd_shape` describes as many operands as its schema declares, with positive extents.
  *
- * The codecs are checked against the ABI's own host versions in `rad_plugin.h` over every bit
- * pattern where the domain is small and a sweep where it is not: bf16 and f16 over all 65536, E4M3
- * over all 256 codes and the encoder over the saturating, subnormal, signed-zero and NaN cases,
- * int8 against `rad_round_even_sat` over every tie in its band. This is the check `rad-kbench`
- * cannot do: it compares whole ops, so a codec's disagreement appears as a diffuse percentage.
- * libr3d's codecs are software -- the lane map, not a missing instruction, is the reason, and its
- * bf16 packing is `v_perm` and not `v_cvt_pk_bf16_f32` -- so they are the plugin's own
- * arithmetic and belong to the tests.
+ * The codecs are checked against the ABI's host versions in `rad_plugin.h`: bf16 and f16 over all
+ * 65536 patterns, E4M3 over all 256 codes, the E4M3 encoder over saturating, subnormal,
+ * signed-zero and NaN cases, int8 against `rad_round_even_sat` over every tie in its band.
+ * rad-kbench compares whole ops, where a codec error appears only as a diffuse percentage.
+ * libr3d's codecs are software (its bf16 packing is `v_perm`, not `v_cvt_pk_bf16_f32`), so they
+ * are the plugin's own arithmetic.
  *
- * Then, on a device, every launch is called with a minimal valid input built from the row's own
- * `opd_shape`, and every output plane is read back and checked to be finite. That catches the class
- * of bug a table check cannot: a null operand the shim does not test, a stride read from the wrong
- * axis, an operand index off by one, an undefined symbol, a kernel that writes where it should not.
+ * On a device, every launch is called with a minimal valid input built from the row's own
+ * `opd_shape`, and every output plane is read back and checked to be finite. That catches what a
+ * table check cannot: an untested null operand, a stride from the wrong axis, an operand index off
+ * by one, an undefined symbol, a stray write.
  *
- * The numerical oracle is `rad-kbench`, which replays `kernels.rkb` against libref; this program
- * does not duplicate it. What it adds is that the rows are reachable at all -- on this card, from
- * this .so, with the geometry their constraints state.
- *
+ * The numerical oracle is `rad-kbench` (`kernels.rkb` against libref); this program checks that
+ * the rows are reachable on this device, from this .so, at the geometry their constraints state.
  * The plugin is dlopened rather than linked, so an undefined symbol in the .so is caught too.
  *
- * One child process per row. A bad pointer handed to a kernel is a GPU page fault, which ROCr
- * reports by printing a line and aborting the process. In one process the first bad row would end
- * the run, and with stdout block-buffered down a pipe the fault line can land next to the wrong
- * row. So the parent runs the static phase and then re-execs itself once per row with
- * `--case <name>`; a child killed by a signal is a FAIL naming the signal, and the run continues.
- * posix_spawn rather than fork, because the parent already has the HIP runtime's threads up and
- * only exec resets them.
+ * One child process per row: a GPU page fault makes ROCr print a line and abort the process, so
+ * the parent runs the static phase and then re-execs itself per row with `--case <name>`. A child
+ * killed by a signal is a FAIL naming the signal. posix_spawn rather than fork, because the
+ * parent's HIP runtime threads are already up and only exec resets them.
  *
- * `--case <name>` is also the reproducer: it runs one row, alone, in the foreground.
+ * `--case <name>` also reproduces one row alone in the foreground.
  */
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r3d_codecs.h"
 #include "rad_planes.h"   /* the joined scale+zero plane, for the row no shape hook can describe */
-#include "r3d_plugin.h"   /* the entry points, for the shape hooks that precede their rows */
+#include "r3d_plugin.h"   /* the entry points */
 
 #include <dlfcn.h>
 #include <spawn.h>
@@ -83,9 +71,7 @@ static int g_skip = 0;
 static const char* g_case = nullptr;
 static const char* g_plugin = nullptr;
 
-/* The plugin's table, reached through the symbols dlopened in main. The program is not linked
- * against libr3d: an undefined symbol in the .so must be this program's failure, not its own
- * failure to build. */
+/* The plugin's table, through the symbols dlsym'd in main (the program does not link libr3d). */
 static int (*P_count)(void) = nullptr;
 static const RadKernelInfo* (*P_at)(int) = nullptr;
 static int (*P_scount)(void) = nullptr;
@@ -96,8 +82,7 @@ static const RadKernelInfo* row_at(int i) { return P_at ? P_at(i) : nullptr; }
 static int schemas() { return P_scount ? P_scount() : 0; }
 static const RadOpSchema* schema_at(int i) { return P_sat ? P_sat(i) : nullptr; }
 
-/* The loader's messages are built with a printf into a string; so are these, so a failure reads
- * like the line the engine would have printed. */
+/* printf into a string, as the loader builds its messages. */
 static std::string fmt(const char* f, ...) {
     va_list ap;
     va_start(ap, f);
@@ -140,11 +125,9 @@ static const RadParamSpec* find_param(const RadOpSchema* s, const char* key) {
 
 /* ================================================================== the table's own checks
  *
- * Every check here has a failure mode behind it: a constraint on a key the schema does not declare
- * (the row matches nothing, silently, and the model falls back to a reference kernel), a tunable
- * default outside its axis (the loader refuses the whole plugin), a row whose `op` is spelled for
- * another op's schema (one call meaning two things), a description whose operand count disagrees
- * with its schema (every case for that op skipped, forever).
+ * Failure modes: a constraint on an undeclared key (the row silently matches nothing), a tunable
+ * default outside its axis (the loader refuses the whole plugin), a row whose `op` names another
+ * op's schema, a description whose operand count disagrees with its schema (every case skipped).
  */
 static void check_table() {
     const int n = rows();
@@ -167,28 +150,20 @@ static void check_table() {
         if (!k->launch) fail("row '%s' has no launch", k->name);
         if (k->init && !k->fini) fail("row '%s' inits without a fini", k->name);
         if (k->domain != RAD_DOMAIN_DEVICE) fail("row '%s' is not a device row", k->name);
-        /* No row repacks a weight: the kernel reads the container's stored order, which is the rule that
- * stops a plugin quietly demanding its own format. The exception is a class with a name list, and
- * the class is the container's quantised weight: codes and scales stored as planes behind one
- * operand, which the mapped tier will not place unless a loaded library can read them in place.
- * Three rows, one per grid the container uses -- w2a8's {1,group} with a zero, the fp8a8 GEMM's
- * {128,128} without, and the lm_head's same form -- each transcribed from the reference's own hook,
- * including the case the reference answers nothing for (ref_layout_gemm_q reads zp_grid, and zp_grid
- * has no fp8a8 entry). What carries the rule is the pair: every one of these names has a `layout`
- * **and** a `relayout`, no row anywhere has an `unrelayout`, and a hook that names a joined layout
- * without the writer that produces it is the failure the engine prints at load. A fifth name is a
- * rule change, and it should fail here. */
+        /* No row repacks a weight; kernels read the container's stored order. The exception is the
+         * container's quantised weight (codes and scales as planes behind one operand), which the
+         * mapped tier places only if a loaded library can read it in place. The rows below cover
+         * w2a8's {1,group} grid with a zero, and the fp8a8 GEMM's and lm_head's {128,128} grid
+         * without, each transcribed from the reference's hook. Any other name is a rule change and
+         * should fail here. */
         const bool joined = 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")
                          || 0 == std::strcmp(k->name, "logits_gemm_bf16")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_fp8a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled");
-        /* The query and the writer come as a pair, and the pair is the rule: a row with a hook must
-         * supply the relayout that produces the form the hook names (abi/rad_abi.h -- a query
-         * answering RAD_OK is a promise the loader keeps on the row's word), and no row may carry an
-         * unrelayout, because nothing in this library invents a format a tool would need to invert.
-         * A hook with a null writer is the failure the engine reports at load -- `could not produce
-         * 'output.weight' (rad.planes) from fp8_e4m3*bf16[128x128]: unsupported` -- and a relayout
-         * without a hook is a row repacking a weight nobody asked to have repacked. */
+        /* A layout hook and its relayout writer come as a pair (abi/rad_abi.h: a query answering
+         * RAD_OK promises the loader the writer produces that form; a hook without one fails at
+         * load). No row may carry an unrelayout, since this library invents no format a tool
+         * would need to invert. */
         if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
             || (k->relayout && !k->layout) || k->unrelayout)
             fail("row '%s' declares a layout hook; libr3d stores weights in order", k->name);
@@ -207,8 +182,8 @@ static void check_table() {
                          x.key ? x.key : "(null)", k->op);
                     continue;
                 }
-                /* The selector compares a string constraint against a string parameter and an
-                 * integer one against an integer. A mismatch matches nothing. */
+                /* String constraints match string parameters and integer ones integers; a mismatch
+                 * matches nothing. */
                 if (x.op == RAD_C_IN && p->type != RAD_P_STR)
                     fail("row '%s' matches '%s' with a string list on a non-string parameter",
                          k->name, x.key);
@@ -251,21 +226,16 @@ static void check_table() {
 
 /* ================================================================== the reference library
  *
- * The loader refuses a plugin whose schema for an op differs from the one the first declarer fixed
- * (core/plugin/loader.cpp, `schema_same`), and it refuses the *whole* .so, every row with it. The
- * comparison is positional and narrow: parameter count, each parameter's key, type and
- * requiredness; operand count, each operand's role and optionality. Operand names and doc strings
- * are free, because arguments are positional and names are for diagnostics.
- *
- * So a schema copied from libref with one operand's role mistyped is a plugin that loads in
- * r3d_selftest -- which does not open libref -- and disappears from the engine, with one line in a
- * log most people never read. This check is the loader's own comparison, run here, naming the op
- * and the slot.
+ * The loader refuses the whole .so when its schema for an op differs from the first declarer's
+ * (core/plugin/loader.cpp, `schema_same`). The comparison is positional: parameter count, each
+ * parameter's key, type and requiredness; operand count, each operand's role and optionality.
+ * Names and doc strings are free. This repeats that comparison against libref, naming the op and
+ * the slot, since a mismatch otherwise shows only as one log line at engine load.
  */
 static void check_reference_schemas() {
     std::printf("== schemas against the reference\n");
 
-    /* The reference library beside the plugin under test, the way the engine's home holds them. */
+    /* libref.so beside the plugin under test, as the engine's home holds them. */
     std::string path(g_plugin);
     const size_t slash = path.find_last_of('/');
     path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "libref.so";
@@ -287,9 +257,7 @@ static void check_reference_schemas() {
             if (o && o->op && !std::strcmp(o->op, mine->op)) theirs = o;
         }
         if (!theirs) {
-            /* Not a refusal: an op the reference does not serve is an op with nothing to agree
-             * with, and it is the reason libr3d's rows for a chain libref has no oracle for are
-             * checked by the selftest's own arithmetic instead. */
+            /* Not a refusal: an op the reference does not declare has nothing to agree with. */
             skip("'%s' has no schema in the reference, so nothing to compare against", mine->op);
             continue;
         }
@@ -343,19 +311,11 @@ static void check_reference_schemas() {
 
 /* ================================================================== band reachability
  *
- * A row is chosen by matching its constraints against a band's geometry, and the engine's rule
- * (core/util/rad_util.cpp, constraint_holds) is that a constraint on a key the geometry lacks does
- * not hold, in its own words "a row constraining an optional parameter serves only callers that
- * state it, and others get a row without it". The bands an architecture emits carry the parameters
- * its graph set, and nothing else, so a row that constrains an optional parameter is a row narrowed
- * to the graphs that spell that parameter out.
- *
- * Nothing in kbench shows this: a fixture case names every parameter the op declares, so the
- * constraint is tested against a geometry that has it. A server shows all of it, at startup, as
- * "N device band(s) resolved to no kernel" and a model that will not start. So the check is here:
- * a constraint on an optional parameter is not an error -- it is how a row says "I serve the form
- * that states the parameter" -- but it is a decision, and a row whose author did not make it is a
- * row that will silently not serve.
+ * A constraint on a key the band's geometry lacks does not hold (core/util/rad_util.cpp,
+ * constraint_holds), and bands carry only the parameters their graph set. So a row that constrains
+ * an optional parameter serves only graphs that state it. kbench cannot show this, because its
+ * fixtures name every parameter. Such a constraint is legitimate but must be deliberate, so each one
+ * is listed here.
  */
 static void check_band_reach() {
     std::printf("== band reachability\n");
@@ -377,7 +337,7 @@ static void check_band_reach() {
             const RadOpSchema* o = ra(j);
             if (o && o->op && !std::strcmp(o->op, k->op)) s = o;
         }
-        if (!s) continue;                       /* the table phase already failed this row */
+        if (!s) continue;                       /* not in the reference: nothing to compare */
         for (int ci = 0; ci < k->n_constraints; ++ci) {
             const RadConstraint& c = k->constraints[ci];
             if (!c.key) continue;
@@ -399,11 +359,9 @@ static void check_band_reach() {
 
 /* ================================================================== the operand descriptions
  *
- * Against the schemas, for one geometry per op taken from the widths a model really has: 4096
- * hidden, 128 head, 11008 intermediate, 128256 vocabulary. A description that returns a count the
- * schema disagrees with, a rank of zero, or an extent of zero is a bug in the description or in the
- * schema; rad-kbench reports it as a skipped case for every geometry, which is how a broken hook
- * hides for years.
+ * Against the schemas, for one geometry per op at real model widths (4096 hidden, 128 head, 11008
+ * intermediate, 128256 vocabulary). A wrong operand count, rank or zero extent is a bug in the
+ * description or the schema; rad-kbench would only report it as skipped cases.
  */
 static void check_shapes() {
     /* RadParam is { key, kind, ival, ihi, sval, dval }. */
@@ -439,14 +397,13 @@ static void check_shapes() {
                                PS("act", "silu") } },
         { "dequant", { PI("M", 11008), PI("n", 4096), PI("group", 128),
                        PS("dtype", "fp8_e4m3") } },
-        { "rmsnorm_quant_fp8", { PI("M", 1792), PI("n", 5120), PI("eps", 1e-5), PI("group", 128),
+        { "rmsnorm_quant_fp8", { PI("M", 1792), PI("n", 5120), PF("eps", 1e-5), PI("group", 128),
                                  PS("dtype", "bf16") } },
         { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "bf16") } },
         { "gemm_nt_q", { PI("M", 8), PI("N", 11008), PI("K", 4096), PI("group", 128),
                          PS("dtype", "fp8a16"), PI("pb1", 128), PI("pb2", 128) } },
-        /* The rest are the bands MiniCPM5-2B asks for, in /home/sysadmin/libr3d/bands.txt: the
-         * model's own widths, not invented ones. The vocab is 130560, the MLP is 6144 wide, the
-         * head is 128 with 16 heads over 2 KV heads at 16-token blocks. */
+        /* The rest are MiniCPM5-2B's bands: vocab 130560, MLP 6144 wide, head 128 with 16 heads
+         * over 2 KV heads at 16-token blocks. */
         { "silu_mul", { PI("M", 1792), PI("n", 6144), PS("dtype", "bf16") } },
         { "attn_paged", { PI("q_len", 2048), PI("head_dim", 128), PI("gqa", 8), PI("block_size", 16),
                           PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
@@ -456,10 +413,8 @@ static void check_shapes() {
                           PI("causal", 0), PI("window", 0), PS("q_dtype", "bf16"),
                           PS("kv_dtype", "fp8_e4m3"), PI("n_head", 16), PI("max_ctx", 4096),
                           PI("max_seqs", 256) } },
-        /* The decode band with the context deeper than the query chunk: the walk has to cover keys
-         * that precede the chunk, which is the only thing in the op a q_len-sized cache cannot
-         * show. The second is the geometry that found the tile-sharing bug -- a window that starts
-         * mid-block, over an fp8 cache. */
+        /* A context deeper than the query chunk, so the walk covers keys before the chunk; then a
+         * window that starts mid-block over an fp8 cache, which exercises tile sharing. */
         { "attn_paged", { PI("q_len", 7), PI("head_dim", 128), PI("gqa", 8), PI("block_size", 16),
                           PI("causal", 0), PI("window", 0), PS("q_dtype", "bf16"),
                           PS("kv_dtype", "bf16"), PI("n_head", 16), PI("ctx", 4096),
@@ -468,9 +423,8 @@ static void check_shapes() {
                           PI("causal", 1), PI("window", 37), PS("q_dtype", "bf16"),
                           PS("kv_dtype", "fp8_e4m3"), PI("n_head", 16), PI("ctx", 512),
                           PI("max_ctx", 4096) } },
-        /* The 27B's sliding-window band, in the shape the fixture draws it: the shape hook describes
-         * the descales as ABSENT, so this is the case where an fp8 cache has no scale plane and the
-         * reference reads 1.0. It is the geometry kbench caught a refusal on. */
+        /* A 27B model's sliding-window band as the fixture draws it: the descales are absent, so an
+         * fp8 cache has no scale plane and the reference reads 1.0. */
         { "attn_paged", { PI("q_len", 1), PI("head_dim", 128), PI("gqa", 4), PI("block_size", 16),
                           PI("causal", 0), PI("window", 2048), PS("q_dtype", "bf16"),
                           PS("kv_dtype", "fp8_e4m3"), PI("n_head", 32), PI("max_seqs", 8),
@@ -489,9 +443,8 @@ static void check_shapes() {
         { "sample_ngram_ban", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_mask", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_logprobs", { PI("M", 2048), PI("n_vocab", 130560), PI("k", 21) } },
-        /* The speculative decoder's band, as MiniCPM5-2B declares it: a 7-token draft block, 16
-         * candidates a step, a rank-256 codebook over a 130560-token vocabulary, anchors strided 7
-         * apart. The two codebooks are 63.8 MiB each, which is what the op really is. */
+        /* MiniCPM5-2B's speculative decoder band: a 7-token draft block, 16 candidates a step, a
+         * rank-256 codebook over a 130560-token vocabulary (63.8 MiB each), anchors 7 apart. */
         { "dflash_select", { PI("M", 256), PI("steps", 7), PI("top_k", 16), PI("rank", 256),
                              PI("n_vocab", 130560), PI("anchor_stride", 7), PS("dtype", "bf16") } },
     };
@@ -499,13 +452,8 @@ static void check_shapes() {
 #undef PF
 #undef PS
 
-    /* The descriptions of the ops whose kernels have not landed: the schemas and the hooks are in
-     * the library, checked the moment it loads, so a transcription typo is found here and not on the
-     * day the row lands and kbench skips its cases -- "describes an output differently" is one line
-     * in a report, and a row nobody exercises is a row nobody tested. */
-    /* By symbol name, dlsym'd from the plugin: this program links nothing from the library under
-     * test -- that is the point of dlopening it -- so a hook is a name and a pointer out of the
-     * handle, exactly as the rows are. */
+    /* Shape hooks for ops with no row in the table, found by symbol name in the plugin, so their
+     * descriptions are checked even without a kernel. */
     static const struct { const char* op; const char* sym; } kHooks[] = {
         { "silu_mul", "r3d_shape_silu_mul" },           { "attn_paged", "r3d_shape_attn_paged" },
         { "row_topk", "r3d_shape_row_topk" },           { "sample_argmax", "r3d_shape_sample_argmax" },
@@ -533,7 +481,7 @@ static void check_shapes() {
                 hook = (int (*)(const RadParam*, int, int, RadOpdDesc*))dlsym(g_h, kHooks[q].sym);
         if (!hook) { skip("no operand description for '%s' -- no row and no hook", gm.op);
                      continue; }
-        if (!row) std::printf("  --   '%s': the hook, ahead of its kernel\n", gm.op);
+        if (!row) std::printf("  --   '%s': operand description from the shape hook (no row)\n", gm.op);
 
         bool bad = false;
         for (int o = 0; o < s->n_operands && !bad; ++o) {
@@ -561,23 +509,17 @@ static void check_shapes() {
     }
 }
 
-/* ================================================================== the codecs
- *
- * Against the ABI's host implementations. Exactness is the claim, and it is the claim because the
- * widenings are exact (seven mantissa bits into ten, four exponent and three mantissa bits into
- * five and ten) and the encoders are mirrors of `rad_plugin.h`, line for line.
- */
 /* Two floats are the same when their bits are: `a == b` is false for two NaNs, and a codec that
- * quiet a NaN the same way the ABI's does is a codec that agrees. */
+ * quiets a NaN the way the ABI's does agrees. */
 static bool same_float(float a, float b) {
     return bits_of(a) == bits_of(b);
 }
 
 /* ================================================================== the codecs
  *
- * Against the ABI's host implementations. Exactness is the claim, and it is the claim because the
- * widenings are exact (seven mantissa bits into ten, four exponent and three mantissa bits into
- * five and ten) and the encoders are mirrors of `rad_plugin.h`, line for line.
+ * Against the ABI's host implementations, bit for bit: the widenings are exact (seven mantissa bits
+ * into ten; four exponent and three mantissa bits into five and ten) and the encoders mirror
+ * `rad_plugin.h`.
  */
 static void check_codecs() {
     std::printf("== codecs\n");
@@ -587,15 +529,14 @@ static void check_codecs() {
     for (uint32_t u = 0; u < 0x10000 && !bad; ++u) {
         const uint16_t b = (uint16_t)u;
         if (!same_float(bf16_to_f32(b), rad_bf16_to_f32(b))) { ++bad; break; }
-        /* Encoder against encoder: a NaN's payload is quieted on the way out by both, so a
-         * round-trip to the original pattern is not the claim. */
+        /* Encoder against encoder: both quiet a NaN's payload, so a round trip to the original
+         * pattern is not the claim. */
         if (f32_to_bf16(bf16_to_f32(b)) != rad_f32_to_bf16(rad_bf16_to_f32(b))) { ++bad; break; }
     }
     if (bad) fail("bf16: the codecs disagree with rad_plugin.h");
     else ok("bf16: 65536 patterns, decode and encode, match rad_plugin.h bit for bit");
 
-    /* f16: the same, subnormals included -- the narrowing keeps them, which the ABI's codec does
-     * and a naive shift-and-round does not. */
+    /* f16: the same, subnormals included (a naive shift-and-round loses them). */
     bad = 0;
     for (uint32_t u = 0; u < 0x10000 && !bad; ++u) {
         const uint16_t h = (uint16_t)u;
@@ -606,13 +547,10 @@ static void check_codecs() {
     if (bad) fail("f16: the codecs disagree with rad_plugin.h");
     else ok("f16: 65536 patterns, both directions, match rad_plugin.h (subnormals included)");
 
-    /* A bf16 pair widened to an f16 pair, in one register, exactly -- the reason the dot2 path is
-     * sound. Exact over f16's normal range [2^-14, 65504], as r3d_codecs.h states, and the sweep is
-     * over the patterns in it. Outside, the widening is not exact and is not claimed to be: above
-     * 65504 it saturates, and below 2^-14 an f16 subnormal's grid is coarser than bf16's, so the
-     * packing instruction truncates toward zero. Those patterns are counted and named in the
-     * message, because the number of them -- and the fact that they are the format's range, not a
-     * bug -- is the thing a reader needs. */
+    /* A bf16 pair widened to an f16 pair in one register, which the dot2 path relies on. Exact over
+     * f16's normal range [2^-14, 65504] (r3d_codecs.h), which is what is swept. Outside it the
+     * widening saturates above 65504 and truncates toward zero below 2^-14, where f16's subnormal
+     * grid is coarser than bf16's; those patterns are counted in the message. */
     bad = 0;
     int inside = 0, outside = 0;
     for (uint32_t u = 0; u < 0x10000 && !bad; ++u) {
@@ -630,8 +568,8 @@ static void check_codecs() {
     else ok("bf16 -> f16 exact over the %d patterns in f16's normal range (the other %d saturate "
             "or truncate as the format says they must)", inside, outside);
 
-    /* E4M3, both directions, over every code. The widening to f16 is exact for every code: e4m3 has
-     * four exponent and three mantissa bits, f16 five and ten, and 448 is well inside f16. */
+    /* E4M3, both directions, over every code, and the exact widening to f16 (448 is well inside
+     * f16's range). */
     bad = 0;
     for (uint32_t c = 0; c < 256 && !bad; ++c) {
         if (!same_float(e4m3_to_f32((uint8_t)c), rad_fp8e4m3_to_f32((uint8_t)c))) { ++bad; break; }
@@ -645,8 +583,8 @@ static void check_codecs() {
     if (bad) fail("e4m3: the codecs disagree with rad_plugin.h, or the widening is not exact");
     else ok("e4m3: 256 codes both ways, and the f16 widening exact, match rad_plugin.h");
 
-    /* The encoder over the cases that break a naive one: saturation at 448, the subnormals below
-     * 2^-6, the sign of zero, NaN, and the values a scale lands on. */
+    /* The encoder over the cases that break a naive one: saturation at 448, subnormals below 2^-6,
+     * the sign of zero, NaN, and typical scale values. */
     bad = 0;
     const float sweep[] = { 0.0f, -0.0f, 1.0f / 512, 1.0f / 1024, 1.0f / 6, 0.33f, 1.0f, 1.7f,
                             2.0f, 3.0f, 447.0f, 448.0f, 449.0f, 1024.0f, 1e30f, -1e30f,
@@ -670,18 +608,17 @@ static void check_codecs() {
     if (bad) fail("int8: the encoder disagrees with rad_round_even_sat");
     else ok("int8 encoder: 4804 values, every tie in the band, match rad_round_even_sat");
 
-    /* dot2's order. The device instruction folds the products with guard bits, so the host path is
-     * the reference's arithmetic and this checks only that the pairs are read low-then-high: the
-     * GEMMs' accumulation order is checked by rad-kbench against libref. */
+    /* dot2's operand order only: the device instruction folds the products with guard bits, so
+     * this checks that pairs are read low-then-high; accumulation order is rad-kbench's to check. */
     float acc = 0.0f;
     const uint32_t a = f16x2_pack(1.5f, -2.5f), b = f16x2_pack(4.0f, 4.0f);
     acc = dot2_f16x2(a, b, acc);
     if (acc != 1.5f * 4.0f + -2.5f * 4.0f) fail("dot2: the pair is not read low-then-high");
     else ok("dot2: the pair is read low-then-high, into the accumulator it is handed");
 
-    /* The bf16 store a kernel's epilogue uses: two values, one dword, round to nearest even, the
-     * high half in the high half. A `v_perm` picking the wrong bytes shows up here and not in a
-     * kernel's output, where a swapped pair looks like a plausible tensor. */
+    /* The epilogue's bf16 store: two values, one dword, round to nearest even, the high value in
+     * the high half. A `v_perm` picking the wrong bytes shows here; in a kernel's output a swapped
+     * pair looks plausible. */
     bad = 0;
     for (int i = -500; i < 500 && !bad; ++i) {
         const float lo = (float)i * 0.001f, hi = (float)i * -0.002f;
@@ -704,20 +641,18 @@ struct Case {
     RadTensor t[MAX_OPD];
     RadParam p[32];
     std::vector<void*> dev;
-    std::vector<void*> host;       /* pinned operands: read on the host, read by the kernel too */
+    std::vector<void*> host;       /* pinned operands, read by both host and kernel */
     std::vector<std::string> words;   /* the strings out.sval points into; reserved in make_params */
     int n_p = 0;
 };
 
 /* ================================================================== the lane helpers, on the card
  *
- * Every wave-sum in the library is five rounds of a butterfly over lane shuffles, and the
- * arithmetic that rides on a shuffle is invisible to a codec sweep: `d += (double)f((unsigned long
- * long)d)` moves a *value* where a bit pattern is wanted, and a wave of fractions then sums to 1 --
- * which is a bug this file's own predecessor shipped, in the logprobs sum, and which showed up as
- * 40% of a row's probability mass missing at one shape. So the card runs the butterflies through
- * `r3d_lanes_check` (r3d_sample_pre_f32.hip) and every lane of every wave is compared with a host
- * emulation of the same five rounds, in the same order.
+ * Every wave-sum in the library is five butterfly rounds over lane shuffles, and an error there is
+ * invisible to a codec sweep: `d += (double)f((unsigned long long)d)` moves a value where a bit
+ * pattern is wanted, and a wave of fractions sums to an integer. The device runs the butterflies
+ * through `r3d_lanes_check` (r3d_sample_pre_f32.hip) and every lane of every wave is compared with
+ * a host emulation of the same five rounds in the same order.
  */
 static void check_lanes() {
     std::printf("== lane helpers\n");
@@ -800,9 +735,8 @@ static uint32_t xorshift(uint32_t& s) {
     return s;
 }
 
-/* Fill a host plane per its description. "Normals" is a sum of four uniforms: a kernel's
- * arithmetic is exercised by any value that is not a special case, and the special cases are what
- * the hand-written cases and rad-kbench's sweeps are for. */
+/* Fill a host plane per its description. "Normals" are a sum of four uniforms: any non-special
+ * value exercises the arithmetic, and special cases are rad-kbench's. */
 static void fill_plane(const RadOpdDesc& d, uint8_t* p, size_t nel, uint32_t seed) {
     uint32_t s = seed ? seed : 1u;
     const size_t nbyte = d.dtype == RAD_U2 ? nel / 4
@@ -823,8 +757,8 @@ static void fill_plane(const RadOpdDesc& d, uint8_t* p, size_t nel, uint32_t see
         return;
     }
     if (d.dtype == RAD_I4) {
-        /* Two signed codes a byte, the low nibble first: both grids' -7..7 draw, stored in
-         * two's complement, which is the low four bits. */
+        /* Two signed codes a byte, low nibble first, drawn in -7..7 and stored as the low four bits
+         * of two's complement. */
         for (size_t j = 0; j < nel / 2; ++j) {
             double v0 = ((double)xorshift(s) / 4294967296.0) * 2.0 - 1.0;
             double v1 = ((double)xorshift(s) / 4294967296.0) * 2.0 - 1.0;
@@ -835,8 +769,8 @@ static void fill_plane(const RadOpdDesc& d, uint8_t* p, size_t nel, uint32_t see
         return;
     }
     if (d.dtype == RAD_FP4E2M1) {
-        /* Two e2m1 codes a byte, drawn independently: all 16 values, so the unpack's magnitude
-         * and sign paths are both exercised. */
+        /* Two e2m1 codes a byte over all 16 values, exercising the unpack's magnitude and sign
+         * paths. */
         for (size_t j = 0; j < nel / 2; ++j) {
             const uint8_t lo = (uint8_t)(xorshift(s) & 0xFu);
             const uint8_t hi = (uint8_t)(xorshift(s) & 0xFu);
@@ -864,21 +798,16 @@ static void fill_plane(const RadOpdDesc& d, uint8_t* p, size_t nel, uint32_t see
     }
 }
 
-/* The geometry a row is run at: the band's bounds where the row constrains them, the widths a
- * model has elsewhere. Reading the row's own constraints is what makes this a test of the
- * constraint table and not of a geometry the table happens to admit. */
+/* The geometry a row runs at: the row's constraint values where it has them, real model widths
+ * elsewhere, so the constraint table itself is what is tested. */
 static void make_params(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
     c.words.reserve(32);   /* more parameters than any op declares, so no string ever moves */
     for (int q = 0; q < s->n_params && c.n_p < 32; ++q) {
         const RadParamSpec& sp = s->params[q];
-        /* Only the parameters the geometry has to carry. The engine passes the graph's parameters
-         * with their ranges collapsed, and an optional parameter the graph did not set is simply
-         * not in the list: the kernel's own default is then the one libref's `p_*` default is. A
-         * selftest that filled every optional slot with a value would be testing a geometry no
-         * graph produces -- and for rope, whose optional `sections` string switches the position
-         * plane to one row per component, it would be testing a mode the row's constraints
-         * exclude. Constrained parameters are always passed: the constraint states the row's band,
-         * so its value is the row's own claim. */
+        /* Only required and constrained parameters, as the engine passes them: an optional
+         * parameter the graph did not set is absent, and the kernel uses libref's `p_*` default.
+         * Filling every optional slot would test geometries no graph produces (for rope, the
+         * `sections` string would switch to a mode the row's constraints exclude). */
         bool constrained = false;
         for (int ci = 0; ci < k->n_constraints && !constrained; ++ci)
             if (k->constraints[ci].key && sp.key && !std::strcmp(k->constraints[ci].key, sp.key))
@@ -911,18 +840,15 @@ static void make_params(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
         if (sp.key && !std::strcmp(sp.key, "from")) out.sval = "bf16";
         if (sp.key && !std::strcmp(sp.key, "to")) out.sval = "f32";
         if (sp.key && !std::strcmp(sp.key, "act")) out.sval = "silu";
-        /* A constraint's own value wins: it is the band the row is compiled for, and C_IN spells
-         * the whole list. A list takes its first word. */
+        /* A constraint's own value wins; a C_IN list takes its first word. */
         for (int ci = 0; ci < k->n_constraints; ++ci) {
             const RadConstraint& x = k->constraints[ci];
             if (!x.key || !sp.key || std::strcmp(x.key, sp.key)) continue;
             if (x.op == RAD_C_EQ && sp.type == RAD_P_STR && x.sval) out.sval = x.sval;
             if ((x.op == RAD_C_EQ || x.op == RAD_C_GE) && sp.type == RAD_P_INT) out.ival = x.ival;
             if (x.op == RAD_C_IN && sp.type == RAD_P_STR && x.sval && x.sval[0]) {
-                /* The band's first word. The words outlive the parameter list, so they live in a
-                 * vector that is reserved once: a string built per constraint and pointed at from
-                 * out.sval is a pointer to storage the next constraint reuses, and a row with two
-                 * string constraints reads the second one's value into the first's key. */
+                /* out.sval must outlive the loop, so the words live in c.words, reserved once so
+                 * no reallocation moves them. */
                 c.words.emplace_back(x.sval);
                 std::string& w = c.words.back();
                 const size_t sp0 = w.find(' ');
@@ -936,19 +862,17 @@ static void make_params(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
 
 /* ------------------------------------------------------------------ a row with no shape hook
  *
- * `gemm_q_shape` declines w2a8 for a good reason: the container stores the weight's scale and zero
- * as two planes behind the one `b_scale` operand, and a RadOpdDesc names one dtype and one extent
- * set, so it cannot describe that. A hook that named only the byte count would have the tool fill a
- * container header with random bytes, and the kernel's correct refusal would be reported as a bug.
- * So the row's `opd_shape` is null, kbench names the skip, and this is the row's coverage: the band
- * MiniCPM5-2B asks for, with the joined plane built by rad_planes_relayout exactly as
- * r3d_gemm_nt_q_w2a8_driver.cpp builds it, so the card test and the driver cannot drift apart. */
+ * `gemm_q_shape` declines w2a8: the container stores scale and zero as two planes behind the one
+ * `b_scale` operand, and a RadOpdDesc names one dtype and extent set. A byte-count-only hook would
+ * fill a container header with random bytes. So the row's `opd_shape` is null and this builds its
+ * case by hand at MiniCPM5-2B's band, with the joined plane built by rad_planes_relayout as
+ * r3d_gemm_nt_q_w2a8_driver.cpp builds it. */
 static int build_w2a8(Case& c, const RadOpSchema* s) {
 #define W_PI(k, v) { (k), RAD_P_INT, (long long)(v), 0, nullptr, 0.0 }
 #define W_PS(k, v) { (k), RAD_P_STR, 0, 0, (v), 0.0 }
     const long long M = 16, N = 130560, K = 2048, group = 128, G = K / group;
     if (s->n_operands != 7) { fail("w2a8: the schema has %d operands, not 7", s->n_operands); return 1; }
-    c.n_p = 0;                     /* the band, not the constraint table's minimums */
+    c.n_p = 0;                     /* the model's band, not the constraint minimums */
     const RadParam pp[] = { W_PI("M", M), W_PI("N", N), W_PI("K", K), W_PI("group", group),
                             W_PS("dtype", "w2a8") };
     for (const RadParam& q : pp) c.p[c.n_p++] = q;
@@ -992,12 +916,9 @@ static int build_w2a8(Case& c, const RadOpSchema* s) {
         fail("w2a8: rad_planes_relayout refused"); return 1;
     }
 
-    /* Slots in the schema's order: a, a_scale, b, b_scale (the joined blob), y, a_sum. y is the
-     * output and it is pre-filled with a bf16 NaN: a kernel that never launches leaves its status
-     * RAD_OK behind and the caller's bytes in the plane, and a plane of the caller's own zeros is
-     * finite, so only a NaN fill says the row ran. */
-    /* Schema order: a, a_scale (optional), b, b_scale, y, a_sum (optional), b_ref (an absent
-     * weight: a null tensor is what an omitted optional means to the shim). */
+    /* Schema order: a, a_scale, b, b_scale (the joined blob), y, a_sum, b_ref (absent: a null
+     * tensor). y is pre-filled with a bf16 NaN, since a shim that returns RAD_OK without launching
+     * would otherwise leave finite bytes behind. */
     struct Slot { long long rows, cols; uint32_t dt; int nan; } q[7] = {
         { M, K, RAD_I8, 0 }, { M, 1, RAD_F32, 0 }, { N, K, RAD_U2, 0 },
         { jb, 1, RAD_U8, 0 }, { M, N, RAD_BF16, 1 }, { G, 16, RAD_F32, 0 }, { 0, 0, RAD_F32, 0 } };
@@ -1022,16 +943,11 @@ static int build_w2a8(Case& c, const RadOpSchema* s) {
             uint16_t* b16 = (uint16_t*)h.data();
             for (size_t i = 0; i < bytes / 2; ++i) b16[i] = 0x7fc0u;
         }
-        /* The joined operand stays on the host: the shim reads its header where it lies, which is
-         * the mapped tier the engine puts a joined weight on, and a device pointer there is a null
-         * header and a refused geometry. The driver hands it over the same way. The allocation is
-         * left standing -- this process is short-lived and one blob per run. */
         void* d = nullptr;
         if (o == 3) {
-            /* Pinned host memory, the mapped tier's shape: the shim reads this operand's header on
-             * the host, the kernel reads the same bytes as a device pointer, and plain malloc is
-             * not device-addressable -- it faults with 700. hipHostMalloc is valid on both sides,
-             * which is what the engine's container mapping gives a joined weight. */
+            /* The joined operand is pinned host memory, as the engine's mapped tier holds a joined
+             * weight: the shim reads its header on the host and the kernel reads the same bytes.
+             * Plain malloc is not device-addressable. */
             if (hipHostMalloc(&d, bytes, 0) != hipSuccess) { fail("w2a8: hipHostMalloc(%zu) failed", bytes); return 1; }
             c.dev.push_back(d);
             c.host.push_back(d);
@@ -1065,8 +981,7 @@ static int run_row(int i) {
     skip("built without the HIP runtime: no device run");
     return 0;
 #else
-    /* No card is not a failure: the static phase above is a third of what this program checks, and
-     * a build machine, a container and the CI job that builds the plugin all run it without one. */
+    /* No device is a skip, not a failure: build machines and CI run the static phase alone. */
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
         skip("no device visible");
@@ -1104,13 +1019,10 @@ static int run_row(int i) {
                          : (size_t)nel * dt_bytes(d.dtype);
         std::vector<uint8_t> h(bytes ? bytes : 1);
         fill_plane(d, h.data(), (size_t)nel, 0x9E3779B9u + (uint32_t)o * 7919u);
-        /* Standing to-do, measured and not shipped: filling every OUT plane with the dtype's NaN --
-         * which is what says a row that returns RAD_OK without launching has left the caller's bytes
-         * in the plane, the failure the attention unit's third bug is -- works for 66 of the 68 rows
-         * and, in the forked child, kills `quant_act_i8_bf16` and `sample_logprobs_f32` on signal 11
-         * while both run clean in-process (`--case`), and both write planes the reference pads. It
-         * is the right check, it needs the padded-plane story finished, and the hand-built geometry
-         * below already does it for the row whose coverage is this file. */
+        /* TODO: pre-fill output planes with the dtype's NaN, to catch a shim that returns RAD_OK
+         * without launching. Doing so makes `quant_act_i8_bf16` and `sample_logprobs_f32` die on
+         * signal 11 in the spawned child (both pass with `--case`); both write planes the
+         * reference pads. build_w2a8 already NaN-fills its output. */
         void* p = nullptr;
         if (hipMalloc(&p, bytes) != hipSuccess) { fail("hipMalloc(%zu) failed", bytes); return 1; }
         c.dev.push_back(p);
@@ -1150,9 +1062,7 @@ launched:
         skip("the shim declines this geometry (%d)", rc);
     } else if (rc != RAD_OK) {
         fail("launch returned %d", rc);
-        /* The band, spelled out: a shim's mapped code says what kind of answer it gave, not what
-         * it was given, and the difference between a launch that failed and a geometry nobody
-         * intended is in the numbers. */
+        /* Print the geometry, since the return code alone does not say what the shim was given. */
         for (int i = 0; i < c.n_p; ++i)
             if (c.p[i].kind == RAD_P_STR)
                 std::printf("   param %s = %s\n", c.p[i].key, c.p[i].sval ? c.p[i].sval : "(null)");
@@ -1162,7 +1072,7 @@ launched:
             const RadTensor& t = c.t[o];
             std::printf("   operand %d '%s' dt=%u rank=%u data=%p", o, s->operands[o].name,
                         t.dtype, t.rank, t.data);
-            for (uint32_t r = 0; r < t.rank; ++r) std::printf(" %lld/%lld", t.shape[r], t.stride[r]);
+            for (uint32_t r = 0; r < t.rank; ++r) std::printf(" %lld/%lld", (long long)t.shape[r], (long long)t.stride[r]);
             std::printf("\n");
         }
         ret = 1;
@@ -1175,16 +1085,13 @@ launched:
             if (s->operands[o].role == RAD_OPD_IN) continue;
             const RadTensor& t = c.t[o];
             if (!t.data) continue;
-            /* A joined plane lives where the mapped tier puts it: pinned host bytes the shim reads
-             * on the host and the kernel reads over PCIe. It is not a device buffer, so there is
-             * nothing to copy back, and its contents are the container's, not the row's work. */
+            /* A joined plane is pinned host memory holding the container's bytes, not the row's
+             * output: nothing to read back. */
             if (std::find(c.host.begin(), c.host.end(), t.data) != c.host.end()) continue;
             ++outs;
             long long nel = 1;
             for (uint32_t r = 0; r < t.rank; ++r) nel *= t.shape[r];
-            /* Sub-byte planes are counted in codes, not bytes: a U2 tensor of 267M codes is
-             * 66.8 MB on the card, and asking the runtime for 267 MB of it is an out-of-range
-             * copy, not a large one. */
+            /* Sub-byte planes are counted in codes, not bytes (a U2 code is a quarter byte). */
             const size_t bytes = t.dtype == RAD_U2 ? (size_t)(nel / 4)
                              : (t.dtype == RAD_U4 || t.dtype == RAD_I4 || t.dtype == RAD_FP4E2M1)
                                  ? (size_t)(nel / 2)
@@ -1207,24 +1114,20 @@ launched:
                 if (v != v) ++nan;
                 else if (!(v > -1e31f && v < 1e31f)) ++big;
             }
-            /* An infinity is the sampler's contract, not a broken number: a dropped candidate is
-             * `cand_idx` -1 and `cand_val` -inf, a narrowing stage drops by writing -inf, the mask
-             * and the ban write -inf into the logits, and a slot row_topk cannot fill is -inf. A
-             * NaN is nobody's contract, so it stays a failure everywhere. */
+            /* -infinity is the sampler's contract (a dropped or unfilled candidate, a masked or
+             * banned logit, an unfilled row_topk slot); a NaN is always a failure. */
             const bool sentinel = (k->family && 0 == std::strcmp(k->family, "sample")) ||
                                   (k->op && 0 == std::strcmp(k->op, "row_topk"));
-            /* Two planes carry the reference's grid rather than the row's work: `asum`, the int8
-             * activation's row sums padded to a 16-row grid, and `stats`, the quantiser's per-group
-             * statistics. The row writes the rows it was given and leaves the pad, and with outputs
-             * pre-filled NaN the pad is NaN by construction. Named planes only -- NaN anywhere else
-             * is exactly the silent no-op the fill exists to find. */
+            /* Two planes are padded to the reference's grid: `asum`, the int8 activation's row sums on
+             * a 16-row grid, and `stats`. The row leaves the pad unwritten, so a NaN there is not
+             * the row's work. Named planes only; NaN anywhere else is a failure. */
             const bool padded = s->operands[o].name &&
                 (0 == std::strcmp(s->operands[o].name, "asum") ||
                  0 == std::strcmp(s->operands[o].name, "stats"));
             if (nan && padded) {
                 ok("ran, %d output plane%s read back with %d pad NaN of %lld on '%s' (the "
-                   "reference's grid, not the row's work)", outs, outs == 1 ? "" : "s", nan, nan == 1
-                   ? "" : "s", nel, s->operands[o].name);
+                   "reference's grid, not the row's work)", outs, outs == 1 ? "" : "s", nan,
+                   nel, s->operands[o].name);
             } else if (nan) { fail("operand %d ('%s'): %d NaN of %lld", o, s->operands[o].name, nan,
                             nel); ret = 1; }
             else if (big && !sentinel) {
@@ -1240,16 +1143,18 @@ launched:
     }
 
     if (scratch) (void)hipFree(scratch);
-    for (void* p : c.dev) (void)hipFree(p);
+    for (void* p : c.dev) {
+        if (std::find(c.host.begin(), c.host.end(), p) != c.host.end()) (void)hipHostFree(p);
+        else (void)hipFree(p);
+    }
     return ret;
 #endif
 }
 
 /* ================================================================== main */
 int main(int argc, char** argv) {
-    /* A row that dies takes the line it was printing with it, and knowing which row died is the
-     * whole point of the census: stdout is unbuffered, so the last line is the last thing that
-     * worked. Redirecting the output to a file is exactly when the buffering would hide it. */
+    /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
+     * even when output goes to a file or pipe. */
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* path = nullptr;
     for (int i = 1; i < argc; ++i) {
@@ -1262,7 +1167,7 @@ int main(int argc, char** argv) {
     if (!path) { std::fprintf(stderr, "r3d_selftest: no plugin given\n"); return 2; }
     g_plugin = path;
 
-    /* dlopen, not link: an undefined symbol in the .so must be this program's failure. */
+    /* dlopen, not link, so an undefined symbol in the .so is reported here. */
     void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::fprintf(stderr, "r3d_selftest: %s\n", dlerror()); return 2; }
     g_h = h;

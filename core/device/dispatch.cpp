@@ -648,6 +648,20 @@ void* rad_dev_alloc_uncached(int64_t bytes) {
     if (const auto f = dev()->alloc_uncached) return f(bytes);
     return nullptr;
 }
+void* rad_dev_map_file(int fd, int64_t foff, int64_t bytes) {
+    const auto f = dev()->map_file;
+    if (!f) {
+        rad::device_set_error("rad_dev_map_file: the %s backend has no pinned host memory to map a "
+                              "file into", dev()->name);
+        return nullptr;
+    }
+    void* p = f(fd, foff, bytes);
+    if (p) {
+        rad::g_ledger[RAD_MEM_HOST_MAPPED].bytes.fetch_add(bytes, std::memory_order_relaxed);
+        rad::g_ledger[RAD_MEM_HOST_MAPPED].count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return p;
+}
 void rad_dev_free_uncached(void* p) {
     if (const auto f = dev()->free_uncached) f(p);
 }

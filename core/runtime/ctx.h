@@ -80,7 +80,9 @@ struct OpPlan {
      * leave out. */
     int32_t       n_opd_schema   = -1;
     int32_t       n_opd_required = -1;
-    bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump) */
+    bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump);
+                                        the step path and the HTTP graph dump meet on it through
+                                        std::atomic_ref (Ctx::flush_issued, rad_graph.cpp) */
     /* Whether issuing it puts bytes on the interconnect. Set at bind from the resolved rows
      * (rad_kernel_collective) and the conventional all_reduce. The weight stager's copies share
      * the link and give way to it while it runs (Ctx::issue_body). */

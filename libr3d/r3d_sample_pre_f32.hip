@@ -3,78 +3,54 @@
  * `sample_ngram_ban` and `sample_mask`; the draw spine -- argmax, temp, top-k, the narrowings and
  * the pick -- is `r3d_sample_f32.hip`, and the only things shared are statics.
  *
- * The arithmetic is libref's, transcribed: the reference's sampler is the law, and
- * `abi/rad_sample.h` is the wire format for every scalar, one 96-byte row per sampled position. The order of the
- * arithmetic is transcription where the order can be seen, and there is a lot of it here: the
- * penalties law (sign-dependent repetition, the count times the frequency, presence once per
- * distinct token, all of it at the token's FIRST occurrence in the window), DRY's longest-suffix
- * repeat per continuation token with its repeated-multiplication penalty, the n-gram ban's
- * windowed prefix search and its whitelist exemption, and the mask's bit-per-token rule.
+ * The arithmetic is libref's, transcribed, and `abi/rad_sample.h` is the wire format for every
+ * scalar (one 96-byte row per sampled position). Order is transcribed wherever it is visible: the
+ * penalties law (sign-dependent repetition, count times frequency, presence once per distinct
+ * token, all at the token's first occurrence in the window), DRY's longest-suffix repeat per
+ * continuation token with its repeated-multiplication penalty, the n-gram ban's windowed prefix
+ * search and whitelist exemption, and the mask's bit-per-token rule.
  *
- * ============================== what each stage reads, and why the shapes differ ==============
+ * ============================== stage shapes ==============================
  *
- * The row is 130560 f32 at the band and there are 2048 of them: the logits plane is 1.02 GiB and
- * one pass over it is ~3.6 ms on this card (RX 7600, 16 CUs). That number sorts the five into two
- * shapes, and the shape is decided by how many of the row's columns the stage touches -- which is
- * what the reference touches, not what it could:
+ * At the band a row is 130560 f32 and there are 2048 rows: the logits plane is 1.02 GiB, about
+ * 3.6 ms a pass on gfx1102. The stages fall into two shapes by how many columns they touch, as
+ * the reference does:
  *
- *   HISTORY STAGES -- penalties, dry, ngram_ban. A row's window is 64 tokens, so a row has at most
- *   64 columns to touch. libref touches exactly those, and so does this file: one block a row of 64
- *   threads, each position a thread, the window read straight from L2 (4096 integer reads a row,
- *   which is why the quadratic scans are free and why there is no LDS copy of the history). These
- *   kernels move kilobytes a row. Micro-optimising the scans would be optimising the part that is
- *   not the cost.
+ *   History stages (penalties, dry, ngram_ban). A window is 64 tokens, so a row touches at most 64
+ *   columns: one block of 64 threads a row, a position a thread, the window read straight from L2
+ *   (4096 integer reads a row). The quadratic scans cost little, so there is no LDS copy.
  *
- *   ROW STAGES -- mask, logprobs. A mask writes every disallowed column of the row and logprobs
- *   summarises every column of it, so these read and write the plane and are the bandwidth rows of
- *   the unit: 256 threads a row, a thread a run of columns, so each lane's traffic is one
- *   contiguous segment.
+ *   Row stages (mask, logprobs). These read or write the whole plane and are bandwidth-bound: 256
+ *   threads a row, each lane a contiguous run of columns.
  *
- * `sample_logprobs` is where the pass count is the whole argument. libref reads the row three
- * times -- a max, then a sum of `exp(v - max)`, then a third scan to insert every element into a
- * k-list -- so at the band it reads 3.06 GiB where one pass reads 1.02. One pass cannot know the
- * row's max before it has seen the row, so each lane keeps a running max and a running DOUBLE sum
- * of `exp(v - its own max)`, rescaling its sum when its max rises (one double multiply per rise,
- * a handful per lane), and the butterfly merges pairs of (max, sum) by
+ * `sample_logprobs` reads the row once where libref reads it three times (max, sum of
+ * `exp(v - max)`, k-list). Each lane keeps a running max and a running double sum of
+ * `exp(v - its own max)`, rescaling the sum when its max rises, and pairs merge by
  *
  *     m = max(a, b);   sum = a.sum * exp(a.mx - m) + b.sum * exp(b.mx - m)
  *
- * which is the reference's sum shifted by a constant per lane. Each term is the reference's term
- * to a fraction of an f64 ulp, the merged sum lands on the reference's to ~1e-15 relative, and the
- * stored value is f32 -- 6e-8 is the granularity of what the plane holds, so the rescaling is
- * below the store's own rounding. The lane shuffles carry the max (32-bit) and the k-list (one
- * 8-byte pattern an entry at a time); the sum is merged in LDS, by wave and then across waves, and
- * the reason is in sample_logprobs_kernel's comment: a double can cross lanes soundly only by
- * moving bits, never by value. `r3d_lanes_check` at the end of the file is the control that keeps
- * that true, and `r3d_selftest.cpp` runs it. The `exp`
- * is `exp(double)`, the reference's own width: libref's sum adds double exps and the row is the
- * logit distribution, so this is the file's one fp64-heavy kernel and it is the slow path by law,
- * not by oversight -- consumer RDNA3 is 1:64 on doubles. At the band (M=2048,
- * n_vocab=130560, k=21) the plane's one read is 3.6 ms at 266 GiB/s, a read that also sums
- * `exp(double)` is 30.4 ms, this kernel is 38.9 ms, and libref's three reads of that plane are
- * 2.988 GiB against this kernel's 0.996.
+ * which is the reference's sum shifted by a constant per lane; it agrees to about 1e-15 relative,
+ * far below the f32 store's 6e-8. The max and the k-list cross lanes by shuffle; the sum merges in
+ * LDS (see sample_logprobs_kernel), checked by `r3d_lanes_check` at the end of the file, which
+ * `r3d_selftest.cpp` runs. The exp is `exp(double)`, the reference's width, which makes this the
+ * file's one fp64-heavy kernel (consumer RDNA3 runs doubles at 1:64); at the band most of its time
+ * is the double exp, not the read.
  *
- * The k-list is per lane too, k deep, kept in the reference's order -- descending by value, ties
- * to the LOWER column, which is `topk_next`'s total order and the narrowing stages' -- and merged
- * pairwise in the same butterfly, so the block's list is the reference's list. `k` at the band is
- * 21; the pool is 64 deep, and a request above that is refused rather than silently truncated.
+ * The k-list is per lane, k deep, in the reference's order (descending by value, ties to the lower
+ * column, `topk_next`'s total order) and merged pairwise in the same butterfly. The pool is 64
+ * deep; a larger k is refused, not truncated.
  *
- * ============================== agreement, and where this file declines ==============================
+ * ============================== agreement and declines ==============================
  *
- * Maxima are strict `>` with the max as the first argument, which is `std::max`'s law and is how a
- * NaN is kept out of the row's max: a NaN never compares greater, so it is never adopted, at the
- * first element or anywhere later. A NaN in the sum propagates, because the reference's
- * `exp(NaN - mx)` is NaN and it is added.
+ * Maxima use a strict `>` with the max as the first argument (`std::max`'s law), so a NaN is never
+ * adopted as the row's max. A NaN in the sum propagates, as the reference's `exp(NaN - mx)` does.
  *
- * A row whose parameters turn the stage off is left bit for bit as it was -- the flag test is the
- * reference's, and for penalties the identity test (rep 1, freq 0, pres 0) is too.
+ * A row whose parameters turn the stage off is left bit-exact; the flag test is the reference's,
+ * and for penalties so is the identity test (rep 1, freq 0, pres 0).
  *
- * Declines, all of them RAD_E_UNSUPPORTED from the shim and none of them reachable from a row that
- * carries the constraints its rows do: a history plane wider than 2^31/8 columns is not a plane;
- * `k` above 64 for logprobs (the pool's depth, and far above any k the engine requests); and for
- * ngram_ban a `whitelist` plane, which the kernel implements -- the whitelist is exempted before
- * the -inf writes, as the reference removes it from the banned set -- so the only decline is the
- * `ngram` plane's dtype and the mask and whitelist's, which must be 32-bit words.
+ * Declines (RAD_E_UNSUPPORTED or a dtype refusal from the shim, none reachable from a row that
+ * carries its constraints): a history plane wider than 2^31/8 columns; `k` above 64 for logprobs;
+ * an `ngram` plane of the wrong dtype; mask or whitelist planes that are not 32-bit words.
  */
 
 #include "r3d.h"
@@ -88,8 +64,8 @@
 
 /* ================================================================== shared helpers (statics)
  *
- * The headers are frozen, so a unit that needs a helper carries its own copy and keeps it static: a
- * non-static one collides at link with the same helper in another unit and takes the library down.
+ * Helpers are per-unit and internal-linkage: a non-static copy would collide at link with the same
+ * helper in another unit.
  */
 namespace {
 
@@ -99,17 +75,9 @@ constexpr uint32_t kWave    = 32;
 constexpr uint32_t kWaves   = kThreads / kWave;
 constexpr int      kKMax    = 64;               /* the k-list pool's depth, per lane */
 
-/* The row's summary accumulates `exp` in DOUBLE, because that is where the reference's sum lives.
- * The width is a switch, because the width is the cost: at the band the double exp is 30 ms of the
- * kernel's 38 ms against a 3.7 ms plane read, and an f32 exp widened to double --
- * `expf`, terms accurate to an f32 ulp, summed in double -- lands the row's sum on the reference's
- * to ~1e-10 relative against a stored f32 granularity of 6e-8. Define R3D_LP_EXP_F32 to build the
- * fast exp; the default is the reference's arithmetic. */
-#ifdef R3D_LP_EXP_F32
-__device__ __forceinline__ double dexp(double x) { return (double)expf((float)x); }
-#else
+/* The row's summary accumulates `exp` in double, as the reference's sum does. At the band the
+ * double exp is most of the kernel's time; it stays, so the summary is the reference's arithmetic. */
 __device__ __forceinline__ double dexp(double x) { return exp(x); }
-#endif
 
 /* A whole-register load of an index plane: the history, the n-gram pair, the bitmask words. */
 __device__ __forceinline__ int32_t ldg_i32(const int32_t* p) {
@@ -122,12 +90,10 @@ template <int N>
 __device__ __forceinline__ int32_t xor_i32(int32_t v) {
     return (int32_t)r3d_xor_lane_u32<N>((uint32_t)v);
 }
-/* There is no 64-bit lane shuffle here on purpose: see sample_logprobs_kernel. */
+/* No 64-bit numeric lane shuffle: see sample_logprobs_kernel. */
 
-/* The law, verbatim. The window both history stages read, clamped to the row's own row
- * of the plane; `last_n` 0 disables the stage, a negative keeps the whole span, a positive keeps
- * its TAIL. The window law IS the history law: the window, and the rule that a token is penalised
- * at its first occurrence in it. */
+/* The reference's window, verbatim, clamped to the row's own row of the plane: `last_n` 0
+ * disables the stage, a negative keeps the whole span, a positive keeps its tail. */
 __device__ __forceinline__ bool hist_window(const RadSampleParams& sp, int32_t last_n, int64_t hmax,
                                             int64_t* ho_out, int64_t* hl_out) {
     if (last_n == 0) return false;
@@ -144,8 +110,8 @@ __device__ __forceinline__ bool hist_window(const RadSampleParams& sp, int32_t l
     return hl > 0;
 }
 
-/* The law, verbatim, including the stop short of overflow: repeated multiplication, so
- * every implementation lands on the same float. */
+/* The reference's penalty, verbatim, including the stop short of overflow. Repeated multiplication
+ * rather than powf, so every implementation lands on the same float. */
 __device__ __forceinline__ float dry_penalty(float multiplier, float base, int64_t e) {
     float pen = multiplier;
     if (base == 1.0f) return pen;
@@ -157,8 +123,8 @@ __device__ __forceinline__ float dry_penalty(float multiplier, float base, int64
     return pen;
 }
 
-/* The k-list's order: descending by value, ties to the lower column. `above(x, y)` is "x comes
- * first", the reference's comparator and `topk_next`'s chain. */
+/* The k-list's order: descending by value, ties to the lower column. `above(x, y)` means x comes
+ * first (the reference's comparator, `topk_next`'s chain). */
 struct Cand { float v; int32_t i; };
 __device__ __forceinline__ bool above(Cand x, Cand y) {
     return x.v > y.v || (x.v == y.v && x.i < y.i);
@@ -166,13 +132,12 @@ __device__ __forceinline__ bool above(Cand x, Cand y) {
 
 /* ================================================================== sample_logprobs
  *
- * The law. The row's summary: its max, the sum of exp(v - max) in double, and the k
- * largest as (id, logit) pairs descending, ids as floats with `vocab_off` added, an unfilled slot
- * id -1 and logit -infinity. Rows without RAD_SP_LOGPROBS are not written at all.
+ * The row's summary: its max, the sum of exp(v - max) in double, and the k largest as (id, logit)
+ * pairs descending, ids as floats with `vocab_off` added; an unfilled slot is id -1, logit
+ * -infinity. Rows without RAD_SP_LOGPROBS are not written.
  *
- * One pass over the row, per the file's header: the max, the sum and the k-list are three
- * independent accumulations of the same read, and the sum is rescaled into the row's final max at
- * the merge, which is a per-lane shift of the reference's terms.
+ * One pass (see the file header): max, sum and k-list accumulate from the same read, and the sum is
+ * rescaled into the final max at each merge.
  */
 struct Acc {
     float mx;
@@ -181,17 +146,17 @@ struct Acc {
     int n;
 };
 
-/* A lane's running state over its own elements. A new maximum rescales the sum it has so far; the
- * reference never rescales (it knows the max up front) and the rescale is the price of the read. */
+/* A lane's running state over its own elements. A new maximum rescales the sum so far, the cost
+ * of not knowing the max up front as the reference does. */
 __device__ __forceinline__ void acc_push(Acc& a, int k, uint32_t col, float v) {
     if (v > a.mx) {
         if (a.mx != -INFINITY) a.sum *= dexp((double)a.mx - (double)v);
         a.mx = v;
     }
     a.sum += dexp((double)v - (double)a.mx);
-    /* The reference's insertion: an element that is not above the k-th is dropped, and the insert
-     * point is the first slot the element beats (with a NaN, no slot, so the tail: insert, then the
-     * pop leaves the list exactly as it was). */
+    /* The reference's insertion: an element not above the k-th is dropped; otherwise it goes in
+     * the first slot it beats. A NaN beats no slot, so it lands at the tail and the list is
+     * unchanged. */
     if (a.n == k && !above(Cand{ v, (int32_t)col }, a.c[a.n - 1])) return;
     int pos = 0;
     while (pos < a.n && !above(Cand{ v, (int32_t)col }, a.c[pos])) ++pos;
@@ -201,10 +166,9 @@ __device__ __forceinline__ void acc_push(Acc& a, int k, uint32_t col, float v) {
     if (a.n < k) ++a.n;
 }
 
-/* The butterfly's merge of two lanes' states: the max is strict, the sum is the two shifted sums,
- * and the lists merge on the same order. Ties in the merge (two equal values at equal columns
- * cannot happen -- the column is the lane's -- and a NaN is not above anything, so a NaN list
- * entry stays in the lane that read it). */
+/* The merge of two lanes' states: a strict max, the sum of both shifted sums, and the lists merged
+ * in the same order. Equal values at equal columns cannot occur (each column belongs to one lane),
+ * and a NaN entry is above nothing. */
 __device__ __forceinline__ Acc acc_merge(const Acc& a, const Acc& b, int k) {
     Acc r;
     r.mx = a.mx > b.mx ? a.mx : b.mx;
@@ -234,35 +198,20 @@ __global__ __launch_bounds__(THR) void sample_logprobs_kernel(
     const float* __restrict__ lr = lg + (size_t)row * lg_ld;
     for (uint32_t c = threadIdx.x; c < n; c += THR) acc_push(a, (int)k, c, ldg_f32(lr + c));
 
-    /* The k-list and the max meet their partners in the wave's 32-bit lane shuffles, five rounds.
+    /* The k-list and the max meet their partners by lane shuffle, five rounds. The shuffle mask
+     * on wave32 is `0xFFFFFFFFull`; `~0ull` would name lanes 32..63, which do not exist.
      *
-     * The participation mask of a 64-bit shuffle on this ROCm is an `unsigned long long`, and on
-     * wave32 it is `0xFFFFFFFFull`: `~0ull` names lanes 32..63, which a wave of 32 does not have.
-     * `r3d_lanes_check` at the end of this file is the control that proves the lane helpers, and
-     * `r3d_selftest.cpp` runs it and checks every lane of every wave.
-     *
-     * The SUM does not go through a lane shuffle: it meets its partners in LDS, the machinery
-     * `block_sum` already trusts. A double can cross lanes soundly -- lanes_check_kernel below is
-     * exact in all 256 lanes of all 8 waves for three forms of it -- but only by moving the value's
-     * *bits*, never by value: a cast to an integer type converts by value, so
-     *
-     *     d += (double)r3d_xor_lane_u64<N>((unsigned long long)d);
-     *
-     * truncates the partner's term to its integer part, and a wave of fractions then sums to 1, the
-     * largest term's integer part -- a 40% loss of the row's mass at the band's width, the shape a
-     * hardware fault takes. The k-list, whose entries are bit patterns by construction (a float's
-     * pattern and an int in one 8-byte value), crosses lanes as that pattern in one shuffle; the sum,
-     * which is a number, does not cross lanes at all. */
+     * The sum does not cross lanes; it merges in LDS below. A double can cross lanes only as its
+     * bits: `(unsigned long long)d` converts by value and truncates the partner's term to its
+     * integer part (see lanes_check_kernel). The k-list entries are bit patterns (a float's
+     * pattern and an int packed into 8 bytes), so they cross as one 64-bit shuffle. */
 #define R3D_ACC_XOR(M)                                                                           \
     {                                                                                            \
         Acc b;                                                                                   \
         b.mx = r3d_xor_lane<M>(a.mx);                                                            \
         b.n = xor_i32<M>((int32_t)a.n);                                                          \
         for (int j = 0; j < k; ++j) {                                                            \
-            /* One list entry is one 8-byte value -- a float's pattern and a column -- and it
-             * crosses lanes as that pattern, in one shuffle. Assembling it from the two halves on
-             * the far side would need each half shuffled and then reassembled by value, which is
-             * the shape that turns a bit pattern into a number. */                                \
+            /* One entry, a float's pattern and a column, crosses lanes as one 8-byte pattern. */ \
             const unsigned long long packed =                                                   \
                 (unsigned long long)__float_as_uint(a.c[j].v) |                                  \
                 ((unsigned long long)(uint32_t)a.c[j].i << 32);                                  \
@@ -270,8 +219,7 @@ __global__ __launch_bounds__(THR) void sample_logprobs_kernel(
             b.c[j] = Cand{ __uint_as_float((uint32_t)got), (int32_t)(uint32_t)(got >> 32) };      \
         }                                                                                        \
         b.sum = 0.0;                                                                             \
-        const float mx = a.mx > b.mx ? a.mx : b.mx;   /* no lane's max is a NaN: a NaN is never   \
-                                                 adopted by the strict test above */             \
+        const float mx = a.mx > b.mx ? a.mx : b.mx;   /* no lane's max is a NaN (strict test) */ \
         a = acc_merge(a, b, (int)k);                                                             \
         a.mx = mx;                                                                               \
     }
@@ -282,9 +230,9 @@ __global__ __launch_bounds__(THR) void sample_logprobs_kernel(
     R3D_ACC_XOR(1)
 #undef R3D_ACC_XOR
 
-    /* The wave's sum, in LDS: the wave's max first, then every lane's sum shifted into it, in lane
-     * order. An empty lane (a row narrower than the block) has max -infinity and sum 0 and
-     * contributes nothing, which is the reference's own arithmetic on an empty span. */
+    /* The wave's sum in LDS: the wave's max, then every lane's sum shifted into it, in lane order.
+     * An empty lane (a row narrower than the block) has max -infinity and sum 0 and contributes
+     * nothing. */
     __shared__ float s_mx[kThreads];
     __shared__ double s_sum[kThreads];
     __shared__ float w_mx[kWaves];
@@ -345,16 +293,15 @@ __global__ __launch_bounds__(THR) void sample_logprobs_kernel(
 
 /* ================================================================== sample_penalties
  *
- * The law. llama.cpp's ordering, at the token's first occurrence in the window:
+ * llama.cpp's ordering, applied at the token's first occurrence in the window:
  *
  *     repetition  logit = logit > 0 ? logit / rep : logit * rep
  *     frequency   logit -= count * freq
  *     presence    logit -= pres
  *
  * The repetition penalty is sign-dependent because dividing a negative logit would raise it. The
- * count carries the multiplicity, which is why the update runs once per distinct token, and the
- * scan for it is the reference's own: walk the window from the front, stop at an earlier
- * occurrence, count the ones from here on.
+ * count carries the multiplicity, so the update runs once per distinct token; the scan is the
+ * reference's: walk the window from the front, stop at an earlier occurrence, count the rest.
  *
  * Columns are global ids less `vocab_off`, so a token on another rank's shard is skipped here and
  * penalised there. Each distinct token is one column and one thread, so the writes cannot race.
@@ -395,15 +342,14 @@ __global__ __launch_bounds__(kPre) void sample_penalties_kernel(
 
 /* ================================================================== sample_dry
  *
- * The law, DRY's rule (llama.cpp's llama_sampler_dry_apply): for every earlier position
- * j, n_j is how long a suffix of the window also ends at j, capped at the breaker limit; the token
- * at j+1 would extend that repeat and is penalised by multiplier * base^(n - allowed), once, by the
- * LONGEST repeat it follows. A token that is itself a whole-sequence breaker is never penalised,
- * and only lengths at or above `allowed` count.
+ * DRY (llama.cpp's llama_sampler_dry_apply): for every earlier position j, n_j is how long a suffix
+ * of the window also ends at j, capped at the repeat limit. The token at j+1 would extend that
+ * repeat and is penalised once by multiplier * base^(n - allowed), using the longest repeat it
+ * follows. A breaker token is never penalised, and only lengths >= `allowed` count.
  *
- * A thread a position, the window read from L2. The map the reference keeps is here a maximum over
- * the threads that share a token, applied by the thread holding the token's first occurrence, so
- * one column is written once.
+ * A thread a position, the window read from L2. The reference's per-token map becomes a maximum
+ * over the threads sharing a token, applied by the thread at the token's first occurrence, so each
+ * column is written once.
  */
 __global__ __launch_bounds__(kPre) void sample_dry_kernel(
     float* __restrict__ lg, const RadSampleParams* __restrict__ pr, const int32_t* __restrict__ hist,
@@ -434,8 +380,8 @@ __global__ __launch_bounds__(kPre) void sample_dry_kernel(
         const int32_t tok = tok_at((int64_t)j + 1);
         const int64_t col = (int64_t)tok - voff;
         if (tok < 0 || col < 0 || col >= n) continue;
-        /* The longest repeat any position attributes to this token, and the first thread that
-         * carries it pays for it. Equal tokens at equal lengths: the lowest j, so one writer. */
+        /* The longest repeat any position attributes to this token; the lowest qualifying j is
+         * the one writer. */
         int64_t longest = m;
         bool first = true;
         for (int64_t q = 0; q + 1 < hl; ++q) {
@@ -455,18 +401,17 @@ __global__ __launch_bounds__(kPre) void sample_dry_kernel(
 
 /* ================================================================== sample_ngram_ban
  *
- * The law, the windowed no-repeat-ngram ban. With the row's window s[0, hl):
+ * The windowed no-repeat-ngram ban. With the row's window s[0, hl):
  *
  *     search_start = max(0, hl - w);  search_end = hl - n + 1;  prefix = s[hl - n + 1, hl)
  *     for idx in [search_start, search_end): s[idx, idx + n - 1) == prefix  =>  ban s[idx + n - 1]
  *
- * The window is on the START index, so the n-gram that straddles the window's edge is searched. A
- * banned token's logit becomes -infinity, and the whitelist is removed from the banned set before
- * any -inf is written, so a whitelisted column is never touched. n == 1 bans every token in the
- * window, the prefix being empty. A row whose n is 0 is left bit for bit as it was.
+ * The window bounds the start index, so an n-gram straddling the window's edge is searched. A
+ * banned token's logit becomes -infinity; whitelisted columns are exempt and never touched. n == 1
+ * bans every token in the window (empty prefix). A row with n 0 is left unchanged.
  *
- * A thread a search index. Several indices can ban the same token; the write is the same -infinity
- * from every one of them, so the race writes one value.
+ * A thread a search index. Several indices may ban the same token, but all write the same
+ * -infinity.
  */
 __global__ __launch_bounds__(kPre) void sample_ngram_ban_kernel(
     float* __restrict__ lg, const RadSampleParams* __restrict__ pr, const int32_t* __restrict__ hist,
@@ -514,16 +459,12 @@ __global__ __launch_bounds__(kPre) void sample_ngram_ban_kernel(
 
 /* ================================================================== sample_mask
  *
- * The law. A set bit means allowed; an unset column's logit becomes -infinity. This is
- * the dense row stage: a row of 130560 columns and a bitmask of 4080 words, so a thread takes a
- * word and the 32 columns under it, which is one contiguous 128-byte segment a lane. A word that
- * is all ones is skipped whole, and a word that is all zeros is a run of eight 16-byte stores;
- * either way the row is written in the order the plane is laid out.
+ * A set bit means allowed; an unset column's logit becomes -infinity. A thread takes one bitmask
+ * word and its 32 columns, a contiguous 128-byte segment. An all-ones word is skipped; an all-zeros
+ * word is a straight run of stores.
  *
- * `mask_row` is the row's own row of the bitmask plane, and the reference skips a row index
- * outside the plane, -1 included (the shape hook caps `idx_max` at M so a fixture draws a real
- * row); the shim bounds the plane to at least M rows, which is the same test at the geometry the
- * op's descriptor describes.
+ * `mask_row` selects the row of the bitmask plane; as in the reference, a row index outside the
+ * plane (-1 included) leaves the row unmasked.
  */
 __global__ __launch_bounds__(kThreads) void sample_mask_kernel(
     float* __restrict__ lg, const RadSampleParams* __restrict__ pr, const int32_t* __restrict__ bm,
@@ -556,9 +497,8 @@ static inline int sp_is_word(const RadTensor* t) {
     return t && (t->dtype == RAD_U32 || t->dtype == RAD_I32 || t->dtype == RAD_F32);
 }
 
-/* The params plane: [M, 24] words. The dtype test is not decoration -- a 16-bit view of the plane
- * passes a byte-count check and then misreads every row, sampling with the top half of one row's
- * temp and the bottom of the next. */
+/* The params plane: [M, 24] words. The dtype test matters: a 16-bit view passes a byte-count check
+ * and then misreads every row. */
 static inline int params_ok(const RadTensor* t, long long M) {
     if (!t || !t->data) return RAD_E_INVAL;
     if (!sp_is_word(t)) return RAD_E_DTYPE;
@@ -600,8 +540,8 @@ static inline int r3d_launch_status(int rc) {
 /* The logits row count, from the plane and never from the band's M. */
 static inline int logits_rows(const RadArgs* a, const RadTensor* lg, long long* n_vocab,
                               long long* rows, long long* lg_ld) {
-    /* The reference reads the width off the band, falling back to the plane's last dimension, and
-     * a rank-1 plane has no last dimension to read: the width is absent, which is E_SHAPE. */
+    /* As in the reference: the width from the band, else the plane's last dimension; a rank-1
+     * plane has none, which is E_SHAPE. */
     *n_vocab = r3d_geti_or(a, "n_vocab",
                            lg->rank >= 2 ? r3d_dim(lg, (int)lg->rank - 1) : 0);
     if (*n_vocab <= 0 || *n_vocab > 0x7fffffffLL) return RAD_E_SHAPE;
@@ -697,13 +637,11 @@ extern "C" int r3d_sample_mask(long lg, long params, long bitmask, int M, int n_
     if (M <= 0 || n_vocab <= 0) return -2;
     if (!lg_ld) lg_ld = n_vocab;
     if (lg_ld < n_vocab) return -3;
-    if (mask_rows < M) return -3;   /* a plane that cannot address row M-1 is not that plane */
+    if (mask_rows < M) return -3;   /* the plane must hold at least M rows */
     const uint32_t words = (uint32_t)((n_vocab + 31) / 32);
-    /* mask_rows is the bitmask plane's own row count, which is what the reference compares
-     * mask_row against, and the shim reads it off the operand. It is M at the geometry the shape
-     * hook draws and the engine builds, and larger when a caller hands a plane of its own, in which
-     * case a row addressing past M is masked, as the reference masks it. The grid stays M: rows
-     * past the logits plane's row count have no logits to mask. */
+    /* mask_rows is the bitmask plane's own row count, the bound the reference tests mask_row
+     * against; it may exceed M when a caller passes a larger plane. The grid stays M, the logits
+     * row count. */
     R3D_KLAUNCH(R3D_KNAME(sample_mask_kernel), dim3((uint32_t)M), dim3(kThreads),
                 (hipStream_t)(uintptr_t)stream, (float*)(uintptr_t)lg,
                 (const RadSampleParams*)(uintptr_t)params, (const int32_t*)(uintptr_t)bitmask,
@@ -725,8 +663,7 @@ extern "C" int r3d_rad_sample_logprobs(const RadArgs* a, RadStream stream) {
     R3D_NEED(logits_ok(lg));
     const long long k = r3d_geti_or(a, "k", 0);
     if (k <= 0) return R3D_NO(RAD_E_SHAPE);
-    /* The pool is 64 deep per lane, which is above every k the engine requests. A row carrying
-     * C_LE("k", 64) is what keeps a request above it out of the band. */
+    /* The pool is 64 deep per lane; the row's C_LE("k", 64) keeps larger requests out of the band. */
     if (k > kKMax) return R3D_NO(RAD_E_UNSUPPORTED);
     long long n_vocab = 0, rows = 0, lg_ld = 0;
     R3D_NEED(logits_rows(a, lg, &n_vocab, &rows, &lg_ld));
@@ -770,7 +707,7 @@ extern "C" int r3d_rad_sample_dry(const RadArgs* a, RadStream stream) {
     R3D_NEED(hist_ok(hi, rows, &hmax));
     long long baddr = 0;
     if (brk && brk->data) {
-        /* One byte a history position, the exemption matching the history position for position. */
+        /* One exemption byte per history position. */
         if (!r3d_is_u8(brk)) return R3D_NO(RAD_E_DTYPE);
         if (!r3d_contig(brk)) return R3D_NO(RAD_E_STRIDE);
         if (r3d_numel(brk) < rows * hmax) return R3D_NO(RAD_E_SHAPE);
@@ -822,8 +759,7 @@ extern "C" int r3d_rad_sample_mask(const RadArgs* a, RadStream stream) {
     if (!r3d_contig(bm)) return R3D_NO(RAD_E_STRIDE);
     const long long words = (n_vocab + 31) / 32;
     if (words <= 0 || r3d_numel(bm) < rows * words) return R3D_NO(RAD_E_SHAPE);
-    /* The plane's own row count is the bound the reference tests, and the plane may be longer than
-     * the logits: a caller that hands a plane of its own gets its rows. */
+    /* The plane's own row count is the bound the reference tests; it may exceed the logits'. */
     const long long mask_rows = r3d_numel(bm) / words;
     return r3d_launch_status(r3d_sample_mask(r3d_addr(lg), r3d_addr(pr), r3d_addr(bm), (int)rows,
                                             (int)n_vocab, lg_ld, (int)mask_rows,
@@ -832,32 +768,20 @@ extern "C" int r3d_rad_sample_mask(const RadArgs* a, RadStream stream) {
 
 /* ================================================================== the lane helpers, proved
  *
- * Every wave-sum in libr3d is a butterfly over lane shuffles, and the arithmetic that rides on a
- * lane shuffle is invisible to a codec sweep: a helper that hands back a stale half of a 64-bit
- * value reads as a few percent of a perplexity, in a model nobody suspects. This file
- * has one of the shapes in it -- the logprobs k-list crosses lanes as 8-byte values -- so it also
- * carries the control that checks the helpers, on the card, one entry per lane per wave.
+ * Every wave-sum in libr3d is a butterfly over lane shuffles, and an error in a lane helper (say, a
+ * stale half of a 64-bit value) is invisible to a codec sweep. The logprobs k-list crosses lanes as
+ * 8-byte values, so this file carries the on-device control for the helpers: one entry per lane of
+ * all 8 waves, seeds at wave-local lanes 6, 9, 19 and 25, five butterfly rounds, over
+ * `r3d_xor_lane_u64` (two 32-bit shuffles), and one 64-bit shuffle.
  *
- * On this box (gfx1102, -O2 and -O3, wave32) the control is exact in **all 256 lanes of all 8
- * waves**: seeds at wave-local lanes 6, 9, 19 and 25, five butterfly rounds, and every form of the
- * 64-bit exchange -- `r3d_xor_lane_u64` (two 32-bit shuffles of the halves), the same shape written
- * as a `__shfl_xor_sync` per half, and one shuffle of the 64-bit value -- with the lane's value
- * derived from `threadIdx.x`, loaded from a plane, and accumulated in a grid-stride loop.
- * `r3d_xor_lane_u64` is sound; the form it must not be written in converts by value:
+ * The form that must not be written converts by value:
  *
- *     d += (double)r3d_xor_lane_u64<N>((unsigned long long)d);      // WRONG
+ *     d += (double)r3d_xor_lane_u64<N>((unsigned long long)d);      // wrong
  *
- * `(unsigned long long)d` converts a double to an integer **by value** and `(double)` converts back
- * by value, so the partner's term arrives truncated to its integer part. A wave of fractions then
- * sums to 1 -- the largest term's integer part -- a 40% loss of the row's mass at the band's width,
- * and a loss that vanishes when the terms are integers: an integer survives the round trip. Nothing
- * about the lane shuffle is involved, and a codec sweep cannot see it, because the expression is not
- * a codec. The correct form moves bits, not values (`bits_of` / `d_from_bits` below), which is what
- * the k-list's shuffle does.
- *
- * The two traps of this shape are the whole content of the warning: summing a
- * float's IEEE pattern as an integer, and converting a float's pattern to a value. The control
- * catches both, in both directions, on the card, in every lane.
+ * The partner's term arrives truncated to its integer part, so a wave of fractions sums to the
+ * largest integer part; the error vanishes for integer terms. The correct form moves bits
+ * (`bits_of` / `d_from_bits` below), as the k-list's shuffle does. The control catches both traps:
+ * summing an IEEE pattern as an integer, and converting a pattern to a value.
  */
 __device__ __forceinline__ double d_from_bits(unsigned long long b) {
     double d;
@@ -871,12 +795,11 @@ __device__ __forceinline__ unsigned long long bits_of(double d) {
 }
 
 __global__ __launch_bounds__(256) void lanes_check_kernel(double* __restrict__ out) {
-    /* kThreads and kWave are this file's anonymous-namespace names and are ambiguous out here, so
-     * the control spells its own geometry. */
+    /* kThreads and kWave are ambiguous outside the anonymous namespace, so the control spells its
+     * own geometry. */
     constexpr uint32_t kLWave = 32, kLBlock = 256;
-    /* Seeds at wave-local lanes 6, 9, 19, 25: a wave with four non-zero lanes and an expected sum
-     * of 0.08945 + 1 + 0.5971 + 0.9768, in the butterfly's own order. Every wave carries them, so
-     * every wave is checked. */
+    /* Four non-zero lanes per wave, expected sum 0.08945 + 1 + 0.5971 + 0.9768 in the butterfly's
+     * order; every wave carries them. */
     const uint32_t lane = threadIdx.x & (kLWave - 1);
     const double seed = (lane == 6) ? 0.08945 : (lane == 9) ? 1.0 : (lane == 19) ? 0.5971
                         : (lane == 25) ? 0.9768 : 0.0;
@@ -886,8 +809,7 @@ __global__ __launch_bounds__(256) void lanes_check_kernel(double* __restrict__ o
     s_f[threadIdx.x] = (float)seed;
     __syncthreads();
 
-    /* Form 0: the 32-bit butterfly every wave-sum in the library is built from, over a value read
-     * out of LDS so it is a memory operand and not a constant. */
+    /* Form 0: the 32-bit butterfly, over a value read from LDS so it is not a constant. */
     float f = s_f[threadIdx.x];
     f += r3d_xor_lane<16>(f);
     f += r3d_xor_lane<8>(f);
@@ -896,24 +818,21 @@ __global__ __launch_bounds__(256) void lanes_check_kernel(double* __restrict__ o
     f += r3d_xor_lane<1>(f);
     out[0 * kLBlock + threadIdx.x] = (double)f;
 
-    /* Form 1: the halves form over a value derived from the lane index. The pattern goes to the
-     * helper and back through bits_of/d_from_bits: a cast between double and an integer type
-     * converts the value, which is what this control guards against. */
+    /* Form 1: the halves form over a value derived from the lane index, passed as bits. */
     double d = seed;
 #define R3D_L64(N) d += d_from_bits(r3d_xor_lane_u64<N>(bits_of(d)));
     R3D_L64(16) R3D_L64(8) R3D_L64(4) R3D_L64(2) R3D_L64(1)
 #undef R3D_L64
     out[1 * kLBlock + threadIdx.x] = d;
 
-    /* Form 2: the same halves form over a value loaded from LDS, the shape an accumulator has. */
+    /* Form 2: the halves form over a value loaded from LDS, as an accumulator is. */
     d = s_d[threadIdx.x];
 #define R3D_L64B(N) d += d_from_bits(r3d_xor_lane_u64<N>(bits_of(d)));
     R3D_L64B(16) R3D_L64B(8) R3D_L64B(4) R3D_L64B(2) R3D_L64B(1)
 #undef R3D_L64B
     out[2 * kLBlock + threadIdx.x] = d;
 
-    /* Form 3: one shuffle of the 64-bit pattern, the form this file's k-list uses. The mask is
-     * 0xFFFFFFFFull, the 32 lanes a wave32 wave has. */
+    /* Form 3: one 64-bit shuffle, the k-list's form; the mask names wave32's 32 lanes. */
     d = s_d[threadIdx.x];
 #define R3D_S64(N) d += d_from_bits(__shfl_xor_sync(0xFFFFFFFFull, bits_of(d), N));
     R3D_S64(16) R3D_S64(8) R3D_S64(4) R3D_S64(2) R3D_S64(1)
@@ -921,9 +840,9 @@ __global__ __launch_bounds__(256) void lanes_check_kernel(double* __restrict__ o
     out[3 * kLBlock + threadIdx.x] = d;
 }
 
-/* Four forms x 256 lanes of doubles (8 KiB, which the caller owns: this launcher allocates nothing,
- * as every launcher in this file does). 0, -1 null, -4 the launch failed. r3d_selftest.cpp dlsyms
- * this by name and compares every lane against a host emulation of the same five rounds. */
+/* Writes four forms x 256 lanes of doubles (8 KiB, caller-owned). 0, -1 null, -4 the launch
+ * failed. r3d_selftest.cpp resolves this by name and compares every lane against a host emulation
+ * of the same five rounds. */
 extern "C" int r3d_lanes_check(long out, long stream) {
     if (!out) return -1;
     R3D_KLAUNCH(R3D_KNAME(lanes_check_kernel), dim3(1), dim3(256),

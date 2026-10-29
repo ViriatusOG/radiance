@@ -127,6 +127,11 @@ struct GdnFP8 {
      * the widest decode window the fold serves. */
     rad_op  op_cr = 0;
     int64_t cr_rows = 0;
+    /* Set by the architecture after declare: a `prefetch` of the out-projection's leading bytes
+     * (decl_prefetch, rad_arch.h), issued on the second lane beside the decode recurrent update on
+     * steps of up to pf_out_rows rows and pf_out_seqs sequences. 0 where none is declared. */
+    rad_op  op_pf_out = 0;
+    int64_t pf_out_rows = 0, pf_out_seqs = 0;
     rad_op op_ar = 0, op_add = 0;
     /* The next block absorbs this block's closing all-reduce (see rad_block_attn_gated_fp8.h). */
     bool ar_out = false;
@@ -481,6 +486,14 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int64_t PT = T - DT;
     const int64_t in_w = conv_dim + v_dim;      /* w.in.x's declared row width */
 
+    /* The recurrent update at decode heights runs one workgroup per (sequence, head) and leaves the
+     * card's memory mostly idle, so the out-projection's weight is read into the on-die cache
+     * beside it, on the second lane behind a join from lane 0 (as prefetch_beside). */
+    if (op_pf_out && D > 0 && D <= pf_out_seqs && P == 0 && T <= pf_out_rows) {
+        if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK)
+            RAD_ISSUE(c, op_pf_out, RAD_W(out.w));
+        rad_lane(c, 0);
+    }
     if (D > 0 && op_cr && qd <= cr_rows) {
         RAD_ISSUE_N(c, op_cr, qd,
                     bcol(w.in.x, 0, conv_dim, DT), RAD_W(w_conv), RAD_NONE, kv_cache(kv_conv, layer),

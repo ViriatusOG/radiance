@@ -21,14 +21,35 @@
  * under `model`. Which one this is comes from the config (a VL checkpoint has a `text_config`),
  * not the model's name.
  *
+ * ============================== 8-BIT LINEARS ==============================
+ *
+ * Every linear is a LinearFP8 (rad_fp8.h), so the container's encoding of each weight decides the
+ * GEMM: plain bf16 is `gemm_nt` over the bf16 activation, exactly as a bf16 model runs; a recipe's
+ * block E4M3 (`codes=fp8_e4m3 block=128x128 scale=bf16`) is `gemm_nt_q` at fp8a8 over the
+ * activation quantised per 128 columns (one quant_act_fp8 per activation, shared by the linears
+ * that read it); int8 (`codes=i8 group=128 scale=bf16`) is `gemm_nt_q` at i8a8, each linear
+ * quantising its input. The trunk's format is read off layer 0's down projection and every linear
+ * must match it. The convolution, the norms and attention stay bf16; the lm_head is read at its
+ * stored codes (bf16, or E4M3 / int8 where a recipe made it so; logits_gemm_fp8 / _i8). At d1-3B
+ * the linears are 5.8 of the 6.3 GB a token reads, so 8-bit codes nearly halve decode and short
+ * prefill, both bound by that read.
+ *
+ * A block-fp8 trunk also takes the fused producers (rad_fp8.h), which matter once the GEMMs are
+ * this cheap: each norm quantises in its own pass and does the preceding block's residual add
+ * (rmsnorm_quant_fp8 with a fold), and the feed-forward is MlpFP8, whose gate|up GEMM applies
+ * SiLU(gate) * up and quantises in its epilogue at decode and short-prompt rows. Six launches a
+ * layer become two; the last layer's feed-forward keeps its add for the final norm. The fused
+ * kernels are byte-identical to the chains they replace.
+ *
  * ============================== WHAT IT DOES NOT SERVE ==============================
  *
  * Tensor parallelism (a 3B model needs one card). A drafter, MoE (LFM2-8B-A1B), conv bias, or a
  * checkpoint without the rotary: each is refused by name.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_block_mlp.h>
 #include <arch/rad_block_vit.h>
+#include <arch/rad_block_mlp_fp8.h>
+#include <arch/rad_fp8.h>
 
 #include "siglip2.h"
 
@@ -42,17 +63,32 @@ using namespace rad::arch;
 
 struct Layer {
     bool    attention = false;
-    MlpBF16 mlp;
-    rad_weight w_norm = 0, w_in = 0, w_out = 0;
+    rad_weight w_norm = 0;
+    /* in is q (attention) or the convolution's in_proj; out is the mixer's out-projection */
+    LinearFP8 in, out;
     /* conv */
     rad_weight w_conv = 0;
     rad_op op_gate_in = 0, op_conv = 0, op_gate_out = 0;
-    /* attention: w_in is q, these are k, v and the two head norms */
-    rad_weight w_k = 0, w_v = 0, w_q_norm = 0, w_k_norm = 0;
-    rad_op op_k = 0, op_v = 0, op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
+    /* `gate_quant_fp8` at act none: C * conv(B * x) and its E4M3 codes in one pass. Absent
+     * (bf16, int8, or no library serving it), op_gate_out and q_mix run the pair. */
+    rad_op op_gate_q = 0;
+    /* attention: k, v and the two head norms */
+    LinearFP8 k, v;
+    rad_weight w_q_norm = 0, w_k_norm = 0;
+    rad_op op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op op_store = 0, op_attn = 0;
     /* both */
-    rad_op op_norm = 0, op_in = 0, op_out = 0, op_add = 0;
+    rad_op op_norm = 0, op_add = 0;
+    /* the feed-forward: norm, gate|up (w1 | w3), SiLU(gate) * up, down (w2), residual add */
+    rad_weight w_ffn_norm = 0;
+    LinearFP8 gate_up, down;
+    rad_op op_ffn_norm = 0, op_act = 0, op_ffn_add = 0;
+    /* fp8a8 only: the activation quantisers, one per activation the linears read */
+    QuantFP8 q_h, q_mix, q_ffn_h, q_ffn;
+    /* fp8a8 fused: the mixer's norm (quantising, and adding the previous feed-forward's delta
+     * from layer 1 on) and the whole feed-forward */
+    NormQuantFP8 nq_mix;
+    MlpFP8       mlp8;
 };
 
 struct Model {
@@ -64,6 +100,12 @@ struct Model {
     rad_buf b_x = 0, b_h = 0, b_bcx = 0, b_conv_in = 0, b_conv_out = 0;
     rad_buf b_q = 0, b_k = 0, b_v = 0, b_attn = 0, b_gate_up = 0, b_ffn = 0;
     rad_buf b_hout = 0, b_logits = 0;
+    /* The linears' inputs: the bf16 plane plus, for an 8-bit trunk, its codes. a_mix is the
+     * mixer's output (attention or convolution), the out-projection's input. */
+    ActFP8 a_h{}, a_attn{}, a_conv{}, a_ffn{};
+    /* The trunk's format, read off layer 0's first linear. `fused`: the fp8 trunk's fused
+     * producers (see the head of the file). */
+    bool q_fp8 = false, q_i8 = false, fused = false;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_gather = 0, op_final_norm = 0, op_logits = 0;
@@ -215,8 +257,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
     m.w_out_norm = decl_w(b, nm.f("output_norm.weight"), RAD_F32, {g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    m.w_lm_head = decl_w(b, nm.f("output.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
-                         RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+    /* The head at its codes' dtype: bf16, or E4M3 / int8 where a recipe quantised it. */
+    m.w_lm_head = decl_w(b, nm.f("output.weight"),
+                         weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
+                         {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
 
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
@@ -227,27 +271,78 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.media = Siglip2::present(meta) && ctx->max_enc_patches > 0;
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, g.n_embd, m.b_x));
 
-    MlpBF16::Wire mw{};
-    mw.x = m.b_x; mw.h = m.b_h; mw.gate_up = m.b_gate_up; mw.ffn = m.b_ffn;
-
-    auto gemm = [&](int64_t N, int64_t K, rad_weight w, rad_buf in, rad_buf out) {
-        return rw(b, RAD_OP(b, "gemm_nt",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_STR("dtype", g.dtype)),
-                      RAD_WEIGHTS(w)),
-                  {in}, {out});
+    /* ---- the trunk's format, from layer 0's first linear: q, or the convolution's in_proj
+     * (probe() makes its name map and reads its encoding). Plain bf16, or no encoding yet, is a
+     * bf16 trunk; an int8 weight makes the activations carry int8 codes, any other 8-bit weight
+     * E4M3 ones. */
+    const char* ffn_fmt = "%s.layers.%d.feed_forward.%s";
+    {
+        Layer& L0 = m.layers[0];
+        const char* base0 = nm.f(L0.attention ? "blk.%d.attn_q" : "blk.%d.conv_in", 0);
+        RAD_ARCH_TRY(L0.in.probe(b, nm, g, base0,
+                                 { nm.ckpt(L0.attention ? "%s.layers.%d.self_attn.%s"
+                                                        : "%s.layers.%d.conv.%s",
+                                           pre, 0, L0.attention ? "q_proj.weight"
+                                                                : "in_proj.weight") }));
+        RadEncoding enc{};
+        const bool known = weight_enc(b, nm.f("%s.weight", base0), &enc);
+        const bool plain = !known || (rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
+                                      enc.plane[0].dtype == RAD_BF16);
+        g.w_bf16 = plain;
+        m.q_i8   = !plain && L0.in.probed_i8;
+        m.q_fp8  = !plain && !m.q_i8;
+        m.fused  = m.q_fp8;
+    }
+    m.a_h.x = m.b_h; m.a_attn.x = m.b_attn; m.a_conv.x = m.b_conv_out; m.a_ffn.x = m.b_ffn;
+    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.q_i8));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.q_i8));
+    RAD_ARCH_TRY(m.a_conv.declare_qs(b, nm, g, "conv_out", g.n_embd, 0, m.q_i8));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.q_i8));
+    /* An E4M3 activation is quantised once by the model and read by every linear on it; an int8
+     * linear quantises its own input (LinearFP8::op_q), and a bf16 one reads the bf16 plane. */
+    auto quant = [&](QuantFP8& q, const ActFP8& a, int64_t n) {
+        return m.q_fp8 ? q.declare(b, g, a, n) : RAD_OK;
     };
-    auto rmsnorm = [&](int64_t rows, int64_t n, rad_weight w, rad_buf in, rad_buf out) {
-        return rw(b, RAD_OP(b, "rmsnorm",
+
+    /* `op`: "rmsnorm", or "rmsnorm_rows" for the head norms, whose short-row form a prefill's
+     * thousands of head_dim-wide rows take. */
+    auto rmsnorm = [&](int64_t rows, int64_t n, rad_weight w, rad_buf in, rad_buf out,
+                       const char* op = "rmsnorm") {
+        return rw(b, RAD_OP(b, op,
                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", g.eps),
                                  RAD_STR("dtype", g.dtype)),
                       RAD_WEIGHTS(w)),
                   {in}, {out});
     };
+    auto add = [&](rad_buf x, rad_buf h) {
+        return rw(b, RAD_OP(b, "add",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                 RAD_STR("dtype", g.dtype)),
+                      RAD_NOWEIGHTS),
+                  {x, h}, {x});
+    };
     auto layer_w = [&](const char* name, int l, std::initializer_list<int64_t> shape,
                        uint32_t dtype) {
         return decl_w(b, nm.f(name, l), dtype, shape, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                       grp_layer(l));
+    };
+    /* One linear: `base` is the declared name without `.weight`. Every linear must have the
+     * trunk's format; LinearFP8 refuses a bf16 weight in an 8-bit trunk with no bf16 plane, and
+     * this refuses the other mixes. */
+    auto linear = [&](LinearFP8& lin, int l, const char* base_fmt, int64_t N, int64_t K,
+                      std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
+                      std::initializer_list<int64_t> parts) -> int {
+        const char* base = nm.f(base_fmt, l);
+        RAD_ARCH_TRY(lin.declare(b, nm, g, base, N, K, RAD_SHARD_NONE, grp_layer(l), src, a, y, 0,
+                                 parts));
+        const bool ok = g.w_bf16 ? lin.bf16 : m.q_i8 ? lin.i8 : (!lin.bf16 && !lin.i8);
+        if (!ok) {
+            fprintf(stderr, "radiance: lfm2: '%s.weight' is not in the trunk's format (%s); quantise "
+                            "every linear of the trunk alike\n",
+                    base, g.w_bf16 ? "bf16" : m.q_i8 ? "int8" : "block fp8");
+            return RAD_E_DTYPE;
+        }
+        return RAD_OK;
     };
 
     for (int l = 0; l < (int)m.layers.size(); ++l) {
@@ -255,38 +350,46 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l),
                               nm.ckpt("%s.layers.%d.operator_norm.weight", pre, l)));
         L.w_norm = layer_w("blk.%d.attn_norm.weight", l, {g.n_embd}, RAD_F32);
-        L.op_norm = rmsnorm(g.max_tok, g.n_embd, L.w_norm, m.b_x, m.b_h);
+        if (m.fused) {
+            /* From layer 1 on the previous feed-forward's delta is still in h: the norm adds it
+             * into the stream, then normalises and quantises. */
+            const bool fold = l > 0;
+            RAD_ARCH_TRY(L.nq_mix.declare(b, g, L.w_norm, fold ? m.b_h : m.b_x, m.a_h, g.n_embd,
+                                          fold ? m.b_x : 0));
+        } else {
+            L.op_norm = rmsnorm(g.max_tok, g.n_embd, L.w_norm, m.b_x, m.b_h);
+            RAD_ARCH_TRY(quant(L.q_h, m.a_h, g.n_embd));
+        }
 
         if (L.attention) {
             RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.kv_attn));
             const char* a = "%s.layers.%d.self_attn.%s";
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q.weight", l), nm.ckpt(a, pre, l, "q_proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_k.weight", l), nm.ckpt(a, pre, l, "k_proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_v.weight", l), nm.ckpt(a, pre, l, "v_proj.weight")));
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_norm.weight", l),
                                   nm.ckpt(a, pre, l, "q_layernorm.weight")));
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_k_norm.weight", l),
                                   nm.ckpt(a, pre, l, "k_layernorm.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_output.weight", l),
-                                  nm.ckpt(a, pre, l, "out_proj.weight")));
-            L.w_in     = layer_w("blk.%d.attn_q.weight", l, {g.q_dim(), g.n_embd}, RAD_BF16);
-            L.w_k      = layer_w("blk.%d.attn_k.weight", l, {g.kv_dim(), g.n_embd}, RAD_BF16);
-            L.w_v      = layer_w("blk.%d.attn_v.weight", l, {g.kv_dim(), g.n_embd}, RAD_BF16);
+            RAD_ARCH_TRY(linear(L.in, l, "blk.%d.attn_q", g.q_dim(), g.n_embd,
+                                { nm.ckpt(a, pre, l, "q_proj.weight") }, m.a_h, m.b_q, {}));
+            /* k and v are the trunk's narrowest linears: past 40 rows the narrow fp8 row's split
+             * leaves each slice too few waves, so they ask for the short-prompt split rule. */
+            L.k.short_split = L.v.short_split = true;
+            RAD_ARCH_TRY(linear(L.k, l, "blk.%d.attn_k", g.kv_dim(), g.n_embd,
+                                { nm.ckpt(a, pre, l, "k_proj.weight") }, m.a_h, m.b_k, {}));
+            RAD_ARCH_TRY(linear(L.v, l, "blk.%d.attn_v", g.kv_dim(), g.n_embd,
+                                { nm.ckpt(a, pre, l, "v_proj.weight") }, m.a_h, m.b_v, {}));
             L.w_q_norm = layer_w("blk.%d.attn_q_norm.weight", l, {g.head_dim}, RAD_F32);
             L.w_k_norm = layer_w("blk.%d.attn_k_norm.weight", l, {g.head_dim}, RAD_F32);
-            L.w_out    = layer_w("blk.%d.attn_output.weight", l, {g.n_embd, g.q_dim()}, RAD_BF16);
 
-            L.op_in = gemm(g.q_dim(), g.n_embd, L.w_in, m.b_h, m.b_q);
-            L.op_k  = gemm(g.kv_dim(), g.n_embd, L.w_k, m.b_h, m.b_k);
-            L.op_v  = gemm(g.kv_dim(), g.n_embd, L.w_v, m.b_h, m.b_v);
             /* The head norms run over rows of head_dim: a [T, heads * head_dim] buffer is
              * T * heads rows. */
-            L.op_q_norm = rmsnorm(g.max_tok * g.n_head, g.head_dim, L.w_q_norm, m.b_q, m.b_q);
-            L.op_k_norm = rmsnorm(g.max_tok * g.n_head_kv, g.head_dim, L.w_k_norm, m.b_k, m.b_k);
+            L.op_q_norm = rmsnorm(g.max_tok * g.n_head, g.head_dim, L.w_q_norm, m.b_q, m.b_q,
+                                 "rmsnorm_rows");
+            L.op_k_norm = rmsnorm(g.max_tok * g.n_head_kv, g.head_dim, L.w_k_norm, m.b_k, m.b_k,
+                                 "rmsnorm_rows");
             L.op_rope_q = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head, 0, g.head_dim,
-                                          "neox"), {m.b_q}, {m.b_q});
+                                          "neox", "rope_rows"), {m.b_q}, {m.b_q});
             L.op_rope_k = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head_kv, 0, g.head_dim,
-                                          "neox"), {m.b_k}, {m.b_k});
+                                          "neox", "rope_rows"), {m.b_k}, {m.b_k});
             /* attn_paged before kv_store: the cache's block size is read from the resolved
              * attention kernel. */
             L.op_attn = rw(b, RAD_OP(b, "attn_paged",
@@ -309,21 +412,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                            RAD_STR("kv_dtype", g.kv_dtype)),
                                 RAD_NOWEIGHTS),
                             {m.b_k, m.b_v}, {});
-            L.op_out = gemm(g.n_embd, g.q_dim(), L.w_out, m.b_attn, m.b_h);
+            RAD_ARCH_TRY(quant(L.q_mix, m.a_attn, g.q_dim()));
+            RAD_ARCH_TRY(linear(L.out, l, "blk.%d.attn_output", g.n_embd, g.q_dim(),
+                                { nm.ckpt(a, pre, l, "out_proj.weight") }, m.a_attn, m.b_h, {}));
         } else {
             RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.kv_conv));
             const char* c = "%s.layers.%d.conv.%s";
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.conv_in.weight", l), nm.ckpt(c, pre, l, "in_proj.weight")));
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.conv.weight", l), nm.ckpt(c, pre, l, "conv.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.conv_out.weight", l), nm.ckpt(c, pre, l, "out_proj.weight")));
-            L.w_in   = layer_w("blk.%d.conv_in.weight", l, {3 * g.n_embd, g.n_embd}, RAD_BF16);
+            /* in_proj's row is [B | C | x]: conv(B * x), then C * that. */
+            RAD_ARCH_TRY(linear(L.in, l, "blk.%d.conv_in", 3 * g.n_embd, g.n_embd,
+                                { nm.ckpt(c, pre, l, "in_proj.weight") }, m.a_h, m.b_bcx, {}));
             /* The checkpoint ships [n_embd, 1, width]; the depthwise group axis is squeezed at
              * convert, as the gated delta net's conv1d is. */
             L.w_conv = layer_w("blk.%d.conv.weight", l, {g.n_embd, m.width}, RAD_BF16);
-            L.w_out  = layer_w("blk.%d.conv_out.weight", l, {g.n_embd, g.n_embd}, RAD_BF16);
 
-            /* in_proj's row is [B | C | x]: conv(B * x), then C * that. */
-            L.op_in = gemm(3 * g.n_embd, g.n_embd, L.w_in, m.b_h, m.b_bcx);
             L.op_gate_in = rw(b, RAD_OP(b, "mul",
                                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                              RAD_STR("dtype", g.dtype)),
@@ -334,25 +436,78 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_INT("width", m.width), RAD_STR("dtype", g.dtype)),
                                RAD_WEIGHTS(L.w_conv)),
                            {m.b_conv_in}, {m.b_conv_out});
-            L.op_gate_out = rw(b, RAD_OP(b, "mul",
-                                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                              RAD_STR("dtype", g.dtype)),
-                                   RAD_NOWEIGHTS),
-                               {m.b_bcx, m.b_conv_out}, {m.b_conv_out});
-            L.op_out = gemm(g.n_embd, g.n_embd, L.w_out, m.b_conv_out, m.b_h);
+            /* C * conv(B * x), then the codes the out projection reads, in one pass. The kernel
+             * rounds the product to bf16 before taking the codes, so it is byte-identical to the
+             * mul + quant_act_fp8 pair; the bf16 product has no reader in a block-fp8 trunk. */
+            if (m.q_fp8 && rad_op_declared(b, "gate_quant_fp8"))
+                L.op_gate_q = rw(b, RAD_OP(b, "gate_quant_fp8",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                               RAD_INT("n", g.n_embd),
+                                               RAD_INT("group", RAD_FP8_BLOCK),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_STR("act", "none")),
+                                    RAD_NOWEIGHTS),
+                                {m.b_bcx, m.b_conv_out}, {m.a_conv.cq(), m.a_conv.cs()});
+            if (!L.op_gate_q) {
+                L.op_gate_out = rw(b, RAD_OP(b, "mul",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                                  RAD_INT("n", g.n_embd),
+                                                  RAD_STR("dtype", g.dtype)),
+                                       RAD_NOWEIGHTS),
+                                   {m.b_bcx, m.b_conv_out}, {m.b_conv_out});
+                RAD_ARCH_TRY(quant(L.q_mix, m.a_conv, g.n_embd));
+            }
+            RAD_ARCH_TRY(linear(L.out, l, "blk.%d.conv_out", g.n_embd, g.n_embd,
+                                { nm.ckpt(c, pre, l, "out_proj.weight") }, m.a_conv, m.b_h, {}));
         }
-        L.op_add = rw(b, RAD_OP(b, "add",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+        if (m.fused) {
+            /* The feed-forward's norm adds the mixer's delta; its own add is left to the next
+             * layer's norm, except after the last layer, whose output the final norm reads. */
+            MlpFP8::Wire mw{};
+            mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
+            MlpFP8::Src ms{};
+            ms.norm = nm.ckpt("%s.layers.%d.ffn_norm.weight", pre, l);
+            ms.gate = nm.ckpt(ffn_fmt, pre, l, "w1.weight");
+            ms.up   = nm.ckpt(ffn_fmt, pre, l, "w3.weight");
+            ms.down = nm.ckpt(ffn_fmt, pre, l, "w2.weight");
+            const bool last = l + 1 == (int)m.layers.size();
+            /* The whole prompt in the fold: gemm_nt_q_gated_wide serves every M, so a prefill
+             * chunk does not fall back to the pair past 64 rows. */
+            RAD_ARCH_TRY(L.mlp8.declare(b, nm, g, l, mw, ms, /*fold=*/true, /*add_out=*/last,
+                                        0, false, 0, /*wide_fold=*/true));
+            if (L.mlp8.gate_up.bf16 || L.mlp8.gate_up.i8 || L.mlp8.down.bf16 || L.mlp8.down.i8) {
+                fprintf(stderr, "radiance: lfm2: layer %d's feed-forward is not block fp8 like the "
+                                "rest of the trunk; quantise every linear alike\n", l);
+                return RAD_E_DTYPE;
+            }
+            continue;
+        }
+        L.op_add = add(m.b_x, m.b_h);
+
+        /* ---- the feed-forward */
+        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ffn_norm.weight", l),
+                              nm.ckpt("%s.layers.%d.ffn_norm.weight", pre, l)));
+        L.w_ffn_norm = layer_w("blk.%d.ffn_norm.weight", l, {g.n_embd}, RAD_F32);
+        L.op_ffn_norm = rw(b, RAD_OP(b, "rmsnorm",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                           RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd),
+                                           RAD_STR("dtype", g.dtype)),
+                                RAD_WEIGHTS(L.w_ffn_norm)),
+                            {m.b_x}, {m.b_h});
+        RAD_ARCH_TRY(quant(L.q_ffn_h, m.a_h, g.n_embd));
+        RAD_ARCH_TRY(linear(L.gate_up, l, "blk.%d.ffn_gate_up", 2 * g.n_ff, g.n_embd,
+                            { nm.ckpt(ffn_fmt, pre, l, "w1.weight"),
+                              nm.ckpt(ffn_fmt, pre, l, "w3.weight") },
+                            m.a_h, m.b_gate_up, { g.n_ff, g.n_ff }));
+        L.op_act = rw(b, RAD_OP(b, "silu_mul",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff),
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
-                      {m.b_x, m.b_h}, {m.b_x});
-
-        MlpBF16::Src ms{};
-        ms.norm = nm.ckpt("%s.layers.%d.ffn_norm.weight", pre, l);
-        ms.gate = nm.ckpt("%s.layers.%d.feed_forward.w1.weight", pre, l);
-        ms.up   = nm.ckpt("%s.layers.%d.feed_forward.w3.weight", pre, l);
-        ms.down = nm.ckpt("%s.layers.%d.feed_forward.w2.weight", pre, l);
-        RAD_ARCH_TRY(L.mlp.declare(b, nm, g, l, mw, ms));
+                      {m.b_gate_up}, {m.b_ffn});
+        RAD_ARCH_TRY(quant(L.q_ffn, m.a_ffn, g.n_ff));
+        RAD_ARCH_TRY(linear(L.down, l, "blk.%d.ffn_down", g.n_embd, g.n_ff,
+                            { nm.ckpt(ffn_fmt, pre, l, "w2.weight") }, m.a_ffn, m.b_h, {}));
+        L.op_ffn_add = add(m.b_x, m.b_h);
     }
 
     /* The final norm runs on the gathered rows only: it is per token, and those are the rows the
@@ -363,6 +518,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                      {m.b_x}, {m.b_hout});
     m.op_final_norm = rmsnorm(g.max_logit_rows, g.n_embd, m.w_out_norm, m.b_hout, m.b_hout);
+    /* A tied head is the bf16 embedding table, whatever codes the head itself is read at: a
+     * scored step (/v1/systemone) leaves the final-normed rows in h_out and the core takes the
+     * candidates' logits from the table on the host (rad_declare_scores), with no head read. */
+    if (text_bool(meta, "tie_word_embeddings", false))
+        RAD_ARCH_TRY(rad_declare_scores(b, m.b_hout, m.w_tok));
     m.op_logits = rw(b, RAD_OP(b, "logits_gemm",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
                                     RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", g.n_embd),
@@ -431,12 +591,17 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     for (int l = 0; l < (int)m.layers.size(); ++l) {
         const Layer& L = m.layers[(size_t)l];
-        RAD_ISSUE(c, L.op_norm, brows(m.b_x, T), RAD_W(L.w_norm), brows(m.b_h, T));
+        if (m.fused) {
+            L.nq_mix.step(c, T);
+        } else {
+            RAD_ISSUE(c, L.op_norm, brows(m.b_x, T), RAD_W(L.w_norm), brows(m.b_h, T));
+            L.q_h.step(c, T);
+        }
         if (L.attention) {
             const RadKVGroupBatch* kv = kv_batch(batch, m.kv_attn);
-            RAD_ISSUE(c, L.op_in, brows(m.b_h, T), RAD_W(L.w_in), brows(m.b_q, T));
-            RAD_ISSUE(c, L.op_k, brows(m.b_h, T), RAD_W(L.w_k), brows(m.b_k, T));
-            RAD_ISSUE(c, L.op_v, brows(m.b_h, T), RAD_W(L.w_v), brows(m.b_v, T));
+            L.in.step(c, m.a_h, m.b_q, T);
+            L.k.step(c, m.a_h, m.b_k, T);
+            L.v.step(c, m.a_h, m.b_v, T);
             RAD_ISSUE_N(c, L.op_q_norm, T * g.n_head, brows(m.b_q, T), RAD_W(L.w_q_norm),
                         brows(m.b_q, T));
             RAD_ISSUE_N(c, L.op_k_norm, T * g.n_head_kv, brows(m.b_k, T), RAD_W(L.w_k_norm),
@@ -453,18 +618,36 @@ static void step(RadCtx* c, const RadBatch* batch) {
                         RAD_NONE, RAD_NONE,
                         praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
                         brows(m.b_attn, T));
-            RAD_ISSUE(c, L.op_out, brows(m.b_attn, T), RAD_W(L.w_out), brows(m.b_h, T));
+            L.q_mix.step(c, T);
+            L.out.step(c, m.a_attn, m.b_h, T);
         } else {
-            RAD_ISSUE(c, L.op_in, brows(m.b_h, T), RAD_W(L.w_in), brows(m.b_bcx, T));
+            L.in.step(c, m.a_h, m.b_bcx, T);
             RAD_ISSUE(c, L.op_gate_in, bcol(m.b_bcx, 0, n, T), bcol(m.b_bcx, 2 * n, n, T),
                       brows(m.b_conv_in, T));
             conv_step(m, L, c, batch, l);
-            RAD_ISSUE(c, L.op_gate_out, bcol(m.b_bcx, n, n, T), brows(m.b_conv_out, T),
-                      brows(m.b_conv_out, T));
-            RAD_ISSUE(c, L.op_out, brows(m.b_conv_out, T), RAD_W(L.w_out), brows(m.b_h, T));
+            if (L.op_gate_q) {
+                RAD_ISSUE(c, L.op_gate_q, bcol(m.b_bcx, n, n, T), brows(m.b_conv_out, T),
+                          brows(m.a_conv.cq(), T), brows(m.a_conv.cs(), T), RAD_NONE);
+            } else {
+                RAD_ISSUE(c, L.op_gate_out, bcol(m.b_bcx, n, n, T), brows(m.b_conv_out, T),
+                          brows(m.b_conv_out, T));
+                L.q_mix.step(c, T);
+            }
+            L.out.step(c, m.a_conv, m.b_h, T);
+        }
+        if (m.fused) {
+            L.mlp8.step(c, batch);
+            continue;
         }
         RAD_ISSUE(c, L.op_add, brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
-        L.mlp.step(c, batch);
+
+        RAD_ISSUE(c, L.op_ffn_norm, brows(m.b_x, T), RAD_W(L.w_ffn_norm), brows(m.b_h, T));
+        L.q_ffn_h.step(c, T);
+        L.gate_up.step(c, m.a_h, m.b_gate_up, T);
+        RAD_ISSUE(c, L.op_act, brows(m.b_gate_up, T), brows(m.b_ffn, T));
+        L.q_ffn.step(c, T);
+        L.down.step(c, m.a_ffn, m.b_h, T);
+        RAD_ISSUE(c, L.op_ffn_add, brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
     }
 
     /* The lm_head runs only on the rows the sampler asked for; a prefill chunk that finishes no
@@ -474,15 +657,17 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.b_hout, batch->n_out));
         RAD_ISSUE_N(c, m.op_final_norm, batch->n_out, brows(m.b_hout, batch->n_out),
                     RAD_W(m.w_out_norm), brows(m.b_hout, batch->n_out));
-        RAD_ISSUE_N(c, m.op_logits, batch->n_out, brows(m.b_hout, batch->n_out),
-                    RAD_W(m.w_lm_head), brows(m.b_logits, batch->n_out));
+        if (!batch->score_only)
+            RAD_ISSUE_N(c, m.op_logits, batch->n_out, brows(m.b_hout, batch->n_out),
+                        RAD_W(m.w_lm_head), brows(m.b_logits, batch->n_out));
     }
 }
 
 }  /* namespace lfm2_bf16 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
-RAD_ARCH_PLUGIN(lfm2_bf16, "lfm2", "", "0.1.0",
-                "LiquidAI LFM2 / LFM2-VL, bf16: short gated convolutions and GQA attention in the "
-                "checkpoint's own schedule, one rank; LFM2-VL's SigLIP2 tower for images")
+RAD_ARCH_PLUGIN(lfm2_bf16, "lfm2", "", "0.2.0",
+                "LiquidAI LFM2 / LFM2-VL, bf16, or with block-fp8 or int8 linears from a recipe: "
+                "short gated convolutions and GQA attention in the checkpoint's own schedule, one "
+                "rank; LFM2-VL's SigLIP2 tower for images")
 #endif

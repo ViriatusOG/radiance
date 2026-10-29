@@ -41,6 +41,10 @@ struct StepEntry {
     int32_t ckpt_restore = -1;
     const int32_t* draft = nullptr;   /* the drafter's proposal, appended after the committed tail */
     int32_t n_draft = 0;
+    /* A tree drafter's proposal (rad_drafter_tree): draft_parent[j] is the parent of draft[j] as a
+     * node index (0 the anchor, j + 1 draft[j]). Null for a chain. Read only on a tree step
+     * (StepPlan::spec_is_tree), where a null one is staged as the chain. */
+    const int32_t* draft_parent = nullptr;
     /* First logits row, written into `out_ids`, that this entry reads, or -1 for the default
      * rule. The MTP history pass uses it to gather the 1 + n_spec trunk rows of a verifying
      * sequence; the DFlash2 query pass uses it to name the mask rows of its own block. Which
@@ -319,6 +323,7 @@ private:
     int64_t pay_words_ = 0;   /* payload build_groups wrote, in int32 words */
     void forget_tables();
     int64_t last_n_seq_ = 0;
+    bool    last_tree_  = false;   /* the last build staged spec_parent (advance_args' parent_off) */
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;

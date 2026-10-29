@@ -113,6 +113,7 @@ void populated(LiveSnapshot& s) {
     s.link.ar_calls = 50; s.link.ar_bytes = 5000; s.link.h2d_bytes = 900; s.link.d2h_bytes = 800;
     s.link.ssd_reads = 4; s.link.ssd_bytes = 400; s.link.stream_bytes = 700;
     s.link.prefetched = 2; s.link.prefetch_bytes = 300; s.link.staged_bytes = 200;
+    s.link.kv_streaming = true; s.link.kv_stream_active = true; s.link.kv_stream_bytes = 600;
     s.passes.present = true;
     s.passes.played = 10; s.passes.recorded = 2;
 }
@@ -228,6 +229,9 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
         CHECK_EQ(s["experts"]["tiers"][t].value("units", (int64_t)0), (int64_t)(t + 1));
     }
     CHECK_EQ(s["link"].value("stream_bytes", (int64_t)0), (int64_t)700);
+    CHECK_EQ(s["link"].value("kv_stream_bytes", (int64_t)0), (int64_t)600);
+    CHECK(s["link"].value("kv_streaming", false));
+    CHECK(s["link"].value("kv_stream_active", false));
     CHECK_EQ(s["passes"].value("played", (int64_t)0), (int64_t)10);
     CHECK_EQ(s["ckpt_evictions"].value("store_full", (int64_t)0), (int64_t)3);
     CHECK_EQ(s["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);

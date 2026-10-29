@@ -280,8 +280,11 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _bf16)(const RadArgs* a, Rad
 
 /* Split-KV partial buffer size at declare time, from the band's upper bound. Declare passes
  * parameters and no tensors, so parameters come first and tensors are the fallback (see the
- * h256/gqa6 dispatch). The size is the maximum over every sequence count up to max_seqs, because
- * S * floor(128 / (kv_heads * S)) is not monotone in S. */
+ * h256/gqa6 dispatch). The size is the maximum over every sequence count up to max_seqs and every
+ * query length up to the band's: S * floor(128 / (kv_heads * S)) is not monotone in S, and the
+ * split law's targets (r4d_decode_splits: 256 workgroups at q_len * gqa <= 32; above, 128 to 16384
+ * tokens deep and more past it) can give a shorter query more splits: at gqa 8 a 4-row step needs
+ * 1.6x the partials of the band bound 5. */
 /* `row` is a token's bytes in a (block, head) page, 0 for the 16-bit and E4M3 caches' 2 * head_dim
  * (fill_paged_row). */
 static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row = 0) {
@@ -298,17 +301,19 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
         const long long gqa = r4d_geti_or(a, "gqa", 1);
         r.kv_heads   = (int)(gqa > 0 ? n_head / gqa : n_head);
         r.num_seqs   = (int)max_seqs;
-        r.q_len      = (int)r4d_geti_or(a, "q_len", 1);
+        const long long q_hi = std::max(1LL, r4d_geti_or(a, "q_len", 1));
         r.max_ctx    = (int)r4d_geti_or(a, "max_ctx", 0);
         r.block_size = (int)r4d_geti_or(a, "block_size", 16);
         r.splits     = sp;
         if (r.max_ctx <= 0) return R4D_NO(RAD_E_INVAL);
         int64_t worst = 0;
-        for (long long n = 1; n <= max_seqs; ++n) {
-            r.num_seqs = (int)n;
-            const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
-            if (need > worst) worst = need;
-        }
+        for (long long q = 1; q <= q_hi; ++q)
+            for (long long n = 1; n <= max_seqs; ++n) {
+                r.q_len    = (int)q;
+                r.num_seqs = (int)n;
+                const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
+                if (need > worst) worst = need;
+            }
         return worst;
     }
     const int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);

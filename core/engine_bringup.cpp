@@ -19,6 +19,7 @@
 #include "format/rope_override.h"
 #include "format/share.h"
 #include "format/table_copy.h"
+#include "format/table_share.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
 #include "kvstream/bringup.h"
@@ -399,15 +400,59 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
 }
 
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
- * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). One copy
- * per container address, shared by every rank; freed in ~Engine. */
+ * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). With
+ * --ngram-placement ram=DIR the pinned memory is a file in DIR mapped shared (core/format/
+ * table_share.h): this engine fills it or, if another engine did, checks samples of it against the
+ * container, and pins it either way. Only a table of kTableShareMin or more is shared: the gather's
+ * scale is an n-gram weight too, since it moves with the table between gather sites, and as a file
+ * its two bytes would cost the 2 MiB header and a 2 MiB page. One copy per container address,
+ * shared by every rank; freed in ~Engine. */
 int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
     const auto t0 = std::chrono::steady_clock::now();
+    auto since = [&] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    };
     void* base = nullptr;
-    if (card) {
+    if (card && !cfg_.ngram_share_dir.empty() && n >= kTableShareMin) {
+        const std::string id = table_share_id(file_->path(), foff, n);
+        if (id.empty()) {
+            *why = fmt("the container %s cannot be stat'ed, which names the shared table",
+                       file_->path());
+            return RAD_E_IO;
+        }
+        TableShare s;
+        int rc = table_share_open(cfg_.ngram_share_dir, id, n, &s, why);
+        if (rc != RAD_OK) return rc;
+        base = rad_dev_map_file(s.fd, kTableShareHeader, n);
+        if (!base) {
+            *why = fmt("pinning %s of %s: %s", humanb(n).c_str(), s.path.c_str(),
+                       rad_dev_last_error());
+            table_share_close(&s);
+            return RAD_E_NOMEM;
+        }
+        if (s.filler) {
+            rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
+            if (rc == RAD_OK) rc = table_share_mark_ready(&s, n, id, why);
+        } else {
+            rc = table_copy_check(src, n, static_cast<const uint8_t*>(base), why);
+            if (rc != RAD_OK)
+                *why = fmt("the shared file %s does not match the container (%s)", s.path.c_str(),
+                           why->c_str());
+        }
+        if (rc != RAD_OK) {
+            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+            table_share_close(&s);
+            return rc;
+        }
+        card_copies_.push_back(base);
+        table_shares_.push_back(s);
+        RAD_INFO("placement: n-gram table in pinned memory the cards read, %s in shared file %s, "
+                 "%s in %.1f s", humanb(n).c_str(), s.path.c_str(),
+                 s.filler ? "filled" : "reused (probes match)", since());
+    } else if (card) {
         base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
         if (!base) {
             *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
@@ -419,16 +464,17 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             return rc;
         }
         card_copies_.push_back(base);
+        RAD_INFO("placement: n-gram table copied into pinned memory the cards read, %s in %.1f s",
+                 humanb(n).c_str(), since());
     } else {
         TableCopy tc;
         const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
         if (rc != RAD_OK) return rc;
         table_copies_.push_back(tc);
         base = tc.base;
+        RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s",
+                 humanb(n).c_str(), since());
     }
-    RAD_INFO("placement: n-gram table copied into %s, %s in %.1f s",
-             card ? "pinned memory the cards read" : "locked memory", humanb(n).c_str(),
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     table_copy_of_.push_back({ src, base });
     *out = base;
     return RAD_OK;
@@ -564,8 +610,43 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
      * then the container. */
     const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_total_mib() * MiB +
                           cfg_.prefix_cache_mib * MiB + host_late;
-    const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
+    int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
     const char* copy = ngram_device ? "a pinned copy the card reads" : "a locked copy";
+    /* ram=DIR: the copy is a file other engines map too. One already complete costs this engine
+     * no host memory for the table; a weight under kTableShareMin beside it (the scale) is a
+     * private copy either way. */
+    std::string share_note;
+    if (!cfg_.ngram_share_dir.empty() && ngram_bytes > 0) {
+        if (!ngram_device) {
+            RAD_ERR("--ngram-placement ram=%s: only the pinned copy a card reads is shared, and no "
+                    "loaded kernel plugin reads an n-gram table on a card (embed_lookup_q has host "
+                    "kernels only), so the host gather would read a private locked copy. Use ram "
+                    "or disk.", cfg_.ngram_share_dir.c_str());
+            return RAD_E_INVAL;
+        }
+        share_note = fmt("a file in %s that other engines share", cfg_.ngram_share_dir.c_str());
+        if (file_ && !ranks_.empty()) {
+            const Program& prog = ranks_.front()->program;
+            for (size_t i = 1; i < prog.weights.size(); ++i) {
+                const WeightInfo& w = prog.weights[i];
+                if (!is_ngram_table(prog, (rad_weight)i) || w.n_sel < 1) continue;
+                const RadFileEntry* e = file_->find(w.source);
+                if (!e) continue;
+                const RadFilePlane& p0 = file_->plane(*e, w.sel[0]);
+                if ((int64_t)p0.bytes < kTableShareMin) continue;
+                const std::string id =
+                    table_share_id(file_->path(), (int64_t)p0.offset, (int64_t)p0.bytes);
+                if (table_share_is_ready(cfg_.ngram_share_dir, id, (int64_t)p0.bytes)) {
+                    need = align_up(std::max<int64_t>(ngram_bytes - (int64_t)p0.bytes, 0),
+                                    (int64_t)2 << 20);
+                    share_note = fmt("a complete shared file in %s already holds it, which "
+                                     "takes no memory of this engine's own for the table",
+                                     cfg_.ngram_share_dir.c_str());
+                }
+                break;
+            }
+        }
+    }
     auto card_holds = [&](std::string* why) {
         std::vector<VramFacts> with = facts;
         int64_t fixed = 0;
@@ -640,7 +721,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                         "%s: %s", humanb(ngram_bytes).c_str(), copy, ram_why.c_str());
                 return RAD_E_NOMEM;
             }
-            ng_why = "as asked";
+            ng_why = share_note.empty() ? std::string("as asked") : "as asked, as " + share_note;
         } else if (card) {
             ng = TablePlacement::Vram;
             ng_why = "the card holds it beside the other weights and a KV pool for one "
@@ -896,6 +977,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.max_seqs   = cfg_.max_seqs;
     bc.max_ctx    = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     bc.max_spec   = cfg_.n_spec;
+    bc.draft_tree = draft_tree_ ? 1 : 0;
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
      * other callers and means the plugin's default. */
@@ -1124,6 +1206,22 @@ int Engine::declare() {
                                    "speculatively";
         RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);
         decide("chained launches", on ? "on" : "off", why);
+    }
+    /* Trees: a block drafter's proposals verified as a tree, where the model's plugin measured a
+     * gain with one (RadArchProbe::tree_pays; the Gemma 4 31B with DFlash2: +7% single-stream
+     * decode, +6-9% aggregate at 1-16 users on 4x R9700) and the drafter decodes speculatively.
+     * A tree changes no token, only how many drafts land a step. */
+    {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
+         * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
+        draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        if (draft_tree_) {
+            const char* why = "the model's plugin measured a gain with them";
+            RAD_INFO("draft trees: asked -- %s", why);
+            decide("draft trees", "asked", why);
+        }
     }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
      * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
@@ -1364,7 +1462,14 @@ int Engine::declare() {
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
-    drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
+    /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
+    tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
+    tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
+     * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
+     * wide tree's extra nodes repay at one sequence and not at many. */
+    short_from_    = cfg_.draft_short_from >= 0 ? cfg_.draft_short_from : (tree_ ? 2 : 0);
+    drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && short_from_ > 0
                    ? p0.drafter_short_block : 0;
     if (cfg_.draft_short_from > 0 && drafter_.kind == RAD_DRAFT_NONE)
         RAD_WARN("--draft-short-from %lld: this deployment runs no drafter, so there is no block "
@@ -1374,14 +1479,23 @@ int Engine::declare() {
                  drafter_name_.c_str(),
                  drafter_.kind == RAD_DRAFT_BLOCK ? "declares no shorter block, so it keeps its own"
                                                   : "is a serial head, which proposes no block");
-    if (drafter_short_)
+    if (drafter_short_ && tree_)
         RAD_INFO("speculation: from %lld decoding sequences on, '%s' runs its short block of %lld "
-                 "row(s), %lld token(s)", (long long)cfg_.draft_short_from,
+                 "row(s), a tree of %lld node(s) over it", (long long)short_from_,
+                 drafter_name_.c_str(), (long long)drafter_short_,
+                 (long long)std::min<int64_t>(drafter_.depth, drafter_short_ - 1));
+    else if (drafter_short_)
+        RAD_INFO("speculation: from %lld decoding sequences on, '%s' runs its short block of %lld "
+                 "row(s), %lld token(s)", (long long)short_from_,
                  drafter_name_.c_str(),
                  (long long)drafter_short_,
                  (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block
                                                                    : drafter_.depth + 1) -
                                                drafter_.depth)));
+    if (tree_)
+        RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
+                 "path the target agrees with, and that path's K and V move into place",
+                 drafter_.name, drafter_.depth);
     if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
          * the ordinary sampler chain. */
@@ -1610,6 +1724,7 @@ int Engine::plan() {
              * memory, and the real pool does not exist yet. */
             KVManager probe;
             host_arenas += arena_host_bytes(r->program);
+            probe.set_drafter_window_snapshot(drafter_window_snap(r->program));
             if (declare_ring_windows(probe, r->program) == RAD_OK &&
                 probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 ck_slot += probe.checkpoint_bytes();
@@ -1702,9 +1817,9 @@ int Engine::plan() {
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
         /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
-         * the strategy runs, so they are not part of the elastic plane the card must hold and the
-         * pool must have room for them on top of the trunk's spill. Growing the pool here, before
-         * the split, is what lets a drafter fit beside a trunk that already fills the card. */
+         * the strategy runs, so they leave the elastic plane the card must hold and the pool must
+         * have room for them on top of the trunk's spill. The pool grows here, before the split,
+         * so a drafter fits beside a trunk that already fills the card. */
         if (cfg_.draft_expert_placement == "host") {
             const int64_t MiB = (int64_t)1 << 20;
             int64_t draft_max = 0;
@@ -1715,10 +1830,9 @@ int Engine::plan() {
                 return RAD_E_INVAL;
             }
             if (draft_max > 0) {
-                /* The pool must hold the drafter on top of the trunk's own spill, so it grows by
-                 * the drafter's bytes and the floor is recomputed against that larger room with
-                 * the drafter taken out of the plane the card places. */
-                const int64_t add = (align_up(draft_max, MiB) + MiB - 1) / MiB;
+                /* The pool grows by the drafter's bytes, and each rank's floor is recomputed
+                 * against that room with the drafter out of the plane the card places. */
+                const int64_t add = align_up(draft_max, MiB) / MiB;
                 cfg_.host_pool_mib += add;
                 for (size_t i = 0; i < facts.size(); ++i) {
                     int64_t room = cfg_.host_pool_mib * MiB;
@@ -1797,6 +1911,7 @@ int Engine::plan() {
              * its carve). */
             for (size_t i = 0; i < ranks_.size(); ++i) {
                 probes[i] = std::make_unique<KVManager>();
+                probes[i]->set_drafter_window_snapshot(drafter_window_snap(ranks_[i]->program));
                 if (declare_ring_windows(*probes[i], ranks_[i]->program) != RAD_OK ||
                     probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
                     kept = fmt("rank %d's KV groups did not plan", ranks_[i]->index);
@@ -1882,14 +1997,22 @@ int Engine::plan() {
             in.profile   = file_->profile();
             in.n_profile = (int64_t)file_->header().prof_count;
         }
-        /* --expert-profile replaces the container's activation profile, which is prefill-heavy:
-         * decode-hot experts differ, and the pin below keeps them resident. Loaded once, before
-         * any rank plans, so every rank ranks the same way. */
+        /* --expert-profile replaces the container's activation profile, which is prefill-heavy
+         * while decode-hot experts differ (--expert-pin-top keeps them resident). Loaded once, at
+         * the first rank's plan, so every rank ranks the same way. */
         if (!cfg_.expert_profile.empty()) {
             if (expert_profile_.empty() && ri == 0) {
                 int32_t trunk = -1;
                 const int pr = xs_profile_load(cfg_.expert_profile, &expert_profile_, &trunk);
                 if (pr < 0) return pr;
+                /* A profile from another model would rank its layers onto this one's. */
+                if (trunk >= 0 && trunk != (int32_t)meta_.n_layers) {
+                    RAD_ERR("--expert-profile: %s counts %d trunk layers and this model has %d: "
+                            "it was recorded on another model", cfg_.expert_profile.c_str(),
+                            (int)trunk, (int)meta_.n_layers);
+                    expert_profile_.clear();
+                    return RAD_E_INVAL;
+                }
             }
             if (!expert_profile_.empty()) {
                 in.profile   = expert_profile_.data();
@@ -3087,22 +3210,50 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
 
     int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
     for (const auto& r : ranks_) still += arena_host_bytes(r->program);
-    std::string limit;
-    int64_t room = lockable_bytes(still, host_headroom_bytes(), &limit);
-    if (!device_is_host()) {
-        bool lifted = false;
-        if (const int64_t cap = amdgpu_pin_cap(&lifted); cap > 0) {
-            int64_t pinned = 0, mapped = 0;
-            rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
-            rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
-            const int64_t left = std::max<int64_t>(cap - pinned - mapped - still, 0);
-            if (left < room) {
-                room = left;
-                limit = fmt("the amdgpu driver's pin cap of %s, of which this process holds %s "
-                            "and still pins %s", humanb(cap).c_str(),
-                            humanb(pinned + mapped).c_str(), humanb(still).c_str());
+    /* The fewest snapshots the store means to hold, in bytes: the count below which prefix reuse
+     * is not worth the pinning. It is what the reserve below must not decide away, and it scales
+     * with the model's own state -- any hybrid's linear layers, any KV encoding's mirror -- since
+     * it is measured from this rank's slot and the host's own spare memory. */
+    const int64_t floor_slots =
+        std::min<int64_t>(checkpoint_slots_want(*pol, cfg_.max_seqs, ctx, interval),
+                          kCheckpointSlotsFloor);
+    const int64_t floor_bytes =
+        slot > INT64_MAX / std::max<int64_t>(floor_slots, 1) ? INT64_MAX : floor_slots * slot;
+    const int64_t asked = host_headroom_bytes();
+    int64_t margin = asked;
+    std::string limit, gave_way;
+    /* What the host can pin with `marg` held free: spare memory (MemAvailable and every memory
+     * cgroup), then the driver's own pin cap. Both are the host's own measurement, so a wider
+     * mirror, a bigger pool or a larger slot never needs a second rule here. */
+    auto room_with = [&](int64_t marg, std::string* why) {
+        int64_t r = lockable_bytes(still, marg, why);
+        if (!device_is_host()) {
+            bool lifted = false;
+            if (const int64_t cap = amdgpu_pin_cap(&lifted); cap > 0) {
+                int64_t pinned = 0, mapped = 0;
+                rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
+                rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
+                const int64_t left = std::max<int64_t>(cap - pinned - mapped - still, 0);
+                if (left < r) {
+                    r = left;
+                    *why = fmt("the amdgpu driver's pin cap of %s, of which this process holds %s "
+                               "and still pins %s", humanb(cap).c_str(),
+                               humanb(pinned + mapped).c_str(), humanb(still).c_str());
+                }
             }
         }
+        return r;
+    };
+    int64_t room = room_with(margin, &limit);
+    if (const int64_t keep = host_reserve_for_floor(floor_bytes, room, margin); keep < margin) {
+        /* The host has the bytes, but the reserve stood between them and a store that works.
+         * Take back exactly the shortfall and say so; a host that cannot pin the floor even
+         * then still gets the honest warning below. */
+        const int64_t wider = room_with(keep, &limit);
+        gave_way = fmt("; the host reserve gave back %s of its %s for the floor of %lld "
+                       "snapshot(s), holding %s", humanb(margin - keep).c_str(),
+                       humanb(asked).c_str(), (long long)floor_slots, humanb(keep).c_str());
+        room = wider;
     }
     const int64_t total = meminfo_bytes("MemTotal");
     const int64_t share = total > 0 ? total / 8 : room;
@@ -3122,19 +3273,19 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     else if (c.bound == CheckpointSlots::Bound::Room)
         bound = fmt("; %lld wanted, held to what the host can pin: %s", (long long)c.want,
                     limit.c_str());
-    decide("--checkpoint-slots", std::to_string(c.slots), need + bound);
+    decide("--checkpoint-slots", std::to_string(c.slots), need + bound + gave_way);
     if (c.slots == 0) {
-        RAD_WARN("checkpoint slots: auto finds no room for one %s snapshot of %s (%s), so every "
-                 "prefix hit on this model prefills from the start. Free host memory, or lower "
-                 "--host-pool-mib or --prefix-cache-mib", what, humanb(slot).c_str(),
-                 limit.c_str());
+        RAD_WARN("checkpoint slots: the host cannot pin one %s snapshot of %s: %s%s. Every prefix "
+                 "hit on this model prefills from the start. Free host memory, or lower "
+                 "--host-pool-mib, --prefix-cache-mib or --host-headroom-mib", what,
+                 humanb(slot).c_str(), limit.c_str(), gave_way.c_str());
         return RAD_OK;
     }
     const std::string line =
         fmt("checkpoint slots: auto: %lld %s snapshot(s) of %s in pinned host memory (%s), none of "
-            "it on the card; %s%s", (long long)c.slots, what, humanb(slot).c_str(),
-            humanb(slot * c.slots).c_str(), need.c_str(), bound.c_str());
-    if (c.bound == CheckpointSlots::Bound::Room) RAD_WARN("%s", line.c_str());
+            "it on the card; %s%s%s", (long long)c.slots, what, humanb(slot).c_str(),
+            humanb(slot * c.slots).c_str(), need.c_str(), bound.c_str(), gave_way.c_str());
+    if (c.slots < floor_slots || c.bound == CheckpointSlots::Bound::Room) RAD_WARN("%s", line.c_str());
     else RAD_INFO("%s", line.c_str());
     return RAD_OK;
 }
@@ -3167,7 +3318,9 @@ int Engine::configure_kv() {
         auto& r = ranks_[i];
         LogRank lr(r->index);
         RAD_TRY(declare_ring_windows(r->kv, r->program));
+        r->kv.set_drafter_window_snapshot(drafter_window_snap(r->program));
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
+        if (i == 0) drafter_snap_ = r->kv.drafter_window_snapshot();
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
         /* A rank plan() re-sized for the common token count must page at least that count (same
          * plan, same bytes); anything less is a broken invariant. */
@@ -3238,7 +3391,8 @@ int Engine::configure_kv() {
             shard_off[i] = slot;
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
-        /* A slot holds linear state, a trunk's window (KVGroupPlan::win_snap), or both. */
+        /* A slot holds linear state, a trunk's window (KVGroupPlan::win_snap), or both; a block
+         * drafter's window rides beside a trunk's window where the engine snapshots it. */
         bool linear = false;
         for (const KVGroupPlan& p : ranks_[0]->kv.plans()) linear = linear || p.stateful();
         const char* what = !ranks_[0]->kv.has_window_snapshot() ? "linear-state"
@@ -3265,7 +3419,14 @@ int Engine::configure_kv() {
             };
             if (!sized) return refuse("no host has");
             std::string why;
-            if (!lockable_room(slot * n, 0, host_headroom_bytes(), false, &why))
+            /* The same reserve rule the sizing used, or a count that auto could fit by giving the
+             * reserve back would be refused a few lines after it was chosen. */
+            std::string guard_why;
+            const int64_t want_bytes = slot * n;
+            const int64_t marg = host_reserve_for_floor(
+                want_bytes, lockable_bytes(0, host_headroom_bytes(), &guard_why),
+                host_headroom_bytes());
+            if (!lockable_room(want_bytes, 0, marg, false, &why))
                 return refuse("does not fit: " + why);
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());

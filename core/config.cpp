@@ -110,7 +110,10 @@ static const Flag g_flags[] = {
     "                                    host memory at load, pinned for the cards to read\n"
     "                                    (locked, where only a host kernel reads it); disk reads\n"
     "                                    its rows from the container on the host. auto takes the\n"
-    "                                    first of the three that holds it" },
+    "                                    first of the three that holds it. ram=DIR makes the\n"
+    "                                    pinned copy a file in DIR (a tmpfs) mapped shared, so\n"
+    "                                    two engines on separate cards hold one table: the\n"
+    "                                    first fills it, the last to exit deletes it" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
@@ -180,8 +183,9 @@ static const Flag g_flags[] = {
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
-                                        "from N decoding sequences on (0 never, the default): the\n"
-                                        "long block pays at one sequence, the short one at many" },
+                                        "from N decoding sequences on (0 never): the long block pays\n"
+                                        "at one sequence, the short one at many. auto (the default):\n"
+                                        "never for a chain, from 2 for a tree drafter" },
     { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
     "                                    samples each proposal from its own shortlist and the sampler\n"
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
@@ -585,10 +589,20 @@ int config_parse(int argc, char** argv, Config* c) {
                     RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
                 return RAD_E_INVAL;
             }
-            if (!emb && !parse_table_placement(v, &p)) {
-                RAD_ERR("%s takes auto, vram, ram or disk, not '%s'", a.c_str(), v);
+            std::string share_dir;
+            if (!emb && !std::strncmp(v, "ram=", 4)) {
+                share_dir = v + 4;
+                if (share_dir.empty()) {
+                    RAD_ERR("--ngram-placement ram= needs a directory: ram=DIR, the tmpfs that "
+                            "holds the shared table");
+                    return RAD_E_INVAL;
+                }
+                p = TablePlacement::Ram;
+            } else if (!emb && !parse_table_placement(v, &p)) {
+                RAD_ERR("%s takes auto, vram, ram, ram=DIR or disk, not '%s'", a.c_str(), v);
                 return RAD_E_INVAL;
             }
+            if (!emb) c->ngram_share_dir = share_dir;
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
         }
@@ -727,7 +741,11 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
-        else if (S("--draft-short-from"))      { if (!num(0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL; }
+        else if (S("--draft-short-from")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->draft_short_from = -1;
+            else if (!parse_int(a.c_str(), v, 0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL;
+        }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -751,7 +769,14 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--host"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->host = v; }
         else if (S("--port"))                  { if (!num(0, 65535, &c->port)) return RAD_E_INVAL; }
-        else if (S("--api-key"))               { if (!(v = need(i))) return RAD_E_INVAL; c->api_key = v; }
+        else if (S("--api-key")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* An empty key is no key: --api-key "" or --api-key "$UNSET_VAR" must not start a
+             * server that looks guarded and answers everything keyless. */
+            if (!*v) { RAD_ERR("--api-key takes a non-empty key; an empty value guards nothing");
+                       return RAD_E_INVAL; }
+            c->api_key = v;
+        }
         else if (S("--served-model-name")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
@@ -1166,7 +1191,9 @@ const ShowRow kShow[] = {
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
-    { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
+    { "--ngram-placement",    [](const Config& c) {
+          std::string v = table_placement_name(c.ngram_placement);
+          return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--prefix-cache-mib",   [](const Config& c) {
@@ -1202,7 +1229,8 @@ const ShowRow kShow[] = {
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-short-from",   [](const Config& c) {
-          return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
+          return c.draft_short_from < 0 ? std::string("auto")
+               : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },

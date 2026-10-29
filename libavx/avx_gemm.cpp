@@ -840,8 +840,8 @@ static int gemm_zp(const avxp::ZpGrid& zg, const RadTensor* A, const RadTensor* 
     if (A->rank >= 2 && A->shape[A->rank - 1] != acols) return RAD_E_SHAPE;
     int64_t ars = row_stride(A, acols), acs = laststride(A);
 
-    /* The W4 decode graph supplies BF16 directly so HIP can narrow on load. Keep the previous
-     * explicit BF16->F16 cast semantics for CPU execution before entering the F16 activation grid. */
+    /* A BF16 activation (the W4 decode graph's, which the card narrows on load) is narrowed to F16
+     * first, with the cast kernel's rounding, so the F16 grid sees what the card's GEMM sees. */
     std::vector<uint16_t> narrowed;
     RadTensor a_f16{};
     if (zg.act == ZP_F16 && A->dtype == RAD_BF16) {

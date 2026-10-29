@@ -111,7 +111,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     plan_ = &plan;
     cfg_ = cfg;
     budget_ = budget;
-    stats_ = MoverStats{};
+    stats_.reset();
     if (!budget_)
         RAD_WARN("mover: no Pools given; allocating the slab and host pool directly (test only)");
 

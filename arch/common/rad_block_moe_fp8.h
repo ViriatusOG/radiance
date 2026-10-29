@@ -1419,9 +1419,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
 
     if (separate_fp32_combine) {
-        /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: exactly the
-         * former cast + cast + F32 add + cast chain. Keep the routed gather's BF16 rounding
-         * and the separate TP reductions; a local gather cannot fold those reductions. */
+        /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: the same bytes as
+         * cast + cast + F32 add + cast. The routed gather's BF16 rounding and the separate TP
+         * reductions stay; a local gather cannot fold those reductions. */
         op_combine = rw(b, RAD_OP(b, "add",
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                       RAD_STR("dtype", "bf16")),

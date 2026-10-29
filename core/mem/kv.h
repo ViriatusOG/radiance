@@ -122,9 +122,12 @@ struct KVGroupPlan {
                    ? (runtime_tokens + block_size - 1) / block_size : 0;
     }
     /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot), after any
-     * linear state. Set for a trunk group; a drafter's window is recomputed by draft refill, so
-     * its snapshot would not be read. */
+     * linear state. Set for a trunk group, and for a drafter's group on a model without linear
+     * state where the engine saves the snapshot behind the drafter's context pass
+     * (set_drafter_window_snapshot). Elsewhere a drafter's window is recomputed by draft refill,
+     * so its snapshot would not be read. */
     bool        win_snap = false;
+    bool        drafter = false;           /* a drafter's group (KVGroupInfo::drafter) */
 
     int64_t     n_blocks = 0;          /* paged groups: blocks the group addresses (its context) */
     /* Paged groups: blocks the device pool backs, fewer than `n_blocks` when the group streams
@@ -230,6 +233,17 @@ public:
      * is sized and capped from these two alone (core/mem/vram_budget.cpp); VRAM above the ceiling
      * would never be addressed. carve() spends the pool it is given. */
     int     plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg);
+    /* Whether a drafter's WINDOW group rides in the window snapshot too (KVGroupPlan::win_snap).
+     * The engine sets it, before plan_groups, where the drafter stores its context right behind
+     * the trunk step and the snapshot is saved after that (a block drafter on the card's driver);
+     * a snapshot taken before would hold the window without the step's rows. Kept across
+     * forget(). */
+    void    set_drafter_window_snapshot(bool on) { snap_drafter_ = on; }
+    /* Some drafter group rides in the window snapshot (after plan_groups). */
+    bool    drafter_window_snapshot() const {
+        for (const auto& p : plans_) if (p.win_snap && p.drafter) return true;
+        return false;
+    }
     int64_t ceiling(int64_t ctx) const;
     /* The context-independent part of every ceiling: recurrent and conv state for max_seqs
      * sequences, plus alignment padding. Set by plan_groups(). */
@@ -436,6 +450,12 @@ public:
     /* Whether a sequence of this length fits an empty pool. If not, preemption cannot help and
      * the request is failed rather than deadlocking the engine (spec §17). */
     bool can_ever_fit(int64_t n_tokens) const;
+
+    /* Whether `seq` can grow to `n_tokens` without taking blocks from another sequence. */
+    bool can_grow(uint64_t seq, int64_t n_tokens) const;
+
+    /* Blocks a paged group can still hand out, including the lendable part. */
+    int64_t available_blocks(int32_t group) const;
 
     /* ---------------- the loan ----------------
      *
@@ -668,6 +688,7 @@ private:
     int64_t   max_seqs_ = 0;
     int64_t   max_ctx_ = 0;
     int64_t   max_tok_ = 0;      /* --max-num-batched-tokens; the buffer floor is one of these */
+    bool    snap_drafter_ = false;   /* set_drafter_window_snapshot */
     /* plan_groups() computes these; carve() spends against them and ceiling() reports on them. */
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */
     int64_t   ckpts_ = 0;      /* --checkpoint-slots, kept for the warning on a model with none */
@@ -707,8 +728,6 @@ private:
     std::vector<int64_t>  bucket_blocks_;   /* per group: blocks one held_hist_ bucket covers */
     std::vector<std::vector<int32_t>> held_hist_;   /* per group, per bucket: held blocks */
 
-    int64_t available_blocks(int32_t g) const;
-    /* The buffer this group wants in hand, in blocks. See buffer_bytes(). */
     int64_t  buf_blocks(size_t i) const;
     /* One past the highest held block, rounded up to a bucket. */
     int64_t  held_top(size_t i) const;

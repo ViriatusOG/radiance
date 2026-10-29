@@ -1,45 +1,44 @@
 /* r3d_gemm_inta8.hip -- gemm_nt_q at dtype=w4a8 and w8a8: the symmetric int4 and int8 weight
  * grids at decode heights, one kernel per grid.
  *
- * The grids, libref's descriptions: int8 activations in quant_act_i8's step order against
- * signed weight codes (I4, two a byte, or I8, one a byte) with one f16 scale per (row, 128 of
- * K), an f32 activation scale per row, and no zero point -- the dequant is code times scale,
- * so there is no a_sum to carry and no bias to take off. The group sub-sum is formed on the
- * integer grid and scaled once per group, the reference's order:
+ * The grids (libref's descriptions): int8 activations in quant_act_i8's step order with an f32
+ * scale per row, against signed weight codes (I4 two per byte, or I8) with one f16 scale per
+ * (row, 128 of K). No zero point: the dequant is code times scale, so there is no a_sum and no
+ * bias. The group sub-sum is formed on the integer grid and scaled once per group, in the
+ * reference's order:
  *
  *   sub = sum over the group of a * code, an exact integer
  *   acc += (sub * a_scale[m]) * scale[n, g]
  *
  * ---- exactness, and why the dots may run in f16 --------------------------------------------------
  *
- * A lane's 64 products are |a * code| <= 127 * 7 (w4a8) or 127 * 127 (w8a8), and the group's
- * 128 of them sum to 113,792 (w4a8) or 2,064,512 (w8a8): both under 2^24, the f32 mantissa, so
- * the lane partial and the pair fold are exact, and the group terms land in the accumulator
- * in the reference's ascending order. The codes widen to f16 through a sign extension, which
- * is exact for both grids; the activations widen through the i8 codec the w2a8 arm uses.
+ * Each product is |a * code| <= 127 * 7 (w4a8) or 127 * 127 (w8a8), and a group's 128 of them sum
+ * to at most 113,792 (w4a8) or 2,064,512 (w8a8), both under 2^24, so the lane partial and the pair
+ * fold are exact and the group terms enter the accumulator in the reference's ascending order. The
+ * codes widen to f16 by sign extension, exact for both grids; the activations widen through the i8
+ * codec the w2a8 arm uses.
  *
- * The activation is the step order: within each sixteen-byte step the middle two dwords are
- * exchanged, so the staging reads through the same position map the w2a8 arm does, and a
- * weight row's codes are plain row-major, two a byte at I4 and one a byte at I8.
+ * In the activation's step order the middle two dwords of each 16-byte step are exchanged, so the
+ * staging reads through the same position map as the w2a8 arm. Weight codes are plain row-major.
  *
  * ---- the tile --------------------------------------------------------------------------------------
  *
- * One workgroup serves kWaves weight rows; a wavefront takes one row, lane l owns rows
- * l & (MT-1) and k-lane l / MT, and the chunk is 2048 / MT codes: a multiple of the 128
- * group at every MT, so a chunk carries CG = 16 / MT whole groups and the group's scale is
- * one read. The lane's 64 codes are 32 bytes at I4, two 16-byte loads, and 64 at I8, four.
- * The lane's 64 sit in the group's two halves the w2a8 arm folds with one shfl_xor(MT), and
- * the group's term -- scaled by the activation's row scale and the weight's group scale --
- * goes to shared, where the row's owner lane sums the chunk's groups in ascending order.
+ * One workgroup serves kWaves weight rows, one per wave. Lane l owns activation row l & (MT-1) and
+ * k-lane l / MT. A chunk is 2048 / MT codes, a multiple of the 128 group at every MT, so it holds
+ * CG = 16 / MT whole groups and a group's scale is one read. A lane's 64 codes are 32 bytes at I4
+ * (two 16-byte loads) and 64 at I8 (four). Lanes l and l^MT hold the two halves of one group and
+ * fold with one shfl_xor(MT); the group's term, scaled by the activation's row scale and the
+ * weight's group scale, goes to shared memory, where the row's owner lane sums the chunk's groups
+ * in ascending order.
  *
- * M > 16 is the tiled row's; the w2a8 arm serves the 2- and 4-bit container grids there, and
- * the 8-bit grid at prefill heights is declared out of this unit.
+ * M > 16 belongs to the tiled row, where the w2a8 arm serves the 2- and 4-bit container grids; the
+ * 8-bit grid at prefill heights is declared outside this unit.
  *
  * ---- refusals --------------------------------------------------------------------------------------
  *
- * Every structural violation is a refusal, in the shim: the dtypes of all five operands,
- * K % 128, the band's M, the b row pitch's 16-byte alignment, the a and y pitches. There is
- * no data that is a refusal: both grids have no reserved value.
+ * The shim refuses every structural violation: the dtypes of all five operands, K % 128, the
+ * band's M, the b row pitch's 16-byte alignment, the a and y pitches. No data value is refused;
+ * neither grid has a reserved value.
  */
 
 #include "r3d_common.h"
@@ -56,18 +55,17 @@ constexpr int kMTMax         = 16;
 constexpr int kGroup         = 128;
 constexpr int kTileQuads     = 512;        /* MT rows x CHUNK/4 f16, constant over MT */
 
-/* Column c sits at byte step_pos(c), bits 2 and 3 of c swapped, the map its own inverse.
- * Applied to the four columns of one dword it leaves them four contiguous bytes and turns
- * the map on the DWORD index into a swap of bits 0 and 1 -- the middle two dwords of a
- * 16-byte step exchanged. */
+/* Column c sits at byte step_pos(c): bits 2 and 3 of c swapped, a self-inverse map. On the
+ * dword index it is a swap of bits 0 and 1, i.e. the middle two dwords of a 16-byte step
+ * exchanged, with each dword's four columns left contiguous. */
 __device__ __forceinline__ int64_t dword_pos(int64_t d)
 {
     return 4 * ((d & ~(int64_t)3) | ((d & 1) << 1) | ((d & 2) >> 1));
 }
 
-/* The LDS swizzle, at the granularity the tile is touched: a quad of four f16, two dwords,
- * moved as one 8-byte word. Quads are numbered q = r*(CHUNK/4) + c, and p_ix XORs q's low
- * four bits with bits 4..7 -- a bijection on 16-quad groups. */
+/* The LDS swizzle, at the tile's access granularity: a quad of four f16 (two dwords) moved as one
+ * 8-byte word. Quads are numbered q = r*(CHUNK/4) + c; p_ix XORs q's low four bits with bits 4..7,
+ * a bijection on 16-quad groups. */
 __device__ __forceinline__ int p_ix(int q) { return q ^ ((q >> 4) & 15); }
 
 /* Four int8 codes -> two f16x2 dwords. Exact: an integer of |a| <= 127 needs no rounding. */
@@ -78,11 +76,10 @@ __device__ __forceinline__ void i8x4_to_f16x2(uint32_t w, uint32_t& lo, uint32_t
                     (float)(int32_t)(int8_t)((w >> 24) & 0xffu));
 }
 
-/* Four signed int4 codes (two bytes, the low code in the low nibble) -> two f16x2 dwords.
- * Exact: the sign extension lands on an integer, and f16 steps by 1/8 at exponent 2^-3.
- * A nibble n is the value (n & 7) - (n & 8): 0..7 pass through and 8..15 land on -8..-1.
- * The gfx1102 backend folds the bias-8 spelling ((n ^ 8) - 8) to n ^ 16 once it has proven
- * the nibble range, so the sign is kept as a bit term. */
+/* Four signed int4 codes (two bytes, the low code in the low nibble) -> two f16x2 dwords. Exact:
+ * the sign extension yields an integer in -8..7. A nibble n is the value (n & 7) - (n & 8), so
+ * 0..7 pass through and 8..15 map to -8..-1. The gfx1102 backend folds the bias-8 form
+ * ((n ^ 8) - 8) to n ^ 16 once it has proven the nibble range, so the sign stays a bit term. */
 __device__ __forceinline__ void i4x4_to_f16x2(uint32_t w, uint32_t& lo, uint32_t& hi)
 {
     const uint32_t n0 = w & 0xFu;
@@ -144,8 +141,8 @@ gemm_inta8_kernel(const int8_t* __restrict__ a, const float* __restrict__ sa,
 
     float acc = 0.0f;
     for (int ch = 0; ch < nchunk; ++ch) {
-        /* Stage the chunk's activation rows, widened and step-unpermuted on the way in. Cells
-         * are four codes: MT * CHUNK/4 = 512 of them at every MT, two per thread. */
+        /* Stage the chunk's activation rows, widened and step-unpermuted. Cells are four codes:
+         * MT * CHUNK/4 = 512 at every MT, two per thread. */
         for (int i = threadIdx.x; i < MT * (chunk >> 2); i += kBlockThreads) {
             const int r = i / (chunk >> 2), c = i % (chunk >> 2);
             uint32_t w = 0;
@@ -160,17 +157,17 @@ gemm_inta8_kernel(const int8_t* __restrict__ a, const float* __restrict__ sa,
         __syncthreads();
 
         if (live) {
-            /* 64 codes: 32 bytes at I4, 64 at I8. The lane's codes are kl * 64 within the
-             * chunk, and the row pitch keeps every 16-byte load aligned. */
+            /* 64 codes: 32 bytes at I4, 64 at I8, starting at code kl * 64 of the chunk. The
+             * row pitch keeps every 16-byte load aligned. */
             const uint8_t* bp = b + (long long)n * row_bytes + (int64_t)ch * cq +
                                 kl * (CL / 2) * (CDT / 4);
             uint4 qw[NLOAD];
 #pragma unroll
             for (int L = 0; L < NLOAD; ++L)
                 __builtin_memcpy(&qw[L], bp + 16 * L, 16);
-            /* One value per quad: I4 the two-byte window as a 16-bit element, I8 the dword.
-             * The I4 window is taken as a half at its own address; shifting a dword array by
-             * a byte amount miscompiles on the gfx1102 backend. */
+            /* One value per quad: at I4 the two-byte window as a 16-bit element, at I8 the dword.
+             * The I4 window is read as a 16-bit element at its own address, because shifting a
+             * dword array by a byte amount miscompiles on the gfx1102 backend. */
             uint32_t wd[(CL >> 2)];
             if (CDT == 4) {
                 uint16_t wq[CL / 2];
@@ -208,14 +205,13 @@ gemm_inta8_kernel(const int8_t* __restrict__ a, const float* __restrict__ sa,
             const int g = ch * CG + (kl >> 1);
             const float sc = f16_to_f32(sb[(long long)n * sb_rb + g]);
             const float term = (isg * sSa[m]) * sc;    /* the reference's parentheses */
-            /* One slot per (row, group-in-chunk): MT*CG is 16 at every MT. The group's two
-             * half-lanes write the same value, which is what the pair fold above is for. */
+            /* One slot per (row, group-in-chunk); MT*CG is 16 at every MT. Both half-lanes of
+             * a group write the same folded value. */
             sT[warp * 16 + m * CG + (kl >> 1)] = term;
         }
         __syncthreads();
-        /* The chunk's groups, in ascending order, into the lane that owns the row's answer:
-         * the reference walks g in ascending order and f32 adds are not associative, so the
-         * order is part of the answer, not a detail. */
+        /* The chunk's groups in ascending g, into the row's owner lane: f32 adds are not
+         * associative and the reference walks g ascending. */
         if (live && kl == 0) {
 #pragma unroll
             for (int j = 0; j < CG; ++j)
@@ -309,9 +305,9 @@ extern "C" int r3d_gemm_nt_q_w8a8_m16(long a, long a_scale, long b, long b_scale
 
 /* ================================================================== the shims
  *
- * gemm_nt_q's slots, as the two shims take them: 0 a (I8, step order), 1 a_scale (f32, one
- * per row), 2 b (I4 or I8 codes), 3 b_scale (f16, one per (row, 128 of K)), 4 y (bf16),
- * 5 a_sum (absent: symmetric), 6 b_ref (absent).
+ * gemm_nt_q's slots: 0 a (I8, step order), 1 a_scale (f32, one per row), 2 b (I4 or I8 codes),
+ * 3 b_scale (f16, one per (row, 128 of K)), 4 y (bf16), 5 a_sum (absent: symmetric),
+ * 6 b_ref (absent).
  */
 
 extern "C" int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s)
@@ -359,7 +355,7 @@ extern "C" int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s)
     if (yp < N) return R3D_NO(RAD_E_STRIDE);
     if (!r3d_aligned(r3d_p(A), 4) || !r3d_aligned(r3d_p(B), 16)) return R3D_NO(RAD_E_ALIGN);
 
-    const long long bbr = r3d_row_pitch(B) / 2;   /* I4 counts elements, two a byte */
+    const long long bbr = r3d_row_pitch(B) / 2;   /* I4 pitch is in elements, two per byte */
     const int rc = r3d_gemm_nt_q_w4a8_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                           r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
                                           bbr, (long long)r3d_row_pitch(BS), (long)s);

@@ -16,10 +16,11 @@ constexpr int32_t kBlock = 64;
 
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     params_ = params;
-    stats_ = HeatStats{};
+    stats_.reset();
 
     const size_t n = plan.units.size();
     tier_.assign(n, Tier::VRAM);
+    tier_pub_.assign(n);
     busy_.assign(n, 0u);
     movable_.assign(n, 0u);
     pinned_.assign(n, 0u);
@@ -59,6 +60,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     for (size_t u = 0; u < n; ++u) {
         const MoveUnit& mu = plan.units[u];
         tier_[u] = mu.tier;
+        tier_pub_.set(u, (uint8_t)mu.tier);
         layer_of_[u] = mu.layer;
         bytes_[u] = mu.bytes;
         movable_[u] = mu.movable ? 1u : 0u;
@@ -259,6 +261,7 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
         else if (was != Tier::VRAM && t == Tier::VRAM) ++res_count_[(size_t)l];
     }
     tier_[(size_t)unit] = t;
+    tier_pub_.set((size_t)unit, (uint8_t)t);
     set_place(unit);
     end_invalidate(unit);
 

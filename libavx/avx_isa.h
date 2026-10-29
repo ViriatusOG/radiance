@@ -144,7 +144,8 @@ int         avx_par_force(int threads);
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
+    X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)          \
+    X(dflash_tree)          X(attn_paged_tree)
 
 /* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link
  * error from that level's avx_table.cpp object. */

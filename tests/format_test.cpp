@@ -8,17 +8,20 @@
 #include "rad_test.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "format/table_share.h"
 #include "format/tunecache.h"
 #include "format/imatrix.h"
 #include "format/safetensors.h"
 #include "format/checkpoint.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <functional>
 #include <signal.h>
 #include <string>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unordered_map>
 #include <vector>
@@ -448,6 +451,160 @@ TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
     CHECK(bad.base == nullptr);
     CHECK(bwhy.find("does not match") != std::string::npos);
     f.close();
+}
+
+/* --ngram-placement ram=DIR: the first holder to open the file fills it, a later one finds it
+ * ready (a second descriptor in one process is a second holder, since flock locks belong to the
+ * open file description), and the file goes when the last holder leaves. A file whose header is
+ * not this table's is never overwritten, since a live engine may have it mapped. */
+TEST(a_shared_table_file_is_filled_once_and_deleted_by_the_last_holder) {
+    const std::string dir = radtest::tmp_path("share");
+    REQUIRE(::mkdir(dir.c_str(), 0777) == 0 || errno == EEXIST);
+    const std::string container = write_tmp("share-container", ramp(8192, 1));
+    REQUIRE(!container.empty());
+    const int64_t n = 64 << 10;
+    const std::string id = table_share_id(container, 4096, n);
+    CHECK_EQ(id.size(), (size_t)16);
+    CHECK_EQ(table_share_id(container, 4096, n), id);
+    CHECK(table_share_id(container, 8192, n) != id);
+    CHECK(table_share_id(container, 4096, n + 1) != id);
+    CHECK(table_share_id(radtest::tmp_path("share-absent"), 4096, n).empty());
+
+    TableShare a, b, bad;
+    std::string why;
+    CHECK_OK(table_share_open(dir, id, n, &a, &why));
+    CHECK(a.filler && !a.ready);
+    CHECK(!table_share_is_ready(dir, id, n));
+    const std::vector<uint8_t> table = ramp(n, 3);
+    REQUIRE_EQ(::pwrite(a.fd, table.data(), (size_t)n, kTableShareHeader), (ssize_t)n);
+    CHECK_OK(table_share_mark_ready(&a, n, id, &why));
+    CHECK(a.ready);
+    CHECK(table_share_is_ready(dir, id, n));
+    CHECK(!table_share_is_ready(dir, id, n * 2));
+    struct stat st{};
+    REQUIRE_EQ(::stat(a.path.c_str(), &st), 0);
+    CHECK_EQ((int64_t)st.st_size, table_share_file_bytes(n));
+    CHECK_EQ(table_share_file_bytes(n), kTableShareHeader + ((int64_t)2 << 20));
+
+    CHECK_OK(table_share_open(dir, id, n, &b, &why));
+    CHECK(b.ready && !b.filler);
+    CHECK_EQ(b.lock_fd, -1);
+    std::vector<uint8_t> back((size_t)n);
+    REQUIRE_EQ(::pread(b.fd, back.data(), (size_t)n, kTableShareHeader), (ssize_t)n);
+    CHECK(back == table);
+
+    /* The same name, asked for a table of another length. */
+    CHECK_EQ(table_share_open(dir, id, n * 2, &bad, &why), (int)RAD_E_INVAL);
+    CHECK(bad.fd == -1);
+    CHECK(why.find("exists") != std::string::npos);
+
+    /* A file at another table's name whose header names this one: the id in the header is checked. */
+    const std::string other = table_share_id(container, 0, n);
+    const std::string other_path = dir + "/ngram-" + other + ".tab";
+    std::vector<uint8_t> head(4096);
+    REQUIRE_EQ(::pread(a.fd, head.data(), head.size(), 0), (ssize_t)head.size());
+    {
+        const int fd = ::open(other_path.c_str(), O_RDWR | O_CREAT, 0644);
+        REQUIRE(fd >= 0);
+        REQUIRE_EQ(::pwrite(fd, head.data(), head.size(), 0), (ssize_t)head.size());
+        REQUIRE_EQ(::ftruncate(fd, table_share_file_bytes(n)), 0);
+        ::close(fd);
+    }
+    CHECK_EQ(table_share_open(dir, other, n, &bad, &why), (int)RAD_E_INVAL);
+    CHECK_EQ(::access(other_path.c_str(), F_OK), 0);
+    ::unlink(other_path.c_str());
+
+    const std::string path = a.path, lock_path = a.lock_path;
+    table_share_close(&a);
+    CHECK(a.fd == -1);
+    CHECK_EQ(::access(path.c_str(), F_OK), 0);   /* b still holds it, after a's wait for it */
+    table_share_close(&b);
+    CHECK(::access(path.c_str(), F_OK) != 0);
+    CHECK(::access(lock_path.c_str(), F_OK) != 0);
+
+    /* A filler that leaves without marking the table ready leaves nothing behind, and the next
+     * holder fills. */
+    TableShare c, d;
+    CHECK_OK(table_share_open(dir, id, n, &c, &why));
+    CHECK(c.filler);
+    table_share_close(&c);
+    CHECK(::access(path.c_str(), F_OK) != 0);
+    CHECK_OK(table_share_open(dir, id, n, &d, &why));
+    CHECK(d.filler && !d.ready);
+    table_share_close(&d);
+}
+
+/* A shared file costs the header and the table's rounding to 2 MiB. From kTableShareMin on that is
+ * under an eighth of the table, and kTableShareMin is the least such bound for every size above
+ * it; the n-gram gather's two-byte scale would be a 4 MiB file, so it keeps a private copy. */
+TEST(a_table_is_shared_only_where_the_file_costs_little_beside_it) {
+    CHECK(2 < kTableShareMin);
+    CHECK_EQ(table_share_file_bytes(2), (int64_t)4 << 20);
+    const int64_t huge = (int64_t)2 << 20;
+    for (int64_t n : { kTableShareMin, kTableShareMin + 1, kTableShareMin + huge - 1,
+                       (int64_t)47 << 30 })
+        CHECK((table_share_file_bytes(n) - n) * 8 < n);
+    const int64_t below = kTableShareMin - huge + 1;
+    CHECK((table_share_file_bytes(below) - below) * 8 >= below);
+}
+
+/* Engines stopped together leave together. A holder that leaves while another still holds the
+ * file waits for it, so the file goes even when the other dies before its own close (killed at a
+ * stop timeout; its locks go with it). A holder that gets the lock on a file already deleted, with
+ * a new engine's file at the name, leaves the new one alone. */
+TEST(a_shared_table_file_goes_when_its_holders_leave_together) {
+    const std::string dir = radtest::tmp_path("share-leave");
+    REQUIRE(::mkdir(dir.c_str(), 0777) == 0 || errno == EEXIST);
+    const std::string container = write_tmp("share-leave-container", ramp(8192, 1));
+    REQUIRE(!container.empty());
+    const int64_t n = 64 << 10;
+    const std::string id = table_share_id(container, 4096, n);
+    REQUIRE(!id.empty());
+    std::string why;
+
+    TableShare a;
+    CHECK_OK(table_share_open(dir, id, n, &a, &why));
+    REQUIRE(a.filler);
+    CHECK_OK(table_share_mark_ready(&a, n, id, &why));
+    const std::string path = a.path, lock_path = a.lock_path;
+    int ready[2];
+    REQUIRE_EQ(::pipe(ready), 0);
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        TableShare b;
+        std::string bwhy;
+        char c = table_share_open(dir, id, n, &b, &bwhy) == RAD_OK && b.ready ? 'y' : 'n';
+        (void)!::write(ready[1], &c, 1);
+        ::usleep(300 * 1000);
+        ::_exit(0);
+    }
+    char c = 0;
+    CHECK_EQ(::read(ready[0], &c, 1), (ssize_t)1);
+    CHECK_EQ(c, 'y');
+    table_share_close(&a);
+    CHECK(::access(path.c_str(), F_OK) != 0);
+    CHECK(::access(lock_path.c_str(), F_OK) != 0);
+    ::waitpid(child, nullptr, 0);
+    ::close(ready[0]);
+    ::close(ready[1]);
+
+    TableShare p, q, r;
+    CHECK_OK(table_share_open(dir, id, n, &p, &why));
+    REQUIRE(p.filler);
+    CHECK_OK(table_share_mark_ready(&p, n, id, &why));
+    CHECK_OK(table_share_open(dir, id, n, &q, &why));
+    CHECK(q.ready);
+    REQUIRE_EQ(::flock(q.fd, LOCK_UN), 0);   /* q is on its way out too */
+    table_share_close(&p);
+    CHECK(::access(path.c_str(), F_OK) != 0);
+    CHECK_OK(table_share_open(dir, id, n, &r, &why));
+    CHECK(r.filler);
+    table_share_close(&q);
+    CHECK_EQ(::access(path.c_str(), F_OK), 0);
+    CHECK_EQ(::access(lock_path.c_str(), F_OK), 0);
+    table_share_close(&r);
+    CHECK(::access(path.c_str(), F_OK) != 0);
 }
 
 /* ------------------------------------------------------------------ reserving and writing */

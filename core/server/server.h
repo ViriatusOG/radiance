@@ -149,9 +149,10 @@ struct ServerOptions {
      * a string rendered once: the dump includes `OpInfo::issued`, which a pre-first-step snapshot
      * would report as false for every op, hiding dead declarations.
      *
-     * Regenerating reads the Program on the HTTP thread while the step path writes that field. It
-     * is a monotonic false -> true bool, so at worst a mid-step fetch shows an op unissued one step
-     * early. Registry::select is called with record = false and mutates nothing else. */
+     * Regenerating reads the Program on the HTTP thread while the step path writes that field;
+     * both sides go through std::atomic_ref (Ctx::flush_issued, rad_graph.cpp), so the pairing is
+     * a relaxed exchange rather than a data race. Registry::select is called with record = false
+     * and mutates nothing else. */
     std::function<std::string()> graph_json;
     /* The startup report as JSON (core/diag/diag.h): options in force, the machine as it is now
      * (the provider may reuse a reading for a second), and what on it costs speed. Without an API

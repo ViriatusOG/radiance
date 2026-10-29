@@ -167,7 +167,8 @@ public:
 
     /* False only for a constraining grammar whose backend cannot snapshot its state. Masking a
      * draft window walks the grammar over the drafts and rewinds, which needs
-     * push_state/rollback; without it the request decodes one token at a time. */
+     * push_state/rollback (a tree's rows each walk their own ancestors); without it the request
+     * decodes one token at a time. */
     bool allows_speculation(uint64_t req_id) const;
     /* Whether allows_speculation's answer can no longer change. It changes only when a grammar
      * whose backend cannot rewind starts to constrain (on a commit). */

@@ -1053,10 +1053,9 @@ int Planner::pin_towers(const Config& cfg, Plan* p) const {
 
 /* --draft-expert-placement host: a draft head's routed experts (layers at meta.n_layers and above,
  * and only when the program declares a drafter) go to the pinned host pool before any strategy
- * runs. The card reads them in place at the DeviceZeroCopy site, the same way it reads a pooled
- * expert, so a drafter's experts fit beside a trunk that already fills the card instead of the
- * strategy having to make room for them on it. They are not movable: heat never promotes a draft
- * expert onto the card and into the trunk's slab. */
+ * runs. The card reads them in place at the DeviceZeroCopy site, as it reads a pooled expert, so
+ * a drafter's experts fit beside a trunk that already fills the card. They are not movable: heat
+ * never promotes a draft expert onto the card and into the trunk's slab. */
 int Planner::pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const {
     if (cfg.draft_expert_placement != "host") return RAD_OK;
     if (prog.drafter.kind == RAD_DRAFT_NONE || prog.meta.n_layers == 0) {
@@ -1107,12 +1106,12 @@ int Planner::pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) 
 
 /* --expert-pin-top F: the hottest fraction of the routed experts, ranked by the profile the planner
  * was given (the container's, or --expert-profile's decode counts), stay resident. They are marked
- * unmovable, so the heat engine never demotes them and the decode-hot set stops paying the host
+ * unmovable, so the heat engine never demotes them and the decode-hot set never pays the host
  * pool's PCIe read. The cut keeps the hottest ceil(F * n), and a tie at the cut stays movable: the
  * threshold is the share just below the hot set, and only a share strictly above it pins. Runs
  * after the strategy, which has already put the hot set in VRAM; a hot unit the strategy had to
- * leave on the host is left there and counted, since pinning it would need VRAM the card does not
- * have. */
+ * leave on the host stays there and is counted, since pinning it would need VRAM the card does
+ * not have. */
 void Planner::pin_hot(const Config& cfg, Plan* p) const {
     if (cfg.expert_pin_top <= 0.0f) return;
     std::vector<float> shares;
@@ -1120,9 +1119,7 @@ void Planner::pin_hot(const Config& cfg, Plan* p) const {
         if (mu.expert >= 0 && mu.tier != Tier::Mapped) shares.push_back(mu.profile_share);
     if (shares.empty()) return;
     std::sort(shares.begin(), shares.end());
-    /* The cut sits after the coldest (1 - F) of the plane, so the hottest F are pinned. A tie at
-     * the cut stays movable: the threshold is the share just below the hot set, and only a share
-     * strictly above it pins. */
+    /* The cut sits after the coldest (1 - F) of the plane, so the hottest F are pinned. */
     const double keep = (double)cfg.expert_pin_top * (double)shares.size();
     const size_t hot = keep <= 0.0 ? 0 : std::min(shares.size(), (size_t)std::ceil(keep));
     const float threshold = hot == 0 ? shares.back() + 1.0f
@@ -1174,7 +1171,8 @@ int Planner::plan(Plan* out) {
     build_classes(out);
 
     /* After build_classes: a unit's slot_bytes is its class's stride, and the pins below charge
-     * the host pool that. Before it the charge would be zero and the pool would not hold them. */
+     * the host pool that. Before it the charge would be zero and the pool would not hold them.
+     * Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
     int hrc = pin_embedding(prog, cfg, out);
     const int trc = pin_towers(cfg, out);
     if (hrc >= 0) hrc = trc;
@@ -1211,9 +1209,6 @@ int Planner::plan(Plan* out) {
             out->file_windows = windows;
         }
     }
-
-    /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. The pins ran above,
-     * once slot_bytes was known. */
 
     int rc = assign(out);
     enforce_op_site_agreement(prog, out);

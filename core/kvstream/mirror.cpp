@@ -186,8 +186,8 @@ void KVStreamStore::release(MemAllocator& host_alloc) {
 
 KVStreamStats KVStreamStore::stats(const std::vector<KVGroupPlan>& plans) const {
     KVStreamStats st;
-    st.misses   = misses_;
-    st.bytes_in = bytes_in_;
+    st.misses   = (int64_t)misses_.load(std::memory_order_relaxed);
+    st.bytes_in = (int64_t)bytes_in_.load(std::memory_order_relaxed);
     for (const auto& p : plans)
         if (p.streamed()) st.resident_blocks += p.pool_blocks();
     return st;

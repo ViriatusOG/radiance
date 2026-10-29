@@ -349,6 +349,93 @@ struct MoverStats {
     uint64_t file_read_ns = 0, file_wait_ns = 0;
 };
 
+/* The live twin of MoverStats: every counter an atomic. The mover writes these through the
+ * step on its rank thread while the HTTP thread reads them for /stats and LiveView, and reading
+ * a plain field another thread writes is a data race (UB). Relaxed atomics give exactly the
+ * "either side of a store" telemetry promises, at no cost on the writer. snapshot() loads them
+ * all into a plain MoverStats; same reasoning that made flex_used_ atomic, for the same reader.
+ */
+struct MoverCounters {
+    std::atomic<uint64_t> dispatches{0};
+    std::atomic<uint64_t> promotions{0}, demotions{0};
+    std::atomic<uint64_t> h2d_bytes{0}, d2h_bytes{0};
+    std::atomic<uint64_t> prefetched{0}, prefetch_bytes{0};
+    std::atomic<uint64_t> no_record{0}, starved_slab{0}, starved_pool{0};
+    std::atomic<uint64_t> quarantined{0};
+    std::atomic<uint64_t> dropped{0};
+    std::atomic<uint64_t> donated{0}, relocated{0}, stranded{0};
+    std::atomic<uint64_t> ssd_reads{0}, ssd_bytes{0};
+    std::atomic<uint64_t> stage_layers{0}, staged_units{0}, staged_bytes{0}, stage_overflow{0};
+    std::atomic<uint64_t> stage_copies{0};
+    std::atomic<uint64_t> file_layers{0}, file_units{0}, file_bytes{0}, file_preads{0};
+    std::atomic<uint64_t> file_read_ns{0}, file_wait_ns{0};
+
+    void reset() {
+        /* Field by field: atomics are not copy-assignable. */
+        dispatches.store(0, std::memory_order_relaxed);
+        promotions.store(0, std::memory_order_relaxed);
+        demotions.store(0, std::memory_order_relaxed);
+        h2d_bytes.store(0, std::memory_order_relaxed);
+        d2h_bytes.store(0, std::memory_order_relaxed);
+        prefetched.store(0, std::memory_order_relaxed);
+        prefetch_bytes.store(0, std::memory_order_relaxed);
+        no_record.store(0, std::memory_order_relaxed);
+        starved_slab.store(0, std::memory_order_relaxed);
+        starved_pool.store(0, std::memory_order_relaxed);
+        quarantined.store(0, std::memory_order_relaxed);
+        dropped.store(0, std::memory_order_relaxed);
+        donated.store(0, std::memory_order_relaxed);
+        relocated.store(0, std::memory_order_relaxed);
+        stranded.store(0, std::memory_order_relaxed);
+        ssd_reads.store(0, std::memory_order_relaxed);
+        ssd_bytes.store(0, std::memory_order_relaxed);
+        stage_layers.store(0, std::memory_order_relaxed);
+        staged_units.store(0, std::memory_order_relaxed);
+        staged_bytes.store(0, std::memory_order_relaxed);
+        stage_overflow.store(0, std::memory_order_relaxed);
+        stage_copies.store(0, std::memory_order_relaxed);
+        file_layers.store(0, std::memory_order_relaxed);
+        file_units.store(0, std::memory_order_relaxed);
+        file_bytes.store(0, std::memory_order_relaxed);
+        file_preads.store(0, std::memory_order_relaxed);
+        file_read_ns.store(0, std::memory_order_relaxed);
+        file_wait_ns.store(0, std::memory_order_relaxed);
+    }
+
+    MoverStats snapshot() const {
+        MoverStats s;
+        s.dispatches     = dispatches.load(std::memory_order_relaxed);
+        s.promotions     = promotions.load(std::memory_order_relaxed);
+        s.demotions      = demotions.load(std::memory_order_relaxed);
+        s.h2d_bytes      = h2d_bytes.load(std::memory_order_relaxed);
+        s.d2h_bytes      = d2h_bytes.load(std::memory_order_relaxed);
+        s.prefetched     = prefetched.load(std::memory_order_relaxed);
+        s.prefetch_bytes = prefetch_bytes.load(std::memory_order_relaxed);
+        s.no_record      = no_record.load(std::memory_order_relaxed);
+        s.starved_slab   = starved_slab.load(std::memory_order_relaxed);
+        s.starved_pool   = starved_pool.load(std::memory_order_relaxed);
+        s.quarantined    = quarantined.load(std::memory_order_relaxed);
+        s.dropped        = dropped.load(std::memory_order_relaxed);
+        s.donated        = donated.load(std::memory_order_relaxed);
+        s.relocated      = relocated.load(std::memory_order_relaxed);
+        s.stranded       = stranded.load(std::memory_order_relaxed);
+        s.ssd_reads      = ssd_reads.load(std::memory_order_relaxed);
+        s.ssd_bytes      = ssd_bytes.load(std::memory_order_relaxed);
+        s.stage_layers   = stage_layers.load(std::memory_order_relaxed);
+        s.staged_units   = staged_units.load(std::memory_order_relaxed);
+        s.staged_bytes   = staged_bytes.load(std::memory_order_relaxed);
+        s.stage_overflow = stage_overflow.load(std::memory_order_relaxed);
+        s.stage_copies   = stage_copies.load(std::memory_order_relaxed);
+        s.file_layers    = file_layers.load(std::memory_order_relaxed);
+        s.file_units     = file_units.load(std::memory_order_relaxed);
+        s.file_bytes     = file_bytes.load(std::memory_order_relaxed);
+        s.file_preads    = file_preads.load(std::memory_order_relaxed);
+        s.file_read_ns   = file_read_ns.load(std::memory_order_relaxed);
+        s.file_wait_ns   = file_wait_ns.load(std::memory_order_relaxed);
+        return s;
+    }
+};
+
 /* ------------------------------------------------------------------ the mover */
 class Mover {
 public:
@@ -543,7 +630,8 @@ public:
     }
     int64_t file_buffer_bytes() const { return file_vram_ ? file_buf_bytes_ : 0; }
 
-    const MoverStats& stats() const { return stats_; }
+    /* A snapshot by value: the counters are atomics read while the rank thread writes them. */
+    MoverStats stats() const { return stats_.snapshot(); }
     std::string report() const;
 
 private:
@@ -624,7 +712,7 @@ private:
     const Plan*    plan_ = nullptr;
     MoverConfig    cfg_;
     Residency      res_;
-    MoverStats     stats_;
+    MoverCounters  stats_;
     Pools*         budget_ = nullptr;
     /* True only when this object called the allocator itself (the test path). A Pool
      * reservation belongs to the Pool; freeing it here would be a double free. */

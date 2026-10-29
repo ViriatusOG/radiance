@@ -63,13 +63,13 @@ inline void put_nibbles(uint8_t* row, const uint8_t* q, int n) {
         row[k] = (uint8_t)((q[2 * k] & 15) | ((q[2 * k + 1] & 15) << 4));
 }
 
-/* Q4_K: value v is a nibble of qs[32*(v/64) + v%32], the low one for the first 32 of each 64. The
- * 6-bit scale and min of sub-block j are get_scale_min_k4's. */
+/* Q4_K: value v is a nibble of qs[32*(v/64) + v%32], the low one for the first 32 of each 64. */
 inline uint32_t k_low4(const uint8_t* qs, int v) {
     const uint8_t q = qs[32 * (v / 64) + v % 32];
     return (uint32_t)((v % 64) < 32 ? q & 15 : q >> 4);
 }
 
+/* Q4_K: the 6-bit scale and min of sub-block j, as llama.cpp's get_scale_min_k4 unpacks them. */
 inline void k4_scale_min(int j, const uint8_t* q, uint32_t* d, uint32_t* m) {
     if (j < 4) {
         *d = q[j] & 63u;

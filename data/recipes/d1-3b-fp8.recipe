@@ -1,0 +1,22 @@
+# d1-3b-fp8.recipe -- LiquidAI d1-3B (LFM2) with block-scaled fp8 linears.
+#
+#   rad-convert <LiquidAI/d1-3B> -o d1-3b-fp8.rad --set decision.type=d1 \
+#       --recipe data/recipes/d1-3b-fp8.recipe
+#
+# Every linear of the 30 layers (attention q, k, v and output; the convolutions' in and out
+# projections; gate|up and down) becomes E4M3 codes with a bf16 scale a 128 x 128 block, read by the
+# fp8a8 GEMMs over activations quantised per 128 columns. The lm_head (tied to the embedding, so the
+# embedding itself stays bf16) becomes int8 with a bf16 scale per row per 128 columns, read by
+# logits_gemm_i8: as fast as an E4M3 head and closer to bf16 (84 d1 decisions against the bf16
+# model: no decision moved, mean |dP| 0.0086 against 0.0085 with a bf16 head). The short
+# convolution and the norms stay bf16.
+
+blk.*.attn_q.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_k.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_v.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.conv_in.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.conv_out.weight        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up.weight     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down.weight        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+output.weight                rtn  codes=i8 group=128 scale=bf16

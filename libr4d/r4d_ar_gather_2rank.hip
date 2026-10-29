@@ -60,7 +60,7 @@ __global__ void r4d_ar_gather_2rank_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
-    unsigned int nbw) {
+    unsigned int nbw, long stage) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
@@ -68,6 +68,7 @@ __global__ void r4d_ar_gather_2rank_kernel(
   const int slot = (int)s_slot;
   int4* ps = peer_base + (size_t)slot * slot_stride16;
   const int4* ms = my_base + (size_t)slot * slot_stride16;
+  const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
 
   const int w = (n16 + nb - 1) / nb;
   const int start = b * w;
@@ -116,8 +117,10 @@ __global__ void r4d_ar_gather_2rank_kernel(
   __syncthreads();
   if (acq) __threadfence_system();
   r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
-    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+    for (int k = start + tid; k < end; k += nt)
+      h += r4d_archk_u4(r4d_archk_keep(&ms[k], md), 4u * (unsigned)k);
   });
+  ms = r4d_archk_moved(ms, md);
 
   // Place the peer's slice, now staged in this rank's scratch.
   {
@@ -136,7 +139,8 @@ __global__ void r4d_ar_gather_2rank_kernel(
 void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream_i, long nblocks,
-                         long nthreads, long drain, long acq, long dpitch, long spitch) {
+                         long nthreads, long drain, long acq, long dpitch, long spitch,
+                         long stage) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
@@ -177,5 +181,5 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   r4d_ar_gather_2rank_kernel<<<nb, nt, 0, st>>>(
       (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
       (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,
-      (int)slot_stride16, (int)rank, row16, dp16, sp16, (int)drain, (int)acq, nbw);
+      (int)slot_stride16, (int)rank, row16, dp16, sp16, (int)drain, (int)acq, nbw, stage);
 }

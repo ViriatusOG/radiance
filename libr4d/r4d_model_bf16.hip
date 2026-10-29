@@ -614,6 +614,52 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     }
 }
 
+// The same rotary at prefill row counts with each (token, pair) angle computed once. rope_kernel
+// gives every (head, pair) its own thread, which recomputes powf and the accurate sincosf for every
+// head; the angle depends on the token and the pair alone, so at 32 heads 31 of 32 evaluations are
+// repeats (q at 408 tokens: ~50 us on gfx1200). Here a thread owns one pair of one token and turns
+// that pair in every head. Byte-identical: the angle, cos and sin are rope_kernel's expressions on
+// the same inputs, and each head's two stores are its.
+__global__ __launch_bounds__(kThreads) void rope_rows_kernel(
+    uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t M,
+    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj,
+    float theta, float rscale, uint32_t row_pitch,
+    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3) {
+    const uint32_t half = rot / 2;
+    const uint32_t rpb = kThreads / half;                 // rows a block; half <= kThreads
+    const uint32_t m = blockIdx.x * rpb + threadIdx.x / half, i = threadIdx.x % half;
+    if (threadIdx.x >= rpb * half || m >= M) return;
+    const float div = rscale != 0.0f ? rscale : 1.0f;
+    const float p0 = (float)pos[m] / div;
+    const int sec[3] = { s0, s1, s2 };
+
+    float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
+    float p = p0;
+    if (plane) {
+        uint32_t j = i;
+        const int c = rope_comp(mode, i, sec, n_sec, &j);
+        p = (float)pos[(size_t)c * plane + m] / div;
+        if (mode == 4)
+            inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
+    }
+    inv = yarn.frequency(inv, (int)i);
+    inv = l3.frequency(inv);
+    if (i >= nfreq) inv = 0.0f;
+    const float ang = p * inv;
+    float c, s;
+    sincosf(ang, &s, &c);
+    if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
+    const uint32_t i0 = gptj ? 2 * i : i;
+    const uint32_t i1 = gptj ? 2 * i + 1 : i + half;
+    uint16_t* __restrict__ row = qkv + (size_t)m * row_pitch;
+    for (uint32_t h = 0; h < n_rope_heads; ++h) {
+        uint16_t* __restrict__ hd = row + (size_t)h * head_dim;
+        const float x0 = bf16_to_f32(hd[i0]), x1 = bf16_to_f32(hd[i1]);
+        hd[i0] = f32_to_bf16(x0 * c - x1 * s);
+        hd[i1] = f32_to_bf16(x0 * s + x1 * c);
+    }
+}
+
 // ---------------------------------------------------------------------------- kv_store
 // ref_kv_store. The paged layout every kernel in this project shares:
 //
@@ -952,20 +998,65 @@ extern "C" int r4d_scatter_rows_u8(long v, long idx, long x, int M, int n, int d
                                 (RadStream)(uintptr_t)stream);
 }
 
+
+// Short rows (n <= 256: per-head q/k norms at head_dim 64..256): a wave a row, eight rows a block.
+// rmsnorm_kernel gives such a row a whole workgroup of 256+ threads, most of them idle, and at a
+// prefill step's T x heads rows (13,000 at 408 tokens x 32 heads) the launch is bound by workgroup
+// dispatch: ~48 us for 1.7 MB on gfx1200.
+//
+// Byte-identical to rmsnorm_kernel at any width it is launched at. There, with n no wider than the
+// block, thread i holds element i alone; each wave's 32 squares are summed by r4d_wave_sum and the
+// wave sums are added in wave order from 0.f (block_sum), the waves past the row adding exact
+// zeros. Here lane l holds elements l + 32c of the row, chunk c summed by the same r4d_wave_sum,
+// and the chunk sums added in the same order. The scale and the store are rmsnorm_kernel's.
+constexpr uint32_t kShortNormMax = 256;
+template <bool WF32>
+__global__ __launch_bounds__(256) void rmsnorm_short_kernel(
+    const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
+    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    const uint32_t lane = threadIdx.x & (kWave - 1);
+    const uint32_t m = blockIdx.x * (256u / kWave) + threadIdx.x / kWave;
+    if (m >= M) return;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    constexpr uint32_t NC = kShortNormMax / kWave;
+    float v[NC];
+    float ss = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < NC; ++c) {
+        const uint32_t i = lane + c * kWave;
+        v[c] = i < n ? bf16_to_f32(xr[i]) : 0.0f;
+        if (c * kWave < n) {
+            float q = 0.0f;
+            q += v[c] * v[c];
+            ss += r4d_wave_sum(q);
+        }
+    }
+    const float s = rsqrtf(ss / (float)n + eps);
+#pragma unroll
+    for (uint32_t c = 0; c < NC; ++c) {
+        const uint32_t i = lane + c * kWave;
+        if (i >= n) continue;
+        const float g = !w ? 1.0f : WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        yr[i] = f32_to_bf16(v[c] * s * (g + wadd) * mult);
+    }
+}
+
 // `w_f32` selects an f32 or bf16 gain; a null `w` is a gain of one. `mult` scales the row before
 // its single rounding.
 /* `chain`: the chained form, at decode heights (r4d_rad_rmsnorm passes the row's resolved
- * parameter; every other caller none). */
+ * parameter; every other caller none). `rows_form`: the caller declared `rmsnorm_rows` and the
+ * short-row form may be taken (rmsnorm_short_kernel); every other caller keeps rmsnorm_kernel. */
 static int rmsnorm_mult_launch(long x, long w, long y, int M, int n, float eps, float wadd,
                                float mult, int w_f32, int x_ld, int y_ld, long stream,
-                               bool chain);
+                               bool chain, bool rows_form = false);
 extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
                                      float mult, int w_f32, int x_ld, int y_ld, long stream) {
     return rmsnorm_mult_launch(x, w, y, M, n, eps, wadd, mult, w_f32, x_ld, y_ld, stream, false);
 }
 static int rmsnorm_mult_launch(long x, long w, long y, int M, int n, float eps, float wadd,
                                float mult, int w_f32, int x_ld, int y_ld, long stream,
-                               bool chain) {
+                               bool chain, bool rows_form) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
@@ -977,6 +1068,23 @@ static int rmsnorm_mult_launch(long x, long w, long y, int M, int n, float eps, 
     const int thr = r4d_act_threads(M, n);
     // A drafter's 256-row head norm at 256 threads is exactly a full card; step past the cliff.
     const bool ch = chain && M <= 64;
+    /* Short rows at more rows than the card has waves: a wave a row (rmsnorm_short_kernel, the
+     * same bytes). Below that the per-row workgroups already fill the part. Opt-in by op name, so
+     * every other caller's launch is the one it had. */
+    if (rows_form && n <= (int)kShortNormMax && M >= 1024 && !ch) {
+        /* Eight waves a block, stepped past the cliff r4d_cliff_rows names for the card's wave
+         * count (on the 32-CU part 1024 rows are 1024 waves: 17 us against 7 at 3264). */
+        const dim3 grid(r4d_cliff_rows(((uint32_t)M + 7u) / 8u, 1, 8));
+        if (w_f32)
+            hipLaunchKernelGGL((rmsnorm_short_kernel<true>), grid, dim3(256), 0, (hipStream_t)stream,
+                               (const uint16_t*)x, (const void*)w, (uint16_t*)y, (uint32_t)n, eps,
+                               wadd, mult, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
+        else
+            hipLaunchKernelGGL((rmsnorm_short_kernel<false>), grid, dim3(256), 0, (hipStream_t)stream,
+                               (const uint16_t*)x, (const void*)w, (uint16_t*)y, (uint32_t)n, eps,
+                               wadd, mult, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
 #define R4D_RN_T(wf, T)                                                                         \
     hipLaunchKernelGGL((ch ? r4dchain_rmsnorm<wf, T> : rmsnorm_kernel<wf, T>),                  \
                        dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)),                         \
@@ -1180,7 +1288,7 @@ extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope
 static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
                        int gptj, float theta, float rscale, int row_pitch, int mode,
                        const int* sec, int n_sec, int plane, RadYarn yarn, long stream,
-                       int nfreq = -1, RadLlama3 l3 = RadLlama3{}) {
+                       int nfreq = -1, RadLlama3 l3 = RadLlama3{}, bool rows_form = false) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_rope_heads <= 0) return -2;
     if (rot <= 0 || rot > head_dim || (rot & 1)) return -3;
@@ -1190,6 +1298,19 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
     const uint32_t gy = (pairs + kThreads - 1) / kThreads;
     const int s0 = n_sec > 0 ? sec[0] : 0, s1 = n_sec > 1 ? sec[1] : 0, s2 = n_sec > 2 ? sec[2] : 0;
     if (nfreq < 0) nfreq = rot / 2;
+    /* Prefill rows with at least four heads: one angle a (token, pair), every head turned with it
+     * (rope_rows_kernel, the same bytes). Decode rows keep a thread a (head, pair), which spreads a
+     * single token over the card. Opt-in by op name (`rope_rows`): every other caller's launch is
+     * the one it had. */
+    if (rows_form && M >= 64 && n_rope_heads >= 4 && rot / 2 <= (int)kThreads) {
+        const uint32_t rpb = kThreads / (uint32_t)(rot / 2);
+        hipLaunchKernelGGL(rope_rows_kernel, dim3(((uint32_t)M + rpb - 1) / rpb), dim3(kThreads), 0,
+                           (hipStream_t)stream, (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)M,
+                           (uint32_t)head_dim, (uint32_t)n_rope_heads, (uint32_t)rot,
+                           (uint32_t)nfreq, (int)den, gptj, theta, rscale, (uint32_t)row_pitch, mode,
+                           s0, s1, s2, n_sec, (uint32_t)plane, yarn, l3);
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
     hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
                        (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
                        (uint32_t)n_rope_heads, (uint32_t)rot, (uint32_t)nfreq, (int)den, gptj, theta,
@@ -1696,7 +1817,9 @@ static int rmsnorm_x_f32(const float* x, const void* w, uint16_t* y, int M, int 
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
+/* `rows_form`: the row is `rmsnorm_rows`, which may take the short-row form (rmsnorm_short_kernel).
+ * Every other caller passes false and gets the launch it always had. */
+static int rmsnorm_emit(const RadArgs* a, RadStream s, bool rows_form) {
     const RadTensor* x = r4d_opt(a, RN_X);
     const RadTensor* w = r4d_opt(a, RN_W);
     const RadTensor* y = r4d_opt(a, RN_Y);
@@ -1746,7 +1869,18 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
     return rmsnorm_mult_launch(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n, eps, wadd,
                             (float)r4d_getf(a, "mult", 1.0),
                             w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
-                            r4d_geti_or(a, "chain", 0) != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
+                            r4d_geti_or(a, "chain", 0) != 0, rows_form) == 0
+               ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
+    return rmsnorm_emit(a, s, false);
+}
+
+/* `rmsnorm_rows`: the same norm, whose launch may take the short-row form (n <= 256 at 1024 rows
+ * or more, the head norms of a prefill step). Byte-identical to the row above at every width. */
+extern "C" int r4d_rad_rmsnorm_rows(const RadArgs* a, RadStream s) {
+    return rmsnorm_emit(a, s, true);
 }
 
 /* ------------------------------------------------------------------ add_rmsnorm */
@@ -2095,7 +2229,9 @@ extern "C" int r4d_rad_gelu_mul(const RadArgs* a, RadStream s) {
 
 enum { RP_QKV = 0, RP_POS };
 
-extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
+/* `rows_form`: the row is `rope_rows`, which may turn every head of a (token, pair) with the one
+ * angle it computed (rope_rows_kernel). Every other caller passes false. */
+static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
     const RadTensor* qkv = r4d_opt(a, RP_QKV);
     const RadTensor* pos = r4d_opt(a, RP_POS);
     if (!qkv || !pos) return R4D_NO(RAD_E_INVAL);
@@ -2181,9 +2317,19 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
                        (int)(n_head + n_head_kv), (int)rot_l, (int)den, gptj, theta, rscale,
                        (int)pitch, mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s,
-                       (int)nfreq, l3) == 0
+                       (int)nfreq, l3, rows_form) == 0
         ? RAD_OK
         : RAD_E_DEVICE;
+}
+
+extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
+    return rope_emit(a, s, false);
+}
+
+/* `rope_rows`: the same rotation, whose launch may compute one angle a (token, pair) and turn every
+ * head with it (rope_rows_kernel, the same bytes) at prefill row counts. */
+extern "C" int r4d_rad_rope_rows(const RadArgs* a, RadStream s) {
+    return rope_emit(a, s, true);
 }
 
 /* ------------------------------------------------------------------ kv_store */

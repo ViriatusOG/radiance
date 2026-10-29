@@ -95,11 +95,12 @@ struct ExpertPlane {
 
 /* Interconnect traffic by consumer.
  *
- * Three things share the link: the tensor-parallel all-reduce (set by model width and batch), the
- * expert mover's promotions and demotions (set by placement policy), and the MoE GEMM streaming a
- * routed expert that is not in VRAM (what the moves try to avoid). All are cumulative byte counts
- * on one clock, so rates from two polls compare directly: is the link busy because the model is
- * wide or because placement is thrashing?
+ * Four things share the link: the tensor-parallel all-reduce (set by model width and batch), the
+ * expert mover's promotions and demotions (set by placement policy), the MoE GEMM streaming a
+ * routed expert that is not in VRAM (what the moves try to avoid), and --kv-resident's per-step
+ * resolve, which copies the blocks a streamed KV group missed from its host mirror into the VRAM
+ * ring (core/kvstream). All are cumulative byte counts on one clock, so rates from two polls
+ * compare directly: is the link busy because the model is wide or because placement is thrashing?
  *
  * `ar_bytes` is the message payload summed over issues (see Ctx::ar_bytes). `h2d`/`d2h` are the
  * mover's measured copy sizes.
@@ -117,6 +118,20 @@ struct LinkStat {
     /* The prefill stager's copies of the next layer's pooled experts (core/place/stager.h).
      * Included in `h2d_bytes`, like `prefetch_bytes`; subtract both for promotions alone. */
     int64_t staged_bytes = 0;
+    /* KV streaming (--kv-resident): the bytes the resolves copied from the host mirror into the
+     * ring. Rank 0's counters -- the ranks resolve the same block ids through maps brought up
+     * identically, so one rank's answer is every rank's (see Engine::stream_probe_take) -- times
+     * the world, to sit on every card's link like the move rows. `kv_streaming` says the switch
+     * was asked for; a renderer then shows the row at zero included, because a zero with the
+     * switch on is the answer to "does this model's pipeline ever stream?".
+     *
+     * `kv_stream_active` is the DIFFERENT question: whether a group's device pool really is a
+     * resident window under its context. The switch is a preference -- it is zeroed when the
+     * architecture refuses it, and --kv-resident at or above the group's context leaves a plain
+     * resident pool -- so text that names a memory tier must read this, never the flag. */
+    int64_t kv_stream_bytes = 0;
+    bool    kv_streaming = false;
+    bool    kv_stream_active = false;
 };
 
 /* How the ranks ran their passes, summed over ranks (see Ctx::PassCounts). A played pass costs

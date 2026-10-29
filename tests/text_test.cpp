@@ -2298,9 +2298,9 @@ TEST(the_normal_forms_agree_with_an_independent_implementation) {
     CHECK(rows > 2500);
 }
 
-/* A release that ships no chat template (DeepSeek's) is why --chat-template exists: the file is
- * read, trailing newlines stripped exactly as the checkpoint's own file is, and an unreadable or
- * empty file is refused rather than skipped. */
+/* --chat-template serves a release that ships no chat template (DeepSeek's): the file is read,
+ * trailing newlines stripped exactly as the checkpoint's own file is, and an unreadable or empty
+ * file is refused rather than skipped. */
 TEST(read_chat_template_path_strips_newlines_and_refuses_empty) {
     VocabBuild vb;
     const std::string p = radtest::tmp_path("chat_template.jinja");

@@ -40,7 +40,8 @@ struct Slab {
         USED  = SLOT + kGroups * kTok,          /* [kGroups][kSeq] */
         BT    = USED + kGroups * kSeq,          /* [kGroups][kSeq][kPitch] */
         FIRST = BT + kGroups * kSeq * kPitch,   /* [kGroups][kSeq] */
-        END   = FIRST + kGroups * kSeq
+        PAR   = FIRST + kGroups * kSeq,         /* [kTok] spec_parent, when a test stages trees */
+        END   = PAR + kTok
     };
     alignas(16) int32_t w[END] = {};
     StepSlot st[kSeq];
@@ -217,6 +218,83 @@ TEST(the_cards_acceptance_is_accept_greedy_and_the_end_of_generation_cut) {
     /* The draw reaches the interesting branches, not only full acceptance or none. */
     CHECK(cut_cases > 100);
     CHECK(partial > 100);
+}
+
+/* The same over trees (rad_drafter_tree): a row whose spec_parent marks a tree verify is accepted
+ * by accept_tree's walk (the lowest-numbered child that is the target's pick at its parent, from
+ * the bonus token down), cut at the first end-of-generation token, and the StepSlot carries the
+ * accepted nodes for ADV_COMPACT. Random trees of 0-8 nodes over {1, 2, 3}, so siblings often
+ * share a token and the lowest-numbered one must win. Seeded; a failure prints the case. */
+TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
+    const uint32_t seed = 0x7ee5eedu;
+    uint32_t rng = seed;
+    int bad = 0, deep = 0, branched = 0, cut_cases = 0;
+    for (int c = 0; c < 10000 && !bad; ++c) {
+        Slab s(ADV_ACCEPT);
+        s.a.parent_off = Slab::PAR * 4;
+        for (int t = 0; t < Slab::kTok; ++t) s.w[Slab::PAR + t] = -2;
+        int n_eog = 0;
+        int32_t eog_ids[3];
+        for (int32_t t : { 2, 3, 8 }) if (lcg(rng) % 4 == 0) eog_ids[n_eog++] = t;
+        for (int j = 0; j < n_eog; ++j) s.eog[j] = eog_ids[j];
+        s.a.n_eog = n_eog;
+        auto is_eog = [&](int32_t t) {
+            return std::find(eog_ids, eog_ids + n_eog, t) != eog_ids + n_eog;
+        };
+
+        const int n_rows = 1 + (int)(lcg(rng) % 4);
+        int k = 0, out_row = 0;
+        struct Want { int card, acc, tok, head; int32_t path[8]; } want[4];
+        for (int i = 0; i < n_rows; ++i) {
+            const int n_spec = (int)(lcg(rng) % 9);
+            const int n_tok = 1 + n_spec;
+            const int ctx = (int)(lcg(rng) % 1000);
+            const int rtok = k;                       /* a decode row: its first token is the bonus */
+            s.row(i, true, k, n_tok, ctx, i, rtok, out_row, n_spec);
+            int32_t draft[8] = {}, parent[8] = {}, target[9] = {};
+            s.w[Slab::TOK + rtok] = 50;
+            s.w[Slab::PAR + rtok] = -1;                /* the root: this row is a tree verify */
+            for (int j = 1; j <= n_spec; ++j) {
+                parent[j - 1] = (int32_t)(lcg(rng) % (uint32_t)j);
+                draft[j - 1] = 1 + (int32_t)(lcg(rng) % 3);
+                s.w[Slab::TOK + rtok + j] = draft[j - 1];
+                s.w[Slab::PAR + rtok + j] = (rtok - k) + parent[j - 1];
+                branched += parent[j - 1] != j - 1;
+            }
+            for (int r = 0; r <= n_spec; ++r) {
+                target[r] = 1 + (int32_t)(lcg(rng) % 3);
+                s.src[out_row + r] = target[r];
+            }
+            int32_t out[9] = {}, path[8] = {}, acc = -1;
+            CHECK_OK(accept_tree(draft, parent, n_spec, target, out, path, &acc));
+            const int32_t cut = accept_cut_at_eog(out, acc, is_eog);
+            deep += cut >= 2;
+            cut_cases += cut < acc;
+            want[i] = { i, cut, out[cut], ctx + cut, {} };
+            std::memcpy(want[i].path, path, sizeof path);
+            out_row += 1 + n_spec;
+            k += n_tok;
+        }
+        s.run();
+        for (int i = 0; i < n_rows && !bad; ++i) {
+            const StepSlot& S = s.st[want[i].card];
+            bool ok = S.acc == want[i].acc && S.tok[0] == want[i].tok && S.n_acc == want[i].acc + 1 &&
+                      S.head == want[i].head && S.ctx == want[i].head + 1 && S.npath == want[i].acc;
+            for (int t = 0; ok && t < want[i].acc; ++t) ok = S.path[t] == want[i].path[t];
+            if (!ok) {
+                bad = 1;
+                CHECK(ok);
+                std::fprintf(stderr, "    seed 0x%x, case %d, row %d: card acc %d tok %d npath %d; "
+                             "host acc %d tok %d\n", seed, c, i, S.acc, S.tok[0], S.npath,
+                             want[i].acc, want[i].tok);
+            }
+        }
+    }
+    CHECK_EQ(bad, 0);
+    /* The draw reaches branching trees, accepted paths of two nodes or more, and the cut. */
+    CHECK(branched > 1000);
+    CHECK(deep > 100);
+    CHECK(cut_cases > 100);
 }
 
 /* ================================================================== ADV_TRUNK */

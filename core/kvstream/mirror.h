@@ -9,6 +9,7 @@
 #pragma once
 #include "mem/pools.h"
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -85,17 +86,19 @@ public:
 
     KVStreamStats stats(const std::vector<KVGroupPlan>& plans) const;
 
-    /* Charged by the engine, which reads the resolve's counters where a step has drained. */
+    /* Charged by the engine, which reads the resolve's counters where a step has drained. Atomic
+     * (relaxed): stats() is also read by the dashboard's snapshot on an HTTP thread while a step
+     * may be in flight; only the values carry meaning, not their order. */
     void note_traffic(int64_t misses, int64_t bytes) {
-        if (misses > 0) misses_ += (uint64_t)misses;
-        if (bytes  > 0) bytes_in_ += (uint64_t)bytes;
+        if (misses > 0) misses_.fetch_add((uint64_t)misses, std::memory_order_relaxed);
+        if (bytes  > 0) bytes_in_.fetch_add((uint64_t)bytes, std::memory_order_relaxed);
     }
 
 private:
     std::vector<int64_t> resident_tokens_;   /* by group handle: its pool's depth in tokens */
     std::vector<Map>     maps_;              /* set_map(), by group handle */
-    uint64_t misses_ = 0;                    /* note_traffic() */
-    uint64_t bytes_in_ = 0;
+    std::atomic<uint64_t> misses_{0};        /* note_traffic() */
+    std::atomic<uint64_t> bytes_in_{0};
 };
 
 }  /* namespace rad */

@@ -8,7 +8,7 @@
 #   rad-convert <DeepSeek-V4.1-Flash-1017 dir> --add engram-tables.safetensors \
 #     --recipe data/recipes/deepseek41-ud-iq1s.recipe --imatrix <imatrix.gguf> -o deepseek41-ud-iq1s.rad
 #
-# The imatrix is Unsloth's with entries for the fused weights added (docs/deepseek41-wip.md). One rule per weight,
+# The imatrix is Unsloth's with entries for the fused weights added (data/imatrix_merge.py, docs/deepseek41-hf-direct.md). One rule per weight,
 # experts collapsed per layer; first match wins.
 # PATTERN  QUANTISER  OPTIONS
 dspark.enc.output_norm.weight  cast  dtype=f32

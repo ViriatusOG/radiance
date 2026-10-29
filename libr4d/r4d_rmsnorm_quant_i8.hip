@@ -308,7 +308,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
     int4* peer_base, const int4* my_base, unsigned int* peer_flags, unsigned int* my_flags,
     unsigned int* seq_ctrs, int M, uint32_t n, float eps, float wadd, uint32_t r_ld, uint32_t y_ld,
-    int slot_stride16, int drain, int acq, unsigned int nbw) {
+    int slot_stride16, int drain, int acq, unsigned int nbw, long stage) {
     extern __shared__ uint16_t ybuf[];
     __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
     __shared__ unsigned int s_seq, s_slot;
@@ -319,7 +319,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   /* device-resident, replay-safe */
     const unsigned int sq = s_seq;
     int4* const ps = peer_base + (size_t)s_slot * slot_stride16;
-    const int4* const ms = my_base + (size_t)s_slot * slot_stride16;
+    const int4* ms = my_base + (size_t)s_slot * slot_stride16;
+    const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
 
     /* push my rows into the peer's slot; `x` is a tight [M][n] of bf16 */
     const int wpr = (int)(n >> 3);
@@ -346,8 +347,9 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     if (acq) __threadfence_system();
     r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, sq, [&](unsigned int& h) {
         for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR)
-            h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+            h += r4d_archk_u4(r4d_archk_keep(&ms[k], md), 4u * (unsigned)k);
     });
+    ms = r4d_archk_moved(ms, md);
 
     const uint16_t* __restrict__ P = (const uint16_t*)ms;   /* the peer's rows, in my scratch */
     const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
@@ -938,7 +940,7 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
                                        long x, long res, long w, long wp, long sc, int sc_f32,
                                        long y, long q, long s, int M, int n, float eps, float wadd,
                                        int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                                       int drain, int acq) {
+                                       int drain, int acq, long stage) {
     if (!x || !w || !q || !s) return -1;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -961,7 +963,7 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
                        (const int4*)my_scratch, (unsigned int*)peer_flags,                       \
                        (unsigned int*)my_flags, (unsigned int*)seq_ctrs, M, (uint32_t)n, eps,    \
                        wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, drain, acq,      \
-                       (unsigned)nbw)
+                       (unsigned)nbw, stage)
 #define R4D_ARQ8(WF, RS, PO, SC)                                                                  \
     do { if (thr == 1024)     R4D_ARQ8_T(WF, RS, PO, SC, 1024);                                   \
          else if (thr == 512) R4D_ARQ8_T(WF, RS, PO, SC, 512);                                    \

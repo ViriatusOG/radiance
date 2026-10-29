@@ -92,10 +92,13 @@ json form_value(const std::string& key, const std::string& v) {
         if (v == "true" || v == "1") return json(true);
         if (v == "false" || v == "0") return json(false);
     }
-    /* `loras` as JSON text, or one adapter's name. */
+    /* `loras` as JSON text, or one adapter's name. Bounded like a request body: a form field
+     * under the body cap can be brackets alone, and the deep tree's teardown would take the
+     * process with it. Over-deep or over-budget reads as plain text, as a discarded parse did. */
     if ((key == "loras" || key == "lora") && !v.empty() && (v[0] == '[' || v[0] == '{')) {
-        json j = json::parse(v, nullptr, false);
-        if (!j.is_discarded()) return j;
+        bool over = false, deep = false;
+        json j = parse_json_bounded(v, 0, &over, &deep);
+        if (!j.is_discarded() && !over && !deep) return j;
     }
     return json(v);
 }
@@ -623,7 +626,16 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         src_px = std::move(src.rgba);
     }
 
-    auto render = [&](const std::string& prompt, gen::Branch* out, ApiError* err) -> int {
+    auto render = [&](const std::string& prompt, const char* field, gen::Branch* out,
+                      ApiError* err) -> int {
+        /* A prompt spelling the media marker would be scanned for pictures this request never
+         * uploaded, and the scan would walk off the item list: refuse the text, as the chat and
+         * embeddings paths refuse marker text (oai.cpp). */
+        if (prompt.find(RAD_MEDIA_MARKER) != std::string::npos) {
+            *err = err_bad(field, std::string("contains \"") + RAD_MEDIA_MARKER +
+                                        "\": it names a picture this request did not upload");
+            return RAD_E_INVAL;
+        }
         std::string text = r.background == "transparent" && !info.tmpl_transparent.empty()
                                ? replace_all(info.tmpl_transparent, "{prompt}", prompt)
                                : prompt;
@@ -651,6 +663,14 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
                 out->tokens.insert(out->tokens.end(), ids.begin(), ids.end());
             }
             if (at == std::string::npos) break;
+            if (mi >= items.size()) {
+                /* Unreachable for any request: the prompt text is refused above, so only a model
+                 * template that spells the marker past its pictures could reach it. Belt for the
+                 * day one does. */
+                *err = err_internal("the render template spells the media marker more times "
+                                    "than the request has pictures");
+                return RAD_E_STATE;
+            }
             mm::Placed pl;
             pl.item = items[mi++];
             pl.tok = (int32_t)out->tokens.size();
@@ -716,8 +736,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     };
     {
         ApiError err;
-        if (render(r.prompt, &g->pos, &err) < 0) return error_response(err, req.peer);
-        if (r.has_neg && render(r.negative, &g->neg, &err) < 0)
+        if (render(r.prompt, "prompt", &g->pos, &err) < 0) return error_response(err, req.peer);
+        if (r.has_neg && render(r.negative, "negative_prompt", &g->neg, &err) < 0)
             return error_response(err, req.peer);
     }
 

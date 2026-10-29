@@ -59,7 +59,50 @@ __global__ __launch_bounds__(kThreads) void r4dchain_step_advance(rad::AdvanceAr
     }
 }
 
+/* ADV_COMPACT: block (x, y) is work item x (a pool, layer and head) of batch row y; its threads
+ * split the K|V row into 16-byte chunks. Chained like the advance where launches chain, every
+ * block waiting for the kernels before it and counting itself in after its moves. */
+constexpr int kCompactThreads = 64;
+__device__ __forceinline__ void step_compact_body(const rad::AdvanceArgs& a) {
+    int p = 0, l = 0, h = 0;
+    if (!rad::adv_compact_item(a, (int)blockIdx.x, &p, &l, &h)) return;
+    rad::adv_compact(a, (int)blockIdx.y, p, l, h, (int)threadIdx.x, kCompactThreads);
+}
+__global__ __launch_bounds__(kCompactThreads) void rad_step_compact(rad::AdvanceArgs a) {
+    step_compact_body(a);
+}
+__global__ __launch_bounds__(kCompactThreads) void r4dchain_step_compact(rad::AdvanceArgs a) {
+    const ChainRec* r = chain_rec();
+    if (r) {
+        if (threadIdx.x == 0)
+            while (__hip_atomic_load(r->ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < r->target)
+                __builtin_amdgcn_s_sleep(1);
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    step_compact_body(a);
+    if (r) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __syncthreads();
+        if (threadIdx.x == 0)
+            __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+
 }  // namespace
+
+extern "C" int rad_step_compact_launch(const rad::AdvanceArgs* args, void* stream) {
+    if (!args || args->n_seq <= 0) return 0;
+    const int items = rad::adv_compact_items(*args);
+    if (items <= 0) return 0;
+    if (!rad_dev_chain_enabled())
+        hipLaunchKernelGGL(rad_step_compact, dim3((unsigned)items, (unsigned)args->n_seq),
+                           dim3(kCompactThreads), 0, (hipStream_t)stream, *args);
+    else
+        hipLaunchKernelGGL(r4dchain_step_compact, dim3((unsigned)items, (unsigned)args->n_seq),
+                           dim3(kCompactThreads), 0, (hipStream_t)stream, *args);
+    return hipGetLastError() == hipSuccess ? 0 : -1;
+}
 
 extern "C" int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
     if (!args || args->n_seq <= 0) return 0;

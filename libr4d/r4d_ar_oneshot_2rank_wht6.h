@@ -219,26 +219,27 @@ __device__ __forceinline__ void wht6_handshake(unsigned int* peer_flags, unsigne
 template <int CG = CHUNK_GROUPS>
 __device__ __forceinline__ void wht6_rehash_chunk(unsigned int& h, int c, int n_groups, int lane,
                                                   int lig, int gw, const uint4* m_pay,
-                                                  const unsigned short* m_sc) {
+                                                  const unsigned short* m_sc, long md) {
   using Ch = Wht6Chunk<CG>;
   if constexpr (Ch::U4) {
 #pragma unroll
     for (int u = 0; u < Ch::NW / 4; ++u) {
       const long o = (long)c * (Ch::NW / 4 * WAVE) + (long)u * WAVE + lane;
-      h += r4d_archk_u4(m_pay[o], 4u * (unsigned)o);
+      h += r4d_archk_u4(r4d_archk_keep(&m_pay[o], md), 4u * (unsigned)o);
     }
   } else {
     const unsigned int* mp = reinterpret_cast<const unsigned int*>(m_pay);
 #pragma unroll
     for (int u = 0; u < Ch::NW; ++u) {
       const long o = (long)c * (Ch::NW * WAVE) + (long)u * WAVE + lane;
-      h += r4d_archk_mix(mp[o], (unsigned)o);
+      h += r4d_archk_mix(r4d_archk_keep(&mp[o], md), (unsigned)o);
     }
   }
 #pragma unroll
   for (int t = 0; t < Ch::ITERS; ++t) {
     const int g = c * CG + t * GPW + gw;
-    if (lig == 0 && g < n_groups) h += r4d_archk_mix(m_sc[g], R4D_ARCHK_U16 + (unsigned)g);
+    if (lig == 0 && g < n_groups)
+      h += r4d_archk_mix(r4d_archk_keep(&m_sc[g], md), R4D_ARCHK_U16 + (unsigned)g);
   }
 }
 
@@ -295,6 +296,11 @@ struct Wht6Slot {
   uint4* p_pay; unsigned short* p_sc;               // the peer's scratch: payload, bf16 scales
   const uint4* m_pay; const unsigned short* m_sc;   // this rank's scratch, which the peer filled
   uint4* l_pay; float* l_sc;                        // this rank's own half, local only
+  // Onto the host mailbox's VRAM mirror once the check has passed (r4d_ar_seq.h).
+  __device__ __forceinline__ void moved(long md) {
+    m_pay = r4d_archk_moved(m_pay, md);
+    m_sc = r4d_archk_moved(m_sc, md);
+  }
 };
 __device__ __forceinline__ Wht6Slot wht6_slot(char* peer_scratch, const char* my_scratch,
                                               char* loc_pack, int slot, long slot_stride_bytes,
@@ -316,15 +322,16 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
     const T* __restrict__ in, char* peer_scratch, const char* my_scratch, char* loc_pack,
     T* __restrict__ out, unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     int n_groups, int n_chunks, long slot_stride_bytes, long scale_off_bytes, int drain, int acq,
-    unsigned int nbw) {
+    unsigned int nbw, long stage) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   const int lane = tid & (WAVE - 1), wid = tid / WAVE, nwarp = nt / WAVE;
   const int lig = lane & (LPG - 1), gw = lane / LPG;
   __shared__ unsigned int s_seq, s_slot;
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
   const unsigned int s = s_seq;
-  const Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
-                               slot_stride_bytes, scale_off_bytes);
+  Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
+                         slot_stride_bytes, scale_off_bytes);
+  const long md = r4d_archk_md(stage, my_scratch);   // the host mailbox's VRAM mirror
 
   const int cpb = (n_chunks + nb - 1) / nb;                 // block b owns chunks [c0,c1)
   const int c0 = b * cpb; int c1 = c0 + cpb; if (c1 > n_chunks) c1 = n_chunks;
@@ -341,8 +348,9 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
   wht6_handshake(peer_flags, my_flags, b, s, tid, drain, acq);
   r4d_archk_wait(my_flags, nbw, s_slot, (unsigned)b, s, [&](unsigned int& h) {
     for (int c = c0 + wid; c < c1; c += nwarp)
-      wht6_rehash_chunk(h, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc);
+      wht6_rehash_chunk(h, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc, md);
   });
+  w.moved(md);
 
   const auto st = [&](long off, const float* v) {
 #pragma unroll
@@ -366,7 +374,8 @@ static void r4d_ar_wht6_launch(int64_t peer_scratch, int64_t my_scratch, int64_t
                             int64_t my_flags, int64_t seq_ctrs, int64_t loc_pack,
                             int64_t slot_stride_bytes, int64_t scale_off_bytes, int64_t inp,
                             int64_t out, int64_t n_elem, int64_t dtype, int64_t stream_i,
-                            int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq) {
+                            int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq,
+                            int64_t stage = 0) {
   hipStream_t st = (hipStream_t)stream_i;
   if (dtype != 0 && dtype != 1) throw std::runtime_error("pack ar: only bf16/fp16 payloads");
   if (n_elem % GROUP != 0) throw std::runtime_error("pack ar: n_elem not a multiple of GROUP");
@@ -378,7 +387,7 @@ static void r4d_ar_wht6_launch(int64_t peer_scratch, int64_t my_scratch, int64_t
     (const T*)inp, (char*)peer_scratch, (const char*)my_scratch, (char*)loc_pack, (T*)out, \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n_groups, n_chunks, \
     (long)slot_stride_bytes, (long)scale_off_bytes, (int)drain, (int)acq, \
-    (unsigned)R4D_AR_MAX_BLOCKS)
+    (unsigned)R4D_AR_MAX_BLOCKS, (long)stage)
   if (dtype == 0) LF(__hip_bfloat16);
   else LF(__half);
 #undef LF

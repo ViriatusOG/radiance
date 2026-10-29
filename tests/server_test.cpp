@@ -2848,6 +2848,7 @@ TEST(the_live_view_prints_ordinary_lines_when_it_is_not_a_terminal) {
      * GEMM streaming across the link. */
     s.experts.routed = 200; s.experts.routed_resident = 150;
     s.link.stream_bytes = 700;
+    s.link.kv_streaming = true; s.link.kv_stream_bytes = 600;
 
     /* A pipe is not a terminal, so the constructor picks the line renderer and the frame must
      * contain no escape sequence: a log full of cursor-home codes is ungreppable, and the breakage
@@ -2871,11 +2872,12 @@ TEST(the_live_view_prints_ordinary_lines_when_it_is_not_a_terminal) {
     /* Hit rate is not residency: 37.50% of the units are in VRAM and 75% of the routing found one
      * there, which is the placement working. Both numbers, since either alone misleads. */
     CHECK(line.find("hit=75.00%") != std::string::npos);
-    /* The link, cumulative, with all three of the things that share it. */
+    /* The link, cumulative, with all four of the things that share it. */
     CHECK(line.find("link ar=5000") != std::string::npos);
     CHECK(line.find("h2d=900") != std::string::npos);
     CHECK(line.find("d2h=800") != std::string::npos);
     CHECK(line.find("stream=700") != std::string::npos);
+    CHECK(line.find("kv=600") != std::string::npos);
     CHECK(line.back() == '\n');
 
     /* The terminal renderer is the one that may use escapes, and it colours by tier. */
@@ -4745,6 +4747,10 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         CHECK(!def);
         /* Refuses a body that names no boolean rather than guessing. */
         CHECK_EQ(f.post("/admin/control-vector", R"({"enabled":"yes"})").status, 400);
+        /* And a body that is brackets alone: valid JSON, nested deeper than any stack wants to
+         * tear down, parsed bounded and refused. */
+        CHECK_EQ(f.post("/admin/control-vector",
+                        std::string(20000, '[') + std::string(20000, ']')).status, 400);
         /* Without --api-key a change comes from loopback only; reading it is not restricted. */
         HttpRequest q;
         q.method = "POST";
@@ -4756,6 +4762,21 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         q.peer = "127.0.0.1:50122";
         CHECK_EQ(f.srv->router().dispatch(q).status, 200);
         CHECK(def);
+        /* A browser page on another origin is not a loopback client, even though its own
+         * browser makes the request arrive loopback: defeating the guard that way is exactly
+         * what the drive-by would do. Same-origin browser traffic still passes. */
+        HttpRequest x;
+        x.method = "POST";
+        x.path = "/admin/control-vector";
+        x.body = R"({"enabled":false})";
+        x.peer = "127.0.0.1:50122";
+        x.headers["Origin"] = "http://evil.test";
+        x.headers["Host"]   = "127.0.0.1:8080";
+        CHECK_EQ(f.srv->router().dispatch(x).status, 403);
+        CHECK(def);
+        x.headers["Origin"] = "http://127.0.0.1:8080";
+        CHECK_EQ(f.srv->router().dispatch(x).status, 200);
+        CHECK(!def);
         HttpRequest g2;
         g2.path = "/admin/control-vector";
         g2.peer = "192.168.1.20:50122";

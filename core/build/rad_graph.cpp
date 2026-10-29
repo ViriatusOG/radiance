@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <unordered_map>
 #include <cstring>
@@ -650,7 +651,9 @@ std::string dump_graph_json(const Program& p) {
         j["geometry"] = o.base.str();
         j["ranged"]   = o.ranged_key;
         if (!o.ranged_key.empty()) { j["range_lo"] = o.range_lo; j["range_hi"] = o.range_hi; }
-        j["issued"]   = o.issued;
+        /* Read through an atomic_ref: the step path stores this flag from the engine thread
+         * (Ctx::flush_issued); a plain read here would race it. */
+        j["issued"] = std::atomic_ref<const bool>(o.issued).load(std::memory_order_relaxed);
         j["schema"]   = schema_json(o.schema ? o.schema : reg.schema(o.op));
 
         json ws = json::array();

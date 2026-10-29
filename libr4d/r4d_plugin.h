@@ -175,6 +175,18 @@ int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
+/* attn_paged_qrow_tree (docs/OPS.md): the h256/gqa2 split-KV decode and the windowed kernels with a
+ * tree verify's mask from operand 8, `spec_parent`. */
+int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs*, RadStream);
+#define R4D_WIN_TREE_DECL(HD, G)                                                                  \
+    int r4d_rad_attn_window_tree_h##HD##_gqa##G##_bf16(const RadArgs*, RadStream);                \
+    int r4d_rad_attn_window_tree_h##HD##_gqa##G##_fp8 (const RadArgs*, RadStream);
+R4D_WIN_TREE_DECL(256, 1) R4D_WIN_TREE_DECL(256, 2) R4D_WIN_TREE_DECL(256, 4) R4D_WIN_TREE_DECL(256, 8)
+R4D_WIN_TREE_DECL(512, 1) R4D_WIN_TREE_DECL(512, 2) R4D_WIN_TREE_DECL(512, 4) R4D_WIN_TREE_DECL(512, 8)
+#undef R4D_WIN_TREE_DECL
+/* dflash_tree (r4d_dflash_tree_bf16.hip): dflash_select's lattice grown best-first into a tree. */
+int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
  * draft head's merge (r4d_pair_argmax_f32.hip). */
 int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);
@@ -563,6 +575,10 @@ int r4d_rad_rope_table            (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a16_m1  (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a8_m16  (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs*, RadStream);
+int r4d_rad_gemm_fp8a8_gated_wide(const RadArgs*, RadStream);
+/* `gemm_nt_q_short`: the narrow row with the short-prompt split rule (narrow_ksplit). */
+int r4d_rad_gemm_fp8a8_m16_short(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_fp8a8_m16_short_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_bias_m16(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_fp8a8_m16_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_tiled(const RadArgs*, RadStream);
@@ -728,6 +744,8 @@ int r4d_rad_gather_rows_u8  (const RadArgs*, RadStream);
 int r4d_rad_scatter_rows_u8 (const RadArgs*, RadStream);
 int r4d_rad_scatter_rows_bf16(const RadArgs*, RadStream);
 int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
+/* The same row choosing the short-row form when it serves (`rmsnorm_rows`, rmsnorm_short_kernel). */
+int r4d_rad_rmsnorm_rows    (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_p       (const RadArgs*, RadStream);
 int r4d_rad_add             (const RadArgs*, RadStream);
 int r4d_rad_mul             (const RadArgs*, RadStream);
@@ -787,6 +805,8 @@ int r4d_shape_moe_gather_inv(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_gelu_mul        (const RadArgs*, RadStream);
 int r4d_rad_rope            (const RadArgs*, RadStream);
+/* The same row choosing the per-(token, pair) angles form when it serves (`rope_rows`). */
+int r4d_rad_rope_rows       (const RadArgs*, RadStream);
 /* -- the vision tower's ops (r4d_vit_bf16.hip) -- */
 int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);

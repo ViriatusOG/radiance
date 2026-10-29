@@ -299,6 +299,26 @@ TEST(a_speech_session_refuses_what_it_cannot_take_and_goes_on) {
     CHECK(!s.conn.closed);
 }
 
+/* A frame that is brackets alone, nested tens of thousands deep, is still valid JSON: parsing it
+ * into a tree and tearing that tree down both recurse once per level, so the session parses it
+ * bounded — the tree never outgrows the stack — answers its invalid-message error, and goes on.
+ */
+TEST(a_deeply_nested_frame_is_refused_not_fatal) {
+    Stream s;
+    const std::string deep = std::string(20000, '[') + std::string(20000, ']');
+    {
+        std::lock_guard<std::mutex> lk(s.conn.m);
+        s.conn.in.push_back(deep);
+        s.conn.cv.notify_all();
+    }
+    CHECK(!s.conn.wait_for("error").is_null());
+    CHECK(!s.conn.closed);
+    s.config();
+    s.text("Still here.");
+    s.done();
+    REQUIRE(!s.conn.wait_for("session.done").is_null());
+}
+
 /* A sentence the generator refuses or fails is an error and an audio.done saying so; the next
  * sentence is spoken as usual. */
 TEST(a_failed_sentence_says_so_and_the_next_is_spoken) {

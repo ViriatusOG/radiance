@@ -86,6 +86,8 @@ struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 using namespace rad_fake;
 
 struct RadBuilder {
+    rad_buf    score_hidden = 0;   /* rad_declare_scores */
+    rad_weight score_table = 0;
     std::vector<RecWeight> weights;
     std::vector<RecBuf>    bufs;
     std::vector<RecOp>     ops;
@@ -121,6 +123,8 @@ struct RadBuilder {
     bool           drafter_shared = false;
     int            drafter_pos = -1;
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
+    /* A tree drafter's parents buffer (rad_drafter_tree), 0 for a chain. */
+    rad_buf        drafter_parents = 0;
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -289,6 +293,14 @@ extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     return RAD_OK;
 }
 
+/* Scored steps' hidden rows and head table, recorded for the tests. */
+extern "C" int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table) {
+    if (!b || !hidden || !table) return RAD_E_INVAL;
+    b->score_hidden = hidden;
+    b->score_table = table;
+    return RAD_OK;
+}
+
 /* An embedding program names its pooled output instead of logits; a program declares one. */
 extern "C" int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
     if (!b || !pooled || b->logits) return RAD_E_INVAL;
@@ -408,6 +420,11 @@ extern "C" int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
     b->drafter_pos = pos_offset;
     return RAD_OK;
 }
+extern "C" int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
+    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK || parents == 0) return RAD_E_STATE;
+    b->drafter_parents = parents;
+    return RAD_OK;
+}
 /* The core's chaining decision as the recorder answers it (it has no chaining backend): 0 unless a
  * test holds a ChainOn, to see where a plugin places work when launches chain. */
 static int g_chain_on = 0;
@@ -420,7 +437,9 @@ struct ChainOn {
 extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     const int64_t full = b ? (b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1) : 0;
     if (!b || b->drafter.kind != RAD_DRAFT_BLOCK) return RAD_E_STATE;
-    if (block >= full || block - (full - b->drafter.depth) < 1) return RAD_E_INVAL;
+    if (b->drafter_parents ? (block < 2 || block >= full)
+                           : (block >= full || block - (full - b->drafter.depth) < 1))
+        return RAD_E_INVAL;
     b->drafter_short = block;
     return RAD_OK;
 }

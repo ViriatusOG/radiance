@@ -433,6 +433,14 @@ static std::string lower_ascii(std::string s) {
     return s;
 }
 
+bool HttpRequest::is_cross_origin() const {
+    const std::string origin = header("Origin");
+    if (origin.empty()) return false;
+    const size_t at = origin.find("://");
+    const std::string auth = at == std::string::npos ? origin : origin.substr(at + 3);
+    return lower_ascii(auth) != lower_ascii(header("Host"));
+}
+
 /* The API key a browser's socket carries. A browser cannot set a header on a WebSocket, so
  * OpenAI's browser clients offer it as a subprotocol, `openai-insecure-api-key.<key>`, beside
  * `realtime`; the subprotocol chosen is never that one. Compared in constant time, as the header
@@ -486,6 +494,11 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     const size_t queued = (size_t)std::max<int64_t>(o.max_queued, 0);
     svr.new_task_queue = [nt, most, queued] { return new ConnectionPool((size_t)nt, most, queued); };
 
+    /* Every response, refusals and preflights included: no browser may second-guess the type.
+     * The JSON routes answer only the dashboard's own fetch, and a body sniffed as HTML would
+     * otherwise execute where it was only meant to be read. */
+    svr.set_default_headers({{"X-Content-Type-Options", "nosniff"}});
+
     /* An exception escaping a handler would close the connection with no body; answer 500 with
      * an error object instead. */
     svr.set_exception_handler([](const httplib::Request& req, httplib::Response& res,
@@ -494,7 +507,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         try { std::rethrow_exception(ep); }
         catch (const std::exception& e) { what = e.what(); }
         catch (...) {}
-        RAD_ERR("server: %s", what.c_str());
+        /* e.what() can carry request text (a path, a header): keep it off the log as an
+         * escape-sequence vector. */
+        RAD_ERR("server: %s", log_sanitize(what).c_str());
         res.status = 500;
         res.set_content(error_body(req.path, 500, "internal_server_error", what),
                         "application/json");
@@ -534,10 +549,17 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         /* The probe paths and the dashboard page are exempt. A load balancer cannot send a
          * bearer token, and a browser opening the page cannot send a header; the page holds no
          * data and sends the key on every data fetch. Everything else is guarded, including
-         * /tokenize, which vLLM leaves open (it only guards /v1). */
+         * /tokenize, which vLLM leaves open (it only guards /v1).
+         *
+         * The exemption follows the methods those paths actually answer — reads, plus the POST
+         * /ping of the health-check convention — so it cannot ride a method the router might
+         * one day put behind one of these paths. */
         const std::string& p = hreq.path;
-        if (!api_key.empty() && p != "/health" && p != "/v1/health" && p != "/ping" && p != "/" &&
-            p != "/dashboard") {
+        const std::string& m = hreq.method;
+        const bool reads  = m == "GET" || m == "HEAD";
+        const bool probe  = p == "/health" || p == "/v1/health" || p == "/" || p == "/dashboard";
+        const bool exempt = (reads && (probe || p == "/ping")) || (p == "/ping" && m == "POST");
+        if (!api_key.empty() && !exempt) {
             if (!key_ok(hreq)) {
                 /* Logged in Server::error_response's format; the gate answers before the router. */
                 RAD_INFO("req refused from %s:%d -> 401 authentication_error: invalid api key",
@@ -582,8 +604,22 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         hres.set_chunked_content_provider(
             st->content_type,
             [st](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                /* In the vendored 0.46 an exception escaping the provider unwinds the task queue
+                 * and aborts the process (upstream's 0.54.0 serve_guarded fixed exactly this);
+                 * until the lift moves, a throwing next() ends this response, not the server. */
                 std::string chunk;
-                bool more = st->next(chunk);
+                bool more = true;
+                try {
+                    more = st->next(chunk);
+                } catch (const std::exception& e) {
+                    RAD_ERR("server: stream provider threw: %s", log_sanitize(e.what()).c_str());
+                    sink.done();
+                    return true;
+                } catch (...) {
+                    RAD_ERR("server: stream provider threw a non-standard exception");
+                    sink.done();
+                    return true;
+                }
                 if (!chunk.empty()) {
                     if (!sink.write(chunk.data(), chunk.size())) return false;  /* peer gone */
                 }

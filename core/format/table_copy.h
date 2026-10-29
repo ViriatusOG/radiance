@@ -32,6 +32,11 @@ int  table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t
 int  table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
                      uint8_t* dst, std::string* why);
 
+/* The check table_copy_fill ends with, on its own: samples of [buf, buf + n) against [src, src + n)
+ * (the first and last 4 KiB and 64 spread between). RAD_OK, or RAD_E_IO with `why`. For a copy
+ * another process filled. */
+int  table_copy_check(const uint8_t* src, int64_t n, const uint8_t* buf, std::string* why);
+
 /* Unlock and unmap; a no-op for a copy never made. */
 void table_copy_free(TableCopy* c);
 

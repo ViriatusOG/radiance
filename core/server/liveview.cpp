@@ -260,15 +260,18 @@ std::string LiveView::render_line(const LiveSnapshot& s) const {
             o += " readmit=" + std::to_string(s.experts.readmits);
         }
     }
-    /* Link traffic by consumer (collective, mover, MoE GEMM streaming), cumulative so a `| tee`
-     * of these lines can be differenced into rates. */
+    /* Link traffic by consumer (collective, mover, MoE GEMM streaming, KV streaming), cumulative
+     * so a `| tee` of these lines can be differenced into rates. */
     if (s.link.present &&
-        (s.link.ar_bytes || s.link.h2d_bytes || s.link.d2h_bytes || s.link.stream_bytes)) {
+        (s.link.ar_bytes || s.link.h2d_bytes || s.link.d2h_bytes || s.link.stream_bytes ||
+         s.link.kv_streaming)) {
         o += " link ar=" + std::to_string(s.link.ar_bytes);
         o += " h2d=" + std::to_string(s.link.h2d_bytes);
         o += " d2h=" + std::to_string(s.link.d2h_bytes);
         if (s.link.stream_bytes) o += " stream=" + std::to_string(s.link.stream_bytes);
         if (s.link.ssd_bytes) o += " ssd=" + std::to_string(s.link.ssd_bytes);
+        /* Printed at zero when the switch is on: the zero is the measurement. */
+        if (s.link.kv_streaming) o += " kv=" + std::to_string(s.link.kv_stream_bytes);
     }
     o += "\n";
     return o;

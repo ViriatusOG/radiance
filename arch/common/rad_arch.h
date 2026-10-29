@@ -1410,16 +1410,18 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
 }
 
 /* `rope` declared for the geometry's rotary: M-RoPE's mode and sections when the model has them,
- * `mode` otherwise. */
+ * `mode` otherwise. `op` names the row: "rope" (every caller), or "rope_rows" for a model that
+ * wants the per-(token, pair) angles form at prefill row counts. */
 inline rad_op decl_rope(RadBuilder* b, const Geom& g, int64_t rows, int64_t head_dim,
-                        int64_t n_head, int64_t n_head_kv, int64_t rot, const char* mode) {
+                        int64_t n_head, int64_t n_head_kv, int64_t rot, const char* mode,
+                        const char* op = "rope") {
     const RadParam ps[] = { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", head_dim),
                             RAD_INT("n_head", n_head), RAD_INT("n_head_kv", n_head_kv),
                             RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
                             RAD_STR("mode", g.rope_mc ? g.rope_mode : mode),
                             RAD_INT("rotary_dim", rot), RAD_STR("sections", g.rope_sections) };
     const int n = (int)(sizeof ps / sizeof ps[0]) - (g.rope_mc ? 0 : 1);
-    return decl_rotary(b, g, "rope", ps, n, nullptr, 0);
+    return decl_rotary(b, g, op, ps, n, nullptr, 0);
 }
 
 /* How many of this step's sequences are decode rows, and where their tokens end.

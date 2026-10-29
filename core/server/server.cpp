@@ -406,13 +406,15 @@ static std::string from_peer(const std::string& peer) {
 HttpResponse Server::error_response(const ApiError& e, const std::string& peer, ApiShape shape) {
     metrics_.observe_http(e.status);
     /* Log every refusal with status, type, message and peer: 4xx at info (the client's doing),
-     * 5xx as a warning (ours). */
+     * 5xx as a warning (ours). The message can echo request text (a URL-decoded label, a field
+     * name), so the log copy is control-byte-clean; the wire copy keeps the bytes. */
+    const std::string msg = log_sanitize(e.message), typ = log_sanitize(e.type);
     if (e.status >= 500)
-        RAD_WARN("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, e.type.c_str(),
-                 e.message.c_str());
+        RAD_WARN("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, typ.c_str(),
+                 msg.c_str());
     else
-        RAD_INFO("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, e.type.c_str(),
-                 e.message.c_str());
+        RAD_INFO("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, typ.c_str(),
+                 msg.c_str());
     HttpResponse r = HttpResponse::json_body(
         e.status, shape == ApiShape::Anthropic ? anthropic_error_body(e) : e.dump());
     if (e.status == 429) r.set_header("Retry-After", std::to_string(opt_.retry_after_s));
@@ -1791,6 +1793,7 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
     }
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(json{
+        { "model", opt_.model_id },
         { "answers", std::move(answers) },
         { "usage", { { "input_tokens", r.input_tokens }, { "output_tokens", 0 } } } }));
 }
@@ -1969,6 +1972,7 @@ HttpResponse Server::handle_mica(const HttpRequest& req) {
     if (mica_answers(r, dist, &answers, &err) < 0) return error_response(err, req.peer);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(json{
+        { "model", opt_.model_id },
         { "answers", std::move(answers) },
         { "usage", { { "input_tokens", input_tokens }, { "output_tokens", 0 } } } }));
 }
@@ -2056,6 +2060,7 @@ HttpResponse Server::handle_clef(const HttpRequest& req) {
     release(1);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(json{
+        { "model", opt_.model_id },
         { "answers", std::move(answers) },
         { "usage", { { "input_tokens", (int64_t)r.tokens.size() }, { "output_tokens", 0 } } } }));
 }
@@ -2150,7 +2155,8 @@ HttpResponse Server::handle_laya(const HttpRequest& req) {
     retire(gens);
     release(n);
     metrics_.observe_http(200);
-    return HttpResponse::json_body(200, json_dump(json{ { "answers", std::move(answers) },
+    return HttpResponse::json_body(200, json_dump(json{ { "model", opt_.model_id },
+                                                        { "answers", std::move(answers) },
                                                         { "usage", laya_usage(r) } }));
 }
 
@@ -2206,7 +2212,6 @@ HttpResponse Server::handle_loras(const HttpRequest& req) {
 }
 
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
-    using json = nlohmann::json;
     auto fail = [&](int status, const char* type, const std::string& msg) {
         ApiError e;
         e.status = status;
@@ -2217,12 +2222,18 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     if (!opt_.lora_load || !opt_.lora_unload)
         return fail(404, "not_found_error", "this server was started without runtime LoRA (--lora or "
                                             "--max-loras)");
-    if (opt_.api_key.empty() && !req.peer_is_loopback())
+    if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin()))
+        /* A cross-origin browser counts as neither loopback nor local: the victim's own browser
+         * is loopback to this port, and that is exactly how a hostile page would reach here. */
         return fail(403, "permission_error", "loading an adapter reads a path on this machine, and a "
                                              "server started without --api-key takes it only from a "
                                              "loopback client");
-    const json j = json::parse(req.body, nullptr, false);
-    if (j.is_discarded() || !j.is_object() || !j.contains("lora_name") || !j["lora_name"].is_string())
+    /* Bounded like a generation body: this parses client text the same way, and a deep bracket
+     * nest would overflow this worker's stack when the tree is torn down. */
+    bool over = false, deep = false;
+    const json j = parse_json_bounded(req.body, 0, &over, &deep);
+    if (j.is_discarded() || over || deep || !j.is_object() || !j.contains("lora_name") ||
+        !j["lora_name"].is_string())
         return fail(400, "invalid_request_error", "the body must be a JSON object with lora_name");
     const std::string name = j["lora_name"].get<std::string>();
     if (name.empty() || name == opt_.model_id)

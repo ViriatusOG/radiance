@@ -358,9 +358,9 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
 
     std::string s;
     s += "# radiance kernel libraries\n\n";
-    /* The header may claim only what this pass measured. The counts are the same ones the
-     * Rows nothing ran section prints from this data below; the sentence claiming every
-     * kernel ran is true only when no declared row was left unreached. */
+    /* The header claims only what this pass measured: its counts are the ones the *Rows nothing
+     * ran* section prints below, and "every kernel ran" only when no declared row went
+     * unreached. */
     size_t declared_rows = 0, reached_rows = 0;
     for (const LibRow& l : libs) { declared_rows += l.rows.size(); reached_rows += l.ran.size(); }
     const bool all_ran = reached_rows == declared_rows;

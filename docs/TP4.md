@@ -9,14 +9,13 @@ All numbers: paired within-session windows, bar ≥0.5% + sign test, geometry
 `--prefill-span 2 --tp-wire wht6 --placement all_vram` iq4r MoE unless stated.
 Every "dead" row is a *measured* dead — the mechanism, not a guess.
 
-Shorthand used in the table and the prose (glossed once, used everywhere):
-`pp` prefill; `c1/c2/c8/c16` concurrency (live streams) 1/2/8/16; `M` rows in a collective
-(batch tokens at a step, rows in a MoE launch); `I` `--checkpoint-interval`; `T` tokens
-(`T<=25` at most 25 tokens); `ti8` the int8 peer wire (`--tp-wire wht6`'s coding); `FK` the
-MoE fast band; `W4` the 4-bit weight format; `iq4r` the shipped MoE quantisation; `hc_write`
-the fused all-reduce + residual-write row; `pp64K` a 64 K-token prefill; `QSA` the sparse
-indexer (docs/QSA.md); `L0..L3` kill levels, defined under *Kill levels*; `W#`/`R#` the
-experiment rows of this table.
+Shorthand: `pp` prefill; `c1/c2/c8/c16` concurrency (live streams) 1/2/8/16; `M` rows in a
+collective (batch tokens at a step, rows in a MoE launch); `I` `--checkpoint-interval`; `T` tokens
+(`T<=25` at most 25 tokens); `ti8` the int8 peer wire (`--tp-wire wht6`'s coding); `FK` the MoE fast
+band; `W4` the 4-bit weight format; `iq4r` the shipped MoE quantisation; `hc_write` the fused
+all-reduce + residual-write row; `pp64K` a 64 K-token prefill; `QSA` the sparse indexer
+(docs/QSA.md); `L0..L3` kill levels, defined under *Kill levels*; `W#`/`R#` the experiment rows of
+this table.
 
 ## The table
 

@@ -7,69 +7,61 @@
  *
  * ---- the format, and the fold it gives ----------------------------------------------------------------
  *
- * OCP MXFP4 stores a weight row as e2m1 codes, two per byte, element 2j in the LOW nibble of
- * byte j, with one e8m0 exponent per 32 K elements: a u8 plane [N, K/32] behind the u8 codes
- * plane [N, K/2]. e8m0 value e means the factor 2^(e-127); e = 0 and e = 255 are reserved
- * (zero, NaN) and a plane carrying either is refused, the reference's answer for the same
- * bytes.
+ * OCP MXFP4 stores a weight row as e2m1 codes, two per byte, element 2j in the low nibble of
+ * byte j, with one e8m0 exponent per 32 K elements: a u8 plane [N, K/32] beside the u8 codes
+ * plane [N, K/2]. e8m0 value e means the factor 2^(e-127); e = 0 and e = 255 are reserved (zero,
+ * NaN), and a plane carrying either is refused, as the reference does.
  *
- * The fold this kernel runs, per 32-block:
+ * Per 32-block:
  *
- *   1. the code for element k is e4m3(mag) at d = 0 -- the e2m1 magnitude is EXACT in e4m3,
- *      because all eight magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are e4m3 grid points. The
- *      unpack is a 4-bit lookup on the nibble through the eight e4m3 magnitude bytes
- *      {0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C}, the sign bit of the code on the
- *      sign bit of the byte.
- *   2. the code products run on dot2_f16x2. A product is at most 6 x 448 = 2688, in f16's
- *      range (65504), and an eight-term partial is under 21504, in f16's grid: the dot's
- *      only rounding is the instruction's own.
- *   3. the per-block factor 2^(e-127) is applied in the epilogue: the 32-block partial, an
- *      f32, is multiplied by the factor -- a power of two, exact in f32 short of the
- *      under/overflow edge -- and added to the running f32 sum. One multiply and one add per
- *      block per output element, no per-element scale traffic.
+ *   1. the code for element k becomes e4m3(mag): all eight e2m1 magnitudes
+ *      {0, .5, 1, 1.5, 2, 3, 4, 6} are e4m3 grid points, so this is exact. The unpack is a
+ *      4-bit lookup on the nibble through the e4m3 bytes {0x00, 0x30, 0x38, 0x3C, 0x40, 0x44,
+ *      0x48, 0x4C}, with the code's sign bit moved to the byte's sign bit.
+ *   2. the products run on dot2_f16x2. A code product is at most 6 x 448 = 2688, inside f16's
+ *      range (65504), and an eight-term partial is under 21504.
+ *   3. the block factor 2^(e-127) is applied in the epilogue: the f32 32-block partial is
+ *      multiplied by it (a power of two, exact short of under/overflow) and added to the running
+ *      f32 sum. One multiply and one add per block per output, no per-element scale traffic.
  *   4. the store narrows once, to bf16.
  *
- * The e2m1 magnitude is exact, the products are exact, and the two roundings a block sees are
- * the dot's fused rounding and the store: the row's distance from the reference is the store's
- * ulp, nothing else.
+ * The roundings are the activation-scale fold at staging (fold_pair, f16), the dot's fused
+ * rounding, and the store.
  *
- * The RDNA4 sibling folds the e8 into the table through a d-indexed row, because its WMMA
- * path needs one scale per row; this library's dot2 path folds per block in the epilogue, and
- * the table is the eight fixed magnitude bytes, no index.
+ * The RDNA4 sibling folds the e8 into a d-indexed table row because its WMMA path needs one scale
+ * per row; the dot2 path here applies it per block in the epilogue, so the table is the eight
+ * fixed magnitude bytes.
  *
  * ---- the tiled row (M >= 17) -------------------------------------------------------------------------
  *
- * The 128x128 tile, 8x8 f32 accumulators a lane, k ascending in 32-code chunks. The chunk IS
- * the OCP 32-block: the lane's e8 bytes for its eight tile columns enter as one byte per row
- * at staging, through LDS, and the chunk's partials flush at the chunk's end:
+ * A 128x128 tile, 8x8 f32 accumulators per lane, k ascending in 32-code chunks. A chunk is one OCP
+ * 32-block: the e8 byte of each tile column is staged through LDS, and the chunk's partials flush
+ * at its end:
  *
  *     total[i][j] += acc[i][j] * 2^(e8[n_c + j][blk] - 127);  acc[i][j] = 0;
  *
  * `acc` is the 32-block partial, `total` the running f32 sum over blocks in ascending k. The
- * activation stages exactly as the fp8a8 tiled row's: E4M3 through the LDS table, the f32
- * scale per (row, 128 of K) folded at staging; 32 divides 128, so a chunk sits inside one
- * group and never straddles one.
+ * activation stages as in the fp8a8 tiled row: E4M3 through the LDS table, with the f32 scale per
+ * (row, 128 of K) folded in at staging. 32 divides 128, so a chunk never straddles a group.
  *
  * ---- the m16 row (M <= 16) ----------------------------------------------------------------------------
  *
- * One wave per weight row, the w2a8 row's shape: lane l owns row m = l % MT and k-lane
- * kl = l / MT, a chunk is CHUNK = 2048/MT codes, and every lane takes 64 of them -- two OCP
- * 32-blocks, the lane's blocks 2*kl and 2*kl+1 of the chunk. Each lane sums its two blocks in
- * k, scales each by the block's e8, and the group's four block terms are formed in ascending
- * block order by one shfl_xor pair and written to LDS, where the kl == 0 lane adds them to the
- * accumulator in ascending block order: the reference's ascending-k accumulation, at the
- * 32-block granularity the format fixes.
+ * One wave per weight row, as in the w2a8 row: lane l owns row m = l % MT and k-lane kl = l / MT,
+ * a chunk is CHUNK = 2048/MT codes, and each lane takes 64 of them, the chunk's 32-blocks 2*kl and
+ * 2*kl+1. Each lane sums its two blocks in k and scales each by its e8; one shfl_xor pair puts the
+ * group's four block terms in ascending order in LDS, and the kl == 0 lane adds them to the
+ * accumulator in that order. This is the reference's ascending-k accumulation at the 32-block
+ * granularity the format fixes.
  *
  * ---- refusals -----------------------------------------------------------------------------------------
  *
- * Every structural violation is a refusal, in the shim: the dtypes of all seven operands (the
- * codes as fp4_e2m1 or raw bytes, the e8 plane as e8m0 or u8, `b_ref` the e8 plane again and
- * ignored), K % 32 and K % 128, the codes plane's extent and 16-byte row alignment, the e8
- * plane's [N, K/32] extent, the pitches, the band's M. A reserved e8 (0, 255) is a data
- * violation, and it is refused where the data is readable: the shim scans the e8 plane once
- * per (pointer, size) pair, on a plane the host can see, and answers E_INVAL. A plane the
- * host cannot see is not scanned, and the kernel's e8 guard -- reserved values take the scale
- * zero -- keeps its output finite.
+ * The shim refuses every structural violation: the dtypes of all seven operands (codes as
+ * fp4_e2m1 or raw bytes, the e8 plane as e8m0 or u8, `b_ref` the e8 plane again, ignored), K % 32
+ * and K % 128, the codes plane's extent and 16-byte row alignment, the e8 plane's [N, K/32]
+ * extent, the pitches and the band's M. A reserved e8 (0, 255) is refused with E_INVAL where the
+ * host can read the plane: the shim scans it once per (pointer, size) pair. A plane the host
+ * cannot see is not scanned; the kernel gives reserved values the scale zero, so the output stays
+ * finite.
  */
 
 #include <hip/hip_runtime.h>
@@ -90,26 +82,24 @@ namespace {
 
 constexpr int kBlockThreads = 256;
 constexpr int kWaves = 8;
-constexpr int kTM = 128;                     /* rows a tile */
-constexpr int kTN = 128;                     /* columns a tile */
-constexpr int kKC = 32;                      /* k a chunk: one OCP 32-block */
+constexpr int kTM = 128;                     /* rows per tile */
+constexpr int kTN = 128;                     /* columns per tile */
+constexpr int kKC = 32;                      /* k per chunk: one OCP 32-block */
 constexpr int kMX = 32;                      /* K per e8m0 exponent: the OCP MX block */
 constexpr int kGroup = 128;                  /* the activation's scale group */
 constexpr int kMMin = 17;                    /* the tiled row's floor: the m16 row's ceiling plus one */
 constexpr int kMTMax = 16;
 constexpr int kTileQuads = 512;              /* MT * CHUNK/4, constant over MT: 2048 codes, 4 KiB of f16 */
 
-/* The eight e2m1 magnitudes, as e4m3 bytes: 0, .5, 1, 1.5 in the low word, 2, 3, 4, 6 in the
- * high. Every one is exact, which is the whole point of the fold. */
+/* The eight e2m1 magnitudes as e4m3 bytes, each exact: 0, .5, 1, 1.5 in the low word, 2, 3, 4, 6
+ * in the high. */
 #define R3D_MXFP4_MAG_LO 0x3c383000u
 #define R3D_MXFP4_MAG_HI 0x4c484440u
 
 /* Eight e2m1 codes (four packed bytes, element 2j in the low nibble of byte j) as eight e4m3
- * bytes in k order (word 0 = elements 0..3, word 1 = 4..7). Even and odd nibbles each run
- * through the magnitude bytes by a v_perm_b32 on the 3-bit magnitude, bit 3 of the code shifts
- * onto the e4m3 sign, and two more v_perm_b32 interleave the halves. The table is the fixed
- * d = 0 row: no index, because the per-block factor is applied in the epilogue, not folded
- * here. */
+ * bytes in k order (word 0 = elements 0..3, word 1 = 4..7). Even and odd nibbles each go through
+ * the magnitude bytes with a v_perm_b32 on the 3-bit magnitude, bit 3 of the code shifts onto the
+ * e4m3 sign, and two more v_perm_b32 interleave the halves. */
 __device__ __forceinline__ void mxfp4_unpack8(uint32_t wv, uint32_t* lo, uint32_t* hi)
 {
     const uint32_t ev = wv & 0x0F0F0F0Fu;              /* low nibble of each byte -> even elements */
@@ -122,9 +112,9 @@ __device__ __forceinline__ void mxfp4_unpack8(uint32_t wv, uint32_t* lo, uint32_
     *hi = __builtin_amdgcn_perm(bo, be, 0x07030602u);
 }
 
-/* The e8m0 factor: 2^(e-127). The reserved values take the scale zero -- e = 0 is the
- * format's zero, e = 255 its NaN -- so a plane that carries one computes a zero block and
- * stays finite; the refusal for such a plane is the shim's, where the bytes are readable. */
+/* The e8m0 factor: 2^(e-127). The reserved values (e = 0 the format's zero, e = 255 its NaN) take
+ * the scale zero, so such a block computes zero and stays finite; the shim refuses such a plane
+ * where it can read it. */
 __device__ __forceinline__ float e8_scale(uint8_t e)
 {
     return (e == 0 || e == 255) ? 0.0f : ldexpf(1.0f, (int)e - 127);
@@ -138,7 +128,7 @@ __device__ __forceinline__ void e4m3x4_to_f16x2(const uint16_t* tbl, uint32_t w,
     o[1] = (uint32_t)tbl[(w >> 16) & 0xffu] | ((uint32_t)tbl[(w >> 24) & 0xffu] << 16);
 }
 
-/* code * scale, in f16 arithmetic: one v_mul_f16, round to nearest, subnormals kept. NOT
+/* code * scale, in f16 arithmetic: one v_mul_f16, round to nearest, subnormals kept. Not
  * f16x2_pack, which truncates. */
 __device__ __forceinline__ uint32_t fold_pair(uint32_t w, float sc)
 {
@@ -186,13 +176,11 @@ struct MxWQ {
 };
 
 /*
- * The tile: 128 rows x 128 columns of y, 256 threads, eight waves, eight outputs a side a
- * lane -- 64 f32 accumulators a lane for the 32-block partials, 64 more for the running
- * sum, grid (N/kTN) x ceil(M/kTM). k is walked in chunks of 32; the activation arrives as
- * E4M3 codes, decodes through the block's table and leaves staging as f16 with its scale
- * folded in, and the weight arrives as e2m1 nibbles, unpacks to e4m3 and leaves staging as
- * f16 UNSIGNED by the block: its scale is the e8, and the e8 is applied at the chunk's end,
- * where the chunk's partials meet it.
+ * The tile: 128 rows x 128 columns of y, 256 threads, eight waves, 8x8 outputs per lane (64 f32
+ * accumulators for the 32-block partials and 64 for the running sum), grid (N/kTN) x ceil(M/kTM).
+ * k is walked in chunks of 32. The activation's E4M3 codes decode through the block's table and
+ * are staged as f16 with their scale folded in. The weight's e2m1 nibbles unpack to e4m3 and are
+ * staged as f16 without the block scale, which is applied to the partials at the chunk's end.
  */
 template <int NT>
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(2)
@@ -242,12 +230,12 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
             const int n = n0 + nn;
             uint4 st[4] = { make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0),
                             make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0) };
-            /* The e8 for the column, written even past N: a row the tile does not serve keeps
-             * the scale zero, so the flush multiplies a staged zero by a defined value. */
+            /* The column's e8, written even past N (as zero), so the flush multiplies a staged
+             * zero by a defined value. */
             sE8[nn] = (n < N) ? h.e8[(long long)n * h.e8_row + blk] : 0;
             if (n < N) {
-                /* 32 codes, 16 bytes, one load: k0 is a multiple of 32, the row a multiple of
-                 * 64 bytes, so the load is aligned. */
+                /* 32 codes, 16 bytes, one load, aligned because k0 is a multiple of 32 and the
+                 * row pitch a multiple of 16 bytes. */
                 uint4 cv;
                 __builtin_memcpy(&cv, h.codes + (long long)n * h.code_row + (k0 >> 1), 16);
                 const uint32_t d[4] = { cv.x, cv.y, cv.z, cv.w };
@@ -269,9 +257,8 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
         }
         __syncthreads();
 
-        /* The chunk's e8 for the lane's eight columns, held in registers: the flush reads it
-         * and nothing else does. The index is tile-local -- sE8 is this tile's 128 rows, and a
-         * global column index reads past it on every tile past the first. */
+        /* The chunk's e8 for the lane's eight columns, in registers for the flush. sE8 holds
+         * this tile's 128 columns, so the index is tile-local. */
         float e8s[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) e8s[j] = e8_scale(sE8[cg * 8 + j]);
@@ -290,8 +277,8 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
 #pragma unroll
                 for (int j = 0; j < 8; ++j) acc[i][j] = dot2_f16x2(af[i], bf[j], acc[i][j]);
         }
-        /* The 32-block boundary: the partial scales by the block's factor, the sum keeps the
-         * blocks in ascending k, and the partial resets for the next block. */
+        /* The 32-block boundary: scale the partial by the block's factor, add it to the running
+         * sum in ascending k, reset the partial. */
 #pragma unroll
         for (int i = 0; i < 8; ++i)
 #pragma unroll
@@ -325,9 +312,9 @@ mxfp4a8_tiled_kernel(const uint8_t* __restrict__ a, ActQ aq, MxWQ h, void* __res
 
 /* ================================================================== the m16 row */
 
-/* The LDS swizzle, at the granularity the tile is touched: a quad of four codes, two dwords,
- * moved as one 8-byte word. Quads are numbered q = r*(CHUNK/4) + c, and p_ix XORs q's low four
- * bits with bits 4..7 -- a bijection on 16-quad groups. */
+/* The LDS swizzle, at the tile's access granularity: a quad of four codes (two dwords) moved as one
+ * 8-byte word. Quads are numbered q = r*(CHUNK/4) + c; p_ix XORs q's low four bits with bits 4..7,
+ * a bijection on 16-quad groups. */
 __device__ __forceinline__ int p_ix(int q) { return q ^ ((q >> 4) & 15); }
 
 template <int MT>
@@ -339,7 +326,7 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
 {
     constexpr int KL = kWave / MT;                    /* k-lanes per activation row */
     constexpr int CL = 64;                            /* codes per lane per chunk: two 32-blocks */
-    constexpr int BPR = (2048 / MT) / kMX;            /* 32-blocks a row of the chunk: 64/MT */
+    constexpr int BPR = (2048 / MT) / kMX;            /* 32-blocks per chunk row: 64/MT */
 
     __shared__ __align__(16) uint16_t sTbl[R3D_E4M3_TBL];
     __shared__ __align__(16) uint2 sA[kTileQuads];    /* MT rows x CHUNK/2 f16, swizzled */
@@ -361,8 +348,8 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
     for (int ch = 0; ch < nchunk; ++ch) {
         __syncthreads();
         /* The chunk's activation rows, decoded and scaled on the way in. Cells are four codes:
-         * MT * CHUNK/4 = 512 of them at every MT, two per thread. The scale is per (row, 128
-         * of K); a cell's four codes sit in one group, so one scalar a cell. */
+         * MT * CHUNK/4 = 512 at every MT, two per thread. A cell's four codes sit in one 128-wide
+         * scale group, so one scale per cell. */
         for (int i = threadIdx.x; i < MT * (chunk >> 2); i += kBlockThreads) {
             const int r = i / (chunk >> 2), c = i % (chunk >> 2);
             uint32_t lo = 0, hi = 0;
@@ -406,8 +393,8 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
             }
 
             /* The lane's two blocks, scaled by their e8. The pair (kl, kl^1) owns the group's
-             * four blocks -- kl even the lower two, kl odd the upper two -- so one exchange
-             * forms the group in ascending block order. */
+             * four blocks (kl even the lower two, kl odd the upper two), so one exchange puts
+             * them in ascending block order. */
             const int blk0 = ch * (chunk / kMX) + 2 * kl;
             const float q0f = p0 * e8_scale(e8[(long long)n * e8_row + blk0]);
             const float q1f = p1 * e8_scale(e8[(long long)n * e8_row + blk0 + 1]);
@@ -419,8 +406,8 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
             const float t2 = lo ? o0f : q0f;
             const float t3 = lo ? o1f : q1f;
 
-            /* One slot per (row, 32-block-in-chunk): MT*BPR is 64 at every MT. The group's two
-             * half-lanes write the same four values. */
+            /* One slot per (row, 32-block-in-chunk); MT*BPR is 64 at every MT. Both half-lanes
+             * of a group write the same four values. */
             const int j = kl >> 1;
             const int bb = warp * 64 + m * BPR + 4 * j;
             sB[bb + 0] = t0;
@@ -429,9 +416,8 @@ gemm_mxfp4a8_m16_kernel(const uint8_t* __restrict__ a, const float* __restrict__
             sB[bb + 3] = t3;
         }
         __syncthreads();
-        /* The chunk's block terms, in ascending block order, into the lane that owns the row's
-         * answer: the reference walks k in ascending order and f32 adds are not associative, so
-         * the order is part of the answer, not a detail. */
+        /* The chunk's block terms in ascending block order, into the row's owner lane: f32 adds
+         * are not associative and the reference walks k ascending. */
         if (live && kl == 0) {
 #pragma unroll
             for (int bl = 0; bl < BPR; ++bl)
@@ -467,7 +453,7 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_m16(long a, long a_scale, long b, long b_sc
     if (!a_ld) a_ld = K;
     if (!y_ld) y_ld = N;
     if (a_ld < K) return -3;
-    if (a_ld % 4) return -3;                  /* four codes a dword, staged whole */
+    if (a_ld % 4) return -3;                  /* four codes per dword, staged whole */
     if (y_ld < N) return -3;
     if (!e8_row) e8_row = K / kMX;
     if (e8_row < K / kMX) return -3;
@@ -548,17 +534,16 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_tiled(long a, long a_scale, long b_codes, l
 
 /* ================================================================== the shims
  *
- * gemm_nt_q's slots, as the two shims take them: 0 a (E4M3), 1 a_scale (f32, one per (row,
- * 128 of K)), 2 b (the e2m1 codes -- fp4_e2m1, or the raw u8 bytes, two a byte), 3 b_scale (the
- * e8 plane, e8m0 or u8, one per 32 of K), 4 y (bf16), 5 a_sum (absent: symmetric), 6 b_ref (the
- * e8 plane again, accepted and ignored).
+ * gemm_nt_q's slots: 0 a (E4M3), 1 a_scale (f32, one per (row, 128 of K)), 2 b (the e2m1 codes,
+ * as fp4_e2m1 or raw u8 bytes, two per byte), 3 b_scale (the e8 plane, e8m0 or u8, one per 32 of
+ * K), 4 y (bf16), 5 a_sum (absent: symmetric), 6 b_ref (the e8 plane again, accepted and
+ * ignored).
  */
 
-/* The reserved-e8 scan: one pass per (pointer, size) pair for the process's life. The plane is
- * the weight's, its address stable across the launches a pass makes, and a second scan of the
- * same bytes buys nothing. The scan needs the host to see the plane -- the mapped tier's form,
- * the placement the row's operands take; a plane the host cannot see is not scanned, and the
- * kernel's e8 guard carries the reserved values there. */
+/* The reserved-e8 scan, once per (pointer, size) pair for the process's life: the plane is a
+ * weight at a stable address. The host must be able to read the plane (the mapped tier's
+ * placement); a plane it cannot see is not scanned, and the kernel's e8 guard handles reserved
+ * values there. */
 struct E8ScanKey { const void* p; long long n; };
 static bool e8_scan_once(const void* p, long long n)
 {
@@ -591,20 +576,20 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_m16(const RadArgs* a, RadStream s)
     if (!r3d_p(A) || !r3d_p(AS) || !r3d_p(B) || !r3d_p(BS) || !r3d_p(Y))
         return R3D_NO(RAD_E_INVAL);
     if (r3d_has(ASUM)) return R3D_NO(RAD_E_DTYPE);      /* symmetric: no zero point */
-    /* `b_ref` is the reference's per-row exponent, derived from `b_scale`: it changes no
-     * product, so beside an e2m1 weight its dtype is checked and its value ignored. */
+    /* `b_ref` is the reference's per-row exponent, derived from `b_scale`. It changes no product,
+     * so with an e2m1 weight only its dtype is checked. */
     if (r3d_has(BREF) && BREF->dtype != RAD_E8M0 && BREF->dtype != RAD_U8)
         return R3D_NO(RAD_E_DTYPE);
 
     if (!r3d_is_e4m3(A)) return R3D_NO(RAD_E_DTYPE);
     if (!r3d_is_f32(AS)) return R3D_NO(RAD_E_DTYPE);
-    if (B->dtype != RAD_FP4E2M1 && B->dtype != RAD_U8) return R3D_NO(RAD_E_DTYPE);  /* e2m1, two a byte */
+    if (B->dtype != RAD_FP4E2M1 && B->dtype != RAD_U8) return R3D_NO(RAD_E_DTYPE);  /* e2m1, 2 per byte */
     if (BS->dtype != RAD_E8M0 && BS->dtype != RAD_U8) return R3D_NO(RAD_E_DTYPE);   /* e8m0, one per 32 */
     if (!r3d_is_bf16(Y)) return R3D_NO(RAD_E_DTYPE);
 
     const long long N = r3d_geti_or(a, "N", 0), K = r3d_geti_or(a, "K", 0);
-    /* The `group` key names the band; the blocks the kernel reads -- 128 for the activation's
-     * scale, 32 for the weight's e8 -- are the format's, so the key is not checked. */
+    /* The `group` key names the band; the kernel's blocks (128 for the activation scale, 32 for
+     * the weight's e8) are fixed by the format, so the key is not checked. */
     if (N < 1 || K < 1) return R3D_NO(RAD_E_SHAPE);
     if (K % kGroup || K % kMX) return R3D_NO(RAD_E_SHAPE);
 
@@ -669,14 +654,13 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
     if (BS->dtype != RAD_E8M0 && BS->dtype != RAD_U8) return R3D_NO(RAD_E_DTYPE);
     if (!r3d_is_bf16(Y)) return R3D_NO(RAD_E_DTYPE);
 
-    /* The band's keys, from the schema: N, K, group. The codes plane is [N, K/2], so a band that
-     * names no N or K is answered by the operand, with the /2 restored. */
+    /* The band's keys from the schema: N, K, group. A band without N or K takes them from the
+     * codes plane. */
     const long long M_band = r3d_geti_or(a, "M", 0);
     const long long N0 = r3d_geti_or(a, "N", 0), K0 = r3d_geti_or(a, "K", 0);
     const long long N = N0 > 0 ? N0 : r3d_dim(B, 0);
-    /* A band that names no K is answered by the codes plane: [N, K] of fp4_e2m1, [N, K/2] of
-     * raw bytes. The `group` key names the band; the blocks the kernel reads are the
-     * format's, so the key is not checked. */
+    /* Without a K key, K comes from the codes plane: [N, K] of fp4_e2m1, [N, K/2] of raw bytes.
+     * The `group` key is not checked (see the m16 shim). */
     const long long K = K0 > 0 ? K0
                     : (B->dtype == RAD_FP4E2M1 ? r3d_dim(B, 1) : 2 * r3d_dim(B, 1));
     if (N <= 0 || K <= 0) return R3D_NO(RAD_E_SHAPE);
@@ -686,10 +670,8 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
     long long a_rows = 0;
     const long long ap = r3d_rows_pitch(A, K, &a_rows);
     if (ap < K || a_rows < 1) return R3D_NO(RAD_E_STRIDE);
-    if (ap % 8) return R3D_NO(RAD_E_STRIDE);          /* 8-byte code loads, 8 codes a lane */
-    /* THE STEP'S M IS THE ACTIVATION'S ROW COUNT. The band key M is an upper bound: a step
-     * shorter than the band is the step the engine runs, and the key keeps its job as the
-     * ceiling the plan promised not to exceed. */
+    if (ap % 8) return R3D_NO(RAD_E_STRIDE);          /* 8-byte code loads, 8 codes per lane */
+    /* The step's M is the activation's row count; the band key M is only the upper bound. */
     const long long M = a_rows;
     if (M_band > 0 && M > M_band) return R3D_NO(RAD_E_SHAPE);
     if (M < kMMin) return R3D_NO(RAD_E_UNSUPPORTED);   /* the m16 row serves M <= 16 */
@@ -706,7 +688,7 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s)
 
     const long long as_p = r3d_row_pitch(AS);
     if (as_p < K / kGroup) return R3D_NO(RAD_E_STRIDE);
-    /* The codes plane's pitch, in bytes: fp4_e2m1 counts elements, two to a byte. */
+    /* The codes plane's pitch in bytes: fp4_e2m1 counts elements, two per byte. */
     const long long cp0 = r3d_row_pitch(B);
     const long long cp = B->dtype == RAD_FP4E2M1 ? cp0 / 2 : cp0;
     if (cp < K / 2) return R3D_NO(RAD_E_STRIDE);

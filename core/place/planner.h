@@ -230,9 +230,8 @@ public:
     int64_t tower_host_bytes = 0;
     int64_t draft_host_bytes = 0;
     int64_t forced_host_used = 0;
-    /* --expert-profile and --expert-pin-top: the profile's units the planner pinned resident and the
-     * share threshold it derived from the fraction. Reported so the window can see what the decode
-     * set costs the card. */
+    /* --expert-profile and --expert-pin-top: the units the planner pinned resident, the profiled
+     * units, and the share threshold it derived from the fraction (Plan::report). */
     int64_t pinned_units = 0;
     int64_t profile_units = 0;
     float   pin_threshold = 0.0f;

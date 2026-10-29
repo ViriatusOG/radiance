@@ -820,3 +820,117 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------- dflash_tree */
+/* `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w -> `tokens`, `parents`
+ *
+ * dflash_select's lattice and edge scores, grown into a tree of `nodes` nodes instead of walked
+ * into one path (rad_drafter_tree). Node 0 is the anchor, at lattice position -1 with log
+ * probability 0. A node at position l with token t has a child for every valid candidate c at
+ * position l + 1, scored as dflash_select scores it after t, with log probability its parent's
+ * plus log_softmax(score / temp)[c] over the valid candidates there. Best-first: each round
+ * selects the not-yet-selected child of any selected node with the largest log probability (ties
+ * to the one pushed first: lower parent, then lower c), until `nodes` are selected. Selected node
+ * j (1-based, in selection order, so a parent always precedes its child) is written as
+ * tokens[j-1] and parents[j-1], the parent's node index (0 the anchor). A frontier that runs dry
+ * (every candidate invalid) pads with token 0 under the last node, which the verify rejects.
+ *
+ * In f32: score as dflash_select; x = score / temp; m = max x; lse = m + log(sum exp(x - m)) over
+ * the valid candidates, summed in c order; child = parent + (x - lse). */
+int ref_dflash_tree(const RadArgs* a, RadStream) {
+    if (a->n_t < 8) return RAD_E_INVAL;
+    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
+    const RadTensor *pred = &a->t[4], *succ = &a->t[5], *out = &a->t[6], *par = &a->t[7];
+    const RadTensor* hp = t_in(a, 2);
+    if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data ||
+        !par->data)
+        return RAD_E_INVAL;
+
+    const int64_t steps = p_int(a, "steps", 0);
+    const int64_t K     = p_int(a, "top_k", 0);
+    const int64_t M     = steps > 0 && K > 0
+                        ? band_rows(numel(cand) / (steps * K), p_int(a, "M", 0)) : 0;
+    const int64_t R     = p_int(a, "rank", pred->rank >= 2 ? pred->shape[pred->rank - 1] : 0);
+    const int64_t nv    = p_int(a, "n_vocab", pred->rank >= 2 ? pred->shape[pred->rank - 2] : 0);
+    const int64_t astr  = p_int(a, "anchor_stride", 1);
+    const int64_t N     = p_int(a, "nodes", steps);
+    const float   temp  = p_f32(a, "temp", 1.0f);
+    if (M <= 0 || steps <= 0 || K <= 0 || R <= 0 || nv <= 0 || astr <= 0 || N <= 0 ||
+        !(temp > 0.0f))
+        return RAD_E_SHAPE;
+    if (numel(un) < M * steps * K) return RAD_E_SHAPE;
+    if (numel(anc) < (M - 1) * astr + 1 || numel(out) < M * N || numel(par) < M * N)
+        return RAD_E_SHAPE;
+    if (numel(pred) < nv * R || numel(succ) < nv * R) return RAD_E_SHAPE;
+    if (hp && numel(hp) < M * steps * R) return RAD_E_SHAPE;
+
+    const int64_t cs = laststride(cand), us = laststride(un), os = laststride(out);
+    const int64_t pps = laststride(par);
+    const int64_t ps = laststride(pred), sxs = laststride(succ);
+    const int64_t hs = hp ? laststride(hp) : 1;
+
+    REF_PAR_FOR(M * N * K * R)
+    for (int64_t m = 0; m < M; ++m) {
+        struct Node { int64_t l, tok, parent; float lp; };
+        struct Kid  { float lp; int64_t parent, l, tok; bool taken; };
+        std::vector<Node> sel;     /* selected, node 0 the anchor */
+        std::vector<Kid>  front;   /* every child pushed so far, in push order */
+        std::vector<float> ax((size_t)R), x((size_t)K);
+        sel.push_back({ -1, ld_int(anc->dtype, anc->data, offlin(anc, m * astr)), -1, 0.0f });
+
+        auto expand = [&](int64_t n) {
+            const Node nd = sel[(size_t)n];
+            const int64_t l = nd.l + 1;
+            if (l >= steps) return;
+            const int64_t r  = m * steps + l;
+            const int64_t cb = rowoff(cand, r, K), ub = rowoff(un, r, K);
+            const int64_t hb = hp ? rowoff(hp, r, R) : 0;
+            const bool ok = nd.tok >= 0 && nd.tok < nv;
+            for (int64_t i = 0; i < R; ++i)
+                ax[(size_t)i] = (ok ? ldt(pred, rowoff(pred, nd.tok, R) + i * ps) : 0.0f) *
+                                (hp ? ldt(hp, hb + i * hs) : 1.0f);
+            float mx = -INFINITY;
+            for (int64_t c = 0; c < K; ++c) {
+                const int64_t tok = ld_int(cand->dtype, cand->data, cb + c * cs);
+                float sc = ldt(un, ub + c * us);
+                const bool valid = tok >= 0 && tok < nv;
+                if (valid) {
+                    const int64_t sb = rowoff(succ, tok, R);
+                    for (int64_t i = 0; i < R; ++i) sc += ax[(size_t)i] * ldt(succ, sb + i * sxs);
+                }
+                x[(size_t)c] = valid ? sc / temp : -INFINITY;
+                if (x[(size_t)c] > mx) mx = x[(size_t)c];
+            }
+            if (mx == -INFINITY) return;
+            float sum = 0.0f;
+            for (int64_t c = 0; c < K; ++c)
+                if (x[(size_t)c] > -INFINITY) sum += std::exp(x[(size_t)c] - mx);
+            const float lse = mx + std::log(sum);
+            for (int64_t c = 0; c < K; ++c) {
+                if (!(x[(size_t)c] > -INFINITY)) continue;
+                front.push_back({ nd.lp + (x[(size_t)c] - lse), n, l,
+                                  ld_int(cand->dtype, cand->data, cb + c * cs), false });
+            }
+        };
+
+        expand(0);
+        for (int64_t j = 1; j <= N; ++j) {
+            int64_t best = -1;
+            for (size_t f = 0; f < front.size(); ++f)
+                if (!front[f].taken && (best < 0 || front[f].lp > front[(size_t)best].lp))
+                    best = (int64_t)f;
+            if (best < 0) {
+                sel.push_back({ steps, 0, (int64_t)sel.size() - 1, -INFINITY });
+            } else {
+                Kid& k = front[(size_t)best];
+                k.taken = true;
+                sel.push_back({ k.l, k.tok, k.parent, k.lp });
+                expand((int64_t)sel.size() - 1);
+            }
+            const Node& nd = sel.back();
+            st_int(out->dtype, out->data, rowoff(out, m, N) + (j - 1) * os, nd.tok);
+            st_int(par->dtype, par->data, rowoff(par, m, N) + (j - 1) * pps, nd.parent);
+        }
+    }
+    return RAD_OK;
+}

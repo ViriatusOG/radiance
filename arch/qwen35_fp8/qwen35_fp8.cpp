@@ -114,6 +114,16 @@ using MtpHead = MtpFP8;
  * wash. The drafter's reads (Dflash2::Config::prefetch) take the same size. */
 constexpr int64_t kPrefetchBytes    = (int64_t)12 << 20;
 constexpr int64_t kPrefetchStepRows = 32;
+/* The delta net's out-projection read into the on-die cache beside its decode recurrent update
+ * (GdnFP8::op_pf_out): the update runs one workgroup per (sequence, head) and leaves the memory mostly
+ * idle, so the whole projection (7.9 MB a rank in MXFP4; the read stops at the weight's end) is read
+ * there. Qwen3.8-27B MXFP4 + DFlash2 at tp 2, production flags, 1k context, hwgrid ms/step, median of
+ * five interleaved rounds, none -> whole: x1 19.40 -> 19.10, x2 20.93 -> 20.78, x4 24.26 -> 24.17
+ * (every round faster), x8 25.22 -> 25.48 (four rounds of five slower: eight sequences' state traffic
+ * fills the memory and the read competes with it), so up to four sequences. 4 MB read as the whole
+ * (x1 19.24 / 19.10 against 19.20 / 19.06); 90k x4 and x16 (64 rows, no read) unchanged. */
+constexpr int64_t kGdnOutPrefetchBytes = (int64_t)8 << 20;
+constexpr int64_t kGdnOutPrefetchSeqs  = 4;
 
 struct Layer {
     int          full = 0;
@@ -430,11 +440,11 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     /* --draft-coupling (RadBuildCtx::draft_coupling): the walk samples each draft from Q, its
      * scores' softmax over the best eight candidates, and the sampler couples the target's own draw
      * to it (abi/rad_spechub.h). The planes are named as the MTP head's, which is how the engine
-     * finds them. RADIANCE_DFLASH_Q_TEMP sets Q's temperature; any value keeps the output exact
-     * and moves only acceptance. The default, 0.6, is where held-out acceptance peaked on
-     * Qwen3.8-27B MXFP4 + its DFlash2 drafter at request temperature 1 (tokens a step at x4, 32
-     * rows: ordinary rule 3.52; Q at 1.0 3.71, 0.7 3.88, 0.5 3.85, 0.35 3.77): the walk's scores
-     * are flatter than the target's law, and a sharper Q puts its mass where the target's is. */
+     * finds them. Q's temperature keeps the output exact at any value and moves only acceptance;
+     * 0.6 is where held-out acceptance peaked on Qwen3.8-27B MXFP4 + its DFlash2 drafter at request
+     * temperature 1 (tokens a step at x4, 32 rows: ordinary rule 3.52; Q at 1.0 3.71, 0.7 3.88,
+     * 0.5 3.85, 0.35 3.77): the walk's scores are flatter than the target's law, and a sharper Q
+     * puts its mass where the target's is. */
     if (ctx->draft_coupling) {
         if (dc.steps() > RAD_MTP_COUPLE_MAX_ROUNDS || dc.sel_topk > RAD_DFLASH_COUPLE_MAX_K ||
             dc.sel_rank % RAD_DFLASH_EDGE_PARTS || dc.sel_rank > RAD_DFLASH_COUPLE_MAX_R) {
@@ -445,15 +455,6 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
             return RAD_E_UNSUPPORTED;
         }
         dc.q_temp = 0.6;
-        if (const char* e = std::getenv("RADIANCE_DFLASH_Q_TEMP")) {
-            const double t = std::strtod(e, nullptr);
-            if (!(t > 0.0) || t > 100.0) {
-                fprintf(stderr, "radiance: RADIANCE_DFLASH_Q_TEMP=%s is not a temperature in "
-                                "(0, 100]\n", e);
-                return RAD_E_INVAL;
-            }
-            dc.q_temp = t;
-        }
         dw.couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
                                  {dg.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
         dw.couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
@@ -1097,6 +1098,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             Layer& lay = m.layers[(size_t)l];
             lay.pf_gu_w  = lay.mlp.gate_up.w;
             lay.op_pf_gu = decl_prefetch(b, lay.pf_gu_w, kPrefetchBytes);
+            if (!lay.full) {
+                lay.gdn.op_pf_out   = decl_prefetch(b, lay.gdn.out.w, kGdnOutPrefetchBytes);
+                lay.gdn.pf_out_rows = kPrefetchStepRows;
+                lay.gdn.pf_out_seqs = kGdnOutPrefetchSeqs;
+            }
             if (l + 1 < m.n_main) {
                 const Layer& nx = m.layers[(size_t)l + 1];
                 lay.pf_next_w  = nx.full ? nx.attn.qg.w : nx.gdn.in.w;

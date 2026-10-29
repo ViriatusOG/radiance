@@ -77,7 +77,13 @@ void GeometricBackoff::select(const std::vector<int64_t>& pos, std::vector<int64
 
 void KeepTipOnly::select(const std::vector<int64_t>& pos, std::vector<int64_t>* keep) const {
     keep->clear();
-    if (!pos.empty()) keep->push_back(pos.back());
+    if (pos.empty()) return;
+    const int64_t tip = pos.back();
+    if (floor_ > 0) {
+        const auto it = std::upper_bound(pos.begin(), pos.end(), tip - floor_);
+        if (it != pos.begin()) keep->push_back(*(it - 1));
+    }
+    keep->push_back(tip);
 }
 
 void KeepAll::select(const std::vector<int64_t>& pos, std::vector<int64_t>* keep) const {
@@ -122,8 +128,7 @@ CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t ma
                                       int64_t share_bytes, int64_t room_bytes) {
     CheckpointSlots c;
     c.per_seq = policy.held(ctx, interval) + 1;
-    const int64_t seqs = std::max<int64_t>(max_seqs, 1);
-    c.want = seqs > INT64_MAX / c.per_seq ? INT64_MAX : seqs * c.per_seq;
+    c.want = checkpoint_slots_want(policy, max_seqs, ctx, interval);
     if (slot_bytes <= 0) return c;
     const int64_t share = std::max<int64_t>(share_bytes, 0) / slot_bytes;
     const int64_t room = std::max<int64_t>(room_bytes, 0) / slot_bytes;
@@ -134,6 +139,24 @@ CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t ma
         c.bound = CheckpointSlots::Bound::Room;
     }
     return c;
+}
+
+int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
+                              int64_t interval) {
+    const int64_t per = policy.held(ctx, interval) + 1;
+    const int64_t seqs = std::max<int64_t>(max_seqs, 1);
+    return seqs > INT64_MAX / per ? INT64_MAX : seqs * per;
+}
+
+int64_t host_reserve_for_floor(int64_t need_bytes, int64_t room_bytes, int64_t margin_bytes) {
+    if (need_bytes <= 0 || margin_bytes <= 0 || room_bytes >= need_bytes) return margin_bytes;
+    /* Whole MiB, the unit --host-headroom-mib takes, and the shortfall rounding up: the reserve
+     * gives back at least what the floor asked for, so the store is never a byte short of it. */
+    const int64_t mib = (int64_t)1 << 20;
+    const int64_t shortfall = (need_bytes - room_bytes + mib - 1) / mib;
+    const int64_t margin = margin_bytes / mib;
+    const int64_t keep = margin - shortfall;
+    return std::min(margin, std::max(kHostReserveFloor / mib, keep)) * mib;
 }
 
 /* ------------------------------------------------------------------ configure */
@@ -151,6 +174,7 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     ck_by_prefix_.clear(); ck_by_session_.clear();
     /* set_policy() may override this afterwards. */
     policy_ = make_checkpoint_policy(cfg.checkpoint_policy, checkpoint_interval);
+    policy_->set_floor(drafter_floor_);
     report_.clear();
 
     if (!kv) return RAD_E_INVAL;
@@ -160,9 +184,9 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     }
 
     /* Every paged group but a windowed one is cached. An entry covers the lcm of their block
-     * sizes, and holds that over a group's block size of the group's blocks: a hit then ends on
-     * a block of every group, which adopt() needs. The chunk quantum is a multiple of every paged
-     * group's block (core/sched/geometry.cpp), so the lcm divides every checkpoint position. */
+     * sizes and holds lcm / B blocks of a group with B-token blocks, so a hit ends on a block of
+     * every group, which adopt() needs. The chunk quantum is a multiple of every paged group's
+     * block (core/sched/geometry.cpp), so the lcm divides every checkpoint position. */
     for (const auto& p : kv->plans()) {
         if (p.stateful()) has_linear_ = true;
         if (p.paged() && p.kind != RAD_KV_WINDOW && p.block_size > 0)
@@ -250,6 +274,12 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
 
 void PrefixCache::set_policy(std::unique_ptr<CheckpointPolicy> p) {
     if (p) policy_ = std::move(p);
+    if (policy_) policy_->set_floor(drafter_floor_);
+}
+
+void PrefixCache::set_drafter_floor(int64_t tokens) {
+    drafter_floor_ = tokens > 0 ? tokens : 0;
+    if (policy_) policy_->set_floor(drafter_floor_);
 }
 
 std::string PrefixCache::report() const { return report_; }

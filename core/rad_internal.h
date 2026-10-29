@@ -29,6 +29,12 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...)
  * the first. */
 uint64_t log_last_line_ns();
 
+/* A copy safe to interpolate into a log line: every byte below 0x20 but '\t', and DEL, becomes
+ * '?'. Client-controlled text reaches the log — session labels, echoed request fields — and an
+ * unfiltered newline forges a line while an ESC sequence drives the terminal that reads it.
+ * Multi-byte UTF-8 is left alone; only control bytes are replaced. */
+std::string log_sanitize(const std::string& s);
+
 /* Rank tags on log lines. Per-rank components (pools, planner, mover, sampler) print the same
  * line once per rank, so under TP each line needs its rank. LogRank sets the tag as a scope
  * because the printers are several layers down, where threading a rank argument through every

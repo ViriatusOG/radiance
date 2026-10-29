@@ -38,6 +38,30 @@ int64_t prefill_shared_tok(const Config& cfg) {
     return std::max(std::min(cfg.max_tok, I), cfg.max_tok - (cfg.prefill_span - 1) * I);
 }
 
+/* What a prefix hit restores beside the cached blocks: linear state, or a trunk's sliding window.
+ * Only the trunk's window makes a model take window snapshots; a block drafter's rides in them
+ * where they exist (KVManager::set_drafter_window_snapshot) and is recomputed by draft refill
+ * where they do not. A RAD_KV_RING group has no snapshot at all
+ * (KVManager::declare_runtime_window): its window is each sequence's own prompt length, which no
+ * slot could describe, so it is sized for the context plus a ring and is never checkpointed. */
+static void restored_state(const Program& prog, bool* linear, bool* window) {
+    *linear = *window = false;
+    for (const KVGroupInfo& kg : prog.kv_groups) {
+        if (kg.decl.kind != RAD_KV_FULL && kg.decl.kind != RAD_KV_WINDOW &&
+            kg.decl.kind != RAD_KV_RING)
+            *linear = true;
+        else if (kg.decl.kind == RAD_KV_WINDOW && kg.block_size > 0 && !kg.layers.empty() &&
+                 !kg.drafter)
+            *window = true;
+    }
+}
+
+bool window_snapshots(const Program& prog, const Config& cfg) {
+    bool linear = false, window = false;
+    restored_state(prog, &linear, &window);
+    return !linear && window && cfg.prefix_cache && cfg.checkpoint_interval > 0;
+}
+
 int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out) {
     if (!out) return RAD_E_INVAL;
     ChunkGeometry g;
@@ -46,22 +70,12 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
     /* lcm across every paged group. libr4d uses 16 for all of them, but a sliding-window group
      * served by a different kernel may differ (§7.2). */
     bool has_linear = false, has_window = false;
+    restored_state(prog, &has_linear, &has_window);
     for (const KVGroupInfo& kg : prog.kv_groups) {
-        if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW ||
-            kg.decl.kind == RAD_KV_RING) {
-            if (kg.block_size > 0) {
-                g.attn_block = lcm64(g.attn_block, kg.block_size);
-                note(g.why, "attn_block", kg.block_size, kg.name.c_str());
-                /* A drafter's window is recomputed by draft refill; only the trunk's needs a
-                 * snapshot for a prefix hit to resume. A RAD_KV_RING group has no snapshot at all
-                 * (KVManager::declare_runtime_window): its window is each sequence's own prompt
-                 * length, which no slot could describe, so it is sized for the context plus a ring
-                 * and is never checkpointed. */
-                if (kg.decl.kind == RAD_KV_WINDOW && !kg.layers.empty() && !kg.drafter)
-                    has_window = true;
-            }
-        } else {
-            has_linear = true;
+        if ((kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW ||
+             kg.decl.kind == RAD_KV_RING) && kg.block_size > 0) {
+            g.attn_block = lcm64(g.attn_block, kg.block_size);
+            note(g.why, "attn_block", kg.block_size, kg.name.c_str());
         }
     }
 
@@ -152,11 +166,11 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
     }
 
     /* The resume grid (--prefix-resume exact): where an idle server's prefill chunks start. A
-     * prefill alone in its step takes the budget, rounded down to the quantum, and stops at every
-     * interval boundary it reaches where chunks split at the interval (linear state, or periodic
-     * window snapshots); a span carries h intervals from the second one on. An interval past the
-     * budget must then be a multiple of the budget's chunk, or the chunk after a checkpoint would
-     * start off the grid every cold run cuts: rounded up, as the quantum rounds it, since a longer
+     * prefill alone in its step takes the budget, rounded down to the quantum. Where chunks split
+     * at the interval (linear state, or periodic window snapshots) it stops at every interval
+     * boundary it reaches, and a span carries h intervals from the second one on. An interval past
+     * the budget must be a multiple of the budget's chunk, or the chunk after a checkpoint would
+     * start off the cold run's grid; it is rounded up, as the quantum rounds it, since a longer
      * interval costs only retention. */
     const int64_t I0 = g.checkpoint_interval;
     const bool splits = I0 > 0 && (!g.window_ckpt || g.window_periodic);

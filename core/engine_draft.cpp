@@ -175,6 +175,14 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
                                                                   : rk.ctx.buf_ptr(rk.tok_buf));
             a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
                               ? drafter_.proposal_pitch : 1;
+            /* A tree drafter's parents, at the proposal's pitch (rad_drafter_tree). */
+            if (tree_ && mode == ADV_BTAKE) {
+                a.par = static_cast<const int32_t*>(rk.ctx.buf_ptr(tree_parents_));
+                if (!a.par) {
+                    RAD_ERR("drafter '%s': rank %zu has no parents buffer", drafter_.name, i);
+                    return RAD_E_STATE;
+                }
+            }
         } else {
             a.src = static_cast<const int32_t*>(rk.ctx.buf_ptr(rk.tok_buf));
         }
@@ -184,6 +192,49 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
             return RAD_E_STATE;
         }
         RAD_TRY(step_advance(a, rk.ctx.stream()));
+    }
+    return RAD_OK;
+}
+
+/* ADV_COMPACT on every rank, against the scheduler's latest build (the tree step just accepted):
+ * the accepted paths' K and V into place in every paged group. Each rank's pools are its own. */
+int Engine::tree_compact(int rows) {
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        Rank& rk = *ranks_[i];
+        AdvanceArgs a = sched_.advance_args((int)i);
+        if (rows >= 0 && rows < a.n_seq) a.n_seq = rows;
+        a.mode = 0;
+        a.st   = rk.step_slots;
+        const Program& p = rk.program;
+        for (size_t g = 1; g < p.kv_groups.size() && (int)g < a.n_groups; ++g) {
+            const int kind = p.kv_groups[g].decl.kind;
+            if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) continue;
+            const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
+            if (!b || !b->base || b->rank != 4) continue;   /* a zero group on this rank */
+            const int bits = rad_dtype_bits(b->dtype);
+            const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
+            int32_t layers = 0;
+            for (int32_t s : b->layer_slot) layers += s >= 0;
+            if (row <= 0 || row % 16 || (bits != 8 && bits != 16 && bits != 32) ||
+                (b->bytes && (int64_t)layers * b->layer_stride > b->bytes)) {
+                RAD_ERR("speculation: KV group %zu's cache (%s, %lld-byte rows) is not one a tree's "
+                        "acceptance can move", g, rad_dtype_name(b->dtype), (long long)row);
+                return RAD_E_UNSUPPORTED;
+            }
+            if (a.n_pool >= kAdvMaxPools) {
+                RAD_ERR("speculation: more than %d paged KV groups for a tree's acceptance",
+                        (int)kAdvMaxPools);
+                return RAD_E_UNSUPPORTED;
+            }
+            AdvPool& q = a.pool[a.n_pool++];
+            q.base         = static_cast<char*>(b->base);
+            q.layer_stride = b->layer_stride;
+            q.n_layers     = layers;
+            q.n_head       = (int32_t)b->shape[1];
+            q.row_bytes    = (int32_t)row;
+            q.grp          = (int32_t)g;
+        }
+        RAD_TRY(step_compact(a, rk.ctx.stream()));
     }
     return RAD_OK;
 }
@@ -496,9 +547,13 @@ void Engine::block_shape(int* block, int* steps) {
      * fewer proposals as rows. The load is the step just run's, which the next step, the one these
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
     if (drafter_short_ <= 0) return;
-    short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), cfg_.draft_short_from);
+    short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
     if (short_on_) {
-        *steps -= *block - (int)drafter_short_;
+        /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
+         * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
+         * full pass's prefix); the verify takes that many. */
+        if (tree_) *steps = std::min(*steps, (int)drafter_short_ - 1);
+        else       *steps -= *block - (int)drafter_short_;
         *block  = (int)drafter_short_;
     }
 }
@@ -508,6 +563,9 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (!block_drafting()) return RAD_OK;
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+    /* A tree's accepted path into place in the trunk's cache, against the same build (the step
+     * just accepted), before any later pass reads it. */
+    if (tree_) RAD_TRY(tree_compact(-1));
     /* The sampled ids before either pass, as the serial driver reads them. */
     RAD_TRY(collect_issue(so, /*fence=*/true));
 
@@ -518,15 +576,25 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     block_shape(&block, &steps);
     block_steps_ = steps;
     block_row_.resize((size_t)cfg_.max_seqs);
-    const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
+    /* The head reads the block's draft rows. A tree (rad_drafter_tree; DFlash2's convention, the
+     * anchor predicts nothing) reads all block - 1 of them whatever its node count. */
+    const int head = tree_ ? block - 1 : steps;
+    const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 
     /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). */
     if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
-     * drafter will need, and skipping would leave a permanent hole in its cache. */
-    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
+     * drafter will need, and skipping would leave a permanent hole in its cache. A tree verify's
+     * context rows store only the accepted path, at its committed positions (ADV_CTXTREE). */
+    if (const RadBatch* cb = sched_.block_context(step)) {
+        if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
+        RAD_TRY(block_pass(cb, "context", step));
+    }
+    /* A snapshot carrying the drafter's window is saved now, with the step's context rows stored
+     * and before the query pass and the step issued ahead (save_checkpoints). */
+    if (drafter_snap_) RAD_TRY(save_checkpoints());
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
     if (!qb) return RAD_OK;
@@ -581,12 +649,25 @@ int Engine::finish_block_drafter(const StepOut& so) {
         for (int j = 0; j < steps; ++j)
             draft_out_[(size_t)i * (size_t)steps + (size_t)j] = S.tok[1 + j];
     }
+    /* -v: what each block pass proposed, a line a sequence, so two runs can be compared draft by
+     * draft where acceptance alone cannot tell them apart (a drafter whose context is wrong still
+     * drafts, and its rejected drafts change no token). */
+    const bool show = (int)log_level() >= (int)Log::Debug;
     for (int i = 0; i < block_rows_; ++i) {
+        const int32_t* d = &draft_out_[(size_t)i * (size_t)steps];
+        if (show) {
+            std::string t;
+            for (int j = 0; j < steps; ++j) t += fmt(" %d", (int)d[j]);
+            RAD_DEBUG("drafter '%s': sequence %llu proposes%s", drafter_.name,
+                      (unsigned long long)block_row_[(size_t)i].seq, t.c_str());
+        }
         /* As in finish_serial_drafter: the step issued ahead only carries a request whose answer
-         * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. */
+         * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. A
+         * tree's parents come from the same slot, as ADV_BTAKE took them. */
         if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
         const uint64_t seq = block_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+        const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
+        const int rc = sched_.set_draft(seq, d, steps, tree_ ? S.par : nullptr);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }

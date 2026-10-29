@@ -194,6 +194,9 @@ struct AttnArgs {
     int*                 tinfo;                            /* [tile] = (first row, positions) */
     float qscale;                                          /* softmax scale * log2(e) */
     int   max_blocks, n_seq, q_len, tps, kv_heads, causal, window, n_split;
+    /* A tree verify (attn_paged_qrow_tree): RadBatch::spec_parent, one a query row; read only by
+     * the TREE instances. */
+    const int*           tpar;
 };
 
 /* Tile `tile` of a ragged batch: its sequence and which BQ-position slice of that sequence's query
@@ -240,7 +243,7 @@ __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* 
 /* ------------------------------------------------------------------ the attention kernel */
 /* The body; attn_kernel and its chained form r4dchain_attn_window (r4d_chain.h) wrap it below,
  * since its blocks return early. */
-template <int HD, int GQA, bool KV8>
+template <int HD, int GQA, bool KV8, bool TREE = false>
 __device__ __forceinline__ void attn_body(AttnArgs A) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, RW = R / kWaves, BQ = R / GQA;
     constexpr int NC = HD / 128;                     /* 4-element chunks a lane holds of a row */
@@ -284,6 +287,17 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
     }
     if (npos <= 0) return;                           /* uniform across the block */
 
+    /* TREE: the sequence's first rows' parents staged once (a tree block is at most 64 rows), so
+     * each row's walk below reads LDS rather than a chain of dependent global loads. */
+    __shared__ int s_tpar[TREE ? 64 : 1];
+    if constexpr (TREE) {
+        if (A.tpar) {
+            const int nst = imin(qlen, 64);
+            for (int r = tid; r < nst; r += kThreads) s_tpar[r] = A.tpar[tokb + r];
+            __syncthreads();
+        }
+    }
+
     const int tok0 = tokb + pfirst;
     const int qbase = ctx - qlen + pfirst;           /* absolute position of the tile's first query */
     const int plast = qbase + npos - 1;
@@ -293,7 +307,10 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
     int hi = causal ? plast + 1 : ctx;
     if (!causal && window > 0) hi = imin(hi, plast + window);
     hi = imin(imin(hi, ctx), A.max_blocks * 16);
-    const int lo = window > 0 ? imax(0, qbase - window + 1) : 0;
+    /* A tree row's window is measured from the block's first position plus its depth, which can
+     * be below its own position, so a tree launch starts every tile at the block's first. */
+    const int tbase = ctx - qlen;
+    const int lo = window > 0 ? imax(0, ((TREE && A.tpar) ? tbase : qbase) - window + 1) : 0;
     const int lo_a = lo & ~(BK - 1);
     const int nkt = hi > lo_a ? (hi - lo_a + BK - 1) / BK : 0;
     const int per = (nkt + A.n_split - 1) / A.n_split;
@@ -306,6 +323,11 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
     float qf[RW][NC][4], o[RW][NC][4], m[RW], l[RW];
     int pos[RW];
     bool val[RW];
+    /* TREE: each row's ancestors inside the block (a bit per row of the block, itself included),
+     * whether it is a tree row at all, and the position its window is measured from. */
+    uint64_t tm[RW];
+    int wq[RW];
+    bool tr[RW];
 #pragma unroll
     for (int i = 0; i < RW; ++i) {
         const int r = wave * RW + i, p = r / GQA, g = r - p * GQA;
@@ -313,6 +335,28 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
         pos[i] = qbase + p;
         m[i] = -__builtin_inff();
         l[i] = 0.0f;
+        tm[i] = 0;
+        wq[i] = pos[i];
+        tr[i] = false;
+        if constexpr (TREE) {
+            const int rel = pfirst + p;              /* the row within its sequence's rows */
+            if (A.tpar && val[i] && rel < 64) {
+                int pj = s_tpar[rel];
+                if (pj != -2) {
+                    uint64_t mk = 1ull << rel;
+                    int dep = 0;
+                    for (int at = rel; pj >= 0 && pj < at; ) {
+                        mk |= 1ull << pj;
+                        ++dep;
+                        at = pj;
+                        pj = s_tpar[pj];
+                    }
+                    tr[i] = true;
+                    tm[i] = mk;
+                    wq[i] = tbase + dep;
+                }
+            }
+        }
         const uint16_t* qp = A.q + (long long)(tok0 + p) * A.q_rs + (long long)(kh * GQA + g) * A.q_hs;
         const float qs = A.qscale * kds;             /* k_descale folds into the query */
 #pragma unroll
@@ -391,7 +435,10 @@ __device__ __forceinline__ void attn_body(AttnArgs A) {
             }
             const int pq = pos[i];
             bool vis = kok && (causal ? kk <= pq : true);
-            if (window > 0) vis = vis && (pq - kk < window) && (causal || kk - pq < window);
+            if constexpr (TREE)
+                if (tr[i] && vis && kk >= tbase) vis = ((tm[i] >> (kk - tbase)) & 1ull) != 0;
+            const int wpq = TREE ? wq[i] : pq;
+            if (window > 0) vis = vis && (wpq - kk < window) && (causal || kk - wpq < window);
             const float sv = vis ? sc[0] : -__builtin_inff();
             const float mn = __builtin_fmaxf(m[i], wave_max(sv));
             if (mn == -__builtin_inff()) return;     /* nothing visible yet: uniform */
@@ -974,12 +1021,14 @@ static constexpr int64_t scratch_need() {
 
 /* The plain kernels and their chained forms (r4dchain*, RadKernelChainFn): the chained ones wait
  * for the kernels before them on the queue in their prologue and count themselves in at the end. */
-template <int HD, int GQA, bool KV8>
-__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) { attn_body<HD, GQA, KV8>(A); }
-template <int HD, int GQA, bool KV8>
+template <int HD, int GQA, bool KV8, bool TREE = false>
+__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
+    attn_body<HD, GQA, KV8, TREE>(A);
+}
+template <int HD, int GQA, bool KV8, bool TREE = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_attn_window(AttnArgs A) {
     r4d_chain_wait();
-    attn_body<HD, GQA, KV8>(A);
+    attn_body<HD, GQA, KV8, TREE>(A);
     r4d_chain_done();
 }
 template <int HD, int GQA>
@@ -991,10 +1040,15 @@ __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
     r4d_chain_done();
 }
 
-template <int HD, int GQA, bool KV8>
+template <int HD, int GQA, bool KV8, bool TREE = false>
 static int launch_attn(const RadArgs* a, RadStream stream) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
-    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    if (!a || a->n_t < (TREE ? 9 : 8)) return RAD_E_INVAL;
+    /* attn_paged_qrow_tree's ninth operand: one int32 a query row (docs/OPS.md). Causal only. */
+    const RadTensor* tp = TREE ? rad_arg_in(a, 8) : nullptr;
+    if (TREE && (!tp || !tp->data)) return RAD_E_INVAL;
+    if (TREE && tp->dtype != RAD_I32) return RAD_E_DTYPE;
+    if (TREE && rad_args_geti_or(a, "causal", 1) != 1) return RAD_E_UNSUPPORTED;
     const RadTensor* q  = rad_arg_in(a, 0);
     const RadTensor* kv = rad_arg_in(a, 1);
     const RadTensor* bt = rad_arg_in(a, 2);
@@ -1028,6 +1082,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     if (!head_view(q, qh, HD, &rows, &q_rs, &q_hs) || !head_view(o, qh, HD, &orows, &o_rs, &o_hs))
         return RAD_E_SHAPE;
     if (orows < rows) return RAD_E_SHAPE;
+    if (TREE && rad_tensor_numel(tp) < rows) return RAD_E_SHAPE;
     const int64_t n_seq = rad_tensor_numel(su);
     if (rows == 0) return RAD_OK;
     if (n_seq <= 0 || n_seq > (1 << 24)) return RAD_E_SHAPE;
@@ -1081,7 +1136,8 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
             qmax_w = rad_args_geti_or(a, "q_len", rows);
             if (qmax_w <= 0 || qmax_w > rows) qmax_w = rows;
         }
-        const bool shaped = qmax_w >= kWmmaMinQ && rows >= n_seq * (kWmmaMinQ / 2);
+        /* Never a tree: its verify blocks are decode-sized, and only the scalar kernel reads one. */
+        const bool shaped = !TREE && qmax_w >= kWmmaMinQ && rows >= n_seq * (kWmmaMinQ / 2);
         const bool aligned = rad_ptr_aligned(q->data, 16) && rad_ptr_aligned(o->data, 16) &&
                              (q_rs | q_hs | o_rs | o_hs) % 8 == 0;
         if (shaped && aligned) {
@@ -1159,16 +1215,17 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.causal = (int)causal;
     A.window = (int)window;
     A.n_split = (int)ns;
+    A.tpar = TREE ? (const int*)tp->data : nullptr;
 
     hipStream_t s = (hipStream_t)stream;
     /* The chained forms where the row resolved with `chain` (launches chain), at decode heights
      * only: the 31B's full layers at a verify. */
     const bool chain = rad_args_geti_or(a, "chain", 0) != 0 && rows <= 64;
     if (chain)
-        R4D_KLAUNCH(R4D_KNAME(r4dchain_attn_window<HD, GQA, KV8>),
+        R4D_KLAUNCH(R4D_KNAME(r4dchain_attn_window<HD, GQA, KV8, TREE>),
                    dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
     else
-        R4D_KLAUNCH(R4D_KNAME(attn_kernel<HD, GQA, KV8>),
+        R4D_KLAUNCH(R4D_KNAME(attn_kernel<HD, GQA, KV8, TREE>),
                    dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
     if (ns > 1) {
         if (chain)
@@ -1197,6 +1254,18 @@ R4D_WIN_DEF(128, 1)
 R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
 R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8)
 #undef R4D_WIN_DEF
+
+/* attn_paged_qrow_tree: the scalar kernel with a tree verify's mask (TREE). */
+#define R4D_WIN_TREE_DEF(HD, G)                                                                   \
+    int r4d_rad_attn_window_tree_h##HD##_gqa##G##_bf16(const RadArgs* a, RadStream s) {           \
+        return r4d_win::launch_attn<HD, G, false, true>(a, s);                                     \
+    }                                                                                              \
+    int r4d_rad_attn_window_tree_h##HD##_gqa##G##_fp8(const RadArgs* a, RadStream s) {            \
+        return r4d_win::launch_attn<HD, G, true, true>(a, s);                                      \
+    }
+R4D_WIN_TREE_DEF(256, 1) R4D_WIN_TREE_DEF(256, 2) R4D_WIN_TREE_DEF(256, 4) R4D_WIN_TREE_DEF(256, 8)
+R4D_WIN_TREE_DEF(512, 1) R4D_WIN_TREE_DEF(512, 2) R4D_WIN_TREE_DEF(512, 4) R4D_WIN_TREE_DEF(512, 8)
+#undef R4D_WIN_TREE_DEF
 
 /* Called at declare with no tensors. Partials are capped at kPartBudget (tile, head, split)
  * triples for any batch, so the size is a constant. */

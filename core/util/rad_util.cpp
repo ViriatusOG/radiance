@@ -68,6 +68,15 @@ LogRank::~LogRank() { g_log_rank = prev_; }
 static std::atomic<uint64_t> g_last_line_ns{0};
 uint64_t log_last_line_ns() { return g_last_line_ns.load(std::memory_order_relaxed); }
 
+std::string log_sanitize(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        const unsigned char b = (unsigned char)c;
+        if ((b < 0x20 && b != '\t') || b == 0x7f) c = '?';
+    }
+    return out;
+}
+
 void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
     const char* base = std::strrchr(file, '/');
     base = base ? base + 1 : file;

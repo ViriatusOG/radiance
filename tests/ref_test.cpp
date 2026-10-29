@@ -983,6 +983,8 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
+        "dflash_tree", "attn_paged_tree",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant",
@@ -1065,15 +1067,17 @@ TEST(op_vocabulary) {
     }
     CHECK_EQ(api().kernel_count(), (int)(sizeof(kOps) / sizeof(kOps[0])));
 
-    /* The two structural constraints, and only those; everything else must match anything. */
+    /* The structural constraint on the paged block, and only that; everything else must match
+     * anything. attn_paged_tree is attn_paged's row with the tree operand, the same constraint. */
     CHECK_EQ(kern("attn_paged")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged")->constraints[0].key, "block_size") == 0);
+    CHECK_EQ(kern("attn_paged_tree")->n_constraints, 1);
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
     CHECK_EQ(kern("gemm_nt")->n_constraints, 0);
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 2);
+    CHECK_EQ(constrained, 3);
 }
 
 /* ================================================================== the numerics
@@ -9687,6 +9691,8 @@ std::vector<Geo> geometries() {
                                      .s("dtype", "fp8a8").s("act", "silu")),
         G("dflash_select", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                    .i("n_vocab", 30).s("dtype", "bf16")),
+        G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
+                                 .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
@@ -9698,6 +9704,10 @@ std::vector<Geo> geometries() {
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
+        G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                         .i("block_size", 4).i("causal", 1).i("window", 0)
+                                         .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
+                                         .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
         /* One-row segments, so M is also the segment count (n_seq, the description's hint for

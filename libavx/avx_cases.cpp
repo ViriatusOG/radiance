@@ -348,6 +348,13 @@ std::vector<Case> build_cases() {
                                     HI("block_size", 16), HI("causal", 1), HI("window", window),
                                     HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
                                     HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* The tree form over the same shapes (its described parents are ordinary rows, -2). */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 17 })
+            add("attn_paged_tree", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
+                                     HI("block_size", 16), HI("causal", 1), HI("window", 8),
+                                     HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
+                                     HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
     for (const char* dt : { "f32", "bf16" })
         for (int causal : { 0, 1 })
             add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 2),
@@ -752,6 +759,13 @@ std::vector<Case> build_cases() {
                            HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
     add("dflash_select", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
                            HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
+    /* The same lattices grown into trees: more nodes than steps, and fewer. */
+    add("dflash_tree", { HI("M", 3), HI("steps", 4), HI("top_k", 8), HI("rank", 64),
+                         HI("n_vocab", 300), HI("anchor_stride", 1), HI("nodes", 6),
+                         HS("dtype", "bf16") });
+    add("dflash_tree", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
+                         HI("n_vocab", 97), HI("anchor_stride", 2), HI("nodes", 2),
+                         HS("dtype", "bf16") });
     /* DFlash2's convolution: the 27B drafter's form (2 taps, groups of 16) over a narrower row,
      * then groups that are no multiple of a vector, three taps and a one-row block. f16 rows take
      * the path through f32 copies, bf16 and f32 the fused one. */

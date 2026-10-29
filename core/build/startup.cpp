@@ -175,8 +175,12 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
 
     /* An imported quantisation is served by the family's quantised plugin (startup.h). A plugin
      * that declines imports (rad_arch_serves_imports) is left out of the family here: neither
-     * counted as a second quantised plugin nor picked as the only one. */
-    if (imported && !arch_id.empty() && out->arch_plugin.empty()) {
+     * counted as a second quantised plugin nor picked as the only one. Block-scaled fp8 reads
+     * stock weight by weight, so a family with no plugin claiming it is served the same way: the
+     * plugin declares each weight at the encoding it finds (Qwen3.8-Flash-Next-FP8: fp8 routed
+     * experts beside bf16 linears, served by qwen4exp_fp8). */
+    const bool stock = quant == "fp8_e4m3";
+    if ((imported || stock) && !arch_id.empty() && out->arch_plugin.empty()) {
         std::vector<const Plugin*> fam, quantised;
         for (const Plugin& p : r.plugins())
             if (p.kind == RAD_PLUGIN_ARCH && p.arch_id == arch_id && p.arch_serves_imports) {
@@ -198,7 +202,7 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
             out->arch_version = pick->version;
             out->arch_id      = pick->arch_id;
             out->arch_quant   = pick->arch_quant;
-            RAD_INFO("quantisation '%s' is imported weight by weight; '%s' serves it as %s",
+            RAD_INFO("quantisation '%s' is read weight by weight; '%s' serves it as %s",
                      quant.c_str(), pick->name.c_str(),
                      pick->arch_quant.empty() ? "(unquantised)" : pick->arch_quant.c_str());
         }

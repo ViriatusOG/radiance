@@ -52,6 +52,11 @@ struct HttpRequest {
     bool        peer_gone() const { return closed && closed(); }
     /* True for 127.0.0.0/8, ::1, an IPv4-mapped 127.x address, and an in-process request. */
     bool        peer_is_loopback() const;
+    /* True when the request comes from a browser on another origin: an `Origin` header whose
+     * authority differs from `Host`. Scripts send no Origin, so this never fires for curl or an
+     * SDK. Through a proxy that rewrites Host, every browser reads as cross-origin — which is
+     * exactly the case the "loopback-only" guards must not wave through. */
+    bool        is_cross_origin() const;
 };
 
 struct HttpResponse {

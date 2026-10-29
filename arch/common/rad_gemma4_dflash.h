@@ -188,6 +188,10 @@ inline bool dflash2_probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->draft_depth = (int)(bs - 1);
     out->draft_depth_fixed = 1;
     out->chain_pays = 1;
+    /* Its proposals verified as a tree of the same node count (dflash_tree, rad_drafter_tree): on
+     * 4x R9700 +7% single-stream decode and +6-9% aggregate at 1-16 users over the selector's
+     * chain (BetterBench, thinking off; on two cards +4% and +6-12%). */
+    out->tree_pays = 1;
     return true;
 }
 

@@ -31,6 +31,8 @@
 #include "planner.h"
 
 #include <string>
+#include <atomic>
+#include <memory>
 #include <vector>
 
 namespace rad {
@@ -111,6 +113,100 @@ struct HeatStats {
     uint64_t routed = 0, routed_resident = 0, stream_bytes = 0;
 };
 
+/* The live twin of HeatStats: every counter an atomic, so the HTTP thread's /stats and LiveView
+ * reads are relaxed loads beside the dispatch thread's writes rather than a data race. Written
+ * as plain counters are (++ and +=), read through snapshot(). See MoverCounters, same reasoning.
+ */
+struct HeatCounters {
+    std::atomic<uint64_t> dispatches{0};
+    std::atomic<uint64_t> proposed{0}, promotions{0}, demotions{0};
+    std::atomic<uint64_t> refused{0}, no_candidate{0};
+    std::atomic<uint64_t> distinct_promoted{0}, readmits{0};
+    std::atomic<uint64_t> routed{0}, routed_resident{0}, stream_bytes{0};
+
+    /* HeatEngine is copyable — place_test snapshots engines — so its counters must copy too.
+     * A copy takes the current values: relaxed loads into the copy's own atomics. */
+    HeatCounters() = default;
+    HeatCounters(const HeatCounters& o) { *this = o; }
+    HeatCounters& operator=(const HeatCounters& o) {
+        dispatches.store(o.dispatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        proposed.store(o.proposed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        promotions.store(o.promotions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        demotions.store(o.demotions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        refused.store(o.refused.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        no_candidate.store(o.no_candidate.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        distinct_promoted.store(o.distinct_promoted.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        readmits.store(o.readmits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        routed.store(o.routed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        routed_resident.store(o.routed_resident.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+        stream_bytes.store(o.stream_bytes.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        return *this;
+    }
+
+    void reset() {
+        /* Field by field: atomics are not copy-assignable. */
+        dispatches.store(0, std::memory_order_relaxed);
+        proposed.store(0, std::memory_order_relaxed);
+        promotions.store(0, std::memory_order_relaxed);
+        demotions.store(0, std::memory_order_relaxed);
+        refused.store(0, std::memory_order_relaxed);
+        no_candidate.store(0, std::memory_order_relaxed);
+        distinct_promoted.store(0, std::memory_order_relaxed);
+        readmits.store(0, std::memory_order_relaxed);
+        routed.store(0, std::memory_order_relaxed);
+        routed_resident.store(0, std::memory_order_relaxed);
+        stream_bytes.store(0, std::memory_order_relaxed);
+    }
+
+    HeatStats snapshot() const {
+        HeatStats s;
+        s.dispatches        = dispatches.load(std::memory_order_relaxed);
+        s.proposed          = proposed.load(std::memory_order_relaxed);
+        s.promotions        = promotions.load(std::memory_order_relaxed);
+        s.demotions         = demotions.load(std::memory_order_relaxed);
+        s.refused           = refused.load(std::memory_order_relaxed);
+        s.no_candidate      = no_candidate.load(std::memory_order_relaxed);
+        s.distinct_promoted = distinct_promoted.load(std::memory_order_relaxed);
+        s.readmits          = readmits.load(std::memory_order_relaxed);
+        s.routed            = routed.load(std::memory_order_relaxed);
+        s.routed_resident   = routed_resident.load(std::memory_order_relaxed);
+        s.stream_bytes      = stream_bytes.load(std::memory_order_relaxed);
+        return s;
+    }
+};
+
+/* The per-unit tier mirror HeatEngine keeps for the HTTP thread: one relaxed atomic byte per
+ * unit, written by set_tier and read by tier_published. A type of its own because it must be
+ * copyable — HeatEngine is copyable, and a copy takes the tier values into an array of its
+ * own — which a bare unique_ptr of atomics is not. */
+struct TierMirror {
+    std::unique_ptr<std::atomic<uint8_t>[]> a;
+    size_t n = 0;
+
+    void assign(size_t m) {
+        n = m;
+        a.reset(m ? new std::atomic<uint8_t>[m] : nullptr);
+    }
+    void set(size_t i, uint8_t v) const { a[i].store(v, std::memory_order_relaxed); }
+    uint8_t get(size_t i) const { return a[i].load(std::memory_order_relaxed); }
+
+    TierMirror() = default;
+    TierMirror(const TierMirror& o) {
+        assign(o.n);
+        for (size_t i = 0; i < n; ++i) set(i, o.get(i));
+    }
+    TierMirror& operator=(const TierMirror& o) {
+        if (this == &o) return *this;
+        assign(o.n);
+        for (size_t i = 0; i < n; ++i) set(i, o.get(i));
+        return *this;
+    }
+};
+
 class HeatEngine {
 public:
     /* Binds to the plan. A static plan is a mode, not a failure: init returns RAD_OK and
@@ -145,6 +241,12 @@ public:
     void set_tier(int32_t unit, Tier t);
     void set_busy(int32_t unit, bool busy);
     Tier tier(int32_t unit) const { return tier_[(size_t)unit]; }
+    /* The tier as the HTTP thread may safely read it: set_tier mirrors every change into a
+     * relaxed atomic, and /stats and LiveView read the mirror. tier_ itself belongs to the
+     * dispatch thread; reading it from another thread mid-step is a data race. */
+    Tier tier_published(int32_t unit) const {
+        return (Tier)tier_pub_.get((size_t)unit);
+    }
     bool busy(int32_t unit) const { return busy_[(size_t)unit] != 0; }
 
     /* The best swap available, or false when the guards refuse. */
@@ -165,7 +267,9 @@ public:
         const int32_t l = (size_t)unit < layer_of_.size() ? layer_of_[(size_t)unit] : -1;
         return l >= 0 && (size_t)l < res_count_.size() ? res_count_[(size_t)l] : 0;
     }
-    const HeatStats& stats() const { return stats_; }
+    /* A snapshot by value: the counters are atomics read while the dispatch thread writes them.
+     * Engine-internal decisions must use the individual counters (`warm`), not a snapshot. */
+    HeatStats stats() const { return stats_.snapshot(); }
 
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
@@ -175,7 +279,7 @@ private:
     HeatParams params_;
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
-    HeatStats  stats_;
+    HeatCounters stats_;
 
     /* Heat by position, not by unit. Each layer owns a run of positions whose front is indexed by
      * expert: expert e of layer l is at slot_lo_[l] + e, whether or not the plan has a unit for it
@@ -208,10 +312,14 @@ private:
     /* Unit bytes from the plan, so a miss is priced where it is detected. */
     std::vector<int64_t> bytes_;
     std::vector<Tier>    tier_;
+    /* Per unit, the tier as a relaxed atomic mirror, for the HTTP thread's reads (tier_published
+     * reads, set_tier and init write). Sized with tier_; element type uint8_t to keep the read
+     * lock-free and the mirror one byte per unit. */
+    TierMirror tier_pub_;
     std::vector<uint8_t> busy_;
     std::vector<uint8_t> movable_;
-    /* --expert-pin-top: a decode-hot resident the planner marked unmovable is never a demotion
-     * candidate, even where a later pass made its unit movable again. */
+    /* --expert-pin-top: a decode-hot resident the planner pinned is never a demotion candidate,
+     * even where a later pass made its unit movable again. */
     std::vector<uint8_t> pinned_;
     std::vector<int32_t> layer_of_;
     /* Bit 0: promoted before. Bit 1: demoted before. Feeds the readmit counters. */

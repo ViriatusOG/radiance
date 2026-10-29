@@ -14,6 +14,20 @@
 
 namespace rad {
 
+int table_copy_check(const uint8_t* src, int64_t n, const uint8_t* buf, std::string* why) {
+    if (!why || !src || !buf || n <= 0) return RAD_E_INVAL;
+    const int64_t probe = std::min<int64_t>(n, 4096);
+    bool same = std::memcmp(buf, src, (size_t)probe) == 0 &&
+                std::memcmp(buf + n - probe, src + n - probe, (size_t)probe) == 0;
+    for (int64_t o = 0; same && o + 4096 <= n; o += std::max<int64_t>(n / 64, 4096))
+        same = std::memcmp(buf + o, src + o, 4096) == 0;
+    if (!same) {
+        *why = "the copy does not match the container's mapping";
+        return RAD_E_IO;
+    }
+    return RAD_OK;
+}
+
 int table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
                     uint8_t* buf, std::string* why) {
     if (!why || !src || !buf || n <= 0) return RAD_E_INVAL;
@@ -45,16 +59,7 @@ int table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t 
         *why = fmt("reading the container failed (%s)", rad_strerror(err.load()));
         return RAD_E_IO;
     }
-    const int64_t probe = std::min<int64_t>(n, 4096);
-    bool same = std::memcmp(buf, src, (size_t)probe) == 0 &&
-                std::memcmp(buf + n - probe, src + n - probe, (size_t)probe) == 0;
-    for (int64_t o = 0; same && o + 4096 <= n; o += std::max<int64_t>(n / 64, 4096))
-        same = std::memcmp(buf + o, src + o, 4096) == 0;
-    if (!same) {
-        *why = "the copy does not match the container's mapping";
-        return RAD_E_IO;
-    }
-    return RAD_OK;
+    return table_copy_check(src, n, buf, why);
 }
 
 int table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,

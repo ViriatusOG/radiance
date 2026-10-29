@@ -289,6 +289,13 @@ static const RadParamSpec pDflashSelect[] = { P_INT("M"), P_INT("steps"), P_INT(
 static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
                                                 OUT("tokens") };
+static const RadParamSpec pDflashTree[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
+                                            P_INT("rank"), P_INT("n_vocab"),
+                                            P_INTO("anchor_stride"), P_INT("nodes"),
+                                            P_F64O("temp"), P_STR("dtype") };
+static const RadOperandSpec oDflashTree[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                              OPD("anchor"), WGT("pred"), WGT("succ"),
+                                              OUT("tokens"), OUT("parents") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
@@ -367,6 +374,11 @@ static const RadParamSpec pAttnPaged[] = {
 static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out")
+};
+/* attn_paged with the verify block's tree (RadBatch::spec_parent, rad_drafter_tree). */
+static const RadOperandSpec oAttnPagedTree[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
 };
 /* Effective on kv_store, where `block_size` is RAD_REQUIRED: admits every value and refuses only a
  * query that omits it. On attn_paged the key is RAD_DERIVED and the constraint is skipped
@@ -1322,6 +1334,12 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
+{ "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
+  "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
+  "is the anchor, each selected node's children are the valid candidates at the next position "
+  "with log probability parent + log_softmax(score / temp) over them, and each round selects the "
+  "unselected child with the largest (ties to the first pushed). tokens[j-1] and parents[j-1] are "
+  "the j-th selected node and its parent's index (0 the anchor)." },
 { "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
   "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
   "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
@@ -1407,6 +1425,11 @@ static const RadOpSchema kSchemas[] = {
   "one kernel serves decode, speculative verify and prefill. seqused is the TOTAL key count "
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
+{ "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
+  "attn_paged over a tree verify (rad_drafter_tree): spec_parent[row] is -2 for an ordinary "
+  "causal row, else the row's parent's index within its sequence's rows (-1 for the block's "
+  "first row). Inside the block such a row sees itself and its ancestors only, and its window is "
+  "measured from the block's first position plus its depth." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "Dense varlen attention over cu_seqlens segments (rows cu/cu_div). Nothing paged. `window` is "
   "attn_paged's rule over a segment's positions: causal, i - j < window; non-causal, |i - j| < "
@@ -2284,6 +2307,9 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
+       "DFlash2's candidate lattice grown best-first into a tree",
+       "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),
 SIMPLE("ref_givens_rotate", "givens_rotate", "quant",
        "channel scale and Givens rotations per part, in the output's dtype",
        "float in, float out; int32 pairs, f32 angles and channel scales", ref_givens_rotate),
@@ -2341,6 +2367,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
+ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
+    "paged causal / sliding-window attention with a tree verify block (spec_parent)",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    nullptr, nullptr, ref_attn_paged_tree, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",

@@ -38,6 +38,36 @@ namespace rad {
 int accept_greedy(const int32_t* draft, int n_draft, const int32_t* target,
                   int32_t* out, int32_t* n_accepted);
 
+/* The same rule over a tree (rad_drafter_tree). Node 0 is the verify's first row (the bonus token
+ * it starts from); node j, 1 <= j <= n_draft, is draft[j - 1], verified at row j, and its parent
+ * is node parent[j - 1] (< j), or node j - 1 when `parent` is null (a chain). `target[r]` is the
+ * target's token after node r's row.
+ *
+ * From node 0, take the lowest-numbered child whose token is the target's at the current node,
+ * while there is one. Writes the walk's nodes to path[0..n_accepted) and the emitted tokens to
+ * out[0..n_accepted]: out[t] is the target's token at path[t - 1] (node 0 for t = 0), which equals
+ * the accepted draft there, and out[n_accepted] is the bonus. The card's acceptance
+ * (sched/advance_impl.h, ADV_ACCEPT) walks the same way. */
+inline int accept_tree(const int32_t* draft, const int32_t* parent, int n_draft,
+                       const int32_t* target, int32_t* out, int32_t* path, int32_t* n_accepted) {
+    if (!draft || !target || !out || !path || !n_accepted || n_draft < 0) return RAD_E_INVAL;
+    int32_t cur = 0, acc = 0;
+    for (;;) {
+        int32_t nxt = -1;
+        for (int32_t j = cur + 1; j <= n_draft; ++j) {
+            int32_t p = parent ? parent[j - 1] : j - 1;
+            if (p < 0 || p >= j) p = j - 1;     /* as the builder and ADV_TRUNK read it */
+            if (p == cur && draft[j - 1] == target[cur]) { nxt = j; break; }
+        }
+        if (nxt < 0) break;
+        path[acc++] = nxt;
+        cur = nxt;
+    }
+    for (int32_t t = 0; t <= acc; ++t) out[t] = target[t == 0 ? 0 : path[t - 1]];
+    *n_accepted = acc;
+    return RAD_OK;
+}
+
 /* Where a verify step's emission ends: at the first end-of-generation token among `out`'s
  * n_accepted + 1 tokens (accept_greedy's output), which is emitted, or after all of them. Returns
  * the number of accepted drafts to commit, at most `n_accepted`. A drafter that predicts the stop

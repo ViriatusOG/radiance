@@ -866,14 +866,6 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 (long long)max_seqs_, (long long)max_tok_);
         return nullptr;
     }
-    if (plan.spec_is_tree) {
-        /* spec_parent is in the ABI and allocated, but no drafter emits a tree, so tree parents
-         * and positions are not written. Filling in the linear-chain answer would verify a tree
-         * against the wrong causal mask. */
-        RAD_ERR("tree-layout speculation was requested but is not implemented in this build");
-        return nullptr;
-    }
-
     Set& s = set_;
     const int64_t n_seq = (int64_t)plan.e.size();
 
@@ -963,6 +955,29 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             s.h_tok[k + j] = token_at(e, (int64_t)e.ctx_len + j + shift);
             s.h_pos[k + j] = e.ctx_len + j;
         }
+        /* A tree verify (RadBatch::spec_parent): every verify block of a tree step is staged as
+         * a tree, a chain proposal (prompt lookup) as the tree whose node j hangs off j - 1, so
+         * the card's acceptance and the host's agree on every row. Node j stores its K and V at
+         * its row's position (the slots below are unchanged) and rotates at the anchor + its
+         * depth. A parent is named by its row within the sequence's rows (from cu_seqlens), the
+         * index an attention kernel has. A card row is restaged by ADV_TRUNK from its StepSlot. */
+        if (plan.spec_is_tree) {
+            for (int32_t j = 0; j < e.n_tokens; ++j) s.h_parent[k + j] = -2;
+            if (e.produces_token && !e.is_prefill && e.n_spec > 0 &&
+                e.n_spec < e.n_tokens && e.n_spec <= RAD_SCHED_MAX_SPEC) {
+                const int32_t a0 = e.n_tokens - 1 - e.n_spec;   /* the anchor's row */
+                int32_t dep[1 + RAD_SCHED_MAX_SPEC];
+                dep[0] = 0;
+                s.h_parent[k + a0] = -1;
+                for (int32_t j = 1; j <= e.n_spec; ++j) {
+                    int32_t p = e.draft_parent ? e.draft_parent[j - 1] : j - 1;
+                    if (p < 0 || p >= j) p = j - 1;
+                    dep[j] = dep[p] + 1;
+                    s.h_parent[k + a0 + j] = a0 + p;
+                    s.h_pos[k + a0 + j] = e.ctx_len + a0 + dep[j];
+                }
+            }
+        }
         /* Every row of a sequence runs with its request's adapter (RadBatch::lora_slot), fixed at
          * admission; a placeholder row with no request is a base row. */
         if (lora_on_) {
@@ -979,7 +994,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 (e.req && e.req->media && !e.req->media->rope.empty()) ? &e.req->media->rope : nullptr;
             for (int32_t j = 0; j < e.n_tokens; ++j) {
                 int32_t v[3];
-                const int64_t p = (int64_t)e.ctx_len + j;
+                /* h_pos, not ctx_len + j: a tree verify's rows rotate at their depth. */
+                const int64_t p = (int64_t)s.h_pos[k + j];
                 if (rl) rl->at(p, v);
                 else v[0] = v[1] = v[2] = (int32_t)p;
                 s.h_rope[k + j]             = v[0];
@@ -1155,6 +1171,21 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         mm_ev_live_ = true;
     }
 
+    /* A scored step (RadBatch::score_only): every sampled row is a scored request's first row, on
+     * one rank, in a program that told the core where its hidden rows and head table are. */
+    int32_t score_only = 0;
+    if (n_out > 0 && n_dout == 0 && !plan.draft_pass && ranks_.size() == 1 &&
+        prog_->score_hidden != RAD_NULL_HANDLE && prog_->score_table != RAD_NULL_HANDLE) {
+        score_only = 1;
+        for (const StepEntry& e : plan.e) {
+            if (!e.produces_token) continue;
+            if (!e.req || !e.req->token_scores || !e.req->output.empty() || e.n_spec > 0) {
+                score_only = 0;
+                break;
+            }
+        }
+    }
+
     /* ---------------------------------------------------------- the batch, one per rank */
     for (size_t r = 0; r < ranks_.size(); ++r) {
         void* const base = s.dev[r];
@@ -1170,6 +1201,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.seq_ids = on_rank(base, b0, s.d_sid);
         B.n_out = n_out;
         B.out_ids = n_out ? on_rank(base, b0, s.d_out) : nullptr;
+        B.score_only = score_only;
         B.n_draft_out = n_dout;
         B.draft_out_ids = n_dout ? on_rank(base, b0, s.d_dout) : nullptr;
         B.q_lens = on_rank(base, b0, s.d_q);
@@ -1188,7 +1220,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * without drafts may follow one that had drafts, and the linear kernels need its accepted
          * count instead of their absent-operand default of 1. */
         B.num_accepted = cfg_.n_spec > 0 ? on_rank(base, b0, s.d_acc) : nullptr;
-        B.spec_parent = nullptr;      /* a linear chain; the tree case is refused above */
+        /* Staged above on a tree step: each row's parent row, -2 for an ordinary causal one. */
+        B.spec_parent = plan.spec_is_tree ? on_rank(base, b0, s.d_parent) : nullptr;
         B.rope_pos = mm_on_ ? on_rank(base, b0, s.d_rope) : nullptr;
         B.rope_mixed = rope_mixed;
         B.n_mm_rows = n_mm;
@@ -1232,6 +1265,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     ++ring_.live;
     last_n_seq_ = n_seq;
     last_n_tok_ = n_tok;
+    last_tree_  = plan.spec_is_tree;
     ring_.head = off + used;
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
@@ -1263,6 +1297,7 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.cu_off   = off(s.d_cu);
     a.q_off    = off(s.d_q);
     a.row_off  = off(s.d_rows);
+    a.parent_off = last_tree_ ? off(s.d_parent) : -1;
     a.row_pitch = (int32_t)max_seqs_;
     a.grp_off  = off(s.d_grp);
     if (mm_on_) {

@@ -163,7 +163,11 @@ std::string ApiError::dump() const {
     if (n_ctx >= 0) e["n_ctx"] = n_ctx;
     json o;
     o["error"] = e;
-    return o.dump();
+    /* A message can carry raw request text (a URL-decoded label, an echoed field name): dump
+     * must survive invalid UTF-8 by replacing it rather than throwing and turning a 404 into
+     * a 500. The JSON parsers refuse invalid UTF-8 in bodies, but URL-decoded params do not
+     * pass through one. */
+    return o.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 ApiError err_bad(const std::string& param, const std::string& why) {
@@ -431,13 +435,16 @@ std::string str_or(const json& o, const char* k, const std::string& def = std::s
 }
 
 /* A conversation's label for /sessions: at most 128 bytes, cut at a UTF-8 character boundary
- * because the label is serialised into JSON. */
+ * because the label is serialised into JSON. Control bytes are dropped at the door: the label
+ * is logged on release and shown on the dashboard, and an embedded ESC sequence would drive
+ * whatever terminal renders it. */
 std::string session_label_of(const std::string& s) {
+    std::string t = log_sanitize(s);
     constexpr size_t kMax = 128;
-    if (s.size() <= kMax) return s;
+    if (t.size() <= kMax) return t;
     size_t cut = kMax;
-    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
-    return s.substr(0, cut);
+    while (cut > 0 && ((unsigned char)t[cut] & 0xC0) == 0x80) --cut;
+    return t.substr(0, cut);
 }
 
 /* One field under several spellings (OpenAI's, vLLM's, llama.cpp's), read as a number (double)
@@ -1053,8 +1060,11 @@ void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
     if (lim.reasoning_effort_map.empty()) return;
     auto it = opt->template_kwargs.find("reasoning_effort");
     if (it == opt->template_kwargs.end()) return;
-    const json v = json::parse(it->second, nullptr, false);
-    if (!v.is_string()) return;
+    /* The kwarg is client text re-parsed as JSON: bound it like a body, a string of brackets
+     * would overflow this worker's stack when the tree comes down. */
+    bool over = false, deep = false;
+    const json v = parse_json_bounded(it->second, 0, &over, &deep);
+    if (over || deep || !v.is_string()) return;
     auto m = lim.reasoning_effort_map.find(v.get<std::string>());
     if (m == lim.reasoning_effort_map.end()) return;
     if (m->second == "none" || m->second == "minimal") {
@@ -1071,9 +1081,11 @@ ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, in
      * variable was in the render. The set is more actionable than the template's traceback. */
     auto it = opt.template_kwargs.find("reasoning_effort");
     if (it != opt.template_kwargs.end() && !lim.reasoning_efforts.empty()) {
-        const json v = json::parse(it->second, nullptr, false);
+        bool over = false, deep = false;
+        const json v = parse_json_bounded(it->second, 0, &over, &deep);
         const std::vector<std::string>& set = lim.reasoning_efforts;
-        if (v.is_string() && std::find(set.begin(), set.end(), v.get<std::string>()) == set.end()) {
+        if (!over && !deep && v.is_string() &&
+            std::find(set.begin(), set.end(), v.get<std::string>()) == set.end()) {
             std::string list;
             for (size_t i = 0; i < set.size(); ++i)
                 list += (i ? (i + 1 == set.size() ? " and " : ", ") : "") + ("'" + set[i] + "'");
@@ -3782,7 +3794,7 @@ std::string anthropic_error_body(const ApiError& e) {
     json o;
     o["type"] = "error";
     o["error"] = json{ { "type", anthropic_error_type(e.status) }, { "message", e.message } };
-    return o.dump();
+    return o.dump(-1, ' ', false, json::error_handler_t::replace);  /* see ApiError::dump */
 }
 
 AnthropicStream::AnthropicStream(const OaiRequest& r, int index, const IReplyParser* parser)

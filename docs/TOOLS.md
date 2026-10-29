@@ -974,3 +974,12 @@ scripts/mctools.sh && scripts/mcstream.sh
 `tools/kbench-analysis.sh` produces the static- and dynamic-analysis fragment that
 `rad-kbench --analysis` splices into its report. `tools/ops_doc_check.sh` is the `ops_doc` test: it
 checks `docs/OPS.md` against the schemas the plugins declare.
+
+`rad-chatparse` (built into the build's `bin/`) answers where a tool call goes wrong without loading
+weights. `rad-chatparse --request REQ.json --rad MODEL.rad --reply R.txt` renders one OpenAI chat
+request as the server would (the container's template or `--override-chat-template`,
+`--chat-template-kwargs`, the plugin's declared reply format, or the template's own with
+`--no-plugin`), then reads each reply file as the model's output: parsed whole, parsed through the
+SSE stream as a client reassembles it, and run through the request's tool-call grammar. It prints one
+JSON object; the exit status is 1 when the two parses disagree or the grammar refuses a token.
+`--render-raw T.jinja --context CTX.json` renders a template with any context.

@@ -261,6 +261,16 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      weight_prefetch_off;
+
+    /* ---- appended in ABI 31 (tree verification) */
+    /* Nonzero: grow the block drafter's proposals into a tree (rad_drafter_tree) where the plugin
+     * can. The engine sets it where the plugin's probe said trees pay (RadArchProbe::tree_pays)
+     * and the drafter decodes speculatively; 0 keeps the chain. A plugin that grows no trees
+     * ignores it. 64-bit so it starts past the older
+     * struct's tail padding, where a plugin built against it would read nothing.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int64_t  draft_tree;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */
@@ -661,6 +671,17 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
  * embedding-only or encoder-only plugin declares none. */
 int rad_declare_logits(RadBuilder* b, rad_buf logits);
 
+/* Scored steps (RadBatch::score_only). A plugin whose lm_head is the bf16 table `table`
+ * ([n_vocab, n_embd], e.g. a tied embedding, whatever encoding the head itself is read at) and
+ * whose final-normed rows land in `hidden` ([rows, n_embd] bf16, row k the step's k-th sampled row,
+ * as the lm_head reads them) declares both here. On a step where every sampled row is a scored row
+ * the core sets RadBatch::score_only, the plugin issues everything but the lm_head, and the core
+ * reads the hidden rows and the candidates' table rows back and takes the dot products on the host
+ * in f64: the logits a scored request returns, at no head read on the card (half a gigabyte a step
+ * at a 128K bf16 vocabulary). Optional; one rank only (the core ignores it at --tp > 1).
+ * Additive export; RAD_ABI_VERSION does not move. */
+int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table);
+
 /* Which buffer holds this step's pooled vectors, what an embedding model returns instead of
  * logits. Row s is sequence s's whole input pooled into one vector, with whatever pooling the
  * model was trained with (a mean, the last token, a CLS row). The core reads rows [0, n_seq) back
@@ -764,6 +785,25 @@ int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
  * checkpoint was trained with is the plugin's to know. */
 int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
 
+/* A block drafter whose one pass proposes a tree rather than a chain. Called once, after
+ * rad_declare_drafter. `parents` is an i32 buffer at the proposal's pitch: row i's j-th entry is
+ * the parent of the proposal's j-th token as a node index, 0 for the token the verify starts from
+ * (the bonus token) and j' + 1 for the proposal's j'-th token, with every parent before its child.
+ * Additive export; RAD_ABI_VERSION does not move.
+ *
+ * Each verify then runs the proposal as a tree in the same rows: node j at row j, rotated at the
+ * committed end + its depth, its K and V stored at the committed end + j, and every trunk step
+ * carries RadBatch::spec_parent, which the plugin hands its attention so a row sees, inside its
+ * own block, only its ancestors. The acceptance follows the deepest root path the target agrees
+ * with; the core then moves that path's K and V into place in every paged group. A proposal from
+ * prompt lookup is verified as the chain-shaped tree.
+ *
+ * Requirements on the plugin: the trunk's attention honours spec_parent on every decode row; the
+ * drafter's context pass stores K and V through the slot mapping only (it is staged per node, the
+ * rejected ones at slot -1); and the step is issued ahead, behind which the block driver queues
+ * the drafter's passes (the KL mode drafts nothing, so trees do not apply there). */
+int rad_drafter_tree(RadBuilder* b, rad_buf parents);
+
 /* Whether this engine's launches chain (RadKernelChainFn, abi/rad_abi.h): the core's decision, on
  * the AQL backend only, which keeps a completion counter per queue, where the model's plugin
  * measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
@@ -775,11 +815,14 @@ int rad_chain_on(void);
 /* A block drafter that also serves a shorter block: the plugin declared its query pass at `block`
  * rows a sequence as well as at RadDrafterDecl::block, with the same anchor convention, so the
  * core may stage a step's block at either. The short block proposes
- * `block - (RadDrafterDecl::block - depth)` tokens. Called once, after rad_declare_drafter.
+ * `block - (RadDrafterDecl::block - depth)` tokens; a tree drafter's (rad_drafter_tree, declared
+ * first) a tree of its own over the shorter pass, at most `block - 1` nodes, which needs only that
+ * the short block be 2 rows or more. Called once, after rad_declare_drafter.
  *
  * The block is proposed whole, so its length is paid for by every drafting sequence whatever each
  * verifies: at one sequence a long block's extra drafts pay, at many its rows and its weaker first
- * positions cost more than they bring. The core picks per step (--draft-short-from). */
+ * positions cost more than they bring. The core picks per step (--draft-short-from; by default
+ * a tree's from two decoding sequences on, a chain's never). */
 /* ---- appended in ABI 27 (a block drafter's short block) */
 int rad_drafter_short_block(RadBuilder* b, int64_t block);
 
@@ -1259,8 +1302,8 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  *
  * `enc_kind` (RAD_ENC_*, rad_runtime.h) and `enc_slot`, the media's 1-based number within its kind,
  * say where the latents go. A latent-upscaled request's keyframes, pinned on the grid its steps
- * run on, are encoded at W' x H' before the prompt pass and again at W x H, into the same slots,
- * after the VUPSCALE pass and before the first evaluation at W x H; references, in their own grid,
+ * run on, are encoded at W' x H' before the prompt pass, then again at W x H into the same slots
+ * after the VUPSCALE pass and before the first evaluation at W x H. References, on their own grid,
  * are encoded once. The media's shape is the plugin's to accept: rad_arch_encode_geom
  * (below) refuses what the encoders cannot take, and the step's packed sequence with the encoded
  * media in it is the plugin's rad_arch_video_pack.
@@ -1523,6 +1566,14 @@ typedef struct RadArchProbe {
      * and its kernels read that width. --state-cache-dtype f16 is refused at startup with the
      * plugin named when this is 0. */
     int32_t state_f16_ok;
+
+    /* ---- appended in ABI 31 (tree verification) */
+    /* Nonzero when this plugin can grow its block drafter's proposals into a tree
+     * (rad_drafter_tree) and measured its speculative step faster with one. The core then asks for
+     * a tree (RadBuildCtx::draft_tree) wherever that drafter decodes speculatively. Zero keeps the
+     * chain: a plugin that never measured trees asks for none. 64-bit so it starts past the older
+     * struct's tail padding, which a plugin built against it may copy over. */
+    int64_t tree_pays;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

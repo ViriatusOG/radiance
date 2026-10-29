@@ -123,6 +123,16 @@ struct Dflash2 {
         int64_t group    = 16;
         int64_t sel_rank = 256;   /* the codebooks' width */
         int64_t sel_topk = 16;    /* candidates kept per position */
+        /* Propose a tree of `steps()` nodes instead of the selector's one path (`dflash_tree`,
+         * rad_drafter_tree): best-first over the candidate lattice by path probability, each
+         * edge's probability the softmax of its scores over the K candidates divided by
+         * `tree_temp`. False: the greedy walk. */
+        bool    tree      = false;
+        double  tree_temp = 1.0;
+        /* A tree's draft nodes a step, 0 for `steps()`. More than the block drafts is a wider tree
+         * over the same lattice (its depth is still at most `steps()`); the proposal buffers, the
+         * drafter's declared depth and the verify are this wide. */
+        int64_t tree_nodes = 0;
         int64_t window   = 0;     /* sliding attention width, 0 for none */
         int     causal   = 0;
         /* The target's embedding scale, applied to the query block as the drafter was trained
@@ -132,15 +142,18 @@ struct Dflash2 {
          * pass (prefetch_beside, rad_arch.h); 0 reads none. */
         int64_t prefetch = 0;
 
-        /* Also declare the short block's query pass (kShortBlock rows) for --draft-short-from; an
-         * architecture that does not call rad_drafter_short_block leaves it off and its graph as
-         * it was. */
+        /* Also declare the short block's query pass (kShortBlock rows, or `short_rows`) for
+         * --draft-short-from; an architecture that does not call rad_drafter_short_block leaves
+         * it off and its graph as it was. A tree's selector at that block grows a tree of its own
+         * over the shorter pass, `short_rows - 1` nodes or fewer. */
         int     short_block = 0;
         /* --draft-coupling: the temperature of the draft law Q the coupled walk samples from
          * (dflash_couple_propose's `q_temp`). Any value keeps the output exact; it only moves
          * acceptance, sum min(P, Q). */
         double  q_temp = 1.0;
+        int64_t short_rows  = 0;
         int64_t steps() const { return block - 1; }
+        int64_t nodes() const { return tree && tree_nodes > 0 ? tree_nodes : steps(); }
         int64_t ng(int64_t n_embd) const { return group ? n_embd / group : 0; }
         /* The kernel projection emits [2, taps, NG] per token (prepare's set, then finish's);
          * `dflash_conv` reads a slice of it at the full row pitch. */
@@ -198,6 +211,8 @@ struct Dflash2 {
         /* --draft-coupling: [max_seqs, DRAW_WORDS] draws the engine stages, and [steps, max_seqs,
          * STATE_WORDS] states it reads back (abi/rad_spechub.h). Both or neither. */
         rad_buf couple_draws = 0, couple_state = 0;
+        /* [max_seqs, steps] i32  a tree's parents (Config::tree, rad_drafter_tree); 0 otherwise */
+        rad_buf parents = 0;
     };
 
     /* Whether the 2-bit draft head is vocab-sharded (rad_arch.h: vocab_head_sharded), so whoever
@@ -277,6 +292,7 @@ struct Dflash2 {
      * and the selector strides by it, so each has an op of its own; every other op is per row. */
     rad_op op_aconv_lo[MAX_LAYERS] = {}, op_fconv_lo[MAX_LAYERS] = {}, op_sel_lo = 0;
     int64_t block_lo = 0;
+    int64_t sel_lo_nodes = 0;   /* a tree's nodes at the short block (op_sel_lo) */
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn = 0;
     rad_op op_act = 0, op_ar = 0, op_add = 0, op_final = 0;
     /* The residual add folded into the norm after it (add_rmsnorm), issued in place of op_add and
@@ -718,7 +734,10 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      * layers. Planned from those alone, its range would end before the coefficients' begins and
      * the plan could lay one over the other. Read by the last convolution as well, it is live
      * wherever the coefficients are. */
-    block_lo = cfg.short_block && cfg.block > kShortBlock ? kShortBlock : 0;
+    {
+        const int64_t rows = cfg.short_rows > 0 ? cfg.short_rows : kShortBlock;
+        block_lo = cfg.short_block && rows >= 2 && cfg.block > rows ? rows : 0;
+    }
     for (int64_t l = 0; block_lo && l < g.n_layer; ++l) {
         const int i = (int)l;
         op_aconv_lo[i] = rw(b, RAD_OP(b, "dflash_conv",
@@ -943,15 +962,65 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                   RAD_WEIGHTS(w_selp)),
               {w.sel_h}, {w.hp});
     /* `anchor_stride` is `block`: the operand is the step's token_ids, `block` per sequence with
-     * the anchor first. */
-    op_sel = rw(b, RAD_OP(b, "dflash_select",
+     * the anchor first.
+     *
+     * A tree (Config::tree): `dflash_tree` grows `steps` nodes best-first over the same lattice
+     * and the same edge scores, writing each node's parent beside its token. Where no library
+     * serves it the block falls back to the chain and says so; the caller reads `cfg.tree` after
+     * declare to decide whether to tell the core (rad_drafter_tree). --draft-coupling samples one
+     * path per sequence, so a coupled drafter proposes the chain. */
+    if (cfg.tree && (w.couple_draws || w.couple_state)) {
+        rad_note(b, "DFlash2: --draft-coupling samples a chain; the drafter proposes no tree");
+        cfg.tree = false;
+    }
+    if (cfg.tree) {
+        op_sel = RAD_OP(b, "dflash_tree",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", cfg.steps()),
+                              RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
+                              RAD_INT("n_vocab", g.n_vocab_all),
+                              RAD_INT("anchor_stride", cfg.block),
+                              RAD_INT("nodes", cfg.nodes()), RAD_F64("temp", cfg.tree_temp),
+                              RAD_STR("dtype", g.dtype)),
+                   RAD_WEIGHTS(w_pred, w_succ));
+        if (op_sel && rad_op_resolved(b, op_sel)) {
+            rw(b, op_sel, {w.cand, w.unary, w.hp}, {w.tokens, w.parents});
+        } else {
+            rad_note(b, "DFlash2: no library serves dflash_tree here; the drafter proposes its "
+                        "selector's chain");
+            cfg.tree = false;
+            op_sel = 0;
+        }
+    }
+    if (!cfg.tree) op_sel = rw(b, RAD_OP(b, "dflash_select",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", cfg.steps()),
                               RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
                               RAD_INT("n_vocab", g.n_vocab_all),
                               RAD_INT("anchor_stride", cfg.block), RAD_STR("dtype", g.dtype)),
                    RAD_WEIGHTS(w_pred, w_succ)),
                {w.cand, w.unary, w.hp}, {w.tokens});
-    if (block_lo)
+    if (block_lo && cfg.tree) {
+        /* A tree over the short block's own lattice (the pass attends across its block, so it is
+         * not the full pass's prefix): as many nodes as the block drafts, or the tree's own count
+         * where that is fewer. */
+        sel_lo_nodes = std::min<int64_t>(cfg.nodes(), block_lo - 1);
+        op_sel_lo = RAD_OP(b, "dflash_tree",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", block_lo - 1),
+                                 RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
+                                 RAD_INT("n_vocab", g.n_vocab_all),
+                                 RAD_INT("anchor_stride", block_lo),
+                                 RAD_INT("nodes", sel_lo_nodes), RAD_F64("temp", cfg.tree_temp),
+                                 RAD_STR("dtype", g.dtype)),
+                      RAD_WEIGHTS(w_pred, w_succ));
+        if (op_sel_lo && rad_op_resolved(b, op_sel_lo)) {
+            rw(b, op_sel_lo, {w.cand, w.unary, w.hp}, {w.tokens, w.parents});
+        } else {
+            rad_note(b, "DFlash2: no library serves dflash_tree at the short block; the tree keeps "
+                        "its own block under load");
+            op_sel_lo = 0;
+            block_lo = 0;
+            sel_lo_nodes = 0;
+        }
+    } else if (block_lo)
         op_sel_lo = rw(b, RAD_OP(b, "dflash_select",
                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", block_lo - 1),
                                      RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
@@ -1197,10 +1266,19 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     }
 
     RAD_ISSUE_N(c, op_hp, S, brows(w.sel_h, S), RAD_W(w_selp), brows(w.hp, S));
-    RAD_ISSUE_N(c, lo ? op_sel_lo : op_sel, batch->n_seq, bcol(w.cand, 0, cfg.sel_topk, S),
-                bcol(w.unary, 0, cfg.sel_topk, S), brows(w.hp, S),
-                praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
-                brows(w.tokens, batch->n_seq));
+    /* A tree's outputs as views exactly its nodes wide, at the buffers' row pitch: at the short
+     * block it grows fewer nodes than a row holds, and the proposals are read at the full pitch. */
+    const int64_t nn = lo ? sel_lo_nodes : cfg.nodes();
+    if (cfg.tree)
+        RAD_ISSUE_N(c, lo ? op_sel_lo : op_sel, batch->n_seq, bcol(w.cand, 0, cfg.sel_topk, S),
+                    bcol(w.unary, 0, cfg.sel_topk, S), brows(w.hp, S),
+                    praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
+                    bcol(w.tokens, 0, nn, batch->n_seq), bcol(w.parents, 0, nn, batch->n_seq));
+    else
+        RAD_ISSUE_N(c, lo ? op_sel_lo : op_sel, batch->n_seq, bcol(w.cand, 0, cfg.sel_topk, S),
+                    bcol(w.unary, 0, cfg.sel_topk, S), brows(w.hp, S),
+                    praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
+                    brows(w.tokens, batch->n_seq));
     if (op_couple)
         RAD_ISSUE_N(c, lo ? op_couple_lo : op_couple, batch->n_seq,
                     bcol(w.cand, 0, cfg.sel_topk, S), bcol(w.unary, 0, cfg.sel_topk, S),

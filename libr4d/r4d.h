@@ -82,6 +82,10 @@ struct R4DArgs {
     // The engine's chained launch (RadKernelChainFn, r4d_chain.h): the decode path launches its
     // chained forms. fill_paged sets it from the resolved `chain` parameter.
     int  chain;
+    // A tree verify (attn_paged_qrow_tree, docs/OPS.md): RadBatch::spec_parent, one int32 a query
+    // row, -2 for an ordinary causal row, else the row's parent's index within its sequence's rows
+    // (-1 for the block's first). Read only by the O_TREE instances; null elsewhere.
+    const int* spec_parent;
 };
 
 // Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook
@@ -129,6 +133,9 @@ long r4d_attn_decode_h128_gqa2w_scratch_bytes(const R4DArgs* a);
 // ...with q at R4DArgs::q_ld (attn_paged_qrow).
 int  r4d_attn_decode_h256_gqa2_qld_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa2_qld_bf16kv (const R4DArgs* a, hipStream_t stream);
+// ...and a tree verify's mask from R4DArgs::spec_parent (attn_paged_qrow_tree).
+int  r4d_attn_decode_h256_gqa2_qld_tree_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h256_gqa2_qld_tree_bf16kv (const R4DArgs* a, hipStream_t stream);
 // The geometry the attention kernels above are compiled for, so a caller can check a model
 // before the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
@@ -291,18 +298,22 @@ void r4d_ar_ipc_enable_peer(long peer);
 // VRAM. Zeroed; the address is valid on every card and the CPU. Startup-only.
 long r4d_ar_host_alloc(long size);
 void r4d_ar_host_free(long p);
+// `stage`, the last argument of every 2-rank kernel below: 0, or a host-mailbox instance's mirror
+// of its slots in this card's VRAM (same layout), which the reader's push check fills as it reads
+// the slot so the reduce reads VRAM instead of the link a second time (r4d_ar_seq.h).
 // Exact sum, fp32 accumulate, bf16 / fp16 / fp32 payload (dtype 0 / 1 / 2).
 void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                                 long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                                 long dtype, long stream, long nblocks, long nthreads, long drain,
-                                long acq);
+                                long acq, long stage = 0);
 // Same topology, with the wire payload Walsh-Hadamard rotated and quantised to 6 bits per element
 // in groups of 64 (plus a bf16 scale per group). Lossy; bf16 / fp16 payload only. loc_pack is this
 // rank's own packed copy, so the reduce folds exactly the bytes it sent.
 void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                                long seq_ctrs, long loc_pack, long slot_stride_bytes,
                                long scale_off_bytes, long inp, long out, long n_elem, long dtype,
-                               long stream, long nblocks, long nthreads, long drain, long acq);
+                               long stream, long nblocks, long nthreads, long drain, long acq,
+                               long stage = 0);
 // The exact all-reduce of `y` [M][n] bf16 with hc_write as its epilogue: h[r][c*n + i] +=
 // inj[r][c] * y[r][i] over the reduced y, byte-identical to all_reduce then hc_write. `irow` and
 // `hrow` are the pitches of inj [M][hc] and h [M][hc*n] in elements; y is tight. A non-zero `gate`
@@ -311,7 +322,7 @@ void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_fla
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream, long nblocks, long nthreads,
-                     long drain, long acq, long gate, long gate_ctr);
+                     long drain, long acq, long gate, long gate_ctr, long stage = 0);
 // The same with the MoE gather as its prologue: y is produced, not read, from the routed experts'
 // rows `ye` [M*top_k][ye_ld] summed to token order by weights `ew` [M][ew_ld] and `sorted`
 // [M*top_k], with the shared arm `sh` [M][sh_ld] and its gate `sg` folded when both are non-zero.
@@ -323,7 +334,8 @@ int  r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags,
                             long n, long hc, long irow, long hrow, long ye, long ew, long sorted,
                             long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                             long top_k, long sig, long stream, long nblocks, long nthreads,
-                            long drain, long acq, long inv, long gate, long gate_ctr);
+                            long drain, long acq, long inv, long gate, long gate_ctr,
+                            long stage = 0);
 // r4d_ar_hc_write and r4d_ar_gather_hc_write on the rotated 6-bit wire (r4d_ar_oneshot_2rank_wht6's
 // format, loc_pack and scratch split): byte-identical to all_reduce on that wire then hc_write,
 // with `ye` non-zero preceded by moe_gather. Gather operands as r4d_ar_gather_hc_write; its slot
@@ -336,7 +348,7 @@ int  r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, l
                           long irow, long hrow, long ye, long ew, long sorted, long sh, long sg,
                           long ye_ld, long ew_ld, long sh_ld, long sg_ld, long top_k, long sig,
                           long stream, long nblocks, long nthreads, long drain, long acq,
-                          long gate, long gate_ctr);
+                          long gate, long gate_ctr, long stage = 0);
 int  r4d_ar_max_blocks(void);                                   // the two 2-rank kernels
 void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit payload only
 
@@ -349,7 +361,7 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream, long nblocks,
                          long nthreads, long drain, long acq, long dpitch,
-                         long spitch);
+                         long spitch, long stage = 0);
 
 // ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
 // The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). Peer arguments are in ascending
@@ -703,8 +715,8 @@ void r4d_moe_gemm_pin_down_dec(int pin);
 void r4d_hc_read_pin_prefill(int form);
 // Test hook: pins the gated residual read's decode kernels. 0 is the launcher's rule (kernels A and
 // B as one grid at one to seven rows where the per-stream counters exist, the tiled up-mix's K
-// passes pipelined from eight rows), 1 the kernels the rule replaced (A, then the up-mix in a second
-// launch; the tiled up-mix's passes in sequence). Bit-identical; r4d_selftest compares their bytes
+// passes pipelined from eight rows), 1 the two-grid form (A, then the up-mix in a second launch;
+// the tiled up-mix's passes unpipelined). Bit-identical; r4d_selftest compares their bytes
 // and --perfhc times both.
 void r4d_hc_read_pin_decode(int form);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
@@ -745,6 +757,13 @@ int  r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws,
                                  int a_ld, int sa_ld, int w_ld, int sw_ld,
                                  int q_ld, int s_ld, int y_ld, long stream);
 int  r4d_gemm_fp8a8_gated_nt_m16_max_m(void);
+// The same fold at any M (`gemm_nt_q_gated_wide`): past the narrow tile's 64 rows it takes the gated
+// prefill tile, whose accumulators are the unfused prefill GEMM's, so its bytes are the pair's.
+int  r4d_gemm_fp8a8_gated_nt_wide(long a, long ascale, long wq, long ws,
+                                  long q, long s, long y, int act,
+                                  int M, int K, int nout,
+                                  int a_ld, int sa_ld, int w_ld, int sw_ld,
+                                  int q_ld, int s_ld, int y_ld, long stream);
 // The narrow GEMM with a bias: `bias` bf16 [N], added to each output column's f32 accumulator before
 // its one rounding, and C written at row pitch `c_ld` (0 = N), so C may be a column slice of a wider
 // buffer. Never split. M up to r4d_gemm_fp8a8_nt_m16_max_m(); K a multiple of 128, N of 16.
@@ -799,7 +818,7 @@ int  r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long q, long s,
 int  r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, int n, int mode,
                              int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
 // The activation is rounded to bf16 before the product, matching the unfused `sigmoid` then `mul`
-// pair with a bf16 buffer between them.
+// pair with a bf16 buffer between them; `mode` 2 is the plain product (`mul` + quantiser).
 // The same epilogue with the gate in a different buffer from what it scales, as in gated
 // attention: `x` is the attention output and the gate a column slice of the [q|gate] projection.
 // A row is then a (token, head) pair; both sources are a fixed stride apart and the scale plane
@@ -821,7 +840,7 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int M, int n, float eps, float wadd, int w_f32,
                               int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                               int nblocks, int nthreads, int drain, int acq, int wire,
-                              long loc_pack, long loc_scale_off, long wp = 0);
+                              long loc_pack, long loc_scale_off, long wp = 0, long stage = 0);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
 // Its rotated int8 form, as r4d_rmsnorm_had_quant_i8g: the reduction and the norm unchanged, the
 // norm's pass quantised by had_quant_act_i8g's rule. No post-norm.
@@ -831,7 +850,7 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_
                                   int M, int n, float eps, float wadd, int w_f32,
                                   int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                   int nblocks, int nthreads, int drain, int acq, int wire,
-                                  long loc_pack, long loc_scale_off);
+                                  long loc_pack, long loc_scale_off, long stage = 0);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8
@@ -840,7 +859,7 @@ int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags
                              long seq_ctrs, long slot_stride16, long x, long res, long w, long wp,
                              long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                             int drain, int acq);
+                             int drain, int acq, long stage = 0);
 // ...and at four ranks, on the wide family's transport: r4d_ar_oneshot_4rank_exact's IPC
 // arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
 // engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h), and, with
@@ -913,7 +932,7 @@ void r4d_ar_ln_had_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
                             long x, long residual, long wgain, long out_bf16, long q, long s,
                             int M, int K, int had, float eps, float wadd,
                             long stream, int nblocks, int nthreads, int drain, int acq,
-                            int wire = 0);
+                            int wire = 0, long stage = 0);
 // An elementwise gated product, then the same Hadamard and int8 quantiser. Mode 0 is silu(a)*b
 // (down_proj's input, vLLM's silu_and_mul); mode 1 is sigmoid(a)*b (o_proj's input, since
 // Qwen3_5Attention computes attn_output * sigmoid(gate)). Strides are in elements and may be 0 for

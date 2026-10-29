@@ -3,8 +3,9 @@
 # speculator merged in (gemma-4-31B-it-speculator.dflash2: block 8, 7 drafts a pass, int8 head), and
 # the vision tower. Converted with data/recipes/gemma4-31b-dense-bf16-w4a8-df2.recipe, or downloaded
 # from https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2. The drafter
-# serves the depth it was trained at (`auto`). Sampling defaults are the checkpoint's
-# generation_config; thinking is switched per request (chat_template_kwargs).
+# serves the depth it was trained at (`auto`), its proposals verified as a 7-node tree a step (on
+# by default for this drafter). Sampling defaults are the
+# checkpoint's generation_config; thinking is switched per request (chat_template_kwargs).
 #
 # --tp 4 over four cards; chained launches, the weight reads beside the collectives and the prefill
 # overlap turn themselves on there.
@@ -12,9 +13,10 @@
 # tokens of a step, with one decode-only step after it, so a long prompt holds the others up by a
 # fraction of a chunk rather than all of it. 16 sequences, as measured below.
 #
-# On 4x R9700 (PCIe 4.0 x16): one user 390 code / 288 prose / 208 story tok/s, and
-# 590 after a 6442-token prompt (prefill 5962 tok/s); 302 / 512 / 658 / 835 / 981 tok/s aggregate
-# at 1 / 2 / 4 / 8 / 16 users (BetterBench, thinking off).
+# On 4x R9700 (PCIe 4.0 x16), BetterBench with thinking off: 378 tok/s single-stream (weighted
+# over its categories; JSON 593, math 496, code 417, prose 230) and 341 / 552 / 727 / 877 / 960
+# tok/s aggregate at 1 / 2 / 4 / 8 / 16 users. The chain on the same cards: 352, and 315 / 505 /
+# 680 / 816 / 907. Prefill of a 6442-token prompt: about 5960 tok/s.
 #
 # Measured with the host CPU's performance governor and its idle states past C1 off. The cards'
 # peer-to-peer traffic crosses the root complex, so the host's power state shows in every step, and

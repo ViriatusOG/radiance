@@ -413,6 +413,9 @@ extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, 
  * The gated attention's gate is a sigmoid, so nothing issues this row with silu and the shim's
  * `mode` defaults to 1.
  *
+ * `act` none is the plain product: the chain is `mul` then `quant_act_fp8`, and the kernel rounds
+ * the bf16 product once, exactly as mul_bf16 does. The product is TMP(0) or `out_bf16`.
+ *
  * TMP(0) is act(gate), an [M, n] bf16 plane the fusion never writes. `out_bf16` is an operand: the
  * kernel stores the product there when asked and takes the codes over those bytes.
  */
@@ -423,7 +426,28 @@ extern "C" int r4d_fuse_gate_quant_fp8(const RadParam* p, int n_p, uint64_t pres
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
     /* The shim (r4d_fused_quant_fp8.hip) defaults this row's `mode` to 1 (sigmoid). */
-    if (!act_is(p, n_p, "sigmoid", "sigmoid")) return RAD_E_UNSUPPORTED;
+    const bool none = act_is(p, n_p, "sigmoid", "none");
+    if (!none && !act_is(p, n_p, "sigmoid", "sigmoid")) return RAD_E_UNSUPPORTED;
+    const int16_t mid = RAD_FUSE_HAS(present, 4) ? (int16_t)4 : RAD_FUSE_TMP(0);
+
+    if (none) {
+        switch (step) {
+        case 0: {
+            /* gate * x, rounded to bf16 once: mul_bf16's store. */
+            Step s(out, "mul");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+            return s.wire({ 0, 1, mid });           /* a, b, y */
+        }
+        case 1: {
+            Step s(out, "quant_act_fp8");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group")
+             .mirror(p, n_p, "dtype");
+            return s.wire({ mid, 2, 3 });           /* x, q, scale */
+        }
+        default:
+            return RAD_E_NOTFOUND;
+        }
+    }
 
     switch (step) {
     case 0: {

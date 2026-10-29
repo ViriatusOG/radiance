@@ -301,9 +301,12 @@ extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {
  * row with "invalid argument". q_len is the band's upper bound, since the region is sized once
  * for the worst step.
  *
- * The size is the maximum over every sequence count up to max_seqs: S * splits(S) is not monotone
- * in S (at kv_heads 2 the h256 law gives 60 at twelve sequences and 63 at nine, and the h128 law's
- * step-up doubles splits at one count only). The laws are closed forms, so the sweep is cheap. */
+ * The size is the maximum over every sequence count up to max_seqs and every query length up to
+ * the band's: S * splits(S) is not monotone in S (at kv_heads 2 the h256 law gives 60 at twelve
+ * sequences and 63 at nine, and the h128 law's step-up doubles splits at one count only), and the
+ * h256 law's targets (r4d_decode_splits: 256 workgroups at q_len * gqa <= 32; above, 128 to 16384
+ * tokens deep and more past it) can give a shorter query more splits (at gqa 6 and 16384 tokens, 5
+ * rows a sequence need 1.67x the band bound 6's). The laws are closed forms, so the sweep is cheap. */
 // Per-geometry byte counts over the shared partial layout, so one sweep serves all.
 // which: 0 = h256/gqa6, 1 = h128/gqa4, 2 = h256/gqa2 (Gemma 4 windowed).
 static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
@@ -332,7 +335,7 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long lo
         r.kv_heads  = (int)(gqa > 0 ? n_head / gqa : n_head) * rep;
         r.kv_rep    = rep;
         r.num_seqs  = (int)max_seqs;
-        r.q_len     = (int)r4d_geti_or(a, "q_len", 1);
+        const long long q_hi = std::max(1LL, r4d_geti_or(a, "q_len", 1));
         r.max_ctx   = (int)r4d_geti_or(a, "max_ctx", 0);
         r.block_size = (int)r4d_geti_or(a, "block_size", 16);
         r.splits    = sp;
@@ -340,11 +343,13 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long lo
          * for a launch that later picks more, so refuse. */
         if (r.max_ctx <= 0) return R4D_NO(RAD_E_INVAL);
         int64_t worst = 0;
-        for (long long n = 1; n <= max_seqs; ++n) {
-            r.num_seqs = (int)n;
-            const int64_t need = decode_scratch_bytes_of(&r, which);
-            if (need > worst) worst = need;
-        }
+        for (long long q = 1; q <= q_hi; ++q)
+            for (long long n = 1; n <= max_seqs; ++n) {
+                r.q_len    = (int)q;
+                r.num_seqs = (int)n;
+                const int64_t need = decode_scratch_bytes_of(&r, which);
+                if (need > worst) worst = need;
+            }
         return worst;
     }
 
@@ -515,6 +520,32 @@ extern "C" int r4d_rad_attn_qrow_decode_h256_gqa2_bf16(const RadArgs* a, RadStre
     int rc = decode_common(a, &r, 256, 2, 0, 1, true);
     if (rc != RAD_OK) return rc;
     return r4d_attn_decode_h256_gqa2_qld_bf16kv(&r, (hipStream_t)s);
+}
+
+/* ...under attn_paged_qrow_tree: the same, with the tree verify's mask from `spec_parent` (operand
+ * 8, one int32 a query row; docs/OPS.md). Causal only, as the op is. */
+static int tree_operand(const RadArgs* a, R4DArgs* r) {
+    const RadTensor* tp = a->n_t > 8 ? r4d_opt(a, 8) : nullptr;
+    if (!tp || !tp->data) return R4D_NO(RAD_E_INVAL);
+    if (tp->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (r4d_numel(tp) < r4d_q_total(*r)) return R4D_NO(RAD_E_SHAPE);
+    if (r->causal != 1 || r->causal_seq) return R4D_NO(RAD_E_UNSUPPORTED);
+    r->spec_parent = (const int*)tp->data;
+    return RAD_OK;
+}
+extern "C" int r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 2, 0, 1, true);
+    if (rc == RAD_OK) rc = tree_operand(a, &r);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa2_qld_tree_fp8kv(&r, (hipStream_t)s);
+}
+extern "C" int r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 2, 0, 1, true);
+    if (rc == RAD_OK) rc = tree_operand(a, &r);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa2_qld_tree_bf16kv(&r, (hipStream_t)s);
 }
 
 /* Head_dim 128 at 8 queries per kv head, any window, causal or not, q_len up to 16, under

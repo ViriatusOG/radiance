@@ -716,9 +716,10 @@ int main(int argc, char** argv) {
                 "recipe is checked against");
         return 1;
     }
-    /* An imported quantisation is recorded as the descriptor of the plugin serving it; the engine
-     * selects by exact match, and each weight states its own encoding. */
-    if (imported) {
+    /* An imported quantisation, or block fp8 served by a family that claims no descriptor for it,
+     * is recorded as the descriptor of the plugin serving it; the engine selects by exact match,
+     * and each weight states its own encoding. */
+    if (!plugins.arch_plugin.empty() && plugins.arch_quant != meta.quant) {
         meta.quant = plugins.arch_quant;
         meta.finish();
     }
@@ -1304,11 +1305,18 @@ int main(int argc, char** argv) {
                 /* An imported weight is re-laid row by row (ckpt_plane_rows); its bytes are not
                  * the plane's. */
                 if (!L.src.imported && (L.src.concat_dim == 0 || src.size() == 1)) {
+                    /* Pieces that share one scale tensor (shards under `X.weight_scale`) have
+                     * that one plane, written once. */
+                    const bool shared = k > 0 && std::all_of(src.begin(), src.end(),
+                                                             [&](const SrcTensor* s) {
+                                                                 return s == src[0];
+                                                             });
                     int64_t off = 0;
                     for (const SrcTensor* s : src) {
                         if (w.write_plane(idx, k, off, s->data, s->bytes) != RAD_OK)
                             return RAD_E_IO;
                         off += s->bytes;
+                        if (shared) break;
                     }
                     if (off != pb) {
                         RAD_ERR("'%s': its sources hold %lld bytes of plane '%s' and the "

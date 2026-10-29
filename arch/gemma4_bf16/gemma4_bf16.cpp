@@ -423,6 +423,12 @@ struct Gemma4Attn {
      * the copies of k and v too, ahead of the unfused prologue, which reads them dense. */
     rad_op op_attn_row = 0, op_attn_dec = 0, op_lift_q = 0, op_lift_k = 0, op_lift_v = 0;
     int64_t dec_hi = 0;
+    /* Tree verification (rad_drafter_tree): attention that honours RadBatch::spec_parent over a
+     * step's decode rows, reading q in the row (attn_paged_qrow_tree) or dense (attn_paged_tree,
+     * after op_tree_lift copies it out). Declared only when `tree` is set before declare; 0 where
+     * no library serves it, which the model reads as "no trees". */
+    bool   tree = false;
+    rad_op op_attn_tree = 0, op_tree_lift = 0;
     /* the feed-forward's gate_up read into the cache beside this block's all-reduce, or 0 (see
      * "Prefetch beside the reductions") */
     rad_op     op_pf = 0;
@@ -697,6 +703,20 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
         }
     }
 
+    /* The tree form over the decode rows: a verify block of 1 + n_spec rows a sequence, so the
+     * split-KV band (q_len * gqa <= 64) covers it at every class here. In the row where the
+     * prologue leaves q there, else dense after a copy. */
+    if (tree) {
+        const int64_t thi = std::min<int64_t>(
+            g.max_tok, std::max<int64_t>({ (int64_t)1, 64 / cls.gqa(), (int64_t)g.max_spec + 1 }));
+        if (fused && op_qnr && rad_op_declared(b, "attn_paged_qrow_tree"))
+            op_attn_tree = attn("attn_paged_qrow_tree", {w.qkv}, thi);
+        if (!op_attn_tree && rad_op_declared(b, "attn_paged_tree")) {
+            op_attn_tree = attn("attn_paged_tree", {w.q}, thi);
+            if (op_attn_tree && fused && op_qnr) op_tree_lift = lift(qd, w.q);
+        }
+    }
+
     /* With the cache store folded into the prologue where a library serves it
      * (qkv_norm_rope_kv_store: the same prologue, then kv_store of the finished k and v from the
      * same launch, byte for byte), one launch a layer fewer. Declared after the attention ops,
@@ -947,26 +967,51 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
 
     if (op_kv) RAD_ISSUE(c, op_kv, K, V, praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
-    /* attn_paged reads q dense: one row of the row's slice is, a taller step copies q out. */
-    rad_op a_op = op_attn;
-    RadOperand a_q = brows(w.q, T);
-    if (op_attn_row) {
-        a_op = op_attn_row;
-        a_q  = Q;
-    } else if (op_attn_dec && batch->max_q_len <= dec_hi) {
-        a_op = op_attn_dec;
-        a_q  = Q;
-    } else if (row) {
-        if (T == 1) a_q = Q;
-        else        RAD_ISSUE_N(c, op_lift_q, T, Q, brows(w.q, T));
+    /* A tree step (rad_drafter_tree): every decode row's verify block sees, inside the block,
+     * only that row's ancestors (RadBatch::spec_parent), so the decode rows go through the tree
+     * form. On a step of decode rows alone that is the step's attention; beside a prefill chunk the
+     * ordinary form runs over every row first and the tree form then rewrites the decode rows,
+     * which come first (spec §8). */
+    const bool tree_step = op_attn_tree && batch->spec_parent && batch->draft_pass == 0 &&
+                           batch->n_seq_decode > 0;
+    if (!tree_step || batch->n_seq_decode < batch->n_seq) {
+        /* attn_paged reads q dense: one row of the row's slice is, a taller step copies q out. */
+        rad_op a_op = op_attn;
+        RadOperand a_q = brows(w.q, T);
+        if (op_attn_row) {
+            a_op = op_attn_row;
+            a_q  = Q;
+        } else if (op_attn_dec && batch->max_q_len <= dec_hi) {
+            a_op = op_attn_dec;
+            a_q  = Q;
+        } else if (row) {
+            if (T == 1) a_q = Q;
+            else        RAD_ISSUE_N(c, op_lift_q, T, Q, brows(w.q, T));
+        }
+        RAD_ISSUE_N(c, a_op, batch->max_q_len,
+                    a_q, kv_cache(kv, layer),
+                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, batch->n_seq),
+                    RAD_NONE, RAD_NONE,
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                    brows(w.attn, T));
     }
-    RAD_ISSUE_N(c, a_op, batch->max_q_len,
-                a_q, kv_cache(kv, layer),
-                praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
-                praw(used, RAD_I32, batch->n_seq),
-                RAD_NONE, RAD_NONE,
-                praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
-                brows(w.attn, T));
+    if (tree_step) {
+        const int64_t Td = batch->n_tok_decode, Sd = batch->n_seq_decode;
+        RadOperand tq = row ? bcol(w.qkv, 0, qd, Td) : brows(w.q, Td);
+        if (op_tree_lift) {
+            RAD_ISSUE_N(c, op_tree_lift, Td, bcol(w.qkv, 0, qd, Td), brows(w.q, Td));
+            tq = brows(w.q, Td);
+        }
+        RAD_ISSUE_N(c, op_attn_tree, batch->max_q_len_decode,
+                    tq, kv_cache(kv, layer),
+                    praw2(table, RAD_I32, Sd, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, Sd),
+                    RAD_NONE, RAD_NONE,
+                    praw(batch->cu_seqlens, RAD_I32, Sd + 1),
+                    brows(w.attn, Td),
+                    praw(batch->spec_parent, RAD_I32, Td));
+    }
 }
 
 /* A slice's rows see exactly the keys they see in the whole step: the cache holds the step's
@@ -1811,6 +1856,9 @@ struct Model {
     Dflash2         df2{};
     Dflash2::Wire   df2w{};
     bool            have_df2 = false;
+    /* Tree verification (RadBuildCtx::draft_tree): every layer's attention has its tree form, and
+     * the drafter proposes trees once it has declared dflash_tree too. */
+    bool            tree = false;
     /* The prefill overlap runs attention per slice: a trim a KV group (sliding, global). */
     SliceTrim       trim[2]{};
     int             n_trim = 0;
@@ -1877,6 +1925,13 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     Dflash2::Config dc{};
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
+    /* A tree (m.tree, asked before the trunk) is `max_spec` nodes grown over the lattice of the
+     * block the drafter was trained at, whatever its width: the block is the trained one and
+     * --num-speculative-tokens counts nodes. */
+    if (m.tree && gemma4::dflash_block(meta) > 1) {
+        dc.block      = gemma4::dflash_block(meta);
+        dc.tree_nodes = ctx->max_spec;
+    }
     dc.taps     = df2_geti(meta, "conv_kernel_size", 2);
     dc.group    = df2_geti(meta, "conv_group_size", 16);
     dc.sel_rank = df2_geti(meta, "selector_rank", 0);
@@ -1985,13 +2040,39 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, tw, 2});
         dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * tw, 2});
     }
-    dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
+    const int64_t nodes = dc.tree_nodes > 0 ? dc.tree_nodes : dc.steps();
+    dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, nodes});
+    /* Trees (RadBuildCtx::draft_tree; the trunk's attention already has its tree form): the
+     * selector's lattice grown best-first into `steps` nodes, each edge weighed by the softmax of
+     * its scores over a temperature. 1.25 measured best at 7 nodes on the speculator benchmarks
+     * (greedy, and sampled at 0.7 and 1.0); its path probabilities are calibrated there. */
+    if (m.tree) {
+        dc.tree = true;
+        dc.tree_temp = 1.25;
+        dw.parents = decl_b(b, nm.f("dflash_parents"), RAD_I32, {dg.max_seqs, nodes});
+        /* A block of 16 (the DBloom drafter): its 15-node tree's verify rows pay at one sequence
+         * and not at many, so the query pass is declared at half the block too, over which the
+         * drafter grows a 7-node tree of its own: the drafter's short block
+         * (rad_drafter_short_block), which the core runs from two decoding sequences on
+         * (--draft-short-from auto). A shorter block's tree verifies as few rows as that already. */
+        if (dc.block >= 16 && (dc.block & (dc.block - 1)) == 0) {
+            dc.short_block = 1;
+            dc.short_rows  = dc.block / 2;
+        }
+    }
 
     /* The head copy comes from the tied table, under the block's own name; the recipe makes it
      * 8-bit. */
     RAD_ARCH_TRY(m.df2.declare(b, nm, dg, dc, (int)m.n_main, m.kv_draft, m.w_tok, "draft",
                                nm.ckpt("model.language_model.embed_tokens.weight"), dw));
     m.have_df2 = true;
+    m.tree = m.df2.cfg.tree;   /* false where dflash_tree did not resolve */
+    if (!m.tree && nodes != dc.steps()) {
+        fprintf(stderr, "radiance: gemma4: a DFlash2 tree of %lld nodes needs dflash_tree, which no "
+                        "library serves here; the block's chain is %lld\n", (long long)nodes,
+                (long long)dc.steps());
+        return RAD_E_UNSUPPORTED;
+    }
 
     RadDrafterDecl drf{};
     drf.name           = "dflash2";
@@ -1999,7 +2080,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     drf.depth          = ctx->max_spec;
     drf.block          = dc.block;
     drf.proposal       = dw.tokens;
-    drf.proposal_pitch = dc.steps();
+    drf.proposal_pitch = nodes;
     drf.window         = dc.window;
     drf.mask_token     = (int32_t)df2_geti(meta, "mask_token_id", -1);
     if (drf.mask_token < 0) {
@@ -2008,6 +2089,17 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         return RAD_E_FORMAT;
     }
     RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+    if (m.tree) {
+        RAD_ARCH_TRY(rad_drafter_tree(b, dw.parents));
+        if (m.df2.block_lo > 0) {
+            RAD_ARCH_TRY(rad_drafter_short_block(b, m.df2.block_lo));
+            rad_note(b, "DFlash2 drafter: a short block of %lld rows, a tree of %lld nodes over it",
+                     (long long)m.df2.block_lo, (long long)m.df2.sel_lo_nodes);
+        }
+        rad_note(b, "DFlash2 drafter: a tree of %lld nodes a step (softmax temperature %.3g) over "
+                    "the lattice of its %lld-row block, verified in %lld rows", (long long)nodes,
+                 dc.tree_temp, (long long)dc.block, (long long)nodes + 1);
+    }
 
     rad_note(b, "DFlash2 drafter: %lld layers at absolute %lld.., %lld heads / %lld kv x %lld, ffn "
                 "%lld, %s attention with a %lld-token window, %d trunk taps; one forward proposes "
@@ -2351,6 +2443,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Gemma4Attn::Wire gw{}; gw.x = m.b_x; gw.h = m.b_h; gw.q = m.b_qg; gw.k = m.b_kg; gw.v = m.b_vg;        gw.attn = m.b_atting;
     Gemma4Mlp::Wire  mw{}; mw.x = m.b_x; mw.h = m.b_h; mw.gu = m.b_gu; mw.ffn = m.b_ffn;
 
+    /* Tree verification for a DFlash2 drafter (RadBuildCtx::draft_tree, which the engine sets
+     * from this plugin's probe; rad_drafter_tree): asked of every layer's attention here, before
+     * the drafter, and used only if every layer has it. Not where a layer reads another layer's
+     * cache (KV sharing, Gemma 4 E2B/E4B): untested there. */
+    const bool tree_want = ctx->max_spec > 0 && m.n_taps > 0 && gemma4::dflash_kind(meta) == 2 &&
+                           kv_shared == 0 && ctx->draft_tree != 0;
+    bool tree_all = tree_want;
+
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
@@ -2360,8 +2460,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const Gemma4Attn::Wire& aw   = lay.global ? gw : sw;
         /* A KV-shared layer is not bound: the group's pages hold only the layers that write. */
         if (kv_src[(size_t)l] < 0) RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
+        lay.attn.tree = tree_want;
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre,
                                       lay.global ? &m.b_qkvg : &m.b_qkvs, kv_src[(size_t)l]));
+        if (tree_want && !lay.attn.op_attn_tree) tree_all = false;
         /* The double-wide layers write their own pair of buffers (see b_gu_w). */
         Gemma4Mlp::Wire lw = mw;
         const bool wide = wide_mlp && l >= first_shared;
@@ -2626,6 +2728,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * declaration order is the buffer planner's liveness. It reads the taps the trunk copied into
      * `dflash_src` and the trunk's tied table, as its embedding and, where the container holds no
      * 8-bit copy, as its head. */
+    if (tree_want && !tree_all)
+        rad_note(b, "DFlash2 tree: no library serves tree attention for every layer here "
+                    "(attn_paged_qrow_tree / attn_paged_tree); the drafter proposes a chain");
+    m.tree = tree_all;
     if (m.n_taps > 0 && gemma4::dflash_kind(meta) == 2) {
         RAD_ARCH_TRY(declare_dflash2(b, meta, ctx, m));
     } else if (m.n_taps > 0) {

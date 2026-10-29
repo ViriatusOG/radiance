@@ -506,7 +506,9 @@ HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
         return error_response(err_not_implemented(
             "the server was not given a diagnostics provider; this build has no engine attached"),
                 req.peer);
-    if (opt_.api_key.empty() && !req.peer_is_loopback()) {
+    if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin())) {
+        /* A cross-origin browser is not a loopback client even when its own machine serves
+         * this port: the drive-by that guard exists to refuse. */
         ApiError e;
         e.status = 403;
         e.type = "permission_error";

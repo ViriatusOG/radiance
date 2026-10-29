@@ -3012,6 +3012,92 @@ TEST(a_grammar_masks_each_draft_position_against_the_drafts_before_it) {
     CHECK_EQ(p[3].flags & RAD_SP_MASK, 0);
 }
 
+/* The same over a tree (rad_drafter_tree): row k is masked against the state after its own
+ * ancestors, not after drafts 0..k-1, a refused path kills that row only, and the grammar's request
+ * still speculates. The tree: a, then b and c both after a, then x after c. */
+TEST(a_grammar_masks_each_tree_row_against_its_ancestors) {
+    SimpleVocab v({ "a", "b", "c", "x", "<call>", "z" });
+    HostChain ch(6, 1, 4, &v);
+    NEED_CHAIN(ch)
+    auto row = [](std::initializer_list<std::pair<int, float>> hot) {
+        std::vector<float> r(6, 0.0f);
+        for (auto [t, x] : hot) r[(size_t)t] = x;
+        return r;
+    };
+    std::vector<float> lg;
+    for (const auto& r : { row({ { 1, 5.0f } }),                  /* root: only a */
+                           row({ { 3, 5.0f }, { 2, 1.0f } }),     /* after a: b or c */
+                           row({ { 0, 5.0f } }),                  /* after a b: only x */
+                           row({ { 1, 5.0f } }),                  /* after a c: only x */
+                           row({ { 5, 5.0f } }) })                /* after a c x: nothing */
+        lg.insert(lg.end(), r.begin(), r.end());
+
+    SamplingParams sp = greedy_params();
+    sp.grammar = "root ::= \"a\" ( \"b\" | \"c\" ) \"x\"";
+    Request a = make_req(1, { 5 }, sp);
+    const int32_t da[4] = { 0, 1, 2, 3 };
+    const int32_t pa[4] = { 0, 1, 1, 3 };
+    a.n_draft = 4;
+    a.draft = da;
+    a.draft_parent = pa;
+    CHECK(ch.s.allows_speculation(1));
+    std::vector<int32_t> tok;
+    int64_t n = 0;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    /* Row 2 (a b) and row 3 (a c) take the same mask though a chain would have walked b then c;
+     * row 4's path is complete, so it stays unmasked without failing the request. */
+    CHECK(tok == (std::vector<int32_t>{ 0, 2, 3, 3, 5 }));
+    const DeviceSampleParams* p = ch.s.staged_params(&n);
+    for (int k = 0; k < 4; ++k) CHECK((p[k].flags & RAD_SP_MASK) != 0);
+    CHECK_EQ(p[4].flags & RAD_SP_MASK, 0);
+    CHECK(ch.s.take_failed().empty());
+    /* Rolled back: the grammar accepts a path from its start. */
+    CHECK_OK(ch.s.accept_token(1, 0));
+    CHECK_OK(ch.s.accept_token(1, 2));
+    CHECK_OK(ch.s.accept_token(1, 3));
+}
+
+/* accept_tree walks from the bonus token to the lowest-numbered child that is the target's pick at
+ * its parent, as long as one is; the emitted tokens are the target's picks along that path. A
+ * chain-shaped tree (or no parents) accepts what accept_greedy does. */
+TEST(accept_tree_follows_the_lowest_child_the_target_agrees_with) {
+    /* node 1: 7 (under 0), node 2: 8 (under 0), node 3: 9 (under 2), node 4: 9 (under 1),
+     * node 5: 4 (under 3) */
+    const int32_t draft[5]  = { 7, 8, 9, 9, 4 };
+    const int32_t parent[5] = { 0, 0, 2, 1, 3 };
+    int32_t out[6] = {}, path[5] = {}, n = -1;
+    /* The target picks 8 at the bonus, 9 at node 2, 4 at node 3, 6 at node 5. */
+    const int32_t t1[6] = { 8, 1, 9, 4, 1, 6 };
+    CHECK_OK(accept_tree(draft, parent, 5, t1, out, path, &n));
+    CHECK_EQ(n, 3);
+    CHECK((std::vector<int32_t>(path, path + 3) == std::vector<int32_t>{ 2, 3, 5 }));
+    CHECK((std::vector<int32_t>(out, out + 4) == std::vector<int32_t>{ 8, 9, 4, 6 }));
+    /* Both children of the bonus carry the target's pick: the lower-numbered one is taken. */
+    const int32_t d2[3] = { 5, 5, 6 };
+    const int32_t p2[3] = { 0, 0, 2 };
+    const int32_t t2[4] = { 5, 3, 6, 2 };
+    CHECK_OK(accept_tree(d2, p2, 3, t2, out, path, &n));
+    CHECK_EQ(n, 1);
+    CHECK_EQ(path[0], 1);
+    CHECK((std::vector<int32_t>(out, out + 2) == std::vector<int32_t>{ 5, 3 }));
+    /* No child agrees: only the bonus token's pick is emitted. */
+    const int32_t t3[6] = { 1, 1, 1, 1, 1, 1 };
+    CHECK_OK(accept_tree(draft, parent, 5, t3, out, path, &n));
+    CHECK_EQ(n, 0);
+    CHECK_EQ(out[0], 1);
+    /* A chain, with or without parents, is accept_greedy. */
+    const int32_t dc[3] = { 4, 5, 6 };
+    const int32_t pc[3] = { 0, 1, 2 };
+    const int32_t tc[4] = { 4, 5, 9, 1 };
+    int32_t og[4] = {}, ng = -1;
+    CHECK_OK(accept_greedy(dc, 3, tc, og, &ng));
+    for (const int32_t* pp : { pc, (const int32_t*)nullptr }) {
+        CHECK_OK(accept_tree(dc, pp, 3, tc, out, path, &n));
+        CHECK_EQ(n, ng);
+        CHECK((std::vector<int32_t>(out, out + n + 1) == std::vector<int32_t>(og, og + ng + 1)));
+    }
+}
+
 /* A grammar that admits nothing (complete, and no end-of-generation token in the vocabulary)
  * fails its request, not the step: the step returns success, the request is reported once, and
  * the next take is empty. */

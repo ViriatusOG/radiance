@@ -480,6 +480,111 @@ inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
     return write_checkpoint(dir, c, ts);
 }
 
+/* ------------------------------------------------------------------ dflash2: a block drafter */
+
+/* A DFlash2 drafter in vLLM's speculators layout, RedHatAI/gemma-4-31B-it-speculator.dflash2's at
+ * toy sizes, for a write_gemma4 target of the same `hidden` and `vocab`: Qwen3-shaped layers on a
+ * non-causal sliding window, an fc over the target's residual stream after the `taps` layers, a
+ * grouped dynamic convolution around each sublayer (a prepare and a finish half, `conv_kernel`
+ * taps a group of `conv_group` channels) and a candidate selector. It ships no embedding or head:
+ * it reads the target's. rad-convert merges it (--draft-model) into a container the 31B's plugin
+ * serves (gemma4_bf16, under the w4a8 DFlash2 recipe). */
+struct DFlash2 {
+    int64_t layers = 2, hidden = 256, heads = 4, kv_heads = 2, head_dim = 64, ffn = 512;
+    int64_t window = 64, block = 8, conv_group = 16, conv_kernel = 2, rank = 16, top_k = 16;
+    int64_t vocab = 320, ctx = 4096, mask_id = 4;
+    std::vector<int64_t> taps = { 1, 3, 5 };
+    /* The gain of o_proj and down_proj, and the q/k norms' centre. A random drafter's residual is
+     * otherwise its input embedding, which its head (the target's table) answers with the mask
+     * token at every position whatever the context: sharp attention and strong branches make
+     * what it proposes follow the context it attends to. */
+    float    branch = 4.0f, qk = 3.0f;
+    uint64_t seed = 6;
+};
+
+inline bool write_dflash2(const std::string& dir, const DFlash2& s) {
+    Rng r(s.seed);
+    const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
+    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    for (int64_t l = 0; l < s.layers; ++l) types.push_back("sliding_attention");
+    nlohmann::ordered_json t;
+    t["attention_bias"] = false;
+    t["head_dim"] = s.head_dim;
+    t["hidden_act"] = "silu";
+    t["hidden_size"] = H;
+    t["intermediate_size"] = s.ffn;
+    t["layer_types"] = types;
+    t["max_position_embeddings"] = s.ctx;
+    t["model_type"] = "qwen3";
+    t["num_attention_heads"] = s.heads;
+    t["num_hidden_layers"] = s.layers;
+    t["num_key_value_heads"] = s.kv_heads;
+    t["rms_norm_eps"] = 1e-6;
+    t["rope_parameters"] = { { "rope_theta", 10000.0 }, { "rope_type", "default" } };
+    t["sliding_window"] = s.window;
+    t["use_sliding_window"] = true;
+    t["vocab_size"] = s.vocab;
+    nlohmann::ordered_json greedy;
+    greedy["proposal_type"] = "greedy";
+    greedy["speculative_tokens"] = s.block - 1;
+    nlohmann::ordered_json verifier;
+    verifier["architectures"] = { "Gemma4ForConditionalGeneration" };
+    verifier["name_or_path"] = "tiny";
+    nlohmann::ordered_json spec;
+    spec["algorithm"] = "dflash2";
+    spec["default_proposal_method"] = "greedy";
+    spec["proposal_methods"] = nlohmann::ordered_json::array({ greedy });
+    spec["verifier"] = verifier;
+    nlohmann::ordered_json c;
+    c["architectures"] = { "DFlash2DraftModel" };
+    c["aux_hidden_state_layer_ids"] = s.taps;
+    c["block_size"] = s.block;
+    c["conv_group_size"] = s.conv_group;
+    c["conv_kernel_size"] = s.conv_kernel;
+    c["draft_vocab_size"] = s.vocab;
+    c["dtype"] = "bfloat16";
+    c["mask_token_id"] = s.mask_id;
+    c["sample_from_anchor"] = false;
+    c["selector_rank"] = s.rank;
+    c["selector_top_k"] = s.top_k;
+    c["sliding_window_non_causal"] = true;
+    c["speculators_config"] = spec;
+    c["speculators_model_type"] = "dflash2";
+    c["tie_word_embeddings"] = false;
+    c["transformer_layer_config"] = t;
+
+    /* The convolution's coefficients: a prepare and a finish half, each conv_kernel taps for every
+     * group of conv_group channels. */
+    const int64_t coef = 2 * s.conv_kernel * (H / s.conv_group);
+    std::vector<Tensor> ts;
+    ts.push_back(linear("candidate_selector.hidden_projection.weight", s.rank, H, r));
+    ts.push_back(noise("candidate_selector.predecessor_codebook", { s.vocab, s.rank }, r, 0.5f));
+    ts.push_back(noise("candidate_selector.successor_codebook", { s.vocab, s.rank }, r, 0.5f));
+    ts.push_back(linear("fc.weight", H, (int64_t)s.taps.size() * H, r));
+    ts.push_back(noise("hidden_norm.weight", { H }, r, 0.1f, 1.0f));
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = "layers." + std::to_string(l) + ".";
+        for (const char* conv : { "attention_conv.", "mlp_conv." }) {
+            ts.push_back(noise(p + conv + "base_kernel", { 2, s.conv_kernel, H }, r, 0.3f));
+            ts.push_back(linear(p + conv + "kernel_projection.weight", coef, H, r, 0.3f));
+        }
+        ts.push_back(noise(p + "input_layernorm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "post_attention_layernorm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(linear(p + "self_attn.q_proj.weight", q, H, r));
+        ts.push_back(linear(p + "self_attn.k_proj.weight", kv, H, r));
+        ts.push_back(linear(p + "self_attn.v_proj.weight", kv, H, r));
+        ts.push_back(linear(p + "self_attn.o_proj.weight", H, q, r, s.branch));
+        ts.push_back(noise(p + "self_attn.q_norm.weight", { s.head_dim }, r, 0.1f, s.qk));
+        ts.push_back(noise(p + "self_attn.k_norm.weight", { s.head_dim }, r, 0.1f, s.qk));
+        ts.push_back(linear(p + "mlp.gate_proj.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "mlp.up_proj.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "mlp.down_proj.weight", H, s.ffn, r, s.branch));
+    }
+    ts.push_back(noise("norm.weight", { H }, r, 0.1f, 1.0f));
+    return write_text(dir + "/config.json", c.dump(2)) &&
+           write_safetensors(dir + "/model.safetensors", ts);
+}
+
 /* ------------------------------------------------------------------ llama: dense attention */
 
 /* LLaMA (`llama`, served by llama_dense_fp8 once rad-convert has made its linears block fp8):

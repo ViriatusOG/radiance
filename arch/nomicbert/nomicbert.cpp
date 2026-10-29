@@ -6,7 +6,7 @@
  * returns each sequence's pooled row. Attention is bidirectional on every layer, so nothing is
  * paged: a token attends to later tokens, and there is nothing to carry between steps.
  *
- * ============================== THE SHAPE ==============================
+ * Shape:
  *
  *   12 layers, hidden 768, 12 heads of 64, ffn 3072, vocab 250048, type vocab 1
  *   post-norm block, the config's `prenorm: false`:
@@ -20,14 +20,12 @@
  *   output: the mean of every real token, then cast to the f32 pooled buffer
  *
  * The expert tables are one concatenated tensor each: w1 [8 * 3072, 768] as [out, in], w2
- * [8 * 3072, 768] as [in, out] per expert, so w2 is sliced then transposed at convert
- * (RAD_MAP_TRANSPOSE with src_index and src_rows). Every expert's two tensors take distinct group
- * slots.
+ * [8 * 3072, 768] as [in, out] per expert, so w2 is sliced, then transposed (RAD_MAP_TRANSPOSE
+ * with src_index and src_rows). Every expert's two tensors take distinct group slots.
  *
- * The block order and the unused shared experts.bias were settled against the production
- * llama.cpp embedder by scripts/nomic_ref.py; the winning variant and the vectors it produced are
- * in tests/data/nomic/golden.json (norm=post, bias=none). The checkpoint's `experts.bias` tensors
- * are therefore not declared and stay unconverted.
+ * The block order and the omitted shared bias match llama.cpp's embedder for this model
+ * (post-norm, no expert bias). The checkpoint's `experts.bias` tensors are not declared and stay
+ * unconverted.
  */
 #include <arch/rad_arch.h>
 
@@ -40,10 +38,8 @@ namespace nomicbert {
 
 using namespace rad::arch;
 
-/* Post-norm, the reading scripts/nomic_ref.py and tests/data/nomic/golden.json settle: the
- * attention is on the raw stream, then LN1, then the feed-forward on LN1's output, then LN2 over
- * that output plus the feed-forward's. The shared experts.bias is not applied (bias=none there). */
-constexpr bool kPostNorm = true;
+/* Post-norm: attention on the raw stream, then LN1, then the feed-forward on LN1's output, then
+ * LN2 over that output plus the feed-forward's. */
 
 struct Layer {
     bool moe = false;
@@ -77,10 +73,9 @@ struct Model {
 
 static Model g_model[MAX_RANKS];
 
-/* The layer schedule, read rather than derived: a wrong interval would turn a dense layer into a
- * MoE layer whose tensors the checkpoint does not hold, which convert refuses but only after the
- * graph was built. Layer l is routed when (l + 1) % moe_every_n_layers == 0, as nomic's
- * modeling_hf_nomic_bert builds it. */
+/* The layer schedule, read from moe_every_n_layers rather than derived: a wrong interval would
+ * declare a MoE layer whose tensors the checkpoint does not hold. Layer l is routed when
+ * (l + 1) % moe_every_n_layers == 0, as nomic's modeling_hf_nomic_bert builds it. */
 static bool is_moe_layer(int64_t l, int64_t every) {
     return every > 0 && (l + 1) % every == 0;
 }
@@ -99,7 +94,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    /* One 475M-parameter encoder on one card; tensor parallelism would only add an all-reduce per
+    /* A 475M-parameter encoder fits one card; tensor parallelism would only add an all-reduce per
      * layer. */
     if (ctx->world_size > 1) {
         fprintf(stderr, "radiance: nomicbert runs on one card (--tp 1); the model is 475M "
@@ -325,8 +320,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   src("mlp.router.layer.weight")));
             y.w_router   = decl_w(b, nm.f("blk.%lld.ffn_router.weight", ll), RAD_BF16,
                                   {m.n_expert, E}, A, N, gl);
-            /* mlp.experts.bias is deliberately not mapped: the verified variant applies no
-             * expert bias, so the tensor is left in the checkpoint. */
+            /* mlp.experts.bias is not mapped (no expert bias, see the header). */
             /* Each projection is a consecutive run of expert handles: all w1 in expert order,
              * then all w2. A grouped GEMM takes the run's first handle and its length. The name
              * maps come first: declare reads a weight's planned encoding when the weight is
@@ -356,9 +350,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
         }
 
-        const rad_buf att_in = kPostNorm ? m.b_x : m.b_h;
         y.op_qkv = rw(b, gemm_bias_op(3 * E, E, y.w_qkv, y.b_qkv, nullptr),
-                      {att_in}, {m.b_qkv});
+                      {m.b_x}, {m.b_qkv});
         y.op_rope = rw(b, RAD_OP(b, "rope",
                                  RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", g.head_dim),
                                             RAD_INT("n_head", g.n_head),
@@ -381,12 +374,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (!y.moe) {
             y.op_fc1 = rw(b, gemm_bias_op(g.n_ff, E, y.w_fc1, y.b_fc1, "gelu"),
                           {m.b_h}, {m.b_ff});
-            if constexpr (kPostNorm)
-                y.op_fc2 = rw(b, gemm_bias_op(E, g.n_ff, y.w_fc2, y.b_fc2, nullptr),
-                              {m.b_ff, m.b_h}, {m.b_o});
-            else
-                y.op_fc2 = rw(b, gemm_bias_op(E, g.n_ff, y.w_fc2, y.b_fc2, nullptr),
-                              {m.b_ff, m.b_x}, {m.b_x});
+            y.op_fc2 = rw(b, gemm_bias_op(E, g.n_ff, y.w_fc2, y.b_fc2, nullptr),
+                          {m.b_ff, m.b_h}, {m.b_o});
         } else {
             y.op_router = rw(b, gemm_op(m.n_expert, E, y.w_router), {m.b_h}, {m.b_logits});
             y.op_topk = rw(b, RAD_OP(b, "router_topk",
@@ -416,16 +405,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                                   RAD_STR("act", "none")),
                                        RAD_NOWEIGHTS),
                              {m.b_edn, m.b_ew, m.b_sorted}, {m.b_emoe});
-            if constexpr (kPostNorm)
-                y.op_add = add_op(m.b_h, m.b_emoe, m.b_o);
-            else
-                y.op_add = add_op(m.b_x, m.b_emoe, m.b_x);
+            y.op_add = add_op(m.b_h, m.b_emoe, m.b_o);
         }
 
-        if constexpr (kPostNorm)
-            y.op_norm2 = rw(b, layernorm_op(y.w_norm2, y.b_norm2), {m.b_o}, {m.b_x});
-        else
-            y.op_norm2 = rw(b, layernorm_op(y.w_norm2, y.b_norm2), {m.b_x}, {m.b_h});
+        y.op_norm2 = rw(b, layernorm_op(y.w_norm2, y.b_norm2), {m.b_o}, {m.b_x});
 
         if (!y.op_qkv || !y.op_rope || !y.op_attn || !y.op_out || !y.op_norm1 || !y.op_norm2)
             return RAD_E_INVAL;
@@ -446,13 +429,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_NOWEIGHTS),
                    {m.b_mean}, {m.b_pooled});
 
-    rad_note(b, "embedding model: %lld layers (%lld routed every %lld), hidden %lld, ffn %lld, "
-                "%lld heads of %lld, %lld experts top %lld; post-norm %d, no expert bias; "
+    int64_t n_routed = 0;
+    for (const Layer& y : m.layers) n_routed += y.moe ? 1 : 0;
+    rad_note(b, "embedding model: %lld layers (%lld routed, every %lld), hidden %lld, ffn %lld, "
+                "%lld heads of %lld, %lld experts top %lld; post-norm, no expert bias; "
                 "mean-pooled to %lld",
-             (long long)g.n_layer, (long long)m.n_expert, (long long)every, (long long)E,
+             (long long)g.n_layer, (long long)n_routed, (long long)every, (long long)E,
              (long long)g.n_ff, (long long)g.n_head, (long long)g.head_dim,
-             (long long)m.n_expert, (long long)m.n_expert_used, kPostNorm ? 1 : 0,
-             (long long)E);
+             (long long)m.n_expert, (long long)m.n_expert_used, (long long)E);
     return RAD_OK;
 }
 
@@ -474,43 +458,22 @@ static void step(RadCtx* c, const RadBatch* batch) {
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const Layer& y = m.layers[(size_t)l];
 
-        auto attention = [&] {
-            const rad_buf att_in = kPostNorm ? m.b_x : m.b_h;
-            RAD_ISSUE_N(c, y.op_qkv, T, brows(att_in, T), RAD_W(y.w_qkv), RAD_W(y.b_qkv),
-                        RAD_NONE, brows(m.b_qkv, T));
-            RAD_ISSUE(c, y.op_rope, brows(m.b_qkv, T), pos);
-            RAD_ISSUE(c, y.op_attn, bcol(m.b_qkv, 0, E, T), bcol(m.b_qkv, E, E, T),
-                      bcol(m.b_qkv, 2 * E, E, T), cu, brows(m.b_att, T));
-            RAD_ISSUE_N(c, y.op_out, T, brows(m.b_att, T), RAD_W(y.w_out), RAD_W(y.b_out),
-                        brows(m.b_x, T), brows(m.b_x, T));
-        };
-
-        if constexpr (kPostNorm) {
-            attention();
-            RAD_ISSUE(c, y.op_norm1, brows(m.b_x, T), RAD_W(y.w_norm1), RAD_W(y.b_norm1),
-                      brows(m.b_h, T));
-        } else {
-            RAD_ISSUE(c, y.op_norm1, brows(m.b_x, T), RAD_W(y.w_norm1), RAD_W(y.b_norm1),
-                      brows(m.b_h, T));
-            attention();
-        }
+        RAD_ISSUE_N(c, y.op_qkv, T, brows(m.b_x, T), RAD_W(y.w_qkv), RAD_W(y.b_qkv),
+                    RAD_NONE, brows(m.b_qkv, T));
+        RAD_ISSUE(c, y.op_rope, brows(m.b_qkv, T), pos);
+        RAD_ISSUE(c, y.op_attn, bcol(m.b_qkv, 0, E, T), bcol(m.b_qkv, E, E, T),
+                  bcol(m.b_qkv, 2 * E, E, T), cu, brows(m.b_att, T));
+        RAD_ISSUE_N(c, y.op_out, T, brows(m.b_att, T), RAD_W(y.w_out), RAD_W(y.b_out),
+                    brows(m.b_x, T), brows(m.b_x, T));
+        RAD_ISSUE(c, y.op_norm1, brows(m.b_x, T), RAD_W(y.w_norm1), RAD_W(y.b_norm1),
+                  brows(m.b_h, T));
 
         if (!y.moe) {
             RAD_ISSUE_N(c, y.op_fc1, T, brows(m.b_h, T), RAD_W(y.w_fc1), RAD_W(y.b_fc1),
                         RAD_NONE, brows(m.b_ff, T));
-            if constexpr (kPostNorm)
-                RAD_ISSUE_N(c, y.op_fc2, T, brows(m.b_ff, T), RAD_W(y.w_fc2),
-                            RAD_W(y.b_fc2), brows(m.b_h, T), brows(m.b_o, T));
-            else
-                RAD_ISSUE_N(c, y.op_fc2, T, brows(m.b_ff, T), RAD_W(y.w_fc2),
-                            RAD_W(y.b_fc2), brows(m.b_x, T), brows(m.b_x, T));
-            if constexpr (kPostNorm)
-                RAD_ISSUE(c, y.op_norm2, brows(m.b_o, T), RAD_W(y.w_norm2), RAD_W(y.b_norm2),
-                          brows(m.b_x, T));
+            RAD_ISSUE_N(c, y.op_fc2, T, brows(m.b_ff, T), RAD_W(y.w_fc2),
+                        RAD_W(y.b_fc2), brows(m.b_h, T), brows(m.b_o, T));
         } else {
-            if constexpr (!kPostNorm)
-                RAD_ISSUE(c, y.op_norm2, brows(m.b_x, T), RAD_W(y.w_norm2), RAD_W(y.b_norm2),
-                          brows(m.b_h, T));
             RAD_ISSUE(c, y.op_router, brows(m.b_h, T), RAD_W(y.w_router), brows(m.b_logits, T));
             RAD_ISSUE(c, y.op_topk, brows(m.b_logits, T), brows(m.b_ids, T), brows(m.b_ew, T));
             RAD_ISSUE(c, y.op_scatter, brows(m.b_ids, T), brows(m.b_sorted, T * K),
@@ -524,14 +487,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
                         brows(m.b_edn, T * K));
             RAD_ISSUE_N(c, y.op_gather, T, brows(m.b_edn, T * K), brows(m.b_ew, T),
                         brows(m.b_sorted, T * K), RAD_NONE, RAD_NONE, brows(m.b_emoe, T));
-            if constexpr (kPostNorm)
-                RAD_ISSUE(c, y.op_add, brows(m.b_h, T), brows(m.b_emoe, T), brows(m.b_o, T));
-            else
-                RAD_ISSUE(c, y.op_add, brows(m.b_x, T), brows(m.b_emoe, T), brows(m.b_x, T));
-            if constexpr (kPostNorm)
-                RAD_ISSUE(c, y.op_norm2, brows(m.b_o, T), RAD_W(y.w_norm2), RAD_W(y.b_norm2),
-                          brows(m.b_x, T));
+            RAD_ISSUE(c, y.op_add, brows(m.b_h, T), brows(m.b_emoe, T), brows(m.b_o, T));
         }
+        RAD_ISSUE(c, y.op_norm2, brows(m.b_o, T), RAD_W(y.w_norm2), RAD_W(y.b_norm2),
+                  brows(m.b_x, T));
     }
 
     RAD_ISSUE(c, m.op_mean, brows(m.b_x, T), cu, brows(m.b_mean, S));

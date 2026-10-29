@@ -46,6 +46,10 @@ struct SchedReq {
     int32_t  draft[RAD_SCHED_MAX_SPEC] = {};
     int32_t  n_draft = 0;
     int32_t  conv_cursor = 0;
+    /* A tree drafter's parents for `draft` (StepEntry::draft_parent), valid while `draft_tree`;
+     * a chain proposal (prompt lookup, or a chain drafter) clears it. */
+    int32_t  draft_par[RAD_SCHED_MAX_SPEC] = {};
+    bool     draft_tree = false;
 
     /* A serial drafter's valid history: positions [0, draft_filled) of the head's own layer hold
      * K and V for the sequence's real tokens. Only the head writes that layer, so before drafting
@@ -140,6 +144,9 @@ public:
          * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
         const TokenLogprobs* lp = nullptr;
         const int32_t*       first_row = nullptr;  /* [n_seq] */
+        /* A tree step's accepted nodes, [n_seq][RAD_SCHED_MAX_SPEC]: entry i's t-th accepted
+         * draft is draft[path[i][t] - 1]. Null on a chain step, where it is draft[t]. */
+        const int32_t*       path = nullptr;
     };
 
     /* What commit left a sequence at: its committed length and whether it is still Running.
@@ -262,7 +269,8 @@ public:
 
     /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
-    int      set_draft(uint64_t id, const int32_t* tokens, int n);
+    /* `parents`: a tree drafter's (rad_drafter_tree), node j + 1's parent node, null for a chain. */
+    int      set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents = nullptr);
 
     /* ---------------------------------------------------------- media the encoder owes
      * A request carrying media is admitted only once every item is encoded; until then it keeps
@@ -400,11 +408,14 @@ public:
      * block drafter's block length is chosen by. Read before block_begin(). */
     int decoded_seqs() const;
     /* Whether a block drafter runs its short block (--draft-short-from `from`), given whether it
-     * ran it last step and this step's decoded_seqs(): on from `from`, off again only at two
-     * below, so a load wavering at the threshold does not switch the pass shape every step. */
+     * ran it last step and this step's decoded_seqs(): on from `from`, and off again two below or
+     * at one sequence below `from`, where the long block pays. Two below keeps a load wavering at
+     * a threshold of 3 or more from switching the pass shape every step. From 2 there is no such
+     * margin: a load between one and two sequences switches every step (block_shape reads it per
+     * step), and the one sequence left after an overlap runs the long block again. */
     static bool short_block_on(bool was_on, int64_t decoded, int64_t from) {
         if (decoded >= from) return true;
-        if (decoded + 2 <= from) return false;
+        if (decoded <= 1 || decoded + 2 <= from) return false;
         return was_on;
     }
     const RadBatch* block_context(int step);
@@ -425,11 +436,15 @@ public:
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
 
-    /* plan_chunk's tail-checkpoint rule (see the definition). */
+    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition). */
     int64_t tail_checkpoint(int64_t target) const;
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
+    /* The lowest position tail_checkpoint takes a window snapshot at (ChunkGeometry::window_ckpt),
+     * or the interval where that is lower. A prompt reaches it at kWindowSnapshotMin +
+     * max(quantum, 16) tokens: 528 at a quantum of 16. */
+    static constexpr int64_t kWindowSnapshotMin = 512;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
@@ -520,6 +535,8 @@ private:
      * at the committed position (advance.h). False and 0 for every other drafter. */
     bool          serial_shared_ = false;
     int32_t       serial_rot_shift_ = 0;
+    /* A tree drafter (rad_drafter_tree): every trunk plan is StepPlan::spec_is_tree. */
+    bool          tree_ = false;
     BatchBuilder  builder_;
     DraftController draft_;
 
@@ -662,6 +679,7 @@ private:
         int32_t        card = -1;
         int32_t        ctx_len = 0;
         int32_t        n_tokens = 0;
+        int32_t        n_spec = 0;        /* the trunk entry's drafts: a tree verify when > 0 */
         int64_t        base_pos = 0;      /* the anchor's position: the sequence's next one */
         bool           can_draft = false;
         /* On the card: the anchor's position is the card's, and `base_pos` the furthest it can
@@ -746,12 +764,19 @@ private:
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
+    /* A preempted request waits until the pool can hold its WHOLE remaining recompute plus one
+     * block of headroom for every running sequence; otherwise admitting it now just gets it
+     * preempted again next step and the prefill loops. */
+    bool preempted_can_prefill(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */
     int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
+    /* Positive sentinel from admit_one: the request waits (its context is still being read off
+     * disk, or a preempted prefill has no room yet) and the walk may ask the one behind it. */
+    static constexpr int kAdmitWait = 1;
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;
     /* A step's prefill entries while step() moves its decode entries first; reserved at init,

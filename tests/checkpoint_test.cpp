@@ -152,7 +152,9 @@ TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
 
 /* The descriptor derives from quant_method and fmt whoever set them, including rad-convert's
  * --set: a bf16 checkpoint converted to block fp8 states that format and selects the fp8 plugin,
- * so the container never names one format and selects another's plugin. */
+ * so the container never names one format and selects another's plugin. transformers' fp8 states
+ * no fmt and is E4M3 (Qwen3.8-Flash-Next-FP8), so it is the same descriptor; another method
+ * without a fmt is its name alone. */
 TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
     const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
                                              "{\"model_type\":\"qwen3_5\",\"hidden_size\":256}");
@@ -161,9 +163,12 @@ TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
     CHECK_EQ(ck.meta().quant, std::string());
     MetaOwn m = ck.meta();
     m.set("quantization_config.quant_method", "fp8");
-    CHECK_EQ(quant_descriptor(m), std::string("fp8"));
+    CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
     m.set("quantization_config.fmt", "e4m3");
     CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
+    MetaOwn ct = ck.meta();
+    ct.set("quantization_config.quant_method", "compressed-tensors");
+    CHECK_EQ(quant_descriptor(ct), std::string("compressed-tensors"));
 }
 
 /* Google's bf16 E2B needs no `--set quantization_config.quant_method`: its per-layer embeddings
@@ -3041,6 +3046,45 @@ TEST(a_compressed_tensors_fp8_release_reads_stock_with_no_import_refusal) {
     std::vector<float> f(128);
     REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, f.data(), &why), RAD_OK);
     CHECK_EQ(f[5], (float)((128 + 5) % 7 - 3) * -2.0f);
+}
+
+/* Qwen3.8-Flash-Next-FP8 ships its n-gram table as FP8 shards, `X.shard_<i>.weight`, under one
+ * scale, `X.weight_scale`. Joined along rows they are one table with one scale, byte for byte:
+ * `fp8_e4m3*bf16[*x*]`, the scale plane its single element, and the rows decode by it. */
+TEST(fp8_shards_under_one_shared_scale_are_one_table_with_one_scale) {
+    T sc{ "t.weight_scale", "BF16", { 1 }, {} };
+    sc.bytes.resize(2);
+    rad_store_f32(sc.bytes.data(), RAD_BF16, 0, 0.5f);
+    const std::string dir = write_checkpoint(
+        { fp8("t.shard_0.weight", { 3, 128 }), fp8("t.shard_1.weight", { 2, 128 }), sc }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("t", RAD_MAP_CONCAT, { "t.shard_0.weight", "t.shard_1.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "t", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && !w.imported);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)0);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)0);
+    CHECK_EQ(w.rows, (int64_t)5);
+    std::vector<float> f(128);
+    REQUIRE_EQ(ckpt_rows_f32(w, 3, 1, f.data(), &why), RAD_OK);   /* shard 1's row 0 */
+    CHECK_EQ(f[5], (float)(5 % 7 - 3) * 0.5f);
+    std::vector<uint16_t> sp(1);
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 1, sp.data(), &why), RAD_OK);
+    CHECK_EQ(rad_load_f32(sp.data(), RAD_BF16, 0), 0.5f);
+    std::vector<uint8_t> raw(128);
+    REQUIRE_EQ(ckpt_plane_rows(w, 0, 3, 1, raw.data(), &why), RAD_OK);
+    CHECK_EQ(rad_load_f32(raw.data(), RAD_F8E4M3, 5), (float)(5 % 7 - 3));
+
+    /* One shard alone is the same table, and a scale of another name is not borrowed. */
+    prog.name_map.push_back(map("u", RAD_MAP_COPY, { "t.shard_1.weight" }));
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "u", false, &w, &why), RAD_OK);
+    CHECK(w.trivial);
 }
 
 /* Per-row FP8 is `fp8_e4m3*<s>[1x*]` whether the scale ships as [N, 1] (compressed-tensors'

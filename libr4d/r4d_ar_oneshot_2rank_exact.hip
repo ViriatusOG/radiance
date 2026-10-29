@@ -64,7 +64,7 @@ template <typename T, int LANES>
 __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
-    int n16, int slot_stride16, int drain, int acq, unsigned int nbw) {
+    int n16, int slot_stride16, int drain, int acq, unsigned int nbw, long stage) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
@@ -72,6 +72,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   const int slot = (int)s_slot;
   int4* ps = peer_base + (size_t)slot * slot_stride16;
   const int4* ms = my_base + (size_t)slot * slot_stride16;
+  const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
 
   const int w = (n16 + nb - 1) / nb;      // 16B words per block
   const int start = b * w;
@@ -121,8 +122,10 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   __syncthreads();
   if (acq) __threadfence_system();
   r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
-    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+    for (int k = start + tid; k < end; k += nt)
+      h += r4d_archk_u4(r4d_archk_keep(&ms[k], md), 4u * (unsigned)k);
   });
+  ms = r4d_archk_moved(ms, md);
   // Reduce the chunk, 4x unrolled: out = local input + peer input (staged in local scratch).
   {
     int k = start + tid;
@@ -149,7 +152,7 @@ __global__ void r4d_ar_hc_write_kernel(
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
     int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
-    unsigned int* gate_ctr) {
+    unsigned int* gate_ctr, long stage) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
@@ -158,6 +161,7 @@ __global__ void r4d_ar_hc_write_kernel(
   const int slot = (int)s_slot;
   int4* ps = peer_base + (size_t)slot * slot_stride16;
   const int4* ms = my_base + (size_t)slot * slot_stride16;
+  const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
 
   const int w = (n16 + nb - 1) / nb;      // 16B words per block
   const int start = b * w;
@@ -189,8 +193,10 @@ __global__ void r4d_ar_hc_write_kernel(
   __syncthreads();
   if (acq) __threadfence_system();
   r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
-    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+    for (int k = start + tid; k < end; k += nt)
+      h += r4d_archk_u4(r4d_archk_keep(&ms[k], md), 4u * (unsigned)k);
   });
+  ms = r4d_archk_moved(ms, md);
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   const int wpr = n >> 3;                 // 16B words a row
@@ -237,7 +243,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
     int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
-    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr) {
+    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, long stage) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   __shared__ int   s_i[R4D_ARG_ROWS * R4D_ARG_SLOTS];
@@ -249,6 +255,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
   const int slot = (int)s_slot;
   int4* ps = peer_base + (size_t)slot * slot_stride16;
   const int4* ms = my_base + (size_t)slot * slot_stride16;
+  const long md = r4d_archk_md(stage, my_base);   // the host mailbox's VRAM mirror (r4d_ar_seq.h)
 
   const int w = (n16 + nb - 1) / nb;      // 16B words per block
   const int start = b * w;
@@ -304,8 +311,10 @@ __global__ void r4d_ar_gather_hc_write_kernel(
   __syncthreads();
   if (acq) __threadfence_system();
   r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& h) {
-    for (int k = start + tid; k < end; k += nt) h += r4d_archk_u4(ms[k], 4u * (unsigned)k);
+    for (int k = start + tid; k < end; k += nt)
+      h += r4d_archk_u4(r4d_archk_keep(&ms[k], md), 4u * (unsigned)k);
   });
+  ms = r4d_archk_moved(ms, md);
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   for (int k = start + tid; k < end; k += nt) {
@@ -411,7 +420,7 @@ int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, lon
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream_i, long nblocks, long nthreads,
-                     long drain, long acq, long gate, long gate_ctr) {
+                     long drain, long acq, long gate, long gate_ctr, long stage) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8) throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
   if (hc < 1 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
@@ -431,7 +440,7 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
       (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
       (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
       n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw,
-      (long long*)gate, (unsigned int*)gate_ctr);
+      (long long*)gate, (unsigned int*)gate_ctr, stage);
 }
 
 int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
@@ -439,7 +448,7 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
                            long n, long hc, long irow, long hrow, long ye, long ew, long sorted,
                            long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                            long top_k, long sig, long stream_i, long nblocks, long nthreads,
-                           long drain, long acq, long inv, long gate, long gate_ctr) {
+                           long drain, long acq, long inv, long gate, long gate_ctr, long stage) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
@@ -483,13 +492,13 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
         (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
-        (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr);
+        (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr, stage);
   } else {
     r4d_ar_gather_hc_write_kernel<false><<<nb, nt, 0, st>>>(
         (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
-        nullptr, (long long*)gate, (unsigned int*)gate_ctr);
+        nullptr, (long long*)gate, (unsigned int*)gate_ctr, stage);
   }
   return (int)hipGetLastError();
 }
@@ -544,7 +553,7 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
                             long my_flags, long seq_ctrs, long slot_stride16,
                             long inp, long out, long n_elem, long dtype,
                             long stream_i, long nblocks, long nthreads,
-                            long drain, long acq) {
+                            long drain, long acq, long stage) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
@@ -569,7 +578,7 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
 #define L(T, LN) r4d_ar_oneshot_2rank_exact_kernel<T, LN><<<nb, nt, 0, st>>>(              \
     (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,        \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,              \
-    (int)slot_stride16, (int)drain, (int)acq, nbw)
+    (int)slot_stride16, (int)drain, (int)acq, nbw, stage)
   if (dtype == 0) L(__hip_bfloat16, 8);
   else if (dtype == 1) L(__half, 8);
   else if (dtype == 2) L(float, 4);

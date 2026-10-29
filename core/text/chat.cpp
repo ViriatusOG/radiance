@@ -24,6 +24,8 @@ struct ChatTemplate::Impl {
     bool                      add_bos = false, add_eos = false;
 };
 
+/* The template's own words: the lifted autoparser wraps whatever the render threw in a sentence
+ * about parser generation, which the render's failure is not. */
 static std::string template_words(const char* what) {
     static const char kWrap[] = "Unable to generate parser for this template. Automatic parser "
                                 "generation failed: ";
@@ -189,9 +191,6 @@ static bool lead_system(const ojson& messages, ojson* out) {
         if (!m.is_object() || m.value("role", "") != "system") out->push_back(m);
     return true;
 }
-
-/* The template's own words: the lifted autoparser wraps whatever the render threw in a sentence
- * about parser generation, which the render's failure is not. */
 
 int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOptions& opt,
                         ChatPrompt* out) const {
