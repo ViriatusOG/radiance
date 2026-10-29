@@ -3,6 +3,8 @@
 
 #include <cstdio>
 #include "clef.h"
+#include "laya.h"
+#include "rad_laya.h"
 #include "json_partial.h"
 #include "systemone.h"
 #include "rad_internal.h"
@@ -1621,6 +1623,11 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"),
                               req.peer);
+    /* Laya runs on the embedding path, but its pooled row is option logits, not a vector. */
+    if (opt_.decision_type == "laya")
+        return error_response(err_not_implemented("/v1/embeddings requires an embedding model; "
+                                                  "this one is Laya, which answers /v1/systemone"),
+                              req.peer);
     if (!deps_.embed)
         return error_response(err_not_implemented(
             opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
@@ -1746,10 +1753,12 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
     if (opt_.decision_type == "clef") return handle_clef(req);
+    if (opt_.decision_type == "laya") return handle_laya(req);
     if (opt_.decision_type != "d1")
         return error_response(err_not_implemented(
             "/v1/systemone serves a decision model; this container does not declare one "
-            "(convert d1 with --set decision.type=d1, clef with --set decision.type=clef)"),
+            "(convert d1 with --set decision.type=d1, clef with --set decision.type=clef; "
+            "rad-convert sets laya for a Laya checkpoint directory)"),
             req.peer);
 
     DecisionRequest r;
@@ -1950,6 +1959,100 @@ HttpResponse Server::handle_clef(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(json{
         { "answers", std::move(answers) },
         { "usage", { { "input_tokens", (int64_t)r.tokens.size() }, { "output_tokens", 0 } } } }));
+}
+
+/* Laya (laya.h): one engine request a question, each its own sequence with the state in it, as
+ * Laya reads them, submitted together so the scheduler runs them in one step. Laya's plugin
+ * (arch/laya) declares a pooled output, so each request runs on the embedding path and comes back
+ * as its pooled row, whose first k values are the question's option logits. */
+HttpResponse Server::handle_laya(const HttpRequest& req) {
+    if (!opt_.laya.ok() || !deps_.embed || deps_.embed->dim() < RAD_LAYA_POOLED)
+        return error_response(err_internal("this container declares laya but carries no complete "
+                                           "decision.laya.* settings or no Laya plugin; convert the "
+                                           "checkpoint directory again with rad-convert"), req.peer);
+    LayaRequest r;
+    ApiError err;
+    if (parse_laya_request(req.body, odeps_, lim_, opt_.model_id, opt_.laya, &r, &err) < 0)
+        return error_response(err, req.peer);
+    const int n = (int)r.questions.size();
+    for (const LayaQuestion& q : r.questions)
+        if ((int64_t)q.tokens.size() > deps_.embed->max_input())
+            return error_response(err_bad("questions", "question " + q.name + " is " +
+                                          std::to_string(q.tokens.size()) + " tokens; this "
+                                          "deployment runs at most " +
+                                          std::to_string(deps_.embed->max_input()) +
+                                          " a step (--max-num-batched-tokens)"), req.peer);
+    if (auto no = admit(n, req.peer, ApiShape::OpenAI, "questions")) return *no;
+    RAD_INFO("systemone (laya) admitted%s questions=%d state=%lld tok",
+             from_peer(req.peer).c_str(), n, (long long)r.state_tokens);
+
+    std::vector<Generation> gens;
+    std::vector<Request> rqs;
+    gens.reserve((size_t)n);
+    rqs.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        Generation g;
+        g.index = i;
+        g.prompt_index = i;
+        g.sink = std::make_shared<Sink>(16);
+        Request rq;
+        rq.prompt = r.questions[(size_t)i].tokens;
+        rq.plugin_words = laya_words(r.questions[(size_t)i]);
+        rq.embed = true;
+        rq.max_tokens = 1;
+        rq.sp.temp = 0.0f;
+        rq.sink = g.sink.get();
+        rqs.push_back(std::move(rq));
+        gens.push_back(std::move(g));
+    }
+    std::vector<uint64_t> ids;
+    deps_.sched->submit_all(rqs, &ids);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        gens[i].id = ids[i];
+        gens[i].sink->id = ids[i];
+        if (!ids[i]) {
+            cancel_all(gens, false);
+            retire(gens);
+            release(n);
+            return error_response(err_internal("the scheduler refused question " +
+                                               r.questions[i].name), req.peer);
+        }
+    }
+    for (;;) {
+        bool all = true;
+        for (auto& g : gens) {
+            if (!g.closed && g.sink->done()) { g.closed = true; g.finish = g.sink->finish_reason(); }
+            all = all && g.closed;
+        }
+        if (all) break;
+        if (auto no = abandoned(req, gens, n)) return *no;
+        for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
+    }
+
+    json answers = json::object();
+    for (int i = 0; i < n; ++i) {
+        const Generation& g = gens[(size_t)i];
+        const LayaQuestion& q = r.questions[(size_t)i];
+        if (g.finish == Finish::Error || g.finish == Finish::Cancelled) {
+            const std::string why = g.finish == Finish::Error ? engine_failure(*g.sink)
+                                                              : "the engine cancelled question " + q.name;
+            retire(gens);
+            release(n);
+            return error_response(err_internal(why), req.peer);
+        }
+        json a;
+        if (laya_answer(q, g.sink->embedding(), opt_.laya, &a, &err) < 0) {
+            retire(gens);
+            release(n);
+            return error_response(err, req.peer);
+        }
+        answers[q.name] = std::move(a);
+    }
+    retire(gens);
+    release(n);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{ { "answers", std::move(answers) },
+                                                        { "usage", laya_usage(r) } }));
 }
 
 HttpResponse Server::handle_models(const HttpRequest& req) {

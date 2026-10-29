@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -2442,6 +2443,24 @@ int Engine::run_server() {
         o.clef_prior_logit_scale = rad_meta_getf(&meta_, keys[0], 0.0);
         o.clef_joint_logit_scale = rad_meta_getf(&meta_, keys[1], 0.0);
         o.clef_residual_gate     = rad_meta_getf(&meta_, keys[2], 0.0);
+    }
+    /* Laya's sequence lengths, special tokens and fitted temperatures, which the server builds
+     * and reads each question with (server/laya.h); rad-convert writes them from the checkpoint's
+     * rl_agent_config.json and tokenizer/. */
+    if (o.decision_type == "laya") {
+        server::LayaSettings& l = o.laya;
+        l.max_len      = rad_meta_geti(&meta_, "decision.laya.max_len", 0);
+        l.head_max_len = rad_meta_geti(&meta_, "decision.laya.head_max_len", 0);
+        l.cls  = (int32_t)rad_meta_geti(&meta_, "decision.laya.cls", -1);
+        l.sep  = (int32_t)rad_meta_geti(&meta_, "decision.laya.sep", -1);
+        l.mask = (int32_t)rad_meta_geti(&meta_, "decision.laya.mask", -1);
+        l.mask_token = rad_meta_gets(&meta_, "decision.laya.mask_token", "");
+        std::sscanf(rad_meta_gets(&meta_, "decision.laya.temperature", "1 1 1"), "%lf %lf %lf",
+                    &l.temperature[0], &l.temperature[1], &l.temperature[2]);
+        const std::string tbo = "decision.laya.temperature_by_options.";
+        for (int i = 0; i < meta_.n_kv; ++i)
+            if (std::strncmp(meta_.kv_key[i], tbo.c_str(), tbo.size()) == 0)
+                l.temperature_by_options[meta_.kv_key[i] + tbo.size()] = std::strtod(meta_.kv_val[i], nullptr);
     }
     o.plugin_words = ranks_.empty() ? 0 : ranks_[0]->program.plugin_words;
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name

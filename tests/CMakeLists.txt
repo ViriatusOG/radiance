@@ -301,7 +301,7 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant qwen35_bf16 lfm2_bf16 gemm
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
@@ -311,6 +311,11 @@ foreach(t engine_e2e_test convert_test clef_decision_test)
       target_compile_definitions(${t} PRIVATE
         RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
       add_dependencies(${t} radiance rad-convert libref libquant clef_bf16)
+    elseif(t STREQUAL "laya_decision_test")
+      # The tiny Laya's golden (tests/mklayagolden.py) and the plugin a Laya container selects.
+      target_compile_definitions(${t} PRIVATE
+        RAD_LAYA_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/laya_tiny.json")
+      add_dependencies(${t} radiance rad-convert libref libquant laya)
     else()
       add_dependencies(${t} ${RAD_E2E_DEPS})
     endif()
@@ -323,6 +328,9 @@ if(TARGET engine_e2e_test)
 endif()
 if(TARGET clef_decision_test)
   set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET laya_decision_test)
+  set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

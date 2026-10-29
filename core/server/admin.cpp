@@ -390,7 +390,8 @@ json Server::capabilities() const {
      * whatever its conditioning network's processor would take. */
     const bool img = opt_.image_model || opt_.video_model;
     caps["grammar"]   = !img && deps_.grammar != nullptr;
-    caps["embedding"] = deps_.embed != nullptr;
+    /* Laya runs on the embedding path, but answers /v1/systemone, not /v1/embeddings. */
+    caps["embedding"] = deps_.embed != nullptr && opt_.decision_type != "laya";
     caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
     caps["video"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Video);
     caps["audio"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Audio);

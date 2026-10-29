@@ -123,6 +123,115 @@ int clef_metadata(const std::string& in, const std::string& config_dir, const Ch
     return 0;
 }
 
+/* Laya (a checkpoint whose config.json says model_type laya, or --set decision.type=laya): the
+ * release keeps its parts in folders, so the encoder's geometry comes from encoder/config.json,
+ * the head's settings from rl_agent_config.json and the vocabulary from tokenizer/. The plugin
+ * declares from the geometry (arch/laya); the server builds each question's sequence from the
+ * special tokens and lengths and applies the fitted temperatures (core/server/laya.h). */
+int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn& meta,
+                  std::string* tokjson) {
+    if (meta.arch != "laya") {
+        RAD_ERR("%s: decision.type=laya needs a Laya checkpoint directory, whose config.json says "
+                "model_type laya (this one's architecture is '%s')", in.c_str(), meta.arch.c_str());
+        return -1;
+    }
+    std::string dir = config_dir;
+    if (dir.empty()) {
+        struct stat st{};
+        if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = in;
+        else {
+            const size_t slash = in.find_last_of('/');
+            dir = slash == std::string::npos ? "." : in.substr(0, slash);
+        }
+    }
+    auto read_json = [](const std::string& path, nlohmann::json* j) {
+        std::ifstream f(path);
+        if (!f) { RAD_ERR("%s: a Laya checkpoint carries it; cannot read it", path.c_str()); return -1; }
+        try { f >> *j; } catch (const std::exception& e) {
+            RAD_ERR("%s: %s", path.c_str(), e.what());
+            return -1;
+        }
+        return j->is_object() ? 0 : -1;
+    };
+
+    /* The encoder's own config: its geometry and free-form keys (layer_types, local_attention,
+     * the rotary thetas), keeping the checkpoint's model_type, which named the plugin. */
+    MetaOwn enc;
+    if (meta_from_config_json(dir + "/encoder", &enc) != RAD_OK) return -1;
+    for (size_t i = 0; i < enc.keys.size(); ++i)
+        if (enc.keys[i] != "model_type" && enc.keys[i] != "architectures") meta.set(enc.keys[i], enc.vals[i]);
+    meta.m = enc.m;
+
+    nlohmann::json rl;
+    if (read_json(dir + "/rl_agent_config.json", &rl) < 0) return -1;
+    const std::pair<const char*, long long> counts[] = { { "max_len", 1 }, { "head_max_len", 1 },
+                                                         { "head_layers", 0 } };
+    for (const auto& [k, least] : counts) {
+        if (!rl.contains(k) || !rl[k].is_number_integer() || rl[k].get<long long>() < least) {
+            RAD_ERR("%s/rl_agent_config.json: `%s` is missing or not a count", dir.c_str(), k);
+            return -1;
+        }
+        meta.set(std::string("decision.laya.") + k, std::to_string(rl[k].get<long long>()));
+    }
+    if (rl.contains("option_layout") && rl["option_layout"] != "sequential") {
+        RAD_ERR("%s/rl_agent_config.json: option_layout '%s'; the sequential layout every "
+                "published checkpoint uses is served", dir.c_str(), rl["option_layout"].dump().c_str());
+        return -1;
+    }
+    auto num = [](double v) { char s[32]; std::snprintf(s, sizeof s, "%.9g", v); return std::string(s); };
+    std::string temps = "1 1 1";
+    if (rl.contains("temperature")) {
+        const nlohmann::json& t = rl["temperature"];
+        if (!t.is_array() || t.size() != 3 || !t[0].is_number() || !t[1].is_number() || !t[2].is_number()) {
+            RAD_ERR("%s/rl_agent_config.json: `temperature` is not three numbers (choice, score, "
+                    "noul)", dir.c_str());
+            return -1;
+        }
+        temps = num(t[0].get<double>()) + " " + num(t[1].get<double>()) + " " + num(t[2].get<double>());
+    }
+    meta.set("decision.laya.temperature", temps);
+    if (rl.contains("temperature_by_options") && rl["temperature_by_options"].is_object())
+        for (const auto& kv : rl["temperature_by_options"].items())
+            if (kv.value().is_number())
+                meta.set("decision.laya.temperature_by_options." + kv.key(), num(kv.value().get<double>()));
+
+    /* The special tokens by name (tokenizer_config.json), their ids from tokenizer.json. */
+    const std::string tdir = dir + "/tokenizer";
+    if (tokjson->empty()) *tokjson = tdir + "/tokenizer.json";
+    nlohmann::json tc, tj;
+    if (read_json(tdir + "/tokenizer_config.json", &tc) < 0 || read_json(*tokjson, &tj) < 0) return -1;
+    for (const char* which : { "cls_token", "sep_token", "mask_token" }) {
+        const nlohmann::json* v = tc.contains(which) ? &tc[which] : nullptr;
+        if (v && v->is_object() && v->contains("content")) v = &(*v)["content"];
+        if (!v || !v->is_string()) {
+            RAD_ERR("%s/tokenizer_config.json: no `%s`", tdir.c_str(), which);
+            return -1;
+        }
+        const std::string tok = v->get<std::string>();
+        long long id = -1;
+        if (tj.contains("added_tokens"))
+            for (const auto& a : tj["added_tokens"])
+                if (a.contains("content") && a["content"] == tok && a.contains("id")) id = a["id"].get<long long>();
+        if (id < 0 && tj.contains("model") && tj["model"].contains("vocab") && tj["model"]["vocab"].is_object() &&
+            tj["model"]["vocab"].contains(tok))
+            id = tj["model"]["vocab"][tok].get<long long>();
+        if (id < 0) {
+            RAD_ERR("%s: the %s '%s' is not in the vocabulary", tokjson->c_str(), which, tok.c_str());
+            return -1;
+        }
+        const std::string base = std::string(which).substr(0, std::strlen(which) - 6);
+        meta.set("decision.laya." + base, std::to_string(id));
+        if (base == "mask") meta.set("decision.laya.mask_token", tok);
+    }
+    meta.set("decision.type", "laya");
+    meta.finish();
+    RAD_INFO("laya     %s: encoder %lld x %lld, head %s layers, max_len %s, head_max_len %s",
+             dir.c_str(), (long long)meta.m.n_layers, (long long)meta.m.n_embd,
+             meta.get("decision.laya.head_layers"), meta.get("decision.laya.max_len"),
+             meta.get("decision.laya.head_max_len"));
+    return 0;
+}
+
 /* `blk.12.attn_q.weight` -> 12; -1 for a model-level name (GGUF naming, as in an imatrix). */
 int32_t layer_from_name(const std::string& n) {
     if (n.rfind("blk.", 0) != 0) return -1;
@@ -482,6 +591,10 @@ int main(int argc, char** argv) {
     for (const auto& kv : set_kv) meta.set(kv.first, kv.second);
     if (const char* dt = meta.get("decision.type"); dt && !std::strcmp(dt, "clef") &&
                                                      clef_metadata(in, config_dir, ck, meta) < 0)
+        return 1;
+    if (const char* dt = meta.get("decision.type");
+        (meta.arch == "laya" || (dt && !std::strcmp(dt, "laya"))) &&
+        laya_metadata(in, config_dir, meta, &tokjson) < 0)
         return 1;
     /* The quantisation descriptor (which selects the plugin pair) is derived from
      * quantization_config, so a --set of it re-derives the descriptor. E.g. a bf16 checkpoint
