@@ -111,6 +111,18 @@ struct LinkStat {
     int64_t ar_calls = 0, ar_bytes = 0;
     int64_t h2d_bytes = 0, d2h_bytes = 0;
     int64_t ssd_reads = 0, ssd_bytes = 0;
+    /* The SSD tier's staging leg: the file stager's copies of those same extents from its
+     * pinned windows into the VRAM staging buffer. Moves out of h2d_bytes so Promotions shows
+     * heat's churn, not the streaming it is spent on. */
+    int64_t ssd_staging_bytes = 0;
+    /* The hot VRAM cache's leg: the same extents, copied into a slab slot
+     * the unit keeps. With ssd_staging_bytes, the two PCIe legs of ssd_bytes; the split is
+     * the hot cache's progress — staging decays as promotions grow. */
+    int64_t ssd_promoted_bytes = 0;
+    /* The SSD tier's deposit leg: SSD-tier reads whose bytes
+     * stayed in a pool slot; evictions relabel a cold pool unit -- native or deposited -- back
+     * to the file tier, copyless (pool_*: the pool's ledger, not SSD traffic). */
+    int64_t ssd_deposits = 0, ssd_deposit_bytes = 0, pool_evictions = 0;
     /* The MoE GEMM reading a routed expert that was not resident: the traffic promotions aim to
      * remove. */
     int64_t stream_bytes = 0;

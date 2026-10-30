@@ -2466,6 +2466,9 @@ int Engine::run_server() {
             s.link.h2d_bytes = s.link.d2h_bytes = s.link.ssd_reads = 0;
             s.link.ssd_bytes = s.link.prefetched = s.link.prefetch_bytes = 0;
             s.link.stream_bytes = s.link.staged_bytes = 0;
+            s.link.ssd_staging_bytes = s.link.ssd_promoted_bytes = 0;
+            s.link.ssd_deposits = s.link.ssd_deposit_bytes = 0;
+            s.link.pool_evictions = 0;
             s.link.kv_stream_bytes = 0;
             s.link.kv_streaming = cfg_.kv_resident > 0;   /* zeroed here if the arch refused it */
             /* The ring's depth, not the flag: KVStreamStats::resident_blocks sums the device pool
@@ -2478,6 +2481,11 @@ int Engine::run_server() {
                 s.link.d2h_bytes      += (int64_t)rms.d2h_bytes;
                 s.link.ssd_reads      += (int64_t)rms.ssd_reads;
                 s.link.ssd_bytes      += (int64_t)rms.ssd_bytes;
+                s.link.ssd_staging_bytes += (int64_t)rms.ssd_staging_bytes;
+                s.link.ssd_promoted_bytes += (int64_t)rms.ssd_promoted_bytes;
+                s.link.ssd_deposits    += (int64_t)rms.ssd_deposits;
+                s.link.ssd_deposit_bytes += (int64_t)rms.ssd_deposit_bytes;
+                s.link.pool_evictions   += (int64_t)rms.pool_evictions;
                 s.link.prefetched     += (int64_t)rms.prefetched;
                 s.link.prefetch_bytes += (int64_t)rms.prefetch_bytes;
                 s.link.staged_bytes   += (int64_t)rms.staged_bytes;

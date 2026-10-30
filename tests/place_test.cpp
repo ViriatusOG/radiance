@@ -529,13 +529,15 @@ TEST(deterministic_mode_pins_placement_to_static) {
 TEST(planner_reads_routed_experts_it_cannot_hold_from_the_container) {
     /* Two routed layers of eight 1.5 MiB experts, a VRAM budget for a few and a host pool for
      * two. With the file tier on, the rest go there and the plan still fits: they are served by
-     * reading the whole layer into one of two buffers charged to the same VRAM budget. */
+     * reading the whole layer into one of two buffers charged to the same VRAM budget. The
+     * budget also carries the unconditional hot cache — each resident expert may hold a shadow
+     * slot (up to the cap) — so it is sized for residents plus their shadow slots. */
     Fixture f;
     build_moe_layers(f, 2, 8, 1 * MiB, MiB / 2);
 
     Config c = base_config();
     c.placement = "expert_tiered";
-    c.vram_weights_mib = 24;
+    c.vram_weights_mib = 26;
     /* The file staging reserve (four slots of the widest unit plus the read windows) and room
      * for two pooled experts. */
     const int64_t reserve = 4 * (MiB + MiB / 2) + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
@@ -1448,9 +1450,9 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
         }
     /* Three layers per pass, each at least two reads (the resident expert between the file-tier
      * ones is skipped, not read), and every unit read once. */
-    CHECK_EQ(m.stats().file_layers, (uint64_t)(2 * L));
-    CHECK_EQ(m.stats().file_units, (uint64_t)(2 * L * 2));
-    CHECK(m.stats().file_preads >= (uint64_t)(2 * L * 2));
+    CHECK_EQ(m.stats().ssd_layers, (uint64_t)(2 * L));
+    CHECK_EQ(m.stats().ssd_units, (uint64_t)(2 * L * 2));
+    CHECK(m.stats().ssd_preads >= (uint64_t)(2 * L * 2));
     rad_stream_sync(m.transfer_stream());
     rad_stream_destroy(s);
     std::remove(path.c_str());

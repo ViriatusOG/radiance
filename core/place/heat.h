@@ -82,6 +82,15 @@ struct HeatParams {
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
     int warmup_dispatches = 0;
+
+    /* The hot VRAM cache's admission bar: the heat at which the file stager
+     * may read a routed expert into a slab slot permanently instead of its per-pass buffer.
+     * Absolute, not relative to a victim: admission happens when the unit is read anyway, and the
+     * shadow slots are the budget. A value near min_gain (1.5) admits anything routed twice
+     * lately and churns; 8 is roughly two consistently-routed steps of the verify union at
+     * MTP-d3, well above an occasional expert's credit of one or two. Eviction is free (the
+     * container is ground truth), so the cost of an admission mistake is one future re-read. */
+    float admit_heat = 8.0f;
 };
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
@@ -249,6 +258,28 @@ public:
     }
     bool busy(int32_t unit) const { return busy_[(size_t)unit] != 0; }
 
+    /* ---- the hot VRAM cache ----------------------------------------------
+     *
+     * A unit the file stager admitted keeps heat's history and, while resident, joins the
+     * demotion ranking as an evictable victim — but never the promotion ranking: its admission
+     * is the stager's own decision (it is read anyway; the slot is the only extra cost), and
+     * once evicted it has no address to promote from (the container, read by the stager).
+     *
+     * set_evictable marks a unit the mover has admitted or may admit. admit_hot is the
+     * admission test: heat past the bar and not already in flight. */
+    void set_evictable(int32_t unit, bool evictable);
+    /* A deposit's plan says Tier::SSD -- non-movable --
+     * but its pool slot makes it a PCIe-speed promotion candidate all the same. The deposit
+     * flips movability here, keeping the plan's word for everything else. */
+    void set_movable(int32_t unit, bool movable);
+    bool evictable(int32_t unit) const { return evictable_[(size_t)unit] != 0; }
+    bool admit_hot(int32_t unit) const {
+        return enabled_ && unit >= 0 && (size_t)unit < tier_.size() &&
+               tier_[(size_t)unit] == Tier::SSD && !busy_[(size_t)unit] &&
+               pos_[(size_t)unit] >= 0 &&
+               heat_[(size_t)pos_[(size_t)unit]] >= params_.admit_heat;
+    }
+
     /* The best swap available, or false when the guards refuse. */
     bool pick(Swap* out) const;
 
@@ -317,6 +348,10 @@ private:
      * lock-free and the mirror one byte per unit. */
     TierMirror tier_pub_;
     std::vector<uint8_t> busy_;
+    /* Per unit, whether heat may rank it as a demotion victim though the plan called it
+     * unmovable: the mover admitted it into the hot VRAM cache. Never a
+     * promotion candidate: with no pool slot, only the stager can bring the unit back. */
+    std::vector<uint8_t> evictable_;
     std::vector<uint8_t> movable_;
     /* --expert-pin-top: a decode-hot resident the planner pinned is never a demotion candidate,
      * even where a later pass made its unit movable again. */

@@ -461,6 +461,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["d2h_bytes"]      = s.link.d2h_bytes;
             l["ssd_reads"]      = s.link.ssd_reads;
             l["ssd_bytes"]      = s.link.ssd_bytes;
+            l["ssd_staging_bytes"] = s.link.ssd_staging_bytes;
+            l["ssd_promoted_bytes"] = s.link.ssd_promoted_bytes;
+            l["ssd_deposits"]      = s.link.ssd_deposits;
+            l["ssd_deposit_bytes"] = s.link.ssd_deposit_bytes;
+            l["pool_evictions"]     = s.link.pool_evictions;
             l["prefetched"]     = s.link.prefetched;
             l["prefetch_bytes"] = s.link.prefetch_bytes;
             l["staged_bytes"]   = s.link.staged_bytes;
@@ -1876,6 +1881,12 @@ const linkSegs = segs("linkbar", "linkrows");
  * own mapping, read in place -- so it is the one that is not a grey. */
 const TIER_INK = ["#f5f5f5", "#9a9a9a", "#5e5e5e", "#2b2b2b", "#3f6fa8"];
 const INK_AR = "#60a5fa", INK_UP = "#4ade80", INK_DOWN = "#fbbf24", INK_SSD = "#a78bfa";
+const INK_SSD_STAGE = "#f9a8d4", INK_SSD_PROMOTE = "#86efac", INK_SSD_DEPOSIT = "#c4b5fd";
+/* The Expert SSD rows take their inks from where their bytes come from or go: staging is a
+ * lighter Expert streaming -- it is that traffic's own second leg, the same extents copied
+ * host to GPU after the drive read them; deposits wear a light tier violet, the kept copy in
+ * host RAM that lands just short of VRAM; promotions are a lighter Promotions (#4ade80), the
+ * same keep-forever copy heat's is, one tier further down. */
 const INK_STREAM = "#f472b6", INK_PREFETCH = "#2dd4bf", INK_KV = "#fb923c";
 /* The plane is painted as raw pixels, so the same inks are wanted as RGB triples. Parsed from
  * TIER_INK rather than written out a second time: two lists of five colours is one list that
@@ -2490,8 +2501,16 @@ function update(s, dt) {
     $("layv").textContent = !lu.length ? DASH
         : wf >= 0.999 ? "all resident"
         : pct(sum / lu.length) + " mean  ·  worst L" + worst + " " + pct(wf);
+    /* Residency, not capability: every bucket says where units are, and the buckets add up to
+     * the plan. The old "N movable" read as if cold disk experts could not move -- deposits and
+     * the stager move them constantly; what they lack is an address heat can relocate without
+     * reading the container. Tier names come from the engine; the page only phrases the two
+     * common ones. */
+    const rest = (ex.tiers || []).slice(1).filter(t => t.units > 0).map(t =>
+        cnt(t.units) + " " + (t.name === "pinned" ? "in host pool"
+                            : t.name === "ssd" ? "on the file tier" : t.name));
     $("planev").textContent = cnt(res) + " of " + cnt(ex.n_units) + " in VRAM" +
-        (ex.movable ? "  ·  " + cnt(ex.movable) + " movable" : "  ·  none movable");
+        (rest.length ? "  ·  " + rest.join("  ·  ") : "  ·  fully resident");
 
     /* ---- the plane itself.
      *
@@ -2532,10 +2551,20 @@ function update(s, dt) {
     const pre = (f) => lk[f] || 0;
     const dP  = (f) => prev.link[f] == null ? 0 : Math.max(0, (pre(f) - prev.link[f]) / dt);
     const ar = d("ar_bytes"), dn = d("d2h_bytes"), sd = d("ssd_bytes"), st = d("stream_bytes");
+    const sg = d("ssd_staging_bytes");
+    const sp = d("ssd_promoted_bytes");
+    const wp = d("ssd_deposits");
     /* Null-safe until a server reports it: an older one, or the switch off, reads as zero. */
     const kv = lk.kv_streaming ? dP("kv_stream_bytes") : 0;
     const pf = dP("staged_bytes") + dP("prefetch_bytes");
-    const up = Math.max(0, d("h2d_bytes") - pf);
+    /* Promotions is a residual: every host-to-device byte that is not prefill prefetch.
+     * Under the file tier the biggest such bytes are the SSD tier's staging leg -- the same
+     * extents ssd_bytes read from the container, copied window to staging buffer -- which
+     * would otherwise make Promotions read as the streaming it is spent on, not heat's churn.
+     * The counter pairs with ssd_bytes (two legs of the same extents). The hot cache's
+     * promotions are the third leg: extents copied into a slab slot that
+     * stays, which get their own row and come out of the residual too. */
+    const up = Math.max(0, d("h2d_bytes") - d("ssd_staging_bytes") - sp - pf);
     const pfAll = pre("staged_bytes") + pre("prefetch_bytes");
     const upAll = Math.max(0, lk.h2d_bytes - pfAll);
     /* AN IDLE LINK STILL HAS A COMPOSITION, and an empty bar is not it. Between two polls of a
@@ -2563,8 +2592,6 @@ function update(s, dt) {
        * fault when the page is not there. Neither goes past this counter, and neither crosses
        * the link this panel is about. A zero here means no expert was fetched from the SSD tier;
        * it does not mean the process touched no disk. */
-      { name: "Expert SSD tier",  ink: INK_SSD,  w: w(sd, lk.ssd_bytes),
-        a: rate(sd), b: hb(lk.ssd_bytes) },
       { name: "Expert streaming", ink: INK_STREAM, w: w(st, lk.stream_bytes),
         a: rate(st), b: hb(lk.stream_bytes) },
       /* KV STREAMING, --kv-resident (core/kvstream): each step's resolve copies the blocks a
@@ -2577,6 +2604,18 @@ function update(s, dt) {
       ...(lk.kv_streaming ? [{ name: "KV streaming", ink: INK_KV,
         w: w(kv, pre("kv_stream_bytes")),
         a: rate(kv), b: hb(pre("kv_stream_bytes")) }] : []),
+      /* THE HOT CACHE'S OWN ROW: SSD-tier reads whose destination was a
+       * slab slot -- the expert stays resident -- read above the deposits row, whose bytes
+       * stop in host RAM. A server from before the hot cache reports none, which reads as
+       * zero. Ink: a lighter Promotions, the same keep-forever copy one tier further down. */
+      { name: "Expert SSD promotions", ink: INK_SSD_PROMOTE, w: w(sp, pre("ssd_promoted_bytes")),
+        a: rate(sp), b: hb(pre("ssd_promoted_bytes")) },
+      { name: "Expert SSD deposits", ink: INK_SSD_DEPOSIT, w: w(wp, pre("ssd_deposit_bytes")),
+        a: rate(wp), b: hb(pre("ssd_deposit_bytes")) },
+      { name: "Expert SSD staging", ink: INK_SSD_STAGE,  w: w(sg, lk.ssd_staging_bytes),
+        a: rate(sg), b: hb(lk.ssd_staging_bytes) },
+      { name: "Expert SSD tier",  ink: INK_SSD,  w: w(sd, lk.ssd_bytes),
+        a: rate(sd), b: hb(lk.ssd_bytes) },
     ]);
     /* THE HEADLINE IS THE PCIe TOTAL, which is the all-reduce plus the moves. The SSD tier is
      * left out of it on purpose: those bytes come off a disk into host memory and only the ones

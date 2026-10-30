@@ -342,14 +342,29 @@ struct MoverStats {
      * dropped by a recall or shrink; recalls that found no free slot for a donor. */
     uint64_t donated = 0, relocated = 0, stranded = 0;
     uint64_t ssd_reads = 0, ssd_bytes = 0;
+    /* The staging leg of the same bytes: the file stager's copies from its pinned windows
+     * into the VRAM staging buffer, which cross the link. Moves out of h2d_bytes so the
+     * dashboard's Promotions row shows heat's churn, not the streaming it is spent on. */
+    uint64_t ssd_staging_bytes = 0;
+    /* The hot VRAM cache's leg: the same extents, staged into a slab slot
+     * instead of the per-pass buffer because heat said the expert keeps routing. A promotion
+     * the stager charges nothing extra to read for: the unit was read anyway. Pairs with
+     * `ssd_staging_bytes`; together with it, the PCIe legs of `ssd_bytes`. */
+    uint64_t ssd_promotions = 0, ssd_promoted_bytes = 0;
+    /* The SSD tier's deposit leg: file reads whose bytes stayed in a
+     * pool slot -- the kept-copy half of the split, like ssd_promoted_bytes, only one tier
+     * down. Evictions stay pool_*: they relabel a cold pool unit -- native or deposited, the
+     * container is ground truth for both -- back to the file tier, copyless, so they are the
+     * pool's ledger, not SSD traffic. */
+    uint64_t ssd_deposits = 0, ssd_deposit_bytes = 0, pool_evictions = 0;
     /* The prefill stager (stage_units). `stage_overflow`: units no buffer had room for, read in
      * place. `stage_copies`: copies issued; neighbouring pool slots go as one. */
     uint64_t stage_layers = 0, staged_units = 0, staged_bytes = 0, stage_overflow = 0;
     uint64_t stage_copies = 0;
     /* The file stager (stage_file_units), including the host time spent in preads and waiting
      * for a window's copies to drain. */
-    uint64_t file_layers = 0, file_units = 0, file_bytes = 0, file_preads = 0;
-    uint64_t file_read_ns = 0, file_wait_ns = 0;
+    uint64_t ssd_layers = 0, ssd_units = 0, ssd_read_bytes = 0, ssd_preads = 0;
+    uint64_t ssd_read_ns = 0, ssd_wait_ns = 0;
     /* Routing-aware reads: units of experts whose routing count was zero at the layer's
      * trigger, not read (their weights are re-published to the layer buffer as a dummy
      * address for the pass, and nulled again with the staged units). */
@@ -374,8 +389,10 @@ struct MoverCounters {
     std::atomic<uint64_t> ssd_reads{0}, ssd_bytes{0};
     std::atomic<uint64_t> stage_layers{0}, staged_units{0}, staged_bytes{0}, stage_overflow{0};
     std::atomic<uint64_t> stage_copies{0};
-    std::atomic<uint64_t> file_layers{0}, file_units{0}, file_bytes{0}, file_preads{0};
-    std::atomic<uint64_t> file_read_ns{0}, file_wait_ns{0};
+    std::atomic<uint64_t> ssd_staging_bytes{0}, ssd_promotions{0}, ssd_promoted_bytes{0};
+    std::atomic<uint64_t> ssd_deposits{0}, ssd_deposit_bytes{0}, pool_evictions{0};
+    std::atomic<uint64_t> ssd_layers{0}, ssd_units{0}, ssd_read_bytes{0}, ssd_preads{0};
+    std::atomic<uint64_t> ssd_read_ns{0}, ssd_wait_ns{0};
     std::atomic<uint64_t> ssd_skipped_units{0}, ssd_skipped_bytes{0};
 
     void reset() {
@@ -402,12 +419,18 @@ struct MoverCounters {
         staged_bytes.store(0, std::memory_order_relaxed);
         stage_overflow.store(0, std::memory_order_relaxed);
         stage_copies.store(0, std::memory_order_relaxed);
-        file_layers.store(0, std::memory_order_relaxed);
-        file_units.store(0, std::memory_order_relaxed);
-        file_bytes.store(0, std::memory_order_relaxed);
-        file_preads.store(0, std::memory_order_relaxed);
-        file_read_ns.store(0, std::memory_order_relaxed);
-        file_wait_ns.store(0, std::memory_order_relaxed);
+        ssd_staging_bytes.store(0, std::memory_order_relaxed);
+        ssd_promotions.store(0, std::memory_order_relaxed);
+        ssd_promoted_bytes.store(0, std::memory_order_relaxed);
+        ssd_deposits.store(0, std::memory_order_relaxed);
+        ssd_deposit_bytes.store(0, std::memory_order_relaxed);
+        pool_evictions.store(0, std::memory_order_relaxed);
+        ssd_layers.store(0, std::memory_order_relaxed);
+        ssd_units.store(0, std::memory_order_relaxed);
+        ssd_read_bytes.store(0, std::memory_order_relaxed);
+        ssd_preads.store(0, std::memory_order_relaxed);
+        ssd_read_ns.store(0, std::memory_order_relaxed);
+        ssd_wait_ns.store(0, std::memory_order_relaxed);
         ssd_skipped_units.store(0, std::memory_order_relaxed);
         ssd_skipped_bytes.store(0, std::memory_order_relaxed);
     }
@@ -436,12 +459,18 @@ struct MoverCounters {
         s.staged_bytes   = staged_bytes.load(std::memory_order_relaxed);
         s.stage_overflow = stage_overflow.load(std::memory_order_relaxed);
         s.stage_copies   = stage_copies.load(std::memory_order_relaxed);
-        s.file_layers        = file_layers.load(std::memory_order_relaxed);
-        s.file_units         = file_units.load(std::memory_order_relaxed);
-        s.file_bytes    = file_bytes.load(std::memory_order_relaxed);
-        s.file_preads        = file_preads.load(std::memory_order_relaxed);
-        s.file_read_ns       = file_read_ns.load(std::memory_order_relaxed);
-        s.file_wait_ns       = file_wait_ns.load(std::memory_order_relaxed);
+        s.ssd_staging_bytes = ssd_staging_bytes.load(std::memory_order_relaxed);
+        s.ssd_promotions    = ssd_promotions.load(std::memory_order_relaxed);
+        s.ssd_promoted_bytes = ssd_promoted_bytes.load(std::memory_order_relaxed);
+        s.ssd_deposits      = ssd_deposits.load(std::memory_order_relaxed);
+        s.ssd_deposit_bytes = ssd_deposit_bytes.load(std::memory_order_relaxed);
+        s.pool_evictions    = pool_evictions.load(std::memory_order_relaxed);
+        s.ssd_layers        = ssd_layers.load(std::memory_order_relaxed);
+        s.ssd_units         = ssd_units.load(std::memory_order_relaxed);
+        s.ssd_read_bytes    = ssd_read_bytes.load(std::memory_order_relaxed);
+        s.ssd_preads        = ssd_preads.load(std::memory_order_relaxed);
+        s.ssd_read_ns       = ssd_read_ns.load(std::memory_order_relaxed);
+        s.ssd_wait_ns       = ssd_wait_ns.load(std::memory_order_relaxed);
         s.ssd_skipped_units = ssd_skipped_units.load(std::memory_order_relaxed);
         s.ssd_skipped_bytes = ssd_skipped_bytes.load(std::memory_order_relaxed);
         return s;
@@ -644,7 +673,8 @@ public:
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                            RadEvent after, RadEvent done, std::vector<int32_t>* staged,
                            std::vector<int32_t>* skipped = nullptr,
-                           const int32_t* ecnt = nullptr, int32_t n_expert = 0);
+                           const int32_t* ecnt = nullptr, int32_t n_expert = 0,
+                           std::vector<int32_t>* promoted = nullptr);
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
@@ -667,7 +697,7 @@ private:
          * need the quarantine, which guards issued kernels, not bytes in flight. Migrate: a donor
          * (Mover::donor_slot) from an uncovered lent slot (`slab_slot`) to a free budgeted one
          * (`to_slot`). */
-        enum class Kind { Promote, Demote, Stage, Release, Drop, Migrate };
+        enum class Kind { Promote, Demote, Stage, Release, Drop, Migrate, Admit, Evict, Deposit };
         State    state = State::Free;
         Kind     kind = Kind::Promote;
         int32_t  unit = -1;
@@ -681,8 +711,10 @@ private:
             unit = -1;
             slab_slot = pool_slot = to_slot = -1;
         }
-        /* Whether the move hands `slab_slot` back once its quarantine clears. */
-        bool frees_slab() const { return kind != Kind::Promote && kind != Kind::Stage; }
+        /* Whether the move hands `slab_slot` back once its quarantine clears. An Admit keeps
+         * its slot: the unit becomes the slot's resident. */
+        bool frees_slab() const { return kind != Kind::Promote && kind != Kind::Stage &&
+                                          kind != Kind::Admit && kind != Kind::Deposit; }
     };
 
     struct UnitState {
@@ -693,6 +725,10 @@ private:
         int64_t static_off = -1;     /* byte offset into the static VRAM region, or -1 */
         int32_t klass = -1;
         int64_t bytes = 0;
+        /* Admitted into the hot VRAM cache: read from the container into a
+         * slab slot and left there. Eviction is bookkeeping (kind Evict): re-tier to SSD, free
+         * the slot, publish null — the container is ground truth. */
+        bool    hot = false;
     };
 
     /* One weight class's memory. Budgeted slots sit at a fixed stride from one base in the
@@ -733,6 +769,10 @@ private:
     MoverConfig    cfg_;
     Residency      res_;
     MoverCounters  stats_;
+    /* The heat engine of the dispatch in flight, bound by begin_dispatch: the file stager's
+     * admission test (which units read into the hot cache) runs between dispatches on this
+     * same thread. Null when heat is off — no hot cache, no evictable victims. */
+    HeatEngine*    heat_ = nullptr;
     Pools*         budget_ = nullptr;
     /* True only when this object called the allocator itself (the test path). A Pool
      * reservation belongs to the Pool; freeing it here would be a double free. */

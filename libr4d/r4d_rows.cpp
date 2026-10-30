@@ -10256,10 +10256,10 @@ extern "C" int rad_kernel_count(void) {
     return (int)(sizeof(kKernels) / sizeof(kKernels[0])) + (int)host_twins().size();
 }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
-    const int base = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
-    if (i < base) return &kKernels[i];
-    return &host_twins()[(size_t)(i - base)].info;
+    const int n = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+    if (i < n) return &kKernels[(size_t)i];
+    return &host_twins()[(size_t)(i - n)].info;
 }
 
 /* Which rows touch nothing but their operands and scratch (rad_abi.h). The exceptions keep state

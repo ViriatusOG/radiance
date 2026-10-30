@@ -119,8 +119,9 @@ static const Flag g_flags[] = {
     "                                    two engines on separate cards hold one table: the\n"
     "                                    first fills it, the last to exit deletes it" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
-    "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
-    "                                    at a time, so a step is paced by the drive" },
+    "                                    container on disk (O_DIRECT) -- the file tier, units on\n"
+    "                                    Tier::SSD; a routed expert is read a layer at\n"
+    "                                    a time, so a step is paced by the drive" },
     { "--row-prefetch",       "MODE",   "on (default) | off -- a host gather from a table read through\n"
     "                                    the container's mapping (--ngram-placement disk) asks for the\n"
     "                                    pages its rows cover before its kernel runs, or beside it when\n"

@@ -480,9 +480,10 @@ int FileStager::start(int32_t li, RadStream s) {
     }
     const int rc = mover_->stage_file_units(layers_[(size_t)li].units, buf_[b], cap_,
                                             free_rec_[b] ? free_[b] : nullptr, done_[b],
-                                            &staged_[b], &skipped_[b], ecnt, n_expert);
+                                            &staged_[b], &skipped_[b], ecnt, n_expert,
+                                            &promoted_[b]);
     if (rc < 0) return rc;
-    if (!staged_[b].empty()) holds_[b] = li;
+    if (!staged_[b].empty() || !promoted_[b].empty()) holds_[b] = li;
     return RAD_OK;
 }
 
@@ -495,6 +496,9 @@ int FileStager::finish(int32_t b, RadStream s) {
         mover_->unstage_units(skipped_[b]);        /* the dummy publications go to null too */
         skipped_[b].clear();
     }
+    /* Hot-cache units are NOT unstaged: their publications name their slots, which outlive
+     * the buffer. The layer's copies into them landed before its ops ran (the done_ wait). */
+    promoted_[b].clear();
     holds_[b] = -1;
     return RAD_OK;
 }

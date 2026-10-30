@@ -274,6 +274,10 @@ private:
     int32_t* scratch_ = nullptr;        /* pinned, for the trigger's blocking counts copy */
     int64_t  scratch_n_ = 0;
     std::vector<int32_t> skipped_[2];   /* per buffer: units not read, nulled at release */
+    /* Per buffer: units the stager read into hot-cache slots. Unlike the
+     * staged ones they keep their publications when the buffer is released — the slot is
+     * their address from here on, until heat evicts one. */
+    std::vector<int32_t> promoted_[2];
     RadEvent done_[2] = { nullptr, nullptr };   /* behind a buffer's copies, on the mover stream */
     RadEvent free_[2] = { nullptr, nullptr };   /* behind the ops that read a buffer's layer */
     bool     free_rec_[2] = { false, false };

@@ -23,22 +23,28 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     tier_pub_.assign(n);
     busy_.assign(n, 0u);
     movable_.assign(n, 0u);
+    evictable_.assign(n, 0u);
     pinned_.assign(n, 0u);
     layer_of_.assign(n, -1);
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
 
-    /* The movable units' slab classes as dense indices (heat.h: `cls_`). */
+    /* The movable units' slab classes as dense indices (heat.h: `cls_`). File-tier units with a
+     * class join them: the hot VRAM cache admits one into a slab slot at run
+     * time, and step() files every candidate by class. Their rank stays 0 (never a promotion
+     * candidate) until the mover admits one and marks it evictable. */
     cls_.assign(n, -1);
     {
         std::vector<int32_t> dense;
-        for (size_t u = 0; u < n; ++u) {
-            const MoveUnit& mu = plan.units[u];
-            if (!mu.movable) continue;
-            const int32_t k = mu.slab_class;
+        auto dense_of = [&dense](int32_t k) {
             auto it = std::find(dense.begin(), dense.end(), k);
             if (it == dense.end()) { dense.push_back(k); it = dense.end() - 1; }
-            cls_[u] = (int32_t)(it - dense.begin());
+            return (int32_t)(it - dense.begin());
+        };
+        for (size_t u = 0; u < n; ++u) {
+            const MoveUnit& mu = plan.units[u];
+            if (mu.movable) cls_[u] = dense_of(mu.slab_class);
+            else if (mu.tier == Tier::SSD && mu.slab_class >= 0) cls_[u] = dense_of(mu.slab_class);
         }
         n_cls_ = dense.empty() ? 1 : (int32_t)dense.size();
     }
@@ -142,11 +148,11 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     }
     enabled_ = true;
     RAD_INFO("heat engine: %lld movable units, %d move%s a step, "
-             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f",
+             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f admit-heat %.1f",
              (long long)movable, params_.moves_per_step,
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
-             (double)params_.credit_cap);
+             (double)params_.credit_cap, (double)params_.admit_heat);
     return RAD_OK;
 }
 
@@ -282,12 +288,32 @@ void HeatEngine::set_busy(int32_t unit, bool busy) {
     end_invalidate(unit);
 }
 
+void HeatEngine::set_evictable(int32_t unit, bool evictable) {
+    if (unit < 0 || (size_t)unit >= evictable_.size()) return;
+    evictable_[(size_t)unit] = evictable ? 1u : 0u;
+    set_place(unit);
+    end_invalidate(unit);
+}
+
+void HeatEngine::set_movable(int32_t unit, bool movable) {
+    if (unit < 0 || (size_t)unit >= movable_.size()) return;
+    movable_[(size_t)unit] = movable ? 1u : 0u;
+    set_place(unit);
+    end_invalidate(unit);
+}
+
 void HeatEngine::set_place(int32_t unit) {
     const size_t u = (size_t)unit, p = (size_t)pos_[u];
     const bool vram = tier_[u] == Tier::VRAM;
-    /* A pinned resident is never a candidate to leave the card: it ranks as off-device only, so a
-     * promotion can still target it but a demotion cannot. */
-    rank_as_[p] = (!movable_[u] || busy_[u] || (pinned_[u] && vram)) ? 0u : vram ? 2u : 1u;
+    /* Two candidate lists share rank 2/1 (heat.h): promotions rank movable units off the
+     * device; demotions rank movable -- or hot-cache -- units on it. A hot-cache unit joins
+     * only the demotion end, and only while resident. A pinned resident (main) is never a
+     * candidate to leave the card: it ranks as off-device only, so a promotion can still target
+     * it but a demotion cannot. */
+    rank_as_[p] = busy_[u] ? 0u
+        : (!movable_[u] && !evictable_[u]) ? 0u
+        : (pinned_[u] && vram) ? 0u
+        : vram ? 2u : 1u;
     routed_as_[p] = vram ? 2u : 1u;
     miss_bytes_[p] = vram ? 0 : bytes_[u];
 }
@@ -331,7 +357,7 @@ bool HeatEngine::pick(Swap* out) const {
     std::vector<int32_t> hot_res((size_t)n_cls_, 0), cold_res((size_t)n_cls_, 0);
 
     for (size_t i = 0; i < movable_.size(); ++i) {
-        if (!movable_[i] || busy_[i]) continue;
+        if (busy_[i] || (!movable_[i] && !evictable_[i])) continue;
         const size_t c = (size_t)cls_[i];
         const int32_t l = layer_of_[i];
         const int32_t rc = l >= 0 ? res_count_[(size_t)l] : 0;
@@ -343,14 +369,16 @@ bool HeatEngine::pick(Swap* out) const {
             if (cold[c] < 0 || h < cold_h[c] || (h == cold_h[c] && rc > cold_res[c])) {
                 cold[c] = (int32_t)i; cold_h[c] = h; cold_res[c] = rc;
             }
-        } else {
+        } else if (movable_[i]) {
             /* Hotter wins; on a tie, the layer with the fewest resident units, whose tokens miss
              * most often.
              *
              * Both Tier::SSD and Tier::HostPinned units are candidates: promotion is from wherever
              * the unit is, and the mover knows the source. Demotion never targets the file tier,
              * since a frequency counter cannot justify a bet that a unit will not be needed; it
-             * targets the host pool, and only the planner assigns SSD. */
+             * targets the host pool, and only the planner assigns SSD. The hot VRAM cache's units
+             * are excluded here while they sit on it (movable_ is false for them): admission is
+             * the stager's decision, not a swap. */
             if (hot[c] < 0 || h > hot_h[c] || (h == hot_h[c] && rc < hot_res[c])) {
                 hot[c] = (int32_t)i; hot_h[c] = h; hot_res[c] = rc;
             }
