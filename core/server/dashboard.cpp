@@ -43,6 +43,18 @@ namespace server {
  * and answers with the same object. A deployment with no vector loaded answers 404 on both: it has
  * no such feature, and its requests refuse `control_vector: true` by name. */
 HttpResponse Server::handle_control_vector(const HttpRequest& req) {
+    /* Keyless, the vector and its switch belong to the machine: a rebinding page, a page on
+     * any origin a localhost proxy fronts, or a plain remote client reads neither the state
+     * nor the 404-that-means-no-vector. With --api-key both verbs are behind the key anyway. */
+    if (opt_.api_key.empty() && !local_operator(req)) {
+        ApiError e;
+        e.status  = 403;
+        e.type    = "permission_error";
+        e.message = "without --api-key, the control vector is read and its default changed only "
+                    "from a loopback client naming this machine; start the server with --api-key "
+                    "to reach it from elsewhere";
+        return error_response(e, req.peer);
+    }
     const bool have = deps_.control_vector.available && deps_.control_vector.available();
     if (!have) {
         /* 404, like a model the server does not serve: the route exists, this deployment has nothing
@@ -56,20 +68,6 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     }
 
     if (req.method == "POST") {
-        /* The default applies to every client's requests that name no choice, so a server
-         * started without --api-key takes the change from a loopback client only, as it does a
-         * runtime adapter load. A browser page on another origin does not qualify even when the
-         * victim's own browser makes it loopback: that is the drive-by this guard must refuse.
-         */
-        if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin())) {
-            ApiError e;
-            e.status  = 403;
-            e.type    = "permission_error";
-            e.message = "without --api-key, the control-vector default is changed only from a "
-                        "loopback client; start the server with --api-key to change it from "
-                        "elsewhere";
-            return error_response(e, req.peer);
-        }
         bool over = false, deep = false;
         json body = parse_json_bounded(req.body.empty() ? "{}" : req.body, 0, &over, &deep);
         if (body.is_discarded()) return error_response(err_bad("body", "not JSON"), req.peer);
@@ -194,6 +192,15 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
 HttpResponse Server::handle_session_release(const HttpRequest& req) {
     if (!deps_.sched)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+
+    /* Releasing a session destroys another client's cached conversation: keyless, that is an
+     * operator act, not something any page or client that reaches the port may do. */
+    if (opt_.api_key.empty() && !local_operator(req))
+        return error_response(
+            err_forbidden("without --api-key, sessions are released only from a loopback client "
+                          "naming this machine; start the server with --api-key to do it from "
+                          "elsewhere"),
+            req.peer);
 
     const std::string label = req.param("label");
     uint64_t id = 0;

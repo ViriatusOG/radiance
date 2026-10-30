@@ -2121,6 +2121,7 @@ by 0.002-0.003 nats.
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
+| `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -3811,12 +3812,21 @@ and sends it on every data fetch. The exemption follows those paths' methods -- 
 `POST /ping` of the health-check convention -- so it cannot follow a method no route answers.
 An empty `--api-key` value is a startup error: it would guard nothing.
 
-Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
-the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
-server with `--api-key`. The same loopback-only rule covers the control-vector default and runtime
-LoRA loads, and a browser page on another origin does not qualify as a loopback client even when
-its own machine serves the port: that is how a hostile web page would reach these routes through a
-victim's browser, and a request that says `Origin: http://evil` is refused the way a remote one is.
+Without a key, the routes that see the machine or change its state answer the machine itself only:
+`/diagnostics` (it describes the host — kernel, boot parameters, PCI layout, memory limits),
+`GET|POST /admin/control-vector`, `/v1/load_lora_adapter` and `/v1/unload_lora_adapter` (they read
+paths from disk), `DELETE /sessions/...` and `/reset_prefix_cache` (they destroy other clients'
+cached conversations). Others get 403. "The machine itself" means the socket comes from loopback,
+carries no foreign `Origin` — a browser page on another origin does not qualify even when its own
+machine serves the port, which is how a hostile web page would reach these routes through a
+victim's browser — **and its `Host` names the loopback** (`localhost`, `127.0.0.1`,
+`[::1]`): a DNS-rebinding page is same-origin with your server and its victim's own browser *is*
+the loopback peer, and behind a localhost TLS proxy every remote client arrives on a loopback
+socket — only the `Host` still tells which machine the client asked for. A browser that typed your
+public name into the address bar is therefore refused; `localhost`, a `127.x` address and an SSH
+tunnel pass. If you reach the box by another name from the box itself, list it: `--allow-host box`
+(repeatable). A local user on the server's own console is admitted either way — the boundary is
+against remote callers, not against whoever owns the machine.
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:

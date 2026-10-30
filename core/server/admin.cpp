@@ -509,14 +509,15 @@ HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
         return error_response(err_not_implemented(
             "the server was not given a diagnostics provider; this build has no engine attached"),
                 req.peer);
-    if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin())) {
-        /* A cross-origin browser is not a loopback client even when its own machine serves
-         * this port: the drive-by that guard exists to refuse. */
+    if (opt_.api_key.empty() && !local_operator(req)) {
+        /* A cross-origin browser is not a loopback client even when the victim's own machine
+         * serves this port, and under rebinding or a localhost proxy the socket alone says
+         * loopback for anyone: the Host is what still names who the client asked. */
         ApiError e;
         e.status = 403;
         e.type = "permission_error";
-        e.message = "without --api-key, /diagnostics answers only loopback clients; start the "
-                    "server with --api-key to read it from elsewhere";
+        e.message = "without --api-key, /diagnostics answers only a loopback client naming this "
+                    "machine; start the server with --api-key to read it from elsewhere";
         return error_response(e, req.peer);
     }
     metrics_.observe_http(200);
@@ -529,6 +530,15 @@ HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
 HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
     if (!deps_.sched)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+
+    /* Wiping every client's cached prefix is an operator act: keyless, it belongs to the
+     * machine, not to whichever browser or page can reach the port. */
+    if (opt_.api_key.empty() && !local_operator(req))
+        return error_response(
+            err_forbidden("without --api-key, /reset_prefix_cache runs only from a loopback "
+                          "client naming this machine; start the server with --api-key to run "
+                          "it from elsewhere"),
+            req.peer);
 
     const int64_t n = deps_.sched->reset_prefix_cache();
     if (n < 0)

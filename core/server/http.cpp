@@ -441,6 +441,31 @@ bool HttpRequest::is_cross_origin() const {
     return lower_ascii(auth) != lower_ascii(header("Host"));
 }
 
+std::string HttpRequest::host_authority() const {
+    std::string h = lower_ascii(header("Host"));
+    if (h.empty()) return h;
+    if (h.front() == '[') {
+        /* "[::1]:8000": the address is what the brackets hold. */
+        const size_t close = h.find(']');
+        return close == std::string::npos ? h.substr(1) : h.substr(1, close - 1);
+    }
+    const size_t colon = h.rfind(':');
+    if (colon != std::string::npos && h.find(':') == colon &&
+        h.find_first_not_of("0123456789", colon + 1) == std::string::npos)
+        h.erase(colon);   /* "localhost:8000" -> "localhost"; a bare "::1" keeps its colons */
+    return h;
+}
+
+bool HttpRequest::host_is_loopback() const {
+    const std::string h = host_authority();
+    if (h.empty()) return peer.empty();   /* no Host: an in-process dispatch, never a socket */
+    if (h == "localhost" || h == "ip6-localhost" || h == "ip6-loopback") return true;
+    in_addr v4{};
+    if (inet_pton(AF_INET, h.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
+    in6_addr v6{};
+    return inet_pton(AF_INET6, h.c_str(), &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6);
+}
+
 /* The API key a browser's socket carries. A browser cannot set a header on a WebSocket, so
  * OpenAI's browser clients offer it as a subprotocol, `openai-insecure-api-key.<key>`, beside
  * `realtime`; the subprotocol chosen is never that one. Compared in constant time, as the header

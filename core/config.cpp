@@ -213,6 +213,9 @@ static const Flag g_flags[] = {
     { "--port",               "N",      "listen port" },
     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but /health,\n"
     "                                    /v1/health, /ping and the dashboard page" },
+    { "--allow-host",         "NAME",   "a Host name the keyless loopback-only routes (/diagnostics,\n"
+    "                                    /admin/control-vector, the LoRA and session admin) accept besides\n"
+    "                                    localhost; repeatable" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
@@ -820,6 +823,11 @@ int config_parse(int argc, char** argv, Config* c) {
                        return RAD_E_INVAL; }
             c->api_key = v;
         }
+        else if (S("--allow-host")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!*v) { RAD_ERR("--allow-host takes a non-empty name"); return RAD_E_INVAL; }
+            c->allow_hosts.emplace_back(v);
+        }
         else if (S("--served-model-name")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
@@ -1344,6 +1352,10 @@ const ShowRow kShow[] = {
     { "--port",               [](const Config& c) { return num(c.port); } },
     /* Never print the secret, only whether it is set. */
     { "--api-key",            [](const Config& c) { return std::string(c.api_key.empty() ? "not set" : "set"); } },
+    { "--allow-host",         [](const Config& c) {
+          std::string o;
+          for (const std::string& h : c.allow_hosts) o += (o.empty() ? "" : ",") + h;
+          return o.empty() ? std::string("the loopback names only") : o; } },
     { "--served-model-name",  [](const Config& c) { return or_none(c.served_model_name, "the container's name"); } },
     { "--mm-max-patches",     [](const Config& c) { return c.mm_max_patches < 0 ? std::string("auto") : num(c.mm_max_patches); } },
     { "--image-gen-max-pixels", [](const Config& c) { return c.image_gen_max_pixels > 0 ? num(c.image_gen_max_pixels) : std::string("the model's"); } },

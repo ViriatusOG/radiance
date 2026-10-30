@@ -1049,6 +1049,9 @@ struct Config {
     /* --api-key: the bearer key every request but the probes and the dashboard page must carry.
      * Empty serves without one. */
     std::string api_key;
+    /* --allow-host, repeatable: Host names the keyless loopback-only routes accept beside the
+     * loopback names themselves, for operators who reach the box by another name. */
+    std::vector<std::string> allow_hosts;
     /* --served-model-name: the id /v1/models lists, a response names when its request named none,
      * and the metrics carry. Empty takes the container's own name. A request may still name any
      * model: one model is loaded and every request is served by it. */

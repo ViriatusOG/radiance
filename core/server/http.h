@@ -57,6 +57,15 @@ struct HttpRequest {
      * SDK. Through a proxy that rewrites Host, every browser reads as cross-origin -- which is
      * exactly the case the "loopback-only" guards must not wave through. */
     bool        is_cross_origin() const;
+    /* The Host header's authority, lowercased with the port stripped; "" when there is no Host.
+     * The name a browser believes it is talking to — under DNS rebinding the attacker's own, and
+     * through a proxy the public one, neither of which the peer's address shows. */
+    std::string host_authority() const;
+    /* True when the Host names this machine as the loopback: "localhost", 127.0.0.1/8, [::1].
+     * A rebinding page is same-origin with the server and its victim's browser is the loopback
+     * peer — only the Host still says what page asked for it. An absent Host reads as local for
+     * an in-process dispatch and as remote for a socket, which always carries one. */
+    bool        host_is_loopback() const;
 };
 
 struct HttpResponse {

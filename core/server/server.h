@@ -183,6 +183,9 @@ struct ServerOptions {
     std::function<std::vector<std::string>()>                                gen_lora_names;
 
     std::string api_key;
+    /* Extra Host authorities the keyless "loopback only" guards accept (--allow-host): names an
+     * operator reaches the box by that the loopback IP check cannot know. Case-insensitive. */
+    std::vector<std::string> local_hosts;
     bool        cors = true;
 
     /* The transport's timeouts and body bound. See TransportOptions. */
@@ -227,6 +230,14 @@ public:
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
+    /* The identity the keyless "loopback only" guards accept: the socket is loopback, the
+     * request carries no foreign Origin, and the Host names the loopback, one of
+     * ServerOptions::local_hosts, or the address --host names. Two ways forge the socket alone:
+     * a DNS-rebinding page is same-origin with the server and its victim's browser *is* the
+     * loopback peer — only the Host still tells which page asked for it — and a localhost TLS
+     * proxy puts every remote client behind the loopback socket, carrying the public Host. An
+     * attacker at the console of this machine is a local user either way, and stays admitted. */
+    bool local_operator(const HttpRequest& req) const;
     void stop();
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 

@@ -186,6 +186,14 @@ ApiError err_unsupported(const std::string& param, const std::string& why) {
     return e;
 }
 
+ApiError err_forbidden(const std::string& why) {
+    ApiError e;
+    e.status = 403;
+    e.type = "permission_error";
+    e.message = why;
+    return e;
+}
+
 ApiError err_not_implemented(const std::string& what) {
     ApiError e;
     e.status = 501;

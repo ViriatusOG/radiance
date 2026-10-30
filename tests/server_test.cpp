@@ -3041,8 +3041,10 @@ TEST(server_info_drops_an_engine_blob_that_is_not_an_object) {
     CHECK(has(r2.body, "\"arch\":\"testarch\""));
 }
 
-/* /diagnostics describes the host, so without a key it answers this machine only. With a key the
- * transport's gate has already checked the caller, and any address may ask. */
+/* /diagnostics describes the host, so without a key it answers this machine only — and the Host
+ * must name it, since a rebinding victim's browser or a localhost proxy's every remote client
+ * arrives with a loopback socket. With a key the transport's gate has already checked the
+ * caller, and any address may ask. */
 TEST(diagnostics_without_a_key_answers_loopback_only) {
     FakeScheduler sched;
     FakeTokenizer tok;
@@ -3051,29 +3053,91 @@ TEST(diagnostics_without_a_key_answers_loopback_only) {
     d.tok = &tok;
     ServerOptions o;
     o.model_id = "test-model";
+    o.local_hosts = { "box" };
     o.diagnostics_json = [] { return std::string(R"({"findings":[]})"); };
     Server srv(d, o);
-    auto from = [](Server& s, const char* peer) {
+    auto from = [](Server& s, const char* peer, const char* host = nullptr,
+                   const char* origin = nullptr) {
         HttpRequest q;
         q.path = "/diagnostics";
         q.peer = peer;
+        if (host) q.headers["Host"] = host;
+        if (origin) q.headers["Origin"] = origin;
         return s.router().dispatch(q).status;
     };
-    CHECK_EQ(from(srv, "127.0.0.1:50122"), 200);
-    CHECK_EQ(from(srv, "127.8.9.10:50122"), 200);
-    CHECK_EQ(from(srv, "::1:50122"), 200);
-    CHECK_EQ(from(srv, "[::1]:50122"), 200);
-    CHECK_EQ(from(srv, "::ffff:127.0.0.1:50122"), 200);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "localhost:8000"), 200);
+    CHECK_EQ(from(srv, "127.8.9.10:50122", "127.8.9.10:8000"), 200);
+    CHECK_EQ(from(srv, "::1:50122", "127.0.0.1:8000"), 200);
+    CHECK_EQ(from(srv, "[::1]:50122", "[::1]:8000"), 200);
+    CHECK_EQ(from(srv, "::ffff:127.0.0.1:50122", "127.0.0.1:8000"), 200);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "localhost:8000", "http://localhost:8000"), 200);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "BOX:8000"), 200);      /* --allow-host, any case */
     CHECK_EQ(from(srv, ""), 200);                       /* in-process */
-    CHECK_EQ(from(srv, "192.168.1.20:50122"), 403);
-    CHECK_EQ(from(srv, "::ffff:10.0.0.7:50122"), 403);
-    CHECK_EQ(from(srv, "fe80::1:50122"), 403);
-    CHECK_EQ(from(srv, "128.0.0.1:50122"), 403);
+    /* Loopback socket, foreign Host: the rebinding page (Origin matching its Host, so the
+     * cross-origin check stays silent) and the localhost proxy handing over the public name
+     * (no Origin at all). Neither names the machine, and a socket that carries no Host does
+     * not either. */
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "evil.test:8000", "http://evil.test:8000"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "api.example.com"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "192.168.1.20:8000"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "other.box:8000"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122", "localhost:8000", "http://evil.test"), 403);
+    CHECK_EQ(from(srv, "192.168.1.20:50122", "localhost:8000"), 403);
+    CHECK_EQ(from(srv, "::ffff:10.0.0.7:50122", "localhost:8000"), 403);
+    CHECK_EQ(from(srv, "fe80::1:50122", "localhost:8000"), 403);
+    CHECK_EQ(from(srv, "128.0.0.1:50122", "localhost:8000"), 403);
 
     ServerOptions ok = o;
     ok.api_key = "k";
     Server keyed(d, ok);
-    CHECK_EQ(from(keyed, "192.168.1.20:50122"), 200);
+    CHECK_EQ(from(keyed, "192.168.1.20:50122", "api.example.com"), 200);
+}
+
+/* Destroying cache is an operator act: without a key, session release and prefix-cache reset
+ * answer the machine only, judged with the same identity as /diagnostics. The statuses below
+ * say the guard passed (the handler's own answers) rather than the 403 it refuses with. */
+TEST(state_changing_routes_without_a_key_answer_the_machine_only) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.model_id = "test-model";
+    Server srv(d, o);
+    auto del = [](Server& s, const char* peer, const char* host) {
+        HttpRequest q;
+        q.method = "DELETE";
+        q.path = "/sessions";
+        q.query["label"] = "conv-1";
+        q.peer = peer;
+        if (host) q.headers["Host"] = host;
+        return s.router().dispatch(q).status;
+    };
+    auto reset = [](Server& s, const char* peer, const char* host) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/reset_prefix_cache";
+        q.peer = peer;
+        if (host) q.headers["Host"] = host;
+        return s.router().dispatch(q).status;
+    };
+    CHECK_EQ(del(srv, "", nullptr), 501);             /* no prefix cache: past the guard */
+    CHECK_EQ(del(srv, "127.0.0.1:50122", "localhost:8000"), 501);
+    CHECK_EQ(del(srv, "127.0.0.1:50122", "evil.test:8000"), 403);        /* rebinding */
+    CHECK_EQ(del(srv, "127.0.0.1:50122", "api.example.com"), 403);       /* proxy */
+    CHECK_EQ(del(srv, "192.168.1.20:50122", "localhost:8000"), 403);     /* remote */
+    CHECK_EQ(reset(srv, "", nullptr), 501);            /* no cache to reset: past the guard */
+    CHECK_EQ(reset(srv, "127.0.0.1:50122", "127.0.0.1:8000"), 501);
+    CHECK_EQ(reset(srv, "127.0.0.1:50122", "evil.test:8000"), 403);
+    CHECK_EQ(reset(srv, "192.168.1.20:50122", "localhost:8000"), 403);
+
+    ServerOptions ok = o;
+    ok.api_key = "k";
+    Server keyed(d, ok);
+    CHECK_EQ(del(keyed, "192.168.1.20:50122", "api.example.com"), 501);
+    CHECK_EQ(reset(keyed, "192.168.1.20:50122", "api.example.com"), 501);
 }
 
 TEST(tokenize_takes_a_prompt_or_messages_and_never_both) {
@@ -4800,16 +4864,27 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
          * tear down, parsed bounded and refused. */
         CHECK_EQ(f.post("/admin/control-vector",
                         std::string(20000, '[') + std::string(20000, ']')).status, 400);
-        /* Without --api-key a change comes from loopback only; reading it is not restricted. */
+        /* Without --api-key the vector is read and changed by the machine itself, and its Host
+         * must still name it: under DNS rebinding the victim's browser IS the loopback peer and
+         * its Origin matches its Host — only the dialled name tells the two apart. */
         HttpRequest q;
         q.method = "POST";
         q.path = "/admin/control-vector";
         q.body = R"({"enabled":true})";
         q.peer = "192.168.1.20:50122";
+        q.headers["Host"] = "127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(q).status, 403);
         CHECK(!def);
         q.peer = "127.0.0.1:50122";
+        q.headers["Host"] = "localhost:8000";
         CHECK_EQ(f.srv->router().dispatch(q).status, 200);
+        CHECK(def);
+        /* The rebinding page: loopback peer, Origin and Host both the attacker's domain, the
+         * pair no `Origin != Host` check can see. */
+        q.body = R"({"enabled":false})";
+        q.headers["Host"] = "evil.test:8000";
+        q.headers["Origin"] = "http://evil.test:8000";
+        CHECK_EQ(f.srv->router().dispatch(q).status, 403);
         CHECK(def);
         /* A browser page on another origin is not a loopback client, even though its own
          * browser makes the request arrive loopback: defeating the guard that way is exactly
@@ -4826,10 +4901,16 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         x.headers["Origin"] = "http://127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(x).status, 200);
         CHECK(!def);
+        /* Reading is guarded like the change: what a keyless deployment carries — that it has
+         * a vector at all, its family and range — is no remote caller's business. */
         HttpRequest g2;
         g2.path = "/admin/control-vector";
         g2.peer = "192.168.1.20:50122";
-        CHECK_EQ(f.srv->router().dispatch(g2).status, 200);
+        g2.headers["Host"] = "box.example:8000";
+        CHECK_EQ(f.srv->router().dispatch(g2).status, 403);
+        HttpRequest g3;
+        g3.path = "/admin/control-vector";
+        CHECK_EQ(f.srv->router().dispatch(g3).status, 200);   /* in-process */
     }
 }
 

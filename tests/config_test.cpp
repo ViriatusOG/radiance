@@ -102,6 +102,16 @@ TEST(an_empty_api_key_is_refused) {
     CHECK(c.api_key == "k");
 }
 
+/* --allow-host repeats: the loopback-only routes take the set of names, and an empty one is
+ * a hole cut by a typo, so it is refused like the empty key. */
+TEST(allow_host_repeats_and_refuses_the_empty_name) {
+    CHECK_EQ(parse_fresh({ "--allow-host", "" }), RAD_E_INVAL);
+    Config c;
+    CHECK_EQ(parse({ "--allow-host", "box", "--allow-host", "box.example" }, &c), 0);
+    CHECK(c.allow_hosts.size() == 2);
+    CHECK(c.allow_hosts[0] == "box" && c.allow_hosts[1] == "box.example");
+}
+
 /* A flag written last with no argument is refused rather than reading past argv. */
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
@@ -482,6 +492,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
+        { "--allow-host", { "box" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },

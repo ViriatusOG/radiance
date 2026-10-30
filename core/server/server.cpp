@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <chrono>
 #include <thread>
@@ -55,6 +56,27 @@ Server::Server(const Deps& d, const ServerOptions& o)
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
     register_routes();
+}
+
+bool Server::local_operator(const HttpRequest& req) const {
+    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
+    if (req.host_is_loopback()) return true;
+    const std::string host = req.host_authority();
+    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
+                                         passed host_is_loopback on its empty peer */
+    for (const std::string& a : opt_.local_hosts) {
+        std::string want = a;
+        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
+        if (want == host) return true;
+    }
+    /* Bound to one concrete address, the box answers to that name on itself. */
+    std::string bind = opt_.host;
+    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
+    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
+        bind = bind.substr(1, bind.size() - 2);
+    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
+        return bind == host;
+    return false;
 }
 
 Server::~Server() { stop(); }
@@ -2251,12 +2273,15 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     if (!opt_.lora_load || !opt_.lora_unload)
         return fail(404, "not_found_error", "this server was started without runtime LoRA (--lora or "
                                             "--max-loras)");
-    if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin()))
+    if (opt_.api_key.empty() && !local_operator(req))
         /* A cross-origin browser counts as neither loopback nor local: the victim's own browser
-         * is loopback to this port, and that is exactly how a hostile page would reach here. */
+         * is loopback to this port, and that is exactly how a hostile page would reach here —
+         * under DNS rebinding it even arrives with a matching Host unless the Host names the
+         * loopback, and through a localhost proxy every remote client does. Reading a path on
+         * this machine is a local operator's act. */
         return fail(403, "permission_error", "loading an adapter reads a path on this machine, and a "
                                              "server started without --api-key takes it only from a "
-                                             "loopback client");
+                                             "loopback client naming this machine");
     /* Bounded like a generation body: this parses client text the same way, and a deep bracket
      * nest would overflow this worker's stack when the tree is torn down. */
     bool over = false, deep = false;

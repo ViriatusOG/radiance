@@ -2620,6 +2620,7 @@ int Engine::run_server() {
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
+    o.local_hosts = cfg_.allow_hosts;
     o.max_seqs = cfg_.max_seqs;
     /* `n` fans one request out over the batch, so the default scales with --max-num-seqs; the
      * floor of 8 keeps a small batch from refusing what it would queue. */

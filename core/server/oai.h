@@ -44,6 +44,7 @@ struct ApiError {
 
 ApiError err_bad(const std::string& param, const std::string& why);
 ApiError err_unsupported(const std::string& param, const std::string& why);
+ApiError err_forbidden(const std::string& why);
 ApiError err_not_implemented(const std::string& what);
 ApiError err_overloaded(const std::string& why);
 ApiError err_internal(const std::string& why);
