@@ -91,6 +91,17 @@ TEST(a_retired_flag_is_refused) {
     CHECK_EQ(parse({ "--kv-host-cache-mib", "4096" }, &c), RAD_E_INVAL);
 }
 
+/* An empty key is no key: --api-key "" -- or --api-key "$UNSET_VAR" in a unit file whose variable
+ * was typo'd -- must not start a server that looks guarded on its command line and answers every
+ * route keyless. The shipped compose files fail closed on ${RADIANCE_API_KEY:?}; this is the
+ * refusal for every other way the binary meets an empty value. */
+TEST(an_empty_api_key_is_refused) {
+    CHECK_EQ(parse_fresh({ "--api-key", "" }), RAD_E_INVAL);
+    Config c;
+    CHECK_EQ(parse({ "--api-key", "k" }, &c), 0);
+    CHECK(c.api_key == "k");
+}
+
 /* A flag written last with no argument is refused rather than reading past argv. */
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
