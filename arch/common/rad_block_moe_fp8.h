@@ -1621,10 +1621,13 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * (rad_expert_prefetch). A failure only loses the prediction. */
     if (xp_next && xp_next->xp.n_parts > 0)
         (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, r0, rows, g.n_embd);
-    /* Write the routing counts straight into the core's row for this layer when it keeps one, so
-     * the report in step() needs no copy (otherwise a dependent blit per routed layer). */
-    int32_t* const counts = rad_route_counts(c_, layer, ne);
-    const RadOperand ecnt = counts ? praw(counts, RAD_I32, ne) : brows(w.ecnt, ne);
+    /* Bind the block's own ecnt buffer, never the core's raw routing row: a raw-pointer operand
+     * does not survive the step tape's replay (the decode path re-issues ops from the tape), so
+     * the histogram the kernel writes there never lands, and a consumer reading the reported
+     * counts -- the file stager, at the layer's trigger -- sees zeros and skips every expert's
+     * weights. The declared buffer is stable across record and replay, and route_report hands
+     * the same buffer on, so the stager's stream-ordered read sees this pass's counts. */
+    const RadOperand ecnt = brows(w.ecnt, ne);
     /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
     const bool rfused = op_router_fused && rows <= router_fused_rows;
@@ -1884,12 +1887,19 @@ inline void MoeFP8::route_report(RadCtx* c_) const {
      * `expert_w` stays null: RadRouting declares it `const float*` but these weights are bf16
      * (f32 under the sigmoid router). Nothing in the core reads it (the heat engine uses
      * `expert_count`). */
+    /* The router kernel writes the block's own ecnt buffer (w.ecnt) every pass, so report THAT
+     * pointer: a consumer reading it stream-ordered (the file stager's trigger runs after this
+     * layer's router on the same stream) sees this pass's counts. Reporting rad_route_counts'
+     * row instead names a buffer the router never writes; the pointer then equals the report's
+     * destination row, the copy here is skipped, and the row stays zero -- which the file stager
+     * read as "no expert routed" and skipped every layer's weights (NaN logits, empty text).
+     * Copying w.ecnt into the row (the pointers now differ) also feeds the heat engine real
+     * histograms instead of the zeros it saw before. */
     moe_debug_weights(c_, layer, c.top_k, w.ids, w.ew, c.sigmoid_router != 0);
     RadRouting r{};
     r.expert_ids    = (const int32_t*)rad_buf_ptr(c_, w.ids);
     r.expert_w      = nullptr;
-    const int32_t* const counts = rad_route_counts(c_, layer, c.n_expert);
-    r.expert_count  = counts ? counts : (const int32_t*)rad_buf_ptr(c_, w.ecnt);
+    r.expert_count  = (const int32_t*)rad_buf_ptr(c_, w.ecnt);
     r.sorted_tok    = (const int32_t*)rad_buf_ptr(c_, w.sorted);
     r.expert_offset = (const int32_t*)rad_buf_ptr(c_, w.eoff);
     r.top_k         = c.top_k;

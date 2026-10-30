@@ -246,9 +246,13 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 });
     mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { T * 8 });
     mw.inv = decl_b(b, nm.f("expert_inverse"), RAD_I32, { T * 8 });
-    mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * F });
-    mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, F });
-    RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", F, T * 8));
+    // FE: the routed experts' WHOLE intermediate (2048). Under expert parallelism a rank owns
+    // whole experts, so the routed arm's buffers are full-width at every world size; the SHARED
+    // expert stays width-sharded (F). The two coincide at world 1.
+    const int64_t FE = 2048;
+    mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * FE });
+    mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, FE });
+    RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", FE, T * 8));
     mw.edn = decl_b(b, nm.f("expert_down"), RAD_BF16, { T * 8, 4096 });
     mw.sgu = bf("shared_gate_up", 2 * F);
     mw.sff.x = bf("shared_ff", F);
@@ -357,9 +361,26 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.router_bias = nm.ckpt("%s.mlp.gate.e_score_correction_bias", pre);
         s.experts = nm.ckpt("%s.mlp.experts", pre);
         s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
-        s.cfg.n_expert = s.cfg.n_expert_all = 288;
+        // EXPERT PARALLELISM AT TP: each rank owns 288/world WHOLE experts (the contiguous
+        // window [expert_base, expert_base+n_expert) of the checkpoint's numbering), which the
+        // helper declares RAD_SHARD_NONE -- unsharded, so an expert unit is file-direct and can
+        // live in the container's mapping or the file tier
+        // instead of needing VRAM+pinned-pool residency for all 151 GiB of them. The router
+        // stays replicated over n_expert_all; moe_scatter/router_topk_scatter drop slots
+        // outside the window (moe_scatter schema: "which is how EXPERT PARALLELISM is
+        // expressed"); the shared expert stays width-sharded on its own declaration path; the
+        // block's all-reduce sums the partials exactly as width TP did. At world 1 this
+        // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
+        s.cfg.n_expert_all = 288;
         s.cfg.top_k = 8;
-        s.cfg.n_ff_exp = s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
+        s.cfg.n_expert = 288 / g.world;
+        // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
+        // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
+        const int ep_rank = g.rank < g.world ? g.rank : 0;
+        s.cfg.expert_base = ep_rank * (288 / g.world);
+        s.cfg.probed_expert = s.cfg.expert_base;      // probe this rank's first owned expert
+        s.cfg.n_ff_exp = 2048;                        // whole: whole experts' intermediate
+        s.cfg.n_ff_shared = 2048 / g.world;
         s.cfg.rows = g.max_tok;
         s.cfg.sigmoid_router = 1;
         s.cfg.route_scale = 2.5;
@@ -367,9 +388,14 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.cfg.shared_ungated = 1;
         s.cfg.router_fuse = 1;
         s.cfg.swiglu_quant = 1;
-        for (int q = 0; q < 2; ++q) {
-            s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
-            s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
+        // At world 1 the width-slice declaration IS the whole model: keep the spans so the
+        // graph stays the pinned one. At world > 1 expert parallelism is in force and whole
+        // experts need no width spans (split && ep is refused by the helper).
+        if (g.world == 1) {
+            for (int q = 0; q < 2; ++q) {
+                s.cfg.ff_lo[q] = g.rank * (2048 / g.world);
+                s.cfg.ff_hi[q] = (g.rank + 1) * (2048 / g.world);
+            }
         }
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
         RAD_ARCH_TRY(lay.moe.declare(b, nm, g, l, w, s, false, draft));

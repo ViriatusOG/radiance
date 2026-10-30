@@ -1612,10 +1612,14 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         bool heads_only = false;   /* the default: the graph before the row form */
     };
     /* Pins from this test's own `pin:` printout: the head form (heads_only, which declares the
-     * streamed ops) and the row form, at one and eight ranks. */
+     * streamed ops) and the row form, at one and eight ranks. Re-recorded after every graph
+     * change -- the merge re-recorded them for main's builder plus this branch's file-direct
+     * expert ops. */
     const Case cases[] = { { 1, 0x8e12725b3ed3548dull, 0x68ffc03d2b640d51ull },
-                           { 8, 0xe4ba21765f690f70ull, 0x82ed1094dbf4b637ull },
-                           { 8, 0xf404ab12440b389full, 0x3818eedb4ac10d1bull, true } };
+                           /* World 8 is this branch's expert-parallel graph (288/world whole
+                            * experts, file-direct), so its pins differ from main's. */
+                           { 8, 0x6232b56d6f971d61ull, 0x1b80576ba8f1ecc7ull },
+                           { 8, 0x3e4b89352f01b57bull, 0xed8cc595e8eeb593ull, true } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
