@@ -1,0 +1,22 @@
+# Codeberg CI (Woodpecker): the full suite on a machine without ROCm -- the CPU-only build, the
+# same posture as `./build.sh --no-hip` -- on the current Ubuntu LTS. The LTS is chosen, not
+# assumed: the media codecs must be new enough for the FFmpeg >= 7 callback signatures the mp4
+# writer binds (24.04's 6.1 does not compile), and the card suites (`*_card`, LABELS "gpu") want
+# hardware this runner does not have, so the run is the host preset -- everything but gpu and oot.
+# vendor_sums runs here as everywhere: a changed lift that the vendor record does not carry fails
+# CI before it fails a user.
+when:
+  - event: [push, pull_request, tag]
+
+steps:
+  test:
+    image: ubuntu:26.04
+    commands:
+      - export DEBIAN_FRONTEND=noninteractive
+      - apt-get update -qq
+      - apt-get install -y -qq --no-install-recommends git cmake ninja-build g++ pkg-config jq
+          ca-certificates libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+          libswresample-dev
+      - cmake -S . -B build -G Ninja -DRAD_WITH_HIP=OFF -DRAD_WITH_FFMPEG=AUTO
+      - cmake --build build -j "$(nproc)"
+      - ctest --preset host          # everything but gpu and oot, in the configured build dir

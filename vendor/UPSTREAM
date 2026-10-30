@@ -7,6 +7,14 @@ patch was REWRITTEN into core/ under our own name instead, so this directory sta
 The bottom half of this file is the list of things that went the other way, and why -- that list
 is as much a part of the record as the lifts are.
 
+The mechanical half of the promise is vendor/SHA256SUMS: every file under this directory -- lifts,
+patch series, this record -- hashed, recomputed by tests/vendor_sums.sh (ctest: vendor_sums). A
+file that differs, or arrived unrecorded, fails the suite: an unrecorded change to a lifted
+dependency has to survive being a committed, hashed manifest update to ship, not slip through a
+rebase. Regenerate the manifest in the same commit that changes vendor/:
+
+    find vendor -type f ! -name SHA256SUMS | sort | xargs sha256sum > vendor/SHA256SUMS
+
 UPSTREAM
 --------
 

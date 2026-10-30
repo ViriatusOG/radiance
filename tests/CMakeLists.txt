@@ -937,3 +937,12 @@ if(TARGET r4d_bf16_capacity_test)
       ENVIRONMENT "RADIANCE_HOME=${RAD_PLUGIN_OUT};RAD_TEST_CPU_BUDGET=0" TIMEOUT 300)
   endif()
 endif()
+
+# The vendor record, verified: every file under vendor/ -- the lifts, the patch series, the record
+# itself -- hashed against vendor/SHA256SUMS. A changed file the record does not carry, or one that
+# arrived unrecorded, is an unrecorded change to a lifted dependency, which is the thing UPSTREAM
+# exists to prevent and nothing else notices. It reads the source tree only: no build inputs, no
+# machine state, so it runs wherever the suite runs.
+add_test(NAME vendor_sums
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
