@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 
@@ -31,15 +32,31 @@ void fwht_row(double* v, int64_t k, int64_t n) {
 
 /* H -> F H F for the block-diagonal Hadamard F of width `n`: every row, then every column. F is
  * symmetric, so the column pass is the row pass over the transpose; the result stays bit-exactly
- * symmetric only because both passes run the same butterflies in the same order. */
+ * symmetric only because both passes run the same butterflies in the same order. The column pass
+ * runs fwht_inplace's butterflies on whole rows of a block of `n` rows, so each column sees the
+ * same operations in the same order as the transform of that column alone; rows, and blocks of
+ * rows, are independent, so threads change nothing. */
 void rotate_gram(std::vector<double>& h, int64_t k, int64_t n) {
-    for (int64_t r = 0; r < k; ++r) fwht_row(h.data() + r * k, k, n);
-    std::vector<double> col((size_t)k);
-    for (int64_t c = 0; c < k; ++c) {
-        for (int64_t r = 0; r < k; ++r) col[(size_t)r] = h[(size_t)(r * k + c)];
-        fwht_row(col.data(), k, n);
-        for (int64_t r = 0; r < k; ++r) h[(size_t)(r * k + c)] = col[(size_t)r];
-    }
+    double* d = h.data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t r = 0; r < k; ++r) fwht_row(d + r * k, k, n);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t b0 = 0; b0 < k; b0 += n)
+        for (int64_t s = 1; s < n; s <<= 1)
+            for (int64_t i = b0; i < b0 + n; i += s << 1)
+                for (int64_t j = i; j < i + s; ++j) {
+                    double* x = d + j * k;
+                    double* y = d + (j + s) * k;
+                    for (int64_t c = 0; c < k; ++c) {
+                        const double a = x[c], b = y[c];
+                        x[c] = a + b;
+                        y[c] = a - b;
+                    }
+                }
 }
 
 bool read_gram(const std::string& path, int64_t k, int64_t domain, std::vector<double>* acc) {
@@ -124,9 +141,15 @@ std::string own_stem(const char* name) {
     return s;
 }
 
+/* A few layers' Grams, the oldest dropped first: a MoE layer's experts read their layer's again
+ * and again, a dense model reads each once, and every layer's kept at once outgrows the host
+ * (Qwen3.8-27B's are ~100 GB; a GPTQ convert with descent was OOM-killed at layer 50). */
+constexpr size_t kGrams = 4;
+
 struct GramCache {
     std::mutex mu;
     std::map<std::string, Gram> g;   /* null = looked and found nothing */
+    std::deque<std::string> order;   /* g's keys, oldest first */
 };
 
 GramCache& gram_cache() {
@@ -342,7 +365,12 @@ Gram calib_gram(const char* dir, const char* name, int64_t K, int64_t domain, co
     if (h)
         std::fprintf(stderr, "libquant: %s reads '%s' against %d calibration file(s), K=%lld\n",
                      who, stem.c_str(), found, (long long)K);
+    while (c.order.size() >= kGrams) {
+        c.g.erase(c.order.front());
+        c.order.pop_front();
+    }
     c.g.emplace(key, h);
+    c.order.push_back(key);
     return h;
 }
 

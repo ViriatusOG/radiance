@@ -1286,7 +1286,7 @@ TEST(a_scored_request_names_real_vocabulary_rows) {
 
 /* The prompt itself names real vocabulary rows too: raw id arrays arrive verbatim from the
  * request body, and an id past the embedding table must die at admission, never staged into a
- * pass — the embedding gather would fail the step, a failed step is a device fault, and a
+ * pass -- the embedding gather would fail the step, a failed step is a device fault, and a
  * device fault stops the engine (spec §17). One bad number must not be a server kill. */
 TEST(a_prompt_names_real_vocabulary_rows) {
     Fixture f;
@@ -4578,6 +4578,34 @@ TEST(the_cards_block_tables_match_the_manager_after_every_build) {
     CHECK(checked > 100);
 }
 
+/* A streamed group's prefill stage copies what the step's own sequences' tables name
+ * (kvstream/stage.h, "Volume"), so the engine reads the step's sequences off the batch it is about
+ * to run: the build's rows in order, for that batch only. */
+TEST(a_built_batch_names_its_own_sequences_in_row_order) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+    f.submit(40, 9);
+    f.submit(70, 20);
+    int checked = 0;
+    for (int step = 0; step < 12; ++step) {
+        if (step == 3) f.submit(33, 12);
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        const std::vector<uint64_t>* seqs = f.sch.step_seqs(b);
+        REQUIRE(seqs != nullptr);
+        REQUIRE_EQ(seqs->size(), p.e.size());
+        for (size_t i = 0; i < p.e.size(); ++i) CHECK_EQ((*seqs)[i], p.e[i].seq);
+        ++checked;
+        CHECK_OK(f.commit(0, 0));
+    }
+    CHECK(checked > 5);
+    RadBatch other{};
+    CHECK(f.sch.step_seqs(&other) == nullptr);
+    CHECK(f.sch.step_seqs(nullptr) == nullptr);
+}
+
 /* A streamed group's residency map and ring bookkeeping live in each rank's KV pool,
  * but the manager the builder is given is rank 0's, so its pointers are rank 0's addresses. A
  * two-rank batch must name rank r's own copies or device r resolves through device 0's memory
@@ -4647,6 +4675,82 @@ TEST(a_two_rank_batch_rebases_stream_maps_into_each_ranks_pool_and_shares_the_mi
         for (int gi = 1; gi < b->n_kv_groups; ++gi)
             CHECK(b->kv[gi].stream == nullptr);
     }
+    bb.fini();
+}
+
+/* A request's words for the plugin (Request::plugin_words) ride the prefill step that samples
+ * its first token, with that row's index in word 0; a sequence without words, or one not at that
+ * step, has an empty range. A request past the declared bound fails the build. */
+TEST(a_requests_plugin_words_ride_the_step_that_samples_its_first_token) {
+    Fixture f;
+    f.build();
+    f.prog.plugin_words = 8;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+    for (uint64_t id = 1; id <= 3; ++id) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_OK(f.kv.ensure(id, 80));
+    }
+    Request r1, r2, r3;
+    r1.prompt.assign(8, 1);
+    r2.prompt.assign(8, 1);
+    r2.plugin_words = { 0, 7, 8, 9 };
+    r3.prompt.assign(8, 1);
+    r3.plugin_words = { 0, 5 };
+
+    StepPlan p;
+    p.reset();
+    auto entry = [&](uint64_t id, const Request* r, bool last) {
+        StepEntry e;
+        e.seq = id;
+        e.card = (int32_t)id - 1;
+        e.req = r;
+        e.n_tokens = 8;
+        e.ctx_len = 0;
+        e.is_prefill = true;
+        e.produces_token = last;
+        p.e.push_back(e);
+        p.n_tok += 8;
+    };
+    entry(1, &r1, true);     /* no words */
+    entry(2, &r2, true);     /* words, sampled this step */
+    entry(3, &r3, false);    /* words, but a mid-prompt chunk */
+    const RadBatch* b = bb.build(p, f.kv, 0);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_plugin_words, (int64_t)4);
+    REQUIRE(b->plugin_cu_h != nullptr);
+    CHECK_EQ(b->plugin_cu_h[0], 0);
+    CHECK_EQ(b->plugin_cu_h[1], 0);
+    CHECK_EQ(b->plugin_cu_h[2], 4);
+    CHECK_EQ(b->plugin_cu_h[3], 4);
+    /* Sequence 1 took logits row 0, so sequence 2's words open with row 1. */
+    CHECK_EQ(b->plugin_words_h[0], 1);
+    CHECK_EQ(b->plugin_words_h[1], 7);
+    CHECK_EQ(b->plugin_words_h[3], 9);
+    CHECK(b->plugin_words != nullptr && b->plugin_cu != nullptr);
+
+    /* No sequence carries words: every field is null. */
+    p.reset();
+    entry(1, &r1, true);
+    b = bb.build(p, f.kv, 1);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_plugin_words, (int64_t)0);
+    CHECK(b->plugin_words == nullptr && b->plugin_cu_h == nullptr);
+
+    /* Past the bound: the build fails rather than overrun the slab. */
+    r3.plugin_words.assign(9, 0);
+    p.reset();
+    entry(3, &r3, true);
+    CHECK(bb.build(p, f.kv, 2) == nullptr);
     bb.fini();
 }
 
@@ -7101,12 +7205,12 @@ uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_
 /* Without a span the scheduler plans and stages the pinned steps: the fingerprints of a scripted
  * workload's every step (plan entries and RadBatch arrays) at budgets of one, two and four
  * intervals, with --busy-prefill-chunk auto, off and fixed, taken from the scheduler as it was
- * before --prefill-span. */
+ * before --prefill-span with batch.cpp's two read-ahead chunks (k_ahead_chunks). */
 TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
     struct Case { int64_t max_tok, interval, busy; uint64_t want; };
     const Case cases[] = {
-        { 256, 256, -1, 0x9b2fe92b1919355cull }, { 512, 256, -1, 0xdae73489249b5339ull }, { 1024, 256, -1, 0x44975a352e78619aull },
-        { 1024, 256, 0, 0x44975a352e78619aull }, { 1024, 256, 128, 0x3c0b9b1a1f864e4aull }, { 2048, 512, -1, 0xd6c184d0563159eeull },
+        { 256, 256, -1, 0x5a54a247b5ba614eull }, { 512, 256, -1, 0x82a560f95b47a8a1ull }, { 1024, 256, -1, 0x5336de4e63911e26ull },
+        { 1024, 256, 0, 0x5336de4e63911e26ull }, { 1024, 256, 128, 0xd14e26bf5be5aa5dull }, { 2048, 512, -1, 0x740799e030270f82ull },
     };
     for (const Case& c : cases) {
         int n = 0;

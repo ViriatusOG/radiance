@@ -40,9 +40,11 @@
 #include "r4d_hc_fp8.h"
 #include "r4d_enc.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 /* Operand indices of `gemm_nt_q`. The schema is positional, so these must follow its order in
  * r4d_rows.cpp. */
@@ -233,11 +235,19 @@ extern "C" int r4d_rad_unrelayout_fp8_block(const RadParam* p, int n_p, int oper
  * `i8a8h` is the same planes holding a weight rotated by the unnormalised 128-wide Hadamard along
  * K, the 1/128 in its scale (libquant's `transform=fwht128`), to be met by had_quant_act_i8g's
  * activation. The bytes cannot tell the two apart, so each dtype accepts only its own transform
- * and the rotated codes carry a tag of their own. */
+ * and the rotated codes carry a tag of their own.
+ *
+ * Int8 codes only. A narrower weight on the same grid (the IQR forms) is kept at its codes' width
+ * and read by the gemm_iqr rows (r4d_iqr_layout.cpp). */
 namespace {
 bool i8_rotated(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     return d && std::strcmp(d, "i8a8h") == 0;
+}
+
+/* int8 codes with a bf16 scale per (row, 128), at transform `tr`. */
+bool i8_codes(const RadEncoding* enc, const char* tr) {
+    return r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK, RAD_DT_INVALID, tr);
 }
 
 int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
@@ -248,9 +258,7 @@ int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     if (rc != RAD_OK) return rc;
     if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
     const bool rot = i8_rotated(p, n_p);
-    if (!r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK, RAD_DT_INVALID,
-                         rot ? "fwht128" : ""))
-        return RAD_E_DTYPE;
+    if (!i8_codes(enc, rot ? "fwht128" : "")) return RAD_E_DTYPE;
     if (operand == FL_BSCALE) {
         if (!r4d_enc::selects(enc, sel, n, "scale") || !r4d_enc::dims(pl[0], g.N, g.sk))
             return RAD_E_SHAPE;
@@ -333,11 +341,17 @@ int lm_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     FGeom g;
     const int rc = lgeom(p, n_p, &g);
     if (rc != RAD_OK) return rc;
-    if (i8 ? !r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK) : !fp8_block_enc(enc))
-        return RAD_E_DTYPE;
-    if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
-    if (!r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], i8 ? g.N : g.sn, g.sk))
-        return RAD_E_SHAPE;
+    if (i8) {
+        if (!i8_codes(enc, "")) return RAD_E_DTYPE;
+        if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
+        if (!r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], g.N, g.sk))
+            return RAD_E_SHAPE;
+    } else {
+        if (!fp8_block_enc(enc)) return RAD_E_DTYPE;
+        if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
+        if (!r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], g.sn, g.sk))
+            return RAD_E_SHAPE;
+    }
     const long long stride = r4d_fp8::lm_row_bytes(g.K);
     ffill(out, i8 ? "r4d.i8lm.r128" : "r4d.fp8lm.b128", i8 ? RAD_I8 : RAD_F8E4M3, g.N, stride,
           g.N * stride);
@@ -577,4 +591,17 @@ extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
     if (!r4d_enc::dims(pl[0], operand == EQ_WTE ? rows : 1, operand == EQ_WTE ? dim : 1))
         return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
+}
+
+/* ================================================================= embed_lookup's table
+ *
+ * The bf16 gather reads a plain bf16 table as stored; a table on the int8 grid is the IQR gather's
+ * (embed_lookup_iqr, r4d_iqr_layout.cpp), kept at its codes' width. */
+extern "C" int r4d_rad_layout_embed_bf16(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, RadLayout* out) {
+    (void)p; (void)n_p; (void)sel; (void)pl; (void)n; (void)out;
+    enum { E_WTE = 1 };
+    if (operand != E_WTE) return RAD_E_UNSUPPORTED;
+    return rad_enc_is(enc, "plain") ? RAD_E_UNSUPPORTED : RAD_E_DTYPE;
 }

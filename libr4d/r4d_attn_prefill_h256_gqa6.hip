@@ -593,7 +593,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             float smax = sc[0];
             #pragma unroll
             for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
-            if (wave_any(smax > m_ref + PGROW)) {
+            // The rescale is the wave's, so a row's bits depend on the rows sharing its wave. Only
+            // live rows decide it: a row past qlen limits its keys at its own qpos, past ctx, so it
+            // scores whatever the cache's last block held before (another request's KV), and the
+            // last query rows of a sequence's final block would round by that.
+            if (wave_any(live && smax > m_ref + PGROW)) {
                 const float rmax  = fmaxf(smax, swap16(smax));
                 const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
                 const float alpha = ex2(m_ref - mnew);
@@ -680,7 +684,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     if (!live) return;
     // fetch-inactive: the split store reads l_i under `if (h == 0)` only, so the exchange may be sunk
-    // into that half; swap16_fi still reads the partner's half of the row sum (#328).
+    // into that half; swap16_fi still reads the partner's half of the row sum.
     l_i += swap16_fi(l_i);
     if constexpr (SPLIT) {
         // Unnormalised: the merge weighs segments by 2^(m - max m) and applies v_descale itself.

@@ -379,16 +379,13 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
     layers_.clear();
     if (!mover) return RAD_OK;
 
-    /* Routing-aware reads: the default. RADIANCE_FILE_ROUTED=0 restores
-     * whole-layer reads. The source may still decline per layer (a layer that has not
+    /* Routing-aware reads. The source may still decline per layer (a layer that has not
      * reported this pass is read whole). */
     routes_ = routes;
     routes_ud_ = routes_ud;
-    routed_ = true;
-    if (const char* e = std::getenv("RADIANCE_FILE_ROUTED")) routed_ = e[0] != '0';
     scratch_ = nullptr;
     scratch_n_ = 0;
-    if (routes_ && routed_ && prog.meta.n_expert > 0) {
+    if (routes_ && prog.meta.n_expert > 0) {
         scratch_n_ = prog.meta.n_expert;
         scratch_ = (int32_t*)rad_dev_alloc((size_t)scratch_n_ * sizeof(int32_t),
                                            RAD_MEM_HOST_PINNED);
@@ -426,13 +423,6 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
         if ((size_t)layers_[i].first_op < first_of_.size())
             first_of_[(size_t)layers_[i].first_op] = (int32_t)i;
     mover_ = mover;
-    /* Temporary diagnostics for the routing-aware-read engagement. */
-    if (routes_ && routed_)
-        RAD_INFO("file stager: routing-aware reads armed (%zd routed layers, scratch %s)",
-                 layers_.size(), scratch_ ? "ok" : "MISSING");
-    else if (routed_)
-        RAD_INFO("file stager: routing-aware reads NOT armed (routes_=%d scratch_=%d)",
-                 routes_ ? 1 : 0, scratch_ ? 1 : 0);
     for (int b = 0; b < 2; ++b)
         if (rad_event_create_local(&done_[b]) < 0 || rad_event_create_local(&free_[b]) < 0) {
             layers_.clear();
@@ -468,7 +458,7 @@ int FileStager::start(int32_t li, RadStream s) {
      * a source that declines (no report yet this pass) reads the whole layer. */
     const int32_t* ecnt = nullptr;
     int32_t n_expert = 0;
-    if (routes_ && routed_) {
+    if (routes_) {
         int64_t n = 0;
         const int32_t* dev = routes_(routes_ud_, layers_[(size_t)li].layer, &n);
         if (dev && n > 0 && n <= scratch_n_ &&

@@ -212,6 +212,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
+| `seg_softmax_pool` | `M`(range) `n` `dtype` | `score`, `v`, `cu_seqlens` → `y` (one softmax-weighted row a segment) |
 | `seg_mean_bf16_sum` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (BF16 sum, then BF16 quotient) |
 | `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
 | `pool_cols` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean column a window of k columns) |
@@ -291,6 +292,13 @@ rounded to `y`'s dtype before the product, as the unfused pair stores it.
 **`seg_mean`** is mean pooling over a ragged batch: row `s` of `y` is the mean of `x`'s rows
 `[cu[s], cu[s+1])`, summed in double and rounded once. `M` is the step's token count and bands the
 op; the segment count is `cu_seqlens`' length less one. An empty segment is a zero row.
+
+**`seg_softmax_pool`** is `seg_mean` with learned weights: row `s` of `y` is `v`'s rows
+`[cu[s], cu[s+1])` summed with the softmax of their `score`s (one a row of `v`, f32, the maximum
+subtracted) as the weights, the sum in f32 and rounded once. It is a query reading its few
+candidates: clef's joint schema head routes each question over its options this way, the scores
+the options' dot products with the question. `M` bands the op as `seg_mean`'s does, and an empty
+segment is a zero row.
 
 **`seg_mean_bf16_sum`** preserves the two BF16 stores of Nemotron 3.5 Rerank's masked
 mean: sum the segment in f32, round the sum to BF16, divide by its valid-token count,
@@ -540,7 +548,7 @@ second of a clip apart and attends in windows of eight seconds:
 | `rmsnorm_had_quant_i8` | `M`(range) `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_had_quant_i8` | `M`(range) `n` `group` `dtype` `act`:str/opt `mode`/opt | `a`, `b`? → `q`, `scale` |
 | `dequant` | `M`(range) `n` `group` `dtype` | `q`, `scale` → `y` |
-| `gram_accum` | `M`(range) `n` `group` `dtype` | `a`, `a_scale`?, `h`:inout |
+| `gram_accum` | `M`(range) `n` `group` `dtype` `upper`/opt | `a`, `a_scale`?, `h`:inout |
 
 **`gram_accum`** characterises a quantiser's output:
 `h[k1][k2] += sum over rows of dequant(a)[m][k1] * dequant(a)[m][k2]`, the Hessian a GPTQ packer
@@ -550,7 +558,10 @@ block. It is not `gemm_nt` with a transposed operand: that op contracts the last
 and this one the first. It is the one op here that no forward pass issues; it runs under a
 calibration flag and its result is read at convert time, in another process, through a file.
 `dtype` says how `a` is read: `fp8a8` is E4M3 codes with an f32 dequant scale per (row, `group`
-columns) in `a_scale`; `bf16` is a plain activation with no `a_scale` and no grouping.
+columns) in `a_scale`; `bf16` is a plain activation with no `a_scale` and no grouping. `upper` 1
+accumulates only `k2 >= k1`, the half a reader of the symmetric `h` needs, for half the work; the
+entries below the diagonal are then outside the contract (libr4d adds whole 64-wide tiles, so it
+writes some of them).
 
 **Activation widths.** Which width a linear's activation takes follows from the weight. Where the
 checkpoint ships E4M3 weights and a block scale plane, every linear is `fp8a8`
@@ -740,8 +751,8 @@ may not have arrived.
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
-| `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
@@ -784,6 +795,15 @@ weight element (n, k) is `(code - zero) * scale`, one f16 scale and one integer 
 `a_sum` is `quant_act_i8`'s `asum`, group-major `[K/group][Mpad]` with `Mpad = ceil(M/16)*16`. The
 ParoQuant grids (the four 4- and 5-bit ones) take parts (`pb1`, `pb2`); `w2a8` and `w4a8_asym` do
 not, and none has a bias form.
+
+`w_rb` is the weight rows one int8 scale covers, when the weight's form makes it more than one: a
+trellis on libquant's `tcq_rb` grid, each value read against its block's largest scale. Absent, 1.
+An IQR weight under one f32 scale a row and one f32 factor a 128-K block for all rows (`kRowF32`,
+a computed trellis's form) needs none: `gemm_iqr_*` fold the block's factor with the activation's
+per-128 scale and take the row's in the epilogue.
+A kernel may then fold one scale a block of rows: libr4d's `gemm_iqr_tiled` does (its form says
+how many), as do `gemm_i8a8_rb8_tiled` and `gemm_i8a8_rb32_tiled` for an int8 weight whose
+per-row scale plane holds each block's one value in each row.
 
 `split_n` is the output width whose K split the call takes, when it is a row slice of a wider
 linear (a rank's share of a weight whose rows do not divide among the ranks, issued as two slices).

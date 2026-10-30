@@ -10,6 +10,7 @@ int main(int argc, char** argv) {
     int s = rad::config_parse(argc, argv, &cfg);
     if (s == 1) { rad::config_usage(argv[0]); return 0; }
     if (s < 0)  { rad::config_usage(argv[0]); return 2; }
+    if (cfg.proceed_incompatible) rad::Engine::print_unsupported_banner();
 
     if (!rad::resolve_hf_model(cfg)) return 1;   /* a repo id: fetched, and --model points at it */
 

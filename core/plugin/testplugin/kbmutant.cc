@@ -17,6 +17,7 @@
 #include "rad_abi.h"
 #include "rad_device.h"
 #include "rad_plugin.h"
+#include "rad_abi_layout.h"
 
 #include <cmath>
 #include <cstdint>
@@ -261,6 +262,7 @@ static const RadPluginInfo kInfo = {
 };
 
 uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 int                  rad_kernel_schema_count(void) { return 0; }
 const RadOpSchema*   rad_kernel_schema_at(int) { return nullptr; }

@@ -283,10 +283,11 @@ set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
 # ================================================================== the device tests on a card
 #
 # The unit entries run on the host backend. These run the tests whose code differs on a card (the
-# AQL backend, the driver's elastic commit, the mover's copies) on the card, one at a time: a test
-# that commits device memory fails beside another holding it, or beside a server.
+# AQL backend, the driver's elastic commit, the mover's copies, libquant's trellis GPTQ) on the
+# card, one at a time: a test that commits device memory fails beside another holding it, or beside
+# a server.
 if(RAD_HIP_FOUND)
-  foreach(n device_test mem_test place_test runtime_test)
+  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test)
     add_test(NAME ${n}_card COMMAND ${n} -perf_)
     set_tests_properties(${n}_card PROPERTIES
       LABELS gpu
@@ -323,18 +324,36 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
-    add_dependencies(${t} ${RAD_E2E_DEPS})
+    if(t STREQUAL "clef_decision_test")
+      # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
+      target_compile_definitions(${t} PRIVATE
+        RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
+      add_dependencies(${t} radiance rad-convert libref libquant clef_bf16)
+    elseif(t STREQUAL "laya_decision_test")
+      # The tiny Laya's golden (tests/mklayagolden.py) and the plugin a Laya container selects.
+      target_compile_definitions(${t} PRIVATE
+        RAD_LAYA_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/laya_tiny.json")
+      add_dependencies(${t} radiance rad-convert libref libquant laya)
+    else()
+      add_dependencies(${t} ${RAD_E2E_DEPS})
+    endif()
   endif()
 endforeach()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET clef_decision_test)
+  set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET laya_decision_test)
+  set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
@@ -385,6 +404,17 @@ if(RAD_HIP_FOUND AND TARGET r4d_selftest)
     LABELS "slow;gpu"
     TIMEOUT 2400
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+endif()
+
+# ================================================================== libhalo's interface parity
+#
+# libhalo serves gfx1151 behind libr4d's exact interface (libhalo/halo_parity.cpp): the same op
+# schemas and rows, so every model plugin runs on either. Host-only (the tables, no device calls);
+# present when one build produces both plugins.
+if(TARGET halo_parity)
+  add_test(NAME halo_parity
+           COMMAND halo_parity ${RAD_PLUGIN_OUT}/kernels/libr4d.so ${RAD_PLUGIN_OUT}/kernels/libhalo.so)
+  set_tests_properties(halo_parity PROPERTIES LABELS "fast" TIMEOUT 60)
 endif()
 
 # ================================================================== the device layer without SVM
@@ -592,6 +622,131 @@ if(R4D_EMU_BUILT)
   # QSA selection at serving sizes, seeded: about 15 s.
   add_test(NAME r4d_emu_qsa_sweep COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_qsa sweep 100)
   set_tests_properties(r4d_emu_qsa_sweep PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 900)
+endif()
+
+# ================================================================== libhalo on the emulator
+#
+# tests/halo_emu runs libhalo units (gfx1151) on the same SIMT emulator through its gfx11 WMMA
+# forms: the LDS-tiled prefill GEMMs against the narrow rows whose bytes they promise, and the
+# MXFP4 decode's activation plane against its in-kernel decode (test_gemm.cpp says which). The
+# units are the plugin's own sources, compiled as C++ the way r4d_emu compiles libr4d's, so a
+# card-less build checks them on every run. Same toolchain rules as r4d_emu above.
+set(HALO_DIR ${CMAKE_SOURCE_DIR}/libhalo)
+set(HALO_EMU ${CMAKE_CURRENT_SOURCE_DIR}/halo_emu)
+set(HALO_EMU_HIP ${HALO_DIR}/halo_gemm_fp8a8.hip ${HALO_DIR}/halo_gemm_mxfp4a8_tiled.hip
+                 ${HALO_DIR}/halo_gemm_mxfp4a8_nt_m64.hip ${HALO_DIR}/halo_gemm_mxfp4a8_decode.hip
+                 ${HALO_DIR}/halo_norm_join_bf16.hip ${HALO_DIR}/halo_expert_scale_bf16.hip
+                 ${HALO_DIR}/halo_pair_argmax_f32.hip ${HALO_DIR}/halo_attn_paged_window.hip
+                 ${HALO_DIR}/halo_qsa_select_bf16.hip ${HALO_DIR}/halo_lora_bf16.hip
+                 ${HALO_DIR}/halo_glm.hip ${HALO_DIR}/halo_mhc.hip
+                 ${HALO_DIR}/halo_gemm_fp8_f32scale.hip ${HALO_DIR}/halo_kda.hip
+                 ${HALO_DIR}/halo_moe_mxfp4.hip ${HALO_DIR}/halo_mla.hip
+                 ${HALO_DIR}/halo_quant_act_fp8.hip ${HALO_DIR}/halo_kv_resolve.hip
+                 ${HALO_DIR}/halo_dsa.hip ${HALO_DIR}/halo_gemm_nt_f32.hip
+                 ${HALO_DIR}/halo_router_sigmoid_topk_f32.hip ${HALO_DIR}/halo_router_scatter.hip
+                 ${HALO_DIR}/halo_gen.hip ${HALO_DIR}/halo_audio.hip ${HALO_DIR}/halo_encoder_bf16.hip
+                 ${HALO_DIR}/halo_model_bf16.hip ${HALO_DIR}/halo_hc_bf16.hip
+                 ${HALO_DIR}/halo_p2p_copy2d.hip
+                 ${HALO_DIR}/halo_attn_paged_gqa8.hip ${HALO_DIR}/halo_attn_paged_h128_gqa1.hip
+                 ${HALO_DIR}/halo_attn_paged_h128_gqa2.hip ${HALO_DIR}/halo_attn_paged_h128_gqa2w.hip
+                 ${HALO_DIR}/halo_attn_paged_h128_gqa4.hip ${HALO_DIR}/halo_attn_paged_h256_gqa2.hip
+                 ${HALO_DIR}/halo_attn_paged_h256_gqa4.hip ${HALO_DIR}/halo_attn_paged_h256_gqa6.hip
+                 ${HALO_DIR}/halo_gemm_bf16_nt_tiled.hip ${HALO_DIR}/halo_gemm_bf16_nt_m64.hip)
+# gemm: test_gemm.cpp above. norm, escale, pick: r4d_emu's tests of the same three ops, renamed --
+# the sandwich-norm joins, expert_scale and pair_argmax have no libref oracle by design (Gemma 4's
+# trunk runs the joins every layer), so the unfused chain bit for bit is the only check they get.
+# attn: r4d_emu's windowed paged attention test against its port of libref's ref_attn_paged --
+# the h128/h256/h512 window rows Gemma 4 runs, prefill and decode, plus a seeded shape sweep.
+# The rest are r4d_emu's other tests by the rename transform, over the libhalo ports of the same
+# units: QSA selection, the LoRA pair, GLM's F32 routing projection and MoE decode fusions, mHC,
+# the F32-scale E4M3 GEMM, KDA, the MXFP4 expert GEMM, MLA, kv_resolve and DSA's split.
+# ref: the elementwise and data-movement rows no model fixture reaches and halo_selftest has no
+# case for, each held to libref's row on operands drawn from libref's own descriptions.
+# paged: every block-size-16 attn_paged decode and prefill row (the decode and prefill bodies through
+# the units that own each geometry) against test_attn's reference.
+set(HALO_EMU_TESTS gemm norm escale pick attn qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
+                   dsa ref paged)
+set(HALO_EMU_BUILT OFF)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  # No fiber switch for this ISA.
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
+  set_source_files_properties(${HALO_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
+  add_library(halo_emu_kernels OBJECT ${HALO_EMU_HIP} ${HALO_EMU}/cfg_host.cpp ${R4D_EMU}/ref_host.cpp
+                                     ${R4D_EMU}/emu/emu.cpp)
+  target_include_directories(halo_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${HALO_DIR})
+  target_link_libraries(halo_emu_kernels PUBLIC rad_abi)
+  target_compile_options(halo_emu_kernels PRIVATE -ffp-contract=off -Wno-psabi)
+  foreach(t ${HALO_EMU_TESTS})
+    add_executable(halo_emu_${t} ${HALO_EMU}/test_${t}.cpp)
+    target_link_libraries(halo_emu_${t} PRIVATE halo_emu_kernels ${CMAKE_DL_LIBS})
+    target_compile_options(halo_emu_${t} PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(halo_emu_${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  endforeach()
+  set(HALO_EMU_BUILT ON)
+elseif(R4D_EMU_CXX)
+  set(dir ${CMAKE_CURRENT_BINARY_DIR}/halo_emu)
+  file(MAKE_DIRECTORY ${dir})
+  set(flags -std=c++20 -O2 -ffp-contract=off -Wno-psabi -I${R4D_EMU}/emu -I${R4D_EMU} -I${HALO_DIR}
+            -I${CMAKE_SOURCE_DIR}/abi)
+  set(objs "")
+  set(srcs ${HALO_EMU_HIP} ${HALO_EMU}/cfg_host.cpp ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp)
+  foreach(t ${HALO_EMU_TESTS})
+    list(APPEND srcs ${HALO_EMU}/test_${t}.cpp)
+  endforeach()
+  foreach(src ${srcs})
+    get_filename_component(stem ${src} NAME_WE)
+    set(lang "")
+    if(src MATCHES "\\.hip$")
+      set(lang -x c++)
+    endif()
+    add_custom_command(OUTPUT ${dir}/${stem}.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/${stem}.o.d ${lang} -c ${src}
+              -o ${dir}/${stem}.o
+      DEPENDS ${src}
+      DEPFILE ${dir}/${stem}.o.d
+      COMMENT "Building halo_emu ${stem}.o with ${R4D_EMU_CXX}"
+      VERBATIM)
+    if(NOT stem MATCHES "^test_")
+      list(APPEND objs ${dir}/${stem}.o)
+    endif()
+  endforeach()
+  # test_lora, test_kda and test_ref open libref with dlopen.
+  set(dl "")
+  foreach(l ${CMAKE_DL_LIBS})
+    list(APPEND dl -l${l})
+  endforeach()
+  set(exes "")
+  foreach(t ${HALO_EMU_TESTS})
+    set(exe ${CMAKE_BINARY_DIR}/tests/halo_emu_${t})
+    add_custom_command(OUTPUT ${exe}
+      COMMAND ${R4D_EMU_CXX} ${dir}/test_${t}.o ${objs} ${dl} -o ${exe}
+      DEPENDS ${dir}/test_${t}.o ${objs}
+      COMMENT "Linking halo_emu_${t}"
+      VERBATIM)
+    list(APPEND exes ${exe})
+  endforeach()
+  add_custom_target(halo_emu ALL DEPENDS ${exes})
+  set(HALO_EMU_BUILT ON)
+endif()
+if(HALO_EMU_BUILT)
+  foreach(t gemm norm escale pick qsa lora f32 mhc fp8f32 kda mla moefuse kvres dsa ref paged)
+    add_test(NAME halo_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_${t})
+    set_tests_properties(halo_emu_${t} PROPERTIES LABELS "halo_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  endforeach()
+  # As r4d_emu: the LoRA pair and KDA are held to libref itself when the test can load it.
+  set_tests_properties(halo_emu_lora halo_emu_kda halo_emu_ref PROPERTIES
+                       ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+  # As r4d_emu_attn: three shards of the fixed cases, and the seeded sweep as `slow`.
+  foreach(k 0 1 2)
+    add_test(NAME halo_emu_attn_shard${k} COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_attn --shard ${k}/3)
+    set_tests_properties(halo_emu_attn_shard${k} PROPERTIES LABELS "halo_emu;fast"
+                         TIMEOUT ${RAD_TEST_TIMEOUT})
+  endforeach()
+  # libhalo's one MXFP4 expert kernel takes about 160 s here (libr4d's shape-specialised forms 30 s).
+  add_test(NAME halo_emu_moemx COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_moemx)
+  set_tests_properties(halo_emu_moemx PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
+  add_test(NAME halo_emu_attn_sweep COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_attn sweep 40)
+  set_tests_properties(halo_emu_attn_sweep PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
 endif()
 
 # ================================================================== the document as a test

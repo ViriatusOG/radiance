@@ -14,6 +14,7 @@
 
 #include "oai.h"
 
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,6 +48,18 @@ struct DecisionRequest {
 
 /* Parse and render. `max_ctx` bounds every question's prompt (one position stays free for the
  * token the request samples and discards). */
+/* Shared by the System One models (d1, clef, laya, mica), whose prompts render request JSON as
+ * their Python reference implementations do. */
+/* A key of `o` outside `allowed` is refused, named at `path`. */
+bool only_keys(const json& o, std::initializer_list<const char*> allowed, const std::string& path,
+               ApiError* err);
+/* json.dumps(v, ensure_ascii=False): the value's own key order, ", " and ": ". */
+std::string py_json_dumps(const json& v);
+/* json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")). */
+std::string py_json_compact_sorted(const json& v);
+/* Empty or whitespace only, as Python's `not s.strip()`. */
+bool blank_text(const std::string& s);
+
 int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                            const std::string& model_id, DecisionRequest* out, ApiError* err);
 

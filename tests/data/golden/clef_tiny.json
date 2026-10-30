@@ -1,0 +1,51 @@
+{
+ "weights_fnv": "c05967c756955d1d",
+ "head_fnv": "a8ffa91b55b639d8",
+ "n_prompt_tokens": 1274,
+ "request": {
+  "state": {
+   "text": "The parcel arrived two weeks late and the box was crushed, but the vase inside was intact. I would like a partial refund for the delay.",
+   "channel": "email"
+  },
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Does the customer ask for money back?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should take this?",
+    "criteria": {
+     "shipping": "Delivery delays and damage in transit",
+     "billing": "Charges and refunds",
+     "product": "Faults in the item itself"
+    }
+   },
+   "tone": {
+    "type": "score",
+    "instructions": "How upset is the customer?",
+    "criteria": [
+     "Calm",
+     "Mildly annoyed",
+     "Angry"
+    ]
+   }
+  }
+ },
+ "answers": {
+  "refund": {
+   "true": 0.47794339060783386,
+   "false": 0.5220565795898438
+  },
+  "team": {
+   "billing": 0.3436005115509033,
+   "product": 0.3282530605792999,
+   "shipping": 0.328146368265152
+  },
+  "tone": {
+   "0": 0.3329094648361206,
+   "1": 0.3263286054134369,
+   "2": 0.34076187014579773
+  }
+ }
+}

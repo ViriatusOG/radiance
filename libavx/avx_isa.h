@@ -89,6 +89,7 @@ int         avx_par_force(int threads);
     X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
     X(seg_mean_bf16_sum) \
     X(seg_mean)             X(mul_weight)           X(pool_rows)            X(pool_cols)          \
+    X(seg_softmax_pool)                                                                           \
     X(relu)                 X(clamp)                X(conv2d)               X(conv1d_dw)          \
     X(rel_sinusoid)         X(seg_sinusoid)         X(conv2d_unfold)                              \
     X(position_scale)                                                                            \

@@ -88,9 +88,56 @@ struct Grid {
     int      l1_lo = 0, l1_hi = 0;   /* its range */
     float    l1max = 0.0f;           /* the largest first-level value its dtype holds */
 
+    /* A vector codebook (vq=FILE): one code per `vdim` consecutive columns, indexing `vq`
+     * (`ventries` rows of `vdim` integer values in -127..127), stored as the encoding's `grid`
+     * table. A block's scale matches its rms to the codebook's: a value v is the entry over
+     * `vq_unit`, the units a unit-rms vector the codebook was fitted to spans. */
+    std::vector<float> vq;
+    int64_t  vdim = 0, ventries = 0;
+    double   vq_unit = 1.0;
+    /* The search's layout: vq_soa[j * ventries + k] = entry k's j-th value, vq_n2[k] its squared
+     * norm, so the distances to every entry vectorise across entries. */
+    std::vector<float> vq_soa, vq_n2;
+
+    /* A trellis (tcq=L): the codes of a column, one per row, are the bits a bitshift trellis
+     * shifts in. Row r's value is tcq_lut[state_r] times its block's scale, where state_r =
+     * (state_{r-1} << k | code_r) mod 2^L, k the code's bits. Each run of tcq_rows rows is
+     * tail-biting: the state before its first row is the one after its last, which its last
+     * ceil(L/k) codes make. A block's scale matches its rms to the table's, as a vector grid's
+     * does (vq_unit). */
+    int      tcq_L = 0, tcq_k = 0;
+    int64_t  tcq_rows = 0;
+    std::vector<float> tcq_lut;           /* 2^L integer values in -127..127 */
+    float    tcq_peak = 0.0f;             /* tcq_peak=1: the table's largest magnitude, which no
+                                             block's largest value may pass; else 0 */
+    /* tcq_rb=R: the values on the int8 grid an int8 GEMM reads with one scale per R rows (and the
+     * block's 128 columns), the largest of the R rows' scales: row r's value is
+     * B * rint(lut[state] * (s_r / B)), B that largest. The row holding it keeps its values; the
+     * others' are rounded onto B's grid, inside the trellis's search. 0: off. */
+    int64_t  tcq_rb = 0;
+    /* tcq_colf=1 (one scale a row, block=1x*): each 128-column block's values also take a factor
+     * shared by every row, its share of the weight's energy, so a value's scale is its row's times
+     * its block's. A GEMM folds the factor into the activation's per-128 scale, which it multiplies
+     * anyway, and the row's in its epilogue. Chosen from the weight before GPTQ. */
+    bool     tcq_colf = false;
+    /* tcq_code=mad: the states' values are computed, not chosen: with h = (st * A + B) mod 2^32
+     * (the product of the factors' low 24 bits), state st's value is bytesum(h & 0x3F3F3F3F) - 126
+     * (tcq_lut_mad). A reader needs no table: a multiply-add, a mask and a byte-sum dot a value. The
+     * table is still stored, A and B beside it ("trellis.mad"). */
+    bool     tcq_mad = false;
+    uint32_t tcq_a = 0, tcq_b = 0;
+
     /* The planes of the encoding, by index; -1 when the grid has none. */
     int plane_zero() const { return asym ? 2 : -1; }
+    int plane_grid() const {
+        return vq.empty() && !tcq_L ? -1 : 2 + (asym ? 1 : 0) + (lv2 ? 1 : 0);
+    }
     int plane_scale2() const { return lv2 ? (asym ? 3 : 2) : -1; }
+    int plane_mad() const { return tcq_mad ? plane_grid() + 1 : -1; }
+    /* A trellis under one scale a row (block=1x*) carries the 128-column blocks' factors beside it,
+     * tcq_colf's or ones, so a reader has one form for both (libr4d's kRowF32). */
+    bool row_scaled() const { return tcq_L && br == 1 && bc == 0 && !lv2; }
+    int plane_colf() const { return row_scaled() ? plane_grid() + (tcq_mad ? 2 : 1) : -1; }
     int plane_table() const {
         return table.empty() ? -1 : 2 + (asym ? 1 : 0) + (lv2 ? 1 : 0);
     }
@@ -129,7 +176,40 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
 
 /* One value onto the grid: its code, and the value the code decodes to (for error feedback). */
 int   grid_code(const Grid& g, const BlockScale& b, float v);
+/* A vector grid's code for the `vdim` values at `v`: the entry nearest v times b.inv. */
+int   grid_vq_code(const Grid& g, const BlockScale& b, const float* v);
 float grid_decode(const Grid& g, const BlockScale& b, int code);
+
+/* tcq_code=mad's value of every one of the 2^L states (Grid::tcq_mad). */
+std::vector<float> tcq_lut_mad(int L, uint32_t a, uint32_t b);
+
+/* A trellis grid's search state for one run, reused across runs. */
+struct TcqWork {
+    std::vector<float>   cost, next, best, rx, rs, rr;
+    std::vector<uint8_t> back;
+    std::vector<int64_t> path;
+};
+/* A trellis grid's codes for a run of n <= tcq_rows rows of one column: a tail-biting path (the
+ * state before the first row is the state after the last) of least sum over the rows of
+ * (x_r - v_r)^2, v_r = s_r * lut[state_r], its codes into `codes` and the values they decode to
+ * into `dq`. With `ratio` (tcq_rb), v_r = s_r * rint(lut[state_r] * ratio_r) instead: s_r is then
+ * the row block's scale and ratio_r the row's own scale over it. */
+void grid_tcq_run(const Grid& g, const float* x, const float* s, int64_t n, int32_t* codes,
+                  float* dq, TcqWork& w, const float* ratio = nullptr);
+
+/* A trellis grid's two-level scales are read as one bf16 a block: the bf16 of the first level
+ * (b->stored) times the second's stored value s2, which is what libr4d widens them to for its
+ * int8 GEMMs. Settle b's scale to that. */
+void grid_tcq_settle(const Grid& g, float s2, BlockScale* b);
+/* A trellis block's two-level scale from its ideal (unrounded) scale under the second level's
+ * stored s2, settled: dyn=1's choice when GPTQ reaches the block. */
+BlockScale grid_tcq_block_lv2(const Grid& g, double ideal, float s2);
+
+/* Rows [row0, row0 + rows) of a "trellis" weight of rows_all x cols back to f32 in its logical
+ * basis (the transform undone), from the plane starts: abi/rad_quant.h's decode hook. Whole runs
+ * only, but for the weight's last. RAD_E_UNSUPPORTED for any other encoding. */
+int grid_tcq_decode(const RadEncoding* e, int64_t rows_all, int64_t cols, const void* const* planes,
+                    int64_t row0, int64_t rows, float* out);
 
 /* Write a scale (and a zero) into element `i` of its plane row. */
 void grid_store_scale(const Grid& g, const BlockScale& b, void* scale_row, void* zero_row,
@@ -143,6 +223,10 @@ struct Planes {
     uint8_t* zero = nullptr;
     uint8_t* scale2 = nullptr;
     uint8_t* table = nullptr;
+    uint8_t* grid = nullptr;
+    uint8_t* mad = nullptr;
+    uint8_t* colf = nullptr;
+    int64_t  colf_cols = 0;
     int64_t  codes_row = 0, scale_row = 0, zero_row = 0, scale2_row = 0;   /* bytes */
     int64_t  scale_cols = 0, scale2_cols = 0;                             /* elements a row */
 };
@@ -159,6 +243,7 @@ struct Scales {
     int64_t br = 1, bc = 1;            /* their extents, resolved against the call */
     std::vector<float> s2;             /* the second level as stored */
     int64_t nr2 = 0, nc2 = 0;
+    std::vector<float> colf;           /* tcq_colf: each 128-column block's factor, all rows' */
     const BlockScale& at(int64_t r, int64_t c) const {
         return b[(size_t)((r / br) * nc + c / bc)];
     }

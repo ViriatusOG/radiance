@@ -375,6 +375,14 @@ a plain int8 trunk is refused.
   take `had_quant_act_i8g` from the bf16 plane, and so does every linear where the ops are not
   declared (libref and libavx). The MLP's gated fold is an fp8a8 tile over E4M3 codes, so an int8
   gate_up runs the pair.
+- **Narrower codes on the same grid.** A trunk linear stored as uN with a zero point, uN indexing
+  an int8 scalar codebook or a vector codebook of int8 codewords, or a bitshift trellis's codes,
+  each under a scale per (row, 128) and fwht128, or a computed trellis (libquant's `tcq_code=mad`,
+  its constants in a `trellis.mad` plane) under one f32 scale a row and one a 128-K block for all
+  rows (`scale.col`; a view of `scale,scale.col`), stays at its codes' width in VRAM: libr4d's
+  `gemm_iqr` rows decode it where they read it, and `embed_lookup_iqr` and `logits_gemm_iqr` do the
+  same for such an embedding and head. The IQR recipes (`data/recipes/q38-27b-iq{2..8}r*.recipe`,
+  [`docs/IQR.md`](IQR.md)) store 2.5 to 8 bits a weight on the int8 trunk's activation path.
 - **It declines imported checkpoints** (`RAD_ARCH_SERVES_IMPORTS(0)`). An imported quantisation
   goes to the family's one quantised plugin, and a second one would refuse every Quark, ParoQuant,
   GPTQ or NVFP4 Qwen3.8 release; they stay with `qwen35_fp8`.

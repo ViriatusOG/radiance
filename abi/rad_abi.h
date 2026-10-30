@@ -14,10 +14,12 @@ extern "C" {
 
 /* Bumped whenever anything a plugin compiles against changes shape: this header, rad_types.h,
  * rad_builder.h, rad_runtime.h, rad_device.h, rad_encoding.h, rad_quant.h, rad_sample.h or
- * rad_spechub.h. Every kind of plugin reports it, and a plugin that does not report exactly this
- * version is refused at load with both versions printed. A new optional export (e.g.
- * rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 31u
+ * rad_spechub.h, a field appended to a struct included; the release that ships the change assigns
+ * the number. Every kind of plugin reports it, and a plugin that does not report exactly this
+ * version is refused at load with both versions printed. Each also exports the layout's fingerprint
+ * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
+ * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
+#define RAD_ABI_VERSION 32u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -35,8 +37,10 @@ typedef struct RadPluginInfo {
     const char* build_target;
 } RadPluginInfo;
 
-/* Every plugin exports these two. */
+/* Every plugin exports these three; rad_plugin_abi_layout is RAD_PLUGIN_ABI_LAYOUT_EXPORT
+ * (rad_abi_layout.h). */
 uint32_t             rad_plugin_abi_version(void);
+uint64_t             rad_plugin_abi_layout(void);
 const RadPluginInfo* rad_plugin_info(void);
 
 /* ================================================================== execution domain */

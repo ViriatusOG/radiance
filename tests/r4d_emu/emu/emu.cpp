@@ -63,9 +63,41 @@ struct Sched {
 
 void yield() { Fiber& me = S.f[S.cur]; emu_switch(&me.sp, S.main_sp); }
 
+/* Lanes of wave `w` that have not returned. A cross-lane op on the card runs over the active lanes:
+ * a lane that has returned takes no part, and the op completes without it (a read of its value is
+ * the kernel's bug, which the exchange poisons below). */
+int g_wmma_pending[64];   /* the wave exchange now forming is a WMMA's, which every lane must join */
+/* The lanes that had returned when the wave's last exchange completed: their slots hold no value
+ * for it. Taken at completion, not at read time -- a lane that posted and then returned before a
+ * slower lane read the exchange still contributed. The next completion needs every live lane to
+ * arrive, so a lane reads this before it can be overwritten. */
+unsigned g_absent[64];
+unsigned wave_done_mask(int w);
+unsigned wave_done_mask(int w) {
+    unsigned m = 0;
+    for (int i = 0; i < 32 && w * 32 + i < S.nthreads; ++i) m |= (unsigned)S.f[w * 32 + i].done << i;
+    return m;
+}
+int wave_alive(int w) {
+    int n = 0;
+    for (int i = w * 32; i < w * 32 + 32 && i < S.nthreads; ++i) n += !S.f[i].done;
+    return n;
+}
 extern "C" void emu_trampoline() {
     S.body(S.ctx);
     S.f[S.cur].done = true;
+    /* The lanes still running may be waiting at a wave exchange only this lane had yet to reach. */
+    const int w = (int)S.f[S.cur].tid.x >> 5;
+    if (S.warrive[w] > 0 && S.warrive[w] == wave_alive(w)) {
+        if (g_wmma_pending[w]) {
+            std::fprintf(stderr, "emu: block (%u,%u,%u), wave %d: lane %d returned while the others wait at a "
+                         "WMMA it skipped (kernel %s)\n", S.bid.x, S.bid.y, S.bid.z, w,
+                         (int)S.f[S.cur].tid.x & 31, emu_last_kernel);
+            std::abort();
+        }
+        g_absent[w] = wave_done_mask(w);
+        S.warrive[w] = 0; ++S.wgen[w];
+    }
     yield();
     std::abort();
 }
@@ -108,7 +140,11 @@ int __syncthreads_or(int p) {
 static void wave_barrier(int w) {
     Fiber& me = S.f[S.cur];
     const unsigned g = S.wgen[w];
-    if (++S.warrive[w] == 32) { S.warrive[w] = 0; ++S.wgen[w]; return; }
+    if (++S.warrive[w] == wave_alive(w)) {
+        g_absent[w] = wave_done_mask(w);
+        S.warrive[w] = 0; ++S.wgen[w]; g_wmma_pending[w] = 0;
+        return;
+    }
     me.waiting = 2;
     while (S.wgen[w] == g) yield();
     me.waiting = 0;
@@ -127,13 +163,18 @@ static const int* exchange(int v, int* lane, int tag) {
     S.slot[w][par][*lane] = v;
     S.tag[w][par][*lane] = tag;
     wave_barrier(w);
-    for (int i = 0; i < 32; ++i)
+    for (int i = 0; i < 32; ++i) {
+        if ((g_absent[w] >> i) & 1u) {       /* a lane that had returned: no value; a read of it shows */
+            S.slot[w][par][i] = 0x7fbadbad;
+            continue;
+        }
         if (S.tag[w][par][i] != tag) {
             std::fprintf(stderr, "emu: DIVERGENCE in block (%u,%u,%u), wave %d: lanes %d and %d met at different "
                          "cross-lane ops (0x%x, 0x%x)\n", S.bid.x, S.bid.y, S.bid.z, w, *lane, i, tag,
                          S.tag[w][par][i]);
             std::abort();
         }
+    }
     return S.slot[w][par];
 }
 int emu_bpermute(int addr, int v) {
@@ -150,6 +191,17 @@ int emu_cvt_pk_fp8(float a, float b, int old, bool hi) {
     const unsigned o = (unsigned)old;
     return (int)(hi ? ((o & 0xffffu) | (pk << 16)) : ((o & 0xffff0000u) | pk));
 }
+/* A WMMA reads every lane's fragment: one issued with lanes already returned is reported. */
+static void wmma_whole_wave(int w) {
+    g_wmma_pending[w] = 1;
+    if (wave_alive(w) != 32) {
+        std::fprintf(stderr, "emu: WMMA in block (%u,%u,%u), wave %d with %d of 32 lanes active (kernel %s); returned:",
+                     S.bid.x, S.bid.y, S.bid.z, w, wave_alive(w), emu_last_kernel);
+        for (int i = w * 32; i < w * 32 + 32; ++i) if (S.f[i].done) std::fprintf(stderr, " lane %d", i & 31);
+        std::fprintf(stderr, "\n");
+        std::abort();
+    }
+}
 /* One 16x16x16 WMMA: each lane posts its A and B elements, then reads the whole tile back. `ga`
  * and `gb` are the exchange slots of one element type, [wave][parity][lane][element]. */
 template <class T, class V, class Cvt>
@@ -158,6 +210,7 @@ static emu_v8f emu_wmma(T (&ga)[64][2][32][8], T (&gb)[64][2][32][8], V a, V b, 
     const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
     const unsigned par = S.xparity[t]++ & 1u;
     for (int e = 0; e < 8; ++e) { ga[w][par][l][e] = a[e]; gb[w][par][l][e] = b[e]; }
+    wmma_whole_wave(w);
     wave_barrier(w);
     const int N = l & 15, h = l >> 4;
     emu_v8f d;
@@ -277,7 +330,7 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
         std::memset(g_lds, 0xA5, dyn_lds);
         S.arrive = 0; S.gen = 0;
         for (int& a : S.or_acc) a = 0;
-        for (int w = 0; w < 64; ++w) { S.warrive[w] = 0; S.wgen[w] = 0; }
+        for (int w = 0; w < 64; ++w) { S.warrive[w] = 0; S.wgen[w] = 0; g_wmma_pending[w] = 0; g_absent[w] = 0; }
         for (int t = 0; t < n; ++t) {
             Fiber& f = S.f[t];
             f.done = false; f.waiting = 0; f.tid = EmuIdx{(unsigned)t, 0, 0};
@@ -307,10 +360,86 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
                 int done = 0, wb = 0, bb = 0;
                 for (auto& f : S.f) { done += f.done; wb += f.waiting == 2; bb += f.waiting == 1; }
                 std::fprintf(stderr, "emu: DEADLOCK in block (%u,%u,%u): %d threads done, %d at a block "
-                             "barrier, %d at a wave barrier -- a barrier not reached uniformly\n",
-                             bx, by, bz, done, bb, wb);
+                             "barrier, %d at a wave barrier -- a barrier not reached uniformly (kernel %s)\n",
+                             bx, by, bz, done, bb, wb, emu_last_kernel);
                 std::abort();
             }
         }
     }
+}
+
+/* ---- gfx11 (gfx1151) WMMA forms, for libhalo (halo_wmma.h's layout) -------------------------- */
+/* Each half-wave computes its own rows from its own lanes, as measured on the part: D's row M lives
+ * in half h = M & 1 and takes A's row M from lane M + 16h and B from that half's lanes. A kernel
+ * that replicates its operands across the halves (the documented form) sees no difference; one that
+ * leaves the lanes the part never reads holding something else is emulated as the part runs it. */
+static uint16_t g11_a[64][2][32][16], g11_b[64][2][32][16];
+template <class Cvt>
+static emu_v8f emu_wmma11(const uint16_t (&a)[16], const uint16_t (&b)[16], emu_v8f c, Cvt cvt) {
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    for (int e = 0; e < 16; ++e) { g11_a[w][par][l][e] = a[e]; g11_b[w][par][l][e] = b[e]; }
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    emu_v8f d;
+    for (int e = 0; e < 8; ++e) {
+        const int M = 2 * e + h;
+        float acc = c[e];
+        for (int k = 0; k < 16; ++k)
+            acc += cvt(g11_a[w][par][M + 16 * h][k]) * cvt(g11_b[w][par][N + 16 * h][k]);
+        d[e] = acc;
+    }
+    return d;
+}
+emu_v8f emu_wmma11_bf16(emu_v16bf a, emu_v16bf b, emu_v8f c) {
+    uint16_t ua[16], ub[16];
+    std::memcpy(ua, &a, 32);
+    std::memcpy(ub, &b, 32);
+    return emu_wmma11(ua, ub, c, [](uint16_t v) { return rad_bf16_to_f32(v); });
+}
+emu_v8f emu_wmma11_f16(emu_v16h a, emu_v16h b, emu_v8f c) {
+    uint16_t ua[16], ub[16];
+    std::memcpy(ua, &a, 32);
+    std::memcpy(ub, &b, 32);
+    return emu_wmma11(ua, ub, c, [](uint16_t v) { _Float16 h; std::memcpy(&h, &v, 2); return (float)h; });
+}
+emu_v2hf emu_cvt_pkrtz(float a, float b) {
+    auto rtz = [](float f) {
+        _Float16 h = (_Float16)f;                       /* nearest; step back toward zero if it rounded away */
+        if (std::fabs((float)h) > std::fabs(f)) {
+            uint16_t u; std::memcpy(&u, &h, 2); --u; std::memcpy(&h, &u, 2);
+        }
+        __fp16 r; std::memcpy(&r, &h, 2); return r;
+    };
+    emu_v2hf v; v[0] = rtz(a); v[1] = rtz(b); return v;
+}
+static uint8_t g11_qa[64][2][32][16], g11_qb[64][2][32][16];
+emu_v8i emu_wmma11_iu8(bool sa, emu_v4i a, bool sb, emu_v4i b, emu_v8i c, bool) {
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    std::memcpy(g11_qa[w][par][l], &a, 16);
+    std::memcpy(g11_qb[w][par][l], &b, 16);
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    emu_v8i d;
+    for (int e = 0; e < 8; ++e) {
+        const int M = 2 * e + h;
+        int acc = c[e];
+        for (int k = 0; k < 16; ++k) {
+            const int x = sa ? (int)(int8_t)g11_qa[w][par][M][k] : (int)g11_qa[w][par][M][k];
+            const int y = sb ? (int)(int8_t)g11_qb[w][par][N][k] : (int)g11_qb[w][par][N][k];
+            acc += x * y;
+        }
+        d[e] = acc;
+    }
+    return d;
+}
+emu_v2f emu_cvt_pk_f32_fp8(int w, bool hi) {
+    const unsigned u = (unsigned)w >> (hi ? 16 : 0);
+    emu_v2f r;
+    r[0] = rad_fp8e4m3_to_f32((uint8_t)(u & 0xffu));
+    r[1] = rad_fp8e4m3_to_f32((uint8_t)((u >> 8) & 0xffu));
+    return r;
 }

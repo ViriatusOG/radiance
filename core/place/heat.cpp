@@ -16,7 +16,7 @@ constexpr int32_t kBlock = 64;
 
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     params_ = params;
-    stats_.reset();
+    stats_ = HeatCounters{};
 
     const size_t n = plan.units.size();
     tier_.assign(n, Tier::VRAM);

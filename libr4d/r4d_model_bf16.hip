@@ -247,7 +247,11 @@ __device__ __forceinline__ void rmsnorm_body(
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
 
     float ss = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = act_f32(xr[i]); ss += v * v; }
+    if (threadIdx.x < kR4dSumLanes)
+        for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) {
+            const float v = act_f32(xr[i]);
+            ss += v * v;
+        }
     ss = block_sum<THR / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += THR) {
@@ -273,9 +277,10 @@ __global__ __launch_bounds__(THR) void r4dchain_rmsnorm(R4D_RN_PARAMS) {
 
 // ---------------------------------------------------------------------------- add_rmsnorm
 // x = x + a, rounded as `add` rounds it, then y = rmsnorm(x) over the x just written, computed as
-// rmsnorm_kernel computes it: the same width (r4d_act_threads), the same columns a thread, the same
-// block_sum. A thread re-reads only the x it wrote itself, so no barrier separates the passes.
-// Byte-identical to `add` followed by `rmsnorm`, on x and on y.
+// rmsnorm_kernel computes it: the same width (r4d_act_threads), the sum over kR4dSumLanes' columns,
+// the same block_sum. Byte-identical to `add` followed by `rmsnorm`, on x and on y. At the
+// narrowest width a thread sums only the x it wrote itself, so the add and the sum are one pass;
+// a wider block sums x other threads wrote, behind a barrier.
 template <bool WF32, uint32_t THR>
 __device__ __forceinline__ void add_rmsnorm_body(
     uint16_t* __restrict__ x, const uint16_t* __restrict__ a, const void* __restrict__ w,
@@ -289,11 +294,22 @@ __device__ __forceinline__ void add_rmsnorm_body(
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
 
     float ss = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += THR) {
-        const uint16_t h = f32_to_bf16(bf16_to_f32(xr[i]) + bf16_to_f32(ar[i]));
-        xr[i] = h;
-        const float v = bf16_to_f32(h);
-        ss += v * v;
+    if constexpr (THR == kR4dSumLanes) {
+        for (uint32_t i = threadIdx.x; i < n; i += THR) {
+            const uint16_t h = f32_to_bf16(bf16_to_f32(xr[i]) + bf16_to_f32(ar[i]));
+            xr[i] = h;
+            const float v = bf16_to_f32(h);
+            ss += v * v;
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < n; i += THR)
+            xr[i] = f32_to_bf16(bf16_to_f32(xr[i]) + bf16_to_f32(ar[i]));
+        __syncthreads();
+        if (threadIdx.x < kR4dSumLanes)
+            for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) {
+                const float v = bf16_to_f32(xr[i]);
+                ss += v * v;
+            }
     }
     ss = block_sum<THR / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
@@ -1062,9 +1078,9 @@ static int rmsnorm_mult_launch(long x, long w, long y, int M, int n, float eps, 
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
     // One workgroup per row, so decode rows are latency-bound. r4d_act_threads is the measured
-    // width table; r4d_rmsnorm_quant_fp8 must use the same one, because the width decides which
-    // columns a thread folds into the sum of squares and the fused kernel must be byte-identical
-    // to this one followed by the quantiser.
+    // width table; the sum of squares folds in kR4dSumLanes' partition at every width, so the
+    // fused norms (r4d_rmsnorm_quant_fp8, r4d_rmsnorm_quant_i8) stay byte-identical to this one
+    // followed by the quantiser at whatever width they run.
     const int thr = r4d_act_threads(M, n);
     // A drafter's 256-row head norm at 256 threads is exactly a full card; step past the cliff.
     const bool ch = chain && M <= 64;

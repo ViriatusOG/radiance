@@ -36,6 +36,11 @@ typedef struct RadDeviceProps {
     int64_t  lds_bytes;       /* per-workgroup scratch, for occupancy arithmetic only */
     int      supports_p2p;
     int      is_host_backend; /* 1 when there is no accelerator behind this device */
+    int      unified;         /* 1 when device memory is host memory (integrated graphics):
+                               * one address space and one RAM ledger -- the device pools and
+                               * the pinned host pools are charged against the same bytes,
+                               * KV tiers collapse to resident, and a copy whose source and
+                               * destination are the same address is a no-op */
 } RadDeviceProps;
 
 int  rad_dev_count(void);

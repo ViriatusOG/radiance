@@ -8,11 +8,12 @@
 //
 // Byte-identical to the five (see r4d_rmsnorm_quant_i8.hip for why that matters), because:
 //
-//   * each norm's sum of squares uses its standalone kernel's partition. rmsnorm runs one workgroup
-//     per row at r4d_act_threads(rows, head_dim) threads and rmsnorm_p at 256; thread t folds
-//     columns t, t+THR, ... in order and the waves are summed in order through LDS. Here a
-//     workgroup is head_dim threads, and thread t < min(THR, head_dim) folds the same columns in the
-//     same order while the rest hold zero, as the standalone kernel's surplus waves do;
+//   * each norm's sum of squares uses its standalone kernel's partition. rmsnorm folds a row over
+//     kR4dSumLanes' 256 lanes whatever its width (r4d_common.h) and rmsnorm_p runs at 256; lane
+//     t < min(256, head_dim) folds columns t, t+256, ... in order and the waves are summed in
+//     order through LDS. Here a workgroup is head_dim threads, and thread t < min(256, head_dim)
+//     folds the same columns in the same order while the rest hold zero, as the standalone
+//     kernel's surplus lanes do;
 //   * the norm output is rounded to bf16 as the standalone norm stores it, and the rotary reads that;
 //   * the rotary's per-pair arithmetic is rope_kernel's (powf ladder, sincosf, `x0*c - x1*s`,
 //     `x0*s + x1*c`), under the library's -ffp-contract=off.
@@ -45,8 +46,8 @@ constexpr uint32_t kWave = 32;
 
 __device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
-// THR threads' partition of one head's sum of squares inside a head_dim-wide workgroup: thread
-// t < P = min(THR, HD) folds t, t+P, ...; the waves are then summed in order.
+// The standalone norm's partition of one head's sum of squares inside a head_dim-wide workgroup:
+// thread t < P = min(256, HD) folds t, t+P, ...; the waves are then summed in order.
 template <uint32_t HD>
 __device__ __forceinline__ float head_ss(const uint16_t* __restrict__ x, uint32_t P, float* lds) {
     float ss = 0.0f;
@@ -281,11 +282,10 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     const long long Mp = r4d_numel(ps);
     if (Mp <= 0 || M < Mp || Mk != M || Mv != M) return R4D_NO(RAD_E_SHAPE);
 
-    // The standalone kernels' widths, from the same function: rmsnorm (one row per head) at
-    // r4d_act_threads(rows, head_dim), rmsnorm_p at 256.
-    const uint32_t pq = nq ? (uint32_t)std::min<long long>(r4d_act_threads((int)(M * nq), (int)hd), hd)
-                           : (uint32_t)hd;
-    const uint32_t pk = (uint32_t)std::min<long long>(r4d_act_threads((int)(M * nkv), (int)hd), hd);
+    // The standalone kernels' partitions: rmsnorm (one row per head) folds over kR4dSumLanes'
+    // lanes at any width, rmsnorm_p runs at 256.
+    const uint32_t pq = nq ? (uint32_t)std::min<long long>(kR4dSumLanes, hd) : (uint32_t)hd;
+    const uint32_t pk = (uint32_t)std::min<long long>(kR4dSumLanes, hd);
     const uint32_t pv = (uint32_t)std::min<long long>(256, hd);
     const float eps   = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd  = (float)r4d_getf(a, "wadd", 0.0);

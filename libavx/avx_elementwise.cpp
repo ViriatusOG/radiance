@@ -20,6 +20,9 @@
 #include "avx_vec.h"
 #include "avx_common.h"
 
+#include <algorithm>
+#include <cmath>
+
 using namespace avx;
 
 /* Round a row through an operand's storage dtype and back, as an unfused store-and-reload would.
@@ -529,6 +532,40 @@ AVX_KERNEL(seg_mean) {
         }
         const double inv = b1 > b0 ? 1.0 / (double)(b1 - b0) : 0.0;
         for (int64_t i = 0; i < n; ++i) sy[i] = b1 > b0 ? (float)(acc[i] * inv) : 0.0f;
+        out_row(Y, rowoff(Y, s, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ seg_softmax_pool */
+/* One output row per cu_seqlens segment: its rows summed with the softmax of their scores as
+ * weights, the softmax in f32 with the maximum subtracted, the sum in f32, rounded once, as in
+ * libref. A segment is a question's few options, so the scores are read plainly. */
+AVX_KERNEL(seg_softmax_pool) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *Sc = &a->t[0], *V = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0);
+    const int64_t S = numel(cu) - 1;
+    if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
+    const int64_t total = ldi(cu, offlin(cu, S));
+    if (total <= 0 || numel(V) < total * n || numel(Sc) < total) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(S >= 2)
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t b0 = ldi(cu, offlin(cu, s)), b1 = ldi(cu, offlin(cu, s + 1));
+        float* acc = scratch_f32_b((size_t)n);
+        float* sy = scratch_f32_c((size_t)n);
+        float one = 0.0f;
+        float m = -INFINITY, z = 0.0f;
+        for (int64_t r = b0; r < b1; ++r) m = std::max(m, in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0]);
+        for (int64_t r = b0; r < b1; ++r) z += std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m);
+        for (int64_t i = 0; i < n; ++i) acc[i] = 0.0f;
+        for (int64_t r = b0; r < b1; ++r) {
+            const float w = std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m) / z;
+            const float* x = in_row(V, rowoff(V, r, n), n, sy);
+            for (int64_t i = 0; i < n; ++i) acc[i] += w * x[i];
+        }
+        for (int64_t i = 0; i < n; ++i) sy[i] = b1 > b0 ? acc[i] : 0.0f;
         out_row(Y, rowoff(Y, s, n), n, sy);
     }
     return RAD_OK;

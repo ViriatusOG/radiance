@@ -22,6 +22,7 @@
 #include "rad_abi.h"
 #include "rad_planes.h"
 #include "rad_plugin.h"
+#include "rad_abi_layout.h"
 
 #include <cstring>
 
@@ -161,6 +162,8 @@ static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
 static const RadParamSpec pActMul[]   = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
 static const RadParamSpec pSegMean[]  = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pSegPool[]  = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
@@ -207,6 +210,9 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group"),
                                             P_STR("dtype") };
+/* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
+static const RadParamSpec pGram[]       = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                            P_INTO("upper") };
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
 static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
@@ -258,10 +264,10 @@ static const RadParamSpec pGemmBias[]   = { P_INT("M"), P_INT("N"), P_INT("K"), 
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
-/* `split_n` is libr4d's (docs/OPS.md); accepted and ignored here. */
+/* `split_n` and `w_rb` are libr4d's (docs/OPS.md); accepted and ignored here. */
 static const RadParamSpec pGemmQ[]        = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                               P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
-                                              P_INTO("split_n") };
+                                              P_INTO("split_n"), P_INTO("w_rb") };
 static const RadParamSpec pGemmQBias[]    = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                               P_STR("dtype") };
 static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b"), WGT("b_scale"),
@@ -965,6 +971,9 @@ static const RadOpSchema kSchemas[] = {
   "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
   "y[s] = the mean of x's rows in cu_seqlens segment s, summed in double, rounded once." },
+{ "seg_softmax_pool", ARR(pSegPool), ARR(oSegPool),
+  "y[s] = v's rows in cu_seqlens segment s summed with the softmax of their scores as weights, "
+  "in f32, rounded once." },
 { "relu", ARR(pMnD), ARR(oUnary), "y = max(x, 0)." },
 { "clamp", ARR(pMnD), ARR(oClamp), "y = min(max(x, lo), hi), lo and hi one-element weights." },
 { "conv2d", ARR(pConv2d), ARR(oConv2d),
@@ -1035,7 +1044,7 @@ static const RadOpSchema kSchemas[] = {
 { "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
-{ "gram_accum", ARR(pQuant), ARR(oGram),
+{ "gram_accum", ARR(pGram), ARR(oGram),
   "h += x^T x over a dequantised E4M3 activation. `h` is [n, n] and INOUT." },
 { "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
   "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
@@ -1436,6 +1445,16 @@ static const RadOpSchema kSchemas[] = {
   "children are the valid candidates at the next position with log probability parent + "
   "log_softmax(score / temp); each round takes the largest untaken child, ties to the first "
   "pushed. tokens and parents list the taken nodes in order, a parent as its node index." },
+/* Row forms libr4d declares under names of their own, so a model can ask for the form: the same op, the same
+ * arithmetic and the same schema as the op named in each string. */
+{ "rmsnorm_rows", ARR(pRmsnorm), ARR(oRmsnorm),
+  "rmsnorm, for rows a model declares in thousands (the head norms over head_dim)." },
+{ "rope_rows", ARR(pRope), ARR(oRope),
+  "rope, for a model that wants the per-(token, pair) angles form at prefill row counts." },
+{ "gemm_nt_q_short", ARR(pGemmQ), ARR(oGemmQ),
+  "gemm_nt_q, for the short-prompt split rule's rows." },
+{ "gemm_nt_q_gated_wide", ARR(pGemmQGated), ARR(oGemmQGated),
+  "gemm_nt_q_gated at any M." },
 };
 
 /* ================================================================== the kernel table
@@ -1586,6 +1605,9 @@ SIMPLE("avx_seg_mean_bf16_sum", "seg_mean_bf16_sum", "elem", "BF16 sum/division 
        "bf16 in and out; f32 sum, BF16 sum and quotient", L(seg_mean_bf16_sum)),
 SIMPLE("avx_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        L(seg_mean)),
+SIMPLE("avx_seg_softmax_pool", "seg_softmax_pool", "elem",
+       "each cu_seqlens segment's rows summed with the softmax of their scores", DT_FLOAT,
+       L(seg_softmax_pool)),
 SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, L(pool_rows)),
 SIMPLE("avx_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
@@ -2034,6 +2056,16 @@ SIMPLE("avx_dflash_select", "dflash_select", "draft",
 SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, tokens and parents, float unary and codebooks", L(dflash_tree)),
+/* The row-form names (see the schema table): each the base op's row. */
+SIMPLE("avx_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
+       L(rmsnorm)),
+SIMPLE("avx_rope_rows", "rope_rows", "attn", "rope under its row-form name", DT_FLOAT, L(rope)),
+ROWL("avx_gemm_nt_q_short", "gemm_nt_q_short", "gemm", "gemm_nt_q under its row-form name",
+     "as avx_gemm_nt_q", L(gemm_nt_q), avx_layout_gemm_q),
+SIMPLE("avx_gemm_nt_q_gated_wide", "gemm_nt_q_gated_wide", "gemm",
+       "gemm_nt_q_gated under its row-form name",
+       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; fp8_e4m3 out, f32 scale",
+       L(gemm_nt_q_gated)),
 };
 
 /* ================================================================== plugin exports */
@@ -2049,6 +2081,7 @@ static const RadPluginInfo kInfo = {
 };
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 
 extern "C" int rad_kernel_schema_count(void) {

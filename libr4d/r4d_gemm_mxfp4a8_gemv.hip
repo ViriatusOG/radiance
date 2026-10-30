@@ -678,9 +678,13 @@ unsigned* mxgg_out_ctr(const void* out) {
   static std::map<std::pair<int, const void*>, unsigned*> blocks;
   int dev = 0;
   if (hipGetDevice(&dev) != hipSuccess) return nullptr;
-  std::lock_guard<std::mutex> lk(mu);
   const auto key = std::make_pair(dev, out);
-  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  {
+    // Not held while the block is made, as in split_ctr (r4d_gemm_fp8a8.hip): the zeroing waits
+    // for the card.
+    std::lock_guard<std::mutex> lk(mu);
+    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  }
   unsigned* p = nullptr;
   if (hipMalloc((void**)&p, R4D_MXGG_MAX_GROUPS * sizeof(unsigned)) != hipSuccess) return nullptr;
   // Zero before any launch reads it: the memset is on the null stream, which the engine's streams
@@ -690,8 +694,15 @@ unsigned* mxgg_out_ctr(const void* out) {
     (void)hipFree(p);
     return nullptr;
   }
-  blocks.emplace(key, p);
-  return p;
+  unsigned* kept = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    const auto [it, fresh] = blocks.emplace(key, p);
+    if (fresh) return it->second;
+    kept = it->second;
+  }
+  (void)hipFree(p);  // another thread made this key's block in the meantime
+  return kept;
 }
 
 // The scratch: the bf16 product [M, n], then each tile's per-row amax [n / 16][M] fp32.

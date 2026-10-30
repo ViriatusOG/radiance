@@ -355,3 +355,107 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
                     granule, (long long)calls);
     return pass;
 }
+
+/* A prefill's read-ahead, as the engine drives it (#355): each call gathers one chunk of 65,536
+ * rows (4096 tokens of 16 heads) and passes the following eight chunks as `ahead`, the window
+ * moving on by one chunk a call, with both ranks passing the same lists. Each row the calls gather
+ * must be read from the file about once: each window adds one chunk to what the reader was handed,
+ * and what is read ahead must still be in the cache when its chunk is gathered. Handing each window
+ * over whole queued every chunk eight times and read ahead the cache's whole 2^19 rows, so rows
+ * were evicted before their chunk came and read again, and the reader went on reading after the
+ * last call. avx_ngram_reads counts the rows read from table files once the reader is idle; the
+ * table is row_gather_case's, so some rows are already cached and read less than once. */
+bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose) {
+    const char* what = "embed_lookup_q's read-ahead over a prefill";
+    const RadKernelInfo* r = lib.row("embed_lookup_q");
+    auto reads = (uint64_t (*)())dlsym(lib.h, "avx_ngram_reads");
+    if (!r || !r->launch || !reads) {
+        std::printf("  %s: %s\n", what, !reads ? "no avx_ngram_reads export" : "no row");
+        return false;
+    }
+    if (const int e = ring_probe()) {
+        std::printf("  %s: SKIPPED -- %s\n", what,
+                    e == ENOMEM ? kRingMemory
+                                : (std::string("io_uring is unavailable here (") +
+                                   std::strerror(e) + ")").c_str());
+        return true;
+    }
+    const int64_t n = 40, V = int64_t(1) << 21, M = 65536, chunks = 12, window = 8;
+    RowTable* rt = row_table(dir, false, V, n);
+    if (rt->state == RowTable::SKIP) {
+        std::printf("  %s: SKIPPED -- %s\n", what, rt->note.c_str());
+        return true;
+    }
+    if (rt->state != RowTable::OK) {
+        std::printf("  %s: %s\n", what, rt->note.c_str());
+        return false;
+    }
+    const uint8_t* tab = rt->tab;
+    const float scale = 0.375f;
+    uint64_t x = 0x2545f4914f6cdd1dull;
+    auto rnd = [&x]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    std::vector<int32_t> ids((size_t)(chunks * M));
+    for (auto& id : ids) id = (int32_t)(rnd() % (uint64_t)V);
+    std::vector<int32_t> distinct(ids);
+    std::sort(distinct.begin(), distinct.end());
+    const int64_t U = std::unique(distinct.begin(), distinct.end()) - distinct.begin();
+    uint16_t lut[256];
+    for (int b = 0; b < 256; ++b) lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * scale);
+
+    auto tensor = [](void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
+        RadTensor t{};
+        t.data = p;
+        t.dtype = dt;
+        t.rank = (uint32_t)shape.size();
+        int i = 0;
+        for (int64_t s : shape) t.shape[i++] = s;
+        int64_t st = 1;
+        for (int k = (int)t.rank - 1; k >= 0; --k) { t.stride[k] = st; st *= t.shape[k]; }
+        return t;
+    };
+    const uint64_t before = reads();
+    std::barrier<> go(2);
+    int64_t bad[2] = {0, 0}, refused[2] = {0, 0};
+    auto rank = [&](int rk) {
+        uint16_t sc = rad_f32_to_bf16(scale);
+        std::vector<uint16_t> out((size_t)(M * n));
+        RadParam ps[3] = {};
+        ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
+        ps[1].key = "n_embd";  ps[1].kind = RAD_P_INT; ps[1].ival = n;
+        ps[2].key = "n_vocab"; ps[2].kind = RAD_P_INT; ps[2].ival = V;
+        for (int64_t c = 0; c < chunks; ++c) {
+            const int64_t na = std::min(window, chunks - 1 - c) * M;
+            std::vector<RadTensor> ts = {
+                tensor(&ids[(size_t)(c * M)], RAD_I32, {M}),
+                tensor(const_cast<uint8_t*>(tab), RAD_F8E4M3, {V, n}),
+                tensor(&sc, RAD_BF16, {1}), tensor(out.data(), RAD_BF16, {M, n}),
+                tensor(na ? &ids[(size_t)((c + 1) * M)] : nullptr, RAD_I32, {na}) };
+            RadArgs a{};
+            a.t = ts.data(); a.n_t = (int)ts.size();
+            a.p = ps; a.n_p = 3;
+            a.rank = rk; a.world_size = 2;
+            go.arrive_and_wait();
+            if (r->launch(&a, nullptr) != RAD_OK) { ++refused[rk]; continue; }
+            for (int64_t m = 0; m < M; ++m) {
+                const uint8_t* row = tab + (int64_t)ids[(size_t)(c * M + m)] * n;
+                for (int64_t i = 0; i < n; ++i)
+                    if (out[(size_t)(m * n + i)] != lut[row[i]]) { ++bad[rk]; break; }
+            }
+        }
+    };
+    std::thread t0(rank, 0), t1(rank, 1);
+    t0.join();
+    t1.join();
+    const uint64_t read = reads() - before;
+    const bool exact = bad[0] + bad[1] + refused[0] + refused[1] == 0;
+    const bool once = (int64_t)read <= U + U / 10;
+    const bool pass = exact && once;
+    std::printf("  %s in %s: %lld chunks of %lld rows x 2 ranks, %llu rows read for %lld distinct "
+                "(%.2f each)%s%s\n", what, dir.c_str(), (long long)chunks, (long long)M,
+                (unsigned long long)read, (long long)U, (double)read / (double)U,
+                exact ? ", every row exact" : "", pass ? "" : " FAIL");
+    if (!exact || verbose)
+        std::printf("    rows wrong %lld/%lld, calls refused %lld/%lld\n", (long long)bad[0],
+                    (long long)bad[1], (long long)refused[0], (long long)refused[1]);
+    return pass;
+}

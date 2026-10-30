@@ -778,6 +778,11 @@ zero and an optional Hadamard.
 Adding a quantisation format is a quantiser plugin plus a kernel that accepts its encoding; the
 core does not change.
 
+A quantiser may run on the cards `rad-convert --gpus` names (the optional `rad_quant_devices`
+export), writing the host's bytes. libquant's trellis GPTQ does: a run of `tcq_rows` rows is one
+workgroup taking the Viterbi search, the error feedback and the tail update in the host loop's
+order, and the dyn=1 scales are chosen on the host by the host's code (`libquant/lq_gpu.h`).
+
 The Hessians come from the engine: `RADIANCE_CALIB_DIR` makes the architecture's calibration tap
 write each layer's Gram matrices while a container serves a corpus, either a bootstrap container
 (convert with absmax, calibrate, convert again) or the unquantised model, where the served
@@ -1683,7 +1688,8 @@ radiance/
   libref/          the conventional vocabulary in plain C++: the oracle, an opt-in last resort
   libavx/          the same vocabulary in x86 SIMD, dispatched by CPU feature: the production host
                    kernels, built on every x86-64 build
-  libquant/        the built-in quantisers (§4.5), host C++, a plugin like any other
+  libquant/        the built-in quantisers (§4.5), host C++ and trellis GPTQ on the card, a plugin
+                   like any other
   tools/           rad-convert, rad-kbench, rad-tune, rad-info, rad-schemas, rad-tokcheck,
                    rad-chatparse, rad-gbnf-check
   tests/           the suite; runs in full on the host backend

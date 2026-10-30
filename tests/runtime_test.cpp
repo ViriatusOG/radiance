@@ -25,6 +25,7 @@
 #include "runtime/residency.h"
 #include "runtime/wtab.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -1806,6 +1807,103 @@ TEST(kv_pools_bind_each_layer_to_its_place_in_the_group) {
     CHECK_EQ(b[3].shape[0], (int64_t)5); CHECK_EQ(b[3].shape[1], (int64_t)32);
     CHECK_EQ(b[3].shape[2], (int64_t)7);
     CHECK_EQ(b[3].layer_slot[2], 0);
+}
+
+/* A staged pass copies the ranges its own tables occupy (kvstream/stage.h, "Volume"). Every id a
+ * table names must lie in a range, or the attention reads another layer's bytes there; the ranges
+ * are sorted, disjoint and at most kStageMaxRuns. Over random tables, a range never starts or ends
+ * on a block more than kStageGapBlocks from a named one unless the cap forced the join. */
+TEST(the_stage_ranges_cover_every_block_a_table_names) {
+    const int64_t bb = 1024;
+    auto covered = [&](const std::vector<rad::KVStageRun>& r, int64_t id) {
+        for (const rad::KVStageRun& x : r)
+            if (id * bb >= x.off && id * bb + bb <= x.off + x.bytes) return true;
+        return false;
+    };
+    auto well_formed = [&](const std::vector<rad::KVStageRun>& r) {
+        bool ok = (int64_t)r.size() <= rad::kStageMaxRuns;
+        for (size_t i = 0; i < r.size(); ++i) {
+            ok = ok && r[i].bytes > 0 && r[i].off % bb == 0 && r[i].bytes % bb == 0;
+            if (i) ok = ok && r[i].off > r[i - 1].off + r[i - 1].bytes;
+        }
+        return ok;
+    };
+
+    /* Two tables, one gap within the join distance, one past it, a duplicate and an unused -1. */
+    const std::vector<int32_t> a = { 0, 1, 2, 3, 40, 41 }, b = { 3, 4, 5, 10, -1, 41, 42 };
+    std::vector<rad::KVStageRun> r;
+    rad::kvstream_runs({ &a, &b }, bb, &r);
+    REQUIRE_EQ((int)r.size(), 2);
+    CHECK_EQ(r[0].off, (int64_t)0);
+    CHECK_EQ(r[0].bytes, 11 * bb);        /* 0..5 and 10, the gap of 4 copied through */
+    CHECK_EQ(r[1].off, 40 * bb);
+    CHECK_EQ(r[1].bytes, 3 * bb);
+    std::vector<rad::KVStageRun> e = { rad::KVStageRun{ 7, 7 } };
+    rad::kvstream_runs({}, bb, &e);
+    CHECK(e.empty());
+    const std::vector<int32_t> none = { -1, -1 };
+    rad::kvstream_runs({ &none }, bb, &e);
+    CHECK(e.empty());
+
+    uint32_t rng = 0x5eed;
+    auto next = [&] { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    for (int round = 0; round < 200; ++round) {
+        std::vector<std::vector<int32_t>> ts((size_t)(1 + next() % 8));
+        const bool sparse = round % 4 == 3;    /* isolated ids: the cap has to join */
+        for (auto& t : ts) {
+            int32_t id = (int32_t)(next() % 50000);
+            const int n = 1 + (int)(next() % 3000);
+            for (int k = 0; k < n; ++k) {
+                t.push_back(id);
+                id += sparse ? 1 + (int32_t)(next() % 400) : (next() % 64 ? 1 : 1 + (int32_t)(next() % 100));
+            }
+            std::reverse(t.begin() + (ptrdiff_t)(t.size() / 3), t.end());   /* not ascending */
+        }
+        std::vector<const std::vector<int32_t>*> tp;
+        for (const auto& t : ts) tp.push_back(&t);
+        std::vector<rad::KVStageRun> got;
+        rad::kvstream_runs(tp, bb, &got);
+        CHECK(well_formed(got));
+        int64_t missed = 0;
+        for (const auto& t : ts)
+            for (const int32_t id : t) missed += !covered(got, id);
+        CHECK_EQ(missed, 0ll);
+        if ((int64_t)got.size() < rad::kStageMaxRuns) {
+            /* No forced join: each range's ends are named blocks. */
+            std::vector<int32_t> all;
+            for (const auto& t : ts) all.insert(all.end(), t.begin(), t.end());
+            std::sort(all.begin(), all.end());
+            for (const rad::KVStageRun& x : got) {
+                CHECK(std::binary_search(all.begin(), all.end(), (int32_t)(x.off / bb)));
+                CHECK(std::binary_search(all.begin(), all.end(), (int32_t)((x.off + x.bytes) / bb - 1)));
+            }
+        }
+    }
+}
+
+/* Blocks no table of the step names are not copied, however low their ids: a prefix cache that
+ * retains a long conversation in blocks 0..29999 leaves a new 2K-token prompt in the ids above,
+ * and the prompt's pass copies its own 500 blocks, not the 30 500 below its highest id. */
+TEST(the_stage_ranges_leave_out_blocks_no_table_of_the_step_names) {
+    const int64_t bb = 1024;
+    std::vector<int32_t> fresh;
+    for (int32_t id = 30000; id < 30500; ++id) fresh.push_back(id);
+    std::vector<rad::KVStageRun> r;
+    rad::kvstream_runs({ &fresh }, bb, &r);
+    REQUIRE_EQ((int)r.size(), 1);
+    CHECK_EQ(r[0].off, 30000 * bb);
+    CHECK_EQ(r[0].bytes, 500 * bb);
+    /* A prefix hit names the retained blocks it resumes from, and those are copied. */
+    std::vector<int32_t> hit;
+    for (int32_t id = 0; id < 4000; ++id) hit.push_back(id);
+    for (int32_t id = 30500; id < 30600; ++id) hit.push_back(id);
+    std::vector<rad::KVStageRun> h;
+    rad::kvstream_runs({ &fresh, &hit }, bb, &h);
+    REQUIRE_EQ((int)h.size(), 2);
+    CHECK_EQ(h[0].off, (int64_t)0);
+    CHECK_EQ(h[0].bytes, 4000 * bb);
+    CHECK_EQ(h[1].off, 30000 * bb);
+    CHECK_EQ(h[1].bytes, 600 * bb);
 }
 
 /* A streamed group's prefill pool is ONE layer deep and every layer of the group addresses it.

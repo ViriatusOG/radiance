@@ -509,6 +509,10 @@ std::string dev_pci_address(int device) {
     if (!dev()->pci_address) return std::string();
     return dev_string(64, [&](char* b, int n) { return dev()->pci_address(device, b, n); });
 }
+int64_t dev_stuck_ms() {
+    const auto f = dev()->stuck_ms;
+    return f ? f() : 0;
+}
 std::string dev_dma_lane(int device) {
     if (!dev()->dma_lane) return std::string();
     return dev_string(256, [&](char* b, int n) { return dev()->dma_lane(device, b, n); });
@@ -589,10 +593,14 @@ int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
 }
 
 int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
+    /* One address space (unified memory, or a host view of a device allocation): a copy
+     * onto itself is already done. */
+    if (dst == src) return RAD_OK;
     return dev()->memcpy_async(dst, src, bytes, s);
 }
 int rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch,
                         int64_t width, int64_t height, RadStream s) {
+    if (dst == src && dpitch == spitch) return RAD_OK;
     return dev()->memcpy_2d_async(dst, dpitch, src, spitch, width, height, s);
 }
 int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {

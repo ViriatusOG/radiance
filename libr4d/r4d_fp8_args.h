@@ -62,12 +62,19 @@ static inline int fp8_ops(const RadArgs* a, Fp8Ops* g, int want_ascale,
     const long long blk = r4d_gemm_fp8a8_block();
     if (blk != R4D_FP8_BLOCK) return R4D_NO(RAD_E_SHAPE);
     g->nkb = (g->K + blk - 1) / blk;
-    /* Check the scale plane's extents: a wrong grid still reads plausible numbers. */
-    if (g->bscale->shape[0] != (wscale == FP8_OPS_ROW_SCALE ? g->N : (g->N + blk - 1) / blk))
-        return R4D_NO(RAD_E_SHAPE);
-    if (g->bscale->shape[1] != g->nkb) return R4D_NO(RAD_E_SHAPE);
+    /* Check the scale plane's extents: a wrong grid still reads plausible numbers. A trellis
+     * weight's two-level scale (E4M3 per row per 128 K under a second level) is a view of two
+     * planes, declared at the weight's logical extents [N][K] (which no one-level scale is); its
+     * layout widens it to the bf16 [N][K/128] a one-level scale is, at that plane's pitch. */
+    const bool two = wscale == FP8_OPS_ROW_SCALE && g->bscale->shape[0] == g->N &&
+                     g->bscale->shape[1] == g->K;
+    if (!two) {
+        if (g->bscale->shape[0] != (wscale == FP8_OPS_ROW_SCALE ? g->N : (g->N + blk - 1) / blk))
+            return R4D_NO(RAD_E_SHAPE);
+        if (g->bscale->shape[1] != g->nkb) return R4D_NO(RAD_E_SHAPE);
+    }
 
-    const long long wp = r4d_row_pitch(g->b), sp = r4d_row_pitch(g->bscale);
+    const long long wp = r4d_row_pitch(g->b), sp = two ? g->nkb : r4d_row_pitch(g->bscale);
     const long long yp = r4d_row_pitch(g->y);
     if (wp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
     /* The output has no pitch argument -- libr4d writes C[r*N + c]. */

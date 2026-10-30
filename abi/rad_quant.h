@@ -106,6 +106,15 @@ typedef struct RadQuantizerInfo {
 int                     rad_quant_count(void);
 const RadQuantizerInfo* rad_quant_at(int i);
 
+/* Optional: the cards a quantiser may run on, as the HIP runtime numbers them (after
+ * HIP_VISIBLE_DEVICES); none is the host alone, the state before any call. rad-convert calls it
+ * once, after loading and before the first weight, with its --gpus list. A quantiser that uses a
+ * card writes the same bytes it writes on the host, so a container does not depend on the machine
+ * that converted it, and --reuse matches it either way. RAD_E_UNSUPPORTED: this build has no
+ * device path; any other negative status refuses the list (a card that is not there). Symbol
+ * name: `rad_quant_devices`. */
+typedef int (*RadQuantDevicesFn)(const int* ids, int n);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -31,6 +31,7 @@
 #include "r4d_fp8_lm.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_chain.h"
+#include "r4d_iqr.h"
 
 #include <algorithm>
 
@@ -184,6 +185,91 @@ __device__ __forceinline__ float code1(uint8_t b) {
     else return e4m3(b);
 }
 
+/* An IQR head (r4d_iqr.h's lm row: TB-bit codes indexing an int8 table of 2^TB entries, the row's
+ * bf16 scales after its codes): TB = 0 is a byte a code (E4M3, or int8 with I8). The table sits
+ * after the last row (lm_tab), and a kernel holds it in sixteen dwords (`tv`) for byte permutes:
+ * a lookup of four codes is one v_perm a group of eight entries, the groups chosen bytewise by the
+ * codes' upper bits. */
+template <uint32_t TB>
+__device__ __forceinline__ void lm_table(const uint8_t* W, uint32_t rows, uint32_t w_ld,
+                                         uint32_t (&tv)[16]) {
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) tv[i] = 0u;
+    if constexpr (TB != 0) {
+        const uint32_t* t = (const uint32_t*)(W + ((size_t)rows * w_ld + 255u) / 256u * 256u);
+#pragma unroll
+        for (uint32_t i = 0; i < ((1u << TB) + 3u) / 4u; ++i) tv[i] = t[i];
+    }
+}
+/* The table entries of four codes, one a byte of `x`. */
+template <uint32_t TB>
+__device__ __forceinline__ uint32_t lm_lookup4(uint32_t x, const uint32_t (&tv)[16]) {
+    const uint32_t lo = x & 0x07070707u;
+    uint32_t g[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i)
+        if (i < ((1u << TB) + 7u) / 8u) g[i] = __builtin_amdgcn_perm(tv[2 * i + 1], tv[2 * i], lo);
+#pragma unroll
+    for (uint32_t b = 3; b < TB; ++b) {
+        /* bytes whose bit b is set take the upper half of each pair of groups */
+        const uint32_t m = ((x >> b) & 0x01010101u) * 0xFFu;
+        const uint32_t half = 1u << (b - 3);
+#pragma unroll
+        for (uint32_t i = 0; i < 8; i += 2 * half)
+            if (i + half < ((1u << TB) + 7u) / 8u) g[i] = (g[i + half] & m) | (g[i] & ~m);
+    }
+    return g[0];
+}
+/* Sixteen consecutive codes from column c (a multiple of 16) of a row, as int8 bytes. */
+template <uint32_t TB>
+__device__ __forceinline__ uint4 lm_codes16(const uint8_t* __restrict__ row, uint32_t c,
+                                            const uint32_t (&tv)[16]) {
+    if constexpr (TB == 0) {
+        return *(const uint4*)(row + c);
+    } else {
+        /* 2*TB bytes from offset 2*TB*(c/16), read from the dword-aligned window over them */
+        constexpr uint32_t ND = (2u * TB + 3u + 3u) / 4u;
+        const uint32_t off = c / 16u * 2u * TB;
+        const uint32_t* p = (const uint32_t*)(row + (off & ~3u));
+        uint32_t w[ND];
+#pragma unroll
+        for (uint32_t i = 0; i < ND; ++i) w[i] = p[i];
+        const uint32_t sh = (off & 3u) * 8u;
+        uint32_t d[ND];
+#pragma unroll
+        for (uint32_t i = 0; i < ND; ++i)
+            d[i] = __builtin_amdgcn_alignbit(i + 1u < ND ? w[i + 1u] : 0u, w[i], sh);
+        uint32_t o[4];
+#pragma unroll
+        for (uint32_t q = 0; q < 4; ++q) {
+            uint32_t x = 0;
+#pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t bit = (q * 4u + j) * TB, i = bit >> 5, s = bit & 31u;
+                const uint32_t v = (s + TB <= 32u ? d[i] >> s
+                                                  : __builtin_amdgcn_alignbit(d[i + 1u], d[i], s)) &
+                                   ((1u << TB) - 1u);
+                x |= v << (8u * j);
+            }
+            o[q] = lm_lookup4<TB>(x, tv);
+        }
+        return make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+/* One code's value, for a ragged tail. */
+template <uint32_t TB, bool I8>
+__device__ __forceinline__ float lm_code1(const uint8_t* __restrict__ row, uint32_t c,
+                                          const uint32_t (&tv)[16]) {
+    if constexpr (TB == 0) {
+        return code1<I8>(row[c]);
+    } else {
+        const uint32_t bit = c * TB;
+        const uint32_t w = (uint32_t)row[bit >> 3] | (uint32_t)row[(bit >> 3) + 1] << 8;
+        const uint32_t code = (w >> (bit & 7u)) & ((1u << TB) - 1u);
+        return (float)(int8_t)(tv[code / 4u] >> (8u * (code % 4u)));
+    }
+}
+
 // MT token rows against RB weight rows per wave: a speculative verify step (M = 1 + n_spec) reads
 // the weight once for all MT rows instead of falling to r4d_gemm_fp8a8_nt_m16.
 //
@@ -193,13 +279,15 @@ __device__ __forceinline__ float code1(uint8_t b) {
 // The E4M3 decode is hoisted out of the token loop. The a0/a1 split (even columns, odd columns, per
 // lane, one wave reduction) keeps row_dot's summation order, so MT = 1 is bit-identical to row_dot
 // and RB changes only which wave owns a row.
-template <uint32_t MT, uint32_t RB, bool SROW, bool I8 = false>
+template <uint32_t MT, uint32_t RB, bool SROW, bool I8 = false, uint32_t TB = 0>
 __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
                                             const uint16_t* __restrict__ S,
                                             const uint16_t* __restrict__ X, uint32_t a_ld,
                                             uint32_t row0, uint32_t rows, uint32_t cols,
                                             uint32_t w_ld, uint32_t sc_cols, uint32_t m_real,
                                             int lane, float* __restrict__ acc) {
+    uint32_t tv[16];
+    lm_table<TB>(W, rows, w_ld, tv);
     const uint32_t stride = kWave * 16u;
     const uint32_t full = (cols / stride) * stride;
     // The activation row a token slot reads. Above kMaxMt, M is rounded up to a multiple of four and
@@ -216,7 +304,8 @@ __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
         // the loop uniform.
         const uint32_t rr = (row0 + r < rows) ? (row0 + r) : (rows - 1);
         w[r] = W + (size_t)rr * w_ld;
-        srow[r] = SROW ? (const uint16_t*)(w[r] + cols) : S + (size_t)(rr / kBlock) * sc_cols;
+        srow[r] = SROW ? (const uint16_t*)(w[r] + (TB ? cols / 8u * TB : cols))
+                       : S + (size_t)(rr / kBlock) * sc_cols;
     }
 #pragma unroll
     for (uint32_t i = 0; i < RB * MT; ++i) acc[i] = 0.0f;
@@ -233,7 +322,7 @@ __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
     auto load = [&](uint32_t c) {
 #pragma unroll
         for (uint32_t r = 0; r < RB; ++r) {
-            wn[r] = *(const uint4*)(w[r] + c);
+            wn[r] = lm_codes16<TB>(w[r], c, tv);
             sn[r] = srow[r][c / kBlock];
         }
         if constexpr (kPre) {
@@ -264,7 +353,7 @@ __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
         for (uint32_t r = 0; r < RB; ++r) {
             uint4 packed;
             if constexpr (kPre) packed = wc[r];
-            else packed = *(const uint4*)(w[r] + c);
+            else packed = lm_codes16<TB>(w[r], c, tv);
             const uint32_t* pw = (const uint32_t*)&packed;
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
@@ -313,7 +402,7 @@ __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
     for (uint32_t c = full + (uint32_t)lane; c < cols; c += kWave) {
 #pragma unroll
         for (uint32_t r = 0; r < RB; ++r) {
-            const float wv = code1<I8>(w[r][c]), s = bscale(srow[r][c / kBlock]);
+            const float wv = lm_code1<TB, I8>(w[r], c, tv), s = bscale(srow[r][c / kBlock]);
 #pragma unroll
             for (uint32_t m = 0; m < MT; ++m)
                 acc[r * MT + m] =
@@ -331,7 +420,7 @@ template <class OT> __device__ __forceinline__ OT mvm_store(float v);
 template <> __device__ __forceinline__ uint16_t mvm_store<uint16_t>(float v) { return f32_to_bf16(v); }
 template <> __device__ __forceinline__ float mvm_store<float>(float v) { return v; }
 
-template <uint32_t MT, bool SROW, class OT, uint32_t RB = 1, bool I8 = false>
+template <uint32_t MT, bool SROW, class OT, uint32_t RB = 1, bool I8 = false, uint32_t TB = 0>
 __global__ __launch_bounds__(kDenseThreads) void mvm_kernel(
     const uint8_t* __restrict__ W, const uint16_t* __restrict__ S,
     const uint16_t* __restrict__ X, uint32_t a_ld, OT* __restrict__ out, uint32_t c_ld,
@@ -343,8 +432,8 @@ __global__ __launch_bounds__(kDenseThreads) void mvm_kernel(
     for (uint32_t r0 = ((uint32_t)blockIdx.x * kDenseWaves + (uint32_t)wave) * RB; r0 < rows;
          r0 += step) {
         float acc[RB * MT];
-        rows_dot_mt<MT, RB, SROW, I8>(W, S, X, a_ld, r0, rows, cols, w_ld, sc_cols, m_real, lane,
-                                      acc);
+        rows_dot_mt<MT, RB, SROW, I8, TB>(W, S, X, a_ld, r0, rows, cols, w_ld, sc_cols, m_real,
+                                          lane, acc);
         // C is [M][N]: lane 0 writes MT scattered values `c_ld` apart, negligible against the
         // weight read. Rows m >= m_real are padding (M rounded up) and are discarded.
         if (lane == 0) {
@@ -481,7 +570,7 @@ constexpr uint32_t lm_waves(uint32_t mt, uint32_t fkb) {
 }
 
 // The body; lm_wmma_kernel and its chained form (RadKernelChainFn) wrap it.
-template <uint32_t MT, uint32_t FKB, bool I8, uint32_t MH = 1>
+template <uint32_t MT, uint32_t FKB, bool I8, uint32_t MH = 1, uint32_t TB = 0>
 __device__ __forceinline__ void lm_wmma_body(
     const uint8_t* __restrict__ W, const uint16_t* __restrict__ A, uint32_t a_ld,
     float* __restrict__ C, uint32_t c_ld,
@@ -503,12 +592,15 @@ __device__ __forceinline__ void lm_wmma_body(
     const uint32_t mo   = (wv / (kDenseWaves / MH)) * 16u * MT;   /* its M half's first row */
     const uint32_t c    = lane & 15u;          /* this lane's weight row inside its 16-row tile */
     const uint32_t h    = lane >> 4;           /* which half of the K step */
+    uint32_t tv[16];
+    lm_table<TB>(W, rows, w_ld, tv);
 
     for (uint32_t base = (uint32_t)blockIdx.x * kRows; base < rows; base += gridDim.x * kRows) {
         /* Clamped, not skipped: a tail workgroup recomputes the last row; the store drops it. */
         const uint32_t n   = base + wn * 16u + c;
         const uint32_t nc  = (n < rows) ? n : (rows - 1u);
-        const uint16_t* scl = (const uint16_t*)(W + (size_t)nc * w_ld + cols);
+        const uint16_t* scl =
+            (const uint16_t*)(W + (size_t)nc * w_ld + (TB ? cols / 8u * TB : cols));
 
         f8v acc[MT];
 #pragma unroll
@@ -545,8 +637,8 @@ __device__ __forceinline__ void lm_wmma_body(
                 const uint32_t u = tid + i * kDenseThreads;
                 const uint32_t r = u / (kFK / 16u), off = (u % (kFK / 16u)) * 16u;
                 const uint32_t g = base + r;
-                const uint8_t* src = W + (size_t)((g < rows) ? g : (rows - 1u)) * w_ld + kt + off;
-                *(uint4*)(s_w + (size_t)r * kPitch + off) = *(const uint4*)src;
+                const uint8_t* src = W + (size_t)((g < rows) ? g : (rows - 1u)) * w_ld;
+                *(uint4*)(s_w + (size_t)r * kPitch + off) = lm_codes16<TB>(src, kt + off, tv);
             }
             lds_barrier();
 
@@ -607,16 +699,16 @@ __device__ __forceinline__ void lm_wmma_body(
 #define R4D_LMW_PARAMS const uint8_t* __restrict__ W, const uint16_t* __restrict__ A,           \
     uint32_t a_ld, float* __restrict__ C, uint32_t c_ld, uint32_t rows, uint32_t cols,          \
     uint32_t w_ld, uint32_t m_real
-template <uint32_t MT, uint32_t FKB, bool I8 = false, uint32_t MH = 1>
+template <uint32_t MT, uint32_t FKB, bool I8 = false, uint32_t MH = 1, uint32_t TB = 0>
 __global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void lm_wmma_kernel(
     R4D_LMW_PARAMS) {
-    lm_wmma_body<MT, FKB, I8, MH>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
+    lm_wmma_body<MT, FKB, I8, MH, TB>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
 }
-template <uint32_t MT, uint32_t FKB, bool I8 = false, uint32_t MH = 1>
+template <uint32_t MT, uint32_t FKB, bool I8 = false, uint32_t MH = 1, uint32_t TB = 0>
 __global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void r4dchain_lm_wmma(
     R4D_LMW_PARAMS) {
     r4d_chain_wait();
-    lm_wmma_body<MT, FKB, I8, MH>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
+    lm_wmma_body<MT, FKB, I8, MH, TB>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
     r4d_chain_done();
 }
 #undef R4D_LMW_PARAMS
@@ -698,7 +790,7 @@ extern "C" int r4d_gemm_fp8a16_nt_mt(long a, long wq, long ws, long c,
 // This row must serve every M: all bands of one op read the same stored bytes, so a band falling
 // to another kernel (e.g. the bf16 projection) would misread the E4M3 codes.
 // core/build/rad_builder.cpp refuses such a split at declare time.
-template <bool I8>
+template <bool I8, uint32_t TB = 0>
 static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
                          int w_ld, long stream, bool chain = false);
 
@@ -716,7 +808,7 @@ extern "C" int r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N,
 
 /* `chain`: the WMMA pass's chained form (the plugin entry, where the row resolved with `chain`);
  * the matvec below three rows stays plain. */
-template <bool I8>
+template <bool I8, uint32_t TB>
 static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
                          int w_ld, long stream, bool chain) {
     if (!a || !wq || !c) return -1;
@@ -747,12 +839,12 @@ static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld,
                 const uint16_t* ac = (const uint16_t*)a + (size_t)m0 * a_ld;
                 float* cc = (float*)c + (size_t)m0 * c_ld;
                 if (fkb == 2u)
-                    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<4, 2, I8, 2> : lm_wmma_kernel<4, 2, I8, 2>),
+                    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<4, 2, I8, 2, TB> : lm_wmma_kernel<4, 2, I8, 2, TB>),
                                        dim3(blocks), dim3(kDenseThreads), 0,
                                        (hipStream_t)stream, (const uint8_t*)wq, ac, (uint32_t)a_ld, cc,
                                        (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc);
                 else
-                    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<4, 1, I8, 2> : lm_wmma_kernel<4, 1, I8, 2>),
+                    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<4, 1, I8, 2, TB> : lm_wmma_kernel<4, 1, I8, 2, TB>),
                                        dim3(blocks), dim3(kDenseThreads), 0,
                                        (hipStream_t)stream, (const uint8_t*)wq, ac, (uint32_t)a_ld, cc,
                                        (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc);
@@ -769,7 +861,7 @@ static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld,
             const uint16_t* ac = (const uint16_t*)a + (size_t)m0 * a_ld;
             float* cc = (float*)c + (size_t)m0 * c_ld;
 #define R4D_LMW2(MTV, FKV)                                                                  \
-    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<MTV, FKV, I8> : lm_wmma_kernel<MTV, FKV, I8>), \
+    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<MTV, FKV, I8, 1, TB> : lm_wmma_kernel<MTV, FKV, I8, 1, TB>), \
                        dim3(blocks), dim3(kDenseThreads), 0,                                 \
                        (hipStream_t)stream, (const uint8_t*)wq, ac, (uint32_t)a_ld, cc,      \
                        (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc)
@@ -789,7 +881,7 @@ static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld,
 
     const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves);
 #define R4D_LGF8(NM)                                                                            \
-    hipLaunchKernelGGL((mvm_kernel<NM, true, float, 1, I8>), dim3(blocks), dim3(kDenseThreads),  \
+    hipLaunchKernelGGL((mvm_kernel<NM, true, float, 1, I8, TB>), dim3(blocks), dim3(kDenseThreads),  \
                        0, (hipStream_t)stream, (const uint8_t*)wq, (const uint16_t*)nullptr,     \
                        (const uint16_t*)a, (uint32_t)a_ld, (float*)c, (uint32_t)c_ld,            \
                        rows, cols, (uint32_t)w_ld, 0u, (uint32_t)M)
@@ -898,6 +990,39 @@ extern "C" int r4d_rad_logits_gemm_fp8(const RadArgs* a, RadStream s) {
 /* The int8 head: the same operands and stored row, i8 codes (r4d_rad_layout_i8_logits). */
 extern "C" int r4d_rad_logits_gemm_i8(const RadArgs* a, RadStream s) {
     return rad_logits_gemm_8(a, s, true);
+}
+
+/* An IQR head (r4d_iqr.h's lm form): the int8 head's kernels with each sixteen codes read at their
+ * width and looked up in the row form's table (lm_codes16), so the arithmetic is the int8 head's
+ * over the same values. */
+extern "C" int r4d_rad_logits_gemm_iqr(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, LG_X);
+    const RadTensor* w = r4d_opt(a, LG_W);
+    const RadTensor* y = r4d_opt(a, LG_Y);
+    if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || y->dtype != RAD_F32 || !r4d_iqr::is_weight_dtype(w->dtype))
+        return R4D_NO(RAD_E_DTYPE);
+    const uint32_t word = w->dtype & r4d_iqr::kWordMask;
+    if (!r4d_iqr::lm_built(word)) return R4D_NO(RAD_E_DTYPE);
+    const r4d_iqr::Form f = r4d_iqr::form(word);
+    const long long n_vocab = r4d_geti_or(a, "n_vocab", r4d_dim(w, 0));
+    const long long n_embd  = r4d_geti_or(a, "n_embd", 0);
+    if (n_vocab <= 0 || n_embd <= 0 || n_embd % 128) return R4D_NO(RAD_E_SHAPE);
+    if (w->rank != 2 || w->shape[0] != n_vocab || w->shape[1] != n_embd) return R4D_NO(RAD_E_SHAPE);
+    const long long stride = r4d_iqr::lm_row(f, n_embd);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n_embd, &M);
+    const long long y_ld = r4d_rows_pitch(y, n_vocab, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 256)) return R4D_NO(RAD_E_ALIGN);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    int (*go)(long, long, long, int, int, int, int, int, int, long, bool) =
+        f.bits == 2u ? logits_gemm_8<true, 2> : f.bits == 3u ? logits_gemm_8<true, 3>
+      : f.bits == 4u ? logits_gemm_8<true, 4> : f.bits == 5u ? logits_gemm_8<true, 5>
+                     : logits_gemm_8<true, 6>;
+    return go(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd, (int)n_vocab, (int)x_ld,
+              (int)y_ld, (int)stride, (long)(uintptr_t)s, ch) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 // ============================================================== the plugin ABI entry points

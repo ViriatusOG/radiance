@@ -291,6 +291,14 @@ __host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
     return M <= lim ? 512 : 256;
 }
 
+// The partition a row's sum is folded over, whatever the workgroup width: lane v < kR4dSumLanes
+// adds columns v, v + kR4dSumLanes, ... in order, the lanes past it add nothing, and block_sum adds
+// the wave sums from the first. Folding over the width instead would round a row's norm by how many
+// rows its launch carries, since r4d_act_threads widens the workgroup at small M: the same token in
+// a 64-token prefill chunk and in a 2048-token one would get different bits. 256 is the narrowest
+// width, so a launch at it keeps the order it always had.
+constexpr uint32_t kR4dSumLanes = 256;
+
 // The full-card cliff of the R9700 (gfx1201, 64 CUs). A launch whose wavefront count falls in
 // the last 32 before a multiple of 2048 runs about five times slower than the same work one
 // workgroup wider, whatever the kernel does: 256-thread workgroups take 27.6 us at 253 to 256 of

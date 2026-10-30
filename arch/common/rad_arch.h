@@ -15,6 +15,7 @@
 #include "rad_device.h"
 #include "rad_runtime.h"
 #include "rad_yarn.h"
+#include "rad_abi_layout.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -1212,6 +1213,17 @@ inline RadOperand bcol_at(rad_buf h, int64_t first_row, int64_t pitch,
     return o;
 }
 
+/* Whether every logits row this step samples belongs to a sequence that carries words for the
+ * plugin (RadBatch::plugin_words). A head that answers from those words then has no use for the
+ * lm_head's row: it is sampled once and discarded. One row a sampled sequence; a speculative
+ * step samples more and answers false. */
+inline bool plugin_words_cover_rows(const RadBatch* b) {
+    if (b->n_out <= 0 || !b->plugin_cu_h) return false;
+    int64_t n = 0;
+    for (int64_t s = 0; s < b->n_seq; ++s) n += b->plugin_cu_h[s + 1] > b->plugin_cu_h[s] ? 1 : 0;
+    return n == b->n_out;
+}
+
 /* Rows [first, first + n), seen by the kernel as [n, pitch]; RadOperand::offset is in elements.
  *
  * Lets one op be issued in slices: an op whose widest kernel stops at M=64 (the delta net's
@@ -1545,6 +1557,7 @@ inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Ge
         NS::step(c, batch);                                                                    \
     }                                                                                          \
     extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }               \
+    extern "C" uint64_t rad_plugin_abi_layout(void) { return rad_abi_layout(); }               \
     extern "C" const RadPluginInfo* rad_plugin_info(void) {                                    \
         /* The plugin's name (rad_abi.h: "qwen3_dense_bf16"), not the architecture id: plugin   \
          * names must be unique and one architecture can have several plugins. */               \

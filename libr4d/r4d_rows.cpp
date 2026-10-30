@@ -23,6 +23,7 @@
  */
 
 #include "r4d_plugin.h"
+#include "rad_abi_layout.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -849,6 +850,9 @@ static const RadParamSpec pGemmNtQ[] = {
     /* The width whose K split a row slice of a wider linear takes (docs/OPS.md); only the narrow
      * fp8a8 / i8a8 rows split K by N, and they read it. */
     { "split_n", RAD_P_INT, RAD_OPTIONAL },
+    /* The weight rows one int8 scale covers, when the weight's form makes it more than one (a
+     * trellis on libquant's tcq_rb grid); the rb8 tile reads it (docs/OPS.md). */
+    { "w_rb", RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
  * quantised GEMMs need a seventh operand. RadLayout can declare aux streams beside a weight, but
@@ -1238,6 +1242,7 @@ static const RadParamSpec pGramAccum[] = {
     { "n",     RAD_P_INT, RAD_REQUIRED },
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "upper", RAD_P_INT, RAD_OPTIONAL },   /* 1: only k2 >= k1 is accumulated (H is symmetric) */
 };
 static const RadOperandSpec oGramAccum[] = {
     { "a",       RAD_OPD_IN,    0 },
@@ -1917,6 +1922,15 @@ static const RadParamSpec pSegMean[] = {
 };
 static const RadOperandSpec oSegMean[] = {
     { "x",          RAD_OPD_IN,  0 },
+    { "cu_seqlens", RAD_OPD_IN,  0 },
+    { "y",          RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pSegPool[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"),
+};
+static const RadOperandSpec oSegPool[] = {
+    { "score",      RAD_OPD_IN,  0 },
+    { "v",          RAD_OPD_IN,  0 },
     { "cu_seqlens", RAD_OPD_IN,  0 },
     { "y",          RAD_OPD_OUT, 0 },
 };
@@ -2999,6 +3013,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("seg_mean", pSegMean, oSegMean,
            "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
            "and rounded once; an empty segment is zeros."),
+    SCHEMA("seg_softmax_pool", pSegPool, oSegPool,
+           "Row s of y is v's rows [cu_seqlens[s], cu_seqlens[s+1]) summed with the softmax of "
+           "their scores (one a row, f32, the maximum subtracted) as weights, in f32 and rounded "
+           "once; an empty segment is zeros."),
     SCHEMA("seg_mean_bf16_sum", pSegMean, oSegMean,
            "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output."),
     SCHEMA("qk_norm_rope", pQkNormRope, oQkNormRope,
@@ -4877,6 +4895,25 @@ static const RadConstraint cGemmNtI8A8Tiled[] = {
     C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
+/* The rb8 and rb32 tiles': a weight scale per whole 8- or 32-row blocks (`w_rb` a multiple). */
+static const RadConstraint cGemmNtI8A8Rb8Tiled[] = {
+    C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"), C_GE("w_rb", 8), C_DIV("w_rb", 8),
+};
+static const RadConstraint cGemmNtI8A8Rb32Tiled[] = {
+    C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"), C_GE("w_rb", 32), C_DIV("w_rb", 32),
+};
+/* The IQR weights (r4d_gemm_iqr.hip): the int8 twins' bands over a weight kept at its codes' width.
+ * K a multiple of 256, the narrow tile's K step, which both rows check so they serve one band. */
+static const RadConstraint cGemmNtIqrM64[] = {
+    C_LE("M", 64), C_DIV("K", 256), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
+static const RadConstraint cGemmNtIqrTiled[] = {
+    C_DIV("K", 256), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
 static const RadConstraint cQuantActFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -5668,11 +5705,24 @@ static const RadKernelInfo kKernels[] = {
 { "embed_lookup_bf16", "embed_lookup", "vocab",
   "embedding gather, one workgroup a token",
   "any n_embd and n_vocab; a negative or out-of-range id writes a zero row",
-  "i32 tokens, bf16 table and output",
+  "i32 tokens, a plain bf16 table and bf16 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
-  nullptr, nullptr, r4d_rad_embed_lookup, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_embed_lookup, nullptr, r4d_rad_layout_embed_bf16, nullptr,
   r4d_shape_embed_lookup },
+
+{ "embed_lookup_iqr", "embed_lookup", "vocab",
+  "embedding gather over an IQR table kept at its codes' width: a workgroup a token and 128 "
+  "columns, each thread a value decoded from its codes, the 128-wide Hadamard of a rotated table "
+  "undone in LDS",
+  "n_embd a multiple of 128; a negative or out-of-range id writes a zero row",
+  "i32 tokens, an IQR table (r4d_iqr.h: uB codes under a table or a zero, or a 4096-state "
+  "trellis, rotated or not), bf16 output; each value the form's int8 times its row's scale, the "
+  "rotation undone in f32 and rounded once, as the table widened to bf16 would hold it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_embed_lookup_iqr, nullptr, r4d_rad_layout_iqr_embed,
+  r4d_rad_relayout_iqr_embed, r4d_shape_embed_lookup },
 
 { "embed_lookup_q_bf16", "embed_lookup_q", "vocab",
   "quantised embedding gather, four entries a thread",
@@ -5825,6 +5875,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_seg_mean },
+
+{ "seg_softmax_pool_bf16", "seg_softmax_pool", "elem",
+  "a segment's rows summed with the softmax of their scores as weights: one row a cu_seqlens "
+  "segment",
+  "any n; a thread an output column, one workgroup row a segment, the softmax formed in f32 by "
+  "every thread",
+  "bf16 scores, rows and out, f32 weights and sum, one rounding",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_seg_softmax_pool },
 
 { "qk_norm_rope_bf16", "qk_norm_rope", "attn",
   "per-head RMS norm of q and k (and optionally v, unit gain) with rotary on q and k, in place",
@@ -6354,6 +6414,19 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_logits_gemm_i8, nullptr,
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
   nullptr, r4d_rad_unrelayout_i8_logits },
+
+{ "logits_gemm_iqr", "logits_gemm", "vocab",
+  "logits_gemm_i8 over an IQR head kept at its codes' width: each lane's sixteen codes read at "
+  "their width and looked up in the head's table by byte permutes, then the int8 head's matvec "
+  "or WMMA tile",
+  "logits_gemm_fp8's: any M, n_embd a multiple of 128",
+  "bf16 x, an IQR head (r4d_iqr.h's lm form: 2- to 6-bit codes indexing an int8 table, a bf16 "
+  "scale per ROW per 128 columns in the row's tail), F32 LOGITS OUT, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_iqr, nullptr,
+  r4d_rad_layout_iqr_logits, r4d_rad_relayout_iqr_logits,
+  nullptr, r4d_rad_unrelayout_iqr_logits },
 
 /* ---------------------------- the decomposed sampler chain (r4d_sample_stages_f32.hip) ------
  *
@@ -8113,6 +8186,56 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
   nullptr, r4d_rad_unrelayout_i8_block },
 
+{ "gemm_i8a8_rb8_tiled", "gemm_nt_q", "gemm",
+  "gemm_i8a8_tiled at a weight scale constant over 8 rows: one scale a lane a tile, the int32 "
+  "accumulator started at 0x4B400000 so a slot reads as f32 with no conversion, the fp8 fold",
+  "the i8 row's, at w_rb a multiple of 8",
+  "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 scale per 8 ROWS per 128 K (each row "
+  "of the plane holding its block's), bf16 C; dtype i8a8h as the i8 row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_TILED + 1,
+  ROW(cGemmNtI8A8Rb8Tiled), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_i8a8_rb8_tiled, nullptr,
+  r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
+  nullptr, r4d_rad_unrelayout_i8_block },
+
+{ "gemm_i8a8_rb32_tiled", "gemm_nt_q", "gemm",
+  "gemm_i8a8_rb8_tiled at a weight scale per 32 rows: one scale a wave, the fp8 tile's fold and "
+  "registers",
+  "the i8 row's, at w_rb a multiple of 32",
+  "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 scale per 32 ROWS per 128 K (each "
+  "row of the plane holding its block's), bf16 C; dtype i8a8h as the i8 row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_TILED + 2,
+  ROW(cGemmNtI8A8Rb32Tiled), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_i8a8_rb32_tiled, nullptr,
+  r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
+  nullptr, r4d_rad_unrelayout_i8_block },
+
+{ "gemm_iqr_nt_m64", "gemm_nt_q", "gemm",
+  "gemm_i8a8_nt_m16 over an IQR weight (r4d_iqr.h) kept at its codes' width: each wave fetches its "
+  "16 rows' codes a K tile ahead and decodes each 64-K supertile into its int8 fragments just "
+  "before the supertile's WMMA steps (tables and trellis states from LDS)",
+  "M <= 64; K a multiple of 256; N a multiple of 16, and of a trellis's run",
+  "i8 A with an f32 scale per (row, 128 K), W an IQR form's codes, decoding to int8 values with a "
+  "scale per row per 128 K (bf16, or E4M3 under an f32; on a tcq_rb trellis its block's), bf16 C; "
+  "the int8 narrow tile's split, accumulation and fold, so its output bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_M16,
+  ROW(cGemmNtIqrM64), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_iqr_m64, r4d_rad_gemm_iqr_m64_scratch,
+  r4d_rad_layout_iqr, r4d_rad_relayout_iqr,
+  nullptr, r4d_rad_unrelayout_iqr },
+
+{ "gemm_iqr_tiled", "gemm_nt_q", "gemm",
+  "the prefill GEMM over an IQR weight: the call decodes the weight's codes into the int8 fragment "
+  "plane in its scratch, once, and runs gemm_i8a8_tiled (or its rb8 / rb32 fold on a tcq_rb "
+  "trellis) over it",
+  "any M; K a multiple of 256 and N of 128",
+  "as gemm_iqr_nt_m64, through the int8 prefill tile's arithmetic and output bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_TILED,
+  ROW(cGemmNtIqrTiled), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_iqr_tiled, r4d_rad_gemm_iqr_tiled_scratch,
+  r4d_rad_layout_iqr, r4d_rad_relayout_iqr,
+  nullptr, r4d_rad_unrelayout_iqr },
+
 /* Band read off the entry point's own rejection tests, not a kernel-side row. */
 { "gemm_w8a8_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with an 8-bit weight and an 8-bit activation: the promoted linears of the INT4 "
@@ -8544,6 +8667,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
   /* No opd_shape, for logit_rerank's reason: the declared shape and the stored row differ. */
   nullptr, r4d_rad_unrelayout_i8_logits },
+
+{ "logit_rerank_iqr", "logit_rerank", "select",
+  "logit_rerank over an IQR head: the same candidates rescored against logits_gemm_iqr's rows",
+  "logit_rerank's: any M, R <= 32, bf16 x and the IQR lm_head rows logits_gemm_iqr stores",
+  "bf16 in, f32 values + i32 ids out, ties to the lower id",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLogitRerank), NOTUNE,
+  nullptr, nullptr, r4d_rad_logit_rerank_iqr, nullptr,
+  r4d_rad_layout_iqr_logits, r4d_rad_relayout_iqr_logits,
+  /* No opd_shape, for logit_rerank's reason: the declared shape and the stored row differ. */
+  nullptr, r4d_rad_unrelayout_iqr_logits },
 
 { "rowtopk_merge", "row_topk_merge", "select",
   "the global top-R of world_size all-gathered per-rank candidate sets",
@@ -10169,6 +10303,7 @@ extern "C" int r4d_record_dispatches(const void** fns, int cap) {
 }
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 
 extern "C" int rad_kernel_schema_count(void) {

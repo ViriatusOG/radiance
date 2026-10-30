@@ -7,6 +7,7 @@
  */
 #include "rad_abi.h"
 #include "rad_builder.h"
+#include "rad_abi_layout.h"
 
 #include <cstring>
 
@@ -51,6 +52,7 @@ static const RadPluginInfo kInfo = {
 };
 
 uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 const char*          rad_arch_id(void) { return "radtest.kbench"; }
 const char*          rad_arch_quant(void) { return ""; }

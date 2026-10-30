@@ -10704,14 +10704,14 @@ struct ArchCases {
             qwen35moe_fp8::step, 3, {}, 0x4c7e42e71f167042ull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x4a12ebade34d845bull);
+            qwen4exp_fp8::step, 3, {}, 0x9454e9dff6db286bull);
         add("qwen4exp_fp8, two ranks", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 2); return qwen4exp_fp8::declare(b, &q4, &c); },
-            nullptr, 3, { "ar_hc_write" }, 0xeb856cde42ac3e3bull);
+            nullptr, 3, { "ar_hc_write" }, 0xdb9da55c4fee69abull);
         add("qwen4exp_fp8, four-bit experts", [this](RadBuilder* b) {
                 b->encs = { { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 } };
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0xa9458e439054bfa0ull);
+            qwen4exp_fp8::step, 3, {}, 0x0ae8abfcf9200c50ull);
         /* The cache dtype stated rather than left to the plugin's default. The streamed store and
          * the prologue that folds it are declared only where the vocabulary has them, and both are
          * written at the KV group's dtype -- bf16 being the copy-only one, and it is what
@@ -10723,7 +10723,7 @@ struct ArchCases {
                 auto c = q4_ctx(0, 1);
                 c.kv_dtype = RAD_BF16;
                 return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x4a12ebade34d845bull);
+            qwen4exp_fp8::step, 3, {}, 0x9454e9dff6db286bull);
         add("llama_fp8 + DSpark", [this](RadBuilder* b) {
                 auto c = dspark_ctx(0, 1); return llama_fp8::declare(b, lla.meta(), &c); },
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
@@ -11439,11 +11439,11 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0xc38f2b3063262a80ull, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xab53806937d83c1aull, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x983f38c3a7ee5a29ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0x780814049d36bebcull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x0723ed824fef82d4ull, 0x36df57cac613c6cfull },
+        { "qwen4exp_fp8", 1, 0, 0x32869dce302eb0e0ull, 0x26a9e2c23cf85696ull },
+        { "qwen4exp_fp8", 2, 0, 0xf0b6701dd7cbb37aull, 0x889c6b36c014609full },
+        { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0x959ef6b7c6f57d8bull },
+        { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
+        { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xc56a518087e3f4b4ull, 0xa7ec3cf6252cd441ull },
         { "qwen35_fp8", 2, 1, 0x6e644b3d13bac619ull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0x7a9330e0da08f97cull, 0x2b5989b2a6dbc7dfull },

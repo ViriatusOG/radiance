@@ -1389,11 +1389,10 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
-    /* The width is not tunable here: it decides which columns a thread accumulates into the sum of
-     * squares, so it must match the standalone rmsnorm_quant_fp8, which uses r4d_act_threads(M, n)
-     * (1024 up to 32 rows, 512 above). A pinned width would change the summation order, and the
-     * generated text, at M = 64. Zero means the norm's width, resolved from M by the entry point.
-     * The tuned block count, drain and acq change no bytes and are honoured. */
+    /* The width is the standalone rmsnorm_quant_fp8's, r4d_act_threads(M, n) (1024 up to 32 rows,
+     * 512 above): zero means that, resolved from M by the entry point. The sums fold in
+     * kR4dSumLanes' partition at every width, so the width changes no bytes; it is not tuned here.
+     * The tuned block count, drain and acq change no bytes either and are honoured. */
     const int nthreads = 0;
     /* One block per row, the norm's shape rather than the all-reduce's. The push saturates the
      * fabric at four blocks, but the norm serialises the rows a block owns, which costs more than

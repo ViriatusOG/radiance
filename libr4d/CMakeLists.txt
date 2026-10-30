@@ -158,6 +158,8 @@ set(R4D_UNITS
   # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"
   "r4d_gemm_fp8a8|"
+  "r4d_gemm_iqr|"
+  "r4d_iqr_embed|"
   "r4d_quant_act_fp8|"
   "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
@@ -227,7 +229,8 @@ endforeach()
 # The host sources are declaration only: the row table, weight layouts and relayouts, operand
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
-set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_shapes.cpp r4d_fuse.cpp)
+set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
+                    r4d_fuse.cpp)
 
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}

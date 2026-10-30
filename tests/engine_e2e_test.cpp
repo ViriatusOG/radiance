@@ -1719,13 +1719,14 @@ TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
 /* Sampling draws each position's random number from (seed, position), so a seeded request repeats
  * exactly, and speculation, which accepts a draft only where the sampler at that coordinate would
  * have drawn it, gives the same tokens as plain decoding. Another seed must give other tokens, or
- * the check is vacuous. */
+ * the check is vacuous. Sampled text seldom repeats a long stretch, so prompt lookup's verify gate
+ * would hold back most proposals; the drafts come from --debug-draft-oracle instead, the plain
+ * run's own continuation with some drafts corrupted, and every one is verified. */
 TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
     REQUIRE(world().ok);
     for (const Family& f : kSpecFamilies) {
         Server plain, spec;
         REQUIRE(plain.start(world().*f.model, kPlain));
-        REQUIRE(spec.start(world().*f.model, kSpec));
         const json req = completion(repetitive_prompt(), 64, 0.5, 1234);
         const std::vector<int32_t> a = tokens_of(post(plain.port, "/completion", req));
         const std::vector<int32_t> a2 = tokens_of(post(plain.port, "/completion", req));
@@ -1734,6 +1735,13 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
                            completion(repetitive_prompt(), 64, 0.5, 99)));
         const std::vector<int32_t> greedy =
             tokens_of(post(plain.port, "/completion", completion(repetitive_prompt(), 64)));
+        const std::string oracle = world().dir / (std::string("oracle-") + f.name);
+        std::string ids;
+        for (int32_t t : a) ids += std::to_string(t) + " ";
+        REQUIRE(tiny::write_text(oracle, ids));
+        std::vector<std::string> args = kSpec;
+        args.insert(args.end(), { "--debug-draft-oracle", oracle });
+        REQUIRE(spec.start(world().*f.model, args));
         int status = 0;
         const json sb = post(spec.port, "/completion", req, &status);
         CHECK_EQ(status, 200);

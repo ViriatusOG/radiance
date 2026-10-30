@@ -4,6 +4,7 @@
 #include "registry.h"
 #include "../device/device.h"
 #include "../format/encoding.h"
+#include "rad_abi_layout.h"
 
 #include <dlfcn.h>
 #include <dirent.h>
@@ -136,6 +137,25 @@ int Registry::stage_(const std::string& path, Staged* out) {
          * versions. Both versions are printed so the operator can tell which side is stale. */
         err_("plugin '%s' was built against ABI version %u; this engine is version %u -- refused",
              path.c_str(), v, (unsigned)RAD_ABI_VERSION);
+        unstage_(*out);
+        return RAD_E_ABI;
+    }
+    /* One version can name two layouts (two trees bumping to the same number): the fingerprint
+     * of the structs as the plugin was compiled is checked against the engine's own. */
+    auto layout = dl_fn<uint64_t (*)(void)>(out->handle, "rad_plugin_abi_layout");
+    if (!layout) {
+        err_("plugin '%s' reports ABI version %u but exports no rad_plugin_abi_layout: rebuild it "
+             "against this engine's abi/ headers, with RAD_PLUGIN_ABI_LAYOUT_EXPORT once in it "
+             "(rad_abi_layout.h) -- refused", path.c_str(), v);
+        unstage_(*out);
+        return RAD_E_ABI;
+    }
+    static const uint64_t mine = rad_abi_layout();
+    if (const uint64_t theirs = layout(); theirs != mine) {
+        err_("plugin '%s' reports ABI version %u, this engine's, but was built against another "
+             "layout of it (fingerprint %016llx, this engine's %016llx): its abi/ headers and the "
+             "engine's disagree on a struct; rebuild it against this engine's -- refused",
+             path.c_str(), v, (unsigned long long)theirs, (unsigned long long)mine);
         unstage_(*out);
         return RAD_E_ABI;
     }

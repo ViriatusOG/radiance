@@ -88,6 +88,13 @@ struct VramFacts {
     /* Integrated graphics: host memory the card must leave to the host, since device memory is
      * host memory there. 0 on a discrete card. */
     int64_t host_reserve = 0;
+    /* Unified memory (RadDeviceProps::unified): the pinned host pools are charged against
+     * the same ledger as the device pools, because both are the same RAM. `unified` says
+     * the device is one; `host_pinned` is this rank's pinned host pool bytes. Both are 0 /
+     * false on a discrete card, where the host pool is charged to host RAM the budget does
+     * not govern. */
+    bool    unified      = false;
+    int64_t host_pinned  = 0;
 };
 
 /* The resolved split in bytes, with every term it came from. Always filled, including for a
@@ -114,6 +121,8 @@ struct VramBudget {
      * placement cannot move any. */
     int64_t stage = 0;
     int64_t weights = 0;              /* statics + experts: what vram_weights is set to */
+    bool    unified = false;          /* a unified-memory device: one RAM ledger */
+    int64_t host_pinned = 0;          /* pinned host pools charged to that ledger */
     std::string report;       /* the block the engine prints at startup */
 };
 

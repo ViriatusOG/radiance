@@ -233,6 +233,16 @@ def gemma_like():
     return js
 
 
+def mmbert_like():
+    """mmBERT's shape (Laya's multilingual checkpoint): the Gemma normaliser that already turns
+    spaces into U+2581, then Metaspace(always, split), which prepends U+2581 only to text that does
+    not already start with it."""
+    js = gemma_like()
+    js["pre_tokenizer"] = {"type": "Metaspace", "replacement": MS, "prepend_scheme": "always",
+                           "split": True}
+    return js
+
+
 def metaspace_specials(scheme):
     """Metaspace BPE with special tokens: "first" prepends only where the text starts."""
     vocab = {"<s>": 0, "[INST]": 1, MS: 2, "H": 3, "i": 4, MS + "H": 5, "Hi": 6, MS + "Hi": 7,
@@ -350,6 +360,7 @@ GEMMA_TEXTS = ["hello", " hello", "hello world", "hello  world", "the cat", "\nt
                "  leading", "trailing  ", "a\tb", "émoji \U0001F600", "x<eos>y",
                "<start_of_turn>user\nhello<end_of_turn>", "Hello, world!", "   ",
                "th the thee", "日本", "zz  zz   zz", "<mask> the", "<bos>hello", ""]
+MMBERT_TEXTS = GEMMA_TEXTS + [" the cat", "  two  leading", " ", "x\n the"]
 
 
 def main():
@@ -414,6 +425,20 @@ def main():
     for t in GEMMA_TEXTS:
         print("        %s," % cstr(tok.decode(tok.encode(t, add_special_tokens=True).ids,
                                               skip_special_tokens=True)))
+    print("    };")
+    print("    return v;")
+    print("}")
+    print()
+    m = mmbert_like()
+    tok = Tokenizer.from_str(json.dumps(m))
+    print("const char* const kMmbertLike = R\"JSON(%s)JSON\";" % json.dumps(m, ensure_ascii=False))
+    print()
+    print("const std::vector<EncodeGolden>& mmbert_goldens() {")
+    print("    static const std::vector<EncodeGolden> v = {")
+    for t in MMBERT_TEXTS:
+        a = tok.encode(t, add_special_tokens=False).ids
+        b = tok.encode(t, add_special_tokens=True).ids
+        print("        { %s, %s, %s }," % (cstr(t), ids_cpp(a), ids_cpp(b)))
     print("    };")
     print("    return v;")
     print("}")

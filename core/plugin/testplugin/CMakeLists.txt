@@ -1,7 +1,7 @@
 # Test plugins built from one source: a hierarchy for plugin_test to load, a schema conflict to
-# refuse and a stale ABI to reject. They go under $RADIANCE_HOME/testkernels, not kernels/, because
-# the engine scans kernels/ at startup and must never select a row that implements nothing
-# (spec.md §17). The two that must be refused live in testkernels/bad, so loading testkernels/ is
+# refuse, and a stale ABI and a foreign layout under the right version to reject. They go under
+# $RADIANCE_HOME/testkernels, not kernels/, because the engine scans kernels/ at startup and must
+# never select a row that implements nothing (spec.md §17). The ones that must be refused live in testkernels/bad, so loading testkernels/ is
 # clean and the refusals are requested by path.
 rad_add_plugin(radtest_base testkernels SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_base PRIVATE RADTEST_BASE=1)
@@ -14,6 +14,9 @@ target_compile_definitions(radtest_conflict PRIVATE RADTEST_CONFLICT=1)
 
 rad_add_plugin(radtest_badabi testkernels/bad SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_badabi PRIVATE RADTEST_BADABI=1)
+
+rad_add_plugin(radtest_badlayout testkernels/bad SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+target_compile_definitions(radtest_badlayout PRIVATE RADTEST_BADLAYOUT=1)
 
 # Two architecture plugins claiming one architecture id: the first is identified, the second
 # refused.

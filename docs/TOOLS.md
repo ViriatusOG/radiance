@@ -129,6 +129,8 @@ rad-convert [options] <input> -o <model.rad>
       --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from
                        the --reuse container's source; every weight that reads one is converted
       --in-place       with --reuse: extend that container instead of writing a new one
+      --gpus LIST      the cards (HIP device numbers, comma separated) quantisers may run on;
+                       large weights then run two at a time. The bytes are the host's
       --plan-only      declare, plan every weight's encoding, print the plan, and stop
       --report N       the worst N quantisation errors to print (default 20)
   -v, --verbose
@@ -831,6 +833,17 @@ reference with the exact wire and a bf16 KV cache.
 A loaded control vector is applied at the deployment's default: `--control-vector on` scores every
 document with the projection, `--control-vector off` without it.
 
+**The sparse reference.** A full row is the vocabulary in f16, so ten million positions of a
+248K-token vocabulary would be 5 TB. `--kld-record DIR --kld-top N` keeps, per position, the `N`
+most likely tokens exactly (f32 log p) and the mass of every other token, summed from the full row
+(one minus the head would cancel to noise on a confident position): 8 bytes a token, 4 KiB a
+position at `N` = 512. `--kld-ref` reads the form from the manifest and scores the KL between the
+two distributions coarsened to the reference's `N` tokens and one bucket for the rest. By the
+data-processing inequality that is at most the full KL; it loses only how each model spreads the
+tail inside the bucket, which is small where the reference's tail mass is small and nothing on a
+confident position. The report's `ref_form` says which form a number was scored against, and
+numbers from the two forms do not compare.
+
 `--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be
 compared position by position.
@@ -841,6 +854,46 @@ runs every document through the adapter, against a reference recorded from the m
 with `PREFIX` through it and the rest as the base, in the same steps. The steps are those of the
 all-adapter and all-base runs with the same flags, so each document's rows should be byte for byte
 theirs: that is how a mixed batch is checked.
+
+## The calibration mode
+
+```
+radiance --model BF16.rad ... --calib-corpus CORPUS.jsonl --calib-dir DIR [--calib-layers LO:HI]
+```
+
+Records GPTQ's Hessian, `H = sum over tokens of x x^T`, of the whole input of every linear in a
+dense bf16 trunk (`qwen35_bf16`), over a corpus. Like the KL mode it replaces the server: every
+document goes through prefill once, with the prefix cache and speculation off so that each corpus
+token is counted exactly once. A document is submitted only while the whole lengths of those in
+flight, its own included, fit the KV pool at once, so none is preempted (a re-prefill would count
+its tokens twice), and a run that preempts all the same fails. The corpus is the KL mode's JSONL;
+only `prompt` is read.
+
+`--calib-dir` beside `--kld-record` (no `--calib-corpus`) records both in one run: the reference
+over `--kld-corpus`, and the Hessians over the same tokens, fed the same way.
+
+Under tensor parallelism a linear split by its input columns (`o_proj`, the delta net's
+`out_proj`, `down_proj`) sees only its rank's columns, and a Gram of those is one diagonal block
+of H. The tap gathers such an input to its whole width before taking the Gram, so the files hold
+the whole matrix at any `--tp`. One rank records each layer (layer modulo the rank count): its card
+sums a step's rows into an f32 scratch (`gram_accum`, upper triangle only), and the host adds the
+step's sum into an accumulator of the packed upper triangle. The host holds every recorded input of
+its rank, 786 MB a layer at Qwen3.8-27B (50 GB for 64 layers), so a large model is recorded in
+several runs over the same corpus, each with its own `--calib-layers`; the run whose range ends at
+the last layer also records the lm_head's input.
+
+The files, written once the corpus is through: `DIR/<checkpoint prefix>.<layer>.<site>.safetensors`
+per input, each holding `hessian_upper`, f32 `[k (k + 1) / 2]` (row `i`'s entries `k2 = i .. k-1`
+after row `i-1`'s), with metadata `k`, `rows` and `linears`, the checkpoint linears that read the
+input (q, k and v share one; so do gate and up). H is the raw sum: divide by `rows` for the mean
+second moment.
+
+```python
+import numpy as np, safetensors.numpy as st
+t = st.load_file("model.language_model.layers.3.mlp.down_proj.input.safetensors")["hessian_upper"]
+k = int((np.sqrt(8 * t.size + 1) - 1) / 2)
+H = np.zeros((k, k), np.float32); H[np.triu_indices(k)] = t; H = H + np.triu(H, 1).T
+```
 
 ---
 

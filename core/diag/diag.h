@@ -161,14 +161,22 @@ struct RunFacts {
     bool        reference_kernels = false;
     bool        profile_ops = false;
     bool        deterministic = false;
+    /* Started with --proceed-with-incompatible-configuration: the report opens with
+     * unsupported_banner() and marks each incompatible finding as started anyway. */
+    bool        unsupported = false;
+    /* -v: the CONFIGURATION section lists every option; without it, the options not at their
+     * default and a count of the rest (/diagnostics always carries every one). */
+    bool        all_options = false;
     /* Names of the RADIANCE_* variables set (env_names): settings outside the option table,
      * such as the log level, a pinned tuning or an instrument left on. */
     std::vector<std::string> environment;
 };
 
 /* ------------------------------------------------------------------ findings */
+/* Incompatible: a machine setting known to break radiance; startup stops on it with the fix unless
+ * --proceed-with-incompatible-configuration starts it anyway (incompatible()). */
 struct Finding {
-    enum Level { Note = 0, Warn = 1 };
+    enum Level { Note = 0, Warn = 1, Incompatible = 2 };
     Level       level = Note;
     std::string id;     /* stable, for a test or a grep: "link-below-max" */
     std::string what;   /* what was seen, with the numbers */
@@ -177,6 +185,14 @@ struct Finding {
 };
 
 std::vector<Finding> check(const Facts& f, const RunFacts& r);
+
+/* The incompatible findings alone, from the machine only, so startup can refuse before it loads
+ * anything: the serving cards (rank >= 0) and their host. check() includes them. */
+std::vector<Finding> incompatible(const Facts& f);
+
+/* The box --proceed-with-incompatible-configuration puts at the top of the log and the startup
+ * report, one log line an element. */
+std::vector<std::string> unsupported_banner();
 
 /* ------------------------------------------------------------------ the report */
 std::string render(const std::vector<ConfigRow>& config, const std::vector<Decision>& derived,

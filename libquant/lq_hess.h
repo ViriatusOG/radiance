@@ -63,9 +63,9 @@ int calib_sum(const char* dir, const std::string& stem, int64_t K, int64_t domai
               std::vector<double>* acc);
 
 /* The summed Gram of `name`'s input in `domain` as f32 K x K, from calib_resolve's stem, or null
- * when `dir` holds none (noted once on stderr). A layer's is cached for the process by (dir, stem,
- * K, domain); an expert's own is read per call, since each is used once and a model's worth would
- * not fit. */
+ * when `dir` holds none (noted once on stderr). The last few layers' are cached by (dir, stem, K,
+ * domain), for a MoE layer's experts; an expert's own is read per call, since each is used once
+ * and a model's worth would not fit. */
 Gram calib_gram(const char* dir, const char* name, int64_t K, int64_t domain, const char* who);
 
 /* G [R x K] = D [R x K] . H [K x K], H symmetric. Each element of G sums over k in ascending order

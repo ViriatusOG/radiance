@@ -23,9 +23,11 @@ quantisers, and §13 building, installing and the search path.
 
 ```c
 #include "rad_abi.h"          /* required */
+#include "rad_abi_layout.h"   /* required: the layout fingerprint */
 #include "rad_plugin.h"       /* optional helpers -- see §6 */
 
 uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT    /* uint64_t rad_plugin_abi_layout(void) */
 
 const RadPluginInfo* rad_plugin_info(void) {
     static const RadPluginInfo i = {
@@ -42,7 +44,16 @@ const RadKernelInfo* rad_kernel_at(int i);
 
 A plugin whose `rad_plugin_abi_version` differs from the engine's is refused at load, by name, with
 both numbers printed. Return the macro, not the integer, and rebuild when it changes; it changes
-with any shape change in a header a plugin compiles against (`rad_abi.h` lists them).
+with any shape change in a header a plugin compiles against (`rad_abi.h` lists them), a field
+appended to a struct included, and the release that ships the change assigns the number: a tree of
+your own never bumps it for its own fields.
+
+`rad_plugin_abi_layout` is a fingerprint of those headers' struct layouts as your plugin was
+compiled (every struct's size and every field's offset and size, `rad_abi_layout_rows.h`). A plugin
+whose fingerprint differs from the engine's under the same version -- built against another tree's
+headers that gave a different layout the same number -- is refused with both fingerprints printed,
+and so is one that does not export it. Every kind of plugin (kernel, architecture, quantiser)
+exports both.
 
 `build_target` is printed, not trusted: the targets the library was built for (`"gfx1100"`,
 `"gfx11-generic"`, several separated by spaces or commas), `"host"` for CPU kernels, or `""` for a
@@ -435,6 +446,13 @@ blk.*.ffn_*_exps.*.weight    myquant    bits=3 group=64
 `rad-convert --list-quantizers` prints every loaded quantiser and its options. A recipe option the
 quantiser does not declare is refused before anything is quantised. Two plugins naming the same
 quantiser are refused, both named.
+
+A quantiser that can use a card exports `int rad_quant_devices(const int* ids, int n)`
+(`RadQuantDevicesFn`). `rad-convert --gpus 0,1` calls it once, before the first weight; without
+the flag the plugin runs on the host. Which device a weight ran on is not recorded anywhere, so the
+planes must be the host's byte for byte: libquant's trellis GPTQ keeps the host's operations and
+their order on the card (`tests/quant_tcq_gpu_test.cpp` compares the two). Return
+`RAD_E_UNSUPPORTED` from a build with no device path.
 
 The core decodes the `plain` and `affine` schemes. Your own scheme is decoded by your `decode`
 hook, which the oracle, `rad-kbench` and `rad-convert`'s error report use; return

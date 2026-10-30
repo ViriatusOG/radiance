@@ -79,7 +79,10 @@ int rad_tools_load_plugins(const std::string& radiance_home,
                            bool imported = false);
 
 /* The architecture plugin's rad_arch_probe answers, given before declare. */
-int rad_tools_probe(const LoadedPlugins& plugins, const RadModelMeta& meta, RadArchProbe* out);
+/* `gen_max_pixels`, `gen_max_refs`: the probe's inputs (RadArchProbe), the deployment's
+ * --image-gen-max-pixels and --image-gen-max-refs; 0 the model's own. */
+int rad_tools_probe(const LoadedPlugins& plugins, const RadModelMeta& meta, RadArchProbe* out,
+                    int64_t gen_max_pixels = 0, int64_t gen_max_refs = 0);
 
 /* The architecture plugin's declared reply format (rad_arch_chat_format), or null when it
  * declares none and the format is to be derived from the chat template. */

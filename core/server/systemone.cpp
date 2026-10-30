@@ -21,6 +21,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <unordered_set>
@@ -33,18 +35,6 @@ namespace {
 const char* const kImStart = "<|im_start|>";
 const char* const kImEnd   = "<|im_end|>";
 
-bool only_keys(const json& o, std::initializer_list<const char*> allowed, const std::string& path,
-               ApiError* err) {
-    for (const auto& kv : o.items()) {
-        bool ok = false;
-        for (const char* k : allowed) ok = ok || kv.key() == k;
-        if (!ok) {
-            *err = err_unsupported(path + kv.key(), "not a field of a System One request");
-            return false;
-        }
-    }
-    return true;
-}
 
 /* The one id `text` encodes to, or -1 when it is not a single token. */
 int32_t one_token(const ITokenizer& tok, const std::string& text) {
@@ -231,6 +221,52 @@ std::string state_block(const json& state) {
 }
 
 }  /* namespace */
+
+/* ---- shared by the System One models (systemone.h) */
+
+bool only_keys(const json& o, std::initializer_list<const char*> allowed, const std::string& path,
+               ApiError* err) {
+    for (const auto& kv : o.items()) {
+        bool ok = false;
+        for (const char* k : allowed) ok = ok || kv.key() == k;
+        if (!ok) {
+            *err = err_unsupported(path + kv.key(), "not a field of a System One request");
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string py_json_dumps(const json& v) {
+    if (v.is_object()) {
+        std::string s = "{";
+        bool first = true;
+        for (const auto& kv : v.items()) {
+            if (!first) s += ", ";
+            first = false;
+            s += json(kv.key()).dump(-1, ' ', false, json::error_handler_t::replace) + ": " +
+                 py_json_dumps(kv.value());
+        }
+        return s + "}";
+    }
+    if (v.is_array()) {
+        std::string s = "[";
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + py_json_dumps(v[i]);
+        return s + "]";
+    }
+    return v.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+std::string py_json_compact_sorted(const json& v) {
+    /* nlohmann's unordered json keeps its keys sorted by bytes, which is code point order for
+     * UTF-8. */
+    return nlohmann::json::parse(v.dump()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+bool blank_text(const std::string& s) {
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c) != 0; });
+}
+
 
 int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                            const std::string& model_id, DecisionRequest* out, ApiError* err) {

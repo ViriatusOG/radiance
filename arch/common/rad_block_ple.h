@@ -109,7 +109,7 @@ struct PleLayer {
     /* The read-ahead queue's depth in steps: batch.cpp's k_ahead_chunks steps of the following
      * prompt, whose rows the gather's reader thread prefetches. Clamped to what `b_ids` holds, so
      * a larger offer only shortens the queue. */
-    static constexpr int64_t kAheadChunks = 8;
+    static constexpr int64_t kAheadChunks = 2;
     /* The prompt that follows the step, bounded by what `b_ids` holds after the step's rows. */
     int64_t ahead_rows(const RadBatch* batch) const {
         const int64_t a = batch->n_ahead;

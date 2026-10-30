@@ -609,7 +609,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
 
     if (!live) return;
     // fetch-inactive: the f32 partials read lrow under `if (h == 0)` only (see the prefill kernel's
-    // epilogue, #328).
+    // epilogue).
     const float lrow = l_i + swap16_fi(l_i);
     const int tok = qoff + qrow;
     const size_t idx = (size_t)(tok * a.q_heads + qhead) * splits + sp;
@@ -1065,10 +1065,10 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
 // keep their segment count. Greedy output is unchanged.
 static constexpr int kVerifySplitsMin = 64;
 // The floor is also bounded by the batch: at most kVerifyFloorWorkgroups workgroups (segments x KV
-// heads x sequences). The declared scratch is the worst over every sequence count up to max_seqs,
-// and 64 a sequence at 256 sequences made it 64x the law's (h256/gqa12 at max_ctx 200000: 7.62 ->
-// 487.5 MiB a card, issue #342). Up to eight sequences of two KV heads the floor stays 64; at 16 it
-// is 32, at 256 two, and the region stays at what eight sequences need.
+// heads x sequences). The scratch is sized at declare for the worst sequence count up to max_seqs,
+// and an unbounded floor reserves 64 segments for each sequence: 487.5 MiB a card for h256/gqa12 at
+// 256 sequences and max_ctx 200000, 7.62 MiB under the bound. Up to eight sequences of two KV
+// heads the floor stays 64; at 16 it is 32, at 256 two: the region stays at what eight need.
 static constexpr int kVerifyFloorWorkgroups = 1024;
 static constexpr int kVerifyMinFrom   = 16384;
 static constexpr int kVerifyDeepFrom  = 65536;

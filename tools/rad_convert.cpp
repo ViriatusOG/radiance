@@ -25,6 +25,9 @@
 #include "rad_plugin.h"
 #include "rad_quant.h"
 
+#include <dlfcn.h>
+#include <nlohmann/json.hpp>
+
 #include <sys/stat.h>
 
 #ifdef _OPENMP
@@ -42,6 +45,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 using namespace rad;
@@ -49,6 +53,203 @@ using namespace rad;
 namespace {
 
 bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
+
+/* clef (decision.type=clef): the head's geometry from joint_head_config.json beside the
+ * checkpoint, and its three learned scalars from the head's own tensors (joint_head.safetensors,
+ * merged with --add), into the header. The plugin declares the head from the geometry
+ * (arch/common/rad_block_clef.h) and the server applies the scalars (core/server/clef.h). */
+int clef_metadata(const std::string& in, const std::string& config_dir, const Checkpoint& ck,
+                  MetaOwn& meta) {
+    /* The head lives in the clef plugins, selected by the architecture id. A container that
+     * says decision.type=clef but keeps its qwen35 id would load the trunk alone and answer
+     * /v1/systemone from a head that never ran. */
+    if (meta.arch != "clef") {
+        RAD_ERR("%s: decision.type=clef needs the clef plugins: convert with --arch clef (the "
+                "container's architecture is '%s')", in.c_str(), meta.arch.c_str());
+        return -1;
+    }
+    std::string dir = config_dir;
+    if (dir.empty()) {
+        struct stat st{};
+        if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = in;
+        else {
+            const size_t slash = in.find_last_of('/');
+            dir = slash == std::string::npos ? "." : in.substr(0, slash);
+        }
+    }
+    const std::string path = dir + "/joint_head_config.json";
+    std::ifstream f(path);
+    if (!f) {
+        RAD_ERR("%s: decision.type=clef needs the head's joint_head_config.json beside the "
+                "checkpoint (or under --config)", path.c_str());
+        return -1;
+    }
+    nlohmann::json c;
+    try { f >> c; } catch (const std::exception& e) {
+        RAD_ERR("%s: %s", path.c_str(), e.what());
+        return -1;
+    }
+    for (const char* k : { "hidden_size", "width", "routing_layers", "layers", "heads", "feedforward" }) {
+        if (!c.contains(k) || !c[k].is_number_integer() || c[k].get<long long>() <= 0) {
+            RAD_ERR("%s: `%s` is missing or not a positive integer", path.c_str(), k);
+            return -1;
+        }
+        meta.set(std::string("decision.clef.") + k, std::to_string(c[k].get<long long>()));
+    }
+    for (const char* k : { "prior_logit_scale", "joint_logit_scale", "residual_gate" }) {
+        const SrcTensor* t = ck.find(k);
+        if (!t || !t->data || t->bytes < 2) {
+            RAD_ERR("the head's `%s` is not in the checkpoint: add joint_head.safetensors with "
+                    "--add", k);
+            return -1;
+        }
+        float v = 0.0f;
+        if (t->rad_dtype == RAD_BF16) {
+            uint16_t h = 0;
+            std::memcpy(&h, t->data, 2);
+            const uint32_t u = (uint32_t)h << 16;
+            std::memcpy(&v, &u, 4);
+        } else if (t->rad_dtype == RAD_F32 && t->bytes >= 4) {
+            std::memcpy(&v, t->data, 4);
+        } else {
+            RAD_ERR("the head's `%s` is %s; bf16 or f32 is read", k, rad_dtype_name(t->rad_dtype));
+            return -1;
+        }
+        char s[32];
+        std::snprintf(s, sizeof s, "%.9g", (double)v);
+        meta.set(std::string("decision.clef.") + k, s);
+    }
+    RAD_INFO("clef     head %s x %s, %s routing + %s decoder layers; scalars from the checkpoint",
+             meta.get("decision.clef.width"), meta.get("decision.clef.heads"),
+             meta.get("decision.clef.routing_layers"), meta.get("decision.clef.layers"));
+    return 0;
+}
+
+/* The rounding every Laya checkpoint needs: the release ships f16 (laya.train saves .half()), and
+ * the laya plugin reads its linears and tables in bf16, as the release computes them on a card.
+ * Norms and biases are declared f32, an exact widening of f16, so no rule names them. */
+const char* const kLayaBf16 =
+    "token_embd.weight          cast dtype=bf16\n"
+    "type_emb.weight            cast dtype=bf16\n"
+    "scorer.fc1.weight          cast dtype=bf16\n"
+    "scorer.fc2.weight          cast dtype=bf16\n"
+    "blk.*.attn_qkv.weight      cast dtype=bf16\n"
+    "blk.*.attn_out.weight      cast dtype=bf16\n"
+    "blk.*.ffn_in_gate.weight   cast dtype=bf16\n"
+    "blk.*.ffn_down.weight      cast dtype=bf16\n"
+    "head.*.attn_qkv.weight     cast dtype=bf16\n"
+    "head.*.attn_out.weight     cast dtype=bf16\n"
+    "head.*.ffn_up.weight       cast dtype=bf16\n"
+    "head.*.ffn_down.weight     cast dtype=bf16\n";
+
+/* Laya (a checkpoint whose config.json says model_type laya, or --set decision.type=laya): the
+ * release keeps its parts in folders, so the encoder's geometry comes from encoder/config.json,
+ * the head's settings from rl_agent_config.json and the vocabulary from tokenizer/. The plugin
+ * declares from the geometry (arch/laya); the server builds each question's sequence from the
+ * special tokens and lengths and applies the fitted temperatures (core/server/laya.h). */
+int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn& meta,
+                  std::string* tokjson) {
+    if (meta.arch != "laya") {
+        RAD_ERR("%s: decision.type=laya needs a Laya checkpoint directory, whose config.json says "
+                "model_type laya (this one's architecture is '%s')", in.c_str(), meta.arch.c_str());
+        return -1;
+    }
+    std::string dir = config_dir;
+    if (dir.empty()) {
+        struct stat st{};
+        if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = in;
+        else {
+            const size_t slash = in.find_last_of('/');
+            dir = slash == std::string::npos ? "." : in.substr(0, slash);
+        }
+    }
+    auto read_json = [](const std::string& path, nlohmann::json* j) {
+        std::ifstream f(path);
+        if (!f) { RAD_ERR("%s: a Laya checkpoint carries it; cannot read it", path.c_str()); return -1; }
+        try { f >> *j; } catch (const std::exception& e) {
+            RAD_ERR("%s: %s", path.c_str(), e.what());
+            return -1;
+        }
+        return j->is_object() ? 0 : -1;
+    };
+
+    /* The encoder's own config: its geometry and free-form keys (layer_types, local_attention,
+     * the rotary thetas), keeping the checkpoint's model_type, which named the plugin. */
+    MetaOwn enc;
+    if (meta_from_config_json(dir + "/encoder", &enc) != RAD_OK) return -1;
+    for (size_t i = 0; i < enc.keys.size(); ++i)
+        if (enc.keys[i] != "model_type" && enc.keys[i] != "architectures") meta.set(enc.keys[i], enc.vals[i]);
+    meta.m = enc.m;
+
+    nlohmann::json rl;
+    if (read_json(dir + "/rl_agent_config.json", &rl) < 0) return -1;
+    const std::pair<const char*, long long> counts[] = { { "max_len", 1 }, { "head_max_len", 1 },
+                                                         { "head_layers", 0 } };
+    for (const auto& [k, least] : counts) {
+        if (!rl.contains(k) || !rl[k].is_number_integer() || rl[k].get<long long>() < least) {
+            RAD_ERR("%s/rl_agent_config.json: `%s` is missing or not a count", dir.c_str(), k);
+            return -1;
+        }
+        meta.set(std::string("decision.laya.") + k, std::to_string(rl[k].get<long long>()));
+    }
+    if (rl.contains("option_layout") && rl["option_layout"] != "sequential") {
+        RAD_ERR("%s/rl_agent_config.json: option_layout '%s'; the sequential layout every "
+                "published checkpoint uses is served", dir.c_str(), rl["option_layout"].dump().c_str());
+        return -1;
+    }
+    auto num = [](double v) { char s[32]; std::snprintf(s, sizeof s, "%.9g", v); return std::string(s); };
+    std::string temps = "1 1 1";
+    if (rl.contains("temperature")) {
+        const nlohmann::json& t = rl["temperature"];
+        if (!t.is_array() || t.size() != 3 || !t[0].is_number() || !t[1].is_number() || !t[2].is_number()) {
+            RAD_ERR("%s/rl_agent_config.json: `temperature` is not three numbers (choice, score, "
+                    "noul)", dir.c_str());
+            return -1;
+        }
+        temps = num(t[0].get<double>()) + " " + num(t[1].get<double>()) + " " + num(t[2].get<double>());
+    }
+    meta.set("decision.laya.temperature", temps);
+    if (rl.contains("temperature_by_options") && rl["temperature_by_options"].is_object())
+        for (const auto& kv : rl["temperature_by_options"].items())
+            if (kv.value().is_number())
+                meta.set("decision.laya.temperature_by_options." + kv.key(), num(kv.value().get<double>()));
+
+    /* The special tokens by name (tokenizer_config.json), their ids from tokenizer.json. */
+    const std::string tdir = dir + "/tokenizer";
+    if (tokjson->empty()) *tokjson = tdir + "/tokenizer.json";
+    nlohmann::json tc, tj;
+    if (read_json(tdir + "/tokenizer_config.json", &tc) < 0 || read_json(*tokjson, &tj) < 0) return -1;
+    for (const char* which : { "cls_token", "sep_token", "mask_token" }) {
+        const nlohmann::json* v = tc.contains(which) ? &tc[which] : nullptr;
+        if (v && v->is_object() && v->contains("content")) v = &(*v)["content"];
+        if (!v || !v->is_string()) {
+            RAD_ERR("%s/tokenizer_config.json: no `%s`", tdir.c_str(), which);
+            return -1;
+        }
+        const std::string tok = v->get<std::string>();
+        long long id = -1;
+        if (tj.contains("added_tokens"))
+            for (const auto& a : tj["added_tokens"])
+                if (a.contains("content") && a["content"] == tok && a.contains("id")) id = a["id"].get<long long>();
+        if (id < 0 && tj.contains("model") && tj["model"].contains("vocab") && tj["model"]["vocab"].is_object() &&
+            tj["model"]["vocab"].contains(tok))
+            id = tj["model"]["vocab"][tok].get<long long>();
+        if (id < 0) {
+            RAD_ERR("%s: the %s '%s' is not in the vocabulary", tokjson->c_str(), which, tok.c_str());
+            return -1;
+        }
+        const std::string base = std::string(which).substr(0, std::strlen(which) - 6);
+        meta.set("decision.laya." + base, std::to_string(id));
+        if (base == "mask") meta.set("decision.laya.mask_token", tok);
+    }
+    meta.set("decision.type", "laya");
+    meta.finish();
+    RAD_INFO("laya     %s: encoder %lld x %lld, head %s layers, max_len %s, head_max_len %s",
+             dir.c_str(), (long long)meta.m.n_layers, (long long)meta.m.n_embd,
+             meta.get("decision.laya.head_layers"), meta.get("decision.laya.max_len"),
+             meta.get("decision.laya.head_max_len"));
+    return 0;
+}
 
 /* `blk.12.attn_q.weight` -> 12; -1 for a model-level name (GGUF naming, as in an imatrix). */
 int32_t layer_from_name(const std::string& n) {
@@ -151,7 +352,8 @@ void usage() {
         "      --max-spec N     the max_spec declare is run at (default 4, or the block a\n"
         "                       drafter states; a number given here is used as given); 0\n"
         "                       leaves a draft head out\n"
-        "      --reuse FILE     a container converted earlier from the SAME checkpoint. A weight\n"
+        "      --reuse FILE     a container converted earlier from the SAME checkpoint (repeatable;\n"
+        "                       the first is searched first). A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
         "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
@@ -176,6 +378,10 @@ void usage() {
         "                       end and the header last. Refused when a weight it holds would\n"
         "                       change or a new weight is an expert. <file>.pre-append keeps the\n"
         "                       old header and length\n"
+        "      --gpus LIST      the cards (HIP device numbers, comma separated) the quantisers\n"
+        "                       may run on, and large weights then run two at a time. A\n"
+        "                       quantiser writes the same bytes on a card as on the host; with\n"
+        "                       no quantiser plugin that has a device path, refused\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
@@ -219,12 +425,14 @@ int main(int argc, char** argv) {
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
     std::string reuse_path, changed_path;
+    std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
     std::vector<std::string> lora_paths;
     double      lora_strength = 1.0;
     std::string lora_map;
     bool        in_place = false;
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
+    std::vector<int> gpus;           /* --gpus: the cards the quantisers may run on */
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -266,7 +474,11 @@ int main(int argc, char** argv) {
         else if (a == "--draft-model") draft_dir = next("--draft-model");
         else if (a == "--plan-only") plan_only = true;
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
-        else if (a == "--reuse")     reuse_path = next("--reuse");
+        else if (a == "--reuse") {
+            const std::string r = next("--reuse");
+            if (reuse_path.empty()) reuse_path = r;
+            else reuse_more.push_back(r);
+        }
         else if (a == "--changed")   changed_path = next("--changed");
         else if (a == "--lora")      lora_paths.push_back(next("--lora"));
         else if (a == "--lora-strength") {
@@ -281,6 +493,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--lora-map")  lora_map = next("--lora-map");
         else if (a == "--in-place")  in_place = true;
+        else if (a == "--gpus") {
+            for (const std::string& d : rad_split_list(next("--gpus")))
+                gpus.push_back((int)rad_flag_int("rad-convert", "--gpus", d.c_str(), 0, 1023));
+        }
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
             if (v == "fp8")       kv_dtype = RAD_F8E4M3;
@@ -389,7 +605,16 @@ int main(int argc, char** argv) {
     /* ---------------------------------------------------------------- source */
     Checkpoint ck;
     if (!config_dir.empty()) ck.set_meta_dir(config_dir);
+    /* A Laya checkpoint as laya's own loader downloads it carries no config.json of its own, only
+     * encoder/config.json beside rl_agent_config.json: the geometry is the encoder's, the
+     * architecture laya (laya_metadata reads the rest). */
+    struct stat in_st{};
+    const bool laya_dir = config_dir.empty() && stat(in.c_str(), &in_st) == 0 && S_ISDIR(in_st.st_mode) &&
+                          !file_exists(in + "/config.json") && file_exists(in + "/rl_agent_config.json") &&
+                          file_exists(in + "/encoder/config.json");
+    if (laya_dir) ck.set_meta_dir(in + "/encoder");
     if (ck.open(in) < 0) return 1;
+    if (laya_dir) ck.meta().arch = "laya";
     for (const std::string& f : add_files) {
         if (ck.add_file(f) < 0) return 1;
         RAD_INFO("added    %s", f.c_str());
@@ -407,6 +632,22 @@ int main(int argc, char** argv) {
      * and in the engine both read RadModelMeta from the container header, so the value holds for
      * both. */
     for (const auto& kv : set_kv) meta.set(kv.first, kv.second);
+    if (const char* dt = meta.get("decision.type"); dt && !std::strcmp(dt, "clef") &&
+                                                     clef_metadata(in, config_dir, ck, meta) < 0)
+        return 1;
+    if (const char* dt = meta.get("decision.type");
+        (meta.arch == "laya" || (dt && !std::strcmp(dt, "laya"))) &&
+        laya_metadata(in, config_dir, meta, &tokjson) < 0)
+        return 1;
+    /* f16 to bf16 rounds, so it is a recipe's rule (spec §4.4). Every Laya checkpoint needs the same
+     * rules, so they follow any the caller gave, and the container records them with the rest. */
+    if (meta.arch == "laya") {
+        std::string why;
+        if (recipe.add_text(kLayaBf16, "laya's f16 to bf16 (built in)", &why) < 0) {
+            RAD_ERR("%s", why.c_str());
+            return 1;
+        }
+    }
     /* The quantisation descriptor (which selects the plugin pair) is derived from
      * quantization_config, so a --set of it re-derives the descriptor. E.g. a bf16 checkpoint
      * whose recipe writes Qwen's block fp8 targets qwen35_fp8 by setting what that release
@@ -421,6 +662,17 @@ int main(int argc, char** argv) {
     /* The --reuse container, read with pread, never through its mapping. */
     RadFile reuse;
     if (!reuse_path.empty() && reuse.open(reuse_path.c_str()) != RAD_OK) return 1;
+    /* Further --reuse containers supply only weights the first lacks or holds converted otherwise:
+     * a container assembled from several converts (a mixed-precision recipe). */
+    std::deque<RadFile> reuse_extra;
+    if (!reuse_more.empty() && in_place) {
+        std::fprintf(stderr, "rad-convert: --in-place extends one container; give --reuse once\n");
+        return 2;
+    }
+    for (const std::string& r : reuse_more) {
+        reuse_extra.emplace_back();
+        if (reuse_extra.back().open(r.c_str()) != RAD_OK) return 1;
+    }
     /* --changed lists the checkpoint tensors that differ from the --reuse container's source
      * (e.g. a partial fine-tune). --reuse matches on how a weight was converted, not on its
      * source bytes, so without the list it would copy the stale weights. */
@@ -500,6 +752,29 @@ int main(int argc, char** argv) {
         meta.finish();
     }
     Registry& reg = rad_tools_registry();
+    if (!gpus.empty()) {
+        /* Every quantiser plugin that runs on a card is handed the list (rad_quant.h,
+         * RadQuantDevicesFn); a plugin without the hook stays on the host. */
+        int taken = 0;
+        for (const Plugin& p : reg.plugins()) {
+            if (p.kind != RAD_PLUGIN_QUANT || !p.handle) continue;
+            const auto fn = (RadQuantDevicesFn)dlsym(p.handle, "rad_quant_devices");
+            if (!fn) continue;
+            const int st = fn(gpus.data(), (int)gpus.size());
+            if (st == RAD_E_UNSUPPORTED) continue;
+            if (st < 0) {
+                RAD_ERR("--gpus: quantiser plugin '%s' refuses the list: %s", p.name.c_str(),
+                        rad_strerror(st));
+                return 2;
+            }
+            ++taken;
+        }
+        if (!taken) {
+            RAD_ERR("--gpus: no quantiser plugin loaded here has a device path (a build without "
+                    "ROCm has none)");
+            return 2;
+        }
+    }
     std::deque<CompiledRule> compiled;
     std::map<const RecipeRule*, const CompiledRule*> by_rule;
     std::map<const RecipeRule*, ImportForm> import_forms;
@@ -845,8 +1120,8 @@ int main(int argc, char** argv) {
      *
      * Small weights run one per thread, in plan order (roughly file order); nested parallelism is
      * off, so a quantiser's OpenMP region stays on its calling thread. Large weights (n-gram
-     * table, lm_head, attention linears) run afterwards one at a time, with decode, quantise and
-     * error each parallel over rows. */
+     * table, lm_head, attention linears) run afterwards one at a time (two with --gpus), with
+     * decode, quantise and error each parallel over rows. */
 #ifdef _OPENMP
     omp_set_max_active_levels(1);
 #endif
@@ -856,7 +1131,8 @@ int main(int argc, char** argv) {
     struct Job {
         Logical*            L = nullptr;
         int64_t             idx = -1;
-        const RadFileEntry* re = nullptr;   /* copied from the --reuse container */
+        const RadFileEntry* re = nullptr;   /* copied from a --reuse container */
+        RadFile*            rf = nullptr;   /* that container */
         int64_t             bytes = 0;      /* its planes */
     };
     std::vector<Job> jobs;
@@ -920,9 +1196,23 @@ int main(int argc, char** argv) {
             }
             if (!same) re = nullptr;
         }
+        RadFile* rf = re ? &reuse : nullptr;
+        for (size_t x = 0; !re && !reads_changed && x < reuse_extra.size(); ++x) {
+            RadFile& R = reuse_extra[x];
+            const RadFileEntry* e = R.find(ww.name);
+            if (!e) continue;
+            const bool expert = ww.expert >= 0 || e->expert >= 0;
+            bool same = rad_enc_equal(&R.encoding(*e), &ww.enc) && ww.quantizer == R.str(e->quantizer) &&
+                        ww.options == R.str(e->options) && e->rank == ww.rank &&
+                        (!expert || (e->layer == ww.layer && e->expert == ww.expert &&
+                                     e->slot == ww.slot));
+            for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
+                if (e->shape[i] != ww.shape[i]) same = false;
+            if (same) { re = e; rf = &R; }
+        }
         const int64_t idx = w.add_weight(ww);
         if (idx < 0) { w.abort(); return 1; }
-        jobs.push_back(Job{ Lp, idx, re, plane_total });
+        jobs.push_back(Job{ Lp, idx, re, rf, plane_total });
     }
     /* A --changed name no weight reads is a typo or an unconverted tensor; refuse it. */
     if (!changed.empty()) {
@@ -1052,15 +1342,15 @@ int main(int argc, char** argv) {
 
         if (j.re) {
             for (int k = 0; k < L.enc.n_planes; ++k) {
-                const RadFilePlane& fp = reuse.plane(*j.re, k);
+                const RadFilePlane& fp = j.rf->plane(*j.re, k);
                 for (int64_t off = 0; off < (int64_t)fp.bytes; off += kChunk) {
                     const int64_t n = std::min<int64_t>(kChunk, (int64_t)fp.bytes - off);
                     stage.resize((size_t)n);
-                    if (reuse.read_at(stage.data(), n, (int64_t)fp.offset + off) != RAD_OK ||
+                    if (j.rf->read_at(stage.data(), n, (int64_t)fp.offset + off) != RAD_OK ||
                         w.write_plane(idx, k, off, stage.data(), n) != RAD_OK)
                         return RAD_E_IO;
                 }
-                reuse.drop_range((int64_t)fp.offset, (int64_t)fp.bytes);
+                j.rf->drop_range((int64_t)fp.offset, (int64_t)fp.bytes);
             }
             written += j.bytes;
             reused += j.bytes;
@@ -1212,9 +1502,27 @@ int main(int argc, char** argv) {
             failed.compare_exchange_strong(ok, st);
         }
     }
-    for (size_t i = 0; i < large.size() && failed.load() == RAD_OK; ++i) {
-        const int st = run_job(jobs[large[i]]);
-        if (st < 0) failed = st;
+    {
+        /* With the quantisers on cards (--gpus), large weights run two at a time, so one's host
+         * work (its rows read, its Hessian factored, its error measured) overlaps the other's on
+         * the card. Each runs on a thread of its own, whose OpenMP regions get a full team. */
+        std::atomic<size_t> next{0};
+        auto worker = [&] {
+            for (size_t i; failed.load() == RAD_OK && (i = next.fetch_add(1)) < large.size();) {
+                const int st = run_job(jobs[large[i]]);
+                if (st < 0) {
+                    int ok = RAD_OK;
+                    failed.compare_exchange_strong(ok, st);
+                }
+            }
+        };
+        if (gpus.empty()) {
+            worker();
+        } else {
+            std::thread side(worker);
+            worker();
+            side.join();
+        }
     }
     if (failed.load() != RAD_OK) { w.abort(); return 1; }
     RAD_INFO("weights  %zu written in %.0f s: %zu a thread each, %zu across every thread",

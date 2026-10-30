@@ -341,6 +341,9 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
 
     int files = 0, rules = 0;
     std::error_code ec;
+    /* Codebook files (vq=) are named from the repository's root, where rad-convert runs them. */
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+    std::filesystem::current_path(dir + "/../..", ec);
     for (const auto& ent : std::filesystem::directory_iterator(dir, ec)) {
         if (ent.path().extension() != ".recipe") continue;
         ++files;
@@ -386,6 +389,7 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
     std::fprintf(stderr, "    %d recipe(s), %d rule(s)\n", files, rules);
     CHECK(files >= 20);
     CHECK(rules >= 250);
+    std::filesystem::current_path(cwd, ec);
     if (old) setenv("CALIB", saved.c_str(), 1); else unsetenv("CALIB");
 }
 
@@ -871,6 +875,87 @@ TEST(a_codebook_indexes_its_table_and_the_scale_multiplies_it) {
             }
         CHECK_EQ(bad, 0);
     }
+}
+
+/* A trellis grid (tcq=L): each column's codes are the bits a 2^L-state bitshift trellis shifts in,
+ * row by row, and a value is its state's table entry times the block's scale. Its own scheme,
+ * decoded by libquant's hook: the decode is the values the Viterbi search chose, and at the same
+ * two bits a weight it is nearer the weight than the scalar grid. */
+TEST(a_trellis_grid_decodes_through_its_states_and_beats_the_scalar_grid) {
+    NEED_LIBQUANT();
+    const int64_t R = 512, C = 256;
+    const std::vector<float> w = draw(R * C, 21, 8.0f);
+    Opts t, s;
+    t.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("group", 128).s("scale", "bf16")
+        .s("transform", "fwht128");
+    s.s("codes", "i2").i("group", 128).s("scale", "bf16").s("transform", "fwht128")
+        .s("rule", "search");
+    Quantised q = quantise(quantizer("gptq"), t, "x", R, C, w);
+    Quantised r = quantise(quantizer("gptq"), s, "x", R, C, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    REQUIRE_EQ(r.status, RAD_OK);
+    CHECK_EQ(std::string(q.enc.scheme), std::string("trellis"));
+    const RadEncPlane* tp = rad_enc_plane(&q.enc, "trellis");
+    REQUIRE(tp != nullptr);
+    CHECK_EQ(tp->extent[0], (int64_t)1024);
+    CHECK_EQ(tp->block[0], (int64_t)256);
+    const std::vector<float> d = decode(q, R, C), dr = decode(r, R, C);
+    REQUIRE(!d.empty());
+    REQUIRE(!dr.empty());
+    const double et = rel_err(w, d), es = rel_err(w, dr);
+    std::fprintf(stderr, "    two bits: trellis %.4f, scalar %.4f\n", et, es);
+    CHECK(et < es * 0.9);
+
+    /* Its scale in two levels, E4M3 a block under one f32 for the tensor: the decode reads a block
+     * at the bf16 of their product, which the codes were chosen against, and the error barely
+     * moves for a byte a block less. */
+    Opts t2;
+    t2.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("group", 128).s("scale", "fp8_e4m3")
+        .s("scale2", "f32").s("block2", "*x*").s("transform", "fwht128");
+    Quantised q2 = quantise(quantizer("gptq"), t2, "x", R, C, w);
+    REQUIRE_EQ(q2.status, RAD_OK);
+    CHECK_EQ(q2.enc.n_planes, 4);
+    CHECK(rad_enc_plane(&q2.enc, "scale.1") != nullptr);
+    const std::vector<float> d2 = decode(q2, R, C);
+    REQUIRE(!d2.empty());
+    const double e2 = rel_err(w, d2);
+    std::fprintf(stderr, "    two bits, E4M3 under f32: trellis %.4f\n", e2);
+    CHECK(e2 < et * 1.02);
+
+    /* Its values on the grid an int8 GEMM reads with one scale per 8 rows (tcq_rb=8): the table
+     * plane carries the rows, the decode rounds each row onto its block's largest scale as the
+     * search did, and the error stays the trellis's. */
+    Opts t3;
+    t3.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("tcq_rb", 8).i("group", 128)
+        .s("scale", "fp8_e4m3").s("scale2", "f32").s("block2", "*x*").s("transform", "fwht128");
+    Quantised q3 = quantise(quantizer("gptq"), t3, "x", R, C, w);
+    REQUIRE_EQ(q3.status, RAD_OK);
+    const RadEncPlane* tp3 = rad_enc_plane(&q3.enc, "trellis");
+    REQUIRE(tp3 != nullptr);
+    CHECK_EQ(tp3->block[1], (int64_t)8);
+    CHECK_EQ(tp->block[1], (int64_t)1);
+    const std::vector<float> d3 = decode(q3, R, C);
+    REQUIRE(!d3.empty());
+    const double e3 = rel_err(w, d3);
+    std::fprintf(stderr, "    two bits, one int8 scale per 8 rows: trellis %.4f\n", e3);
+    CHECK(e3 < e2 * 1.02);
+    /* tcq_rb must divide the run */
+    Opts t4;
+    t4.s("codes", "u2").i("tcq", 10).i("tcq_rows", 256).i("tcq_rb", 24).i("group", 128)
+        .s("scale", "bf16").s("transform", "fwht128");
+    CHECK_EQ(quantise(quantizer("gptq"), t4, "x", R, C, w).status, RAD_E_INVAL);
+
+    /* Coordinate descent over a trellis searches whole columns again against the Hessian's
+     * metric; with no calibration there is none, and GPTQ's codes stand. */
+    Opts c = t;
+    c.i("cd", 1);
+    const Quantised qc = quantise(quantizer("gptq"), c, "x", R, C, w);
+    REQUIRE_EQ(qc.status, RAD_OK);
+    CHECK(decode(qc, R, C) == d);
+    /* A trellis's codes are unsigned bits, fewer than its state's. */
+    Opts i;
+    i.s("codes", "i2").i("tcq", 10).i("group", 128).s("scale", "bf16").s("transform", "fwht128");
+    CHECK_EQ(quantise(quantizer("gptq"), i, "x", R, C, w).status, RAD_E_INVAL);
 }
 
 TEST(nvfp4_is_two_scale_levels_the_second_a_tensor) {

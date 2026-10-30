@@ -26,6 +26,7 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 #include "ref_planes.h"
+#include "rad_abi_layout.h"
 
 /* ================================================================== parameter specs */
 #define P_INT(k)   { k, RAD_P_INT, RAD_REQUIRED }
@@ -194,6 +195,8 @@ static const RadParamSpec pActMul[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_
 /* `M` is the step's token count and bands the op; the segment count is cu_seqlens' length. */
 static const RadParamSpec pSegMean[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pSegPool[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 /* `M` is the input row count, a multiple of `k`; y has M / k rows. */
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
@@ -243,6 +246,8 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype") };
+/* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
+static const RadParamSpec pGram[]  = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"), P_INTO("upper") };
 /* `asum`, quant_act_i8's optional third output: group-major per-row code sums an asymmetric
  * weight grid subtracts to remove the stored zero point. */
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
@@ -324,10 +329,11 @@ static const RadParamSpec pGemmBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
-/* `split_n` is libr4d's (docs/OPS.md): ref never splits K, so it accepts and ignores it. */
+/* `split_n` and `w_rb` are libr4d's (docs/OPS.md): ref never splits K and reads the per-row
+ * scale plane as it is, so it accepts and ignores both. */
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                        P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
-                                       P_INTO("split_n") };
+                                       P_INTO("split_n"), P_INTO("w_rb") };
 /* The bias form has no parts (`pb1`/`pb2`); only the plain product supports them. */
 static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                            P_STR("dtype") };
@@ -1184,6 +1190,10 @@ static const RadOpSchema kSchemas[] = {
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
   "y[s] = mean of x's rows [cu[s], cu[s+1]): one row a segment, summed in double and rounded "
   "once to y's dtype. An empty segment is a zero row." },
+{ "seg_softmax_pool", ARR(pSegPool), ARR(oSegPool),
+  "y[s] = v's rows [cu[s], cu[s+1]) summed with the softmax of their scores (one a row, f32, the "
+  "maximum subtracted) as weights, in f32 and rounded once to y's dtype. An empty segment is a "
+  "zero row." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then "
   "times `mult` (default 1) and rounded again. M, the input rows, is a multiple of k." },
@@ -1381,7 +1391,7 @@ static const RadOpSchema kSchemas[] = {
 /* The calibration op, the only one no forward pass issues: it runs under a calibration flag and
  * its output is read at convert time, in another process, through a file. `dtype` is the input's:
  * fp8a8 where the tap is a quantiser's output, bf16 without `a_scale` for a plain activation. */
-{ "gram_accum", ARR(pQuant), ARR(oGram),
+{ "gram_accum", ARR(pGram), ARR(oGram),
   "h[k1][k2] += sum over rows m of dequant(a)[m][k1] * dequant(a)[m][k2], in f32. The second "
   "moment of a layer's real input over a calibration corpus -- the Hessian a GPTQ packer needs. "
   "dequant(a) is a * a_scale for fp8a8 and `a` itself for bf16, which passes no a_scale. "
@@ -2048,6 +2058,16 @@ static const RadOpSchema kSchemas[] = {
   "bounds derived from a pass's device geometry." },
 { "sub_i32", ARR(pSubI32), ARR(oSubI32),
   "y[i] = x[i] - s[0], int32: a device length less a device offset." },
+/* Row forms libr4d declares under names of their own, so a model can ask for the form: the same op, the same
+ * arithmetic and the same schema as the op named in each string. */
+{ "rmsnorm_rows", ARR(pRmsnorm), ARR(oRmsnorm),
+  "rmsnorm, for rows a model declares in thousands (the head norms over head_dim)." },
+{ "rope_rows", ARR(pRope), ARR(oRope),
+  "rope, for a model that wants the per-(token, pair) angles form at prefill row counts." },
+{ "gemm_nt_q_short", ARR(pGemmQ), ARR(oGemmQ),
+  "gemm_nt_q, for the short-prompt split rule's rows." },
+{ "gemm_nt_q_gated_wide", ARR(pGemmQGated), ARR(oGemmQGated),
+  "gemm_nt_q_gated at any M." },
 };
 
 /* ================================================================== the kernel table */
@@ -2262,6 +2282,9 @@ SIMPLE("ref_seg_mean_bf16_sum", "seg_mean_bf16_sum", "elem", "BF16 sum/division 
        "bf16 in and out; f32 sum, BF16 sum and quotient", ref_seg_mean_bf16_sum),
 SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        ref_seg_mean),
+SIMPLE("ref_seg_softmax_pool", "seg_softmax_pool", "elem",
+       "each cu_seqlens segment's rows summed with the softmax of their scores", DT_FLOAT,
+       ref_seg_softmax_pool),
 SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, ref_pool_rows),
 SIMPLE("ref_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
@@ -2677,6 +2700,16 @@ SIMPLE("ref_int_affine", "int_affine", "elem", "integers derived from device geo
        ref_int_affine),
 SIMPLE("ref_sub_i32", "sub_i32", "elem", "a device int32 vector less a device scalar", DT_ANY,
        ref_sub_i32),
+/* The row-form names (see the schema table): each the base op's reference row. */
+SIMPLE("ref_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
+       ref_rmsnorm),
+SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope under its row-form name", DT_FLOAT, ref_rope),
+ROWL_GQ("ref_gemm_nt_q_short", "gemm_nt_q_short", "gemm", "gemm_nt_q under its row-form name",
+     "as ref_gemm_nt_q", ref_check_gemm_q, ref_gemm_nt_q_m2, ref_layout_gemm_q_m2,
+     ref_relayout_gemm_q_m2, ref_unrelayout_gemm_q_m2),
+SIMPLE("ref_gemm_nt_q_gated_wide", "gemm_nt_q_gated_wide", "gemm",
+       "gemm_nt_q_gated under its row-form name", "fp8_e4m3 operands, fp8_e4m3 out, f32 scale",
+       ref_gemm_nt_q_gated),
 };
 
 /* ================================================================== plugin exports */
@@ -2691,6 +2724,7 @@ static const RadPluginInfo kInfo = {
 };
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 /* Declares this plugin the reference through the ABI (RadPluginReferenceFn); the engine knows no
  * library by name. */

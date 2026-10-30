@@ -282,7 +282,7 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     for (const char* p : { "/health", "/v1/health", "/ping", "/", "/dashboard" })
         CHECK_EQ(ask(get(p)).status, 200);
     /* The page says what bounds it: a CSP that lets its own script talk only to this origin and
-     * keeps it out of a frame, and a type no browser may second-guess — the last on every
+     * keeps it out of a frame, and a type no browser may second-guess -- the last on every
      * response, refusals included. */
     const Reply page = ask(get("/"));
     CHECK(has(page.header("Content-Security-Policy"), "frame-ancestors 'none'"));

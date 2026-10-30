@@ -9,8 +9,8 @@
 //
 // E4M3 input: the taps are the MoE block's own quantiser outputs (`had_quant_act_fp8` for gate_up,
 // `gated_had_quant_fp8` for down), the bytes the expert GEMM actually contracts, and the only form
-// the rotated path stores. A bf16 instantiation reads the plain activation of a bf16-served model;
-// everything past the staging is shared.
+// the rotated path stores, contracted by a scalar kernel. A plain bf16 activation (a bf16-served
+// model's) goes through the matrix cores instead: see gram_accum_bf16_wmma.
 //
 // The gate_up tap is the unsorted activation. Every token is routed to exactly top_k experts, so
 // the expert GEMM's input distribution gives H_sorted = top_k * H_token, and GPTQ is invariant to a
@@ -26,6 +26,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_fp8_wmma.h"
+#include "r4d_gdn_wmma.h"
 
 namespace {
 
@@ -37,12 +38,13 @@ constexpr int kThreads = 256;
 constexpr int kMB      = 32;    // M rows staged a pass; 2 * 32 * 64 * 4 = 16 KiB of LDS
 constexpr int kTT      = 4;
 
-/* BF16 reads a plain bf16 activation with no scale: a staging slot is four elements in two dwords.
- * Everything after the staging is shared with the fp8 form. */
-template <bool BF16>
 __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
     const void* __restrict__ qv, const float* __restrict__ sc, float* __restrict__ h,
-    uint32_t M, uint32_t K, uint32_t q_ld, uint32_t s_ld, uint32_t h_ld, uint32_t grp) {
+    uint32_t M, uint32_t K, uint32_t q_ld, uint32_t s_ld, uint32_t h_ld, uint32_t grp,
+    uint32_t upper) {
+    // `upper`: only the tiles on or above the diagonal; H is symmetric, and a caller that reads
+    // only k2 >= k1 halves the work.
+    if (upper && blockIdx.y < blockIdx.x) return;
 
     __shared__ float sa[kMB][kTile];
     __shared__ float sb[kMB][kTile];
@@ -50,8 +52,8 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
     const uint32_t k1_0 = blockIdx.x * (uint32_t)kTile;
     const uint32_t k2_0 = blockIdx.y * (uint32_t)kTile;
     const uint32_t tx = threadIdx.x & 15u, ty = threadIdx.x >> 4;   // 16 x 16
-    // Both tiles sit inside one scale group each -- see kTile's note. bf16 has no groups.
-    const uint32_t g1 = BF16 ? 0u : k1_0 / grp, g2 = BF16 ? 0u : k2_0 / grp;
+    // Both tiles sit inside one scale group each -- see kTile's note.
+    const uint32_t g1 = k1_0 / grp, g2 = k2_0 / grp;
 
     float acc[kTT][kTT];
 #pragma unroll
@@ -72,33 +74,19 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
             if (m < M) {
                 const size_t qrow = (size_t)m * q_ld;
                 const uint32_t c1 = k1_0 + cq, c2 = k2_0 + cq;
-                if constexpr (BF16) {
-                    // K is a multiple of four, so a slot never runs past the row.
-                    if (c1 < K) {
-                        const uint2 w = *(const uint2*)((const uint16_t*)qv + qrow + c1);
-                        a0 = bf16_to_f32((uint16_t)w.x); a1 = bf16_to_f32((uint16_t)(w.x >> 16));
-                        a2 = bf16_to_f32((uint16_t)w.y); a3 = bf16_to_f32((uint16_t)(w.y >> 16));
-                    }
-                    if (c2 < K) {
-                        const uint2 w = *(const uint2*)((const uint16_t*)qv + qrow + c2);
-                        b0 = bf16_to_f32((uint16_t)w.x); b1 = bf16_to_f32((uint16_t)(w.x >> 16));
-                        b2 = bf16_to_f32((uint16_t)w.y); b3 = bf16_to_f32((uint16_t)(w.y >> 16));
-                    }
-                } else {
-                    if (c1 < K) {
-                        // The row is owned out to K rounded up to four bytes (quant_act_fp8's
-                        // contract), so a dword load at c1 < K stays inside the allocation.
-                        const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c1);
-                        const float s = sc[(size_t)m * s_ld + g1];
-                        const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
-                        a0 = lo.x * s; a1 = lo.y * s; a2 = hi.x * s; a3 = hi.y * s;
-                    }
-                    if (c2 < K) {
-                        const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c2);
-                        const float s = sc[(size_t)m * s_ld + g2];
-                        const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
-                        b0 = lo.x * s; b1 = lo.y * s; b2 = hi.x * s; b3 = hi.y * s;
-                    }
+                if (c1 < K) {
+                    // The row is owned out to K rounded up to four bytes (quant_act_fp8's
+                    // contract), so a dword load at c1 < K stays inside the allocation.
+                    const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c1);
+                    const float s = sc[(size_t)m * s_ld + g1];
+                    const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
+                    a0 = lo.x * s; a1 = lo.y * s; a2 = hi.x * s; a3 = hi.y * s;
+                }
+                if (c2 < K) {
+                    const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c2);
+                    const float s = sc[(size_t)m * s_ld + g2];
+                    const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
+                    b0 = lo.x * s; b1 = lo.y * s; b2 = hi.x * s; b3 = hi.y * s;
                 }
             }
             // Columns past K stage as zeros and contribute nothing; the store masks them anyway.
@@ -135,15 +123,101 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
     }
 }
 
+// The bf16 form on the matrix cores. One 256-thread block owns a 128x128 C tile; its eight waves
+// each own 32x64 of it (2x4 WMMA tiles of 16x16). The contraction runs over the M rows: a pass
+// stages 64 rows of both column strips into LDS row-major ([row][column], as they lie in global)
+// and each wave reads its fragments transposed (fragT), eight 16-bit reads a fragment. A transpose
+// at staging would cost the same reads as stores with an 8-way bank conflict. Products of bf16
+// are exact in f32 and WMMA accumulates in f32, so this matches the scalar form up to summation
+// order, and an entry and its mirror are the same products in the same order (symmetric to the
+// bit). `upper` keeps the scalar form's 64-tile rule, so both forms touch the same entries.
+constexpr int kWT  = 128;           // C tile
+constexpr int kWMB = 64;            // M rows staged a pass: four 16-deep WMMA steps
+constexpr int kWP  = kWT + 8;       // LDS pitch: the two half-waves' rows land 16 banks apart
+
+__device__ __forceinline__ v8bf gram_frag(const unsigned short* src, int base, int kbase, int lane) {
+    return fragT(src, kWP, base, kbase, lane);
+}
+
+__global__ __launch_bounds__(kThreads) void gram_accum_bf16_wmma(
+    const uint16_t* __restrict__ x, float* __restrict__ h, uint32_t M, uint32_t K, uint32_t x_ld,
+    uint32_t h_ld, uint32_t upper) {
+    if (upper && blockIdx.y < blockIdx.x) return;
+    __shared__ __attribute__((aligned(16))) unsigned short sa[kWMB * kWP];
+    __shared__ __attribute__((aligned(16))) unsigned short sb[kWMB * kWP];
+    const uint32_t k1_0 = blockIdx.x * (uint32_t)kWT, k2_0 = blockIdx.y * (uint32_t)kWT;
+    const bool diag = blockIdx.x == blockIdx.y;   // both strips are the same columns
+    const int lane = (int)(threadIdx.x & 31u), wave = (int)(threadIdx.x >> 5);
+    const int wr = (wave & 3) * 32, wc = (wave >> 2) * 64;
+
+    v8f acc[2][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.0f;
+
+    for (uint32_t m0 = 0; m0 < M; m0 += (uint32_t)kWMB) {
+        __syncthreads();
+        // 64 rows x 32 slots of four columns = 2048 a strip, eight per thread. K is a multiple
+        // of four, so a slot is wholly inside or wholly past the row.
+        for (uint32_t idx = threadIdx.x; idx < (uint32_t)(kWMB * kWT / 4); idx += (uint32_t)kThreads) {
+            const uint32_t mi = idx >> 5, c = (idx & 31u) * 4u;
+            const uint32_t m = m0 + mi;
+            uint2 wa = make_uint2(0u, 0u), wb = make_uint2(0u, 0u);
+            if (m < M) {
+                const uint16_t* row = x + (size_t)m * x_ld;
+                if (k1_0 + c < K) wa = *(const uint2*)(row + k1_0 + c);
+                if (!diag && k2_0 + c < K) wb = *(const uint2*)(row + k2_0 + c);
+            }
+            *(uint2*)(sa + mi * kWP + c) = wa;
+            if (!diag) *(uint2*)(sb + mi * kWP + c) = wb;
+        }
+        __syncthreads();
+        const unsigned short* B = diag ? sa : sb;
+        // Rows past M were staged as zeros, so a whole pass runs and adds nothing for them.
+#pragma unroll
+        for (int ks = 0; ks < kWMB / 16; ++ks) {
+            v8bf fa[2], fb[4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) fa[i] = gram_frag(sa, wr + i * 16, ks * 16, lane);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) fb[j] = gram_frag(B, wc + j * 16, ks * 16, lane);
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = mma(fa[i], fb[j], acc[i][j]);
+        }
+    }
+
+    // D: column n = lane % 16 of the B strip (k2), rows m = 8 * (lane / 16) + e of the A strip
+    // (k1). One block owns the tile, so the read-modify-write is race-free.
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t k2 = k2_0 + (uint32_t)(wc + j * 16 + (lane & 15));
+            if (k2 >= K) continue;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const uint32_t k1 = k1_0 + (uint32_t)(wr + i * 16 + 8 * (lane >> 4) + e);
+                if (k1 >= K || (upper && k2 / (uint32_t)kTile < k1 / (uint32_t)kTile)) continue;
+                h[(size_t)k1 * h_ld + k2] += acc[i][j][e];
+            }
+        }
+}
+
 }  // namespace
 
 extern "C" int r4d_gram_accum_fp8_tile(void) { return kTile; }
 
 //   q  [M][K]                E4M3, `q_ld` bytes a row (0 = K), owned out to a multiple of 4
 //   s  [M][ceil(K/grp)]      f32,  `s_ld` elements a row (0 = ceil(K/grp))
-//   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written
+//   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written; with `upper`
+//                            only the 64-wide tiles on or above the diagonal are added to
 extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
-                                  int q_ld, int s_ld, int h_ld, long stream) {
+                                  int q_ld, int s_ld, int h_ld, int upper, long stream) {
     if (!q || !s || !h) return -1;
     if (M <= 0 || K <= 0) return -2;
     if (K % 4) return -3;                       // a staging slot is one dword of four codes
@@ -153,26 +227,27 @@ extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
     if (!s_ld) s_ld = (K + grp - 1) / grp;
     if (!h_ld) h_ld = K;
     const uint32_t nt = (uint32_t)((K + kTile - 1) / kTile);
-    hipLaunchKernelGGL(gram_accum_kernel<false>, dim3(nt, nt), dim3(kThreads), 0,
+    hipLaunchKernelGGL(gram_accum_kernel, dim3(nt, nt), dim3(kThreads), 0,
                        (hipStream_t)stream, (const void*)q, (const float*)s, (float*)h,
                        (uint32_t)M, (uint32_t)K, (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)h_ld,
-                       (uint32_t)grp);
+                       (uint32_t)grp, (uint32_t)(upper != 0));
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
 //   a  [M][K]                bf16, `a_ld` elements a row (0 = K)
-//   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written
-extern "C" int r4d_gram_accum_bf16(long a, long h, int M, int K, int a_ld, int h_ld, long stream) {
+//   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written; `upper` as above
+extern "C" int r4d_gram_accum_bf16(long a, long h, int M, int K, int a_ld, int h_ld, int upper,
+                                   long stream) {
     if (!a || !h) return -1;
     if (M <= 0 || K <= 0) return -2;
     if (K % 4) return -3;                       // a staging slot is four elements of one row
     if (!a_ld) a_ld = K;
     if (a_ld % 4 || (a % 8)) return -6;         // ...loaded as two aligned dwords
     if (!h_ld) h_ld = K;
-    const uint32_t nt = (uint32_t)((K + kTile - 1) / kTile);
-    hipLaunchKernelGGL(gram_accum_kernel<true>, dim3(nt, nt), dim3(kThreads), 0,
-                       (hipStream_t)stream, (const void*)a, (const float*)nullptr, (float*)h,
-                       (uint32_t)M, (uint32_t)K, (uint32_t)a_ld, 0u, (uint32_t)h_ld, 1u);
+    const uint32_t nt = (uint32_t)((K + kWT - 1) / kWT);
+    hipLaunchKernelGGL(gram_accum_bf16_wmma, dim3(nt, nt), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)a, (float*)h, (uint32_t)M, (uint32_t)K, (uint32_t)a_ld,
+                       (uint32_t)h_ld, (uint32_t)(upper != 0));
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -200,7 +275,8 @@ extern "C" int r4d_rad_gram_accum(const RadArgs* a, RadStream s) {
     const long long qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc), hp = r4d_row_pitch(h);
     if (qp < 0 || sp < 0 || hp < 0) return R4D_NO(RAD_E_STRIDE);
     const int e = r4d_gram_accum_fp8(r4d_addr(q), r4d_addr(sc), r4d_addr(h), (int)M, (int)K,
-                                     (int)grp, (int)qp, (int)sp, (int)hp, (long)(uintptr_t)s);
+                                     (int)grp, (int)qp, (int)sp, (int)hp,
+                                     (int)r4d_geti_or(a, "upper", 0), (long)(uintptr_t)s);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -219,6 +295,6 @@ extern "C" int r4d_rad_gram_accum_bf16(const RadArgs* a, RadStream s) {
     const long long xp = r4d_row_pitch(x), hp = r4d_row_pitch(h);
     if (xp < 0 || hp < 0) return R4D_NO(RAD_E_STRIDE);
     const int e = r4d_gram_accum_bf16(r4d_addr(x), r4d_addr(h), (int)M, (int)K, (int)xp, (int)hp,
-                                      (long)(uintptr_t)s);
+                                      (int)r4d_geti_or(a, "upper", 0), (long)(uintptr_t)s);
     return e == 0 ? RAD_OK : R4D_NO(RAD_E_SHAPE);
 }

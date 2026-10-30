@@ -21,6 +21,25 @@
     { "table", RAD_P_STR, nullptr,                                                               \
       "a codebook the codes index: nf4, iq4nl, w4nl, w5nl, binary, ternary, or values "          \
       "separated by ;" },                                                                        \
+    { "vq", RAD_P_STR, nullptr,                                                                \
+      "a vector codebook file: one codeword a line, its integers (-127..127) separated by "     \
+      "spaces; one code a codeword's width of columns" },                                       \
+    { "tcq", RAD_P_INT, nullptr,                                                               \
+      "a trellis of 2^L states down each column over codes=uK, one code a row (gptq)" },         \
+    { "tcq_rows", RAD_P_INT, "256", "the rows one tail-biting trellis runs over" },             \
+    { "tcq_gain", RAD_P_F64, "1", "a trellis block's rms over the table's, its scale's divisor" }, \
+    { "tcq_peak", RAD_P_INT, "0",                                                              \
+      "1: a trellis block's scale never puts its largest value past the table's" },              \
+    { "tcq_rb", RAD_P_INT, "0",                                                                \
+      "R: a trellis's values on the int8 grid of one scale per R rows (the block's largest)" },  \
+    { "tcq_code", RAD_P_STR, nullptr,                                                          \
+      "mad: the states' values computed, bytesum((st*A+B) & 0x3F3F3F3F) - 126 (no tcq_lut=)" }, \
+    { "tcq_a", RAD_P_INT, "11872635", "tcq_code=mad's multiplier A (24 bits)" },               \
+    { "tcq_b", RAD_P_INT, "625341585", "tcq_code=mad's addend B" },                             \
+    { "tcq_colf", RAD_P_INT, "0",                                                              \
+      "1: one scale a row times a factor a 128-column block shared by all rows (block=1x*)" },   \
+    { "tcq_lut", RAD_P_STR, nullptr,                                                           \
+      "the trellis's 2^L state values, integers in -127..127 (default: normal quantiles)" },     \
     { "group", RAD_P_INT, nullptr, "one scale per this many columns of a row" },               \
     { "block", RAD_P_STR, "1x*", "the scale block RxC, * for a whole extent: 128x128, *x*" },    \
     { "scale", RAD_P_STR, "bf16",                                                              \
@@ -49,7 +68,7 @@ namespace lq {
 
 /* The grid a rule's options describe, checked against the weight; a message on stderr, with the
  * weight's name, when it is refused. */
-int grid_of(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g);
+int grid_of(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g, bool vq_ok = false);
 
 /* Rank-1 weights (norms, biases) are declined rather than quantised, so a recipe pattern need not
  * exclude every vector it happens to match. */

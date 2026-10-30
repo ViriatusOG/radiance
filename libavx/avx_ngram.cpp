@@ -39,6 +39,7 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -571,15 +572,17 @@ int ring_errno() {
     return e;
 }
 
-/* Reads `reads` through the ring in batches: rows with a slot are copied into the cache and
- * published READY; rows without one are decoded directly into their output rows. On a failed read,
- * every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
+/* Rows read from table files by this process, every thread together (avx_ngram_reads). */
+std::atomic<uint64_t> g_rows_read{0};
+
+/* Reads `reads[0, total)` through the ring in batches: rows with a slot are copied into the cache
+ * and published READY; rows without one are decoded directly into their output rows. On a failed
+ * read, every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
 int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
-                     const std::vector<SpanRead>& reads, long long n, long long ne,
+                     const SpanRead* reads, size_t total, long long n, long long ne,
                      avx::RowDecode decode, const uint16_t* lut, uint16_t* out, long long x_ld) {
     const long long A      = tf.align;
     const long long stride = ((n + A - 1) / A + 1) * A;
-    const size_t    total  = reads.size();
     for (size_t b = 0; b < total;) {
         const unsigned cnt = (unsigned)(total - b < rr.entries ? total - b : rr.entries);
         uint8_t* bounce = g.bounce_for((size_t)cnt * (size_t)stride, (size_t)A);
@@ -592,6 +595,7 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
             rc.published.notify_all();
             return rs;
         }
+        g_rows_read.fetch_add(cnt, std::memory_order_relaxed);
         g.bsrc.clear();
         g.bdst.clear();
         for (unsigned i = 0; i < cnt; ++i) {
@@ -621,6 +625,17 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
  * never cached); a row another thread is reading, or one with no slot, is read straight into its
  * output row. */
 constexpr long long kOnDemandMaxRows = 4096;
+
+/* Decode-sized gathers reading now. The reader thread starts no batch while any is (see the reader
+ * below); such a gather never waits on another thread's claim, so the pause cannot close a cycle. */
+std::atomic<int> g_urgent_reads{0};
+
+struct UrgentReads {
+    UrgentReads() { g_urgent_reads.fetch_add(1, std::memory_order_acq_rel); }
+    ~UrgentReads() {
+        if (g_urgent_reads.fetch_sub(1, std::memory_order_acq_rel) == 1) g_urgent_reads.notify_all();
+    }
+};
 
 int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
                     avx::RowDecode decode, const uint16_t* lut) {
@@ -657,8 +672,10 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1});
         }
     }
+    const UrgentReads urgent;
     if (!g.reads.empty()) {
-        const int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+        const int rs = read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne,
+                                        decode, lut, q.out, x_ld);
         if (rs != RAD_OK) return rs;
         /* The claimed rows were published into the cache, not decoded: decode them from it. */
         for (const SpanRead& r : g.reads) {
@@ -680,7 +697,8 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
     for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
-    return read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    return read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
+                            q.out, x_ld);
 }
 
 /* out[m] = decoded row ids[m] - voff for every m < M, through the cache: find or claim each row
@@ -725,7 +743,8 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         else if (f == RowCache::THEIRS) g.waits.push_back(m);
     }
 
-    int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    int rs = read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
+                              q.out, x_ld);
     if (rs != RAD_OK) return rs;
 
     /* Wait for rows other threads claimed to turn READY. `published` is read before the words, so
@@ -774,7 +793,8 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
     for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
-    return read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    return read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
+                            q.out, x_ld);
 }
 
 /* ============================== the reader that runs a step ahead ==============================
@@ -790,26 +810,74 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
  * list order. A claim is a promise a gather may wait on, so jobs stay small: a gather that outruns
  * the reader finds unclaimed rows and reads them itself.
  *
- * Both ranks hand over the same ids; a repeated list is dropped. A failed read releases its claims
- * and the next call reads those rows itself. The reader is detached and never destroyed. */
-struct AheadJob {
-    const TableFile*      tf = nullptr;
-    RowCache*             rc = nullptr;
-    long long             n  = 0;
-    std::vector<uint64_t> keys;
-    bool                  retry = false;   /* the keys a full set refused once already */
-};
+ * Each id is handed over once, and only as far ahead as the cache can hold it. A call hands over
+ * at most kAheadRows ids, a quarter of the cache, so a row read ahead is still there when its chunk
+ * gathers it. Each step's list is the previous one moved on by the chunk just gathered, so only the
+ * ids past the end of the previous list are new; both ranks hand over the same list, and a repeated
+ * list adds nothing. A list that does not continue the previous one (another request's prompt)
+ * drops the jobs still queued for the previous one.
+ *
+ * The reader reads in batches of kReaderBatch rows and starts none while a decode-sized gather is
+ * reading (g_urgent_reads), so a decode step's few reads do not queue in the drive behind a
+ * prefetch's thousands. A failed read releases its claims and the next call reads those rows
+ * itself. The reader is detached and never destroyed. */
+
+/* Ids of the following prompt a call hands over, at most: a quarter of the cache. */
+constexpr long long kAheadRows = (long long)(RowCache::kRows / 4);
 
 /* Keys per reader job, about two ring batches: a job's claims are promises a consuming gather may
  * wait on, so it stays short. */
 constexpr size_t kJobRows = 8192;
 
+/* Reads the reader has in the drive at once. A drive serves a batch in arrival order, so this is
+ * the most a decode step's reads can find ahead of them; 128 still keeps an NVMe queue busy. */
+constexpr size_t kReaderBatch = 128;
+
+/* Tries at matching a list against the previous one (read_ahead) before it counts as new. */
+constexpr int kShiftTries = 64;
+
+/* One table's following ids as last handed over: the table's cache and offset in the file, and
+ * the list, clamped to kAheadRows. */
+struct AheadStream {
+    const RowCache*      rc   = nullptr;
+    long long            base = 0;
+    std::vector<int32_t> ids;
+};
+
+struct AheadJob {
+    const TableFile*      tf = nullptr;
+    RowCache*             rc = nullptr;
+    long long             n  = 0;
+    std::vector<uint64_t> keys;
+    bool                  retry = false;            /* the keys a full set refused once already */
+    const AheadStream*    stream = nullptr;
+};
+
 struct AheadReader {
     std::mutex              mu;
     std::condition_variable cv;
+    std::condition_variable idle;     /* the queues are empty and no job runs */
     std::deque<AheadJob>    urgent;   /* keys a full set refused, tried once more first */
     std::deque<AheadJob>    q;        /* the read-ahead queue: future chunks, in order */
-    uint64_t                last = 0;     /* hash of the last id list accepted */
+    std::vector<std::unique_ptr<AheadStream>> streams;
+    bool                    running = false;
+
+    /* Called with `mu` held. */
+    AheadStream* stream(const RowCache* rc, long long base) {
+        for (const auto& st : streams)
+            if (st->rc == rc && st->base == base) return st.get();
+        streams.push_back(std::make_unique<AheadStream>());
+        streams.back()->rc = rc;
+        streams.back()->base = base;
+        return streams.back().get();
+    }
+
+    /* Drops the queued jobs of `st`. Called with `mu` held. */
+    void drop(const AheadStream* st) {
+        for (std::deque<AheadJob>* d : { &urgent, &q })
+            for (auto it = d->begin(); it != d->end();)
+                it = it->stream == st ? d->erase(it) : it + 1;
+    }
 
     void run() {
         Gather&        g  = gather_state();
@@ -819,9 +887,12 @@ struct AheadReader {
             AheadJob j;
             {
                 std::unique_lock<std::mutex> lk(mu);
+                running = false;
+                if (urgent.empty() && q.empty()) idle.notify_all();
                 cv.wait(lk, [&] { return !urgent.empty() || !q.empty(); });
                 if (!urgent.empty()) { j = std::move(urgent.front()); urgent.pop_front(); }
                 else                 { j = std::move(q.front());      q.pop_front(); }
+                running = true;
             }
             if (!rr || !me) continue;
             g.reads.clear();
@@ -837,12 +908,25 @@ struct AheadReader {
                     retry.push_back(j.keys[i]);
             }
             /* Every read has a slot, so nothing is decoded and there is no output. */
-            (void)read_and_publish(*j.tf, *j.rc, *rr, g, g.reads, j.n, 0, nullptr, nullptr,
-                                   nullptr, 0);
+            for (size_t b = 0; b < g.reads.size(); b += kReaderBatch) {
+                for (int u; (u = g_urgent_reads.load(std::memory_order_acquire)) > 0;)
+                    g_urgent_reads.wait(u, std::memory_order_acquire);
+                const size_t cnt = std::min(kReaderBatch, g.reads.size() - b);
+                if (read_and_publish(*j.tf, *j.rc, *rr, g, &g.reads[b], cnt, j.n, 0, nullptr,
+                                     nullptr, nullptr, 0) == RAD_OK)
+                    continue;
+                /* The failed batch released its own claims; the later batches' go too. */
+                for (size_t i = b + cnt; i < g.reads.size(); ++i)
+                    j.rc->word[g.reads[i].slot].store(RowCache::EMPTY, std::memory_order_release);
+                j.rc->published.fetch_add(1, std::memory_order_release);
+                j.rc->published.notify_all();
+                break;
+            }
             if (!retry.empty()) {
                 std::lock_guard<std::mutex> lk(mu);
                 AheadJob r;
                 r.tf = j.tf; r.rc = j.rc; r.n = j.n; r.keys = std::move(retry); r.retry = true;
+                r.stream = j.stream;
                 urgent.push_front(std::move(r));
                 cv.notify_one();
             }
@@ -850,49 +934,68 @@ struct AheadReader {
     }
 };
 
+/* The reader, started by the first call that hands it rows; null before. */
+std::atomic<AheadReader*> g_reader{nullptr};
+
 AheadReader* ahead_reader() {
     static AheadReader* const r = [] {
         AheadReader* a = new AheadReader();
         std::thread([a] { a->run(); }).detach();
+        g_reader.store(a, std::memory_order_release);
         return a;
     }();
     return r;
 }
 
-/* Hands the rows of `q.ahead` (gathered by later calls) to the reader as kJobRows-key jobs in list
- * order, so the nearest chunk's rows come first. */
+/* Hands the ids of `q.ahead` (gathered by later calls) that the previous list did not hold to the
+ * reader, as kJobRows-key jobs in list order, so the nearest chunk's rows come first. */
 void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
-    uint64_t h = 1469598103934665603ull ^ (uint64_t)(uintptr_t)&rc;
-    for (long long m = 0; m < q.n_ahead; ++m) { h ^= (uint32_t)q.ahead[m]; h *= 1099511628211ull; }
-    AheadReader* r = ahead_reader();
-    {
-        std::lock_guard<std::mutex> lk(r->mu);
-        if (h == r->last) return;
-        r->last = h;
-    }
     const long long base = tf.off + (long long)(q.tab - tf.lo);
+    const long long na   = q.n_ahead < kAheadRows ? q.n_ahead : kAheadRows;
+    const int32_t*  w    = q.ahead;
+    /* Keys before the lock; a padding id has none. */
+    constexpr uint64_t kPad = ~0ull;
+    std::vector<uint64_t> keys((size_t)na);
+    for (long long m = 0; m < na; ++m) {
+        const long long id = (long long)w[m] - q.voff;
+        keys[(size_t)m] = id < 0 || id >= q.n_vocab ? kPad : (uint64_t)(base + id * q.row_bytes);
+    }
+    AheadReader* r = ahead_reader();
+    std::lock_guard<std::mutex> lk(r->mu);
+    AheadStream* st = r->stream(&rc, base);
+    const std::vector<int32_t>& p = st->ids;
+    const long long np = (long long)p.size();
+    if (np == na && std::equal(w, w + na, p.data())) return;   /* the other rank's, or a repeat */
+    /* The list continues the previous one moved on by `s` ids if w[0, np - s) == p[s, np); the
+     * smallest such s leaves the fewest ids to hand over. An id repeats only where the text does,
+     * so few shifts pass the first comparison; kShiftTries bounds a text that repeats a lot. */
+    long long from = -1;
+    for (long long s = 1, tries = 0; s < np && tries < kShiftTries; ++s) {
+        if (p[(size_t)s] != w[0]) continue;
+        ++tries;
+        const long long k = std::min(np - s, na);
+        if (std::equal(w, w + k, p.data() + s)) { from = k; break; }
+    }
+    if (from < 0) {
+        r->drop(st);
+        from = 0;
+    }
+    st->ids.assign(w, w + na);
     AheadJob j;
     j.tf = &tf;
     j.rc = &rc;
     j.n  = q.row_bytes;
+    j.stream = st;
     j.keys.reserve(kJobRows);
-    for (long long m = 0; m < q.n_ahead; ++m) {
-        const long long id = (long long)q.ahead[m] - q.voff;
-        if (id < 0 || id >= q.n_vocab) continue;
-        j.keys.push_back((uint64_t)(base + id * q.row_bytes));
+    for (long long m = from; m < na; ++m) {
+        if (keys[(size_t)m] == kPad) continue;
+        j.keys.push_back(keys[(size_t)m]);
         if (j.keys.size() == kJobRows) {
-            {
-                std::lock_guard<std::mutex> lk(r->mu);
-                r->q.push_back(j);
-            }
-            r->cv.notify_one();
+            r->q.push_back(j);
             j.keys.clear();
         }
     }
-    if (!j.keys.empty()) {
-        std::lock_guard<std::mutex> lk(r->mu);
-        r->q.push_back(std::move(j));
-    }
+    if (!j.keys.empty()) r->q.push_back(std::move(j));
     r->cv.notify_one();
 }
 
@@ -902,6 +1005,20 @@ inline const TableFile* table_file(const uint8_t*, long long, int*) { static Tab
 #endif
 
 }  // namespace
+
+/* Rows read from table files by this process, once the reader thread has nothing queued or
+ * running: rad-avx-check counts what a prefill reads with it (avx_check_rows.cpp). */
+extern "C" uint64_t avx_ngram_reads(void) {
+#if defined(__linux__)
+    if (AheadReader* r = g_reader.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lk(r->mu);
+        r->idle.wait(lk, [&] { return !r->running && r->q.empty() && r->urgent.empty(); });
+    }
+    return g_rows_read.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
 
 int avx::row_gather(const RowGather& q, RowDecode decode) {
     if (!decode || !q.ids || !q.tab || !q.out || q.M <= 0 || q.n_embd <= 0 || q.n_vocab <= 0 ||

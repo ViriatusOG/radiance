@@ -28,15 +28,15 @@
 // One block per (token, head) and one element per lane, required for bit-equality.
 //
 // Eight consecutive elements per lane with one wave per head (no LDS, rotary partner one shuffle
-// away) computes a different function. r4d_rmsnorm_bf16's width decides which columns a thread
+// away) computes a different function. r4d_rmsnorm_bf16's partition decides which columns a lane
 // folds into the sum of squares, and a last-bit difference in the norm becomes a few percent where
 // a rotated element's two products nearly cancel, enough to change the engine's text within a few
 // dozen steps.
 //
-// The reference's fold is easy to reproduce: `rmsnorm_bf16` runs
-// `for (i = threadIdx.x; i < n; i += THR)`, `r4d_act_threads` never returns fewer than 256 threads,
-// and every head_dim here is at most 256, so it always folds exactly one element per thread. Lanes
-// past the head add exact zeros, so `block_sum` over 8 or 32 wave partials gives the same number.
+// The reference's fold is easy to reproduce: `rmsnorm_bf16` folds a row over kR4dSumLanes' 256
+// lanes, lane v adding columns v, v+256, ... (r4d_common.h), and every head_dim here is at most
+// 256, so it always folds exactly one element per lane. Lanes past the head add exact zeros, so
+// `block_sum` over 8 or 32 wave partials gives the same number.
 // Hence one element a lane, 256 threads, `block_sum` in ascending wave order.
 //
 // Cost: at rot 64 the rotary partner is in another wave. The lane re-derives it instead of an LDS

@@ -26,6 +26,7 @@
 #include "build/startup.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
+#include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
 #include "sample/vocab_view.h"
@@ -40,6 +41,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -49,6 +51,7 @@ namespace rad {
 class Kld;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
+namespace server { class Sink; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -92,6 +95,9 @@ public:
      * serving cards' power-management files (hardware_facts). */
     std::string diagnostics_json() const;
     bool startup_report_printed() const { return report_printed_; }
+    /* --proceed-with-incompatible-configuration's banner (diag::unsupported_banner) on W lines;
+     * main prints it before anything else, so it heads the log. */
+    static void print_unsupported_banner();
 
     /* ---- the control vector's public surface (core/cvec.h).
      *
@@ -120,6 +126,9 @@ private:
     /* Per rank and KV group, that rank's stream view or null; the batch builder takes these, since it
      * cannot reach each rank's manager. */
     std::vector<std::vector<const RadKVStream*>> rank_stream_views_;
+    /* Per KV group, the ranges a staged pass of the next step copies (kvstream_step_runs), refilled
+     * in place each step. */
+    std::vector<std::vector<KVStageRun>> stage_runs_;
     /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
@@ -582,10 +591,20 @@ private:
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
      * block per rank, holding a step's tokens of that rank's logits columns. */
     int  run_kld();
+    int  run_docs(std::vector<std::unique_ptr<Request>>& reqs,
+                  std::vector<std::unique_ptr<server::Sink>>& sinks, bool fit_pool,
+                  const char* tag, int every_s,
+                  const std::function<void(size_t, double)>& progress, int* bad);
     int  score_rows(const RadBatch* b, const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */
+    /* --calib-corpus, replacing run_server: the corpus, loaded before declare so the plugin is told
+     * its token count (RadBuildCtx::calib_tokens), submitted as plain prefill requests. */
+    int  run_calib();
+    std::unique_ptr<Kld> calib_;
+    /* --kld-record beside --calib-dir: the KL corpus's tokens, which the plugins record over. */
+    long long calib_tokens_ = 0;
     /* The engine half of /server_info, as a JSON object. See the definition in engine.cpp. */
     std::string engine_info() const;
 
@@ -627,6 +646,10 @@ private:
     std::vector<DevId> dev_ids_;
     std::string        runtime_version_;
     void identify_devices(const std::vector<std::string>& names);
+    /* The machine settings startup refuses (diag::incompatible) for the cards the ranks take, asked
+     * before anything loads: RAD_E_UNSUPPORTED with each one and its fix on an E line, or under
+     * --proceed-with-incompatible-configuration each on a W line and the start goes on. */
+    int check_configuration(const std::vector<int>& devs);
     /* Syscall-only facts (diag::probe_process), read once at the first report: the memlock limit
      * cannot change under a running process, and the io_uring probe need not repeat per
      * /diagnostics request. */

@@ -1448,11 +1448,13 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
             const WeightSlot* slot = m.residency()->lookup(w);
             CHECK(slot && slot->ptr);
         }
-    /* Three layers per pass, each at least two reads (the resident expert between the file-tier
-     * ones is skipped, not read), and every unit read once. */
+    /* Three layers per pass, every unit read once, and each contiguous run of a window one read:
+     * a layer's 40 MiB takes two 32 MiB windows, the first holding expert 1 and the start of
+     * expert 3 (two runs, the resident expert 2 between them skipped, not read), the second the
+     * rest of expert 3. */
     CHECK_EQ(m.stats().ssd_layers, (uint64_t)(2 * L));
     CHECK_EQ(m.stats().ssd_units, (uint64_t)(2 * L * 2));
-    CHECK(m.stats().ssd_preads >= (uint64_t)(2 * L * 2));
+    CHECK_EQ(m.stats().ssd_preads, (uint64_t)(2 * L * 3));
     rad_stream_sync(m.transfer_stream());
     rad_stream_destroy(s);
     std::remove(path.c_str());

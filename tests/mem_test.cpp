@@ -290,6 +290,35 @@ TEST(a_device_with_no_capacity_sizes_its_pools_from_the_program) {
     CHECK_EQ(c2.vram_weights_mib, (int64_t)5);
 }
 
+TEST(a_unified_device_charges_its_host_pool_to_the_same_ledger) {
+    /* Unified memory: the pinned host pool is the same RAM as the card, so it comes off
+     * claimable before the split. The same facts without the flag charge nothing. */
+    auto facts = [] {
+        VramFacts f{};
+        f.capacity   = 16LL << 30;
+        f.free       = f.capacity;
+        f.arena      = 64LL << 20;
+        f.kv_ceiling = 300LL << 20;
+        return f;
+    };
+    Config c1 = small_config();
+    VramBudget b1;
+    CHECK_OK(vram_budget_resolve(c1, { facts() }, &b1));
+    CHECK(!b1.unified);
+    CHECK_EQ(b1.host_pinned, (int64_t)0);
+
+    VramFacts f = facts();
+    f.unified     = true;
+    f.host_pinned = 2LL << 30;
+    Config c2 = small_config();
+    VramBudget b2;
+    CHECK_OK(vram_budget_resolve(c2, { f }, &b2));
+    CHECK(b2.unified);
+    CHECK_EQ(b2.host_pinned, 2LL << 30);
+    CHECK_EQ(b1.claimable - b2.claimable, 2LL << 30);
+    CHECK(b2.report.find("unified memory") != std::string::npos);
+}
+
 TEST(a_program_that_copies_no_weight_still_gets_a_weights_pool) {
     /* With every op on the host (CPU-only serving), weights are read from the container mapping
      * and nothing is copied to the weights pool. The pool must still exist, since the pools refuse
@@ -426,6 +455,36 @@ TEST(the_cache_keeps_one_full_length_sequence_even_against_the_expert_floor) {
     CHECK_OK(vram_budget_resolve(c2, { g }, &b2));
     CHECK_EQ(b2.kv, g.kv_ceiling);
     CHECK_EQ(b2.experts, b2.elastic - g.kv_ceiling);
+}
+
+/* A dense model whose weights nearly fill the card: the statics are a floor, so all_vram leaves
+ * the cache short of one full-length sequence, and an explicit layer_offload instead takes static
+ * weight off the card (the planner spills those layers) until that sequence fits. */
+TEST(an_explicit_layer_offload_takes_statics_off_the_card_for_one_sequence) {
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 4LL << 30;
+    f.statics    = 24LL << 30;
+    f.kv_ceiling = 64LL << 30;
+    f.kv_one     = 8LL << 30;
+    for (const char* pl : { "all_vram", "layer_offload" }) {
+        Config c = small_config();
+        c.vram_weights_mib = 0;
+        c.vram_kv_mib      = 0;
+        c.gpu_headroom_mib = 96;
+        c.placement = pl;
+        VramBudget b;
+        CHECK_OK(vram_budget_resolve(c, { f }, &b));
+        if (!std::strcmp(pl, "all_vram")) {
+            CHECK_EQ(b.statics, f.statics);
+            CHECK(b.kv < f.kv_one);
+        } else {
+            CHECK_EQ(b.statics, b.claimable - f.kv_one);
+            CHECK_EQ(b.kv, f.kv_one);
+            CHECK_EQ(b.weights, b.statics);
+        }
+    }
 }
 
 /* With a lending cache at its floor, the prefill staging region is paid by expert residency
@@ -7278,7 +7337,10 @@ TEST(the_vram_budget_never_grants_more_than_the_card) {
             if (!untouched) bad("the trial wrote the configuration");
             if (rc != RAD_OK) {
                 ++refused;
-                if (rc != RAD_E_NOMEM || b.claimable >= 0 || !has(b.report, "short by"))
+                /* Short of the fixed costs, or the weights leave the cache nothing. */
+                const bool short_by = b.claimable < 0 && has(b.report, "short by");
+                const bool no_cache = has(b.report, "The KV cache gets nothing");
+                if (rc != RAD_E_NOMEM || !(short_by || no_cache))
                     bad("a refusal without its shortfall");
                 continue;
             }

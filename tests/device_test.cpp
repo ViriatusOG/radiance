@@ -1216,6 +1216,53 @@ TEST(nothing_behind_a_closed_gate_runs_until_it_opens) {
     CHECK_EQ(std::memcmp(dst, src, 4096), 0);
 }
 
+/* A ride a prefetch DMA list polls stays out of the signal pool until the engine has read it,
+ * however early the caller returns it. The pool reuses a signal at 0 that no queue packet names,
+ * and a DMA poll is none: a mark handed out again and set to 1 before the engine polls it would
+ * hold the list until the next use completes, which can sit behind a wait for this very list. The
+ * engine is held on an earlier list whose mark completes only once a gate opens, so the list
+ * under test has not polled its mark when the mark's dispatch has run and it is returned. */
+TEST(a_dma_lists_mark_stays_out_of_the_pool_until_the_engine_has_read_it) {
+    if (rad::device_is_host()) SKIP("a card only");
+    if (!rad_xp_supported(0)) SKIP("no prefetch DMA queue on this card");
+    Stream held, st;
+    DevBuf<uint8_t> a(256, RAD_MEM_DEVICE), b(256, RAD_MEM_DEVICE);
+    DevBuf<uint32_t> word(64, RAD_MEM_HOST_PINNED);
+    REQUIRE(a && b && word);
+    *(volatile uint32_t*)word.p = 0;
+
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(held.s, &gate), RAD_OK);
+    void* first = nullptr;
+    REQUIRE_EQ(rad_ride(held.s, &first), RAD_OK);
+    CHECK_OK(rad_memset_async(a, 1, 256, held.s));
+    REQUIRE_EQ(rad_xp_list(0, first, 0, nullptr, nullptr, nullptr, nullptr, 0, RAD_XP_NO_YIELD),
+               RAD_OK);
+
+    void* mark = nullptr;
+    REQUIRE_EQ(rad_ride(st.s, &mark), RAD_OK);
+    CHECK_OK(rad_memset_async(b, 2, 256, st.s));
+    REQUIRE_EQ(rad_xp_list(0, mark, 0, nullptr, nullptr, nullptr, word, 7, RAD_XP_NO_YIELD),
+               RAD_OK);
+    CHECK_OK(rad_stream_sync(st.s));                 /* the mark is 0 now */
+    rad_ride_release(mark, nullptr, 0);
+    CHECK(!rad::aql::ride_reusable(mark));
+    CHECK_EQ(*(volatile uint32_t*)word.p, 0u);
+
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(held.s));
+    const auto t0 = std::chrono::steady_clock::now();
+    while (*(volatile uint32_t*)word.p != 7u &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+        std::this_thread::yield();
+    CHECK_EQ(*(volatile uint32_t*)word.p, 7u);
+    bool back = false;
+    while (!back && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(6))
+        back = rad::aql::ride_reusable(mark);
+    CHECK(back);
+    rad_ride_release(first, nullptr, 0);
+}
+
 /* A host wait on a stream at a closed gate could only end when the waiting thread opened it, so it
  * is refused with RAD_E_STATE instead of hanging, and works again once the gate is open. */
 TEST(a_host_wait_on_a_gated_stream_is_refused_not_a_deadlock) {

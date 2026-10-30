@@ -67,6 +67,15 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     }
     b.lends = true;
     for (const VramFacts& f : per_rank) b.lends = b.lends && f.lends;
+    /* One RAM ledger on a unified-memory device: the pinned host pools come off the same
+     * bytes as the device pools. Every rank must agree the device is unified for the
+     * charge to apply (the ranks share the host on one node). */
+    b.unified = !per_rank.empty();
+    for (const VramFacts& f : per_rank) {
+        b.unified = b.unified && f.unified;
+        if (f.unified) b.host_pinned = std::max(b.host_pinned, f.host_pinned);
+    }
+    if (!b.unified) b.host_pinned = 0;
     b.headroom = std::max<int64_t>(cfg.gpu_headroom_mib, 0) * kMiB;
     int64_t host_reserve = 0;
     for (const VramFacts& f : per_rank) host_reserve = std::max(host_reserve, f.host_reserve);
@@ -104,7 +113,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     /* What is left after the fixed terms. */
     b.drift = kDriverDrift;
     b.claimable = b.capacity - (b.already_held + b.drift + b.headroom + b.arena + b.staging +
-                                b.queues + b.prefetch);
+                                b.queues + b.prefetch + b.host_pinned);
 
     if (b.claimable < 0) {
         b.report = fmt(
@@ -139,6 +148,17 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                           "give, so every expert streams from host memory and the KV cache gets "
                           "nothing; use more cards or a smaller --max-num-batched-tokens",
                           humanb(b.statics).c_str(), humanb(b.claimable).c_str());
+    }
+    /* An explicit --placement layer_offload keeps one --max-model-len sequence's cache ahead of the
+     * static weights: the planner spills the layers that no longer fit to the pinned host pool and
+     * stages them in each pass (assign_layer_offload). Otherwise a dense model whose weights
+     * nearly fill the card could never hold one full-length sequence. */
+    if (cfg.placement == "layer_offload" && kv_one > 0 && b.claimable - b.statics < kv_one) {
+        const int64_t spilled = b.statics - std::max<int64_t>(b.claimable - kv_one, 0);
+        b.statics -= spilled;
+        if (log) RAD_INFO("layer_offload: %s of the static weights leave the card so one "
+                          "--max-model-len sequence's cache (%s) fits",
+                          humanb(spilled).c_str(), humanb(kv_one).c_str());
     }
     b.elastic = b.claimable - b.statics;
     if (b.elastic < 0) b.elastic = 0;
@@ -255,7 +275,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * which stays beside the headroom. */
     const int64_t granted   = cfg.vram_weights_mib * kMiB + cfg.vram_kv_mib * kMiB;
     const int64_t unclaimed = b.capacity - b.already_held - b.drift - b.arena - b.staging - b.queues -
-                              b.prefetch - b.stage - granted;
+                              b.prefetch - b.host_pinned - b.stage - granted;
     const double  ela       = b.elastic > 0 ? (double)b.elastic : 1.0;
     b.report = fmt(
         "VRAM budget, per card:\n"
@@ -336,6 +356,26 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         humanb(cfg.vram_weights_mib * kMiB).c_str(), "static + experts",
         humanb(cfg.vram_kv_mib * kMiB).c_str(), "the cache's share",
         humanb(unclaimed).c_str());
+    if (b.unified)
+        b.report += fmt("  unified memory: the pinned host pools (%s) are charged above, in "
+                        "\"claimable\", against this same ledger\n",
+                        humanb(b.host_pinned).c_str());
+
+    /* Resident weights that fill everything the card gives after the arena leave the cache
+     * nothing; with experts the planner streams them instead, so this is a model whose fixed
+     * weights alone fill the card. */
+    if (cfg.vram_kv_mib <= 0 && kv_one > 0) {
+        b.report += fmt(
+            "The KV cache gets nothing: the static weights take all %s the card can give after the "
+            "activation arena (%s) and the fixed costs. Keep fewer weights on the card (--placement "
+            "layer_offload, the towers in host memory), shrink the arena (--max-num-batched-tokens; "
+            "an image generator's --image-gen-max-pixels and --image-gen-max-refs), or use another "
+            "card.\n",
+            humanb(b.claimable).c_str(), humanb(b.arena).c_str());
+        if (log) RAD_ERR("%s", b.report.c_str());
+        if (out) *out = b;
+        return RAD_E_NOMEM;
+    }
 
     if (out) *out = b;
     return RAD_OK;

@@ -17,7 +17,8 @@ thread_local int g_last_layer = -1;
 struct PassStage {
     uint64_t layers = 0, bytes = 0;
     int64_t  tokens = 0, ctx = 0, live_row = 0;   /* live_row: the history one layer reads */
-    int64_t  bound_blocks = 0;                    /* the manager's bound the copy was clamped to */
+    int64_t  bound_blocks = 0;                    /* blocks a layer's copy covers, the gaps it joins included */
+    int64_t  runs = 0;                            /* ranges a layer's list carries */
     int      phase = -1;
 };
 thread_local PassStage g_pass;
@@ -35,11 +36,11 @@ void report_pass() {
     if (!g_pass.layers || !trace_stage()) return;
     const double live = (double)g_pass.live_row * (double)g_pass.layers;
     RAD_INFO("kv streaming: stage pass phase=%d tokens=%lld ctx=%lld: %llu layers, %.1f MiB moved, "
-             "%.1f MiB of live history (%.1fx), bound %lld blocks",
+             "%.1f MiB of live history (%.1fx), bound %lld blocks in %lld ranges",
              g_pass.phase, (long long)g_pass.tokens, (long long)g_pass.ctx,
              (unsigned long long)g_pass.layers, (double)g_pass.bytes / (1024.0 * 1024.0),
              live / (1024.0 * 1024.0), live > 0.0 ? (double)g_pass.bytes / live : 0.0,
-             (long long)g_pass.bound_blocks);
+             (long long)g_pass.bound_blocks, (long long)g_pass.runs);
 }
 }  /* namespace */
 
@@ -96,35 +97,97 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
             const int64_t live_blocks = (reach + b->kv[i].block_size - 1) / b->kv[i].block_size;
             const int64_t row = std::min(live_blocks * b->kv[i].stream->block_bytes, kb->stage.bytes);
             if (row > g_pass.live_row) g_pass.live_row = row;
-            if (kb->stage_live_bytes > 0) {
-                const int64_t bound = kb->stage_live_bytes / b->kv[i].stream->block_bytes;
-                if (bound > g_pass.bound_blocks) g_pass.bound_blocks = bound;
-            }
+            int64_t staged = 0;
+            for (const KVStageRun& r : kb->stage_runs) staged += r.bytes;
+            const int64_t bound = staged / b->kv[i].stream->block_bytes;
+            if (bound > g_pass.bound_blocks) g_pass.bound_blocks = bound;
+            if ((int64_t)kb->stage_runs.size() > g_pass.runs) g_pass.runs = (int64_t)kb->stage_runs.size();
         }
     }
 }
 
-/* The allocator's high-water mark in bytes of one layer (stage.h, "Volume"). */
-void kvstream_bound_live(Ctx* c, const KVManager& kv) {
-    if (!c) return;
+void kvstream_runs(const std::vector<const std::vector<int32_t>*>& tables, int64_t block_bytes,
+                   std::vector<KVStageRun>* out) {
+    out->clear();
+    if (block_bytes <= 0) return;
+    using Run = std::pair<int64_t, int64_t>;   /* [first, end) in blocks */
+    thread_local std::vector<Run> r, m, j;
+    thread_local std::vector<int64_t> gaps;
+    r.clear();
+    /* Runs of consecutive ids in table order: an allocator that hands out ascending ids makes a
+     * long table a few runs, so the sort below is over runs, not entries. */
+    for (const std::vector<int32_t>* t : tables) {
+        if (!t) continue;
+        for (const int32_t id : *t) {
+            if (id < 0) continue;
+            if (!r.empty() && r.back().second == id) ++r.back().second;
+            else r.emplace_back((int64_t)id, (int64_t)id + 1);
+        }
+    }
+    if (r.empty()) return;
+    std::sort(r.begin(), r.end());
+    m.clear();
+    for (const Run& x : r) {
+        if (!m.empty() && x.first <= m.back().second + kStageGapBlocks)
+            m.back().second = std::max(m.back().second, x.second);
+        else
+            m.push_back(x);
+    }
+    if ((int64_t)m.size() > kStageMaxRuns) {
+        /* Join across the smallest gaps: every gap up to the one that leaves kStageMaxRuns. */
+        gaps.clear();
+        for (size_t i = 1; i < m.size(); ++i) gaps.push_back(m[i].first - m[i - 1].second);
+        const size_t cut = m.size() - (size_t)kStageMaxRuns;   /* gaps to close, at least */
+        std::nth_element(gaps.begin(), gaps.begin() + (ptrdiff_t)(cut - 1), gaps.end());
+        const int64_t th = gaps[cut - 1];
+        j.clear();
+        for (const Run& x : m) {
+            if (!j.empty() && x.first - j.back().second <= th) j.back().second = x.second;
+            else j.push_back(x);
+        }
+        m.swap(j);
+    }
+    for (const Run& x : m)
+        out->push_back(KVStageRun{ x.first * block_bytes, (x.second - x.first) * block_bytes });
+}
+
+void kvstream_step_runs(const KVManager& kv, const RadBatch* b, const std::vector<uint64_t>* seqs,
+                        std::vector<std::vector<KVStageRun>>* runs) {
+    runs->resize((size_t)std::max(0, (int)kv.n_groups()));
+    const bool stages = b && kv_pass_view(b->phase, b->n_tok, b->n_seq, b->n_spec) == KVView::Stage;
+    thread_local std::vector<const std::vector<int32_t>*> tables;
     for (int g = 0; g < kv.n_groups(); ++g) {
-        KVPoolBinding* b = c->kv_binding(g);
-        if (!b || !b->has_stage) continue;
+        std::vector<KVStageRun>& out = (*runs)[(size_t)g];
+        out.clear();
         const RadKVStream* st = kv.stream_view(g);
         if (!st || st->block_bytes <= 0) continue;
-        const int64_t blocks = kv.held_top_blocks(g);
-        b->stage_live_bytes = blocks > 0 ? blocks * st->block_bytes : 0;
+        if (stages && seqs) {
+            tables.clear();
+            for (const uint64_t q : *seqs) tables.push_back(&kv.block_table(q, g));
+            kvstream_runs(tables, st->block_bytes, &out);
+            if (!out.empty()) continue;
+        }
+        const int64_t top = kv.held_top_blocks(g);
+        if (top > 0) out.push_back(KVStageRun{ 0, top * st->block_bytes });
+    }
+}
+
+void kvstream_bound_live(Ctx* c, const std::vector<std::vector<KVStageRun>>& runs) {
+    if (!c) return;
+    for (size_t g = 0; g < runs.size(); ++g) {
+        KVPoolBinding* b = c->kv_binding((int)g);
+        if (!b || !b->has_stage) continue;
+        b->stage_runs = runs[g];
     }
 }
 
 namespace {
 
-/* A staged layer's copy: from its mirror row (by group-local position, not model layer) to the
- * pool base, where both views start. */
+/* A staged layer's copy: ranges of its mirror row (by group-local position, not model layer) to
+ * the same offsets from the pool base, where both views start. */
 struct StageSrc {
-    void*          dst = nullptr;
-    const uint8_t* src = nullptr;
-    int64_t        bytes = 0;
+    std::vector<uint64_t> src, dst, len;
+    int64_t               bytes = 0;      /* the ranges' total */
 };
 
 bool stage_src(Ctx* ctx, int group, const RadKVGroupBatch* kvb, int layer, StageSrc* o) {
@@ -133,12 +196,24 @@ bool stage_src(Ctx* ctx, int group, const RadKVGroupBatch* kvb, int layer, Stage
     if (!b || !st) return false;
     const int64_t li = ctx->kv_layer_index(group, layer);
     if (!st->host || st->block_bytes <= 0 || st->host_layer_stride <= 0 || li < 0) return false;
-    o->dst = b->base;
-    o->src = st->host + li * st->host_layer_stride;
-    o->bytes = b->bytes;
-    /* Only up to the held bound (stage.h, "Volume"). */
-    if (b->stage_live_bytes > 0 && b->stage_live_bytes < o->bytes) o->bytes = b->stage_live_bytes;
-    if (o->bytes <= 0 || o->bytes > st->host_layer_stride) o->bytes = st->host_layer_stride;
+    const uint8_t* row = st->host + li * st->host_layer_stride;
+    /* The stage holds one layer, and the mirror row is one layer of the same layout. */
+    int64_t end = b->bytes;
+    if (end <= 0 || end > st->host_layer_stride) end = st->host_layer_stride;
+    o->src.clear(); o->dst.clear(); o->len.clear();
+    o->bytes = 0;
+    auto add = [&](int64_t off, int64_t n) {
+        if (off >= end) return;
+        n = std::min(n, end - off);
+        if (n <= 0) return;
+        o->src.push_back((uint64_t)(uintptr_t)(row + off));
+        o->dst.push_back((uint64_t)(uintptr_t)((uint8_t*)b->base + off));
+        o->len.push_back((uint64_t)n);
+        o->bytes += n;
+    };
+    /* Only the step's ranges (stage.h, "Volume"); none set copies the row. */
+    if (b->stage_runs.empty()) add(0, end);
+    for (const KVStageRun& r : b->stage_runs) add(r.off, r.bytes);
     return o->bytes > 0;
 }
 
@@ -157,6 +232,8 @@ struct StagePipe {
     int64_t  bytes = 0;        /* what that list was told to move, for the pass's counter */
 };
 thread_local StagePipe g_pipe;
+/* The layer's ranges, rebuilt for each list: rad_xp_list writes them into its ring at once. */
+thread_local StageSrc g_src;
 thread_local bool g_warned_ride = false;
 
 /* A list handed over by arm_and_submit() is normally waited for by the next kvstage_wait or
@@ -184,11 +261,10 @@ bool arm_and_submit(Ctx* c, int group, int layer, const StageSrc& s, void* mark)
     arm.dst[0] = (void**)(void*)word;
     arm.val[0] = (void*)(uintptr_t)1;
     if (wtab_patch(arm, c->stream()) < 0) return false;
-    const uint64_t src = (uint64_t)(uintptr_t)s.src, dst = (uint64_t)(uintptr_t)s.dst;
-    const uint64_t bytes = (uint64_t)s.bytes;
     /* No yield: the compute stream waits on this copy, so yielding the link to a hold whose release
      * is behind that wait would deadlock (docs/KV-STREAMING.md §6.1). */
-    if (rad_xp_list(c->device(), mark, 1, &src, &dst, &bytes, word, 0, RAD_XP_NO_YIELD) != RAD_OK)
+    if (rad_xp_list(c->device(), mark, (int)s.len.size(), s.src.data(), s.dst.data(), s.len.data(),
+                    word, 0, RAD_XP_NO_YIELD) != RAD_OK)
         return false;
     g_pipe.inflight = layer;
     g_pipe.group = group;
@@ -203,10 +279,16 @@ bool arm_and_submit(Ctx* c, int group, int layer, const StageSrc& s, void* mark)
 /* The copy on the compute stream: for a backend with no DMA queue, and when no ride is spare. */
 int serial_stage(Ctx* c, const StageSrc& s) {
     RadStream st = c->stream();
-    const int rc = (s.bytes & 15) == 0
-                       ? rad_memcpy_ranges_async(s.dst, s.src, s.bytes, nullptr, 0, st)
-                       : rad_memcpy_async(s.dst, s.src, s.bytes, st);
-    return rc;
+    for (size_t i = 0; i < s.len.size(); ++i) {
+        void* d = (void*)(uintptr_t)s.dst[i];
+        const void* f = (const void*)(uintptr_t)s.src[i];
+        const int64_t n = (int64_t)s.len[i];
+        const int rc = ((n | (int64_t)s.dst[i] | (int64_t)s.src[i]) & 15) == 0
+                           ? rad_memcpy_ranges_async(d, f, n, nullptr, 0, st)
+                           : rad_memcpy_async(d, f, n, st);
+        if (rc < 0) return rc;
+    }
+    return 0;
 }
 
 void count_stage(Ctx* c, int layer, int64_t bytes) {
@@ -285,7 +367,7 @@ int kvstage_run(Ctx* c, int group, int layer, bool after) {
             count_stage(c, layer, moved);
             return 1;
         }
-        StageSrc s;
+        StageSrc& s = g_src;
         if (!stage_src(c, group, kvb, layer, &s)) {
             rad_step_fail(c, "kv streaming: a layer needs its prefill stage but the group has no host "
                              "mirror row for it, so the attention would read an unstaged layer");
@@ -326,7 +408,7 @@ int kvstage_run(Ctx* c, int group, int layer, bool after) {
     if (next < 0 || !dma_stage(c)) return 0;
     if (!g_pipe.done && rad_event_create_local(&g_pipe.done) < 0) g_pipe.done = nullptr;
     if (!g_pipe.done) return 0;
-    StageSrc s;
+    StageSrc& s = g_src;
     if (!stage_src(c, group, kvb, next, &s)) return 0;
     /* No spare ride: the next layer's wait copies it on the compute stream. */
     void* mark = nullptr;

@@ -1,0 +1,242 @@
+{
+ "weights_fnv": "e1a5d79faebbea22",
+ "laya_commit": "fe9a6c3502",
+ "requests": [
+  {
+   "state": "Charged twice for one order; refund one please.",
+   "questions": {
+    "refund": {
+     "type": "noul",
+     "instructions": "Does the customer ask for money back?"
+    },
+    "team": {
+     "type": "choice",
+     "instructions": "Which team should take this?",
+     "criteria": {
+      "billing": "Charges and refunds",
+      "shipping": "Delivery",
+      "product": ""
+     }
+    },
+    "tone": {
+     "type": "score",
+     "instructions": "How upset is the customer?",
+     "criteria": [
+      "Calm",
+      "Mildly annoyed",
+      "Angry"
+     ]
+    }
+   }
+  },
+  {
+   "state": {
+    "message": "The parcel arrived two weeks late and the box was crushed, but the vase inside was intact. I would like a partial refund for the delay, and please tell the courier.",
+    "channel": "email"
+   },
+   "questions": {
+    "topic": {
+     "type": "choice",
+     "instructions": "Topic?",
+     "criteria": [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "j",
+      "k",
+      "l"
+     ]
+    },
+    "spam": {
+     "type": "noul",
+     "instructions": {
+      "ask": "Is this unsolicited?"
+     },
+     "criteria": {
+      "true": "unsolicited bulk mail"
+     }
+    },
+    "team": {
+     "type": "choice",
+     "instructions": "Route it.",
+     "criteria": [
+      "billing",
+      "technical",
+      "sales",
+      "other"
+     ]
+    }
+   }
+  },
+  {
+   "state": [
+    {
+     "role": "user",
+     "content": "The parcel arrived two weeks late and the box was crushed, but the vase inside was intact. I would like a partial refund for the delay, and please tell the courier."
+    },
+    {
+     "role": "agent",
+     "content": "Sorry, checking."
+    },
+    {
+     "role": "user",
+     "content": "Any news on the refund?"
+    }
+   ],
+   "questions": {
+    "waiting": {
+     "type": "noul",
+     "instructions": "Is the customer still waiting?"
+    }
+   }
+  }
+ ],
+ "results": [
+  {
+   "answers": {
+    "refund": {
+     "type": "noul",
+     "noul": 0.4816,
+     "confidence": 0.5184,
+     "answer_confidence": 0.5184,
+     "action": {
+      "act_probability": 0.3778
+     }
+    },
+    "team": {
+     "type": "choice",
+     "choice": "product",
+     "probabilities": {
+      "billing": 0.2738,
+      "shipping": 0.3475,
+      "product": 0.3787
+     },
+     "confidence": 0.0081,
+     "answer_confidence": 0.3787,
+     "action": {
+      "act_probability": 0.6046
+     }
+    },
+    "tone": {
+     "type": "score",
+     "score": 1.3351,
+     "legend": {
+      "0": "Calm",
+      "1": "Mildly annoyed",
+      "2": "Angry"
+     },
+     "probabilities": {
+      "0": 0.2201,
+      "1": 0.2247,
+      "2": 0.5552
+     },
+     "confidence": 0.094,
+     "answer_confidence": 0.5552,
+     "action": {
+      "act_probability": 0.8258
+     }
+    }
+   },
+   "usage": {
+    "input_tokens": 297,
+    "output_tokens": 0,
+    "state_tokens": 47,
+    "state_tokens_dropped": 0,
+    "truncated": false,
+    "truncated_questions": []
+   }
+  },
+  {
+   "answers": {
+    "topic": {
+     "type": "choice",
+     "choice": "d",
+     "probabilities": {
+      "a": 0.0212,
+      "b": 0.0235,
+      "c": 0.0906,
+      "d": 0.2956,
+      "e": 0.1971,
+      "f": 0.1235,
+      "g": 0.0387,
+      "h": 0.001,
+      "i": 0.0043,
+      "j": 0.0429,
+      "k": 0.1461,
+      "l": 0.0153
+     },
+     "confidence": 0.2101,
+     "answer_confidence": 0.2956,
+     "action": {
+      "act_probability": 0.5545
+     }
+    },
+    "spam": {
+     "type": "noul",
+     "noul": 0.4899,
+     "confidence": 0.5101,
+     "answer_confidence": 0.5101,
+     "action": {
+      "act_probability": 0.4172
+     }
+    },
+    "team": {
+     "type": "choice",
+     "choice": "billing",
+     "probabilities": {
+      "billing": 0.3187,
+      "technical": 0.2485,
+      "sales": 0.2368,
+      "other": 0.1961
+     },
+     "confidence": 0.0111,
+     "answer_confidence": 0.3187,
+     "action": {
+      "act_probability": 0.4443
+     }
+    }
+   },
+   "usage": {
+    "input_tokens": 384,
+    "output_tokens": 0,
+    "state_tokens": 199,
+    "state_tokens_dropped": 123,
+    "truncated": true,
+    "truncated_questions": [
+     "topic",
+     "spam",
+     "team"
+    ]
+   }
+  },
+  {
+   "answers": {
+    "waiting": {
+     "type": "noul",
+     "noul": 0.4588,
+     "confidence": 0.5412,
+     "answer_confidence": 0.5412,
+     "action": {
+      "act_probability": 0.6247
+     }
+    }
+   },
+   "usage": {
+    "input_tokens": 128,
+    "output_tokens": 0,
+    "state_tokens": 303,
+    "state_tokens_dropped": 227,
+    "truncated": true,
+    "truncated_questions": [
+     "waiting"
+    ]
+   }
+  }
+ ]
+}

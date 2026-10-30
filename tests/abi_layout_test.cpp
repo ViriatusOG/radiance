@@ -2,13 +2,13 @@
  *
  * Plugins are built apart from the engine, so a struct's layout is the contract: a field that moves
  * or changes size under one RAD_ABI_VERSION is read at the wrong offset by every plugin built
- * before it, and fields are appended without a version bump only because they are trailing and
- * zero-defaulted. The on-disk structs of rad_format.h (and the encoding records serialised into a
+ * before it, and a field appended past a struct's end is read past the end of an older engine's
+ * copy, so either bumps the version (rad_abi.h). The on-disk structs of rad_format.h (and the encoding records serialised into a
  * container) are the .rad format itself.
  *
  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
- * struct's listed fields account for its size, so the list in abi_layout_rows.h is complete; and
- * the layout agrees with the table below, taken at RAD_ABI_VERSION 31 and RAD_FORMAT_VER 2. Under
+ * struct's listed fields account for its size, so the list in rad_abi_layout_rows.h is complete; and
+ * the layout agrees with the table below, taken at RAD_ABI_VERSION 32 and RAD_FORMAT_VER 2. Under
  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
  * headers: nothing else states the layout. When it disagrees the test prints the live table.
@@ -52,14 +52,14 @@ std::vector<Row> cpp_rows() {
 #define ABI_STRUCT(T)   Row{ #T, "", 0, sizeof(T), alignof(T) },
 #define ABI_FIELD(T, f) Row{ #T, #f, offsetof(T, f), sizeof(((T*)0)->f), \
                              alignof(decltype(((T*)0)->f)) },
-#include "abi_layout_rows.h"
+#include "rad_abi_layout_rows.h"
 #undef ABI_STRUCT
 #undef ABI_FIELD
     };
 }
 
-/* The layout at RAD_ABI_VERSION 31 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 31, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 32 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 32, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -99,7 +99,7 @@ TEST(c_and_cpp_lay_out_every_abi_struct_alike) {
 
 /* Each struct's listed fields tile it: every field starts at the end of the one before, rounded up
  * to its own alignment, and the struct ends at the last field's end rounded up to the struct's. A
- * field missing from abi_layout_rows.h leaves a hole and fails here. */
+ * field missing from rad_abi_layout_rows.h leaves a hole and fails here. */
 TEST(the_row_list_accounts_for_every_byte_of_every_struct) {
     std::map<std::string, std::vector<Row>> fields;
     std::map<std::string, Row> whole;

@@ -592,6 +592,19 @@ int ref_seg_mean_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("seg_mean", operand, out);
 }
 
+int ref_seg_softmax_pool_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = n_seq_of(p, n_p);
+    Opd o;
+    o.t(D, { M });                                            /* score, one a row of v */
+    o.t(D, { M, n });                                         /* v */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(D, { S, n });                                         /* y */
+    return o.finish("seg_softmax_pool", operand, out);
+}
+
 int ref_seg_mean_bf16_sum_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     if (act_dt(p, n_p) != RAD_BF16)
         return RAD_E_UNSUPPORTED;

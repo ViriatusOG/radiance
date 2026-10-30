@@ -117,7 +117,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     plan_ = &plan;
     cfg_ = cfg;
     budget_ = budget;
-    stats_.reset();
+    stats_ = MoverCounters{};
     if (!budget_)
         RAD_WARN("mover: no Pools given; allocating the slab and host pool directly (test only)");
 
@@ -948,10 +948,8 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
 
         const auto t0 = std::chrono::steady_clock::now();
         for (const Seg& s : segs) {
-        for (const Seg& s : segs) {
             RAD_TRY(file_.read((uint64_t)s.fs, s.fe - s.fs, win + s.ws, W - s.ws));
             ++stats_.ssd_preads;
-        }
         }
         stats_.ssd_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - t0).count();

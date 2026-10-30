@@ -1,6 +1,10 @@
 /* lq_grid.cpp -- parsing a grid, choosing a block's scale, and round-to-nearest on it. See
  * lq_grid.h for the options and why the rules must not change. */
 #include "lq_grid.h"
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "lq_common.h"
 
 #include <algorithm>
@@ -270,6 +274,38 @@ void search_asym(const Grid& g, const float* w, int64_t cols, int64_t r0, int64_
         }
 }
 
+/* x with Phi(x) = p, the standard normal's quantile, by bisection. */
+double normal_quantile(double p) {
+    double lo = -10.0, hi = 10.0;
+    for (int i = 0; i < 100; ++i) {
+        const double m = 0.5 * (lo + hi);
+        (0.5 * std::erfc(-m / std::sqrt(2.0)) < p ? lo : hi) = m;
+    }
+    return 0.5 * (lo + hi);
+}
+
+/* A trellis's default values: the 2^L quantiles of a normal at (i + 0.5) / 2^L, scaled so the
+ * outermost lands on 127 and rounded, dealt to the states in a fixed random order (Fisher-Yates
+ * over splitmix64), so a state's 2^k successors fall at unrelated levels. */
+std::vector<float> tcq_default_lut(int L) {
+    const int64_t S = (int64_t)1 << L;
+    const double sigma = 127.0 / normal_quantile(1.0 - 0.5 / (double)S);
+    std::vector<float> lut((size_t)S);
+    for (int64_t i = 0; i < S; ++i) {
+        const double v = std::nearbyint(sigma * normal_quantile(((double)i + 0.5) / (double)S));
+        lut[(size_t)i] = (float)(v < -127.0 ? -127.0 : v > 127.0 ? 127.0 : v);
+    }
+    uint64_t x = 0x5EEDu + (uint64_t)L;
+    for (int64_t i = S - 1; i > 0; --i) {
+        uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        std::swap(lut[(size_t)i], lut[(size_t)(z % (uint64_t)(i + 1))]);
+    }
+    return lut;
+}
+
 /* A first-level scale as stored under a transform. The plane holds s / N in the scale dtype and the
  * reader undoes the transform after multiplying by it, so a code is decoded against N times the
  * stored value, and codes are chosen against that. Dividing by N (a power of two) is exact unless
@@ -291,6 +327,156 @@ void store_first_level(const Grid& g, float resid, BlockScale* b) {
 int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
     *g = Grid{};
     const char* codes = rad_param_gets(o, n_o, "codes", nullptr);
+    if (const char* vf = rad_param_gets(o, n_o, "vq", nullptr)) {
+        /* One codeword a line, its integers separated by spaces; a line "# unit X" names the
+         * units a unit-rms vector spans (default: the entries' rms). */
+        FILE* f = std::fopen(vf, "r");
+        if (!f) {
+            if (why) *why = fmt("vq=%s cannot be opened", vf);
+            return RAD_E_INVAL;
+        }
+        char line[4096];
+        double unit = 0.0;
+        while (std::fgets(line, sizeof line, f)) {
+            if (line[0] == '#') {
+                double u = 0.0;
+                if (std::sscanf(line, "# unit %lf", &u) == 1) unit = u;
+                continue;
+            }
+            std::vector<float> row;
+            char* p = line;
+            for (;;) {
+                char* end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (end == p) break;
+                row.push_back((float)v);
+                p = end;
+            }
+            if (row.empty()) continue;
+            if (g->vdim == 0) g->vdim = (int64_t)row.size();
+            bool ok = (int64_t)row.size() == g->vdim;
+            for (float v : row) ok = ok && v >= -127.0f && v <= 127.0f;
+            if (!ok) {
+                std::fclose(f);
+                if (why) *why = fmt("vq=%s: every codeword has %lld integers in -127..127", vf,
+                                    (long long)g->vdim);
+                return RAD_E_INVAL;
+            }
+            g->vq.insert(g->vq.end(), row.begin(), row.end());
+        }
+        std::fclose(f);
+        g->ventries = g->vdim ? (int64_t)g->vq.size() / g->vdim : 0;
+        if (g->ventries < 2 || g->vdim < 2 || g->vdim > 16 || 128 % g->vdim) {
+            if (why)
+                *why = fmt("vq=%s holds %lld codewords", vf, (long long)g->ventries) +
+                       fmt(" of width %s%lld; a vector grid needs 2 or more, their width (2..16) "
+                           "dividing 128", "", (long long)g->vdim);
+            return RAD_E_INVAL;
+        }
+        if (!(unit > 0.0)) {
+            double ss = 0.0;
+            for (float v : g->vq) ss += (double)v * v;
+            unit = std::sqrt(ss / (double)g->vq.size());
+        }
+        g->vq_unit = unit;
+        g->vq_soa.resize(g->vq.size());
+        g->vq_n2.assign((size_t)g->ventries, 0.0f);
+        for (int64_t k = 0; k < g->ventries; ++k)
+            for (int64_t j = 0; j < g->vdim; ++j) {
+                const float c = g->vq[(size_t)(k * g->vdim + j)];
+                g->vq_soa[(size_t)(j * g->ventries + k)] = c;
+                g->vq_n2[(size_t)k] += c * c;
+            }
+        if (rad_param_gets(o, n_o, "table", nullptr) || rad_param_gets(o, n_o, "zero", nullptr) ||
+            rad_param_gets(o, n_o, "scale2", nullptr)) {
+            if (why) *why = "vq= is the codebook: no table=, zero= or scale2= beside it";
+            return RAD_E_INVAL;
+        }
+        const uint32_t need = index_dtype((size_t)g->ventries);
+        if (codes && rad_dtype_parse(codes) != need) {
+            if (why) *why = fmt("vq=%s has %lld codewords, which a code of exactly ", vf,
+                                (long long)g->ventries) + rad_dtype_name(need) + " indexes";
+            return RAD_E_INVAL;
+        }
+        g->codes = need;
+    }
+    if (const int64_t L = rad_param_geti(o, n_o, "tcq", 0)) {
+        int sg = 0;
+        const uint32_t cdt = codes ? rad_dtype_parse(codes) : (uint32_t)RAD_DT_INVALID;
+        const int k = cdt == RAD_U8 ? 8
+                    : rad_dtype_packed_int(cdt, &sg) > 0 && !sg ? rad_dtype_bits(cdt) : 0;
+        if (!k || L <= k || L > 16) {
+            if (why) *why = "tcq=L is a trellis of 2^L states over unsigned codes of k bits, "
+                            "codes=u1..u8, k < L <= 16";
+            return RAD_E_INVAL;
+        }
+        if (!g->vq.empty() || rad_param_gets(o, n_o, "table", nullptr) ||
+            rad_param_gets(o, n_o, "zero", nullptr)) {
+            if (why) *why = "tcq= is the codebook: no vq=, table= or zero= beside it";
+            return RAD_E_INVAL;
+        }
+        g->tcq_L = (int)L;
+        g->tcq_k = k;
+        g->tcq_rows = rad_param_geti(o, n_o, "tcq_rows", 256);
+        if (g->tcq_rows < 1) {
+            if (why) *why = "tcq_rows= is the rows one trellis runs over, 1 or more";
+            return RAD_E_INVAL;
+        }
+        const int64_t S = (int64_t)1 << L;
+        double lut_unit = 0.0;
+        if (const char* code = rad_param_gets(o, n_o, "tcq_code", nullptr)) {
+            if (std::strcmp(code, "mad") != 0 || rad_param_gets(o, n_o, "tcq_lut", nullptr)) {
+                if (why) *why = "tcq_code=mad computes the states' values: no tcq_lut=";
+                return RAD_E_INVAL;
+            }
+            g->tcq_mad = true;
+            g->tcq_a = (uint32_t)rad_param_geti(o, n_o, "tcq_a", 0xB5297B) & 0xFFFFFFu;
+            g->tcq_b = (uint32_t)rad_param_geti(o, n_o, "tcq_b", 0x2545F491);
+            g->tcq_lut = tcq_lut_mad((int)L, g->tcq_a, g->tcq_b);
+        } else if (const char* lf = rad_param_gets(o, n_o, "tcq_lut", nullptr)) {
+            /* The states' values, integers in -127..127 separated by white space, in state order;
+             * a line "# unit X" names the units a unit-rms block spans (default: the values' rms). */
+            FILE* f = std::fopen(lf, "r");
+            if (!f) {
+                if (why) *why = fmt("tcq_lut=%s cannot be opened", lf);
+                return RAD_E_INVAL;
+            }
+            long v = 0;
+            char tok[64];
+            while (std::fscanf(f, "%63s", tok) == 1) {
+                if (tok[0] == '#') {
+                    char rest[256] = {};
+                    if (!std::fgets(rest, sizeof rest, f)) break;
+                    double u = 0.0;
+                    if (std::sscanf(rest, " unit %lf", &u) == 1) lut_unit = u;
+                    continue;
+                }
+                v = std::strtol(tok, nullptr, 10);
+                g->tcq_lut.push_back((float)(v < -127 ? -127 : v > 127 ? 127 : v));
+            }
+            std::fclose(f);
+            if ((int64_t)g->tcq_lut.size() != S) {
+                if (why) *why = fmt("tcq_lut=%s holds %lld values; tcq= wants one a state", lf,
+                                    (long long)g->tcq_lut.size());
+                return RAD_E_INVAL;
+            }
+        } else {
+            g->tcq_lut = tcq_default_lut((int)L);
+        }
+        double ss = 0.0;
+        for (float v2 : g->tcq_lut) ss += (double)v2 * v2;
+        g->vq_unit = (lut_unit > 0.0 ? lut_unit : std::sqrt(ss / (double)S)) /
+                     rad_param_getf(o, n_o, "tcq_gain", 1.0);
+        if (rad_param_geti(o, n_o, "tcq_peak", 0))
+            for (float v2 : g->tcq_lut) g->tcq_peak = std::max(g->tcq_peak, std::fabs(v2));
+        g->tcq_rb = rad_param_geti(o, n_o, "tcq_rb", 0);
+        g->tcq_colf = rad_param_geti(o, n_o, "tcq_colf", 0) != 0;
+        if (g->tcq_rb < 0 || (g->tcq_rb && g->tcq_rows % g->tcq_rb)) {
+            if (why) *why = "tcq_rb= is the rows one int8 scale covers; it must divide tcq_rows";
+            return RAD_E_INVAL;
+        }
+        g->codes = cdt;
+    }
     const char* tab = rad_param_gets(o, n_o, "table", nullptr);
     if (tab) {
         if (!parse_table(tab, &g->table, why)) return RAD_E_INVAL;
@@ -324,14 +510,16 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
         g->tpeak = -mn >= mx ? mn : mx;
         g->tsigned = -mn != mx;
-    } else if (!codes) {
+    } else if (!codes && g->vq.empty()) {
         if (why) *why = "codes= is required: the code dtype, e.g. i4, u2, fp8_e4m3, fp4_e2m1 -- "
                         "or table= for a codebook";
         return RAD_E_INVAL;
     }
-    if (!tab) g->codes = rad_dtype_parse(codes);
+    /* A codebook, scalar or vector, sets the code dtype itself: its codes index entries. */
+    const bool cb = tab || !g->vq.empty() || g->tcq_L;
+    if (!cb) g->codes = rad_dtype_parse(codes);
     const int bits = rad_dtype_bits(g->codes);
-    g->is_float = tab ? false : is_float_code(g->codes);
+    g->is_float = cb ? false : is_float_code(g->codes);
     int sgn = 0;
     bool packed = rad_dtype_packed_int(g->codes, &sgn) > 0 || g->codes == RAD_I8 ||
                   g->codes == RAD_U8;
@@ -341,7 +529,7 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         g->wide = true;
         sgn = g->codes != RAD_U16;
     }
-    if (!tab && !g->is_float && !packed) {
+    if (!cb && !g->is_float && !packed) {
         if (why) *why = fmt("codes=%s is not a code dtype this grid writes", codes);
         return RAD_E_INVAL;
     }
@@ -356,7 +544,7 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
         g->asym = true;
     }
-    if (tab) {
+    if (cb) {
         /* The codebook already set the code dtype. */
     } else if (!g->is_float) {
         if (g->asym && sgn) {
@@ -537,9 +725,24 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
 
 RadEncoding grid_encoding(const Grid& g) {
     RadEncoding e = rad_enc_affine(g.codes, g.scale_dt, g.br, g.bc);
+    if (!g.vq.empty()) e.plane[0].block[1] = g.vdim;        /* one code a vector */
     if (g.asym) rad_enc_add_plane(&e, "zero", g.zero_dt, g.br, g.bc);
     if (g.lv2) rad_enc_add_plane(&e, "scale.1", g.scale2_dt, g.br2, g.bc2);
     if (!g.table.empty()) rad_enc_add_table(&e, "table", g.table_dt, 1, (int64_t)g.table.size());
+    if (!g.vq.empty()) rad_enc_add_table(&e, "grid", RAD_I8, g.ventries, g.vdim);
+    if (g.tcq_L) {
+        /* Its own scheme: a value is its state's, not its code's, so the core's affine reading
+         * would be wrong; libquant decodes it (grid_tcq_decode). The states' values are a table,
+         * whose block is otherwise unused and here holds the rows one trellis runs over and the
+         * rows one int8 scale covers (tcq_rb; 1, each row its own, is the plain trellis). */
+        rad_enc_copy_str(e.scheme, "trellis");
+        const int i = rad_enc_add_table(&e, "trellis", RAD_I8, (int64_t)1 << g.tcq_L, 1);
+        if (i >= 0) e.plane[i].block[0] = g.tcq_rows, e.plane[i].block[1] = g.tcq_rb ? g.tcq_rb : 1;
+        /* tcq_code=mad: A and B, the code a reader computes the table from */
+        if (g.tcq_mad) rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+        /* one scale a row: each 128-column block's factor, one for all rows (Grid::row_scaled) */
+        if (g.row_scaled()) rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    }
     if (g.fwht) {
         char t[RAD_ENC_STR];
         std::snprintf(t, sizeof t, "fwht%lld", (long long)g.fwht);
@@ -558,6 +761,35 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
                             int64_t c0, int64_t c1, const float* imp) {
     BlockScale b;
     const float resid = g.fwht ? 1.0f / (float)g.fwht : 1.0f;
+
+    if (!g.vq.empty() || g.tcq_L) {
+        /* A vector grid or a trellis: the block's rms in the codebook's units. */
+        double ss = 0.0;
+        int64_t n = 0;
+        for (int64_t r = r0; r < r1; ++r)
+            for (int64_t c = c0; c < c1; ++c, ++n) ss += (double)w[r * cols + c] * w[r * cols + c];
+        double s0 = n > 0 && ss > 0.0 ? std::sqrt(ss / (double)n) / g.vq_unit : 1e-12;
+        if (g.tcq_peak > 0.0f) {
+            /* No value past the table's reach: an unrotated weight's outlying values would
+             * otherwise be clipped to it. */
+            double amax = 0.0;
+            for (int64_t r = r0; r < r1; ++r)
+                for (int64_t c = c0; c < c1; ++c) amax = std::max(amax, (double)std::fabs(w[r * cols + c]));
+            s0 = std::max(s0, amax / g.tcq_peak);
+        }
+        if (g.lv2) {
+            /* The first level's ideal scale, which the second level's pass rounds. */
+            b.s = b.stored = (float)s0;
+            b.inv = 1.0f / b.s;
+            b.inv_d = 1.0 / (double)b.s;
+            return b;
+        }
+        b.s = round_nz(g.scale_dt, (float)s0);
+        b.inv = 1.0f / b.s;
+        b.inv_d = 1.0 / (double)b.s;
+        store_first_level(g, resid, &b);
+        return b;
+    }
 
     if (g.rule == Grid::FIXED) {
         /* The reciprocal is of the unrounded value, in double; the stored scale is the rounded
@@ -727,6 +959,291 @@ int grid_code(const Grid& g, const BlockScale& b, float v) {
     return clampi(round_away(x), g.qmin, g.qmax);
 }
 
+namespace {
+/* |c|^2 - 2 x.c for every entry into `d`, entries in a tile at a time; the first minimum wins.
+ * Built for each instruction set and chosen at load; the sums run in the same order everywhere. */
+__attribute__((target_clones("avx512f", "avx2", "default")))
+int vq_argmin(const float* soa, const float* n2, int64_t E, int64_t D, const float* x) {
+    constexpr int64_t kT = 256;
+    float d[kT];
+    int best = 0;
+    float bd = 0.0f;
+    for (int64_t e0 = 0; e0 < E; e0 += kT) {
+        const int64_t n = E - e0 < kT ? E - e0 : kT;
+        for (int64_t k = 0; k < n; ++k) d[k] = n2[e0 + k];
+        for (int64_t j = 0; j < D; ++j) {
+            const float m = -2.0f * x[j];
+            const float* c = soa + j * E + e0;
+            for (int64_t k = 0; k < n; ++k) d[k] += m * c[k];
+        }
+        for (int64_t k = 0; k < n; ++k)
+            if ((e0 == 0 && k == 0) || d[k] < bd) { bd = d[k]; best = (int)(e0 + k); }
+    }
+    return best;
+}
+}  /* namespace */
+
+int grid_vq_code(const Grid& g, const BlockScale& b, const float* v) {
+    float x[16];
+    for (int64_t j = 0; j < g.vdim; ++j) x[j] = v[j] * b.inv;
+    return vq_argmin(g.vq_soa.data(), g.vq_n2.data(), g.ventries, g.vdim, x);
+}
+
+namespace {
+/* A tcq_rb value: v * rt rounded to an integer, nearest even -- of the product as an f32 (rintf),
+ * or for a computed code (Grid::tcq_mad) of the exact product, which one fma against 1.5 * 2^23
+ * rounds (|v * rt| <= 127), as the GEMMs decode it in one instruction. */
+inline float rb_round(float v, float rt, bool fused) {
+    return fused ? std::fma(v, rt, 12582912.0f) - 12582912.0f : rintf(v * rt);
+}
+
+/* One trellis step over every state: the cheaper of each state's 2^k predecessors into `best`
+ * and `from` (which one, by its top k bits; the first on a tie), then each state's cost, its
+ * squared error plus its predecessor's. State st's predecessors are q + t * Q for t < 2^k,
+ * q = st >> k, Q = 2^(L-k). A state's value is s * lut[st], or with `rt` >= 0 (tcq_rb)
+ * s * rint(lut[st] * rt). The AVX-512 form computes the same operations in the same order, so
+ * the two give the same codes. */
+__attribute__((target_clones("avx2", "default")))
+void tcq_step_generic(const float* cost, float* next, float* best, uint8_t* from, const float* lut,
+                      int64_t Q, int B, float x, float s, float rt, bool fused) {
+    for (int64_t q = 0; q < Q; ++q) { best[q] = cost[q]; from[q] = 0; }
+    for (int t = 1; t < B; ++t) {
+        const float* c = cost + (int64_t)t * Q;
+        for (int64_t q = 0; q < Q; ++q)
+            if (c[q] < best[q]) { best[q] = c[q]; from[q] = (uint8_t)t; }
+    }
+    const int64_t S = Q * B;
+    for (int64_t st = 0; st < S; ++st) {
+        const float d = x - s * (rt >= 0.0f ? rb_round(lut[st], rt, fused) : lut[st]);
+        next[st] = d * d + best[st / B];
+    }
+}
+
+#if defined(__x86_64__)
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void tcq_step_avx512(const float* cost, float* next, float* best, uint8_t* from, const float* lut,
+                     int64_t Q, int B, float x, float s, float rt, bool fused) {
+    for (int64_t q = 0; q < Q; q += 16) {
+        __m512 m = _mm512_loadu_ps(cost + q);
+        __m512i a = _mm512_setzero_si512();
+        for (int t = 1; t < B; ++t) {
+            const __m512 c = _mm512_loadu_ps(cost + (int64_t)t * Q + q);
+            const __mmask16 lt = _mm512_cmp_ps_mask(c, m, _CMP_LT_OQ);
+            m = _mm512_mask_mov_ps(m, lt, c);
+            a = _mm512_mask_mov_epi32(a, lt, _mm512_set1_epi32(t));
+        }
+        _mm512_storeu_ps(best + q, m);
+        _mm_storeu_si128((__m128i*)(from + q), _mm512_cvtepi32_epi8(a));
+    }
+    const int64_t S = Q * B;
+    const __m512 xv = _mm512_set1_ps(x), sv = _mm512_set1_ps(s), rv = _mm512_set1_ps(rt);
+    /* Lane j of a 16-state run takes best[(st + j) / B]: a permute for B <= 16, else one value. */
+    const int per = B < 16 ? 16 / B : 1;
+    alignas(64) int32_t lane[16];
+    for (int j = 0; j < 16; ++j) lane[j] = B < 16 ? j / B : 0;
+    const __m512i idx = _mm512_load_si512(lane);
+    const __mmask16 take = (__mmask16)((1u << per) - 1u);
+    for (int64_t st = 0; st < S; st += 16) {
+        const __m512 bq = _mm512_permutexvar_ps(idx, _mm512_maskz_loadu_ps(take, best + st / B));
+        __m512 v = _mm512_loadu_ps(lut + st);
+        /* rintf's rounding: to nearest, ties to even; fused, of the exact product (rb_round) */
+        if (rt >= 0.0f && fused) {
+            const __m512 mg = _mm512_set1_ps(12582912.0f);
+            v = _mm512_sub_ps(_mm512_fmadd_ps(v, rv, mg), mg);
+        } else if (rt >= 0.0f) {
+            v = _mm512_roundscale_ps(_mm512_mul_ps(v, rv), _MM_FROUND_TO_NEAREST_INT |
+                                                         _MM_FROUND_NO_EXC);
+        }
+        const __m512 d = _mm512_sub_ps(xv, _mm512_mul_ps(sv, v));
+        _mm512_storeu_ps(next + st, _mm512_add_ps(_mm512_mul_ps(d, d), bq));
+    }
+}
+#endif
+
+void tcq_step(const float* cost, float* next, float* best, uint8_t* from, const float* lut,
+              int64_t Q, int B, float x, float s, float rt, bool fused) {
+#if defined(__x86_64__)
+    static const bool avx512 = __builtin_cpu_supports("avx512f") &&
+                               __builtin_cpu_supports("avx512bw") &&
+                               __builtin_cpu_supports("avx512vl");
+    if (avx512 && Q % 16 == 0) return tcq_step_avx512(cost, next, best, from, lut, Q, B, x, s, rt, fused);
+#endif
+    tcq_step_generic(cost, next, best, from, lut, Q, B, x, s, rt, fused);
+}
+}  /* namespace */
+
+namespace {
+/* Viterbi over n rows: from predecessor state `start`, or from any state when start < 0; the path
+ * of least cost ending in state `end`, or in the cheapest when end < 0. Its states into `path`. */
+void tcq_viterbi(const Grid& g, const float* x, const float* s, const float* rt, int64_t n,
+                 int64_t start, int64_t end, int64_t* path, TcqWork& w) {
+    const int L = g.tcq_L, k = g.tcq_k, B = 1 << k;
+    const int64_t S = (int64_t)1 << L, Q = S >> k, mask = S - 1;
+    const float* lut = g.tcq_lut.data();
+    const float inf = 3.0e38f;
+    for (int64_t st = 0; st < S; ++st) {
+        const float d = x[0] - s[0] * (rt ? rb_round(lut[st], rt[0], g.tcq_mad) : lut[st]);
+        w.cost[(size_t)st] = start < 0 || (st >> k) == (start & (Q - 1)) ? d * d : inf;
+    }
+    for (int64_t r = 1; r < n; ++r) {
+        tcq_step(w.cost.data(), w.next.data(), w.best.data(), w.back.data() + r * Q, lut, Q, B,
+                 x[r], s[r], rt ? rt[r] : -1.0f, g.tcq_mad);
+        w.cost.swap(w.next);
+    }
+    int64_t st = end;
+    if (st < 0) {
+        st = 0;
+        for (int64_t i = 1; i < S; ++i)
+            if (w.cost[(size_t)i] < w.cost[(size_t)st]) st = i;
+    }
+    for (int64_t r = n - 1; r >= 0; --r) {
+        path[r] = st;
+        if (r > 0) {
+            const int64_t q = st >> k;
+            st = (q + (int64_t)w.back[(size_t)(r * Q + q)] * Q) & mask;
+        }
+    }
+}
+}  /* namespace */
+
+void grid_tcq_run(const Grid& g, const float* x, const float* s, int64_t n, int32_t* codes,
+                  float* dq, TcqWork& w, const float* ratio) {
+    const int k = g.tcq_k;
+    const int64_t S = (int64_t)1 << g.tcq_L;
+    w.cost.resize((size_t)S);
+    w.next.resize((size_t)S);
+    w.best.resize((size_t)(S >> k));
+    w.back.resize((size_t)(n * (S >> k)));
+    w.rx.resize((size_t)n);
+    w.rs.resize((size_t)n);
+    w.rr.resize(ratio ? (size_t)n : 0);
+    w.path.resize((size_t)n);
+    /* Tail-biting: the run's state before its first row is its state after its last, so no bits
+     * go to a start. The boundary state is taken from the best free path over a window across
+     * the seam -- the run's last h rows, then its first h -- at the seam; survivor paths merge
+     * within a few state lengths, so a window of 8 of them finds the state the whole rotated run
+     * would. The run is then searched from and to that state. */
+    const int64_t c = (g.tcq_L + k - 1) / k;
+    const int64_t h = 8 * c < n / 2 ? 8 * c : n / 2;
+    for (int64_t i = 0; i < 2 * h; ++i) {
+        const int64_t r = i < h ? n - h + i : i - h;
+        w.rx[(size_t)i] = x[r];
+        w.rs[(size_t)i] = s[r];
+        if (ratio) w.rr[(size_t)i] = ratio[r];
+    }
+    tcq_viterbi(g, w.rx.data(), w.rs.data(), ratio ? w.rr.data() : nullptr, 2 * h, -1, -1,
+                w.path.data(), w);
+    const int64_t seam = w.path[(size_t)(h - 1)];
+    tcq_viterbi(g, x, s, ratio, n, seam, seam, w.path.data(), w);
+    const float* lut = g.tcq_lut.data();
+    for (int64_t r = 0; r < n; ++r) {
+        const int64_t st = w.path[(size_t)r];
+        codes[r] = (int32_t)(st & ((1 << k) - 1));
+        dq[r] = (ratio ? rb_round(lut[st], ratio[r], g.tcq_mad) : lut[st]) * s[r];
+    }
+}
+
+std::vector<float> tcq_lut_mad(int L, uint32_t a, uint32_t b) {
+    std::vector<float> lut((size_t)1 << L);
+    for (uint32_t st = 0; st < (1u << L); ++st) {
+        const uint32_t h = (((st & 0xFFFFFFu) * (a & 0xFFFFFFu)) + b) & 0x3F3F3F3Fu;
+        lut[st] = (float)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+    }
+    return lut;
+}
+
+int grid_tcq_decode(const RadEncoding* e, int64_t rows_all, int64_t cols, const void* const* planes,
+                    int64_t row0, int64_t rows, float* out) {
+    const int nm = (rad_enc_plane(e, "trellis.mad") ? 1 : 0) + (rad_enc_plane(e, "scale.col") ? 1 : 0);
+    if (!rad_enc_is(e, "trellis") || (e->n_planes - nm != 3 && e->n_planes - nm != 4))
+        return RAD_E_UNSUPPORTED;
+    const RadEncPlane *cp = &e->plane[0], *sp = rad_enc_plane(e, "scale"),
+                      *s2p = rad_enc_plane(e, "scale.1"), *tp = rad_enc_plane(e, "trellis");
+    int sg = 0;
+    const int bits = cp->dtype == RAD_U8 ? 8
+                   : rad_dtype_packed_int(cp->dtype, &sg) > 0 && !sg ? rad_dtype_bits(cp->dtype) : 0;
+    if (!bits || !sp || !tp || sp->kind != RAD_PLANE_TILED || sp->block[0] != 1 ||
+        sp->block[1] < 0 || tp->kind != RAD_PLANE_TABLE || tp->dtype != RAD_I8 ||
+        tp->extent[1] != 1 || tp->block[0] < 1 || (e->n_planes - nm == 4) != (s2p != nullptr))
+        return RAD_E_UNSUPPORTED;
+    /* a scale block of 0 columns is the whole row (tcq_colf's one scale a row) */
+    const int64_t S = tp->extent[0], T = tp->block[0], bc = sp->block[1] ? sp->block[1] : cols,
+                  rb = tp->block[1];
+    const RadEncPlane* cfp = rad_enc_plane(e, "scale.col");
+    const float* cf = cfp ? (const float*)planes[cfp - e->plane] : nullptr;
+    if (S < 2 || (S & (S - 1)) || cols % bc || rb < 1 || T % rb) return RAD_E_FORMAT;
+    if (row0 % T || (rows % T && row0 + rows != rows_all)) return RAD_E_SHAPE;
+    int L = 0;
+    while (((int64_t)1 << L) < S) ++L;
+    const int64_t c = (L + bits - 1) / bits, fw = rad_enc_fwht(e);
+    const uint32_t mask = (uint32_t)(S - 1);
+    const uint8_t* codes = (const uint8_t*)planes[0];
+    const uint8_t* scale = (const uint8_t*)planes[1];
+    const int8_t* lut = (const int8_t*)planes[tp - e->plane];
+    const int64_t crow = rad_enc_row_bytes(cp->dtype, cols);
+    const int64_t srow = rad_enc_row_bytes(sp->dtype, cols / bc);
+    /* A block's scale as the int8 GEMMs read it: the first level, or the bf16 of the first level
+     * times the second (grid_tcq_settle). */
+    const uint8_t* s2 = s2p ? (const uint8_t*)planes[s2p - e->plane] : nullptr;
+    int64_t s2c = 1, s2rb = 0, s2cb = 0, s2row = 0;
+    if (s2p) {
+        s2rb = s2p->block[0];
+        s2cb = s2p->block[1];
+        s2c = s2cb > 0 ? (cols + s2cb - 1) / s2cb : 1;
+        s2row = rad_enc_row_bytes(s2p->dtype, s2c);
+    }
+    auto block_scale = [&](int64_t r, int64_t j) -> float {
+        const float l1 = rad_load_f32(scale + r * srow, sp->dtype, j / bc);
+        if (!s2) return l1;
+        const int64_t i2 = s2rb > 0 ? r / s2rb : 0, j2 = s2cb > 0 ? j / s2cb : 0;
+        return round_to(RAD_BF16, l1 * rad_load_f32(s2 + i2 * s2row, s2p->dtype, j2));
+    };
+    /* With rows per int8 scale rb > 1 (Grid::tcq_rb), row r's value is
+     * B * rint(lut[state] * (s_r / B)), B the largest of its rb-row block's scales. */
+    /* Runs decode independently. Only the last can be short; one shorter than a state's codes
+     * cannot hold its seam. */
+    if (rows > 0 && std::min(row0 + rows, rows_all) - (row0 + (rows - 1) / T * T) < c)
+        return RAD_E_SHAPE;
+    const int64_t runs = (rows + T - 1) / T;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) if (runs > 1 && rows * cols > (1 << 20))
+#endif
+    for (int64_t ri = 0; ri < runs; ++ri) {
+        const int64_t r0 = row0 + ri * T;
+        const int64_t r1 = std::min(r0 + T, rows_all);
+        std::vector<float> bmax(rb > 1 ? (size_t)(cols / bc) : 0);
+        std::vector<uint32_t> st((size_t)cols, 0u);
+        for (int64_t t = r1 - c; t < r1; ++t)
+            for (int64_t j = 0; j < cols; ++j)
+                st[(size_t)j] = ((st[(size_t)j] << bits) |
+                                 (uint32_t)rad_load_bits(codes + t * crow, bits, j)) & mask;
+        for (int64_t r = r0; r < r1; ++r) {
+            float* o = out + (r - row0) * cols;
+            if (rb > 1 && r % rb == 0)
+                for (int64_t jb = 0; jb < cols / bc; ++jb) {
+                    float m = 0.0f;
+                    for (int64_t q = r; q < std::min(r + rb, rows_all); ++q)
+                        m = std::max(m, block_scale(q, jb * bc));
+                    bmax[(size_t)jb] = m;
+                }
+            for (int64_t j = 0; j < cols; ++j) {
+                st[(size_t)j] = ((st[(size_t)j] << bits) |
+                                 (uint32_t)rad_load_bits(codes + r * crow, bits, j)) & mask;
+                const float sr = block_scale(r, j);
+                if (rb > 1) {
+                    const float bm = bmax[(size_t)(j / bc)];
+                    o[j] = bm > 0.0f ? rb_round((float)lut[st[(size_t)j]], sr / bm, nm != 0) * bm : 0.0f;
+                } else {
+                    o[j] = (float)lut[st[(size_t)j]] * (cf ? sr * cf[j / 128] : sr);
+                }
+            }
+            if (fw > 0)
+                for (int64_t j = 0; j < cols; j += fw) fwht_inplace(o + j, fw);
+        }
+    }
+    return RAD_OK;
+}
+
 float grid_decode(const Grid& g, const BlockScale& b, int code) {
     if (!g.table.empty()) return g.table[(size_t)code] * b.s;
     if (g.is_float) {
@@ -761,7 +1278,7 @@ Planes grid_planes(const Grid& g, int64_t cols, void* const* planes) {
     p.codes = (uint8_t*)planes[0];
     p.scale = (uint8_t*)planes[1];
     p.zero  = g.asym ? (uint8_t*)planes[2] : nullptr;
-    p.codes_row  = rad_dtype_bytes(g.codes, cols);
+    p.codes_row  = rad_dtype_bytes(g.codes, g.vq.empty() ? cols : cols / g.vdim);
     p.scale_row  = rad_dtype_bytes(g.scale_dt, sc);
     p.zero_row   = g.asym ? rad_dtype_bytes(g.zero_dt, sc) : 0;
     p.scale_cols = sc;
@@ -771,13 +1288,40 @@ Planes grid_planes(const Grid& g, int64_t cols, void* const* planes) {
         p.scale2_row = rad_dtype_bytes(g.scale2_dt, p.scale2_cols);
     }
     if (!g.table.empty()) p.table = (uint8_t*)planes[g.plane_table()];
+    if (!g.vq.empty() || g.tcq_L) p.grid = (uint8_t*)planes[g.plane_grid()];
+    if (g.tcq_mad) p.mad = (uint8_t*)planes[g.plane_mad()];
+    if (g.row_scaled()) {
+        p.colf = (uint8_t*)planes[g.plane_colf()];
+        p.colf_cols = cols / 128;
+    }
     return p;
 }
 
 void grid_transform_rows(const Grid& g, float* w, int64_t rows, int64_t cols) {
     if (!g.fwht) return;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows * cols > (1 << 20))
+#endif
     for (int64_t r = 0; r < rows; ++r)
         for (int64_t c = 0; c < cols; c += g.fwht) fwht_inplace(w + r * cols + c, g.fwht);
+}
+
+void grid_tcq_settle(const Grid& g, float s2, BlockScale* b) {
+    const float resid = g.fwht ? 1.0f / (float)g.fwht : 1.0f;
+    const float eff = round_to(RAD_BF16, b->stored * s2);
+    b->s = eff != 0.0f ? eff / resid : s2 / resid;
+    b->inv = 1.0f / b->s;
+    b->inv_d = 1.0 / (double)b->s;
+}
+
+BlockScale grid_tcq_block_lv2(const Grid& g, double ideal, float s2) {
+    const float resid = g.fwht ? 1.0f / (float)g.fwht : 1.0f;
+    const double t = (double)s2 / resid;
+    const float q = (float)std::min(std::max(ideal / t, 0.0), (double)g.l1max);
+    BlockScale b;
+    b.stored = q > 0.0f ? round_nz(g.scale_dt, q) : round_nz(g.scale_dt, tiny_of(g.scale_dt));
+    grid_tcq_settle(g, s2, &b);
+    return b;
 }
 
 Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, const float* imp) {
@@ -881,6 +1425,11 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
             b.inv_d = 1.0 / (double)b.s;
             if (g.asym) b.zero = clampi((int)(-b.lo / b.s + 0.5f), 0, g.qmax);
         }
+    if (g.tcq_L)
+        for (int64_t i = 0; i < s.nr; ++i)
+            for (int64_t j = 0; j < s.nc; ++j)
+                grid_tcq_settle(g, s.s2[(size_t)(((i * s.br) / br2) * s.nc2 + (j * s.bc) / bc2)],
+                                &s.b[(size_t)(i * s.nc + j)]);
     /* Only a fixed second level can push a first-level scale past its dtype's top; a derived one
      * maps the largest under it exactly to the top. */
     if (held)
@@ -913,6 +1462,17 @@ void grid_store_scales(const Grid& g, const Scales& s, const Planes& p) {
                     rad_store_f32(row, g.scale2_dt, j, v);
                 }
             }
+    if (p.grid)
+        for (size_t k = 0; k < g.vq.size(); ++k) ((int8_t*)p.grid)[k] = (int8_t)g.vq[k];
+    if (p.grid)
+        for (size_t k = 0; k < g.tcq_lut.size(); ++k) ((int8_t*)p.grid)[k] = (int8_t)g.tcq_lut[k];
+    if (p.mad) {
+        ((uint32_t*)p.mad)[0] = g.tcq_a;
+        ((uint32_t*)p.mad)[1] = g.tcq_b;
+    }
+    if (p.colf)
+        for (int64_t k = 0; k < p.colf_cols; ++k)
+            ((float*)p.colf)[k] = s.colf.empty() ? 1.0f : s.colf[(size_t)k];
     if (p.table)
         for (size_t k = 0; k < g.table.size(); ++k) {
             if (g.table_dt == RAD_I8) ((int8_t*)p.table)[k] = (int8_t)g.table[k];

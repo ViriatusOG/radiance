@@ -850,9 +850,12 @@ constexpr unsigned kMaxConvCtr = 4096;
 static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
   static std::mutex m;
   static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
-  std::lock_guard<std::mutex> lk(m);
   const auto key = std::make_pair(s, out);
-  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  {
+    // Not held while the block is made, as in split_ctr: the zeroing waits for the card.
+    std::lock_guard<std::mutex> lk(m);
+    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  }
   void* p = nullptr;
   if (hipMalloc(&p, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
   // Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has finished
@@ -863,8 +866,15 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
     (void)hipFree(p);
     return nullptr;
   }
-  blocks.emplace(key, (unsigned int*)p);
-  return (unsigned int*)p;
+  unsigned int* kept = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(m);
+    const auto [it, fresh] = blocks.emplace(key, (unsigned int*)p);
+    if (fresh) return it->second;
+    kept = it->second;
+  }
+  (void)hipFree(p);  // another thread made this key's block in the meantime
+  return kept;
 }
 
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row

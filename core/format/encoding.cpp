@@ -189,8 +189,11 @@ void enc_add_decoder(RadQuantDecodeFn fn) {
 }
 
 void enc_remove_decoder(RadQuantDecodeFn fn) {
+    /* One registration: two registries that load the same plugin each add its decoder, and
+     * closing one must leave the other's. */
     std::lock_guard<std::mutex> lk(g_dec_mu);
-    g_decoders.erase(std::remove(g_decoders.begin(), g_decoders.end(), fn), g_decoders.end());
+    const auto at = std::find(g_decoders.rbegin(), g_decoders.rend(), fn);
+    if (at != g_decoders.rend()) g_decoders.erase(std::next(at).base());
 }
 
 int enc_decode_rows(const EncodedView& v, int64_t row0, int64_t n, float* out, std::string* why) {

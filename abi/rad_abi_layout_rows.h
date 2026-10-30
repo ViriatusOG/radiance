@@ -1,6 +1,7 @@
-/* abi_layout_rows.h -- every struct abi/ exports and each of its top-level fields, as
- * ABI_STRUCT(type) and ABI_FIELD(type, field) lines; the includer defines both. abi_c_test.c and
- * abi_layout_test.cpp include it, so the C and C++ translation units list the same rows.
+/* rad_abi_layout_rows.h -- every struct abi/ exports and each of its top-level fields, as
+ * ABI_STRUCT(type) and ABI_FIELD(type, field) lines; the includer defines both. rad_abi_layout.h
+ * hashes them into the layout fingerprint every plugin exports, and tests/abi_c_test.c and
+ * tests/abi_layout_test.cpp list them, so the C and C++ translation units see the same rows.
  *
  * A struct or field added to abi/ is added here too: abi_layout_test fails on a struct whose
  * listed fields do not account for its size. Included once per table, so it has no include guard.
@@ -23,6 +24,8 @@ ABI_FIELD(RadArchProbe, control_vector_ok)
 ABI_FIELD(RadArchProbe, tp_attn_rows_ok)
 ABI_FIELD(RadArchProbe, state_f16_ok)
 ABI_FIELD(RadArchProbe, tree_pays)
+ABI_FIELD(RadArchProbe, gen_max_pixels)
+ABI_FIELD(RadArchProbe, gen_max_refs)
 ABI_STRUCT(RadArgs)
 ABI_FIELD(RadArgs, t)
 ABI_FIELD(RadArgs, n_t)
@@ -85,6 +88,11 @@ ABI_FIELD(RadBatch, control_vector)
 ABI_FIELD(RadBatch, enc_seg_h)
 ABI_FIELD(RadBatch, enc_seg_w)
 ABI_FIELD(RadBatch, score_only)
+ABI_FIELD(RadBatch, n_plugin_words)
+ABI_FIELD(RadBatch, plugin_words)
+ABI_FIELD(RadBatch, plugin_cu)
+ABI_FIELD(RadBatch, plugin_words_h)
+ABI_FIELD(RadBatch, plugin_cu_h)
 ABI_STRUCT(RadBufDecl)
 ABI_FIELD(RadBufDecl, dtype)
 ABI_FIELD(RadBufDecl, rank)
@@ -120,6 +128,12 @@ ABI_FIELD(RadBuildCtx, state_dtype)
 ABI_FIELD(RadBuildCtx, draft_coupling)
 ABI_FIELD(RadBuildCtx, weight_prefetch_off)
 ABI_FIELD(RadBuildCtx, draft_tree)
+ABI_FIELD(RadBuildCtx, calib_dir)
+ABI_FIELD(RadBuildCtx, calib_layer_lo)
+ABI_FIELD(RadBuildCtx, calib_layer_hi)
+ABI_FIELD(RadBuildCtx, calib_tokens)
+ABI_FIELD(RadBuildCtx, gen_max_pixels)
+ABI_FIELD(RadBuildCtx, gen_max_refs)
 ABI_STRUCT(RadAudioGenBatch)
 ABI_FIELD(RadAudioGenBatch, n_lane)
 ABI_FIELD(RadAudioGenBatch, lane)
@@ -268,6 +282,7 @@ ABI_FIELD(RadDeviceProps, vram_free)
 ABI_FIELD(RadDeviceProps, lds_bytes)
 ABI_FIELD(RadDeviceProps, supports_p2p)
 ABI_FIELD(RadDeviceProps, is_host_backend)
+ABI_FIELD(RadDeviceProps, unified)
 ABI_STRUCT(RadDrafterDecl)
 ABI_FIELD(RadDrafterDecl, name)
 ABI_FIELD(RadDrafterDecl, kind)

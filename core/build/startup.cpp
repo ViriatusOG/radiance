@@ -243,9 +243,12 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
 /* Optional export. Without it, or on failure, every field is zero and the caller uses its own
  * defaults. A failed probe is not an error: the plugin can still refuse in declare, where it has
  * the whole configuration and can say why. */
-int rad_tools_probe(const LoadedPlugins& lp, const RadModelMeta& meta, RadArchProbe* out) {
+int rad_tools_probe(const LoadedPlugins& lp, const RadModelMeta& meta, RadArchProbe* out,
+                    int64_t gen_max_pixels, int64_t gen_max_refs) {
     if (!out) return RAD_E_INVAL;
     *out = RadArchProbe{};
+    out->gen_max_pixels = gen_max_pixels;
+    out->gen_max_refs = gen_max_refs;
     const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
     if (!ap || !ap->arch_probe) return RAD_E_UNSUPPORTED;
     const int s = ap->arch_probe(&meta, out);
@@ -253,6 +256,8 @@ int rad_tools_probe(const LoadedPlugins& lp, const RadModelMeta& meta, RadArchPr
         RAD_WARN("%s: rad_arch_probe returned %s; the core will use its own defaults",
                  lp.arch_plugin.c_str(), rad_strerror(s));
         *out = RadArchProbe{};
+        out->gen_max_pixels = gen_max_pixels;
+        out->gen_max_refs = gen_max_refs;
         return s;
     }
     return RAD_OK;

@@ -9,11 +9,90 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <vector>
 
 namespace rad {
+
+/* Every request of a corpus run through the scheduler, each reaped once its sink is done; the
+ * documents that ended in an error go to *bad. With `fit_pool`, a request is submitted only while
+ * the whole lengths of those in flight, its own included, fit the KV pool at once, so none is ever
+ * preempted: a 256K-token document runs beside short ones only as far as the pool holds both.
+ * Without it, all are submitted under one hold of the queue, so batching depends only on the
+ * corpus and the flags and a rerun batches identically. `progress` runs every `every_s` seconds
+ * with the documents done and the seconds since the start. */
+int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
+                     std::vector<std::unique_ptr<server::Sink>>& sinks, bool fit_pool,
+                     const char* tag, int every_s,
+                     const std::function<void(size_t, double)>& progress, int* bad) {
+    const size_t n = reqs.size();
+    const KVManager& kv = ranks_[0]->kv;
+    /* What a document holds of the pool at most: its tokens, plus a block lost to rounding and
+     * one to a copy-on-write in each group, bounded generously. */
+    constexpr int64_t kSlack = 1024;
+    std::vector<int64_t> len(n);
+    for (size_t d = 0; d < n; ++d) len[d] = (int64_t)reqs[d]->prompt.size() + kSlack;
+    std::vector<char> live(n, 0);
+    size_t next = 0, n_live = 0, finished = 0;
+    int64_t held = 0;
+    if (!fit_pool) {
+        std::vector<int> rc(n, RAD_OK);
+        sched_.add_all(reqs.data(), n, rc.data());
+        for (size_t d = 0; d < n; ++d) {
+            if (rc[d] >= 0) continue;
+            RAD_ERR("%s: the scheduler refused document %zu (%zu tokens): %s", tag, d,
+                    (size_t)(len[d] - kSlack), rad_strerror(rc[d]));
+            return rc[d];
+        }
+        std::fill(live.begin(), live.end(), 1);
+        next = n_live = n;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    auto last = t0;
+    while (finished < n) {
+        while (next < n && (n_live == 0 || kv.can_ever_fit(held + len[next]))) {
+            int rc = RAD_OK;
+            sched_.add_all(&reqs[next], 1, &rc);
+            if (rc < 0) {
+                RAD_ERR("%s: the scheduler refused document %zu (%zu tokens): %s", tag, next,
+                        (size_t)(len[next] - kSlack), rad_strerror(rc));
+                return rc;
+            }
+            live[next] = 1;
+            ++n_live;
+            held += len[next];
+            ++next;
+        }
+        const int ls = loop_status_.load(std::memory_order_acquire);
+        if (ls < 0) return ls;
+        size_t oldest = 0;
+        while (oldest < next && !live[oldest]) ++oldest;
+        sinks[oldest]->wait(200);
+        for (size_t d = oldest; d < next; ++d) {
+            if (!live[d] || !sinks[d]->done()) continue;
+            const server::Finish f = sinks[d]->finish_reason();
+            if (f == server::Finish::Error || f == server::Finish::Cancelled) {
+                RAD_ERR("%s: document %zu did not finish: %s", tag, d,
+                        rad_strerror(sinks[d]->status()));
+                ++*bad;
+            }
+            sched_.reap(sinks[d]->id);
+            sinks[d].reset();
+            live[d] = 0;
+            --n_live;
+            held -= len[d];
+            ++finished;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(every_s)) {
+            last = now;
+            progress(finished, std::chrono::duration<double>(now - t0).count());
+        }
+    }
+    return RAD_OK;
+}
 
 int Engine::run_kld() {
     /* Each rank's logits buffer must hold a step's tokens after the sampler's rows
@@ -111,8 +190,6 @@ int Engine::run_kld() {
         RAD_INFO("kld: scoring through the runtime LoRA adapter '%s' (slot %d)", cfg_.kld_lora.c_str(),
                  lora_slot);
 
-    /* Submit every document under one hold of the queue, so batching depends only on the corpus
-     * and the flags and a rerun batches identically. */
     std::vector<std::unique_ptr<server::Sink>> sinks(n);
     std::vector<std::unique_ptr<Request>> reqs(n);
     for (size_t d = 0; d < n; ++d) {
@@ -135,45 +212,77 @@ int Engine::run_kld() {
         sinks[d]->id  = r->id;
         reqs[d] = std::move(r);
     }
-    std::vector<int> rc(n, RAD_OK);
-    sched_.add_all(reqs.data(), n, rc.data());
-    for (size_t d = 0; d < n; ++d) {
-        if (rc[d] >= 0) continue;
-        RAD_ERR("kld: the scheduler refused document %zu (%zu tokens): %s", d,
-                kld_->tokens(d).size(), rad_strerror(rc[d]));
-        return rc[d];
-    }
-
+    /* A recording that also records the calibration statistics (--calib-dir) must not preempt:
+     * the re-prefilled tokens would count twice. */
     const auto t0 = std::chrono::steady_clock::now();
-    auto last = t0;
-    for (size_t first = 0;;) {
-        while (first < n && sinks[first]->done()) ++first;
-        if (first == n) break;
-        const int ls = loop_status_.load(std::memory_order_acquire);
-        if (ls < 0) return ls;
-        sinks[first]->wait(200);
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last >= std::chrono::seconds(15)) {
-            last = now;
-            const double s = std::chrono::duration<double>(now - t0).count();
-            RAD_INFO("kld: %lld / %lld positions, %zu / %zu documents, %.0f s",
-                     (long long)kld_->rows_done(), (long long)kld_->n_rows(), first, n, s);
-        }
-    }
     int bad = 0;
-    for (size_t d = 0; d < n; ++d) {
-        const server::Finish f = sinks[d]->finish_reason();
-        if (f == server::Finish::Error || f == server::Finish::Cancelled) {
-            RAD_ERR("kld: document %zu did not finish: %s", d, rad_strerror(sinks[d]->status()));
-            ++bad;
-        }
-        sched_.reap(sinks[d]->id);
-    }
+    RAD_TRY(run_docs(reqs, sinks, !cfg_.calib_dir.empty(), "kld", 15, [&](size_t done, double s) {
+        RAD_INFO("kld: %lld / %lld positions, %zu / %zu documents, %.0f s",
+                 (long long)kld_->rows_done(), (long long)kld_->n_rows(), done, n, s);
+    }, &bad));
     if (bad) return RAD_E_STATE;
     RAD_INFO("kld: %zu documents in %.0f s, %lld preemption(s)", n,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
              (long long)sched_.metrics().preemptions);
+    if (!cfg_.calib_dir.empty() && sched_.metrics().preemptions) {
+        RAD_ERR("kld: the calibration statistics counted the tokens of %lld preempted request(s) "
+                "twice; the reference is written, the statistics are not to be used",
+                (long long)sched_.metrics().preemptions);
+        RAD_TRY(kld_->finish());
+        return RAD_E_STATE;
+    }
     return kld_->finish();
+}
+
+/* --calib-corpus: every document through prefill once as a plain request, nothing scored. The
+ * plugin records its statistics while the steps run and writes them once it has seen the corpus's
+ * tokens (RadBuildCtx::calib_tokens). A preempted request is prefilled again, which would count
+ * its tokens twice, so the documents are fed so that it cannot (run_docs), and a run that
+ * preempts all the same is reported as failed. */
+int Engine::run_calib() {
+    if (!calib_) return RAD_E_STATE;
+    const size_t n = calib_->n_docs();
+    {
+        const KVManager& kv = ranks_[0]->kv;
+        int too_long = 0;
+        for (size_t d = 0; d < n; ++d) {
+            const int64_t len = (int64_t)calib_->tokens(d).size();
+            if (kv.can_ever_fit(len)) continue;
+            RAD_ERR("calib: document %zu is %lld tokens, more than the KV pool can ever hold", d,
+                    (long long)len);
+            ++too_long;
+        }
+        if (too_long) return RAD_E_FULL;
+    }
+    std::vector<std::unique_ptr<server::Sink>> sinks(n);
+    std::vector<std::unique_ptr<Request>> reqs(n);
+    for (size_t d = 0; d < n; ++d) {
+        sinks[d] = std::make_unique<server::Sink>(64);
+        auto r = std::make_unique<Request>();
+        r->id         = d + 1;
+        r->prompt     = calib_->tokens(d);
+        r->max_tokens = 1;           /* sampled from the last prefill row, never fed back */
+        r->ignore_eos = true;
+        r->sp.temp    = 0.0f;
+        r->sink       = sinks[d].get();
+        sinks[d]->id  = r->id;
+        reqs[d] = std::move(r);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    int bad = 0;
+    RAD_TRY(run_docs(reqs, sinks, true, "calib", 30, [&](size_t done, double s) {
+        RAD_INFO("calib: %zu / %zu documents, %.0f s", done, n, s);
+    }, &bad));
+    const long long pre = (long long)sched_.metrics().preemptions;
+    RAD_INFO("calib: %zu documents, %lld tokens in %.0f s, %lld preemption(s)", n,
+             (long long)calib_->n_tokens(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), pre);
+    if (pre) {
+        RAD_ERR("calib: %lld request(s) were preempted and prefilled again, so their tokens were "
+                "counted twice; rerun with fewer --max-num-seqs or a larger KV pool", pre);
+        return RAD_E_STATE;
+    }
+    return bad ? RAD_E_STATE : RAD_OK;
 }
 
 /* Copy a step's scored rows off the cards. They follow the sampler's rows in the logits buffer in

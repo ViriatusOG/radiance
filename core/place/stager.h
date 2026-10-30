@@ -270,7 +270,6 @@ private:
     int64_t  cap_ = 0;
     RouteCounts routes_ = nullptr;     /* routing-aware reads; null reads whole layers */
     void*    routes_ud_ = nullptr;
-    bool     routed_ = true;           /* RADIANCE_FILE_ROUTED=0 disables the filtering */
     int32_t* scratch_ = nullptr;        /* pinned, for the trigger's blocking counts copy */
     int64_t  scratch_n_ = 0;
     std::vector<int32_t> skipped_[2];   /* per buffer: units not read, nulled at release */

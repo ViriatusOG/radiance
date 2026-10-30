@@ -9,9 +9,11 @@
  */
 #include "lq_ggml.h"
 #include "lq_gptq.h"
+#include "lq_gpu.h"
 #include "lq_quant.h"
 #include "lq_common.h"
 #include "rad_plugin.h"
+#include "rad_abi_layout.h"
 
 #include <cstdio>
 #include <cstring>
@@ -20,9 +22,12 @@
 
 namespace lq {
 
-int grid_of(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g) {
+int grid_of(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g, bool vq_ok) {
     std::string why;
     if (grid_parse(o, n_o, g, &why) != RAD_OK) return refuse(w, why.c_str());
+    /* Only GPTQ's loop chooses vector codewords. */
+    if (!g->vq.empty() && !vq_ok) return refuse(w, "vq= is quantised by gptq");
+    if (g->tcq_L && !vq_ok) return refuse(w, "tcq= is quantised by gptq");
     if (!w || w->cols <= 0 || w->rows <= 0) return RAD_E_SHAPE;
     if (g->fwht && w->cols % g->fwht) return RAD_E_SHAPE;
     return RAD_OK;
@@ -56,6 +61,9 @@ const RadQuantOption kGptqOptions[] = {
     { "cd", RAD_P_INT, "0",
       "sweeps of coordinate descent after the loop: every code re-chosen at its conditional "
       "optimum against the same damped Hessian, the other columns held (lq_gptq.h)" },
+    { "dyn", RAD_P_INT, "0",
+      "1: each 128-column group's scale chosen when the loop reaches it, from the values earlier "
+      "columns' error has moved it to (one scale level, groups of 128)" },
 };
 const RadQuantOption kCastOptions[] = {
     { "dtype", RAD_P_STR, nullptr,
@@ -96,7 +104,7 @@ int rtn_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
 int gptq_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncoding* out) {
     if (declines(w)) return RAD_E_UNSUPPORTED;
     Grid g;
-    const int st = grid_of(o, n_o, w, &g);
+    const int st = grid_of(o, n_o, w, &g, true);
     if (st != RAD_OK) return st;
     *out = grid_encoding(g);
     if (rad_param_geti(o, n_o, "act_order", 0)) {
@@ -105,6 +113,8 @@ int gptq_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodi
         if (rad_param_geti(o, n_o, "cd", 0))
             return refuse(w, "cd= sweeps the columns in their stored order, and act_order=1 "
                              "stores them permuted; one or the other");
+        if (!g.vq.empty()) return refuse(w, "act_order=1 and vq= : a codeword spans adjacent columns");
+        if (g.tcq_L) return refuse(w, "act_order=1 and tcq= : the columns are stored in order");
         rad_enc_copy_str(out->transform, "perm");
         if (rad_enc_add_table(out, "t.perm", RAD_I32, 1, w->cols) < 0)
             return refuse(w, "the encoding has no room for the permutation table");
@@ -114,10 +124,18 @@ int gptq_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodi
 
 int64_t whole_weight(const RadParam*, int, const RadQuantWeight*) { return 0; }
 
+/* gptq's one scheme the core does not decode: a trellis grid's. */
+int gptq_decode(const RadEncoding* e, const RadQuantWeight* w, const void* const* planes,
+                int64_t row0, int64_t rows, float* out) {
+    if (!rad_enc_is(e, "trellis")) return RAD_E_UNSUPPORTED;
+    if (!w || w->rows <= 0 || w->cols <= 0) return RAD_E_SHAPE;
+    return grid_tcq_decode(e, w->rows, w->cols, planes, row0, rows, out);
+}
+
 int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
                   int64_t rows, void* const* planes) {
     Grid g;
-    const int st = grid_of(o, n_o, w, &g);
+    const int st = grid_of(o, n_o, w, &g, true);
     if (st != RAD_OK) return st;
     if (row0 != 0 || rows != w->rows) return RAD_E_SHAPE;
     const int64_t N = w->rows, K = w->cols;
@@ -144,10 +162,14 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
         }
     }
 
-    /* Scales come first, from the weight as it stands, and stay fixed through the loop. */
-    const Scales sc = grid_scales(g, src, N, K, imp);
+    /* Scales come first, from the weight as it stands, and stay fixed through the loop -- or with
+     * dyn=1 each group's is chosen again as the loop reaches it (gptq_quantise). */
+    Scales sc = grid_scales(g, src, N, K, imp);
     const Planes p = grid_planes(g, K, planes);
-    grid_store_scales(g, sc, p);
+    const bool dyn = rad_param_geti(o, n_o, "dyn", 0) != 0;
+    if (dyn && !gptq_dynamic_ok(g, sc))
+        return refuse(w, "dyn=1 chooses a 128-column group's scale as GPTQ reaches it, which needs "
+                         "one scale level per row and 128 columns");
 
     const Gram uf = gptq_factor(dir, w->name, K, g.fwht, damp, act ? perm.data() : nullptr);
     const float* u = uf ? uf->data() : nullptr;
@@ -156,14 +178,26 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     const int cd = (int)rad_param_geti(o, n_o, "cd", 0);
     std::vector<float> x0;
     if (cd > 0 && u) x0.assign(src, src + (size_t)(N * K));
-    gptq_quantise(g, src, codes.data(), sc, N, K, u);
+    {
+        std::string why;
+        const int st = gptq_quantise(g, src, codes.data(), sc, N, K, u, dyn && u, &why);
+        if (st != RAD_OK) {
+            std::fprintf(stderr, "libquant: %s: %s\n", w->name ? w->name : "?", why.c_str());
+            return st;
+        }
+    }
+    grid_store_scales(g, sc, p);
     if (!x0.empty()) {
         const Gram h = calib_gram(dir, w->name, K, g.fwht, "gptq cd");
         if (h) gptq_refine(g, x0.data(), src, codes.data(), sc, N, K, h->data(), damp, cd);
     }
+    const int64_t V = g.vq.empty() ? 1 : g.vdim;            /* one code a vector */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (N * K > (1 << 20))
+#endif
     for (int64_t r = 0; r < N; ++r) {
         uint8_t* cr = p.codes + r * p.codes_row;
-        for (int64_t c = 0; c < K; ++c) grid_store_code(g, cr, c, codes[(size_t)(r * K + c)]);
+        for (int64_t c = 0; c < K; c += V) grid_store_code(g, cr, c / V, codes[(size_t)(r * K + c)]);
     }
     if (act) {
         const int tp = grid_encoding(g).n_planes;      /* t.perm follows the grid's planes */
@@ -228,7 +262,7 @@ const RadQuantizerInfo kQuantizers[] = {
       "error feedback against the layer's input Hessian: each column's rounding error is spread "
       "over the columns after it, on any grid, the scales fixed from the weight first",
       kGptqOptions, (int)(sizeof kGptqOptions / sizeof kGptqOptions[0]),
-      gptq_encoding, whole_weight, gptq_quantize, nullptr },
+      gptq_encoding, whole_weight, gptq_quantize, gptq_decode },
     { "cast",
       "a float weight converted to another float dtype, to nearest even, with no scale",
       kCastOptions, (int)(sizeof kCastOptions / sizeof kCastOptions[0]),
@@ -264,8 +298,10 @@ const RadPluginInfo kInfo = {
 }  /* namespace */
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 extern "C" int rad_quant_count(void) { return (int)table().size(); }
 extern "C" const RadQuantizerInfo* rad_quant_at(int i) {
     return (i >= 0 && i < rad_quant_count()) ? table()[(size_t)i] : nullptr;
 }
+extern "C" int rad_quant_devices(const int* ids, int n) { return lq::gpu_set_devices(ids, n); }

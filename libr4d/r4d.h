@@ -677,6 +677,11 @@ int  r4d_gemm_fp8a8_nt_m16_max_m(void);
 // output element, not the order of the K tiles it accumulates, and the split derives from
 // `gx * mw`, which the rule keeps invariant. r4d_selftest compares bytes at every legal count.
 void r4d_gemm_fp8a8_pin_mw(int mw);
+// Test hook: pins the waves the narrow tiles' K split aims for (fp8a8 and i8a8 128, the IQR narrow
+// tile 512) for every subsequent call on every thread; 0 restores each caller's own. Not for
+// serving; r4d_selftest holds it at the IQR tile's target around the i8a8 reference, so the two
+// split K alike and their bytes compare.
+void r4d_gemm_i8a8_pin_split_waves(int waves);
 // Test hook: pins the QSA score's form. 0 is the launcher's rule, 1 the scalar decode form, 2 the
 // matrix form (which refuses a shape it is not built for). The two sum in different orders, so
 // r4d_selftest --perfqsa compares them to a tolerance.
@@ -787,6 +792,14 @@ int  r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N, int a_ld, 
 int  r4d_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
                          int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                          long stream);
+// The same at a weight scale constant over 8 or 32 rows (a tcq_rb trellis), folded as the fp8
+// tile.
+int  r4d_gemm_i8a8_rb8_tiled(long a, long ascale, long wq, long ws, long c,
+                             int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
+                             long stream);
+int  r4d_gemm_i8a8_rb32_tiled(long a, long ascale, long wq, long ws, long c,
+                              int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
+                              long stream);
 int  r4d_gemm_fp8a8_block(void);
 
 // Per-(row, 128-column) symmetric E4M3 quantisation of a bf16 activation, read by the fp8a8 GEMMs.

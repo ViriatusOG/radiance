@@ -301,7 +301,7 @@ TEST(a_speech_session_refuses_what_it_cannot_take_and_goes_on) {
 
 /* A frame that is brackets alone, nested tens of thousands deep, is still valid JSON: parsing it
  * into a tree and tearing that tree down both recurse once per level, so the session parses it
- * bounded — the tree never outgrows the stack — answers its invalid-message error, and goes on.
+ * bounded -- the tree never outgrows the stack -- answers its invalid-message error, and goes on.
  */
 TEST(a_deeply_nested_frame_is_refused_not_fatal) {
     Stream s;

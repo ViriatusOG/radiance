@@ -271,6 +271,30 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  draft_tree;
+
+    /* ---- appended in ABI 32 (calibration) */
+    /* --calib-dir DIR: the deployment records calibration statistics (the second moment of each
+     * linear's input, GPTQ's Hessian) into DIR; null records nothing. A plugin that keeps none
+     * ignores it. `calib_layer_lo`..`calib_layer_hi` (--calib-layers, hi exclusive; both 0 for
+     * every layer) bound the layers recorded in one run, so a model whose statistics do not fit
+     * in memory at once is recorded in several runs over the same corpus. `calib_tokens` is the
+     * corpus's token count under --calib-corpus: the plugin writes its files once it has seen
+     * that many rows; 0 when the deployment drives no corpus.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    const char* calib_dir;
+    int32_t  calib_layer_lo;
+    int32_t  calib_layer_hi;
+    int64_t  calib_tokens;
+
+    /* ---- appended in ABI 32 (an image generator's bounds) */
+    /* --image-gen-max-pixels: the largest image an image generator makes, in pixels; and
+     * --image-gen-max-refs: the reference pictures a request at most. 0: the model's own. A
+     * generator sizes its per-image and conditioning buffers for them and states them in its
+     * RadGeneratorDecl (max_tokens, max_refs), which the core holds requests to; one that keeps
+     * fixed buffers ignores them, and the core says so at startup. */
+    int64_t  gen_max_pixels;
+    int64_t  gen_max_refs;
 } RadBuildCtx;
 
 /* ================================================================== control vectors */
@@ -698,6 +722,11 @@ int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table);
  * f32, device, [>= max_seqs, dim]: `dim` is the vector width the core reads. A Program declares
  * this or logits, never both. */
 int rad_declare_pooled(RadBuilder* b, rad_buf pooled);
+
+/* The most integer words one request may hand the plugin (RadBatch::plugin_words), 0 for none.
+ * The engine stages that many a sequence in the step batch and refuses a longer request before
+ * it is admitted, so the plugin reads its words at the size it declared. Additive export. */
+int rad_declare_plugin_words(RadBuilder* b, int64_t max_words);
 
 
 /* ================================================================== the drafter */
@@ -1569,6 +1598,13 @@ typedef struct RadArchProbe {
      * chain: a plugin that never measured trees asks for none. 64-bit so it starts past the older
      * struct's tail padding, which a plugin built against it may copy over. */
     int64_t tree_pays;
+
+    /* ---- appended in ABI 32 (inputs: an image generator's bounds) */
+    /* Set by the core before the call: --image-gen-max-pixels and --image-gen-max-refs, as
+     * RadBuildCtx carries them to declare (0: the model's own). A generator's gen_rows and
+     * gen_patches answer for them. */
+    int64_t gen_max_pixels;
+    int64_t gen_max_refs;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

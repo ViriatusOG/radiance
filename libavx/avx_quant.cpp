@@ -740,7 +740,9 @@ AVX_KERNEL(gram_accum) {
     }
 
     /* The upper triangle, each sum added to both (k1, k2) and (k2, k1): the products commute, so
-     * the two sums are the same bits. Rows of the triangle shrink, hence the dynamic schedule. */
+     * the two sums are the same bits. Rows of the triangle shrink, hence the dynamic schedule.
+     * `upper` 1 leaves (k2, k1) as it was. */
+    const bool upper = p_int(a, "upper", 0) != 0;
     const int64_t hst = laststride(h);
 #ifdef _OPENMP
     AVX_PRAGMA(omp parallel for schedule(dynamic, 8) if(n * n >= 1024 || avx_par_forced())
@@ -753,7 +755,7 @@ AVX_KERNEL(gram_accum) {
                 acc += (double)xs[r * n + k1] * (double)xs[r * n + k2];
             const int64_t o12 = rowoff(h, k1, n) + k2 * hst, o21 = rowoff(h, k2, n) + k1 * hst;
             stt(h, o12, (float)((double)ldt(h, o12) + acc));
-            if (k2 != k1) stt(h, o21, (float)((double)ldt(h, o21) + acc));
+            if (k2 != k1 && !upper) stt(h, o21, (float)((double)ldt(h, o21) + acc));
         }
     }
     return RAD_OK;

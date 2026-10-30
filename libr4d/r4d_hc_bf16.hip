@@ -3199,7 +3199,10 @@ void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* _
 constexpr unsigned kMaxMixCtr = 2048;
 
 unsigned int* hc_mix_ctr(RadStream s) {
-    static std::mutex m;
+    /* A lock a device: zeroing a block waits for the card, and under tensor parallelism the card
+     * can be inside an all-reduce whose other half the peer rank has yet to issue, so a peer's
+     * first call must not wait behind this card's (see split_ctr). */
+    static std::mutex m[16];
     struct Slot { std::atomic<RadStream> key{nullptr}; std::atomic<unsigned int*> ctr{nullptr}; };
     static Slot slot[16][4];
     int dev = 0;
@@ -3207,7 +3210,7 @@ unsigned int* hc_mix_ctr(RadStream s) {
     for (int i = 0; i < 4; ++i)
         if (slot[dev][i].key.load(std::memory_order_acquire) == s)
             return slot[dev][i].ctr.load(std::memory_order_acquire);
-    std::lock_guard<std::mutex> lk(m);
+    std::lock_guard<std::mutex> lk(m[dev]);
     for (int i = 0; i < 4; ++i)
         if (slot[dev][i].key.load(std::memory_order_relaxed) == s)
             return slot[dev][i].ctr.load(std::memory_order_relaxed);

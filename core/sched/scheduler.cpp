@@ -310,7 +310,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (r->embed && (int64_t)r->prompt.size() > cfg_.max_tok) return RAD_E_INVAL;
     /* Every prompt id, tokenised or client-supplied, names a real vocabulary row: an id past the
      * embedding table is refused at admission, never staged into a pass. Raw id arrays reach here
-     * straight from the request body, and an op failing mid-step is a device fault (spec §17) —
+     * straight from the request body, and an op failing mid-step is a device fault (spec §17) --
      * the whole engine would die for one bad number. Same bound as the scored-prompt check below.
      */
     for (int32_t t : r->prompt)

@@ -551,8 +551,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
          * data and sends the key on every data fetch. Everything else is guarded, including
          * /tokenize, which vLLM leaves open (it only guards /v1).
          *
-         * The exemption follows the methods those paths actually answer — reads, plus the POST
-         * /ping of the health-check convention — so it cannot ride a method the router might
+         * The exemption follows the methods those paths actually answer -- reads, plus the POST
+         * /ping of the health-check convention -- so it cannot ride a method the router might
          * one day put behind one of these paths. */
         const std::string& p = hreq.path;
         const std::string& m = hreq.method;

@@ -67,6 +67,11 @@ bool code_object_kernels(const void* elf, size_t size, std::vector<KernelMeta>* 
 enum : uint8_t { kFenceAcquireSystem = 1, kFenceReleaseSystem = 2 };
 void set_next_fence(uint8_t f);
 
+/* ------------------------------------------------------------------ test hooks */
+
+/* Whether the signal behind a rad_ride token could be handed out again now (tests/device_test.cpp). */
+bool ride_reusable(void* token);
+
 }  // namespace aql
 }  // namespace rad
 

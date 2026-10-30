@@ -28,9 +28,11 @@
 #include "rad_builder.h"
 #include "rad_runtime.h"
 #endif
+#include "rad_abi_layout.h"
 
 #if !defined(RADTEST_BASE) && !defined(RADTEST_OVER) && !defined(RADTEST_CONFLICT) && \
-    !defined(RADTEST_BADABI) && !defined(RADTEST_IS_ARCH) && !defined(RADTEST_EXTRA) && \
+    !defined(RADTEST_BADABI) && !defined(RADTEST_BADLAYOUT) && !defined(RADTEST_IS_ARCH) && \
+    !defined(RADTEST_EXTRA) && \
     !defined(RADTEST_BADTUNE) && !defined(RADTEST_DECLINE)
 #define RADTEST_BASE 1
 #endif
@@ -614,10 +616,17 @@ static const RadKernelInfo kKernels[] = {
       .domain = RAD_DOMAIN_DEVICE, .priority = 1000, .launch = t_launch },
 };
 
+#if defined(RADTEST_BADLAYOUT)
+static const RadPluginInfo kInfo = {
+    RAD_PLUGIN_KERNEL, "radtest_badlayout", "0.1",
+    "reports this engine's ABI version over another layout; must be refused at load", "host",
+};
+#else
 static const RadPluginInfo kInfo = {
     RAD_PLUGIN_KERNEL, "radtest_badabi", "0.1",
     "reports an ABI version this engine does not speak; must be refused at load", "host",
 };
+#endif
 
 #endif
 
@@ -628,6 +637,13 @@ static const RadPluginInfo kInfo = {
 uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION + 7u; }
 #else
 uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+#endif
+#if defined(RADTEST_BADLAYOUT)
+/* Deliberately wrong: the right version over another layout, as a plugin built against another
+ * tree's headers at the same number reports it. Refused at load with both fingerprints. */
+uint64_t rad_plugin_abi_layout(void) { return rad_abi_layout() ^ 1u; }
+#else
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 #endif
 
 const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }

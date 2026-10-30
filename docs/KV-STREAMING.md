@@ -185,13 +185,18 @@ A staged pass reads the pool by block id, while `kv_store_streamed` writes the r
 map names a slot (none before the group's first decode), so a staged pass also stores at identity
 (`AttnGatedFP8::store_stage_identity`, GLM's plain store), after the mirror writer.
 
-**Volume.** A layer's copy moves the mirror row up to the highest block id the pass can read, not the
-whole context allocation. The bound is `KVManager::held_top_blocks`, one past the highest held block,
-read every step after the step's blocks are ensured (`kvstream_bound_live`). It must never be low:
-the attention would read whatever the previous layer left, which is wrong text, not a fault. It is
-an upper bound because every id a table holds is held, the stage is identity-addressed from block 0,
-and allocation is not assumed ascending. It counts every held block, including the prefix cache's;
-0 (nothing held) stages the whole row.
+**Volume.** A layer's copy moves only the blocks the step's own block tables name, not the whole
+context allocation: its list carries one range per run of those ids (`kvstream_runs`), read every
+step after the step's blocks are ensured (`kvstream_step_runs`). The ranges must never miss a block
+the pass reads: the attention would read whatever the previous layer left, which is wrong text, not
+a fault. They cover every read because the pass reaches the stage only through the step's tables,
+the stage is identity-addressed as the mirror row is, and a prefix hit's cached blocks are in the
+hit's table. Gaps of up to 16 blocks are copied through, and past 256 ranges the smallest gaps are,
+so a fragmented table stays one short list. Blocks the prefix cache retains for other
+conversations are not copied: they often hold the low ids, and a new sequence takes ids above them,
+so a bound on the highest id a step names (or on the highest held one, as before) would still copy
+every retained conversation, and each later prefill paid for all of them. A step whose sequences
+are not known, or whose trunk pass takes the ring, copies up to `KVManager::held_top_blocks`.
 
 ### 3.6 The ABI surface
 
@@ -263,8 +268,8 @@ Capacity is bought in host RAM. Flash-Next fp8, two ranks, `--kv-resident 24576`
 Per retained token: 6.00 KiB of mirror (host), 0.83 KiB of indexer and 0.50 KiB of stage (VRAM);
 only the ring does not scale. Prefill comes out 3-5 % above the resident arm, because the VRAM the
 cache no longer holds goes to experts that would otherwise be read over the link. The stage copy's
-cost is its volume (the held bound moves 0.6 GiB a pass at 16k and 45 GiB at 160k, within 0.3 % of
-the live KV), not its overlap, since it shares the link as an equal (§6.1). Capacity is bought with
+cost is its volume (0.6 GiB a pass at 16k and 45 GiB at 160k, within 0.3 % of the live KV, a
+figure the step's own ranges keep however much the prefix cache retains), not its overlap, since it shares the link as an equal (§6.1). Capacity is bought with
 `--max-num-seqs`, inside the trained window, so no rope change is needed. Perplexity: 3.994 resident,
 4.015 with a covering window, 4.014 with a fraction of it.
 
@@ -395,7 +400,9 @@ whole context resident during prefill (the group would still carve `n_layers x c
 | a mirror nothing writes | the store must resolve to a kernel for the group's geometry | `a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path`; `a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed`; `a_resolve_declared_for_another_group_does_not_enable_streaming` |
 | the flag honoured with no streamed path | the capability gate | `a_model_whose_architecture_declares_no_streamed_ops_ignores_the_flag`; `a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring` |
 | a stage reading the previous layer's bytes | the ordering rule (§3.5.1) | `a_streamed_groups_layers_may_all_alias_one_pool_slot`; `scripts/kv-stage-parity-64k.sh` |
-| a stage copying less than the pass reads | the `held_top_blocks` bound | `scripts/kv-stage-parity-64k.sh` |
+| a stage copying less than the pass reads | the ranges of the step's own tables | `the_stage_ranges_cover_every_block_a_table_names`; `scripts/kv-stage-parity-64k.sh` |
+| a stage copying what other conversations hold | the ranges of the step's own tables | `the_stage_ranges_leave_out_blocks_no_table_of_the_step_names` |
+| a stage list's mark reused while the list still polls it, both cards stopped | the signal pool holds a mark until its list's engine is past the poll | `device_test` `a_dma_lists_mark_stays_out_of_the_pool_until_the_engine_has_read_it` |
 | maps leaving the pool short of the probe | `kvstream_maps_charged` in both paths | `a_streamed_groups_maps_are_charged_before_the_pool_is_sized` |
 | a dense-read sibling funded for one sequence | the `kvstream_dense` floor | `a_dense_read_groups_floor_holds_every_sequence_while_a_sibling_streams` |
 | a recorded pass replayed against another view | `kvstream_view_key`; fixed addresses | `Ctx::pass_key`'s static assertion on `RadKVGroupBatch` |

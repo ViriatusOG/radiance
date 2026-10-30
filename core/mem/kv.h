@@ -430,7 +430,8 @@ public:
     int64_t total_blocks(int32_t group) const;
     /* One past the highest held block, rounded up to a `held_hist_` bucket (0 when nothing is held):
      * an upper bound on every id a block table can name, which a streamed group's stage copies up
-     * to (kvstream/stage.h). It counts blocks the prefix cache and other sequences hold too. */
+     * to for a step whose own tables it cannot read (kvstream/stage.h, "Volume"). It counts blocks
+     * the prefix cache and other sequences hold too. */
     int64_t held_top_blocks(int32_t group) const;
     int64_t free_states(int32_t group) const;
 

@@ -52,8 +52,8 @@
  *
  *   qk_norm_rope_gate
  *       Not byte-identical to the four kernels it replaces (docs/OPS.md): it folds a sum of
- *       squares over one wave per head where `rmsnorm` folds over r4d_act_threads(M, n) threads,
- *       so the two differ by a ULP.
+ *       squares over one wave per head where `rmsnorm` folds over kR4dSumLanes' 256 lanes, so
+ *       the two differ by a ULP.
  *
  *   sample_chain
  *       Stands beside the decomposed sampling stages rather than replacing them: one workgroup
@@ -218,9 +218,9 @@ bool fp8_geometry_ok(const RadParam* p, int n_p, int64_t M, int64_t n) {
  * All three steps are libr4d rows (add_bf16, rmsnorm_bf16, quant_act_fp8), so the check stays
  * within libr4d; `rmsnorm_add` has no libr4d row.
  *
- * Byte identity depends on the workgroup width agreeing: both kernels take their thread count from
- * `r4d_act_threads(M, n)`, which decides the columns each thread folds into the sum of squares
- * (see the launcher in r4d_model_bf16.hip). `M` is mirrored verbatim for that reason.
+ * Both kernels fold the sum of squares in kR4dSumLanes' partition at whatever width
+ * `r4d_act_threads(M, n)` gives them (r4d_common.h), so the width does not decide the bytes; `M`
+ * is mirrored verbatim so both launch the same shape.
  *
  * Step 0 writes the sum into the fused residual operand, both its own `b` and the fused kernel's
  * in-place residual, so both sides leave the same buffers behind. `add_bf16` is safe in place:

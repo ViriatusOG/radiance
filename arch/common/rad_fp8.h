@@ -890,13 +890,99 @@ inline bool linear_is_w8(const RadEncoding& e) {
 
 /* The same planes rotated by the unnormalised 128-wide Hadamard along K, the 1/128 in the scale
  * (libquant's `transform=fwht128`), served at i8a8h behind had_quant_act_i8g. */
-inline bool linear_is_w8h(const RadEncoding& e) {
-    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 ||
+/* How a weight served at i8a8h stores its codes on the same grid (a bf16 scale per [1 x 128],
+ * /fwht128): int8, or a narrower form kept at its codes' width in VRAM and decoded by the GEMM that
+ * reads it (libr4d's gemm_iqr rows) -- signed 2..7-bit codes; unsigned codes less a zero point per
+ * [1 x 128]; unsigned codes indexing an int8 codebook; the codes a bitshift trellis shifts in down
+ * each column ("trellis", whose scale may also be an E4M3 one per [1 x 128] under an f32 or bf16
+ * second level, the bf16 of their product). Each decodes to the int8 grid's values exactly. */
+enum class W8hForm { None, I8, Signed, Zero, Table, Grid, Trellis };
+/* A computed trellis (libquant's tcq_code=mad) carries its code's constants as one more plane,
+ * "trellis.mad", which the GEMM reads instead of the table. */
+inline int linear_w8h_mad(const RadEncoding& e) { return rad_enc_plane(&e, "trellis.mad") ? 1 : 0; }
+/* A trellis under one f32 scale a row times one f32 a 128-K block for all rows (libquant's
+ * tcq_colf): "scale" [1 x whole] and "scale.col" [whole x 128], one view. */
+inline bool linear_w8h_rowf(const RadEncoding& e) {
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    const RadEncPlane* cf = rad_enc_plane(&e, "scale.col");
+    return rad_enc_is(&e, "trellis") && sc && cf && sc->kind == RAD_PLANE_TILED &&
+           sc->dtype == RAD_F32 && sc->block[0] == 1 && sc->block[1] == 0 &&
+           cf->kind == RAD_PLANE_TILED && cf->dtype == RAD_F32 && cf->block[0] == 0 &&
+           cf->block[1] == RAD_FP8_BLOCK && !rad_enc_plane(&e, "scale.1");
+}
+/* A trellis weight's scale in two levels: E4M3 per [1 x 128] under "scale.1" for the tensor or
+ * the row. */
+inline bool linear_w8h_scale2(const RadEncoding& e) {
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    const RadEncPlane* s2 = rad_enc_plane(&e, "scale.1");
+    return rad_enc_is(&e, "trellis") && e.n_planes - linear_w8h_mad(e) == 4 && sc && s2 &&
+           sc->dtype == RAD_F8E4M3 &&
+           s2->kind == RAD_PLANE_TILED && (s2->dtype == RAD_F32 || s2->dtype == RAD_BF16) &&
+           (s2->block[0] == 0 || s2->block[0] == 1) && s2->block[1] == 0;
+}
+inline W8hForm linear_w8h_form(const RadEncoding& e) {
+    const bool trellis = rad_enc_is(&e, "trellis");
+    if ((!rad_enc_is(&e, "affine") && !trellis) ||
+        std::strncmp(e.transform, "fwht128", RAD_ENC_STR) != 0)
+        return W8hForm::None;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    const bool two = linear_w8h_scale2(e), rowf = linear_w8h_rowf(e);
+    if (!sc || (sc->dtype != RAD_BF16 && !two && !rowf) || sc->block[0] != 1 ||
+        sc->block[1] != (rowf ? 0 : RAD_FP8_BLOCK))
+        return W8hForm::None;
+    const uint32_t cd = e.plane[0].dtype;
+    /* A vector grid: one code a [1 x V] run of columns, an i8 grid {E x V}. */
+    if (e.n_planes == 3 && e.plane[0].block[1] > 1) {
+        const RadEncPlane* gr = rad_enc_plane(&e, "grid");
+        return gr && gr->kind == RAD_PLANE_TABLE && gr->dtype == RAD_I8 &&
+                       gr->extent[1] == e.plane[0].block[1] && RAD_FP8_BLOCK % gr->extent[1] == 0
+                   ? W8hForm::Grid : W8hForm::None;
+    }
+    const bool sgn = cd == RAD_I2 || cd == RAD_I3 || cd == RAD_I4 || cd == RAD_I5 || cd == RAD_I6 ||
+                     cd == RAD_I7;
+    const bool uns = cd == RAD_U1 || cd == RAD_U2 || cd == RAD_U3 || cd == RAD_U4 || cd == RAD_U5 ||
+                     cd == RAD_U6 || cd == RAD_U7 || cd == RAD_U8;
+    if (e.plane[0].block[1] != 1) return W8hForm::None;
+    if (e.n_planes == 2) return cd == RAD_I8 ? W8hForm::I8 : sgn ? W8hForm::Signed : W8hForm::None;
+    if (e.n_planes - (trellis ? linear_w8h_mad(e) + (rowf ? 1 : 0) : 0) != (two ? 4 : 3) || !uns)
+        return W8hForm::None;
+    /* A trellis: the codes a bitshift trellis shifts in down each column, an i8 value a state. */
+    if (trellis) {
+        const RadEncPlane* tp = rad_enc_plane(&e, "trellis");
+        if (!tp) return W8hForm::None;
+        const int64_t S = tp->extent[0];
+        return tp->kind == RAD_PLANE_TABLE && tp->dtype == RAD_I8 && tp->extent[1] == 1 &&
+                       tp->block[0] > 0 && S > ((int64_t)1 << rad_dtype_bits(cd)) && S <= 65536 &&
+                       (S & (S - 1)) == 0
+                   ? W8hForm::Trellis : W8hForm::None;
+    }
+    const RadEncPlane* zp = rad_enc_plane(&e, "zero");
+    if (zp && cd != RAD_U1 && cd != RAD_U8 && (zp->dtype == cd || zp->dtype == RAD_U8) &&
+        zp->block[0] == 1 && zp->block[1] == RAD_FP8_BLOCK)
+        return W8hForm::Zero;
+    const RadEncPlane* tb = rad_enc_plane(&e, "table");
+    if (tb && tb->kind == RAD_PLANE_TABLE && tb->dtype == RAD_I8 && tb->extent[0] == 1 &&
+        tb->extent[1] >= 2 && tb->extent[1] <= ((int64_t)1 << rad_dtype_bits(cd)))
+        return W8hForm::Table;
+    return W8hForm::None;
+}
+inline bool linear_is_w8h(const RadEncoding& e) { return linear_w8h_form(e) != W8hForm::None; }
+
+/* A rotated asymmetric weight at four or five bits: u4 or u5 codes, an f16 scale and a u8 (or
+ * code-width) zero point per 128 of K under the 128-wide Hadamard (libquant `codes=u5 zero=u8
+ * group=128 scale=f16 transform=fwht128`). Read by gemm_nt_q at w4a8i8_asym / w5a8i8 over the
+ * rotated int8 codes an i8a8h trunk's producers write, so it mixes with i8a8h linears in one trunk.
+ * The scale carries the transform's 1/128, as an i8a8h weight's does. */
+inline bool linear_is_wnh(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 3 ||
         std::strncmp(e.transform, "fwht128", RAD_ENC_STR) != 0)
         return false;
-    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
-    return e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 && sc && sc->dtype == RAD_BF16 &&
-           sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
+    const RadEncPlane *sc = rad_enc_plane(&e, "scale"), *zp = rad_enc_plane(&e, "zero");
+    const uint32_t cd = e.plane[0].dtype;
+    return (cd == RAD_U4 || cd == RAD_U5) && e.plane[0].block[1] == 1 && sc && zp &&
+           sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK &&
+           (zp->dtype == RAD_U8 || zp->dtype == cd) && zp->block[0] == 1 &&
+           zp->block[1] == RAD_FP8_BLOCK;
 }
 
 /* The OCP-MXFP4 weight LinearFP8 serves at mxfp4a8: e2m1 codes and an E8M0 exponent per [1 x 32],
@@ -990,7 +1076,7 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool known = weight_enc(b, wn, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
-    probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc));
+    probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
      * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
@@ -1160,8 +1246,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      *
      * A rotated weight (i8a8h) takes had_quant_act_i8g instead. It reads a producer's codes only
      * when they are rotated too (ActFP8::q8_rot, a `_had_quant_i8g` producer); a plain int8 weight
-     * only when they are not. */
-    const bool rot8 = known && linear_is_w8h(enc);
+     * only when they are not. A rotated four- or five-bit asymmetric weight (linear_is_wnh) reads
+     * the same rotated codes at w4a8i8_asym / w5a8i8, through two views: codes, and (scale, zero)
+     * as `b_scale` at the logical extents. */
+    const bool asym = known && linear_is_wnh(enc);
+    const bool rot8 = known && (linear_is_w8h(enc) || asym);
     i8 = known && (linear_is_w8(enc) || rot8);
     if (i8) {
         if (stored) {
@@ -1191,13 +1280,36 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         RowParts rp;
         RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
         const char* sn = nm.f("%s.scale", base);
-        w  = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, access, shard, grp,
+        /* A narrower i8a8h weight's codes view takes the plane that decodes it too. */
+        const W8hForm form = linear_w8h_form(enc);
+        const RadEncPlane* tpl = rad_enc_plane(&enc, "trellis");
+        const bool trb = form == W8hForm::Trellis && tpl && tpl->block[1] > 1;
+        const char* cv = form == W8hForm::Zero    ? "codes,zero"
+                       : form == W8hForm::Table ? "codes,table"
+                       : form == W8hForm::Grid  ? "codes,grid"
+                       : form == W8hForm::Trellis ? (linear_w8h_mad(enc) ? "codes,trellis,trellis.mad"
+                                                                          : "codes,trellis")
+                                                : "codes";
+        /* Declared at the stored codes' dtype; the kernel's layout keeps them at that width
+         * (libr4d's r4d_iqr_layout.cpp). */
+        w  = decl_view(b, wn, nullptr, cv, enc.plane[0].dtype, { N, K }, access, shard, grp,
                        rp.w, rp.n);
-        ws = decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK }, access,
-                       shard, grp, rp.w, rp.n);
+        /* A view of two planes is declared at the weight's logical extents and sliced in its
+         * columns, the stored planes left to the layout hook. */
+        const bool two = linear_w8h_scale2(enc) || linear_w8h_rowf(enc);
+        ws = asym ? decl_view(b, sn, wn, "scale,zero", RAD_F16, { N, K }, access, shard, grp,
+                              rp.w, rp.n)
+             : linear_w8h_rowf(enc) ? decl_view(b, sn, wn, "scale,scale.col", RAD_F32, { N, K },
+                                                access, shard, grp, rp.w, rp.n)
+             : two ? decl_view(b, sn, wn, "scale,scale.1", RAD_F8E4M3, { N, K }, access, shard,
+                               grp, rp.w, rp.n)
+                   : decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK }, access,
+                               shard, grp, rp.w, rp.n);
         if (!w || !ws) return RAD_E_INVAL;
         if (span_hi > 0) {
-            const bool col = shard == RAD_SHARD_COL;
+            /* The (scale, zero) and (scale, scale.1) views are at the logical extents, sliced as
+             * the codes are. */
+            const bool col = shard == RAD_SHARD_COL && !asym && !two;
             if (col && (span_lo % RAD_FP8_BLOCK || span_hi % RAD_FP8_BLOCK)) {
                 fprintf(stderr, "radiance: '%s' is sliced [%lld, %lld) on this rank, which cuts a "
                                 "%d-column scale group\n", base, (long long)span_lo,
@@ -1205,6 +1317,13 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                 return RAD_E_INVAL;
             }
             RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+            if ((asym || two) && shard == RAD_SHARD_COL &&
+                (span_lo % RAD_FP8_BLOCK || span_hi % RAD_FP8_BLOCK)) {
+                fprintf(stderr, "radiance: '%s' is sliced [%lld, %lld) on this rank, which cuts a "
+                                "%d-column scale group\n", base, (long long)span_lo,
+                        (long long)span_hi, RAD_FP8_BLOCK);
+                return RAD_E_INVAL;
+            }
             RAD_ARCH_TRY(rad_weight_shard_span(b, ws, col ? span_lo / RAD_FP8_BLOCK : span_lo,
                                                col ? span_hi / RAD_FP8_BLOCK : span_hi));
         }
@@ -1215,12 +1334,21 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
                      RAD_NOWEIGHTS),
                   { a.x }, { a.q8, a.s8 });
-        op = rw(b, RAD_OP(b, "gemm_nt_q",
-                   RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                              RAD_INT("group", RAD_FP8_BLOCK),
-                              RAD_STR("dtype", rot8 ? "i8a8h" : "i8a8")),
-                   RAD_WEIGHTS(w, ws)),
-               { a.q8, a.s8 }, { y });
+        const char* qdt = asym ? (enc.plane[0].dtype == RAD_U5 ? "w5a8i8" : "w4a8i8_asym")
+                               : rot8 ? "i8a8h" : "i8a8";
+        /* A trellis on an int8 grid of several rows a scale (libquant's tcq_rb) says how many
+         * (`w_rb`), which a GEMM's fold may read as one scale a block of rows. */
+        op = trb ? rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt),
+                                     RAD_INT("w_rb", tpl->block[1])),
+                          RAD_WEIGHTS(w, ws)),
+                      { a.q8, a.s8 }, { y })
+                 : rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt)),
+                          RAD_WEIGHTS(w, ws)),
+                      { a.q8, a.s8 }, { y });
         return (op_q || a.q8_fed) && op ? RAD_OK : RAD_E_INVAL;
     }
 

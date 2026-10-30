@@ -155,6 +155,13 @@ struct KVViewState {
     int64_t shape0 = 0;            /* the operand's [blocks] extent for this view */
 };
 
+/* A byte range of one layer's row in a streamed group's mirror and stage (kvstream/stage.h,
+ * "Volume"): both are laid out by block id, so one range is the same offsets in either. */
+struct KVStageRun {
+    int64_t off   = 0;
+    int64_t bytes = 0;
+};
+
 struct KVPoolBinding {
     void*    base = nullptr;
     int64_t  layer_stride = 0;      /* bytes between one layer's cache and the next */
@@ -173,9 +180,9 @@ struct KVPoolBinding {
     KVViewState ring;
     KVViewState stage;
     bool        has_stage = false;
-    /* Bytes of a layer's mirror row a staged pass copies, from the held bound (kvstream/stage.h,
-     * "Volume"), set each step. 0 copies the whole row. */
-    int64_t     stage_live_bytes = 0;
+    /* The ranges of a layer's mirror row a staged pass copies (kvstream/stage.h, "Volume"), set
+     * each step. Empty copies the whole row. */
+    std::vector<KVStageRun> stage_runs;
 };
 
 /* The KV stage's driver (kvstream/stage.cpp), declared here for Ctx::tape_kv_stage. */

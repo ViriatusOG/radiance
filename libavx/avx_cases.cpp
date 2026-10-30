@@ -65,6 +65,7 @@ std::vector<Case> build_cases() {
         add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt), HI("scalar", 1) },
             EB(9, 645, w, 2));
         add("seg_mean",    { HI("M", 23), HI("n", 645), HS("dtype", dt) }, EB(23, 645, w, 1));
+        add("seg_softmax_pool", { HI("M", 23), HI("n", 645), HS("dtype", dt) }, EB(23, 645, w, 2));
         if (!std::strcmp(dt, "bf16"))
             add("seg_mean_bf16_sum", { HI("M", 23), HI("n", 645), HS("dtype", dt) },
                 EB(23, 645, w, 1));
@@ -1222,6 +1223,21 @@ std::vector<Case> build_cases() {
                         HS("add", "-1 7 -7 -3") });
     add("sub_i32", { HI("M", 1) });
     add("sub_i32", { HI("M", 37) });
+
+    /* The row-form names: every case of the base op again under the name. */
+    {
+        const char* const forms[][2] = { { "rmsnorm", "rmsnorm_rows" }, { "rope", "rope_rows" },
+                                         { "gemm_nt_q", "gemm_nt_q_short" },
+                                         { "gemm_nt_q_gated", "gemm_nt_q_gated_wide" } };
+        const size_t n = c.size();
+        for (size_t i = 0; i < n; ++i)
+            for (const auto& f : forms)
+                if (std::strcmp(c[i].op, f[0]) == 0) {
+                    Case x = c[i];
+                    x.op = f[1];
+                    c.push_back(x);
+                }
+    }
 
     /* ================================================================== speed-only, at model size
      *

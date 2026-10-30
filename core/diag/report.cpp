@@ -94,6 +94,14 @@ std::string host_lines(const HostFacts& h, const RunFacts& r) {
     return o;
 }
 
+const char* level_tag(Finding::Level l) {
+    return l == Finding::Incompatible ? "INCOMPATIBLE" : l == Finding::Warn ? "WARN" : "note";
+}
+
+const char* level_json(Finding::Level l) {
+    return l == Finding::Incompatible ? "incompatible" : l == Finding::Warn ? "warn" : "note";
+}
+
 std::string card_lines(const CardFacts& c) {
     std::string o;
     std::string who = c.rank >= 0 ? fmt("rank %d (device %d)", c.rank, c.device)
@@ -137,13 +145,20 @@ std::string card_lines(const CardFacts& c) {
 std::string render(const std::vector<ConfigRow>& config, const std::vector<Decision>& derived,
                    const Facts& f, const RunFacts& r, const std::vector<Finding>& findings) {
     std::string o;
+    if (r.unsupported)
+        for (const std::string& l : unsupported_banner()) o += l + "\n";
     o += "STARTUP REPORT" + (r.version.empty() ? std::string() : " -- radiance " + r.version) +
          (r.failed ? " -- STARTUP STOPPED; this is what it had resolved when it did\n" : "\n");
-    o += "CONFIGURATION -- every option, the value in force, and where it came from\n";
+    o += r.all_options
+             ? "CONFIGURATION -- every option, the value in force, and where it came from\n"
+             : "CONFIGURATION -- every option not at its default, the value in force, and where it "
+               "came from\n";
     size_t w = 0;
     for (const ConfigRow& c : config) w = std::max(w, c.flag.size());
     w = std::min<size_t>(w + 2, 34);
+    int defaults = 0;
     for (const ConfigRow& c : config) {
+        if (!r.all_options && c.source == "default") { ++defaults; continue; }
         const std::string v = c.value.empty() ? "\"\"" : c.value;
         const std::string first = v.substr(0, v.find('\n'));
         std::string l = fmt("  %-*s %s", (int)w, c.flag.c_str(), first.c_str());
@@ -153,6 +168,9 @@ std::string render(const std::vector<ConfigRow>& config, const std::vector<Decis
         if (first.size() != v.size()) indented(&o, v.substr(first.size() + 1), (int)(3 + w));
         if (!c.why.empty()) indented(&o, c.why, (int)(5 + w));
     }
+    if (defaults)
+        o += fmt("  %d option%s at %s default (-v lists every option; /diagnostics carries them "
+                 "all)\n", defaults, defaults == 1 ? "" : "s", defaults == 1 ? "its" : "their");
     o += "ENVIRONMENT -- the RADIANCE_* variables set, by name; their values are not shown\n";
     if (r.environment.empty()) o += "  none\n";
     for (const std::string& n : r.environment) o += "  " + n + "\n";
@@ -167,13 +185,15 @@ std::string render(const std::vector<ConfigRow>& config, const std::vector<Decis
     o += host_lines(f.host, r);
     for (const CardFacts& c : f.cards) o += card_lines(c);
     if (f.cards.empty()) o += "  no display-class PCI device is visible\n";
-    int nw = 0, nn = 0;
-    for (const Finding& x : findings) (x.level == Finding::Warn ? nw : nn)++;
-    o += fmt("FINDINGS -- %d warning%s, %d note%s\n", nw, nw == 1 ? "" : "s", nn, nn == 1 ? "" : "s");
+    int ni = 0, nw = 0, nn = 0;
+    for (const Finding& x : findings)
+        (x.level == Finding::Incompatible ? ni : x.level == Finding::Warn ? nw : nn)++;
+    o += fmt("FINDINGS -- %s%d warning%s, %d note%s\n",
+             ni ? fmt("%d incompatible%s, ", ni, r.unsupported ? " (started anyway)" : "").c_str() : "",
+             nw, nw == 1 ? "" : "s", nn, nn == 1 ? "" : "s");
     if (findings.empty()) o += "  nothing found that costs speed or correctness\n";
     for (const Finding& x : findings) {
-        o += fmt("  %s %s: %s\n", x.level == Finding::Warn ? "WARN" : "note", x.id.c_str(),
-                 x.what.c_str());
+        o += fmt("  %s %s: %s\n", level_tag(x.level), x.id.c_str(), x.what.c_str());
         o += "       why: " + x.why + "\n";
         o += "       fix: " + x.fix + "\n";
     }
@@ -185,6 +205,7 @@ std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Deci
     using J = nlohmann::ordered_json;
     J o;
     o["startup_failed"] = r.failed;
+    o["unsupported_configuration"] = r.unsupported;
     J cfg = J::array();
     for (const ConfigRow& c : config) {
         J e;
@@ -277,7 +298,7 @@ std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Deci
     o["hardware"] = { { "host", std::move(host) }, { "cards", std::move(cards) }, { "run", std::move(run) } };
     J fs = J::array();
     for (const Finding& x : findings)
-        fs.push_back({ { "level", x.level == Finding::Warn ? "warn" : "note" }, { "id", x.id },
+        fs.push_back({ { "level", level_json(x.level) }, { "id", x.id },
                        { "what", x.what }, { "why", x.why }, { "fix", x.fix } });
     o["findings"] = std::move(fs);
     /* Replace invalid UTF-8 instead of throwing: paths, boot parameters and product names are

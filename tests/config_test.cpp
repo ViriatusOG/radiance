@@ -141,6 +141,14 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-ref", "/r", "--kld-corpus", "/c" }, &f), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kld-out", "/o.json" }, &f), RAD_E_INVAL);            /* nothing to report */
     CHECK_EQ(parse({ "--kld-ref" }, &f), RAD_E_INVAL);
+
+    /* --kld-top is the recording's form; a scoring run reads it from the reference. */
+    Config g;
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c.jsonl", "--kld-top", "512" }, &g), RAD_OK);
+    CHECK_EQ(g.kld_top, 512);
+    CHECK_EQ(parse({ "--kld-ref", "/r", "--kld-top", "512" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-top", "9000" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-top", "-1" }, &f), RAD_E_INVAL);
 }
 
 /* Runtime LoRA: the adapters reach their fields in order, the targets as sorted leaf names, and a
@@ -312,16 +320,19 @@ TEST(the_boolean_flags_are_off_until_they_are_given) {
     CHECK(!d.debug_selection);
     CHECK(!d.debug_placement);
     CHECK(!d.accept_reference_kernels);
+    CHECK(!d.proceed_incompatible);
     CHECK(!d.profile_ops);
     CHECK(!d.live_view);
 
     Config c;
     CHECK_EQ(parse({ "--deterministic", "--no-prefix-cache", "--debug-placement",
-                     "--debug-accept-reference-kernels", "--profile-ops", "--live" }, &c), RAD_OK);
+                     "--debug-accept-reference-kernels", "--profile-ops", "--live",
+                     "--proceed-with-incompatible-configuration" }, &c), RAD_OK);
     CHECK(c.deterministic);
     CHECK(!c.prefix_cache);
     CHECK(c.debug_placement);
     CHECK(c.accept_reference_kernels);
+    CHECK(c.proceed_incompatible);
     CHECK(c.profile_ops);
     CHECK(c.live_view);
 }
@@ -449,7 +460,6 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
-        { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
@@ -492,6 +502,12 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
+        { "--kld-top", { "512", "--kld-record", "/r", "--kld-corpus", "/c.jsonl" } },
+        { "--calib-corpus", { "/c.jsonl", "--calib-dir", "/d" } },
+        { "--calib-dir", { "/d", "--calib-corpus", "/c.jsonl" } },
+        { "--calib-layers", { "0:32", "--calib-corpus", "/c.jsonl", "--calib-dir", "/d" } },
+        { "--image-gen-max-pixels", { "1048576" } },
+        { "--image-gen-max-refs", { "2" } },
         { "--lora", { "a=/adapters/a" } },
         { "--lora-dir", { "/" } },
         { "--max-loras", { "2", "--lora-target-modules", "q_proj" } },

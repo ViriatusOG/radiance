@@ -4,7 +4,9 @@
  * Each check is a pure function of the facts (no file or device access), so tests pass a machine
  * described in a struct. A finding states what was seen with numbers, why it matters, and a fix.
  *
- * Warn: a cost or risk to act on. Note: a trade-off, or worth knowing when reading a benchmark.
+ * Incompatible: a machine setting startup refuses (incompatible()), unless
+ * --proceed-with-incompatible-configuration starts it anyway. Warn: a cost or risk to act on. Note:
+ * a trade-off, or worth knowing when reading a benchmark.
  * Load-dependent findings (a parked link) are raised only when the card was busy, since an idle
  * PCIe link parks at its lowest speed by design.
  */
@@ -13,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 
@@ -232,9 +235,12 @@ void check_od_runtime_pm(const Facts& f, std::vector<Finding>* out) {
 
 /* ---- the host ------------------------------------------------------------------------------- */
 
+/* Incompatible where cards serve (#42's class of hang); a host-backend run beside a loaded driver is
+ * only told. */
 void check_cwsr(const Facts& f, std::vector<Finding>* out) {
     if (f.host.cwsr_enable != 0) return;
-    add(out, Finding::Warn, "cwsr-off", "amdgpu cwsr_enable is 0",
+    add(out, served(f).empty() ? Finding::Warn : Finding::Incompatible, "cwsr-off",
+        "amdgpu cwsr_enable is 0",
         "the driver cannot preempt a running queue: any queue eviction (host memory the card maps, "
         "moved under memory pressure) waits for a queue a serve never lets drain, and ends in a "
         "GPU hang and reset",
@@ -400,8 +406,34 @@ void check_engine(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
 
 }  /* namespace */
 
-std::vector<Finding> check(const Facts& f, const RunFacts& r) {
+std::vector<Finding> incompatible(const Facts& f) {
     std::vector<Finding> out;
+    check_cwsr(f, &out);
+    std::stable_sort(out.begin(), out.end(),
+                     [](const Finding& a, const Finding& b) { return a.level > b.level; });
+    return out;
+}
+
+std::vector<std::string> unsupported_banner() {
+    const char* text[] = {
+        "UNSUPPORTED CONFIGURATION -- started with --proceed-with-incompatible-configuration.",
+        "This machine is set up in a way radiance refuses to run on, and it was started anyway.",
+        "ALL GUARANTEES ARE OFF: correctness, speed and stability are not tested here, and",
+        "problems seen on this configuration are not supported. The startup report lists what",
+        "is incompatible and how to fix it.",
+    };
+    size_t w = 0;
+    for (const char* t : text) w = std::max(w, std::strlen(t));
+    const std::string bar(w + 8, '!');
+    std::vector<std::string> out{ bar };
+    for (const char* t : text)
+        out.push_back("!!  " + std::string(t) + std::string(w - std::strlen(t), ' ') + "  !!");
+    out.push_back(bar);
+    return out;
+}
+
+std::vector<Finding> check(const Facts& f, const RunFacts& r) {
+    std::vector<Finding> out = incompatible(f);
     check_engine(f, r, &out);
     check_link_under_load(f, &out);
     check_cards_differ(f, &out);
@@ -409,13 +441,12 @@ std::vector<Finding> check(const Facts& f, const RunFacts& r) {
     check_small_bar(f, &out);
     check_power_cap(f, &out);
     check_od_runtime_pm(f, &out);
-    check_cwsr(f, &out);
     check_memory(f, r, &out);
     check_huge_pages(f, r, &out);
     check_iommu(f, r, &out);
     check_memlock(f, r, &out);
     check_cpu(f, &out);
-    /* Warnings first; stable, so each group keeps the order above. */
+    /* Refusals, then warnings, then notes; stable, so each group keeps the order above. */
     std::stable_sort(out.begin(), out.end(),
                      [](const Finding& a, const Finding& b) { return a.level > b.level; });
     return out;

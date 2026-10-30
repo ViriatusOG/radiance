@@ -104,9 +104,11 @@ extern "C" void* rad_link_gate(RadStream s);
  * A ride is a signal completed by the next dispatch on a stream, instead of a separate barrier
  * packet. That dispatch keeps its ordering bit, so the signal covers everything before it.
  * rad_ride_wait puts a barrier waiting on it onto another stream and recycles the signal behind
- * that barrier. A ride polled by the DMA engine is returned with rad_ride_release once nothing can
- * poll it: immediately (`after` null) when the polling list has finished, else once `after` is
- * `packets` dispatches further on.
+ * that barrier. A ride handed to rad_xp_list as its mark is returned with rad_ride_release once
+ * the caller is done with it, `after` null; the backend keeps it out of reuse until the list's
+ * engine is past its poll. One never handed to a list (a dropped request's) is returned with
+ * `after` and `packets` reaching past the dispatch it rides on: the signal is reused only once
+ * `after` has consumed `packets` more packets.
  *
  * rad_xp_list gives the card's prefetch DMA queue a list: wait for `mark` (a ride, or null), copy
  * the `n` ranges, then write `done_val` to `done` (pinned host memory, or null). rad_xp_behind
@@ -350,6 +352,9 @@ struct DeviceBackend {
 
     /* ---- see rad_dev_map_file. Null on a backend with no pinned host memory to map a file into. */
     void*   (*map_file)(int fd, int64_t foff, int64_t bytes);
+
+    /* ---- see dev_stuck_ms. Null on a backend that cannot tell. */
+    int64_t (*stuck_ms)(void);
 };
 
 
@@ -387,6 +392,12 @@ std::string dev_pci_address(int device);
 std::string dev_runtime_version();
 /* The current backend's DeviceBackend::dma_lane, "" where it has none. */
 std::string dev_dma_lane(int device);
+
+/* How long the device has been stuck, in ms, or 0: since the last moment anything advanced, once a
+ * host wait has seen nothing advance for its stall period and named the stuck packet (the queue
+ * dump), or since a queue faulted. Anything advancing again clears it. 0 where the backend cannot
+ * tell. */
+int64_t dev_stuck_ms();
 
 /* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves

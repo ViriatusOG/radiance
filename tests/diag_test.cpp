@@ -447,21 +447,67 @@ TEST(host_findings) {
     run.host_pool_mib = 12288;
     run.pinned_bytes = f.host.ttm_pages_limit * f.host.page_size - ((int64_t)1 << 20);
     const auto found = diag::check(f, run);
-    CHECK(has(found, "cwsr-off", diag::Finding::Warn));
+    CHECK(has(found, "cwsr-off", diag::Finding::Incompatible));
     CHECK(has(found, "thp-never", diag::Finding::Warn));
     CHECK(has(found, "iommu-translated", diag::Finding::Note));
     CHECK(has(found, "memory-low", diag::Finding::Warn));
     CHECK(has(found, "swap-in-use", diag::Finding::Note));
-    /* Warnings come before notes, so the section leads with what to act on. */
-    bool seen_note = false, order_ok = true;
-    for (const diag::Finding& x : found) {
-        if (x.level == diag::Finding::Note) seen_note = true;
-        else if (seen_note) order_ok = false;
-    }
+    /* Refusals, then warnings, then notes, so the section leads with what to act on. */
+    bool order_ok = true;
+    for (size_t i = 1; i < found.size(); ++i)
+        if (found[i].level > found[i - 1].level) order_ok = false;
     CHECK(order_ok);
     /* THP off on a passthrough IOMMU is only a note: the page size has not measured slower. */
     for (diag::CardFacts& c : f.cards) c.iommu_type = "identity";
     CHECK(has(diag::check(f, run), "thp-never", diag::Finding::Note));
+}
+
+/* CWSR off is refused where cards serve, with its fix; the host backend beside a loaded driver is
+ * only told. */
+TEST(what_startup_refuses_is_named_with_its_fix) {
+    Root r;
+    machine(r);
+    diag::Facts f = served_machine(r);
+    CHECK(diag::incompatible(f).empty());
+    f.host.cwsr_enable = 0;
+    auto bad = diag::incompatible(f);
+    CHECK(has(bad, "cwsr-off", diag::Finding::Incompatible));
+    for (const diag::Finding& x : bad)
+        if (x.id == "cwsr-off") CHECK(x.fix.find("cwsr_enable=1") != std::string::npos);
+    /* The settings main only reports are not refusals. */
+    for (diag::CardFacts& c : f.cards) {
+        c.iommu_type = "DMA-FQ";
+        if (c.rank == 0) c.vram_visible = (int64_t)256 << 20;
+    }
+    bad = diag::incompatible(f);
+    CHECK_EQ(bad.size(), (size_t)1);
+    for (diag::CardFacts& c : f.cards) c.rank = -1;
+    bad = diag::incompatible(f);
+    for (const diag::Finding& x : bad) CHECK(x.level != diag::Finding::Incompatible);
+    CHECK(has(bad, "cwsr-off", diag::Finding::Warn));
+}
+
+TEST(a_run_started_anyway_says_so_at_the_top) {
+    Root r;
+    machine(r);
+    diag::Facts f = served_machine(r);
+    f.host.cwsr_enable = 0;
+    diag::RunFacts run;
+    run.unsupported = true;
+    const auto found = diag::check(f, run);
+    const std::string text = diag::render({}, {}, f, run, found);
+    CHECK(text.rfind(diag::unsupported_banner().front(), 0) == 0);
+    CHECK(text.find("--proceed-with-incompatible-configuration") != std::string::npos);
+    CHECK(text.find("1 incompatible (started anyway)") != std::string::npos);
+    CHECK(text.find("INCOMPATIBLE cwsr-off") != std::string::npos);
+    const nlohmann::json j =
+        nlohmann::json::parse(diag::to_json({}, {}, f, run, found), nullptr, false);
+    CHECK(!j.is_discarded());
+    if (j.is_discarded()) return;
+    CHECK(j["unsupported_configuration"] == true);
+    CHECK(j["findings"][0]["level"] == "incompatible");
+    /* Without the flag the report carries no banner. */
+    CHECK(diag::render({}, {}, f, diag::RunFacts{}, found).rfind("STARTUP REPORT", 0) == 0);
 }
 
 TEST(engine_findings) {
@@ -545,10 +591,28 @@ TEST(every_option_in_the_table_is_reported) {
             radtest::fail(__FILE__, __LINE__, "no value shown for " + rows[i].flag);
         }
     }
-    const std::string text = diag::render(rows, {}, diag::Facts{}, diag::RunFacts{}, {});
+    diag::RunFacts all;
+    all.all_options = true;
+    const std::string text = diag::render(rows, {}, diag::Facts{}, all, {});
     for (const std::string& n : names)
         if (text.find("  " + n + " ") == std::string::npos)
             radtest::fail(__FILE__, __LINE__, "the report has no line for " + n);
+}
+
+/* Without -v the section lists only what is not at its default, and counts the rest. */
+TEST(the_report_lists_the_options_not_at_their_defaults) {
+    Config c;
+    Argv a({ "--model", "/m/x.rad", "--tp", "2" });
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
+    const std::vector<diag::ConfigRow> rows = diag::config_rows(c);
+    int defaults = 0;
+    for (const diag::ConfigRow& x : rows) defaults += x.source == "default";
+    CHECK(defaults > 0);
+    const std::string text = diag::render(rows, {}, diag::Facts{}, diag::RunFacts{}, {});
+    CHECK(text.find("  --tp ") != std::string::npos);
+    CHECK(text.find("  --model ") != std::string::npos);
+    CHECK(text.find("  --max-num-seqs ") == std::string::npos);
+    CHECK(text.find(std::to_string(defaults) + " options at their default") != std::string::npos);
 }
 
 TEST(sources_and_secrets) {

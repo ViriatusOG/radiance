@@ -10,6 +10,7 @@
 #include "plugin/registry.h"
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
+#include "rad_abi_layout.h"
 
 #include <nlohmann/json.hpp>
 
@@ -200,6 +201,19 @@ TEST(abi_mismatch_is_refused_by_name_with_both_versions) {
     CHECK(has(e, "radtest_badabi.so"));
     CHECK(has(e, fmt("ABI version %u", (unsigned)RAD_ABI_VERSION + 7u)));
     CHECK(has(e, fmt("this engine is version %u", (unsigned)RAD_ABI_VERSION)));
+}
+
+/* The right version over another layout (a plugin built against another tree's headers at the same
+ * number) is refused, with both fingerprints. */
+TEST(a_foreign_layout_under_the_right_version_is_refused) {
+    Registry r;
+    const int st = r.load_plugin(bad_dir() + "/radtest_badlayout.so", 0);
+    CHECK_EQ(st, RAD_E_ABI);
+    CHECK_EQ(r.plugins().size(), (size_t)0);
+    const std::string e = errs(r);
+    CHECK(has(e, "radtest_badlayout.so"));
+    CHECK(has(e, "another layout"));
+    CHECK(has(e, fmt("this engine's %016llx", (unsigned long long)rad_abi_layout())));
 }
 
 /* Two disagreeing schemas would make the same positional call mean different things depending on

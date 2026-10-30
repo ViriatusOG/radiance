@@ -371,108 +371,55 @@ struct MoverStats {
     uint64_t ssd_skipped_units = 0, ssd_skipped_bytes = 0;
 };
 
-/* The live twin of MoverStats: every counter an atomic. The mover writes these through the
- * step on its rank thread while the HTTP thread reads them for /stats and LiveView, and reading
- * a plain field another thread writes is a data race (UB). Relaxed atomics give exactly the
- * "either side of a store" telemetry promises, at no cost on the writer. snapshot() loads them
- * all into a plain MoverStats; same reasoning that made flex_used_ atomic, for the same reader.
- */
+/* MoverStats as the mover counts it on its rank thread, readable from the HTTP thread (Relaxed,
+ * heat.h); snapshot() is the plain copy the readers take. */
 struct MoverCounters {
-    std::atomic<uint64_t> dispatches{0};
-    std::atomic<uint64_t> promotions{0}, demotions{0};
-    std::atomic<uint64_t> h2d_bytes{0}, d2h_bytes{0};
-    std::atomic<uint64_t> prefetched{0}, prefetch_bytes{0};
-    std::atomic<uint64_t> no_record{0}, starved_slab{0}, starved_pool{0};
-    std::atomic<uint64_t> quarantined{0};
-    std::atomic<uint64_t> dropped{0};
-    std::atomic<uint64_t> donated{0}, relocated{0}, stranded{0};
-    std::atomic<uint64_t> ssd_reads{0}, ssd_bytes{0};
-    std::atomic<uint64_t> stage_layers{0}, staged_units{0}, staged_bytes{0}, stage_overflow{0};
-    std::atomic<uint64_t> stage_copies{0};
-    std::atomic<uint64_t> ssd_staging_bytes{0}, ssd_promotions{0}, ssd_promoted_bytes{0};
-    std::atomic<uint64_t> ssd_deposits{0}, ssd_deposit_bytes{0}, pool_evictions{0};
-    std::atomic<uint64_t> ssd_layers{0}, ssd_units{0}, ssd_read_bytes{0}, ssd_preads{0};
-    std::atomic<uint64_t> ssd_read_ns{0}, ssd_wait_ns{0};
-    std::atomic<uint64_t> ssd_skipped_units{0}, ssd_skipped_bytes{0};
-
-    void reset() {
-        /* Field by field: atomics are not copy-assignable. */
-        dispatches.store(0, std::memory_order_relaxed);
-        promotions.store(0, std::memory_order_relaxed);
-        demotions.store(0, std::memory_order_relaxed);
-        h2d_bytes.store(0, std::memory_order_relaxed);
-        d2h_bytes.store(0, std::memory_order_relaxed);
-        prefetched.store(0, std::memory_order_relaxed);
-        prefetch_bytes.store(0, std::memory_order_relaxed);
-        no_record.store(0, std::memory_order_relaxed);
-        starved_slab.store(0, std::memory_order_relaxed);
-        starved_pool.store(0, std::memory_order_relaxed);
-        quarantined.store(0, std::memory_order_relaxed);
-        dropped.store(0, std::memory_order_relaxed);
-        donated.store(0, std::memory_order_relaxed);
-        relocated.store(0, std::memory_order_relaxed);
-        stranded.store(0, std::memory_order_relaxed);
-        ssd_reads.store(0, std::memory_order_relaxed);
-        ssd_bytes.store(0, std::memory_order_relaxed);
-        stage_layers.store(0, std::memory_order_relaxed);
-        staged_units.store(0, std::memory_order_relaxed);
-        staged_bytes.store(0, std::memory_order_relaxed);
-        stage_overflow.store(0, std::memory_order_relaxed);
-        stage_copies.store(0, std::memory_order_relaxed);
-        ssd_staging_bytes.store(0, std::memory_order_relaxed);
-        ssd_promotions.store(0, std::memory_order_relaxed);
-        ssd_promoted_bytes.store(0, std::memory_order_relaxed);
-        ssd_deposits.store(0, std::memory_order_relaxed);
-        ssd_deposit_bytes.store(0, std::memory_order_relaxed);
-        pool_evictions.store(0, std::memory_order_relaxed);
-        ssd_layers.store(0, std::memory_order_relaxed);
-        ssd_units.store(0, std::memory_order_relaxed);
-        ssd_read_bytes.store(0, std::memory_order_relaxed);
-        ssd_preads.store(0, std::memory_order_relaxed);
-        ssd_read_ns.store(0, std::memory_order_relaxed);
-        ssd_wait_ns.store(0, std::memory_order_relaxed);
-        ssd_skipped_units.store(0, std::memory_order_relaxed);
-        ssd_skipped_bytes.store(0, std::memory_order_relaxed);
-    }
+    Relaxed<uint64_t> dispatches, promotions, demotions, h2d_bytes, d2h_bytes, prefetched,
+                      prefetch_bytes, no_record, starved_slab, starved_pool, quarantined, dropped,
+                      donated, relocated, stranded, ssd_reads, ssd_bytes, stage_layers,
+                      staged_units, staged_bytes, stage_overflow, stage_copies, ssd_staging_bytes,
+                      ssd_promotions, ssd_promoted_bytes, ssd_deposits, ssd_deposit_bytes,
+                      pool_evictions, ssd_layers, ssd_units, ssd_read_bytes, ssd_preads,
+                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes;
 
     MoverStats snapshot() const {
         MoverStats s;
-        s.dispatches     = dispatches.load(std::memory_order_relaxed);
-        s.promotions     = promotions.load(std::memory_order_relaxed);
-        s.demotions      = demotions.load(std::memory_order_relaxed);
-        s.h2d_bytes      = h2d_bytes.load(std::memory_order_relaxed);
-        s.d2h_bytes      = d2h_bytes.load(std::memory_order_relaxed);
-        s.prefetched     = prefetched.load(std::memory_order_relaxed);
-        s.prefetch_bytes = prefetch_bytes.load(std::memory_order_relaxed);
-        s.no_record      = no_record.load(std::memory_order_relaxed);
-        s.starved_slab   = starved_slab.load(std::memory_order_relaxed);
-        s.starved_pool   = starved_pool.load(std::memory_order_relaxed);
-        s.quarantined    = quarantined.load(std::memory_order_relaxed);
-        s.dropped        = dropped.load(std::memory_order_relaxed);
-        s.donated        = donated.load(std::memory_order_relaxed);
-        s.relocated      = relocated.load(std::memory_order_relaxed);
-        s.stranded       = stranded.load(std::memory_order_relaxed);
-        s.ssd_reads      = ssd_reads.load(std::memory_order_relaxed);
-        s.ssd_bytes      = ssd_bytes.load(std::memory_order_relaxed);
-        s.stage_layers   = stage_layers.load(std::memory_order_relaxed);
-        s.staged_units   = staged_units.load(std::memory_order_relaxed);
-        s.staged_bytes   = staged_bytes.load(std::memory_order_relaxed);
-        s.stage_overflow = stage_overflow.load(std::memory_order_relaxed);
-        s.stage_copies   = stage_copies.load(std::memory_order_relaxed);
-        s.ssd_staging_bytes = ssd_staging_bytes.load(std::memory_order_relaxed);
-        s.ssd_promotions    = ssd_promotions.load(std::memory_order_relaxed);
-        s.ssd_promoted_bytes = ssd_promoted_bytes.load(std::memory_order_relaxed);
-        s.ssd_deposits      = ssd_deposits.load(std::memory_order_relaxed);
-        s.ssd_deposit_bytes = ssd_deposit_bytes.load(std::memory_order_relaxed);
-        s.pool_evictions    = pool_evictions.load(std::memory_order_relaxed);
-        s.ssd_layers        = ssd_layers.load(std::memory_order_relaxed);
-        s.ssd_units         = ssd_units.load(std::memory_order_relaxed);
-        s.ssd_read_bytes    = ssd_read_bytes.load(std::memory_order_relaxed);
-        s.ssd_preads        = ssd_preads.load(std::memory_order_relaxed);
-        s.ssd_read_ns       = ssd_read_ns.load(std::memory_order_relaxed);
-        s.ssd_wait_ns       = ssd_wait_ns.load(std::memory_order_relaxed);
-        s.ssd_skipped_units = ssd_skipped_units.load(std::memory_order_relaxed);
-        s.ssd_skipped_bytes = ssd_skipped_bytes.load(std::memory_order_relaxed);
+        s.dispatches         = dispatches;
+        s.promotions         = promotions;
+        s.demotions          = demotions;
+        s.h2d_bytes          = h2d_bytes;
+        s.d2h_bytes          = d2h_bytes;
+        s.prefetched         = prefetched;
+        s.prefetch_bytes     = prefetch_bytes;
+        s.no_record          = no_record;
+        s.starved_slab       = starved_slab;
+        s.starved_pool       = starved_pool;
+        s.quarantined        = quarantined;
+        s.dropped            = dropped;
+        s.donated            = donated;
+        s.relocated          = relocated;
+        s.stranded           = stranded;
+        s.ssd_reads          = ssd_reads;
+        s.ssd_bytes          = ssd_bytes;
+        s.stage_layers       = stage_layers;
+        s.staged_units       = staged_units;
+        s.staged_bytes       = staged_bytes;
+        s.stage_overflow     = stage_overflow;
+        s.stage_copies       = stage_copies;
+        s.ssd_staging_bytes  = ssd_staging_bytes;
+        s.ssd_promotions     = ssd_promotions;
+        s.ssd_promoted_bytes = ssd_promoted_bytes;
+        s.ssd_deposits       = ssd_deposits;
+        s.ssd_deposit_bytes  = ssd_deposit_bytes;
+        s.pool_evictions     = pool_evictions;
+        s.ssd_layers         = ssd_layers;
+        s.ssd_units          = ssd_units;
+        s.ssd_read_bytes     = ssd_read_bytes;
+        s.ssd_preads         = ssd_preads;
+        s.ssd_read_ns        = ssd_read_ns;
+        s.ssd_wait_ns        = ssd_wait_ns;
+        s.ssd_skipped_units  = ssd_skipped_units;
+        s.ssd_skipped_bytes  = ssd_skipped_bytes;
         return s;
     }
 };

@@ -30,9 +30,10 @@ namespace {
  * `queue_cap` is the admission ceiling (`opt_.queue_depth` or max_seqs * 8), fixed while the
  * server runs. It is not called `queue_depth` because `radiance:http_queue_depth` is the occupancy;
  * the occupancy appears here as `in_flight` (and as `server_load` on /load). */
-json health_body(const std::string& model, bool stopping, int64_t in_flight, int64_t depth) {
+json health_body(const std::string& model, const char* status, int64_t in_flight,
+                 int64_t depth) {
     json o;
-    o["status"]      = stopping ? "stopping" : "ok";
+    o["status"]      = status;
     o["model"]       = model;
     o["in_flight"]   = in_flight;
     o["queue_cap"]   = depth;
@@ -391,7 +392,8 @@ json Server::capabilities() const {
      * whatever its conditioning network's processor would take. */
     const bool img = opt_.image_model || opt_.video_model;
     caps["grammar"]   = !img && !rerank && deps_.grammar != nullptr;
-    caps["embedding"] = deps_.embed != nullptr && !rerank;
+    /* Laya runs on the embedding path, but answers /v1/systemone, not /v1/embeddings. */
+    caps["embedding"] = deps_.embed != nullptr && !rerank && opt_.decision_type != "laya";
     if (rerank) caps["rerank"] = true;
     caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
     caps["video"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Video);
@@ -401,6 +403,9 @@ json Server::capabilities() const {
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
     caps["audio_generation"] = deps_.audio != nullptr;
     caps["video_generation"] = deps_.videos != nullptr;
+    /* The decision protocol /v1/systemone serves (ServerOptions::decision_type), so a proxy can
+     * route to a decision model without trying a generation; null when it serves none. */
+    caps["decision"] = opt_.decision_type.empty() ? json(nullptr) : json(opt_.decision_type);
     /* What a video request may carry. */
     if (deps_.videos) video_caps(caps, deps_.videos);
     /* The efforts a chat request may send, probed from the template at startup; null when it
@@ -542,12 +547,26 @@ HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
  * would dominate the 2xx/5xx ratio. */
 HttpResponse Server::handle_health(const HttpRequest& req) { return handle_ping(req); }
 
+/* How long the device may be stuck (Deps::stuck_ms) before /health answers 503. The stall watch
+ * counts the drive reads of the file tier as progress, so a slow drive is not a stuck device, and
+ * a minute of nothing advancing anywhere is a hang a restart clears. */
+constexpr int64_t kStuckMs = 60000;
+
 HttpResponse Server::handle_ping(const HttpRequest&) {
     const bool stopping = stopping_.load();
-    return HttpResponse::json_body(
-        stopping ? 503 : 200,
-        json_dump(health_body(opt_.model_id, stopping,
-                              in_flight_.load(std::memory_order_relaxed), queue_depth_)));
+    const int64_t stuck = deps_.stuck_ms ? deps_.stuck_ms() : 0;
+    const bool wedged = stuck >= kStuckMs;
+    if (!wedged) {
+        stuck_told_.store(false, std::memory_order_relaxed);
+    } else if (!stuck_told_.exchange(true, std::memory_order_relaxed)) {
+        RAD_ERR("server: the device has advanced nothing for %lld s (the queue dump above names the "
+                "packet it is stuck on); /health answers 503 until it does, so a supervisor can "
+                "restart the server", (long long)(stuck / 1000));
+    }
+    json o = health_body(opt_.model_id, stopping ? "stopping" : wedged ? "stuck" : "ok",
+                         in_flight_.load(std::memory_order_relaxed), queue_depth_);
+    if (wedged) o["stuck_s"] = stuck / 1000;
+    return HttpResponse::json_body(stopping || wedged ? 503 : 200, json_dump(o));
 }
 
 }  /* namespace server */

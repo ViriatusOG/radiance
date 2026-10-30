@@ -77,6 +77,17 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
     return s;
 }
 
+// A row's sum of squares in the standalone norm's partition (kR4dSumLanes, r4d_common.h): lane
+// v < 256 adds columns v, v + 256, ... of `row` in order and the lanes past it add nothing, so a
+// row's bits do not depend on the block's width. When the block's threads stored `row`, the
+// caller issues the barrier first, as add_rmsnorm does.
+__device__ __forceinline__ float lanes_sumsq(const uint16_t* row, uint32_t n) {
+    float ss = 0.0f;
+    if (threadIdx.x < kR4dSumLanes)
+        for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) { const float v = bf2f(row[i]); ss += v * v; }
+    return ss;
+}
+
 // Quantise one 128-column group from the four bf16-rounded values a lane owns. The clamp in
 // q8_pack4 is required (see r4d_q8.h): v_cvt_pk_fp8_f32 returns NaN out of range, and
 // `amax * (1/scale)` can land an ulp above 448.
@@ -155,8 +166,9 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint16_t* __restrict__ nr = RES ? rr : xr;
 
     // Four strides are loaded before any is used, avoiding one round trip per stride. A stride past
-    // the row reloads this thread's first column and is skipped below. The summation order is still
-    // that of `i = tid; i += THR`, shared by every kernel using r4d_act_threads' partition.
+    // the row reloads this thread's first column and is skipped below. At 256 threads the sum is
+    // folded in that loop, whose order is kR4dSumLanes' partition; a wider block folds the stored
+    // row in lanes_sumsq behind a barrier.
     constexpr uint32_t kU = 4;
     float ss = 0.0f;
     for (uint32_t i0 = threadIdx.x; i0 < n; i0 += kU * THR) {
@@ -179,9 +191,14 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
                 } else {
                     v = bf2f(xa[u]);
                 }
-                ss += v * v;
+                if constexpr (THR == kR4dSumLanes) ss += v * v;
+                else (void)v;
             }
         }
+    }
+    if constexpr (THR != kR4dSumLanes) {
+        if (RES) __syncthreads();   // the residual row, stored across the block's threads
+        ss = lanes_sumsq(nr, n);
     }
     const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
 
@@ -307,7 +324,7 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
 // Bit-identical to the pair it replaces. Pass two is norm_quant_row. Pass one reproduces the
 // all-reduce's arithmetic (an f32 sum stored as bf16, as in r4d_ar_oneshot_2rank_exact's vadd) and
 // stores it back into `x`, as the replaced kernel did, so other readers of `x` see the same bytes.
-// Both sum the squares in r4d_act_threads' `i = tid; i += THR` order.
+// Both sum the squares in the standalone norm's partition (lanes_sumsq).
 //
 // Both wires are served. Above --tp-wire-min-kb the message is sent 6-bit rotated; a step carries
 // n_seq * (1 + n_spec) rows, so it crosses that floor from the second concurrent sequence on, and
@@ -664,9 +681,9 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                 uint16_t a;
                 if constexpr (WIRE == 0) { a = f2bf(bf2f(xr[i]) + bf2f(pr[i])); xr[i] = a; }
                 else                     { a = xr[i]; }
-                const float av = bf2f(a);
-                s1s += av * av;
+                if constexpr (THR == kR4dSumLanes) { const float av = bf2f(a); s1s += av * av; }
             }
+            if constexpr (THR != kR4dSumLanes) { __syncthreads(); s1s = lanes_sumsq(xr, n); }
             const float s1 = rsqrtf(block_sum<THR / kWave>(s1s, lds) / (float)n + eps);
             __syncthreads();   // lds is reused by the second sum
             for (uint32_t i = tid; i < n; i += THR) {
@@ -674,8 +691,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                 const uint16_t pv = f2bf(bf2f(xr[i]) * s1 * (g + wadd));
                 const uint16_t h = f2bf(bf2f(rr[i]) + bf2f(pv));
                 rr[i] = h;
-                const float v = bf2f(h);
-                ss += v * v;
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(h); ss += v * v; }
             }
         } else
         for (uint32_t i = tid; i < n; i += THR) {
@@ -687,8 +703,10 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
             float v;
             if (RES) { const uint16_t h = f2bf(bf2f(rr[i]) + bf2f(a)); rr[i] = h; v = bf2f(h); }
             else     { v = bf2f(a); }
-            ss += v * v;
+            if constexpr (THR == kR4dSumLanes) ss += v * v;
+            else (void)v;
         }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss = lanes_sumsq(nr, n); }
         /* block_sum's barrier is also what publishes pass one's stores to pass two's reads. */
         const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
         norm_quant_row<WF32, THR, HI8>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
@@ -734,10 +752,8 @@ static int rmsnorm_quant_launch(long x, long res, long w, long y, long q, long s
     if (!s_ld) s_ld = nkb;
 
     // One workgroup per row, so a decode batch is 8-72 workgroups and the kernel is latency bound;
-    // the workgroup width is the parallelism knob (crossover table in r4d_act_threads).
-    //
-    // rmsnorm_bf16 must pick the same width from the same function: the width decides which
-    // columns a thread sums, so a different width changes the last bits and breaks bit identity.
+    // the workgroup width is the parallelism knob (crossover table in r4d_act_threads). The sum of
+    // squares is folded in kR4dSumLanes' partition at every width, as rmsnorm_bf16 folds it.
     const int thr = r4d_act_threads(M, n);
 #define R4D_RQ_H(wf, rs, T, H)                                                                  \
     hipLaunchKernelGGL((rmsnorm_quant_fp8_kernel<wf, rs, T, H>), dim3((uint32_t)M), dim3(T), 0, \
@@ -934,7 +950,7 @@ static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer
     if (nb > M) nb = M;
     const int nbw = r4d_ar_max_blocks();       // the counter capacity; see r4d_ar_seq.h
     if (nb > nbw) nb = nbw;
-    // The width must be r4d_act_threads', as for the standalone norm (it fixes the summation order).
+    // The standalone norm's width; the sums fold in kR4dSumLanes' partition at any of the three.
     const int thr = nthreads ? nthreads : r4d_act_threads(M, n);
     if (thr != 256 && thr != 512 && thr != 1024) return -6;
     const bool pad = wire == 6 && (n % ARQ_CE) != 0;

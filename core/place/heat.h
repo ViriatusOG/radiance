@@ -122,76 +122,55 @@ struct HeatStats {
     uint64_t routed = 0, routed_resident = 0, stream_bytes = 0;
 };
 
-/* The live twin of HeatStats: every counter an atomic, so the HTTP thread's /stats and LiveView
- * reads are relaxed loads beside the dispatch thread's writes rather than a data race. Written
- * as plain counters are (++ and +=), read through snapshot(). See MoverCounters, same reasoning.
- */
-struct HeatCounters {
-    std::atomic<uint64_t> dispatches{0};
-    std::atomic<uint64_t> proposed{0}, promotions{0}, demotions{0};
-    std::atomic<uint64_t> refused{0}, no_candidate{0};
-    std::atomic<uint64_t> distinct_promoted{0}, readmits{0};
-    std::atomic<uint64_t> routed{0}, routed_resident{0}, stream_bytes{0};
-
-    /* HeatEngine is copyable — place_test snapshots engines — so its counters must copy too.
-     * A copy takes the current values: relaxed loads into the copy's own atomics. */
-    HeatCounters() = default;
-    HeatCounters(const HeatCounters& o) { *this = o; }
-    HeatCounters& operator=(const HeatCounters& o) {
-        dispatches.store(o.dispatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        proposed.store(o.proposed.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        promotions.store(o.promotions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        demotions.store(o.demotions.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        refused.store(o.refused.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        no_candidate.store(o.no_candidate.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
-        distinct_promoted.store(o.distinct_promoted.load(std::memory_order_relaxed),
-                                std::memory_order_relaxed);
-        readmits.store(o.readmits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        routed.store(o.routed.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        routed_resident.store(o.routed_resident.load(std::memory_order_relaxed),
-                              std::memory_order_relaxed);
-        stream_bytes.store(o.stream_bytes.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
+/* A counter one thread writes while another reads it (the HTTP thread's /stats and LiveView):
+ * a relaxed atomic, so the reader sees a whole value from one side of a write or the other.
+ * Copyable, a copy taking the current value, so a struct of them copies and resets by
+ * assignment. */
+template <class T>
+class Relaxed {
+public:
+    Relaxed(T v = 0) : v_(v) {}
+    Relaxed(const Relaxed& o) : v_(o.load()) {}
+    Relaxed& operator=(const Relaxed& o) {
+        v_.store(o.load(), std::memory_order_relaxed);
         return *this;
     }
+    operator T() const { return load(); }
+    T load() const { return v_.load(std::memory_order_relaxed); }
+    Relaxed& operator++() { v_.fetch_add(1, std::memory_order_relaxed); return *this; }
+    Relaxed& operator+=(T d) { v_.fetch_add(d, std::memory_order_relaxed); return *this; }
 
-    void reset() {
-        /* Field by field: atomics are not copy-assignable. */
-        dispatches.store(0, std::memory_order_relaxed);
-        proposed.store(0, std::memory_order_relaxed);
-        promotions.store(0, std::memory_order_relaxed);
-        demotions.store(0, std::memory_order_relaxed);
-        refused.store(0, std::memory_order_relaxed);
-        no_candidate.store(0, std::memory_order_relaxed);
-        distinct_promoted.store(0, std::memory_order_relaxed);
-        readmits.store(0, std::memory_order_relaxed);
-        routed.store(0, std::memory_order_relaxed);
-        routed_resident.store(0, std::memory_order_relaxed);
-        stream_bytes.store(0, std::memory_order_relaxed);
-    }
+private:
+    std::atomic<T> v_;
+};
+
+/* HeatStats as the engine counts it, readable from the HTTP thread; snapshot() is the plain copy
+ * the readers take. */
+struct HeatCounters {
+    Relaxed<uint64_t> dispatches, proposed, promotions, demotions, refused, no_candidate,
+                      distinct_promoted, readmits, routed, routed_resident, stream_bytes;
 
     HeatStats snapshot() const {
         HeatStats s;
-        s.dispatches        = dispatches.load(std::memory_order_relaxed);
-        s.proposed          = proposed.load(std::memory_order_relaxed);
-        s.promotions        = promotions.load(std::memory_order_relaxed);
-        s.demotions         = demotions.load(std::memory_order_relaxed);
-        s.refused           = refused.load(std::memory_order_relaxed);
-        s.no_candidate      = no_candidate.load(std::memory_order_relaxed);
-        s.distinct_promoted = distinct_promoted.load(std::memory_order_relaxed);
-        s.readmits          = readmits.load(std::memory_order_relaxed);
-        s.routed            = routed.load(std::memory_order_relaxed);
-        s.routed_resident   = routed_resident.load(std::memory_order_relaxed);
-        s.stream_bytes      = stream_bytes.load(std::memory_order_relaxed);
+        s.dispatches        = dispatches;
+        s.proposed          = proposed;
+        s.promotions        = promotions;
+        s.demotions         = demotions;
+        s.refused           = refused;
+        s.no_candidate      = no_candidate;
+        s.distinct_promoted = distinct_promoted;
+        s.readmits          = readmits;
+        s.routed            = routed;
+        s.routed_resident   = routed_resident;
+        s.stream_bytes      = stream_bytes;
         return s;
     }
 };
 
 /* The per-unit tier mirror HeatEngine keeps for the HTTP thread: one relaxed atomic byte per
  * unit, written by set_tier and read by tier_published. A type of its own because it must be
- * copyable — HeatEngine is copyable, and a copy takes the tier values into an array of its
- * own — which a bare unique_ptr of atomics is not. */
+ * copyable -- HeatEngine is copyable, and a copy takes the tier values into an array of its
+ * own -- which a bare unique_ptr of atomics is not. */
 struct TierMirror {
     std::unique_ptr<std::atomic<uint8_t>[]> a;
     size_t n = 0;

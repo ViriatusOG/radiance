@@ -17,10 +17,11 @@
 //   * every intermediate the chain stores in bf16 is rounded to bf16 here and the next stage reads
 //     the rounded value: the post-norm output, the residual sum, the scaled residual and the norm
 //     output the quantiser reduces over;
-//   * both sums of squares use the standalone norm's partition: the width r4d_act_threads(M, n)
-//     picks, thread t folding columns t, t+THR, ... in order, then r4d_wave_sum and the waves in
-//     order through LDS (copied from r4d_model_bf16.hip's rmsnorm_kernel and block_sum, which live
-//     in another unit);
+//   * both sums of squares use the standalone norm's partition (kR4dSumLanes, r4d_common.h): lane
+//     v < 256 folds columns v, v+256, ... in order, the lanes past it add nothing, then r4d_wave_sum
+//     and the waves in order through LDS (copied from r4d_model_bf16.hip's rmsnorm_kernel and
+//     block_sum, which live in another unit). At 256 threads a thread's own columns are that
+//     partition; a wider block stages the row in LDS and its first 256 lanes fold it there;
 //   * each element's arithmetic matches the standalone kernels (`x * s * (g + wadd)`,
 //     `a + b`, `x * scalar`, `fmaxf(m, 1e-8f) / 127.f`), under -ffp-contract=off.
 //
@@ -58,6 +59,17 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
     return s;
 }
 
+// A row's sum of squares in the standalone norm's partition (kR4dSumLanes): lane v < 256 adds
+// columns v, v + 256, ... of `row` in order, the lanes past it add nothing, so a row's bits do not
+// depend on the block's width. `row` holds the row's bf16 values; when the block's threads wrote
+// it, the caller issues the barrier first.
+__device__ __forceinline__ float lanes_sumsq(const uint16_t* row, uint32_t n) {
+    float ss = 0.0f;
+    if (threadIdx.x < kR4dSumLanes)
+        for (uint32_t i = threadIdx.x; i < n; i += kR4dSumLanes) { const float f = bf2f(row[i]); ss += f * f; }
+    return ss;
+}
+
 __device__ __forceinline__ float gain(const void* w, uint32_t i, bool f32) {
     return f32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
 }
@@ -86,9 +98,10 @@ __device__ __forceinline__ void junction_row(
             if (SCL) v = f32_to_bf16(bf2f(v) * sv);
             rr[i] = v;
         }
-        const float f = bf2f(v);
-        ss2 += f * f;
+        if constexpr (THR == kR4dSumLanes) { const float f = bf2f(v); ss2 += f * f; }
+        else ybuf[i] = v;
     }
+    if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss2 = lanes_sumsq(ybuf, n); }
     ss2 = block_sum<THR / kWave>(ss2, l2);
     const float s2 = rsqrtf(ss2 / (float)n + eps);
 
@@ -164,7 +177,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
     float s1 = 0.0f;
     if (POST) {
         float ss = 0.0f;
-        for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+        if constexpr (THR == kR4dSumLanes)
+            for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+        else
+            ss = lanes_sumsq(xr, n);   // the branch output, read-only here
         ss = block_sum<THR / kWave>(ss, l1);
         s1 = rsqrtf(ss / (float)n + eps);
     }
@@ -177,11 +193,11 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
 // The same kernel at decode heights (THR 1024, n <= 1024 * EPT), with every operand of the row
 // loaded in one go before the first reduction. The kernel above reads the row again in each pass,
 // each read behind a barrier, so a row costs three dependent memory round trips; on gfx1201 at
-// 1 to 16 rows of 5376 that is 11 us a launch against 8.2 us for this form. Every pass partitions
-// the row the same way (thread t takes columns t, t+THR, ...), so each thread keeps its own
-// columns in registers and none needs another's; only the fragment-order store crosses threads,
-// through `ybuf`. The sums, their order and every element's arithmetic are junction_row's, so the
-// output bytes are the same. One row of it, for this kernel and for the all-reduce's tail
+// 1 to 16 rows of 5376 that is 11 us a launch against 8.2 us for this form. Every elementwise pass
+// partitions the row the same way (thread t takes columns t, t+THR, ...), so each thread keeps its
+// own columns in registers; the sums and the fragment-order store cross threads through `ybuf`,
+// which holds the row each sum folds in the standalone norm's partition. The sums, their order and
+// every element's arithmetic are junction_row's, so the output bytes are the same. One row of it, for this kernel and for the all-reduce's tail
 // (ar_rmsnorm_quant_i8_tail_kernel).
 template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
 __device__ __forceinline__ void junction_reg_row(
@@ -211,7 +227,11 @@ __device__ __forceinline__ void junction_reg_row(
         float ss = 0.0f;
 #pragma unroll
         for (uint32_t e = 0; e < EPT; ++e)
-            if (tid + e * THR < n) { const float v = bf2f(xv[e]); ss += v * v; }
+            if (tid + e * THR < n) {
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(xv[e]); ss += v * v; }
+                else ybuf[tid + e * THR] = xv[e];
+            }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss = lanes_sumsq(ybuf, n); }
         s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
     }
 
@@ -229,10 +249,11 @@ __device__ __forceinline__ void junction_reg_row(
                 rr[i] = v;
             }
             xv[e] = v;
-            const float f = bf2f(v);
-            ss2 += f * f;
+            if constexpr (THR == kR4dSumLanes) { const float f = bf2f(v); ss2 += f * f; }
+            else ybuf[i] = v;
         }
     }
+    if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss2 = lanes_sumsq(ybuf, n); }
     const float s2 = rsqrtf(block_sum<THR / kWave>(ss2, l2) / (float)n + eps);
 
     // ---- the norm output, rounded to bf16 as the standalone norm stores it, and its absmax
@@ -360,8 +381,13 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
         for (uint32_t i = tid; i < n; i += THR) {
             const uint16_t a = f32_to_bf16(bf2f(xr[i]) + bf2f(pr[i]));
             xr[i] = a;
-            if (POST) { const float v = bf2f(a); ss += v * v; }
+            if (POST) {
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(a); ss += v * v; }
+                else ybuf[i] = a;
+            }
         }
+        if constexpr (THR != kR4dSumLanes)
+            if (POST) { __syncthreads(); ss = lanes_sumsq(ybuf, n); }
         float s1 = 0.0f;
         if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
         junction_row<WF32, RES, POST, SCL, THR>(
@@ -382,8 +408,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
 //   * A block owns whole rows, the two-rank fused form's partition, since a post-norm's sum of
 //     squares closes over one row. Every rank runs the same grid over the same M, so block b's
 //     words are the same words on every rank and the per-block handshake pairs them.
-//   * The reduce is element by element in the norm's partition (thread t folds columns t, t+THR,
-//     ...), so the post-norm's sum of squares is the standalone norm's. Each element is ar_vsum's
+//   * The reduce is element by element, stored back into `x`, and the post-norm's sum of squares
+//     folds the stored row in the standalone norm's partition (lanes_sumsq). Each element is ar_vsum's
 //     arithmetic exactly: fp32 from 0.0f, the ranks in ascending order, one rounding to bf16 as the
 //     __hip_bfloat16 cast rounds (bf16_hi_rne_nan). So the reduced row is the standalone exact
 //     all-reduce's to the bit, and what follows is rmsnorm_quant_i8's junction over it.
@@ -445,15 +471,15 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_wide_kernel(
         uint16_t* __restrict__ xr = x + o;
         /* The fold a 16-byte word a thread, every source's word in flight at once (the peers' are
          * in fine-grained memory, a round trip each), stored back into `x`; then the post-norm's
-         * sum of squares over the stored row in the norm's partition. Per element it is the fold
-         * fold_word8 documents, and the sum reads the same rounded values in the same order, so
-         * the bytes are those of the fold and the sum taken in one pass. */
+         * sum of squares over the stored row in the standalone norm's partition. Per element it is
+         * the fold fold_word8 documents, and the sum reads the rounded values the standalone
+         * all-reduce stores, so the bytes are those of the all-reduce and the norm taken apart. */
         for (int k = (int)tid; k < wpr; k += (int)THR)
             ((int4*)xr)[k] = fold_word8<WS>(src4, (size_t)row * wpr + k);
         float ss = 0.0f;
         if (POST) {
             __syncthreads();   /* the folded row, read across the block's threads */
-            for (uint32_t i = tid; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+            ss = lanes_sumsq(xr, n);
         }
         float s1 = 0.0f;
         if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
@@ -635,8 +661,8 @@ __global__ __launch_bounds__(1024) void r4dchain_ar_rmsnorm_quant_i8_tail(R4D_AR
 //      the two-shot's first hop) and takes the handshake;
 //   2. on its own row it folds the four partials in rank order -- r4d_ar_to_f, f32, rank 0 first,
 //      r4d_ar_from_f, the standalone exact all-reduce's fold, so the same bf16 sum -- and runs the
-//      junction on it in the register form at the standalone norm's width (r4d_act_threads), each
-//      thread holding the columns the standalone's does, so every sum is the standalone's; it
+//      junction on it in the register form, each sum folded in the standalone norm's partition
+//      (lanes_sumsq), so every sum is the standalone's; it
 //      stores the residual row and pushes the row's int8 codes and scale (and with `gres` the
 //      residual row) into every peer's slot past the first hop's region, then takes the handshake;
 //   3. it copies the peers' local row b of codes and scales (and residual) into place.
@@ -719,7 +745,11 @@ __device__ __forceinline__ void ar_rmsnorm_quant_i8_sp_body(
         float ss = 0.0f;
 #pragma unroll
         for (uint32_t e = 0; e < EPT; ++e)
-            if (tid + e * THR < n) { const float v = bf2f(xv[e]); ss += v * v; }
+            if (tid + e * THR < n) {
+                if constexpr (THR == kR4dSumLanes) { const float v = bf2f(xv[e]); ss += v * v; }
+                else ybuf[tid + e * THR] = xv[e];
+            }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss = lanes_sumsq(ybuf, n); }
         const float s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
         float ss2 = 0.0f;
 #pragma unroll
@@ -731,10 +761,11 @@ __device__ __forceinline__ void ar_rmsnorm_quant_i8_sp_body(
                 if (sc) v = f32_to_bf16(bf2f(v) * sv);
                 rr[i] = v;
                 xv[e] = v;
-                const float f = bf2f(v);
-                ss2 += f * f;
+                if constexpr (THR == kR4dSumLanes) { const float f = bf2f(v); ss2 += f * f; }
+                else ybuf[i] = v;
             }
         }
+        if constexpr (THR != kR4dSumLanes) { __syncthreads(); ss2 = lanes_sumsq(ybuf, n); }
         const float s2 = rsqrtf(block_sum<THR / kWave>(ss2, l2) / (float)n + eps);
         float m = 0.0f;
 #pragma unroll
@@ -878,8 +909,8 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     const size_t lds = (size_t)n * sizeof(uint16_t);
     if (lds > 60 * 1024) return R4D_NO(RAD_E_SHAPE);
 
-    // The same width rmsnorm_bf16 and quant_act_i8 pick, from the same function: it decides which
-    // columns a thread folds into each sum of squares, hence the byte-identity.
+    // The same width rmsnorm_bf16 and quant_act_i8 pick, from the same function. The sums fold in
+    // kR4dSumLanes' partition at any width, so the width changes speed, not bytes.
     const int thr = r4d_act_threads((int)M, (int)n);
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);

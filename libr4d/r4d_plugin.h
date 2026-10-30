@@ -598,7 +598,16 @@ int r4d_rad_gemm_fp8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
+int r4d_rad_logits_gemm_iqr(const RadArgs*, RadStream);
+int r4d_rad_logit_rerank_iqr(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
+int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs*, RadStream);
+int r4d_rad_gemm_i8a8_rb32_tiled(const RadArgs*, RadStream);
+/* The IQR weights, decoded from their codes where they are read (r4d_gemm_iqr.hip). */
+int r4d_rad_gemm_iqr_m64(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_iqr_m64_scratch(const RadArgs*);
+int r4d_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
@@ -641,6 +650,8 @@ int r4d_rad_logits_gemm_fp8 (const RadArgs*, RadStream);
                                   const void*, int64_t, const RadTensor*, int);
 R4D_HOOKS(fp8_block)
 R4D_HOOKS(i8_block)
+R4D_HOOKS(iqr)
+R4D_HOOKS(iqr_logits)
 R4D_HOOKS(fp8_logits)
 R4D_HOOKS(i8_logits)
 R4D_HOOKS(hc_e4m3)
@@ -652,6 +663,15 @@ R4D_HOOKS(moe_w4_mod4)
 #undef R4D_HOOKS
 int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
+/* embed_lookup_bf16's check that its table is plain bf16 (r4d_fp8_layout.cpp), and the IQR
+ * table's hooks and gather (r4d_iqr_layout.cpp, r4d_iqr_embed.hip). */
+int r4d_rad_layout_embed_bf16(const RadParam*, int, int, const RadEncoding*, const int*,
+                              const RadTensor*, int, RadLayout*);
+int r4d_rad_layout_iqr_embed(const RadParam*, int, int, const RadEncoding*, const int*,
+                             const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_iqr_embed(const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, void*, int64_t);
+int r4d_rad_embed_lookup_iqr(const RadArgs*, RadStream);
 int r4d_rad_layout_embed_q(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);
 int r4d_rad_layout_moe_fp8(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -765,6 +785,7 @@ int r4d_rad_mul             (const RadArgs*, RadStream);
 int r4d_rad_mul_weight      (const RadArgs*, RadStream);
 int r4d_rad_act_mul         (const RadArgs*, RadStream);
 int r4d_rad_seg_mean        (const RadArgs*, RadStream);
+int r4d_rad_seg_softmax_pool(const RadArgs*, RadStream);
 int r4d_rad_seg_mean_bf16_sum(const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope    (const RadArgs*, RadStream);
 int r4d_rad_cast_widen      (const RadArgs*, RadStream);

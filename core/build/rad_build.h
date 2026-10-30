@@ -125,6 +125,7 @@ public:
     int         declare_logits(rad_buf b);
     int         declare_scores(rad_buf hidden, rad_weight table);
     int         declare_pooled(rad_buf b);
+    int         declare_plugin_words(int64_t max_words);
     int         declare_drafter(const RadDrafterDecl* d);
     int         drafter_shared_kv(int pos_offset);
     int         lora_root(const char* native, const char* spellings);

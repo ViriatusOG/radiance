@@ -31,7 +31,7 @@ typedef int hipError_t;
 enum { hipSuccess = 0 };
 inline hipError_t hipGetLastError() { return 0; }
 /* one device, with the R9700's 64 KiB of LDS a workgroup, which launchers size dynamic LDS by */
-struct hipDeviceProp_t { size_t sharedMemPerBlock; };
+struct hipDeviceProp_t { size_t sharedMemPerBlock; int multiProcessorCount; };
 inline hipError_t hipGetDevice(int* d) { *d = 0; return hipSuccess; }
 /* no graphs: a stream never captures */
 enum hipStreamCaptureStatus { hipStreamCaptureStatusNone = 0 };
@@ -42,7 +42,7 @@ inline hipError_t hipStreamIsCapturing(hipStream_t, hipStreamCaptureStatus* s) {
 /* every launch runs to completion before it returns */
 inline hipError_t hipDeviceSynchronize() { return hipSuccess; }
 /* __device__ variables are host globals, so a symbol copy is a memcpy */
-enum hipMemcpyKind { hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2 };
+enum hipMemcpyKind { hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3 };
 #define HIP_SYMBOL(s) (&(s))
 inline hipError_t hipMemcpyFromSymbol(void* dst, const void* sym, size_t n, size_t off, hipMemcpyKind) {
     std::memcpy(dst, (const char*)sym + off, n);
@@ -55,6 +55,7 @@ inline hipError_t hipMemcpyToSymbol(const void* sym, const void* src, size_t n, 
 inline hipError_t hipGetDeviceProperties(hipDeviceProp_t* p, int) {
     *p = hipDeviceProp_t{};
     p->sharedMemPerBlock = 64 * 1024;
+    p->multiProcessorCount = 40;   /* gfx1151's 40 CUs, for launchers that size grids by them */
     return hipSuccess;
 }
 
@@ -152,6 +153,42 @@ typedef int emu_v8i __attribute__((ext_vector_type(8)));
 emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool clamp);
 #define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(sa, a, sb, b, c, cl) \
     emu_wmma_iu8((sa), (a), (sb), (b), (c), (cl))
+/* ---- gfx11 (gfx1151) forms, for tests/halo_emu's libhalo sources (halo_wmma.h's layout):
+ * v_wmma_f32_16x16x16_bf16/f16 take sixteen consecutive k a lane -- A lane l is row l & 15,
+ * B lane l column l & 15, lanes 16-31 replicate -- and D lane l element e is D[2e + (l >> 4)][l & 15].
+ * Each half-wave reads only its own lanes (D's odd rows come from lanes 16-31; emu.cpp).
+ * Each output is c plus its 16 products in k order, as for the gfx12 forms above. */
+typedef __bf16 emu_v16bf __attribute__((ext_vector_type(16)));
+typedef __fp16 emu_v16h __attribute__((ext_vector_type(16)));
+emu_v8f emu_wmma11_bf16(emu_v16bf a, emu_v16bf b, emu_v8f c);
+emu_v8f emu_wmma11_f16(emu_v16h a, emu_v16h b, emu_v8f c);
+#define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c) emu_wmma11_bf16((a), (b), (c))
+#define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c) emu_wmma11_f16((a), (b), (c))
+/* v_wmma_i32_16x16x16_iu8 (gfx11): sixteen bytes a lane in four dwords, exact int32 sums */
+typedef int emu_v4i __attribute__((ext_vector_type(4)));
+emu_v8i emu_wmma11_iu8(bool sa, emu_v4i a, bool sb, emu_v4i b, emu_v8i c, bool clamp);
+#define __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(sa, a, sb, b, c, cl) \
+    emu_wmma11_iu8((sa), (a), (sb), (b), (c), (cl))
+/* v_cvt_pkrtz_f16_f32: two floats to f16, rounded toward zero */
+typedef __fp16 emu_v2hf __attribute__((ext_vector_type(2)));
+emu_v2hf emu_cvt_pkrtz(float a, float b);
+#define __builtin_amdgcn_cvt_pkrtz(a, b) emu_cvt_pkrtz((a), (b))
+/* v_dot2_f32_f16: c + a.x*b.x + a.y*b.y, rounded once (the f16 products are exact in f32) */
+template <class V>
+inline float emu_fdot2(V a, V b, float c, bool) {
+    return (float)((double)c + (double)(float)a[0] * (double)(float)b[0] +
+                   (double)(float)a[1] * (double)(float)b[1]);
+}
+#define __builtin_amdgcn_fdot2(a, b, c, cl) emu_fdot2((a), (b), (c), (cl))
+/* scheduling hints and sleeps order nothing between fibers */
+#define __builtin_amdgcn_sched_group_barrier(m, n, g) ((void)0)
+#define __builtin_amdgcn_s_sleep(n) ((void)0)
+/* libhalo's spellings of the launch hooks (halo_launch.h, halo_emit.h): the emulator's, as for
+ * libr4d's R4D_KLAUNCH, R4D_EMIT and R4D_DYN_LDS */
+#define HALO_DYN_LDS(type, name) type* const name = (type*)emu_dyn_lds()
+#define HALO_KLAUNCH(kernel, grid, block, stream, ...) emu_launch(&kernel, grid, block, __VA_ARGS__)
+#define HALO_EMIT(stream, kernel, grid, block, lds, ...) \
+    emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), __VA_ARGS__)
 /* global_load_tr_b128: not emulated; reported when reached */
 emu_v8s emu_load_tr_b128(const void* p);
 #define __builtin_amdgcn_global_load_tr_b128_v8i16(p) emu_load_tr_b128((const void*)(p))
@@ -208,6 +245,29 @@ inline float __shfl_down(float v, unsigned delta, int width = 32) {
     const int lane = (int)threadIdx.x & 31, in_group = lane & (width - 1);
     return emu_shfl_from(v, in_group + (int)delta < width ? lane + (int)delta : lane);
 }
+/* HIP's integer shuffles move the 32 bits as they are (ds_bpermute). Without these, an int or
+ * unsigned argument would convert to float and back through the overloads above, keeping 24
+ * significant bits: a dword of two packed 16-bit values would lose the low one's mantissa. */
+inline int emu_shfl_from_i(int v, int src) { return emu_bpermute(src << 2, v); }
+inline int __shfl_xor(int v, int mask, int width = 32) {
+    const int lane = (int)threadIdx.x & 31;
+    return emu_shfl_from_i(v, (lane & ~(width - 1)) | ((lane ^ mask) & (width - 1)));
+}
+inline unsigned __shfl_xor(unsigned v, int mask, int width = 32) {
+    return (unsigned)__shfl_xor((int)v, mask, width);
+}
+inline int __shfl(int v, int src, int width = 32) {
+    const int lane = (int)threadIdx.x & 31;
+    return emu_shfl_from_i(v, (lane & ~(width - 1)) | (src & (width - 1)));
+}
+inline unsigned __shfl(unsigned v, int src, int width = 32) { return (unsigned)__shfl((int)v, src, width); }
+inline int __shfl_down(int v, unsigned delta, int width = 32) {
+    const int lane = (int)threadIdx.x & 31, in_group = lane & (width - 1);
+    return emu_shfl_from_i(v, in_group + (int)delta < width ? lane + (int)delta : lane);
+}
+inline unsigned __shfl_down(unsigned v, unsigned delta, int width = 32) {
+    return (unsigned)__shfl_down((int)v, delta, width);
+}
 /* HIP declares the classification functions in the global namespace */
 using std::isfinite;
 inline int min(int a, int b) { return a < b ? a : b; }
@@ -245,9 +305,45 @@ int emu_emit(const char* name, void (*k)(P...), dim3 g, dim3 b, size_t lds, cons
     emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), __VA_ARGS__)
 /* hipLaunchKernelGGL, for units that launch with it directly: the same call as R4D_EMIT. */
 #define hipLaunchKernelGGL(kernel, grid, block, lds, stream, ...) \
-    ((void)(stream), (void)emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), __VA_ARGS__))
+    ((void)(stream), (void)emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), ##__VA_ARGS__))
 /* R4D_DYN_LDS (r4d_launch.h): the launch's dynamic LDS, poisoned at each block's start and ending
  * at an inaccessible page (its start 16-byte aligned), so a read before any write shows and one
  * past the end faults */
 void* emu_dyn_lds();
 #define R4D_DYN_LDS(type, name) type* const name = (type*)emu_dyn_lds()
+
+/* HIP's fused multiply-add, round to nearest; the masked shuffle and the wave vote (the full mask
+ * only: every lane takes part in a cross-lane op here) */
+inline float __fmaf_rn(float a, float b, float c) { return std::fma(a, b, c); }
+template <class T>
+inline T __shfl_sync(unsigned long long, T v, int src, int width = 32) {
+    static_assert(sizeof(T) == 4, "a 32-bit shuffle");
+    return __builtin_bit_cast(T, __shfl(__builtin_bit_cast(int, v), src, width));
+}
+inline int __any(int p) { return emu_ballot(p != 0) != 0; }
+
+/* IEEE single arithmetic, round to nearest (HIP's explicitly-rounded forms) */
+inline float __fadd_rn(float a, float b) { return a + b; }
+inline float __fsub_rn(float a, float b) { return a - b; }
+inline float __fmul_rn(float a, float b) { return a * b; }
+inline float __fdiv_rn(float a, float b) { return a / b; }
+inline float __fsqrt_rn(float a) { return std::sqrt(a); }
+struct alignas(8) float2 { float x, y; };
+inline float2 make_float2(float a, float b) { return float2{a, b}; }
+struct alignas(4) uchar4 { unsigned char x, y, z, w; };
+inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, unsigned char d) {
+    return uchar4{a, b, c, d};
+}
+/* v_cvt_pk_f32_fp8 (gfx12): two E4M3 codes of `w`'s low (hi false) or high half to f32, exact */
+typedef float emu_v2f __attribute__((ext_vector_type(2)));
+emu_v2f emu_cvt_pk_f32_fp8(int w, bool hi);
+#define __builtin_amdgcn_cvt_pk_f32_fp8(w, hi) emu_cvt_pk_f32_fp8((w), (hi))
+/* a system-scope fence orders nothing more between fibers on one thread */
+inline void __threadfence_system() {}
+/* every copy completes before it returns, as every launch does */
+inline hipError_t hipMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch,
+                                   size_t width, size_t height, hipMemcpyKind, hipStream_t) {
+    for (size_t r = 0; r < height; ++r)
+        std::memmove((char*)dst + r * dpitch, (const char*)src + r * spitch, width);
+    return hipSuccess;
+}

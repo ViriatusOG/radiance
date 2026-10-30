@@ -182,6 +182,7 @@ int d_props(int device, RadDeviceProps* out) {
     out->vram_bytes = (int64_t)p.totalGlobalMem;
     out->lds_bytes  = (int64_t)p.sharedMemPerBlock;
     out->is_host_backend = 0;
+    out->unified    = d_integrated(device);
 
     /* hipMemGetInfo reports the current device, so switch to `device` and back. props is not
      * called per step. */

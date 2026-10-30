@@ -4,6 +4,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "kld.h"
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
@@ -18,6 +19,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -122,16 +124,6 @@ static const Flag g_flags[] = {
     "                                    container on disk (O_DIRECT) -- the file tier, units on\n"
     "                                    Tier::SSD; a routed expert is read a layer at\n"
     "                                    a time, so a step is paced by the drive" },
-    { "--row-prefetch",       "MODE",   "on (default) | off -- a host gather from a table read through\n"
-    "                                    the container's mapping (--ngram-placement disk) asks for the\n"
-    "                                    pages its rows cover before its kernel runs, or beside it when\n"
-    "                                    they are already resident; off leaves every row to the\n"
-    "                                    kernel's own page faults. The output is the same either way" },
-    { "--mapped-rewarm",      "MODE",   "on (default) | off -- at startup, ask the page cache again for\n"
-    "                                    the pages of a table read through the container's mapping\n"
-    "                                    that an earlier run left cached and the load's own\n"
-    "                                    allocations pushed out, at most half of the available memory,\n"
-    "                                    so the first requests do not read them from the drive" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
@@ -225,6 +217,11 @@ static const Flag g_flags[] = {
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
                                         "serves text only and keeps the tower off the card" },
+    { "--image-gen-max-pixels", "N",    "an image generator's largest image, in pixels (1048576: 1024 x 1024).\n"
+      "                              Default: the model's. Its per-image buffers, and the activation\n"
+      "                              arena with them, are sized for it; larger requests are refused" },
+    { "--image-gen-max-refs", "N",      "the reference pictures an image generator takes a request. Default: the\n"
+      "                              model's; its conditioning buffers are sized for them" },
     { "--generation-config",  "PATH",   "a generation_config.json whose sampler settings become the default\n"
     "                                    for requests that send none. Without it a <model>.generation.json\n"
     "                                    beside the container is used, then the container's own\n"
@@ -314,6 +311,16 @@ static const Flag g_flags[] = {
     "                                    mean, median, 99/99.9/99.99th percentile KL divergence and top-1\n"
     "                                    agreement, over the positions and tokens DIR was recorded at" },
     { "--kld-corpus",         "FILE",   "JSONL, one {\"prompt\", \"score_from\"?, \"source\"?} a line; --kld-record only" },
+    { "--calib-corpus",       "FILE",   "instead of serving, run a JSONL corpus ({\"prompt\"} a line) through\n"
+    "                                    prefill once, every token, and record the calibration statistics\n"
+    "                                    the model keeps (each linear's input Gram, GPTQ's Hessian)" },
+    { "--calib-dir",          "DIR",    "where --calib-corpus writes the statistics; beside --kld-record, the\n"
+    "                                    reference's run records them over the KL corpus too" },
+    { "--calib-layers",       "RANGE",  "LO:HI, record layers LO..HI-1 only (default every layer), for a model\n"
+    "                                    whose statistics do not fit in memory in one run" },
+    { "--kld-top",            "N",      "--kld-record keeps each position's N most likely tokens exactly and the\n"
+    "                                    mass of the rest, not the whole vocabulary (a corpus too large for\n"
+    "                                    full rows); 0 (default) keeps the whole vocabulary" },
     { "--kld-out",            "FILE",   "the --kld-ref report as JSON, and every position's numbers in FILE.rows" },
     { "--kld-lora",           "NAME",   "run --kld-record / --kld-ref through the --lora adapter NAME" },
     { "--kld-lora-sources",   "PREFIX", "--kld-lora only for documents whose source starts with PREFIX; the\n"
@@ -322,9 +329,6 @@ static const Flag g_flags[] = {
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
-    { "--debug-tape-dump",    nullptr,  "list the dispatches of the first recorded pass of each kind\n"
-    "                                    on stderr (TAPEDUMP lines, every rank) and which of them\n"
-    "                                    start unordered behind the one before" },
     { "--debug-draft-oracle", "FILE",   "a verify-path test, not a drafter: with --spec-ngram, prompt\n"
     "                                    lookup proposes from the token ids in FILE (a plain greedy\n"
     "                                    run's continuation of the one prompt the test sends), 30% of\n"
@@ -333,6 +337,10 @@ static const Flag g_flags[] = {
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
       "                              to it is orders of magnitude of speed with nothing to say so." },
+    { "--proceed-with-incompatible-configuration", nullptr,
+      "start on a machine configuration radiance refuses (amdgpu CWSR off where cards serve).\n"
+      "                              UNSUPPORTED: all guarantees are off, and the log and the startup\n"
+      "                              report say so." },
     { "--profile-ops",        nullptr,  "per-op device timing (see the caveat it prints)" },
     { "--expert-stats",       "FILE",   "count the routed experts every layer selects, apart for prefill, decode,\n"
     "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
@@ -649,24 +657,6 @@ int config_parse(int argc, char** argv, Config* c) {
             c->tower_placement = p;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
-        else if (S("--row-prefetch")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if      (!std::strcmp(v, "on"))  c->row_prefetch = true;
-            else if (!std::strcmp(v, "off")) c->row_prefetch = false;
-            else {
-                RAD_ERR("--row-prefetch takes on or off, not '%s'", v);
-                return RAD_E_INVAL;
-            }
-        }
-        else if (S("--mapped-rewarm")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if      (!std::strcmp(v, "on"))  c->mapped_rewarm = true;
-            else if (!std::strcmp(v, "off")) c->mapped_rewarm = false;
-            else {
-                RAD_ERR("--mapped-rewarm takes on or off, not '%s'", v);
-                return RAD_E_INVAL;
-            }
-        }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--lora")) {
@@ -834,6 +824,14 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
             c->served_model_name = v;
+        }
+        else if (S("--image-gen-max-pixels")) {
+            if (!(v = need(i)) || !parse_int(a.c_str(), v, 256, INT64_MAX, &c->image_gen_max_pixels))
+                return RAD_E_INVAL;
+        }
+        else if (S("--image-gen-max-refs")) {
+            if (!(v = need(i)) || !parse_int(a.c_str(), v, 1, INT64_MAX, &c->image_gen_max_refs))
+                return RAD_E_INVAL;
         }
         else if (S("--mm-max-patches")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1009,15 +1007,28 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--kld-record"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_record = v; }
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
+        else if (S("--kld-top"))               { if (!num(0, kKldTopMax, &c->kld_top)) return RAD_E_INVAL; }
+        else if (S("--calib-corpus"))          { if (!(v = need(i))) return RAD_E_INVAL; c->calib_corpus = v; }
+        else if (S("--calib-dir"))             { if (!(v = need(i))) return RAD_E_INVAL; c->calib_dir = v; }
+        else if (S("--calib-layers")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int lo = -1, hi = -1, used = 0;
+            if (std::sscanf(v, "%d:%d%n", &lo, &hi, &used) != 2 || v[used] != '\0' || lo < 0 || hi <= lo) {
+                RAD_ERR("--calib-layers takes LO:HI with 0 <= LO < HI, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->calib_layer_lo = lo;
+            c->calib_layer_hi = hi;
+        }
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
         else if (S("--kld-lora"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora = v; }
         else if (S("--kld-lora-sources"))      { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora_sources = v; }
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
-        else if (S("--debug-tape-dump"))       c->debug_tape_dump = true;
         else if (S("--debug-draft-oracle"))    { if (!(v = need(i))) return RAD_E_INVAL; c->debug_draft_oracle = v; }
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
+        else if (S("--proceed-with-incompatible-configuration")) c->proceed_incompatible = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
         else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; c->expert_profile_given = true; }
@@ -1104,6 +1115,26 @@ int config_parse(int argc, char** argv, Config* c) {
     if (!c->kld_ref.empty() && !c->kld_corpus.empty()) {
         RAD_ERR("--kld-ref reads its tokens from the reference, which recorded them; drop "
                 "--kld-corpus");
+        return RAD_E_INVAL;
+    }
+    if (c->calib() && c->calib_dir.empty()) {
+        RAD_ERR("--calib-corpus records into --calib-dir; give one");
+        return RAD_E_INVAL;
+    }
+    if ((!c->calib_dir.empty() || c->calib_layer_hi) && !c->calib() && c->kld_record.empty()) {
+        RAD_ERR("--calib-dir and --calib-layers belong to a --calib-corpus or --kld-record run");
+        return RAD_E_INVAL;
+    }
+    if (c->calib_layer_hi && c->calib_dir.empty()) {
+        RAD_ERR("--calib-layers chooses what --calib-dir records; give one");
+        return RAD_E_INVAL;
+    }
+    if (c->calib() && c->kld()) {
+        RAD_ERR("--calib-corpus and the KL mode each replace the server; give one");
+        return RAD_E_INVAL;
+    }
+    if (c->kld_top && c->kld_record.empty()) {
+        RAD_ERR("--kld-top is how --kld-record stores a reference; --kld-ref reads the form from it");
         return RAD_E_INVAL;
     }
     if (!c->kld_out.empty() && c->kld_ref.empty()) {
@@ -1268,8 +1299,6 @@ const ShowRow kShow[] = {
           return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
-    { "--row-prefetch",       [](const Config& c) { return onoff(c.row_prefetch); } },
-    { "--mapped-rewarm",      [](const Config& c) { return onoff(c.mapped_rewarm); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
@@ -1317,6 +1346,8 @@ const ShowRow kShow[] = {
     { "--api-key",            [](const Config& c) { return std::string(c.api_key.empty() ? "not set" : "set"); } },
     { "--served-model-name",  [](const Config& c) { return or_none(c.served_model_name, "the container's name"); } },
     { "--mm-max-patches",     [](const Config& c) { return c.mm_max_patches < 0 ? std::string("auto") : num(c.mm_max_patches); } },
+    { "--image-gen-max-pixels", [](const Config& c) { return c.image_gen_max_pixels > 0 ? num(c.image_gen_max_pixels) : std::string("the model's"); } },
+    { "--image-gen-max-refs", [](const Config& c) { return c.image_gen_max_refs > 0 ? num(c.image_gen_max_refs) : std::string("the model's"); } },
     { "--generation-config",  [](const Config& c) { return or_none(c.generation_config, "none"); } },
     { "--override-chat-template", [](const Config& c) { return or_none(c.override_chat_template, "none (the container's)"); } },
     { "--temp",               [](const Config& c) { return c.sample_temp < 0 ? std::string("unset") : fnum(c.sample_temp); } },
@@ -1381,15 +1412,19 @@ const ShowRow kShow[] = {
     { "--kld-record",         [](const Config& c) { return or_none(c.kld_record, "none"); } },
     { "--kld-ref",            [](const Config& c) { return or_none(c.kld_ref, "none"); } },
     { "--kld-corpus",         [](const Config& c) { return or_none(c.kld_corpus, "none"); } },
+    { "--kld-top",            [](const Config& c) { return c.kld_top ? num(c.kld_top) : std::string("0 (the whole vocabulary)"); } },
+    { "--calib-corpus",       [](const Config& c) { return or_none(c.calib_corpus, "none"); } },
+    { "--calib-dir",          [](const Config& c) { return or_none(c.calib_dir, "none"); } },
+    { "--calib-layers",       [](const Config& c) { return c.calib_layer_hi ? num(c.calib_layer_lo) + ":" + num(c.calib_layer_hi) : std::string("every layer"); } },
     { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
     { "--kld-lora",           [](const Config& c) { return or_none(c.kld_lora, "none (the base)"); } },
     { "--kld-lora-sources",   [](const Config& c) { return or_none(c.kld_lora_sources, "every document"); } },
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
-    { "--debug-tape-dump",    [](const Config& c) { return onoff(c.debug_tape_dump); } },
     { "--debug-draft-oracle", [](const Config& c) { return or_none(c.debug_draft_oracle, "none"); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
+    { "--proceed-with-incompatible-configuration", [](const Config& c) { return onoff(c.proceed_incompatible); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
     { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },

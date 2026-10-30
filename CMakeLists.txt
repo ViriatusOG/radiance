@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 # VERSION is the server release that /version reports. The plugin ABI version is separate and is
 # read from abi/rad_abi.h below.
-project(radiance VERSION 1.14.0 LANGUAGES C CXX)
+project(radiance VERSION 1.15.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -303,6 +303,14 @@ endif()
 # with no kernel library of its own refuses device-only ops (docs/PLUGIN.md §10).
 if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libr3d/CMakeLists.txt)
   add_subdirectory(libr3d)
+endif()
+# libhalo: the Strix Halo (gfx1151) kernel library, built only when RAD_GPU_TARGETS names gfx1151.
+# On a gfx1151 it is preferred over libr3d, which also serves the chip: with no --kernels list the
+# loader takes libraries in file-name order (libhalo.so ahead of libr3d.so), the first library with
+# a row for an op supplies it, and libhalo declines every machine without a gfx1151
+# (rad_plugin_open), so other RDNA3 cards get libr3d alone.
+if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libhalo/CMakeLists.txt)
+  add_subdirectory(libhalo)
 endif()
 # libavx: the production host kernels (x86 SIMD, dispatched by CPU feature), built on every x86-64.
 # Not optional: host-placed ops need a kernel other than the oracle (rad_gate_reference_kernels

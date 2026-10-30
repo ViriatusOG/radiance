@@ -539,11 +539,14 @@ int ref_gram_accum(const RadArgs* a, RadStream) {
                 ldt(x, xb + k * xst) * (s ? ldt(s, sb + (k / g) * sst) : 1.0f);
     }
 
+    /* `upper`: only k2 >= k1. libr4d adds whole 64-wide tiles, so it also writes some entries just
+     * below the diagonal; neither form's entries there are part of the contract. */
+    const bool upper = p_int(a, "upper", 0) != 0;
     const int64_t hst = laststride(h);
     REF_PAR_FOR(n * n * rows)
     for (int64_t k1 = 0; k1 < n; ++k1) {
         const int64_t hb = rowoff(h, k1, n);
-        for (int64_t k2 = 0; k2 < n; ++k2) {
+        for (int64_t k2 = upper ? k1 : 0; k2 < n; ++k2) {
             double acc = 0.0;
             for (int64_t r = 0; r < rows; ++r)
                 acc += (double)xs[(size_t)r * (size_t)n + (size_t)k1] *

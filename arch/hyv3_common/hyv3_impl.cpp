@@ -16,6 +16,7 @@
 #endif
 #include <arch/rad_arch.h>
 #include "hyv3_attention.h"
+#include "rad_abi_layout.h"
 #include <arch/rad_block_mlp_fp8.h>
 #include <arch/rad_block_moe_fp8.h>
 
@@ -536,6 +537,7 @@ extern "C" void rad_arch_step(struct RadCtx* c, const struct RadBatch* batch) {
     HYV3_NS::step(c, batch);
 }
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) {
     static const RadPluginInfo info = {
         RAD_PLUGIN_ARCH, HYV3_PLUGIN_NAME, "0.2.0",

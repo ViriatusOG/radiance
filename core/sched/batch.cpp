@@ -14,9 +14,11 @@
 namespace rad {
 
 /* Steps of the following prompt a prefill batch carries for the PLE read-ahead queue
- * (RadBatch::n_ahead), whose rows the arch's reader thread prefetches off the step path. Keep in
- * step with rad_block_ple.h's kAheadChunks, which clamps to the buffer it declared. */
-static constexpr int64_t k_ahead_chunks = 8;
+ * (RadBatch::n_ahead), whose rows the arch's reader thread prefetches off the step path. Two: the
+ * reader needs to run one chunk ahead of the gather, and libavx hands it at most a quarter of its
+ * row cache (avx_ngram.cpp, kAheadRows), two chunks of 4096 tokens at 16 rows each. Keep in step
+ * with rad_block_ple.h's kAheadChunks, which clamps to the buffer it declared. */
+static constexpr int64_t k_ahead_chunks = 2;
 
 /* Alignment of each staging array carved from a set's slab. One slab per set means a couple of
  * allocations at init instead of two dozen, with every array sharing one mapping. */
@@ -136,6 +138,9 @@ void BatchBuilder::carve(Set& s, char* h) {
     /* Each row's adapter slot, carved only when the engine serves adapters, so an engine without
      * them lays the slab out as if the array did not exist. */
     pair(&s.h_lora,  &s.d_lora,  lora_on_ ? T : 0);
+    /* Each sequence's words for the plugin, carved only when the program declared a bound. */
+    pair(&s.h_pw,    &s.d_pw,    pw_cap_ ? S * pw_cap_ : 0);
+    pair(&s.h_pwcu,  &s.d_pwcu,  pw_cap_ ? S + 1 : 0);
     /* Host-only (derived metadata is copied into the planned arena), but carved on both sides to
      * keep device offsets equal to host offsets. */
     {
@@ -240,6 +245,9 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
         o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
+        o.seqs.clear();
+        o.seqs.reserve((size_t)max_seqs_);   /* a build fills it without allocating */
+        o.has_seqs = false;
     }
     pitch_.assign(s.groups.size(), 1);
     bt_mirror_.assign(s.groups.size(), BtMirror{});
@@ -473,6 +481,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
     lora_on_ = cfg.lora.enabled();
+    pw_cap_ = prog.plugin_words;
     return RAD_OK;
 }
 
@@ -909,6 +918,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     RAD_TRY_NULL(reserve(need, &off));
     carve(s, ring_.host + off);
     Out& o = out_[out_next_];
+    o.has_seqs = true;
+    o.seqs.clear();
+    for (const StepEntry& e : plan.e) o.seqs.push_back(e.seq);
 
     const int64_t n_tok = plan.n_tok;
 
@@ -923,6 +935,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_mm = 0;
     bool lora_rows = false;
     int32_t cvec_rows = 0;
+    int64_t n_pw = 0;
+    if (pw_cap_) s.h_pwcu[0] = 0;
     s.h_cu[0] = 0;
     for (int64_t i = 0; i < n_seq; ++i) {
         const StepEntry& e = plan.e[(size_t)i];
@@ -1023,9 +1037,25 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             const int32_t nr = e.hidden_n > 0 ? e.hidden_n : e.n_tokens;
             for (int32_t j = 0; j < nr; ++j) s.h_out[n_out++] = e.hidden_row + j;
         } else if (e.produces_token) {
+            /* The request's words for the plugin ride the trunk step that samples its prompt's
+             * first token (RadBatch::plugin_words); word 0 is that row's index in `out_ids`. */
+            if (pw_cap_ && e.is_prefill && plan.draft_pass == 0 && e.req &&
+                !e.req->plugin_words.empty()) {
+                const std::vector<int32_t>& w = e.req->plugin_words;
+                if ((int64_t)w.size() > pw_cap_) {
+                    RAD_ERR("step batch: sequence %llu carries %zu words for the plugin, past the "
+                            "%lld it declared", (unsigned long long)e.seq, w.size(),
+                            (long long)pw_cap_);
+                    return nullptr;
+                }
+                std::memcpy(s.h_pw + n_pw, w.data(), w.size() * sizeof(int32_t));
+                s.h_pw[n_pw] = (int32_t)n_out;
+                n_pw += (int64_t)w.size();
+            }
             const int32_t first = (int32_t)(k + e.n_tokens) - 1 - e.n_spec;
             for (int32_t j = 0; j <= e.n_spec; ++j) s.h_out[n_out++] = first + j;
         }
+        if (pw_cap_) s.h_pwcu[i + 1] = (int32_t)n_pw;
         if (e.draft_out) s.h_dout[n_dout++] = (int32_t)(k + e.n_tokens - 1);
         /* RADIANCE_DFLASH_TRACE logs each drafter pass's kind, positions and token ids. A wrong
          * anchor, mask id or position base shows only as near-zero acceptance with correct
@@ -1150,18 +1180,18 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     }
 
     /* A scored step (RadBatch::score_only): every sampled row is a scored request's first row, on
-     * one rank, in a program that told the core where its hidden rows and head table are. */
+     * one rank, in a program that told the core where its hidden rows and head table are. Each
+     * such entry gives one row, so the step is scored only when they account for all n_out: a
+     * mid-prefill chunk's KLD rows or an entry's own hidden rows still need the lm_head. */
     int32_t score_only = 0;
     if (n_out > 0 && n_dout == 0 && !plan.draft_pass && ranks_.size() == 1 &&
         prog_->score_hidden != RAD_NULL_HANDLE && prog_->score_table != RAD_NULL_HANDLE) {
-        score_only = 1;
-        for (const StepEntry& e : plan.e) {
-            if (!e.produces_token) continue;
-            if (!e.req || !e.req->token_scores || !e.req->output.empty() || e.n_spec > 0) {
-                score_only = 0;
-                break;
-            }
-        }
+        int64_t scored = 0;
+        for (const StepEntry& e : plan.e)
+            if (e.produces_token && e.hidden_row < 0 && e.req && e.req->token_scores &&
+                e.req->output.empty() && e.n_spec == 0)
+                ++scored;
+        score_only = scored == n_out;
     }
 
     /* ---------------------------------------------------------- the batch, one per rank */
@@ -1209,6 +1239,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * runs the same pass as an engine serving no adapters. */
         B.lora_slot = lora_rows ? on_rank(base, b0, s.d_lora) : nullptr;
         B.control_vector = cvec_rows;
+        B.n_plugin_words = n_pw;
+        B.plugin_words   = n_pw ? on_rank(base, b0, s.d_pw) : nullptr;
+        B.plugin_cu      = n_pw ? on_rank(base, b0, s.d_pwcu) : nullptr;
+        B.plugin_words_h = n_pw ? s.h_pw : nullptr;
+        B.plugin_cu_h    = n_pw ? s.h_pwcu : nullptr;
         B.enc = 0;
         B.enc_n_patch = 0;
         B.enc_pixels = nullptr;
@@ -1243,6 +1278,14 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
     return &o.batch[0];
+}
+
+const std::vector<uint64_t>* BatchBuilder::step_seqs(const RadBatch* b) const {
+    if (!b) return nullptr;
+    for (const Out& o : out_)
+        for (const RadBatch& rb : o.batch)
+            if (&rb == b) return o.has_seqs ? &o.seqs : nullptr;
+    return nullptr;
 }
 
 const RadBatch* BatchBuilder::batch_for(int rank) const {
@@ -1346,6 +1389,9 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         }
     }
     Out& o = out_[out_next_];
+    /* An encoder pass runs no sequence's KV. */
+    o.has_seqs = false;
+    o.seqs.clear();
     for (size_t r = 0; r < ranks_.size(); ++r) {
         RadBatch& B = o.batch[r];
         B = RadBatch{};

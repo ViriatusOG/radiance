@@ -24,7 +24,7 @@
 const AbiRow abi_c_rows[] = {
 #define ABI_STRUCT(T)   { #T, "", 0, sizeof(T) },
 #define ABI_FIELD(T, f) { #T, #f, offsetof(T, f), sizeof(((T*)0)->f) },
-#include "abi_layout_rows.h"
+#include "rad_abi_layout_rows.h"
 #undef ABI_STRUCT
 #undef ABI_FIELD
 };

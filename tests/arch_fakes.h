@@ -113,6 +113,8 @@ struct RadBuilder {
      * output (rad_declare_pooled). */
     rad_buf logits = 0;
     rad_buf pooled = 0;
+    /* The words a request may hand the plugin (rad_declare_plugin_words). */
+    int64_t plugin_words = 0;
 
     /* The draft head's declaration (rad_declare_drafter), and whether it keeps no cache of its
      * own (rad_drafter_shared_kv) and at which rotary offset. */
@@ -303,6 +305,13 @@ extern "C" int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight tabl
 extern "C" int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
     if (!b || !pooled || b->logits) return RAD_E_INVAL;
     b->pooled = pooled;
+    return RAD_OK;
+}
+
+/* The words a request may hand the plugin, recorded as the core records them. */
+extern "C" int rad_declare_plugin_words(RadBuilder* b, int64_t max_words) {
+    if (!b || max_words < 0) return RAD_E_INVAL;
+    b->plugin_words = max_words;
     return RAD_OK;
 }
 
@@ -589,6 +598,11 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
     (void)dst; (void)value; (void)bytes; (void)s;
     return RAD_OK;
 }
+/* Events complete at once: the fake stream runs nothing. The calibration tap waits on one. */
+extern "C" int  rad_event_create(RadEvent* out) { if (out) *out = (RadEvent)out; return RAD_OK; }
+extern "C" void rad_event_destroy(RadEvent e)   { (void)e; }
+extern "C" int  rad_event_record(RadEvent e, RadStream s) { (void)e; (void)s; return RAD_OK; }
+extern "C" int  rad_event_sync(RadEvent e)      { (void)e; return RAD_OK; }
 
 /* ==================================================================== fixtures and helpers */
 namespace rad_fake {

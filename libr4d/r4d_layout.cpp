@@ -338,13 +338,15 @@ void sz_read(const WGeom& g, const uint32_t* sz, const RadTensor* pl, bool asym)
             }
 }
 
-/* A rotated asymmetric grid (ParoQuant): codes of dtype `codes`, an f16 scale and a zero point
- * per group, optionally with a `givens` transform and its tables. The bytes are the unrotated
- * grid's; the rotation is applied to the activation. */
+/* A rotated asymmetric grid: codes of dtype `codes`, an f16 scale and a zero point per group,
+ * optionally with ParoQuant's `givens` transform and its tables, or libquant's `fwht128` (the
+ * scale carrying its 1/128). The bytes are the unrotated grid's; the rotation is applied to the
+ * activation. */
 static bool paro_asym_enc(const RadEncoding* e, uint32_t codes, long long group) {
     if (!e || !rad_enc_is(e, "affine") || e->n_planes < 3) return false;
     const bool giv = std::strncmp(e->transform, "givens", RAD_ENC_STR) == 0;
-    if (!giv && e->transform[0]) return false;
+    const bool fwht = std::strncmp(e->transform, "fwht128", RAD_ENC_STR) == 0;
+    if (!giv && !fwht && e->transform[0]) return false;
     if (!giv && e->n_planes != 3) return false;
     if (giv && (!rad_enc_valid(e) || rad_enc_find(e, "t.pairs") < 0)) return false;
     if (std::strncmp(e->plane[0].role, "codes", RAD_ENC_STR) != 0 || e->plane[0].dtype != codes ||

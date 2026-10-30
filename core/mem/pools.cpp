@@ -175,7 +175,8 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
 
     /* The budgets were resolved by core/mem/vram_budget.cpp (from the card, the measured driver
      * residency and the computed arena); this refuses rather than re-deciding them (spec §6). A
-     * zero means the resolver never ran, which is a wiring bug. */
+     * zero means the resolver never ran, which is a wiring bug: one that leaves the cache nothing
+     * refuses there, with the budget. */
     std::string missing;
     if (cfg.vram_weights_mib <= 0) missing += "  vram_weights resolved to 0 MiB\n";
     if (cfg.vram_kv_mib      <= 0) missing += "  vram_kv resolved to 0 MiB\n";

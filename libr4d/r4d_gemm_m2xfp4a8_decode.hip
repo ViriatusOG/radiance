@@ -466,9 +466,13 @@ unsigned* m2d_out_ctr(const void* out) {
   static std::map<std::pair<int, const void*>, unsigned*> blocks;
   int dev = 0;
   if (hipGetDevice(&dev) != hipSuccess) return nullptr;
-  std::lock_guard<std::mutex> lk(mu);
   const auto key = std::make_pair(dev, out);
-  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  {
+    // Not held while the block is made, as in split_ctr (r4d_gemm_fp8a8.hip): the zeroing waits
+    // for the card.
+    std::lock_guard<std::mutex> lk(mu);
+    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  }
   const size_t n = R4D_M2D_MAX_N / (R4D_M2D_DWN * 16);
   unsigned* p = nullptr;
   if (hipMalloc((void**)&p, n * sizeof(unsigned)) != hipSuccess) return nullptr;
@@ -479,8 +483,15 @@ unsigned* m2d_out_ctr(const void* out) {
     (void)hipFree(p);
     return nullptr;
   }
-  blocks.emplace(key, p);
-  return p;
+  unsigned* kept = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    const auto [it, fresh] = blocks.emplace(key, p);
+    if (fresh) return it->second;
+    kept = it->second;
+  }
+  (void)hipFree(p);  // another thread made this key's block in the meantime
+  return kept;
 }
 
 // The split, slab and load hint for a launch, from M, the shape and the tunables (0 = the rule).

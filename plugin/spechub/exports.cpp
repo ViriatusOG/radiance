@@ -12,6 +12,7 @@
  * The ops are declared only under --draft-coupling on; the plugin never reads the flag.
  */
 #include "spechub.h"
+#include "rad_abi_layout.h"
 
 #ifdef RAD_SPECHUB_WITH_DEVICE
 #include "../../libr4d/r4d_emit.h"   /* only for the three globals it declares */
@@ -31,6 +32,7 @@ const RadPluginInfo kInfo = {
 }  /* namespace */
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 /* Mixed library: 0, and the per-row answer below does the classifying. */
 extern "C" int rad_plugin_reference(void) { return 0; }

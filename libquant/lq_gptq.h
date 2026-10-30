@@ -18,6 +18,8 @@
 #include "lq_grid.h"
 #include "lq_hess.h"
 
+#include <string>
+
 namespace lq {
 
 /* Upper Cholesky factor U of the damped inverse Hessian, U^T U = (H + lambda I)^-1, as a K x K
@@ -36,9 +38,31 @@ std::vector<int32_t> gptq_act_order(const char* dir, const char* name, int64_t K
 
 /* Quantise `w` [N, K] in place on grid `g` against `scales` (grid_scales'), writing codes to
  * `codes` [N, K]. On return `w` holds the decoded values. With `u` null each value is rounded to
- * nearest on its own, which is byte-identical to grid_rtn. */
-void gptq_quantise(const Grid& g, float* w, int32_t* codes, const Scales& scales, int64_t N,
-                   int64_t K, const float* u);
+ * nearest on its own, which is byte-identical to grid_rtn. A trellis grid runs on the cards when
+ * gpu_set_devices named any (lq_gpu.h), with the same result; RAD_OK, or the card's failure with
+ * the reason in *why.
+ *
+ * `dynamic`: each row's scale for a 128-column group is chosen again when the loop reaches the
+ * group, from the values the earlier columns' error has moved it to (GPTQ's own grouping), rather
+ * than from the weight as it stood; `scales` is updated. Needs a one-row, 128-column scale grid
+ * with one level (gptq_dynamic_ok). */
+int gptq_quantise(const Grid& g, float* w, int32_t* codes, Scales& scales, int64_t N,
+                  int64_t K, const float* u, bool dynamic = false, std::string* why = nullptr);
+/* tcq_colf: the blocks' shared factors into scales.colf and each row's scale against them, from
+ * the weight `w` [N, K] as it stands (Grid::tcq_colf). */
+void gptq_tcq_colf(const float* w, Scales& scales, int64_t N, int64_t K);
+
+bool gptq_dynamic_ok(const Grid& g, const Scales& s);
+
+/* The trellis loop's two scale steps, shared by the host loop and the card's (lq_tcq_gpu.hip).
+ * gptq_tcq_dyn_scales: under dyn=1, rows [r0, r1)'s scales for the block [b0, b1), chosen from
+ * `w` as it stands. gptq_tcq_col_scales: for the n rows from n0 (a multiple of tcq_rows), the
+ * scale each row's values take in column `col`, and under tcq_rb the row's own scale over its row
+ * block's into `rt` (Grid::tcq_rb). */
+void gptq_tcq_dyn_scales(const Grid& g, const float* w, int64_t K, Scales& scales, int64_t r0,
+                         int64_t r1, int64_t b0, int64_t b1);
+void gptq_tcq_col_scales(const Grid& g, const Scales& scales, int64_t n0, int64_t n, int64_t col,
+                         float* s, float* rt);
 
 /* Coordinate descent after the GPTQ loop: `passes` sweeps over each row's columns, re-choosing each
  * code at its conditional optimum (the value minimising the row's e (H + lambda I) e^T,

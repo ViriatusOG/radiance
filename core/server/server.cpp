@@ -2,6 +2,10 @@
 #include "server_priv.h"
 
 #include <cstdio>
+#include "clef.h"
+#include "laya.h"
+#include "mica.h"
+#include "rad_laya.h"
 #include "json_partial.h"
 #include "systemone.h"
 #include "rad_internal.h"
@@ -97,6 +101,8 @@ void Server::register_routes() {
     router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
     router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
+    /* LiteLLM's name for the same endpoint. */
+    router_.post("/v1/decisions",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* Speech to text, for a model whose plugin says how it transcribes (RadAudioFormat). */
     router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return handle_speech(q); });
     router_.post("/v1/videos",       [this](const HttpRequest& q) { return handle_video_create(q); });
@@ -1631,6 +1637,11 @@ HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"),
                               req.peer);
+    /* Laya runs on the embedding path, but its pooled row is option logits, not a vector. */
+    if (opt_.decision_type == "laya")
+        return error_response(err_not_implemented("/v1/embeddings requires an embedding model; "
+                                                  "this one is Laya, which answers /v1/systemone"),
+                              req.peer);
     if (rerank && (!is_reranker(deps_.embed) || deps_.embed->dim() != 1))
         return error_response(err_not_implemented("/rerank requires a reranking model"), req.peer);
     if (!rerank && is_reranker(deps_.embed))
@@ -1773,10 +1784,16 @@ HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
 HttpResponse Server::handle_systemone(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.decision_type == "clef") return handle_clef(req);
+    if (opt_.decision_type == "laya") return handle_laya(req);
+    if (opt_.decision_type == "mica") return handle_mica(req);
     if (opt_.decision_type != "d1")
         return error_response(err_not_implemented(
             "/v1/systemone serves a decision model; this container does not declare one "
-            "(convert d1 with --set decision.type=d1)"), req.peer);
+            "(convert d1 with --set decision.type=d1, clef with --set decision.type=clef; "
+            "rad-convert sets laya for a Laya checkpoint directory, mica with --set "
+            "decision.type=mica)"),
+            req.peer);
 
     DecisionRequest r;
     ApiError err;
@@ -1784,9 +1801,49 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
         return error_response(err, req.peer);
 
     const int n = (int)r.questions.size();
+    std::vector<std::vector<int32_t>> prompts, candidates;
+    std::vector<std::string> names;
+    for (const DecisionQuestion& q : r.questions) {
+        prompts.push_back(q.tokens);
+        candidates.push_back(q.candidates);
+        names.push_back(q.name);
+    }
+    std::vector<std::vector<float>> logits;
+    if (auto no = score_prompts(req, "", prompts, candidates, names, r.trunk, r.media, r.input_tokens,
+                                &logits))
+        return std::move(*no);
+
+    json answers = json::object();
+    for (int i = 0; i < n; ++i) {
+        json a;
+        if (decision_answer(r.questions[(size_t)i], logits[(size_t)i], &a, &err) < 0)
+            return error_response(err, req.peer);
+        answers[r.questions[(size_t)i].name] = std::move(a);
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{
+        { "model", opt_.model_id },
+        { "answers", std::move(answers) },
+        { "usage", { { "input_tokens", r.input_tokens }, { "output_tokens", 0 } } } }));
+}
+
+/* One engine request a prompt, each reading its candidates' logits at the prompt's last position
+ * (Request::token_scores) and sampling one discarded token: d1's and Mica's readout.
+ *
+ * Prompts share their state, and it is read once: the first prompt runs alone and leaves the shared
+ * head of `trunk` tokens in the prefix cache (attention blocks plus a convolution or delta-net
+ * checkpoint, Request::checkpoint_at); the rest are then submitted together and compute only their
+ * own tails. Admits and releases the requests itself. On success `logits` holds each prompt's
+ * candidate logits and nothing is returned; otherwise the response to send. */
+std::optional<HttpResponse> Server::score_prompts(
+    const HttpRequest& req, const char* label, const std::vector<std::vector<int32_t>>& prompts,
+    const std::vector<std::vector<int32_t>>& candidates, const std::vector<std::string>& names,
+    int32_t trunk, const std::shared_ptr<mm::PromptMedia>& media, int64_t input_tokens,
+    std::vector<std::vector<float>>* logits) {
+    const int n = (int)prompts.size();
     if (auto no = admit(n, req.peer, ApiShape::OpenAI, "questions")) return *no;
-    RAD_INFO("systemone admitted%s questions=%d prompt=%lld tok", from_peer(req.peer).c_str(), n,
-             (long long)r.input_tokens);
+    RAD_INFO("systemone%s admitted%s questions=%d prompt=%lld tok", label, from_peer(req.peer).c_str(),
+             n, (long long)input_tokens);
 
     std::vector<Generation> gens;
     std::vector<Request> rqs;
@@ -1796,15 +1853,15 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
         g.index = i;
         g.sink = std::make_shared<Sink>(16);
         auto ts = std::make_shared<TokenScores>();
-        ts->tokens = r.questions[(size_t)i].candidates;
+        ts->tokens = candidates[(size_t)i];
         Request rq;
-        rq.prompt = r.questions[(size_t)i].tokens;
-        rq.media = r.media;
+        rq.prompt = prompts[(size_t)i];
+        rq.media = media;
         rq.token_scores = ts;
         rq.max_tokens = 1;
         rq.sp.temp = 0.0f;
         rq.sink = g.sink.get();
-        if (i == 0 && n > 1) rq.checkpoint_at = r.trunk;
+        if (i == 0 && n > 1) rq.checkpoint_at = trunk;
         rqs.push_back(std::move(rq));
         gens.push_back(std::move(g));
         scores.push_back(std::move(ts));
@@ -1834,7 +1891,7 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
             g.sink->id = ids[k];
             if (!ids[k]) {
                 early = std::make_unique<HttpResponse>(
-                    fail("the scheduler refused question " + r.questions[(size_t)first + k].name));
+                    fail("the scheduler refused question " + names[(size_t)first + k]));
                 return;
             }
         }
@@ -1861,35 +1918,275 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
     /* A first question that failed fails the call; the rest would only repeat it. */
     if (gens[0].finish == Finish::Error || gens[0].finish == Finish::Cancelled)
         return fail(gens[0].finish == Finish::Error ? engine_failure(*gens[0].sink)
-                                                    : "the engine cancelled question " +
-                                                          r.questions[0].name);
+                                                    : "the engine cancelled question " + names[0]);
     if (n > 1) {
         run(1, n);
         if (early) return std::move(*early);
     }
-
-    json answers = json::object();
     for (size_t i = 0; i < gens.size(); ++i) {
         const Generation& g = gens[i];
         if (g.finish == Finish::Error || g.finish == Finish::Cancelled)
             return fail(g.finish == Finish::Error ? engine_failure(*g.sink)
-                                                  : "the engine cancelled question " +
-                                                        r.questions[i].name);
-        json a;
-        if (decision_answer(r.questions[i], scores[i]->logits, &a, &err) < 0) {
-            retire(gens);
-            release(n);
-            return error_response(err, req.peer);
-        }
-        answers[r.questions[i].name] = std::move(a);
+                                                  : "the engine cancelled question " + names[i]);
     }
+    logits->clear();
+    for (const auto& ts : scores) logits->push_back(ts->logits);
     retire(gens);
     release(n);
+    return std::nullopt;
+}
+
+/* Mica (mica.h): d1's readout over Mica's own prompts, one a question, served by the qwen35
+ * plugins as they are. Each prompt is tokenised whole, as Mica's runtime tokenises it, and the
+ * longest head every prompt shares is the trunk the prefix cache carries. */
+HttpResponse Server::handle_mica(const HttpRequest& req) {
+    MicaRequest r;
+    ApiError err;
+    if (parse_mica_request(req.body, lim_, opt_.model_id, &r, &err) < 0)
+        return error_response(err, req.peer);
+    const ITokenizer& tok = *deps_.tok;
+    /* Inputs longer than this are refused, never cut (Mica's README); the deployment's context
+     * keeps one position for the token a request samples and discards. */
+    const int64_t cap = std::min<int64_t>(32768, lim_.max_ctx > 0 ? lim_.max_ctx - 1 : 32768);
+    std::vector<std::vector<int32_t>> prompts, candidates;
+    std::vector<std::string> names;
+    for (const MicaRow& row : r.rows) {
+        std::vector<int32_t> t = tok.encode(mica_prompt(row, r.state), false, true);
+        if ((int64_t)t.size() > cap) {
+            ApiError e = err_bad("state", "question " + row.id + "'s prompt is " + std::to_string(t.size()) +
+                                 " tokens; at most " + std::to_string(cap) + " are read, and nothing is cut");
+            e.code = "context_length_exceeded";
+            e.n_prompt_tokens = (int64_t)t.size();
+            e.n_ctx = cap;
+            return error_response(e, req.peer);
+        }
+        std::vector<int32_t> ids;
+        for (const std::string& label : mica_labels(row)) {
+            const std::vector<int32_t> one = tok.encode(label, false, false);
+            if (one.size() != 1)
+                return error_response(err_internal("Mica's label '" + label + "' is not one token in this "
+                                                   "container's tokenizer"), req.peer);
+            ids.push_back(one[0]);
+        }
+        prompts.push_back(std::move(t));
+        candidates.push_back(std::move(ids));
+        names.push_back(row.id);
+    }
+    int32_t trunk = 0;
+    int64_t input_tokens = 0;
+    if (prompts.size() > 1) {
+        size_t common = prompts[0].size() - 1;
+        for (const auto& p : prompts) {
+            size_t k = 0;
+            while (k < common && k < p.size() - 1 && p[k] == prompts[0][k]) ++k;
+            common = k;
+        }
+        trunk = (int32_t)common;
+    }
+    input_tokens = trunk;
+    for (const auto& p : prompts) input_tokens += (int64_t)p.size() - trunk;
+    std::vector<std::vector<float>> logits;
+    if (auto no = score_prompts(req, " (mica)", prompts, candidates, names, trunk, nullptr, input_tokens,
+                                &logits))
+        return std::move(*no);
+    std::vector<std::vector<double>> dist;
+    for (size_t i = 0; i < r.rows.size(); ++i) {
+        for (float l : logits[i])
+            if (!std::isfinite(l))
+                return error_response(err_internal("question " + r.rows[i].id + " scored a non-finite logit"),
+                                      req.peer);
+        dist.push_back(mica_distribution(r.rows[i], logits[i], opt_.mica));
+    }
+    json answers;
+    if (mica_answers(r, dist, &answers, &err) < 0) return error_response(err, req.peer);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(json{
         { "model", opt_.model_id },
         { "answers", std::move(answers) },
-        { "usage", { { "input_tokens", r.input_tokens }, { "output_tokens", 0 } } } }));
+        { "usage", { { "input_tokens", input_tokens }, { "output_tokens", 0 } } } }));
+}
+
+/* clef (clef.h): one request is the whole prompt, every question decided jointly by the head on
+ * the card (arch/common/rad_block_clef.h). The request's spans and option tokens go down as its
+ * words, and the head's three values an option come back through Request::token_scores, off the
+ * logits row; the learned scalars combine them here and each question's softmax is its answer. */
+HttpResponse Server::handle_clef(const HttpRequest& req) {
+    if (!opt_.clef_scalars)
+        return error_response(err_internal("this container declares clef but carries no "
+                                           "decision.clef.* scalars; convert it again with "
+                                           "rad-convert --set decision.type=clef"), req.peer);
+    ClefRequest r;
+    ApiError err;
+    if (parse_clef_request(req.body, odeps_, lim_, opt_.model_id, &r, &err) < 0)
+        return error_response(err, req.peer);
+    std::vector<int32_t> words;
+    if (clef_words(r, &words, &err) < 0) return error_response(err, req.peer);
+    if ((int64_t)words.size() > opt_.plugin_words)
+        return error_response(err_internal("the loaded plugin takes fewer words a request than "
+                                           "this one needs"), req.peer);
+    const int64_t n_opt = clef_option_count(r);
+    if (auto no = admit(1, req.peer, ApiShape::OpenAI, "questions")) return *no;
+    RAD_INFO("systemone (clef) admitted%s questions=%zu options=%lld prompt=%zu tok",
+             from_peer(req.peer).c_str(), r.questions.size(), (long long)n_opt, r.tokens.size());
+
+    std::vector<Generation> gens(1);
+    Generation& g = gens[0];
+    g.index = 0;
+    g.sink = std::make_shared<Sink>(16);
+    auto ts = std::make_shared<TokenScores>();
+    ts->tokens = clef_score_ids(n_opt);
+    Request rq;
+    rq.prompt = r.tokens;
+    rq.token_scores = ts;
+    rq.plugin_words = std::move(words);
+    rq.max_tokens = 1;
+    rq.sp.temp = 0.0f;
+    rq.sink = g.sink.get();
+    std::vector<Request> part;
+    part.push_back(std::move(rq));
+    std::vector<uint64_t> ids;
+    deps_.sched->submit_all(part, &ids);
+    g.id = ids.empty() ? 0 : ids[0];
+    g.sink->id = g.id;
+    if (!g.id) {
+        retire(gens);
+        release(1);
+        return error_response(err_internal("the scheduler refused the request"), req.peer);
+    }
+    for (;;) {
+        if (g.sink->done()) { g.closed = true; g.finish = g.sink->finish_reason(); break; }
+        if (req.peer_gone() || stopping_.load()) return *abandoned(req, gens, 1);
+        g.sink->wait();
+    }
+    if (g.finish == Finish::Error || g.finish == Finish::Cancelled) {
+        const std::string why = g.finish == Finish::Error ? engine_failure(*g.sink)
+                                                          : "the engine cancelled the request";
+        retire(gens);
+        release(1);
+        return error_response(err_internal(why), req.peer);
+    }
+
+    ClefScalars sc;
+    sc.prior_logit_scale = opt_.clef_prior_logit_scale;
+    sc.joint_logit_scale = opt_.clef_joint_logit_scale;
+    sc.residual_gate     = opt_.clef_residual_gate;
+    const std::vector<float> logits = clef_logits(ts->logits, n_opt, sc);
+    json answers = json::object();
+    size_t at = 0;
+    for (const ClefQuestion& q : r.questions) {
+        std::vector<float> ql(logits.begin() + (std::ptrdiff_t)at,
+                              logits.begin() + (std::ptrdiff_t)(at + q.options.size()));
+        at += q.options.size();
+        json a;
+        if (clef_answer(q, ql, &a, &err) < 0) {
+            retire(gens);
+            release(1);
+            return error_response(err, req.peer);
+        }
+        answers[q.name] = std::move(a);
+    }
+    retire(gens);
+    release(1);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{
+        { "model", opt_.model_id },
+        { "answers", std::move(answers) },
+        { "usage", { { "input_tokens", (int64_t)r.tokens.size() }, { "output_tokens", 0 } } } }));
+}
+
+/* Laya (laya.h): one engine request a question, each its own sequence with the state in it, as
+ * Laya reads them, submitted together so the scheduler runs them in one step. Laya's plugin
+ * (arch/laya) declares a pooled output, so each request runs on the embedding path and comes back
+ * as its pooled row, whose first k values are the question's option logits. */
+HttpResponse Server::handle_laya(const HttpRequest& req) {
+    if (!opt_.laya.ok() || !deps_.embed || deps_.embed->dim() < RAD_LAYA_POOLED)
+        return error_response(err_internal("this container declares laya but carries no complete "
+                                           "decision.laya.* settings or no Laya plugin; convert the "
+                                           "checkpoint directory again with rad-convert"), req.peer);
+    LayaRequest r;
+    ApiError err;
+    if (parse_laya_request(req.body, odeps_, lim_, opt_.model_id, opt_.laya, &r, &err) < 0)
+        return error_response(err, req.peer);
+    const int n = (int)r.questions.size();
+    for (const LayaQuestion& q : r.questions)
+        if ((int64_t)q.tokens.size() > deps_.embed->max_input())
+            return error_response(err_bad("questions", "question " + q.name + " is " +
+                                          std::to_string(q.tokens.size()) + " tokens; this "
+                                          "deployment runs at most " +
+                                          std::to_string(deps_.embed->max_input()) +
+                                          " a step (--max-num-batched-tokens)"), req.peer);
+    if (auto no = admit(n, req.peer, ApiShape::OpenAI, "questions")) return *no;
+    RAD_INFO("systemone (laya) admitted%s questions=%d state=%lld tok",
+             from_peer(req.peer).c_str(), n, (long long)r.state_tokens);
+
+    std::vector<Generation> gens;
+    std::vector<Request> rqs;
+    gens.reserve((size_t)n);
+    rqs.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        Generation g;
+        g.index = i;
+        g.prompt_index = i;
+        g.sink = std::make_shared<Sink>(16);
+        Request rq;
+        rq.prompt = r.questions[(size_t)i].tokens;
+        rq.plugin_words = laya_words(r.questions[(size_t)i]);
+        rq.embed = true;
+        rq.max_tokens = 1;
+        rq.sp.temp = 0.0f;
+        rq.sink = g.sink.get();
+        rqs.push_back(std::move(rq));
+        gens.push_back(std::move(g));
+    }
+    std::vector<uint64_t> ids;
+    deps_.sched->submit_all(rqs, &ids);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        gens[i].id = ids[i];
+        gens[i].sink->id = ids[i];
+        if (!ids[i]) {
+            cancel_all(gens, false);
+            retire(gens);
+            release(n);
+            return error_response(err_internal("the scheduler refused question " +
+                                               r.questions[i].name), req.peer);
+        }
+    }
+    for (;;) {
+        bool all = true;
+        for (auto& g : gens) {
+            if (!g.closed && g.sink->done()) { g.closed = true; g.finish = g.sink->finish_reason(); }
+            all = all && g.closed;
+        }
+        if (all) break;
+        if (auto no = abandoned(req, gens, n)) return *no;
+        for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
+    }
+
+    json answers = json::object();
+    for (int i = 0; i < n; ++i) {
+        const Generation& g = gens[(size_t)i];
+        const LayaQuestion& q = r.questions[(size_t)i];
+        if (g.finish == Finish::Error || g.finish == Finish::Cancelled) {
+            const std::string why = g.finish == Finish::Error ? engine_failure(*g.sink)
+                                                              : "the engine cancelled question " + q.name;
+            retire(gens);
+            release(n);
+            return error_response(err_internal(why), req.peer);
+        }
+        json a;
+        if (laya_answer(q, g.sink->embedding(), opt_.laya, &a, &err) < 0) {
+            retire(gens);
+            release(n);
+            return error_response(err, req.peer);
+        }
+        answers[q.name] = std::move(a);
+    }
+    retire(gens);
+    release(n);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{ { "model", opt_.model_id },
+                                                        { "answers", std::move(answers) },
+                                                        { "usage", laya_usage(r) } }));
 }
 
 HttpResponse Server::handle_models(const HttpRequest& req) {

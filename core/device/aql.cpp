@@ -636,11 +636,25 @@ inline Stream* ours(const void* s) {
     return p->magic == kStreamMagic ? const_cast<Stream*>(p) : nullptr;
 }
 
+/* The device's stuck state, for dev_stuck_ms, in steady-clock ns (0: none). `g_stuck_at` is the
+ * last moment anything advanced, set by the stall verdict (Stall::check) with the read-progress sum
+ * it saw in `g_stuck_progress`; `g_fault_at` is when the first queue faulted. */
+std::atomic<uint64_t> g_stuck_at{0};
+std::atomic<uint64_t> g_stuck_progress{0};
+std::atomic<uint64_t> g_fault_at{0};
+
+inline uint64_t steady_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
     Stream* s = static_cast<Stream*>(data);
     const char* m = nullptr;
     hsa_status_string(st, &m);
     s->fault.store((int)st, std::memory_order_release);
+    uint64_t none = 0;
+    g_fault_at.compare_exchange_strong(none, steady_ns(), std::memory_order_acq_rel);
     G().faulted.store(true, std::memory_order_release);
     hsa_signal_store_screlease(G().fault, 1);
     RAD_ERR("device %d: the AQL queue faulted: %s", s->ord, m ? m : "?");
@@ -903,6 +917,9 @@ struct Stall {
         const uint64_t p = read_progress();
         if (sampled && p == progress) {
             told = true;
+            /* Nothing has advanced since the previous sample, a stall period ago. */
+            g_stuck_progress.store(p, std::memory_order_relaxed);
+            g_stuck_at.store(steady_ns() - (uint64_t)kStallMs * 1000000u, std::memory_order_release);
             dump_queues(where);
             RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
                     "packet named above -- a hung kernel, or a queue the driver evicted and could "
@@ -913,6 +930,22 @@ struct Stall {
         progress = p;
     }
 };
+
+/* dev_stuck_ms. A standing verdict is dropped as soon as the read progress moves again. */
+int64_t stuck_ms() {
+    const uint64_t now = steady_ns();
+    if (G().faulted.load(std::memory_order_acquire)) {
+        const uint64_t f = g_fault_at.load(std::memory_order_acquire);
+        return f && now > f ? (int64_t)((now - f) / 1000000u) : 0;
+    }
+    uint64_t at = g_stuck_at.load(std::memory_order_acquire);
+    if (!at) return 0;
+    if (read_progress() != g_stuck_progress.load(std::memory_order_relaxed)) {
+        g_stuck_at.compare_exchange_strong(at, 0, std::memory_order_acq_rel);
+        return 0;
+    }
+    return now > at ? (int64_t)((now - at) / 1000000u) : 0;
+}
 
 /* Reserves packet `idx` once the packet processor has consumed far enough that its slot is free.
  * A launched barrier-bit packet means every packet before it has completed, which a kernel
@@ -1616,6 +1649,11 @@ struct Sig {
     hsa_agent_t  agent{};                                  /* where it was recorded */
     std::vector<std::pair<uint32_t, uint64_t>> waiters;    /* queue id, packet index */
     bool         stamped = false;                          /* its times not read yet (stamp_hold) */
+    /* A prefetch DMA queue's list polls it (a_xp_list): the card whose queue, -1 for none, and the
+     * list number the queue writes to its finish word once the engine is past the poll. A DMA
+     * poll is no queue packet, so `waiters` cannot hold it. */
+    std::atomic<int32_t>  xp_dev{-1};
+    std::atomic<uint32_t> xp_list{0};
 };
 
 struct SigPool {
@@ -1630,13 +1668,27 @@ SigPool& pool() {
     return *p;
 }
 
+bool xp_list_finished(int ord, uint32_t k);
+
+/* A signal at 0 can still be awaited: by a queue packet not yet consumed (`waiters`), or by a
+ * prefetch DMA list that has not yet read it (`xp_dev`). Reused then, its next user's 1 would be
+ * what that wait sees, and the wait would hang behind work that waits for it. */
 bool reusable(const Sig* g) {
     if (g->stamped || hsa_signal_load_relaxed(g->h) != 0) return false;
     for (const auto& w : g->waiters) {
         hsa_queue_t* q = g_queue_by_id[w.first].load(std::memory_order_acquire);
         if (q && hsa_queue_load_read_index_relaxed(q) <= w.second) return false;
     }
+    const int32_t xd = g->xp_dev.load(std::memory_order_acquire);
+    if (xd >= 0 && !xp_list_finished(xd, g->xp_list.load(std::memory_order_relaxed))) return false;
     return true;
+}
+
+/* Back to the free list: what held it is over. */
+void sig_free(SigPool& p, Sig* g) {
+    g->waiters.clear();
+    g->xp_dev.store(-1, std::memory_order_relaxed);
+    p.free[g->irq].push_back(g);
 }
 
 /* A signal for one record: an interrupt signal if the host waits on the event, else GPU_ONLY.
@@ -1653,8 +1705,7 @@ Sig* sig_get(bool irq) {
     while (p.free[irq].empty() && !p.retiring.empty() && reusable(p.retiring.front())) {
         Sig* g = p.retiring.front();
         p.retiring.pop_front();
-        g->waiters.clear();
-        p.free[g->irq].push_back(g);
+        sig_free(p, g);
     }
     if (p.free[irq].empty()) {
         /* In place and in order, so the front stays the oldest. */
@@ -1662,8 +1713,7 @@ Sig* sig_get(bool irq) {
         for (size_t i = 0; i < p.retiring.size(); ++i) {
             Sig* g = p.retiring[i];
             if (reusable(g)) {
-                g->waiters.clear();
-                p.free[g->irq].push_back(g);
+                sig_free(p, g);
             } else {
                 p.retiring[kept++] = g;
             }
@@ -2835,6 +2885,15 @@ DmaQueue* xp_queue(int ord) {
     return q.ok ? &q : nullptr;
 }
 
+/* Whether card `ord`'s prefetch queue has finished list `k`, or a later one: its lists finish in
+ * order, so the engine is then past every packet list `k` holds. */
+bool xp_list_finished(int ord, uint32_t k) {
+    if (ord < 0 || ord >= kMaxDevices) return true;
+    const DmaQueue& q = g_dma_xp[ord];
+    if (!q.fin) return true;
+    return (int32_t)(*q.fin - k) >= 0;
+}
+
 int a_xp_supported(int device) { return xp_queue(device) != nullptr; }
 
 int a_xp_stream_create(RadStream* out) {
@@ -2971,6 +3030,15 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
                                    (uint32_t)ia, (uint32_t)(ia >> 32), 0u, 0xffffffffu,
                                    10u /* interval */ | (0xfffu << 16) /* retry forever */ };
         rc = dma_put(dq, poll, 6);
+        /* The mark stays out of the pool until the engine is past this poll: the finish word
+         * reaches lists + 1 only behind it, whether this list's own fence writes it or, if the
+         * list below fails, the next list's. Returned earlier, a mark at 0 can be handed out and
+         * set to 1 before the engine reads it, and the list then waits for whatever completes
+         * the next use, which can sit behind the stream's wait for this list. */
+        if (rc == RAD_OK) {
+            in->xp_list.store(dq->lists + 1, std::memory_order_relaxed);
+            in->xp_dev.store(ord, std::memory_order_release);
+        }
     }
     if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle &&
         !(flags & RAD_XP_NO_YIELD)) {
@@ -3925,6 +3993,15 @@ DeviceBackend g_aql;
 
 }  // namespace
 
+namespace aql {
+bool ride_reusable(void* token) {
+    Sig* g = static_cast<Sig*>(token);
+    if (!g) return false;
+    std::lock_guard<std::mutex> lk(pool().mu);
+    return reusable(g);
+}
+}  // namespace aql
+
 size_t aql_code_registered(void) { return a_code_mark(); }
 
 const DeviceBackend* aql_backend_if_present(void) {
@@ -3985,6 +4062,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.alloc_uncached = a_alloc_uncached;
         g_aql.free_uncached = a_free_uncached;
         g_aql.dma_lane = a_dma_lane;
+        g_aql.stuck_ms = stuck_ms;
         g_aql.vmem_granularity = a_vmem_granularity;
         g_aql.vmem_reserve = a_vmem_reserve;
         g_aql.vmem_release = a_vmem_release;
@@ -4207,5 +4285,16 @@ hipError_t hipPeekAtLastError(void) {
 }
 
 }  // extern "C"
+
+#else
+
+#include "aql.h"
+
+namespace rad {
+namespace aql {
+/* A build without the AQL backend hands out no ride. */
+bool ride_reusable(void*) { return false; }
+}  // namespace aql
+}  // namespace rad
 
 #endif /* RAD_HAVE_HIP */

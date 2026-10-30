@@ -4,7 +4,8 @@
  * shards, as two ranks hand them over, and a candidate is scored against it. Each position's KL,
  * argmax agreement and NLL must match a direct double computation from the f32 logits. The
  * reference's f16 storage is the only approximation and sets the tolerance; a candidate identical
- * to the reference scores zero.
+ * to the reference scores zero. The sparse form (--kld-top) is checked the same way against the
+ * KL of the two distributions coarsened to the reference's head and one tail bucket.
  */
 #include "rad_test.h"
 
@@ -355,6 +356,160 @@ TEST(the_reports_statistics_are_those_of_its_rows) {
     expect(rep["by_source"]["a"], 0, 31);
     expect(rep["by_source"]["b"], 31, 55);
     CHECK_EQ(rep["docs"].get<int64_t>(), (int64_t)2);
+}
+
+/* ------------------------------------------------------------------ the sparse form */
+
+void record_top(const std::string& dir, const std::vector<float>& la, const std::vector<float>& lb, int top) {
+    Kld rec;
+    CHECK_OK(rec.add_doc("a", kDocA, 8));
+    CHECK_OK(rec.add_doc("b", kDocB, 0));
+    CHECK_OK(rec.record_into(dir, V, "reference", top));
+    feed(rec, 1, 40, la);
+    feed(rec, 2, 25, lb);
+    CHECK_OK(rec.finish());
+}
+
+/* KL between P and Q coarsened to P's `top` most likely tokens (ties to the lower id) and one
+ * bucket for the rest, in double from the f32 logits. */
+double kl_coarse(const float* p, const float* q, int top) {
+    const double zp = lse(p), zq = lse(q);
+    std::vector<int64_t> ids((size_t)V);
+    for (int64_t i = 0; i < V; ++i) ids[(size_t)i] = i;
+    std::stable_sort(ids.begin(), ids.end(), [&](int64_t a, int64_t b) { return p[a] > p[b]; });
+    double kl = 0, pt = 0, qt = 0;
+    for (int64_t k = 0; k < V; ++k) {
+        const int64_t i = ids[(size_t)k];
+        const double lp = (double)p[i] - zp, lq = (double)q[i] - zq;
+        if (k < top) kl += std::exp(lp) * (lp - lq);
+        else { pt += std::exp(lp); qt += std::exp(lq); }
+    }
+    if (pt > 0) kl += pt * (std::log(pt) - std::log(qt));
+    return kl;
+}
+
+/* A candidate scored against a top-64 reference gets, at every position, the coarsened KL a
+ * direct double computation gives; that KL is at most the full one (data processing) and, with a
+ * confident head, close to it. The manifest names the form, and the files hold no f16 rows. */
+TEST(a_sparse_reference_scores_the_coarsened_kl) {
+    TmpDir t;
+    REQUIRE(!t.path.empty());
+    constexpr int kTop = 64;
+    const std::vector<float> ra = make_logits(40, 21), rb = make_logits(25, 22);
+    record_top(t.path + "/ref", ra, rb, kTop);
+    CHECK(!std::filesystem::exists(t.path + "/ref/logp.f16"));
+    CHECK_EQ((int64_t)std::filesystem::file_size(t.path + "/ref/top.bin"), (int64_t)(55 * kTop * 8));
+    CHECK_EQ((int64_t)std::filesystem::file_size(t.path + "/ref/rows.f32"), (int64_t)(55 * 3 * 4));
+    {
+        std::ifstream in(t.path + "/ref/kld.json");
+        const nlohmann::json m = nlohmann::json::parse(in, nullptr, false);
+        CHECK_EQ(m["format"].get<std::string>(), std::string("radiance-kld-top-1"));
+        CHECK_EQ(m["top"].get<int>(), kTop);
+    }
+
+    std::vector<float> ca = ra, cb = rb;
+    std::mt19937 g(23);
+    std::normal_distribution<float> n(0.0f, 0.6f);
+    for (float& v : ca) v += n(g);
+    for (float& v : cb) v += n(g);
+    Kld k;
+    CHECK_OK(k.score_against(t.path + "/ref", t.path + "/rep.json", V, "candidate"));
+    feed(k, 1, 40, ca);
+    feed(k, 2, 25, cb);
+    CHECK_OK(k.finish());
+
+    const std::vector<float> rows = read_rows(t.path + "/rep.json.rows");
+    REQUIRE_EQ(rows.size(), (size_t)(55 * 4));
+    int64_t r = 0, flips = 0;
+    double sum_c = 0, sum_f = 0;
+    auto check_doc = [&](const std::vector<float>& ref, const std::vector<float>& cand,
+                         const std::vector<int32_t>& tok, int64_t from) {
+        for (int64_t p = from; p + 1 < (int64_t)tok.size(); ++p, ++r) {
+            const float* lp = ref.data() + p * V;
+            const float* lq = cand.data() + p * V;
+            const double want = kl_coarse(lp, lq, kTop), full = kl_direct(lp, lq);
+            CHECK_NEAR(rows[(size_t)(r * 4 + 0)], want, 1e-6 + 1e-5 * want);
+            CHECK(want <= full + 1e-9);
+            sum_c += want;
+            sum_f += full;
+            CHECK_NEAR(rows[(size_t)(r * 4 + 1)], lse(lq) - lq[tok[(size_t)p + 1]], 1e-4);
+            CHECK_NEAR(rows[(size_t)(r * 4 + 2)], lse(lp) - lp[tok[(size_t)p + 1]], 1e-4);
+            const bool same = argmax(lp) == argmax(lq);
+            CHECK_EQ(rows[(size_t)(r * 4 + 3)], same ? 1.0f : 0.0f);
+            flips += !same;
+        }
+    };
+    check_doc(ra, ca, kDocA, 8);
+    check_doc(rb, cb, kDocB, 0);
+    CHECK_EQ(r, (int64_t)55);
+    CHECK(flips > 0);
+    CHECK(sum_c > 0.5 * sum_f);     /* the head carries most of the divergence */
+    std::ifstream in(t.path + "/rep.json");
+    const nlohmann::json rep = nlohmann::json::parse(in, nullptr, false);
+    CHECK_EQ(rep["ref_form"].get<std::string>(), std::string("top-64 + tail"));
+}
+
+/* Control: the reference against its own sparse form scores zero at every position. A head that
+ * covers the whole vocabulary leaves an empty tail, which must cost nothing. */
+TEST(the_reference_against_its_sparse_self_scores_zero) {
+    for (int top : { 64, (int)V }) {
+        TmpDir t;
+        REQUIRE(!t.path.empty());
+        const std::vector<float> ra = make_logits(40, 24), rb = make_logits(25, 25);
+        record_top(t.path + "/ref", ra, rb, top);
+        Kld k;
+        CHECK_OK(k.score_against(t.path + "/ref", t.path + "/rep.json", V, "same"));
+        feed(k, 1, 40, ra);
+        feed(k, 2, 25, rb);
+        CHECK_OK(k.finish());
+        const std::vector<float> rows = read_rows(t.path + "/rep.json.rows");
+        REQUIRE_EQ(rows.size(), (size_t)(55 * 4));
+        for (size_t r = 0; r < 55; ++r) {
+            CHECK(std::fabs(rows[r * 4 + 0]) < 1e-6f);
+            CHECK_EQ(rows[r * 4 + 3], 1.0f);
+        }
+    }
+}
+
+/* The recorded tail is the mass outside the head summed from the row, so a confident position's
+ * tail is its true small value, not the noise one minus the head would leave. */
+TEST(a_sparse_reference_records_the_tail_mass_from_the_row) {
+    TmpDir t;
+    REQUIRE(!t.path.empty());
+    constexpr int kTop = 16;
+    std::vector<float> ra = make_logits(40, 26), rb = make_logits(25, 27);
+    for (int64_t r = 0; r < 25; ++r) rb[(size_t)(r * V + 3)] += 40.0f;   /* p_tail ~ e^-40 */
+    record_top(t.path + "/ref", ra, rb, kTop);
+    const std::vector<float> rows = read_rows(t.path + "/ref/rows.f32");
+    REQUIRE_EQ(rows.size(), (size_t)(55 * 3));
+    auto tail = [&](const float* l) {
+        const double z = lse(l);
+        std::vector<double> lp((size_t)V);
+        for (int64_t i = 0; i < V; ++i) lp[(size_t)i] = (double)l[i] - z;
+        std::sort(lp.begin(), lp.end(), std::greater<double>());
+        double s = 0;
+        for (int64_t i = kTop; i < V; ++i) s += std::exp(lp[(size_t)i]);
+        return s;
+    };
+    for (int64_t p = 8; p < 39; ++p) {
+        const double want = tail(ra.data() + p * V);
+        CHECK_NEAR(rows[(size_t)((p - 8) * 3 + 2)], want, 1e-5 * want);
+    }
+    for (int64_t p = 0; p < 24; ++p) {
+        const double want = tail(rb.data() + p * V);
+        CHECK(want < 1e-9);    /* below what one minus the head resolves in f32 */
+        CHECK_NEAR(rows[(size_t)((31 + p) * 3 + 2)], want, 1e-3 * want);
+    }
+}
+
+/* A head larger than the vocabulary, or past the cap, is refused when the recording opens. */
+TEST(a_sparse_head_must_fit_the_vocabulary) {
+    TmpDir t;
+    REQUIRE(!t.path.empty());
+    Kld k;
+    CHECK_OK(k.add_doc("a", kDocA, 8));
+    CHECK_EQ(k.record_into(t.path + "/a", V, "x", (int)V + 1), RAD_E_INVAL);
+    CHECK_EQ(k.record_into(t.path + "/b", V, "x", -1), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

@@ -42,6 +42,7 @@
  */
 
 #include "r3d_plugin.h"
+#include "rad_abi_layout.h"
 
 #ifndef R3D_BUILD_TARGET
 #define R3D_BUILD_TARGET "gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151"
@@ -1764,4 +1765,5 @@ static const RadPluginInfo kInfo = {
 };
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }

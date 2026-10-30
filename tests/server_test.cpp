@@ -2605,6 +2605,31 @@ TEST(models_and_health_answer) {
     CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
 }
 
+/* A device stuck for a minute (#356: both cards spinning in an all-reduce, every request aborted)
+ * turns /health and /ping 503 with status "stuck", so a supervisor restarts the server; under the
+ * minute, or once the device advances again, they answer 200. */
+TEST(health_answers_503_while_the_device_is_stuck) {
+    std::atomic<int64_t> stuck{0};
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) {
+        d.stuck_ms = [&] { return stuck.load(); };
+    } });
+    CHECK_EQ(f.get("/health").status, 200);
+    stuck = 59999;
+    CHECK_EQ(f.get("/health").status, 200);
+    stuck = 61000;
+    for (const char* p : { "/health", "/v1/health", "/ping" }) {
+        const HttpResponse h = f.get(p);
+        CHECK_EQ(h.status, 503);
+        const json j = json::parse(h.body);
+        CHECK(j["status"].get<std::string>() == "stuck");
+        CHECK_EQ(j["stuck_s"].get<int64_t>(), (int64_t)61);
+    }
+    stuck = 0;
+    const HttpResponse h = f.get("/health");
+    CHECK_EQ(h.status, 200);
+    CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
+}
+
 /* RUNTIME LoRA admin, over a real slot table (lora/slots.h) the way Engine wires it: a request in
  * flight holds its adapter, an unload then drains it (202, new requests 404 as an unknown model,
  * off /v1/models, a load of the name 409), the request's end frees it, and an idle unload is 200.

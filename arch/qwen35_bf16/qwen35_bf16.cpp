@@ -41,6 +41,7 @@
 #include <arch/rad_block_gdn.h>
 #include <arch/rad_block_mlp.h>
 #include <arch/rad_block_vit.h>
+#include <arch/rad_calib_full.h>
 
 #include <vector>
 
@@ -55,6 +56,9 @@ struct Layer {
     AttnGatedBF16 attn;
     GdnBF16       gdn;
     MlpBF16       mlp;
+    /* The layer's calibration inputs (rad_calib_full.h): the attention or delta net's, its output
+     * projection's, the feed-forward's and down_proj's; -1 where the run does not record it. */
+    int cs_in = -1, cs_o = -1, cs_mlp = -1, cs_down = -1;
 };
 
 struct Model {
@@ -78,6 +82,12 @@ struct Model {
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
+    /* Set by a plugin built over this one whose head answers a request from its words
+     * (RadBatch::plugin_words): a `fill` of the logits rows that plugin declared. A step every
+     * sampled row of which carries words then skips the lm_head and leaves those zero rows for the
+     * sampler, whose token the request discards. Zero, the lm_head runs as it always has, and the
+     * graph this plugin declares is unchanged. */
+    rad_op op_logits_fill = 0;
 
     /* ---- media (arch/common/rad_block_vit.h): the vision tower and the scatter of its rows,
      * declared only when the container carries a tower and the deployment asked for media. */
@@ -86,6 +96,10 @@ struct Model {
     MediaRows   mrows{};
 
     std::vector<Layer> layers;
+
+    /* --calib-dir: the whole Hessian of every linear's input over a --calib-corpus run. */
+    CalibFull calib;
+    int       cs_head = -1;     /* the lm_head's input, recorded with the last layer */
 };
 
 /* Declare runs once per rank, in one process, on the rank's own thread (spec §1, §9), so the
@@ -337,6 +351,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     MlpBF16::Wire mw{};
     mw.x = m.b_x; mw.h = m.b_h; mw.gate_up = m.b_gate_up; mw.ffn = m.b_ffn;
 
+    /* The calibration tap: the widest split input is down_proj's (the feed-forward's width), and
+     * no input is wider. */
+    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, g.n_ff * g.world,
+                               std::max({ g.n_embd, q_dim * g.world, v_dim * g.world, g.n_ff * g.world })));
+
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
@@ -370,6 +389,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_conv));
             RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs));
         }
+        if (m.calib.records(l)) {
+            const std::string L = std::string(pre) + "." + std::to_string(l);
+            lay.cs_in = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site(b, g, l, L + ".input",
+                                      lay.full ? L + ".self_attn.q_proj," + L + ".self_attn.k_proj," + L + ".self_attn.v_proj"
+                                               : L + ".linear_attn.in_proj_qkv," + L + ".linear_attn.in_proj_z," +
+                                                 L + ".linear_attn.in_proj_a," + L + ".linear_attn.in_proj_b",
+                                      m.b_h, g.n_embd, g.n_embd));
+            lay.cs_o = (int)m.calib.sites.size();
+            if (lay.full)
+                RAD_ARCH_TRY(m.calib.site(b, g, l, L + ".self_attn.o_proj.input", L + ".self_attn.o_proj",
+                                          m.b_attn, q_dim, q_dim * g.world));
+            else
+                RAD_ARCH_TRY(m.calib.site(b, g, l, L + ".linear_attn.out_proj.input", L + ".linear_attn.out_proj",
+                                          m.b_go, v_dim, v_dim * g.world));
+        }
 
         MlpBF16::Src ms{};
         ms.norm = nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l);
@@ -377,6 +412,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.up   = nm.ckpt("%s.%lld.mlp.up_proj.weight",              pre, (long long)l);
         ms.down = nm.ckpt("%s.%lld.mlp.down_proj.weight",            pre, (long long)l);
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms));
+        if (m.calib.records(l)) {
+            const std::string L = std::string(pre) + "." + std::to_string(l);
+            lay.cs_mlp = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site(b, g, l, L + ".post_attention.input",
+                                      L + ".mlp.gate_proj," + L + ".mlp.up_proj", m.b_h, g.n_embd, g.n_embd));
+            lay.cs_down = (int)m.calib.sites.size();
+            RAD_ARCH_TRY(m.calib.site(b, g, l, L + ".mlp.down_proj.input", L + ".mlp.down_proj",
+                                      m.b_ffn, g.n_ff, g.n_ff * g.world));
+        }
     }
 
     m.op_final_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -384,6 +428,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                         RAD_F64("eps", g.eps), RAD_F64("wadd", final_wadd), RAD_STR("dtype", g.dtype)),
                              RAD_WEIGHTS(m.w_out_norm)),
                          {m.b_x}, {m.b_h});
+    /* The lm_head's input, with the run that records the last layer. */
+    if (m.calib.on && m.calib.hi == m.n_main) {
+        m.cs_head = (int)m.calib.sites.size();
+        RAD_ARCH_TRY(m.calib.site(b, g, -1, "lm_head.input", "lm_head", m.b_h, g.n_embd, g.n_embd));
+    }
 
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
@@ -447,18 +496,39 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
                     brows(m.b_x, batch->n_tok), RAD_NONE);
 
+    const int64_t T = batch->n_tok;
     for (const Layer& l : m.layers) {
+        /* Under calibration a block's input norm is issued once ahead of the block, so its output
+         * is read before the block overwrites `h`; the block computes it again, the same op on
+         * the same bytes. */
+        if (l.cs_in >= 0) {
+            if (l.full) RAD_ISSUE(c, l.attn.op_norm, brows(m.b_x, T), RAD_W(l.attn.w_norm), brows(m.b_h, T));
+            else        RAD_ISSUE(c, l.gdn.op_norm,  brows(m.b_x, T), RAD_W(l.gdn.w_norm),  brows(m.b_h, T));
+            m.calib.tap(c, (size_t)l.cs_in, T);
+        }
         if (l.full) l.attn.step(c, batch);
         else        l.gdn.step(c, batch);
+        if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
+        if (l.cs_mlp >= 0) {
+            RAD_ISSUE(c, l.mlp.op_norm, brows(m.b_x, T), RAD_W(l.mlp.w_norm), brows(m.b_h, T));
+            m.calib.tap(c, (size_t)l.cs_mlp, T);
+        }
         l.mlp.step(c, batch);
+        if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, T);
     }
 
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.b_h, batch->n_tok));
+    if (m.cs_head >= 0) m.calib.tap(c, (size_t)m.cs_head, T);
+    m.calib.after_step(c, T);
 
     /* The lm_head runs only on the rows the sampler asked for; a mid-prompt prefill chunk has
      * n_out zero and skips it. */
     if (batch->n_out > 0) {
+        if (m.op_logits_fill && plugin_words_cover_rows(batch)) {
+            RAD_ISSUE_N(c, m.op_logits_fill, batch->n_out, brows(m.b_logits, batch->n_out));
+            return;
+        }
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.b_h, batch->n_tok),
                     praw(batch->out_ids, RAD_I32, batch->n_out),

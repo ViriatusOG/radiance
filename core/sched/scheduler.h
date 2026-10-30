@@ -178,6 +178,8 @@ public:
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
+    /* See BatchBuilder::step_seqs. */
+    const std::vector<uint64_t>* step_seqs(const RadBatch* b) const { return builder_.step_seqs(b); }
     /* The advance's view of that build on one rank; see BatchBuilder::advance_args. Also carries
      * the serial head's shape, which only the draft passes' modes read. */
     AdvanceArgs advance_args(int rank) const {

@@ -31,6 +31,33 @@ void Engine::identify_devices(const std::vector<std::string>& names) {
     }
 }
 
+void Engine::print_unsupported_banner() {
+    for (const std::string& l : diag::unsupported_banner()) RAD_WARN("%s", l.c_str());
+}
+
+int Engine::check_configuration(const std::vector<int>& devs) {
+    diag::Facts f = hardware_facts(false);
+    for (int i = 0; i < cfg_.tp && i < (int)devs.size(); ++i)
+        for (diag::CardFacts& c : f.cards)
+            if (c.device == devs[(size_t)i]) c.rank = i;
+    int found = 0;
+    for (const diag::Finding& x : diag::incompatible(f)) {
+        if (x.level != diag::Finding::Incompatible) continue;
+        ++found;
+        if (cfg_.proceed_incompatible)
+            RAD_WARN("incompatible configuration, started anyway: %s: %s. Fix: %s", x.id.c_str(),
+                     x.what.c_str(), x.fix.c_str());
+        else
+            RAD_ERR("incompatible configuration: %s: %s -- %s. Fix: %s", x.id.c_str(),
+                    x.what.c_str(), x.why.c_str(), x.fix.c_str());
+    }
+    if (!found || cfg_.proceed_incompatible) return RAD_OK;
+    RAD_ERR("radiance does not start on a configuration it does not support: the fix for each is "
+            "said above. --proceed-with-incompatible-configuration starts it anyway, unsupported "
+            "and without any guarantee");
+    return RAD_E_UNSUPPORTED;
+}
+
 diag::Facts Engine::hardware_facts(bool serving) const {
     std::vector<std::string> mine;
     for (const DevId& id : dev_ids_)
@@ -97,6 +124,8 @@ diag::RunFacts Engine::run_facts(bool failed) const {
     r.reference_kernels = cfg_.accept_reference_kernels;
     r.profile_ops       = cfg_.profile_ops;
     r.deterministic     = cfg_.deterministic;
+    r.unsupported       = cfg_.proceed_incompatible;
+    r.all_options       = cfg_.given.count("-v") > 0;
     r.environment       = env_set_;
     return r;
 }
@@ -127,9 +156,17 @@ void Engine::print_startup_report(int status) {
         at = nl + 1;
     }
     /* Each warning also on its own W line, for readers filtering a log by level. */
-    for (const diag::Finding& x : found)
+    for (const diag::Finding& x : found) {
         if (x.level == diag::Finding::Warn)
             RAD_WARN("startup report: %s: %s. Fix: %s", x.id.c_str(), x.what.c_str(), x.fix.c_str());
+        /* A refusal is an E line; started anyway it is a W line, which the banner explains. */
+        else if (x.level == diag::Finding::Incompatible && cfg_.proceed_incompatible)
+            RAD_WARN("startup report: INCOMPATIBLE, started anyway: %s: %s. Fix: %s", x.id.c_str(),
+                     x.what.c_str(), x.fix.c_str());
+        else if (x.level == diag::Finding::Incompatible)
+            RAD_ERR("startup report: INCOMPATIBLE: %s: %s. Fix: %s", x.id.c_str(), x.what.c_str(),
+                    x.fix.c_str());
+    }
     /* Repeat the failure last, since the original error line is now above the report. */
     if (status < 0)
         RAD_ERR("startup stopped: %s (the reason is said above the startup report)",

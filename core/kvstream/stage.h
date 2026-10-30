@@ -36,23 +36,25 @@
  * copy at all, so the barriers above are the copy's whole ordering (core/runtime/issue.cpp,
  * haz_mark).
  *
- * Volume. The copy moves the mirror row up to the highest block id the pass can read, not the
- * whole row (`n_blocks * block_bytes` is the context allocation). The bound is
- * KVManager::held_top_blocks, one past the highest held block (kvstream_bound_live, per step), and
- * it must never be low: the attention would read whatever the previous layer left there, which is
- * fluent wrong text, not a fault. It is an upper bound because
+ * Volume. The copy moves only the blocks the step's own block tables name, not the whole row
+ * (`n_blocks * block_bytes` is the context allocation): each layer's list carries one range per
+ * run of those ids (kvstream_runs), mirror offset to the same stage offset. The ranges must never
+ * miss a block the pass reads: the attention would read whatever the previous layer left there,
+ * which is fluent wrong text, not a fault. They cover every read because
  *
- *   - every id a block table holds is held, and the held histogram counts sequence and
- *     cache-retained blocks alike;
- *   - the stage is identity-addressed from block 0, so copying [0, bound) covers every id below
- *     it, dense or not;
- *   - it is re-read every step, after the step's blocks are ensured, so a block a chunk appends or
- *     a speculative token's block is inside it; a partial block is copied whole and its unwritten
+ *   - the pass's kernels reach the stage only through the step's block tables (the store through
+ *     the slots derived from them), so an id no table of the step names is never read;
+ *   - the stage is identity-addressed, block b at b * block_bytes, as the mirror row is;
+ *   - they are taken from the step's own sequences after its blocks are ensured
+ *     (kvstream_step_runs, per step), so a block a chunk appends, a prefix hit's cached blocks or a
+ *     speculative token's block is among them; a partial block is copied whole and its unwritten
  *     tail is the mirror's zeros.
  *
- * Allocation is not assumed ascending: a retained or restored block can sit above a free one. The
- * bound counts every held block, so a server with a long cached conversation stages more than one
- * request reads; 0 (nothing held) stages the whole row.
+ * Allocation is not assumed ascending or dense: the prefix cache keeps retained conversations'
+ * blocks, often the low ids, and a new sequence takes ids above them, so a bound on the highest id
+ * a step names would still copy every retained conversation below it. A step whose sequences are
+ * not known (a batch the builder did not produce) or whose trunk pass takes the ring copies up to
+ * KVManager::held_top_blocks, one past the highest held block; nothing held copies the whole row.
  *
  * A backend with no DMA queue (the host backend, a test) copies on the compute stream, in the same
  * order.
@@ -61,6 +63,9 @@
 #include "mem/kv.h"
 #include "runtime/ctx.h"
 
+#include <cstdint>
+#include <vector>
+
 namespace rad {
 
 /* Select the view of every streamed group the pass names and reset the stage's per-pass state.
@@ -68,10 +73,30 @@ namespace rad {
  * step's view (core/sched/batch.cpp) does not link the driver. */
 void kvstream_enter(Ctx* c, const RadBatch* b);
 
-/* Set every streamed group's stage bound from `kv` (rank 0's manager, which hands out the ids) for
- * the step about to run. Called for every rank from Engine::prepare_release, with the ranks parked
- * and the step's blocks ensured. */
-void kvstream_bound_live(Ctx* c, const KVManager& kv);
+/* At most this many ranges a layer's list: gaps of at most kStageGapBlocks are copied through, and
+ * past the cap the smallest gaps are, so a fragmented table stays one short list. */
+constexpr int     kStageMaxRuns   = 256;
+constexpr int64_t kStageGapBlocks = 16;
+
+/* Into `*out`, the ranges of a layer's row the block ids in `tables` occupy at `block_bytes` a
+ * block: each table's runs of consecutive ids, sorted and joined where they overlap, touch or lie
+ * at most kStageGapBlocks apart, then across the smallest remaining gaps until at most
+ * kStageMaxRuns are left. Negative ids are skipped. Empty when no table names a block. Its
+ * scratch is the calling thread's and keeps its capacity, so a step reuses it. */
+void kvstream_runs(const std::vector<const std::vector<int32_t>*>& tables, int64_t block_bytes,
+                   std::vector<KVStageRun>* out);
+
+/* Into `*runs`, by group index, every group's ranges for the step `b` about to run (empty for a
+ * group that does not stream): from the tables of `seqs`, the step's sequences, when its trunk
+ * pass stages; otherwise [0, held_top_blocks) of `kv` (rank 0's manager, which hands out the
+ * ids). The vectors are refilled in place. */
+void kvstream_step_runs(const KVManager& kv, const RadBatch* b, const std::vector<uint64_t>* seqs,
+                        std::vector<std::vector<KVStageRun>>* runs);
+
+/* Install `runs` (kvstream_step_runs) as the step's stage ranges of every streamed group of `c`.
+ * Called for every rank from Engine::prepare_release, with the ranks parked and the step's blocks
+ * ensured. */
+void kvstream_bound_live(Ctx* c, const std::vector<std::vector<KVStageRun>>& runs);
 
 /* The driver, also re-run by a recorded pass (Ctx::tape_kv_stage). `after` is the call after the
  * layer's attention (rad_kv_stage_next) rather than before its store. */
