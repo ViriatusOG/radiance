@@ -238,11 +238,19 @@ class FileStager final : public OpStager {
 public:
     ~FileStager() override;
 
+    /* Routing-aware reads: the engine binds a source of the layer's per-expert routing
+     * counts for the current pass (the router reports them to the Ctx before the layer's
+     * first expert op, which is the stager's trigger). Returns the device pointer of
+     * `n_expert` i32 counts, or null when the layer has not reported this pass — the
+     * caller then reads the whole layer. Null `routes` reads whole layers. */
+    using RouteCounts = const int32_t* (*)(void* ud, int32_t layer, int64_t* n_expert);
+
     /* Binds the routed layers with file-tier units and the ops that read them, over the mover's
      * two file buffers. Leaves enabled() false when no routed unit is on the file tier. Refuses a
      * plan whose routed layers are read by interleaved ops, since a file-tier unit has no other
      * address to fall back on. */
-    int init(const Program& prog, const Plan& plan, Mover* mover);
+    int init(const Program& prog, const Plan& plan, Mover* mover,
+             RouteCounts routes = nullptr, void* routes_ud = nullptr);
 
     bool    enabled() const { return !layers_.empty(); }
     size_t  n_layers() const { return layers_.size(); }
@@ -260,10 +268,17 @@ private:
     Mover*   mover_ = nullptr;
     char*    buf_[2] = { nullptr, nullptr };
     int64_t  cap_ = 0;
+    RouteCounts routes_ = nullptr;     /* routing-aware reads; null reads whole layers */
+    void*    routes_ud_ = nullptr;
+    bool     routed_ = true;           /* RADIANCE_FILE_ROUTED=0 disables the filtering */
+    int32_t* scratch_ = nullptr;        /* pinned, for the trigger's blocking counts copy */
+    int64_t  scratch_n_ = 0;
+    std::vector<int32_t> skipped_[2];   /* per buffer: units not read, nulled at release */
     RadEvent done_[2] = { nullptr, nullptr };   /* behind a buffer's copies, on the mover stream */
     RadEvent free_[2] = { nullptr, nullptr };   /* behind the ops that read a buffer's layer */
     bool     free_rec_[2] = { false, false };
     std::vector<int32_t> staged_[2];
+    int  start(int32_t li, RadStream s);
     int32_t  holds_[2] = { -1, -1 };             /* the layer a buffer holds, or -1 */
     int32_t  cur_ = -1;                          /* the layer whose ops are being issued */
 

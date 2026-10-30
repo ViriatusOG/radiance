@@ -3828,8 +3828,13 @@ int Engine::start() {
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
-         * such a unit has no other address). */
-        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover));
+         * such a unit has no other address). Routing-aware reads take this
+         * rank's routing reports: the trigger runs after the layer's router on the same stream. */
+        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
+                                [](void* ud, int32_t layer, int64_t* n) -> const int32_t* {
+                                    return ((Ctx*)ud)->route_counts_device(layer, n);
+                                },
+                                &r->ctx));
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
                      "pass reads a layer's (up to %s) into one of two VRAM buffers before its "

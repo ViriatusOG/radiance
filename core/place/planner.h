@@ -102,6 +102,12 @@ struct MoveUnit {
     /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), so
      * the file tier can stage it with a read. A unit that is not never goes to the file tier. */
     bool    file_direct = true;
+
+    /* The drafter's own weights (the "mtp." namespace). They run on every draft pass of every
+     * decode step -- up to depth passes plus the verify pass, each re-staging them from the drive
+     * if they land in the file tier -- so the expert fill pins them in the host pool ahead of
+     * everything ranked. One layer's experts, a fraction of the pool. */
+    bool    draft_head = false;
 };
 
 /* The strongest access class in a group, "read most surely", decides the group's: a group with

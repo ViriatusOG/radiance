@@ -239,11 +239,14 @@ public:
     int  read(uint64_t offset, int64_t bytes, void* pinned_dst, int64_t dst_cap);
 
     /* RadFileEntry offsets are RAD_ALIGN_UNIT-aligned (rad_format.h), which is DirectFile's
-     * alignment, so the mover's reads need no bounce buffer. */
+     * alignment, so the mover's reads need no bounce buffer -- except the container's final unit,
+     * whose bytes can end at an unaligned EOF (the MTP head layer's last expert); that read is
+     * clamped to the file end and takes read_at's bounce path, which tolerates an EOF short read. */
     static int64_t direct_align(int64_t v) { return align_up(v, DirectFile::alignment()); }
 
 private:
     DirectFile f_;
+    int64_t    size_ = -1;      /* container size, cached at open */
 };
 
 /* ------------------------------------------------------------------ residency */
@@ -347,6 +350,10 @@ struct MoverStats {
      * for a window's copies to drain. */
     uint64_t file_layers = 0, file_units = 0, file_bytes = 0, file_preads = 0;
     uint64_t file_read_ns = 0, file_wait_ns = 0;
+    /* Routing-aware reads: units of experts whose routing count was zero at the layer's
+     * trigger, not read (their weights are re-published to the layer buffer as a dummy
+     * address for the pass, and nulled again with the staged units). */
+    uint64_t ssd_skipped_units = 0, ssd_skipped_bytes = 0;
 };
 
 /* The live twin of MoverStats: every counter an atomic. The mover writes these through the
@@ -369,6 +376,7 @@ struct MoverCounters {
     std::atomic<uint64_t> stage_copies{0};
     std::atomic<uint64_t> file_layers{0}, file_units{0}, file_bytes{0}, file_preads{0};
     std::atomic<uint64_t> file_read_ns{0}, file_wait_ns{0};
+    std::atomic<uint64_t> ssd_skipped_units{0}, ssd_skipped_bytes{0};
 
     void reset() {
         /* Field by field: atomics are not copy-assignable. */
@@ -400,6 +408,8 @@ struct MoverCounters {
         file_preads.store(0, std::memory_order_relaxed);
         file_read_ns.store(0, std::memory_order_relaxed);
         file_wait_ns.store(0, std::memory_order_relaxed);
+        ssd_skipped_units.store(0, std::memory_order_relaxed);
+        ssd_skipped_bytes.store(0, std::memory_order_relaxed);
     }
 
     MoverStats snapshot() const {
@@ -426,12 +436,14 @@ struct MoverCounters {
         s.staged_bytes   = staged_bytes.load(std::memory_order_relaxed);
         s.stage_overflow = stage_overflow.load(std::memory_order_relaxed);
         s.stage_copies   = stage_copies.load(std::memory_order_relaxed);
-        s.file_layers    = file_layers.load(std::memory_order_relaxed);
-        s.file_units     = file_units.load(std::memory_order_relaxed);
-        s.file_bytes     = file_bytes.load(std::memory_order_relaxed);
-        s.file_preads    = file_preads.load(std::memory_order_relaxed);
-        s.file_read_ns   = file_read_ns.load(std::memory_order_relaxed);
-        s.file_wait_ns   = file_wait_ns.load(std::memory_order_relaxed);
+        s.file_layers        = file_layers.load(std::memory_order_relaxed);
+        s.file_units         = file_units.load(std::memory_order_relaxed);
+        s.file_bytes    = file_bytes.load(std::memory_order_relaxed);
+        s.file_preads        = file_preads.load(std::memory_order_relaxed);
+        s.file_read_ns       = file_read_ns.load(std::memory_order_relaxed);
+        s.file_wait_ns       = file_wait_ns.load(std::memory_order_relaxed);
+        s.ssd_skipped_units = ssd_skipped_units.load(std::memory_order_relaxed);
+        s.ssd_skipped_bytes = ssd_skipped_bytes.load(std::memory_order_relaxed);
         return s;
     }
 };
@@ -622,9 +634,17 @@ public:
      *                   fills, behind `after` (if set), with `done` recorded last. Published
      *                   settled. RAD_E_SCRATCH if the units exceed `cap`. The reads block this
      *                   thread.
+     *
+     * Routing-aware reads: with `ecnt` (host, `n_expert` entries, the layer's per-expert
+     * routing counts for the current pass), a unit whose expert is counted zero is not read:
+     * it goes to `skipped`, its weights are published at `dst` (a dummy address inside the
+     * layer buffer, valid memory a no-run expert never reads through), and the caller nulls
+     * it again with the staged units. Null `ecnt` reads the whole layer.
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                           RadEvent after, RadEvent done, std::vector<int32_t>* staged);
+                           RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                           std::vector<int32_t>* skipped = nullptr,
+                           const int32_t* ecnt = nullptr, int32_t n_expert = 0);
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
@@ -768,6 +788,7 @@ private:
     int64_t  file_buf_bytes_ = 0;
     char*    windows_ = nullptr;
     int      n_windows_ = 0;
+    char*    calm_ = nullptr;      /* zeroed: dummy table entries read zeros, not NaN */
     int      win_next_ = 0;
     std::vector<RadEvent> win_ev_;
     std::vector<uint8_t>  win_rec_;

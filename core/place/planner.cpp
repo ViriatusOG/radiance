@@ -399,6 +399,9 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
         if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        /* The drafter's own weights (the "mtp." namespace) run on every draft pass of every
+         * decode step; the expert fill pins them in the host pool ahead of everything ranked. */
+        if (wi.name.rfind("mtp.", 0) == 0) mu.draft_head = true;
         if (wi.first_use_op >= 0 && (mu.first_use_op < 0 || wi.first_use_op < mu.first_use_op))
             mu.first_use_op = wi.first_use_op;
         if (wi.last_use_op > mu.last_use_op) mu.last_use_op = wi.last_use_op;
@@ -466,6 +469,10 @@ void Planner::rank_units(Plan* p, std::vector<int32_t>* order) const {
     std::stable_sort(order->begin(), order->end(), [&](int32_t a, int32_t b) {
         const MoveUnit& ua = p->units[(size_t)a];
         const MoveUnit& ub = p->units[(size_t)b];
+        /* The drafter's weights run on every draft pass of every decode step -- more often than
+         * anything the profile could rank -- so they take the pool first, before heat or the
+         * share order gets a vote. */
+        if (ua.draft_head != ub.draft_head) return ua.draft_head > ub.draft_head;
         if (ua.profile_share != ub.profile_share) return ua.profile_share > ub.profile_share;
         /* Expert-major tie-break, which is the whole policy without a profile (every share is
          * 0.0). Layer-major would fill layer 0, then layer 1, and leave the layers past the
@@ -691,6 +698,10 @@ int Planner::assign_expert_tiered(Plan* p) {
         Cost k;
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
+            /* A PREPLACED UNIT IS ALREADY PLACED: pin_mapped put it in the container's mapping
+             * (host-only op) and build_classes gave it no class and a 0-byte slot. Re-tiering it
+             * here would strand it -- VRAM tier with no slab slot behind it -- and the mover
+             * would find no address for it at init. */
             if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
             mu.tier = Tier::VRAM;
             mu.site = Site::Device;

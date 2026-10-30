@@ -327,6 +327,11 @@ public:
     /* Called by the drain, so the ring knows which banks are still unread. */
     void              mark_credited(int layer, int bank);
     const RadRouting* last_routing(int layer) const;
+    /* The device pointer of `layer`'s expert counts for the current step, with `n_expert` set,
+     * or null when the layer has not reported this step (a routing-aware file stager then
+     * reads the layer whole). The pointer is stream-ordered behind the router: a copy on the
+     * compute stream at the stager's trigger sees this pass's counts. */
+    const int32_t*    route_counts_device(int layer, int64_t* n_expert) const;
 
     /* ---------------------------------------------------------- the placement seam */
     /* Change an op's execution site. Refuses with RAD_E_NOKERNEL, naming op and band, if the

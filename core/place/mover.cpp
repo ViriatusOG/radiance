@@ -25,6 +25,8 @@ int FileTier::open(const std::string& path) {
     if (rc < 0)
         RAD_ERR("file tier: cannot open %s with O_DIRECT. The tier needs a filesystem that "
                 "supports it -- tmpfs and some overlay mounts do not.", path.c_str());
+    else
+        size_ = f_.size();
     return rc;
 }
 
@@ -32,8 +34,12 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
     if (!f_.is_open()) return RAD_E_STATE;
     if (!dst || bytes <= 0) return RAD_E_INVAL;
     /* The extent rounded up to the alignment: the unit stride already covers it, and reading
-     * one extra block is cheaper than a branch on the step path. */
-    const int64_t want = direct_align(bytes);
+     * one extra block is cheaper than a branch on the step path -- unless the rounding crosses
+     * the container's end: the final unit's bytes can end at an unaligned EOF, and pread_exact
+     * calls that short read an error. Clamp to the file, which sends the tail through read_at's
+     * bounce path (it tolerates an EOF short read) instead of the exact fast path. */
+    int64_t want = direct_align(bytes);
+    if (size_ >= 0 && (int64_t)offset + want > size_) want = size_ - (int64_t)offset;
     if (want > dst_cap) {
         RAD_ERR("file tier: a %s read needs a %s aligned buffer, the staging slot is %s",
                 humanb(bytes).c_str(), humanb(want).c_str(), humanb(dst_cap).c_str());
@@ -213,7 +219,9 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          *
          * Nothing is memset; the load phase writes every weight. rad_memset_async on
          * RAD_MEM_HOST fails on a real card but succeeds on the host backend, so use std::memset
-         * if a host buffer ever needs clearing. */
+         * if a host buffer ever needs clearing. The pool's cache cycle takes slots
+         * on demand: a deposit with no free slot relabels the coldest idle unit back to the
+         * file tier, copyless. */
     }
 
     if (static_need > 0) {
@@ -313,6 +321,17 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_NOMEM;
         }
         n_windows_ = RAD_PLACE_FILE_WINDOWS;
+
+        /* A zeroed region the skipped units' table entries point at. A dead row that reads
+         * through a dummy (a scale plane re-read, a dropped slot) sees zeros, which dequantise
+         * finite -- pointing it at the staging buffer's base handed it real weight bytes whose
+         * reinterpretation produced NaNs. */
+        calm_ = (char*)reserve("file-tier dummy region", 8 << 20, RAD_MEM_HOST_PINNED);
+        if (!calm_) {
+            RAD_ERR("mover: no pinned memory for the file tier's dummy region");
+            return RAD_E_NOMEM;
+        }
+        std::memset(calm_, 0, 8 << 20);
     }
 
     /* ---- streams, events, move records ------------------------------------------------------ */
@@ -660,9 +679,12 @@ constexpr int64_t kReadThrough = (int64_t)256 << 10;
 }  /* namespace */
 
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                            RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
+                            RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                            std::vector<int32_t>* skipped, const int32_t* ecnt,
+                            int32_t n_expert) {
     if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
     staged->clear();
+    if (skipped) skipped->clear();
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
 
     /* The layout in `dst`, unit by unit in the order given, and every weight's extent. */
@@ -671,8 +693,20 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     int64_t off = 0;
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) return RAD_E_INVAL;
-        const UnitState& us = unit_[(size_t)u];
+        UnitState& us = unit_[(size_t)u];
         if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        /* Routing-aware reads: the layer's router has run by the time the stager triggers
+         * (the trigger is the layer's first expert op), so `ecnt` holds this pass's counts.
+         * An expert counted zero has no sorted rows, so no GEMM run names it and nothing
+         * reads its weights: leave its bytes on the drive. The dummy publication below
+         * keeps every table entry valid for the pass. */
+        if (ecnt && skipped) {
+            const MoveUnit& mu = plan_->units[(size_t)u];
+            if (mu.expert >= 0 && mu.expert < n_expert && ecnt[mu.expert] == 0) {
+                skipped->push_back(u);
+                continue;
+            }
+        }
         const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
         if (off + need > cap) {
             RAD_ERR("file stager: a routed layer's file-tier units need more than the %s buffer "
@@ -689,10 +723,32 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         at.push_back(off);
         off += need;
     }
-    if (staged->empty()) return RAD_OK;
+    /* Skipped units' table entries must not name their stale addresses either: point them
+     * into the layer buffer, whose base is a valid allocation no zero-count expert reads
+     * through (a dead row would read row 0 of a real expert's region and discard it). The
+     * caller nulls them again with the staged units. Published even when EVERY unit of the
+     * layer was skipped -- a decode step can route nothing to a layer -- because the kernels
+     * still issue the layer's table and a null entry fails the step. */
+    if (skipped) {
+        for (int32_t u : *skipped) {
+            const MoveUnit& mu = plan_->units[(size_t)u];
+            for (size_t j = 0; j < mu.weights.size(); ++j)
+                res_.publish(mu.weights[j], calm_);
+            stats_.ssd_skipped_bytes += (uint64_t)unit_[(size_t)u].bytes;
+        }
+        stats_.ssd_skipped_units += (uint64_t)skipped->size();
+    }
+    if (ext.empty()) return RAD_OK;
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(ext.begin(), ext.end(),
                      [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
+
+    /* The dashboard's SSD panel and /stats ssd_reads read these: the file tier's container
+     * reads are the expert SSD traffic the metric names. The scheduled prefetch path counted
+     * its own link reads here; the file stager's were invisible, so the panels showed zero
+     * however much the drive streamed. */
+    stats_.ssd_reads += (uint64_t)ext.size();
+    for (const FileExt& e : ext) stats_.ssd_bytes += (uint64_t)e.bytes;
 
     if (after) RAD_TRY(rad_event_wait(mover_, after));
 
@@ -769,7 +825,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     }
     ++stats_.file_layers;
     stats_.file_units += (uint64_t)staged->size();
-    stats_.h2d_bytes += (uint64_t)off;
+    stats_.h2d_bytes += off;
     return RAD_OK;
 }
 
@@ -1618,6 +1674,11 @@ std::string Mover::report() const {
                  (double)stats_.file_bytes * gib, (unsigned long long)stats_.file_preads, rs,
                  rs > 0 ? (double)stats_.file_bytes / rs * 1e-9 : 0.0,
                  (double)stats_.file_wait_ns * 1e-9);
+        if (stats_.ssd_skipped_units)
+            s += fmt("  file stager: routing-aware reads skipped %llu units (%.2f GiB) whose "
+                     "experts were not routed this pass\n",
+                     (unsigned long long)stats_.ssd_skipped_units,
+                     (double)stats_.ssd_skipped_bytes * gib);
     }
     return s;
 }
