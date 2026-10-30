@@ -188,3 +188,44 @@ AVX_KERNEL(embed_attn) {
     }
     return RAD_OK;
 }
+
+/* Native masked mean: the sum is stored in BF16 before dividing, then stored in BF16 again.
+ * Keep this separate from seg_mean's one-rounding sentence-embedding contract. */
+AVX_KERNEL(seg_mean_bf16_sum) {
+    if (!rad_args_have(a, 3))
+        return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *cu = &a->t[1], *y = &a->t[2];
+    if (x->dtype != RAD_BF16 || y->dtype != RAD_BF16 || cu->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (!x->data || !cu->data || !y->data)
+        return RAD_E_INVAL;
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0, N = p_int(a, "n", 0);
+    const int64_t S = cu->rank == 1 && cu->shape[0] > 1 ? cu->shape[0] - 1 : 0;
+    const auto matrix = [](const RadTensor& t, int64_t rows, int64_t cols) {
+        constexpr int64_t limit = INT64_MAX / 2;
+        if (t.rank != 2 || t.shape[0] != rows || t.shape[1] != cols || t.stride[0] <= 0 ||
+            t.stride[1] <= 0 || cols - 1 > limit / t.stride[1])
+            return false;
+        const int64_t columns = (cols - 1) * t.stride[1];
+        return t.stride[0] > columns && rows - 1 <= (limit - columns) / t.stride[0];
+    };
+    if (M <= 0 || M > INT32_MAX || M > p_int(a, "M", 0) || N <= 0 || S <= 0 || S > M ||
+        cu->stride[0] <= 0 || cu->stride[0] > (INT64_MAX / 4) / S || !matrix(*x, M, N) ||
+        !matrix(*y, S, N))
+        return RAD_E_SHAPE;
+    const auto at = [&](int64_t s) { return ldi(cu, s * cu->stride[0]); };
+    if (at(0) != 0 || at(S) != M)
+        return RAD_E_INVAL;
+    for (int64_t s = 0; s < S; ++s)
+        if (at(s) < 0 || at(s + 1) <= at(s) || at(s + 1) > M)
+            return RAD_E_INVAL;
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t c = 0; c < N; ++c) {
+            float sum = 0;
+            for (int64_t r = at(s); r < at(s + 1); ++r)
+                sum += ldt(x, r * x->stride[0] + c * x->stride[1]);
+            stt(y, s * y->stride[0] + c * y->stride[1],
+                narrow1(RAD_BF16, sum) / (float)(at(s + 1) - at(s)));
+        }
+    return RAD_OK;
+}

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -2392,10 +2393,12 @@ static int embedding_input(const std::string& text,
  * boundaries, and no implicit BOS/EOS is added to the retrieval template's output. */
 static int nemotron35_embedding_input(const json& messages, const OaiDeps& d, const OaiLimits& lim,
                                       int32_t image_tokens, const char* field, OaiRequest* out,
-                                      ApiError* err) {
+                                      ApiError* err, bool rerank = false) {
     std::vector<Nemotron35Piece> pieces;
     std::string why;
-    if (nemotron35_format(messages, &pieces, &why) < 0) {
+    const int formatted = rerank ? nemotron35_rerank_format(messages, &pieces, &why)
+                                 : nemotron35_format(messages, &pieces, &why);
+    if (formatted < 0) {
         *err = err_bad(field, why);
         return RAD_E_INVAL;
     }
@@ -2416,8 +2419,9 @@ static int nemotron35_embedding_input(const json& messages, const OaiDeps& d, co
         std::string type = piece.content["type"].get<std::string>();
         if (type == "image")
             type = "image_url"; // template spelling; transport still requires a data URL
-        const char* part_field =
-            !std::strcmp(field, "messages") ? "messages[].content[]" : "input[]";
+        const char* part_field = rerank                            ? "documents[].content[]"
+                                 : !std::strcmp(field, "messages") ? "messages[].content[]"
+                                                                   : "input[]";
         const int rc = read_media_part(piece.content, type, part_field, d, lim, &kind, &bytes, err);
         if (rc < 0) return rc;
         if (rc == 0 || kind != MediaKind::Image) {
@@ -2451,7 +2455,8 @@ static int nemotron35_embedding_input(const json& messages, const OaiDeps& d, co
 }
 
 int check_embedding_template(const IEmbedder* embed, bool overridden, std::string* why) {
-    if (overridden && embed && nemotron35_retrieval_meta(embed->metadata())) {
+    if (overridden && embed &&
+        (nemotron35_retrieval_meta(embed->metadata()) || is_reranker(embed))) {
         if (why)
             *why = "Nemotron 3.5 uses its reference retrieval formatter; "
                    "--override-chat-template is not supported for this model. "
@@ -2463,6 +2468,10 @@ int check_embedding_template(const IEmbedder* embed, bool overridden, std::strin
 
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err) {
+    if (is_reranker(d.embed)) {
+        *err = err_unsupported("model", "this is a reranker; use /rerank with query and documents");
+        return RAD_E_UNSUPPORTED;
+    }
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     RAD_TRY(vet_keys(b, Endpoint::Embedding, err));
@@ -2701,6 +2710,89 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
     return finish_inputs();
 }
 
+bool is_reranker(const IEmbedder* embed) {
+    return embed && nemotron35_rerank_meta(embed->metadata());
+}
+
+int parse_rerank_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
+                         OaiRequest* out, ApiError* err) {
+    if (!is_reranker(d.embed) || d.embed->dim() != 1) {
+        *err = err_unsupported("model", "/rerank requires a reranking model");
+        return RAD_E_UNSUPPORTED;
+    }
+    json b;
+    RAD_TRY(parse_request_object(body, lim, &b, err));
+    for (auto it = b.begin(); it != b.end(); ++it)
+        if (it.key() != "model" && it.key() != "query" && it.key() != "documents" &&
+            it.key() != "top_n" && it.key() != "return_documents" && it.key() != "use_activation") {
+            *err = err_unsupported(it.key(), "this reranker serves query, documents and top_n "
+                                             "without truncation, instructions or activation");
+            return RAD_E_UNSUPPORTED;
+        }
+    out->endpoint = Endpoint::Rerank;
+    out->id = random_id("rerank-");
+    out->created = unix_now();
+    out->model = lim.model_id;
+    bool activation = false;
+    if (!get_str(b, "model", &out->model, err) || !get_int(b, "top_n", &out->top_n, err) ||
+        !get_bool(b, "return_documents", &out->return_documents, err) ||
+        !get_bool(b, "use_activation", &activation, err))
+        return RAD_E_INVAL;
+    if (out->model.empty())
+        out->model = lim.model_id;
+    if (activation) {
+        *err = err_unsupported("use_activation", "this model returns raw relevance logits");
+        return RAD_E_UNSUPPORTED;
+    }
+    if (out->top_n < 0) {
+        *err = err_bad("top_n", "must be zero (all documents) or positive");
+        return RAD_E_INVAL;
+    }
+    if (!b.contains("query") || !b["query"].is_string()) {
+        *err = err_bad("query", "expected a text string");
+        return RAD_E_INVAL;
+    }
+    if (!b.contains("documents") || !b["documents"].is_array() || b["documents"].empty() ||
+        b["documents"].size() > (size_t)INT_MAX) {
+        *err = err_bad("documents", "expected a nonempty array of strings or content objects");
+        return RAD_E_INVAL;
+    }
+    int64_t cap = lim.max_ctx > 0 ? std::min<int64_t>(lim.max_ctx, 32768) : 32768;
+    if (d.embed->max_input() > 0)
+        cap = std::min(cap, d.embed->max_input());
+    for (const auto& doc : b["documents"]) {
+        json content, echo;
+        if (doc.is_string()) {
+            content = doc;
+            echo = {{"text", doc}};
+        } else if (doc.is_object() && doc.size() == 1 && doc.contains("content") &&
+                   doc["content"].is_array()) {
+            content = doc["content"];
+            echo = {{"multi_modal", content}};
+        } else {
+            *err =
+                err_bad("documents", "each document must be a string or {content: [typed blocks]}");
+            return RAD_E_INVAL;
+        }
+        const json messages = json::array({{{"role", "query"}, {"content", b["query"]}},
+                                           {{"role", "document"}, {"content", content}}});
+        RAD_TRY(nemotron35_embedding_input(messages, d, lim, 0, "documents", out, err, true));
+        const int64_t n = (int64_t)out->prompts.back().tokens.size();
+        if (n <= 0 || n > cap) {
+            *err = err_bad("documents",
+                           "query/document pair " + std::to_string(out->prompts.size() - 1) +
+                               " has " + std::to_string(n) +
+                               " tokens; this deployment accepts 1 through " + std::to_string(cap));
+            err->code = "context_length_exceeded";
+            err->n_prompt_tokens = n;
+            err->n_ctx = cap;
+            return RAD_E_INVAL;
+        }
+        out->rerank_documents.push_back(std::move(echo));
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== responses */
 
 static json tool_calls_json(const std::vector<ToolCall>& tcs) {
@@ -2922,6 +3014,29 @@ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<f
     o["model"] = r.model;
     o["usage"] = std::move(usage);
     return o.dump();
+}
+
+std::string rerank_body(const OaiRequest& r, const std::vector<std::vector<float>>& scores,
+                        const UsageOut& u) {
+    std::vector<size_t> order(scores.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return scores[a][0] > scores[b][0]; });
+    if (r.top_n > 0 && (uint64_t)r.top_n < order.size())
+        order.resize((size_t)r.top_n);
+    json results = json::array();
+    for (size_t i : order) {
+        json row = {{"index", i}, {"relevance_score", scores[i][0]}};
+        if (r.return_documents)
+            row["document"] = r.rerank_documents[i];
+        results.push_back(std::move(row));
+    }
+    return json({{"id", r.id},
+                 {"model", r.model},
+                 {"results", std::move(results)},
+                 {"usage", {{"prompt_tokens", u.prompt}, {"total_tokens", u.prompt}}}})
+        .dump();
 }
 
 static json model_card(const ModelCard& c) {

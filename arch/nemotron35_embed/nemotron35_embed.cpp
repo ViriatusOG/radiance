@@ -27,11 +27,12 @@ struct Layer {
            add_ff = 0;
 };
 struct Model {
+    bool rerank = false;
     Geom g{};
-    Names nm{""};
+    Names nm{""}, source{""};
     rad_buf x = 0, h = 0, qkv = 0, attn = 0, o = 0, gu = 0, ff = 0, mean = 0, pooled = 0;
-    rad_weight tok = 0, norm = 0;
-    rad_op embed = 0, inject = 0, final_norm = 0, final_gain = 0, pool = 0, cast = 0;
+    rad_weight tok = 0, norm = 0, score = 0;
+    rad_op embed = 0, inject = 0, final_norm = 0, final_gain = 0, pool = 0, cast = 0, head = 0;
     std::vector<Layer> layers;
     Pixtral vision;
 };
@@ -117,10 +118,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     model = Model{};
     Model& m = model;
+    m.rerank =
+        !std::strcmp(rad_meta_gets(meta, "architectures", ""), "Mistral3ForSequenceClassification");
+    const char* architecture = rad_meta_gets(meta, "architectures", "");
+    if (*architecture && !m.rerank && std::strcmp(architecture, "Mistral3Model"))
+        return RAD_E_UNSUPPORTED;
+    if (m.rerank && (std::strcmp(rad_meta_gets(meta, "pooling", ""), "avg") ||
+                     std::strcmp(rad_meta_gets(meta, "text_config.pooling", ""), "avg")))
+        return RAD_E_UNSUPPORTED;
     m.nm = Names(ctx->scope);
+    // The classifier wrapper prefixes the backbone with model.; its score head stays at root.
+    m.source = Names(m.rerank ? "model" : "");
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
     Geom& g = m.g;
     Names& nm = m.nm;
+    Names& source = m.source;
     if (g.n_head_kv <= 0 || g.n_head % g.n_head_kv || g.head_dim % 2) return RAD_E_INVAL;
     RAD_ARCH_TRY(read_rope(g, meta));
     const int64_t T = g.max_tok, E = g.n_embd, Q = g.q_dim(), K = g.kv_dim(), F = g.n_ff;
@@ -132,7 +144,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.gu = decl_b(b, nm.f("gate_up"), RAD_BF16, {T, 2 * F});
     m.ff = decl_b(b, nm.f("ff"), RAD_BF16, {T, F});
     m.mean = decl_b(b, nm.f("mean"), RAD_BF16, {g.max_seqs, E});
-    m.pooled = decl_b(b, nm.f("pooled"), RAD_F32, {g.max_seqs, E}, RAD_BUF_PERSIST);
+    m.pooled = decl_b(b, nm.f("pooled"), RAD_F32, {g.max_seqs, m.rerank ? 1 : E}, RAD_BUF_PERSIST);
     RAD_ARCH_TRY(rad_declare_pooled(b, m.pooled));
     auto weight = [&](const char* dest, const char* src, std::initializer_list<int64_t> shape,
                       RadWeightGroup group) {
@@ -163,11 +175,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       RAD_NOWEIGHTS);
     };
     RAD_ARCH_TRY(
-        map_copy(b, nm.f("token_embd.weight"), nm.ckpt("language_model.embed_tokens.weight")));
+        map_copy(b, nm.f("token_embd.weight"), source.f("language_model.embed_tokens.weight")));
     m.tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, E}, RAD_ACCESS_VOCAB,
                    RAD_SHARD_NONE, grp_model());
-    m.norm =
-        weight(nm.f("output_norm.weight"), nm.ckpt("language_model.norm.weight"), {E}, grp_model());
+    m.norm = weight(nm.f("output_norm.weight"), source.f("language_model.norm.weight"), {E},
+                    grp_model());
     m.embed = rw(b,
                  RAD_OP(b, "embed_lookup",
                         RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", E),
@@ -181,29 +193,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const auto n = (long long)i;
         l.norm =
             weight(nm.f("blk.%lld.attn_norm.weight", n),
-                   nm.ckpt("language_model.layers.%lld.input_layernorm.weight", n), {E}, group);
-        l.ff_norm = weight(nm.f("blk.%lld.ffn_norm.weight", n),
-                           nm.ckpt("language_model.layers.%lld.post_attention_layernorm.weight", n),
-                           {E}, group);
+                   source.f("language_model.layers.%lld.input_layernorm.weight", n), {E}, group);
+        l.ff_norm = weight(
+            nm.f("blk.%lld.ffn_norm.weight", n),
+            source.f("language_model.layers.%lld.post_attention_layernorm.weight", n), {E}, group);
         RAD_ARCH_TRY(map_concat(b, nm.f("blk.%lld.qkv.weight", n),
-                                {nm.ckpt("language_model.layers.%lld.self_attn.q_proj.weight", n),
-                                 nm.ckpt("language_model.layers.%lld.self_attn.k_proj.weight", n),
-                                 nm.ckpt("language_model.layers.%lld.self_attn.v_proj.weight", n)},
+                                {source.f("language_model.layers.%lld.self_attn.q_proj.weight", n),
+                                 source.f("language_model.layers.%lld.self_attn.k_proj.weight", n),
+                                 source.f("language_model.layers.%lld.self_attn.v_proj.weight", n)},
                                 0));
         l.qkv = decl_w(b, nm.f("blk.%lld.qkv.weight", n), RAD_BF16, {Q + 2 * K, E},
                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, group);
-        l.out =
-            weight(nm.f("blk.%lld.attn_o.weight", n),
-                   nm.ckpt("language_model.layers.%lld.self_attn.o_proj.weight", n), {E, Q}, group);
+        l.out = weight(nm.f("blk.%lld.attn_o.weight", n),
+                       source.f("language_model.layers.%lld.self_attn.o_proj.weight", n), {E, Q},
+                       group);
         RAD_ARCH_TRY(map_concat(b, nm.f("blk.%lld.gate_up.weight", n),
-                                {nm.ckpt("language_model.layers.%lld.mlp.gate_proj.weight", n),
-                                 nm.ckpt("language_model.layers.%lld.mlp.up_proj.weight", n)},
+                                {source.f("language_model.layers.%lld.mlp.gate_proj.weight", n),
+                                 source.f("language_model.layers.%lld.mlp.up_proj.weight", n)},
                                 0));
         l.gate_up = decl_w(b, nm.f("blk.%lld.gate_up.weight", n), RAD_BF16, {2 * F, E},
                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, group);
         l.down =
             weight(nm.f("blk.%lld.ffn_down.weight", n),
-                   nm.ckpt("language_model.layers.%lld.mlp.down_proj.weight", n), {E, F}, group);
+                   source.f("language_model.layers.%lld.mlp.down_proj.weight", n), {E, F}, group);
         l.in_norm = rw(b, rms(), {m.x}, {m.h});
         l.in_gain = rw(b, gain(l.norm), {m.h}, {m.h});
         l.project = rw(b, gemm(Q + 2 * K, E, l.qkv), {m.h}, {m.qkv});
@@ -254,16 +266,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.final_norm = rw(b, rms(), {m.x}, {m.h});
     m.final_gain = rw(b, gain(m.norm), {m.h}, {m.h});
     m.pool = rw(b,
-                RAD_OP(b, "seg_mean",
+                RAD_OP(b, m.rerank ? "seg_mean_bf16_sum" : "seg_mean",
                        RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_STR("dtype", "bf16")),
                        RAD_NOWEIGHTS),
                 {m.h}, {m.mean});
-    m.cast = rw(b,
-                RAD_OP(b, "cast",
-                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", E),
-                                  RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                       RAD_NOWEIGHTS),
-                {m.mean}, {m.pooled});
+    if (m.rerank) {
+        m.score = weight(nm.f("score.weight"), nm.ckpt("language_model.score.weight"), {1, E},
+                         grp_model());
+        m.head = rw(b,
+                    RAD_OP(b, "logits_gemm",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", 1),
+                                      RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
+                           RAD_WEIGHTS(m.score)),
+                    {m.mean}, {m.pooled});
+    } else {
+        m.cast = rw(b,
+                    RAD_OP(b, "cast",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", E),
+                                      RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                           RAD_NOWEIGHTS),
+                    {m.mean}, {m.pooled});
+    }
     /* Recipes may quantise weights without changing the architecture descriptor. Do not read an
      * INT8 plane with a BF16-only graph, even when a container still advertises quant="". */
     const RadEncoding plain = rad_enc_plain(RAD_BF16);
@@ -281,10 +304,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     };
     RAD_ARCH_TRY(bf16_only(nm.f("token_embd.weight")));
     RAD_ARCH_TRY(bf16_only(nm.f("output_norm.weight")));
+    if (m.rerank)
+        RAD_ARCH_TRY(bf16_only(nm.f("score.weight")));
     for (int64_t i = 0; i < g.n_layer; ++i)
         for (const char* suffix : {"attn_norm", "ffn_norm", "qkv", "attn_o", "gate_up", "ffn_down"})
             RAD_ARCH_TRY(bf16_only(nm.f("blk.%lld.%s.weight", (long long)i, suffix)));
-    RAD_ARCH_TRY(m.vision.declare(b, meta, ctx, nm, E, (int)g.n_layer));
+    RAD_ARCH_TRY(m.vision.declare(b, meta, ctx, nm, source, E, (int)g.n_layer));
     if (m.vision.on)
         m.inject =
             rw(b,
@@ -292,10 +317,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_STR("dtype", "bf16")),
                       RAD_NOWEIGHTS),
                {m.x}, {m.x});
-    rad_note(
-        b,
-        "Nemotron-3.5-Embed: BF16 bidirectional embeddings, TP1; mean-pooled to %lld; Pixtral encoder %s",
-        (long long)E, m.vision.on ? "on" : "off");
+    if (m.rerank)
+        rad_note(b,
+                 "Nemotron-3.5-Rerank: BF16 bidirectional query/document scoring, TP1; "
+                 "BF16 sum/division, FP32 score; Pixtral encoder %s",
+                 m.vision.on ? "on" : "off");
+    else
+        rad_note(
+            b,
+            "Nemotron-3.5-Embed: BF16 bidirectional embeddings, TP1; mean-pooled to %lld; Pixtral encoder %s",
+            (long long)E, m.vision.on ? "on" : "off");
     return RAD_OK;
 }
 
@@ -360,12 +391,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE(c, m.final_norm, brows(m.x, T), brows(m.h, T));
     RAD_ISSUE(c, m.final_gain, brows(m.h, T), RAD_W(m.norm), brows(m.h, T));
     RAD_ISSUE(c, m.pool, brows(m.h, T), cu, brows(m.mean, S));
-    RAD_ISSUE_N(c, m.cast, S, brows(m.mean, S), brows(m.pooled, S));
+    if (m.rerank)
+        RAD_ISSUE_N(c, m.head, S, brows(m.mean, S), RAD_W(m.score), brows(m.pooled, S));
+    else
+        RAD_ISSUE_N(c, m.cast, S, brows(m.mean, S), brows(m.pooled, S));
 }
 } // namespace nemotron35_embed
 
 #ifndef RAD_ARCH_NO_EXPORTS
-RAD_ARCH_PLUGIN(nemotron35_embed, "mistral3", "", "0.4.0",
-                "Nemotron-3.5-Embed: experimental BF16 text/image embeddings, TP1")
+RAD_ARCH_PLUGIN(nemotron35_embed, "mistral3", "", "0.5.0",
+                "Nemotron-3.5-Embed/Rerank: experimental BF16 text/image retrieval, TP1")
 RAD_ARCH_PROBE(nemotron35_embed)
 #endif

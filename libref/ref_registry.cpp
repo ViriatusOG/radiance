@@ -1179,6 +1179,8 @@ static const RadOpSchema kSchemas[] = {
   "y = act(a) * b, `act` \"silu\", \"gelu\" (exact erf), \"gelu_tanh\" or \"sigmoid\". The activation is "
   "rounded to y's dtype before the product, which is the unfused pair. `a` and `b` may be column "
   "slices of one fused row." },
+{ "seg_mean_bf16_sum", ARR(pSegMean), ARR(oSegMean),
+  "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
   "y[s] = mean of x's rows [cu[s], cu[s+1]): one row a segment, summed in double and rounded "
   "once to y's dtype. An empty segment is a zero row." },
@@ -2256,6 +2258,8 @@ SIMPLE("ref_mix_rows", "mix_rows", "elem", "a weighted sum of k consecutive rows
        ref_mix_rows),
 SIMPLE("ref_chan_stats", "chan_stats", "elem", "per-channel statistics held as weights",
        DT_FLOAT, ref_chan_stats),
+SIMPLE("ref_seg_mean_bf16_sum", "seg_mean_bf16_sum", "elem", "BF16 sum/division mean pooling",
+       "bf16 in and out; f32 sum, BF16 sum and quotient", ref_seg_mean_bf16_sum),
 SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        ref_seg_mean),
 SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",

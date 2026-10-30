@@ -14,5 +14,8 @@ struct Nemotron35Piece {
 };
 
 bool nemotron35_retrieval_meta(const RadModelMeta* meta);
+bool nemotron35_rerank_meta(const RadModelMeta* meta);
 int nemotron35_format(const json& messages, std::vector<Nemotron35Piece>* pieces, std::string* why);
+int nemotron35_rerank_format(const json& messages, std::vector<Nemotron35Piece>* pieces,
+                             std::string* why);
 } // namespace rad::server

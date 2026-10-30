@@ -5,6 +5,7 @@
  * streaming wire format deterministic. No port is bound; transport_test.cpp covers the socket.
  */
 #include "server_fakes.h"
+#include "rad_plugin.h"
 
 #include "lora/slots.h"
 #include "server/liveview.h"
@@ -14,6 +15,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <random>
 
 /* ================================================================== parsing */
@@ -6157,6 +6159,110 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
     r.route.join();
     CHECK_EQ(r.rig.srv->in_flight(), (int64_t)0);
     CHECK_EQ(r.rig.srv->router().call("GET", "/health").status, 200);
+}
+
+namespace {
+struct RerankInfo final : IEmbedder {
+    const char* keys[6] = {"model_type", "text_config.model_type", "vision_config.model_type",
+                           "is_causal",  "text_config.is_causal",  "architectures"};
+    const char* values[6] = {"mistral3", "ministral3", "pixtral",
+                             "0",        "0",          "Mistral3ForSequenceClassification"};
+    RadModelMeta meta{};
+    int64_t width = 1;
+    RerankInfo() {
+        meta.n_kv = 6;
+        meta.kv_key = keys;
+        meta.kv_val = values;
+    }
+    int64_t dim() const override { return width; }
+    int64_t max_input() const override { return 32768; }
+    const RadModelMeta* metadata() const override { return &meta; }
+};
+} // namespace
+
+TEST(rerank_returns_raw_logits_stable_indices_top_n_and_all_pair_token_usage) {
+    RerankInfo info;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.embed = &info;
+        o.max_ctx = 32768;
+    }});
+    const auto caps = json::parse(f.get("/server_info").body)["capabilities"];
+    CHECK(caps["rerank"].get<bool>());
+    CHECK(!caps["embedding"].get<bool>());
+    CHECK(!caps["chat"].get<bool>());
+    f.sched.embedding = {-2.75f};
+    for (const char* route : {"/rerank", "/v1/rerank"}) {
+        auto r = f.post(route, R"({"query":"q","documents":["short","a longer document"]})");
+        f.sched.join_all();
+        REQUIRE_EQ(r.status, 200);
+        const auto b = json::parse(r.body);
+        REQUIRE_EQ(b["results"].size(), (size_t)2);
+        CHECK_EQ(b["results"][0]["index"].get<int>(), 0);
+        CHECK_EQ(b["results"][1]["index"].get<int>(), 1);
+        CHECK_NEAR(b["results"][0]["relevance_score"].get<float>(), -2.75, 0);
+        CHECK_EQ(b["results"][0]["document"]["text"].get<std::string>(), "short");
+        CHECK_EQ(b["usage"]["prompt_tokens"].get<int>(), 2 * 19 + 5 + 17);
+        CHECK_EQ(f.srv->in_flight(), 0);
+    }
+    f.sched.embed_mark_length = true;
+    auto r = f.post("/rerank", R"({"query":"q","documents":["short","a longer document"],
+                                  "top_n":1,"return_documents":false,"use_activation":false})");
+    f.sched.join_all();
+    REQUIRE_EQ(r.status, 200);
+    const auto b = json::parse(r.body);
+    REQUIRE_EQ(b["results"].size(), (size_t)1);
+    CHECK_EQ(b["results"][0]["index"].get<int>(), 1);
+    CHECK_EQ(b["results"][0]["relevance_score"].get<int>(), 36);
+    CHECK(!b["results"][0].contains("document"));
+    CHECK_EQ(b["usage"]["total_tokens"].get<int>(), 60);
+    CHECK_EQ(f.post("/v1/embeddings", R"({"input":"q"})").status, 501);
+}
+
+TEST(rerank_refuses_invalid_pairs_unsupported_options_and_nonfinite_scores) {
+    RerankInfo info;
+    Fixture f(Fixture::Tweak{[&](ServerOptions&, Deps& d) { d.embed = &info; }});
+    for (const std::string& body :
+         {R"({"query":"q","documents":[]})", R"({"query":1,"documents":["d"]})",
+          R"({"query":"q","documents":[1]})", R"({"query":"q","documents":["d"],"top_n":-1})",
+          R"({"query":"q","documents":["d"],"top_n":1.5})",
+          R"({"query":"q","documents":["d"],"top_n":18446744073709551615})",
+          R"({"query":"q","documents":["d"],"use_activation":true})",
+          R"({"query":"q","documents":["d"],"truncate_prompt_tokens":16})",
+          R"({"query":"q","documents":["d"],"instruction":"new instruction"})",
+          R"({"query":"q","documents":[{"content":[{"type":"image"},{"type":"image"}]}]})"})
+        CHECK_EQ(f.post("/rerank", body).status, 400);
+    CHECK(f.sched.submitted.empty());
+    f.sched.embedding = {std::numeric_limits<float>::quiet_NaN()};
+    CHECK_EQ(f.post("/rerank", R"({"query":"q","documents":["d"]})").status, 500);
+    f.sched.join_all();
+    CHECK_EQ(f.srv->in_flight(), 0);
+    f.sched.embedding = {-3.25f};
+    CHECK_EQ(f.post("/rerank", R"({"query":"q","documents":["d"]})").status, 200);
+    f.sched.join_all();
+    info.width = 2;
+    CHECK_EQ(f.post("/rerank", R"({"query":"q","documents":["d"]})").status, 501);
+    Fixture generation;
+    CHECK_EQ(generation.post("/rerank", R"({"query":"q","documents":["d"]})").status, 501);
+}
+
+TEST(rerank_pair_context_includes_prefixes_and_accepts_the_exact_boundary) {
+    RerankInfo info;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.embed = &info;
+        o.max_ctx = 64;
+    }});
+    f.sched.embedding = {.125f};
+    for (int n : {44, 45, 46}) {
+        const std::string body =
+            json({{"query", "q"}, {"documents", {std::string(n, 'a')}}}).dump();
+        auto r = f.post("/rerank", body);
+        CHECK_EQ(r.status, n <= 45 ? 200 : 400);
+        if (n > 45)
+            CHECK_EQ(json::parse(r.body)["error"]["code"].get<std::string>(),
+                     "context_length_exceeded");
+        f.sched.join_all();
+    }
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
 RAD_TEST_MAIN()

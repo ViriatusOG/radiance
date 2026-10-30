@@ -304,7 +304,7 @@ and runs.
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
-| `nemotron35_embed` | Nemotron 3.5 Embed 1B and 8B, BF16 text/image embeddings at TP1 (§5.6) |
+| `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
@@ -2449,6 +2449,31 @@ attention sequences and existing arithmetic; unsupported multi-launch chains are
 `--mm-max-patches 6400` covers the default 1120-square image in one encoder pass. See
 [ARCHITECTURES.md](ARCHITECTURES.md#nemotron35_embed-embedding-models) for geometry, numerical
 contracts and validation limits.
+
+**Nemotron 3.5 Rerank 8B BF16** uses the same architecture plugin with its own native
+checkpoint and learned scalar head. Serve it with `--max-model-len 32768` and enough
+`--max-num-batched-tokens` for each whole query/document pair. It serves `POST /rerank`
+and `/v1/rerank`, using the vLLM/Jina-style request and result fields:
+
+```sh
+curl -s http://localhost:8000/rerank -H 'Content-Type: application/json' \
+  -d '{"query":"Where can I borrow books?","documents":["A public library lends books.","A football match."],"top_n":2}'
+```
+
+Each result has the original document `index`, a raw `relevance_score` (higher is more
+relevant), and `document`. Scores may be negative; no sigmoid, L2 normalization or
+dimensional truncation applies. Results are sorted descending, with ties retaining
+input order. `top_n` omitted or zero returns all documents; `return_documents:false`
+omits document contents. Token usage includes all scored pairs, even with `top_n`.
+
+Queries are text strings. A document is a string, or `{"content":[...]}` containing
+typed `text` and `image_url` blocks, with an image data URL as for embeddings. At most
+one image is allowed per document. The checkpoint's exact `query`/`document` template
+places its image first, escapes literal controls and adds no BOS/EOS. The 32768-token
+limit covers query, document, prefixes and image tokens together. Overlong pairs are
+rejected, never truncated. Custom instructions, template overrides and activation
+options that change the native score are refused. This model does not serve
+`/v1/embeddings`; the embedding checkpoints continue to use that endpoint unchanged.
 
 ```sh
 # text, a batch of texts, or token ids

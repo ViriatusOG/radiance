@@ -92,6 +92,8 @@ void Server::register_routes() {
     router_.post("/v1/chat/completions", [this](const HttpRequest& q) { return handle_chat(q); });
     router_.post("/v1/completions",      [this](const HttpRequest& q) { return handle_completion(q); });
     router_.post("/v1/embeddings",       [this](const HttpRequest& q) { return handle_embeddings(q); });
+    router_.post("/rerank", [this](const HttpRequest& q) { return handle_rerank(q); });
+    router_.post("/v1/rerank", [this](const HttpRequest& q) { return handle_rerank(q); });
     router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
     router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
@@ -420,7 +422,9 @@ HttpResponse Server::error_response(const ApiError& e, const std::string& peer, 
 void Server::log_admitted(const OaiRequest& r) const {
     int64_t n_prompt = 0;
     for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
-    const char* kind = r.endpoint == Endpoint::Chat ? "chat" : "completion";
+    const char* kind = r.endpoint == Endpoint::Chat     ? "chat"
+                       : r.endpoint == Endpoint::Rerank ? "rerank"
+                                                        : "completion";
     if (r.endpoint == Endpoint::Chat)
         RAD_INFO("req %s %s%s%s model=%s msgs=%d tools=%d prompt=%lld tok n=%d max_tokens=%lld",
                  r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
@@ -1346,6 +1350,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
 std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShape shape) {
     const char* why =
         !deps_.sched || !deps_.tok ? "the server has no engine attached"
+        : is_reranker(deps_.embed) ? "this is a reranker: it serves /rerank and generates no text"
         : opt_.embedding_model     ? "this is an embedding model: it serves /v1/embeddings and "
                                      "generates no text"
         : opt_.image_model         ? "this is an image model: it serves /v1/images/generations "
@@ -1616,10 +1621,20 @@ HttpResponse Server::handle_completion(const HttpRequest& req) {
     return serve(req, r);
 }
 
-HttpResponse Server::handle_embeddings(const HttpRequest& req) {
+HttpResponse Server::handle_embeddings(const HttpRequest& req) { return serve_pooled(req, false); }
+
+HttpResponse Server::handle_rerank(const HttpRequest& req) { return serve_pooled(req, true); }
+
+/* Embedding and reranking programs both return one pooled row per whole input. Share their
+ * admission, batching and cancellation; only embeddings truncate and normalize that row. */
+HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"),
                               req.peer);
+    if (rerank && (!is_reranker(deps_.embed) || deps_.embed->dim() != 1))
+        return error_response(err_not_implemented("/rerank requires a reranking model"), req.peer);
+    if (!rerank && is_reranker(deps_.embed))
+        return error_response(err_not_implemented("this is a reranker; use /rerank"), req.peer);
     if (!deps_.embed)
         return error_response(err_not_implemented(
             opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
@@ -1630,7 +1645,9 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
 
     OaiRequest r;
     ApiError err;
-    if (parse_embeddings_request(req.body, odeps_, lim_, &r, &err) < 0)
+    const int parsed = rerank ? parse_rerank_request(req.body, odeps_, lim_, &r, &err)
+                              : parse_embeddings_request(req.body, odeps_, lim_, &r, &err);
+    if (parsed < 0)
         return error_response(err, req.peer);
     r.peer = req.peer;
 
@@ -1720,17 +1737,29 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
             return error_response(err_internal(why), req.peer);
         }
         std::vector<float> out(v.begin(), v.begin() + keep);
-        double ss = 0.0;
-        for (float x : out) ss += (double)x * x;
-        const float inv = ss > 0.0 ? (float)(1.0 / std::sqrt(ss)) : 0.0f;
-        for (float& x : out) x *= inv;
+        if (rerank) {
+            if (out.size() != 1 || !std::isfinite(out[0])) {
+                retire(gens);
+                release(n_in);
+                return error_response(err_internal("the reranker returned a non-finite score"),
+                                      req.peer);
+            }
+        } else {
+            double ss = 0.0;
+            for (float x : out)
+                ss += (double)x * x;
+            const float inv = ss > 0.0 ? (float)(1.0 / std::sqrt(ss)) : 0.0f;
+            for (float& x : out)
+                x *= inv;
+        }
         u.prompt += (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
         vecs.push_back(std::move(out));
     }
     retire(gens);
     release(n_in);
     metrics_.observe_http(200);
-    return HttpResponse::json_body(200, embeddings_body(r, vecs, u));
+    return HttpResponse::json_body(200,
+                                   rerank ? rerank_body(r, vecs, u) : embeddings_body(r, vecs, u));
 }
 
 /* /v1/systemone (systemone.h): one engine request per question, each reading its answer

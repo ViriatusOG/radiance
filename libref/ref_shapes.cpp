@@ -592,6 +592,12 @@ int ref_seg_mean_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("seg_mean", operand, out);
 }
 
+int ref_seg_mean_bf16_sum_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (act_dt(p, n_p) != RAD_BF16)
+        return RAD_E_UNSUPPORTED;
+    return ref_seg_mean_shape(p, n_p, operand, out);
+}
+
 int ref_pool_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t n = gi(p, n_p, "n", 0), k = gi(p, n_p, "k", 0);

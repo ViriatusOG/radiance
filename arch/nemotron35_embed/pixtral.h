@@ -29,7 +29,7 @@ struct Pixtral {
     std::vector<Layer> layers;
 
     int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx, Names& nm,
-                int64_t output_width, int first_group) {
+                Names& source, int64_t output_width, int first_group) {
         on = false;
         if (ctx->max_enc_patches <= 0) return RAD_OK;
         auto vi = [&](const char* k) {
@@ -117,44 +117,44 @@ struct Pixtral {
                 RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", width), RAD_STR("dtype", "bf16")),
                 RAD_NOWEIGHTS);
         };
-        patch = weight(nm.f("v.patch.weight"), nm.ckpt("vision_tower.patch_conv.weight"),
+        patch = weight(nm.f("v.patch.weight"), source.f("vision_tower.patch_conv.weight"),
                        {width, patch_dim}, grp_model());
         stem = rw(b, gemm(P, width, patch_dim, patch), {}, {x});
-        norm(pre, nm.f("v.pre.weight"), nm.ckpt("vision_tower.ln_pre.weight"), grp_model(), 1e-5, x,
-             x);
+        norm(pre, nm.f("v.pre.weight"), source.f("vision_tower.ln_pre.weight"), grp_model(), 1e-5,
+             x, x);
         layers.resize((size_t)depth);
         for (int64_t i = 0; i < depth; ++i) {
             auto& l = layers[(size_t)i];
             const long long li = i;
             const auto group = grp_layer(first_group + (int)i);
             norm(l.n1, nm.f("v.blk.%lld.n1.weight", li),
-                 nm.ckpt("vision_tower.transformer.layers.%lld.attention_norm.weight", li), group,
+                 source.f("vision_tower.transformer.layers.%lld.attention_norm.weight", li), group,
                  1e-5, x, h);
             norm(l.n2, nm.f("v.blk.%lld.n2.weight", li),
-                 nm.ckpt("vision_tower.transformer.layers.%lld.ffn_norm.weight", li), group, 1e-5,
+                 source.f("vision_tower.transformer.layers.%lld.ffn_norm.weight", li), group, 1e-5,
                  x, h);
             RAD_ARCH_TRY(map_concat(
                 b, nm.f("v.blk.%lld.qkv.weight", li),
-                {nm.ckpt("vision_tower.transformer.layers.%lld.attention.q_proj.weight", li),
-                 nm.ckpt("vision_tower.transformer.layers.%lld.attention.k_proj.weight", li),
-                 nm.ckpt("vision_tower.transformer.layers.%lld.attention.v_proj.weight", li)},
+                {source.f("vision_tower.transformer.layers.%lld.attention.q_proj.weight", li),
+                 source.f("vision_tower.transformer.layers.%lld.attention.k_proj.weight", li),
+                 source.f("vision_tower.transformer.layers.%lld.attention.v_proj.weight", li)},
                 0));
             l.qkv = decl_w(b, nm.f("v.blk.%lld.qkv.weight", li), RAD_BF16, {3 * width, width},
                            RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, group);
             l.out =
                 weight(nm.f("v.blk.%lld.out.weight", li),
-                       nm.ckpt("vision_tower.transformer.layers.%lld.attention.o_proj.weight", li),
+                       source.f("vision_tower.transformer.layers.%lld.attention.o_proj.weight", li),
                        {width, width}, group);
             RAD_ARCH_TRY(map_concat(
                 b, nm.f("v.blk.%lld.gate_up.weight", li),
-                {nm.ckpt("vision_tower.transformer.layers.%lld.feed_forward.gate_proj.weight", li),
-                 nm.ckpt("vision_tower.transformer.layers.%lld.feed_forward.up_proj.weight", li)},
+                {source.f("vision_tower.transformer.layers.%lld.feed_forward.gate_proj.weight", li),
+                 source.f("vision_tower.transformer.layers.%lld.feed_forward.up_proj.weight", li)},
                 0));
             l.gu = decl_w(b, nm.f("v.blk.%lld.gate_up.weight", li), RAD_BF16, {2 * ff, width},
                           RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, group);
             l.down = weight(
                 nm.f("v.blk.%lld.down.weight", li),
-                nm.ckpt("vision_tower.transformer.layers.%lld.feed_forward.down_proj.weight", li),
+                source.f("vision_tower.transformer.layers.%lld.feed_forward.down_proj.weight", li),
                 {width, ff}, group);
             l.project = rw(b, gemm(P, 3 * width, width, l.qkv), {h}, {qkv});
             l.rope = rw(b,
@@ -191,15 +191,17 @@ struct Pixtral {
             l.ffn = rw(b, gemm(P, width, ff, l.down), {ffn}, {o});
             l.add2 = rw(b, add(), {x, o}, {x});
         }
-        norm(post, nm.f("v.post.weight"), nm.ckpt("multi_modal_projector.norm.weight"), grp_model(),
-             eps, x, h);
+        norm(post, nm.f("v.post.weight"), source.f("multi_modal_projector.norm.weight"),
+             grp_model(), eps, x, h);
         merger = weight(nm.f("v.merger.weight"),
-                        nm.ckpt("multi_modal_projector.patch_merger.merging_layer.weight"),
+                        source.f("multi_modal_projector.patch_merger.merging_layer.weight"),
                         {width, mm * width}, grp_model());
-        linear1 = weight(nm.f("v.linear1.weight"), nm.ckpt("multi_modal_projector.linear_1.weight"),
-                         {embd, width}, grp_model());
-        linear2 = weight(nm.f("v.linear2.weight"), nm.ckpt("multi_modal_projector.linear_2.weight"),
-                         {embd, embd}, grp_model());
+        linear1 =
+            weight(nm.f("v.linear1.weight"), source.f("multi_modal_projector.linear_1.weight"),
+                   {embd, width}, grp_model());
+        linear2 =
+            weight(nm.f("v.linear2.weight"), source.f("multi_modal_projector.linear_2.weight"),
+                   {embd, embd}, grp_model());
         pack = rw(b,
                   RAD_OP(b, "pixtral_merge",
                          RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", width),

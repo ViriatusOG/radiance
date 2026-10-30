@@ -23,3 +23,10 @@ python3 tests/mknemotron35inputgolden.py --tokenizer /path/to/checkpoint/tokeniz
 The generator needs Jinja2, Hugging Face tokenizers, and the checked-in vision fixture. The
 golden records the source template, full tokenizer, and subset SHA-256 hashes. It runs no model
 weights and is never called by CMake or CTest.
+
+`rerank-template.jinja` is the unchanged template from
+`nvidia/Nemotron-3.5-Rerank-8B-BF16` revision
+`f88f8d9104726747791283ab156d2fcdb29e90a7`, under the same retained OpenMDW-1.1
+license. It supplies the independent query/document rendering oracle to the
+manually run `tests/mknemotron35rerankgolden.py`; the engine does not execute
+remote model code. The tiny scoring head is seeded synthetic test data.

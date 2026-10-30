@@ -65,6 +65,9 @@ std::vector<Case> build_cases() {
         add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt), HI("scalar", 1) },
             EB(9, 645, w, 2));
         add("seg_mean",    { HI("M", 23), HI("n", 645), HS("dtype", dt) }, EB(23, 645, w, 1));
+        if (!std::strcmp(dt, "bf16"))
+            add("seg_mean_bf16_sum", { HI("M", 23), HI("n", 645), HS("dtype", dt) },
+                EB(23, 645, w, 1));
         add("relu",        { HI("M", 7), HI("n", 645), HS("dtype", dt) }, EB(7, 645, w, 2));
         add("clamp",       { HI("M", 7), HI("n", 645), HS("dtype", dt) }, EB(7, 645, w, 2));
         add("rmsnorm",     { HI("M", 5), HI("n", 645), HF("eps", 1e-6), HS("dtype", dt),

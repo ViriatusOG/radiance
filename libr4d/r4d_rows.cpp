@@ -2999,6 +2999,8 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("seg_mean", pSegMean, oSegMean,
            "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
            "and rounded once; an empty segment is zeros."),
+    SCHEMA("seg_mean_bf16_sum", pSegMean, oSegMean,
+           "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output."),
     SCHEMA("qk_norm_rope", pQkNormRope, oQkNormRope,
            "In place over a fused [q | k | v] row: each q and k head RMS-normed against its gain "
            "(plus wadd) and rounded, then rotated (neox or gptj, rotary_dim of head_dim); with "
@@ -5807,6 +5809,14 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_act_mul, nullptr, nullptr, nullptr,
   r4d_shape_binary },
+
+{ "seg_mean_bf16_sum", "seg_mean_bf16_sum", "elem",
+  "native BF16 sum/division mean pooling over whole nonempty segments",
+  "M and segment count fit int32; pitched BF16 rows and int32 cumulative lengths",
+  "f32 sum, BF16 sum rounding, BF16 quotient",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_seg_mean_bf16_sum, r4d_nemotron_scratch },
 
 { "seg_mean_bf16", "seg_mean", "elem",
   "mean pooling: one row a cu_seqlens segment",
@@ -10281,6 +10291,7 @@ extern "C" int rad_kernel_concurrent(int i) {
         "kv_resolve",
         // Each model-local entry validates metadata before its dependent data launch.
         "position_scale_", "ministral_rope_", "pixtral_rope_", "pixtral_merge_", "embed_attn_",
+        "seg_mean_bf16_sum",
     };
     for (const char* p : kStateful)
         if (std::strncmp(k->name, p, std::strlen(p)) == 0) return 0;

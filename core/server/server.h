@@ -243,6 +243,8 @@ private:
     HttpResponse handle_native_completion(const HttpRequest& req);
     HttpResponse handle_infill(const HttpRequest& req);
     HttpResponse handle_embeddings(const HttpRequest& req);
+    HttpResponse handle_rerank(const HttpRequest& req);
+    HttpResponse serve_pooled(const HttpRequest& req, bool rerank);
     HttpResponse handle_systemone(const HttpRequest& req);
     HttpResponse handle_apply_template(const HttpRequest& req);
     using ToChat = int (*)(const std::string& body, const OaiLimits& lim, std::string* chat,

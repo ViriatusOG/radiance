@@ -66,6 +66,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | nomic-embed-text-v2-moe bf16: text embeddings, one card | `nomic-embed-v2-moe-bf16.rad` (959 MB) | [convert](#convert-a-checkpoint) | - |
 | Nemotron 3.5 Embed 1B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | — |
 | Nemotron 3.5 Embed 8B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | — |
+| Nemotron 3.5 Rerank 8B BF16: text/image document relevance, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16) | — |
 | Anima Aesthetic FP8: anime and illustration, text to image, one card (Base and Turbo convert the same way) | `anima-aesthetic-fp8.rad` (3.0 GiB) | [convert](#convert-a-checkpoint) | `anima.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | — |
 

@@ -201,8 +201,13 @@ std::map<std::string, std::vector<float>> execute_graph(const Kernels& kernels, 
     return result;
 }
 
-std::vector<float> execute(const Kernels& kernels, const json& source, const json& test) {
+std::vector<float> execute(const Kernels& kernels, const json& source, const json& test,
+                           bool rerank = false) {
     auto mk = meta();
+    if (rerank)
+        mk.set("architectures", "Mistral3ForSequenceClassification")
+            .set("pooling", "avg")
+            .set("text_config.pooling", "avg");
     auto ctx = build_ctx();
     ctx.max_tok = 32;
     ctx.max_seqs = 4;
@@ -230,8 +235,12 @@ std::vector<float> execute(const Kernels& kernels, const json& source, const jso
     RadCtx c{.b = &b, .batch = &batch};
     nemotron35_embed::step(&c, &batch);
     if (!c.step_fail.empty()) throw std::runtime_error(c.step_fail);
-    auto result = execute_graph(kernels, source, b, c, batch).at(b.bufs[b.pooled - 1].name);
-    result.resize((size_t)batch.n_seq * 16);
+    json mapped = json::object();
+    for (const auto& entry : source.items())
+        mapped[(rerank && entry.key() != "language_model.score.weight" ? "model." : "") +
+               entry.key()] = entry.value();
+    auto result = execute_graph(kernels, mapped, b, c, batch).at(b.bufs[b.pooled - 1].name);
+    result.resize((size_t)batch.n_seq * (rerank ? 1 : 16));
     return result;
 }
 
@@ -399,10 +408,10 @@ struct InputTokenizer final : rad::server::ITokenizer {
     }
 };
 struct InputEmbedder final : rad::server::IEmbedder {
-    bool selected = true;
+    bool selected = true, rerank = false;
     int64_t limit = 32768;
     mutable MetaKV config = vision_meta();
-    int64_t dim() const override { return 16; }
+    int64_t dim() const override { return rerank ? 1 : 16; }
     int64_t max_input() const override { return limit; }
     const RadModelMeta* metadata() const override { return selected ? config.meta() : nullptr; }
     bool prompt(const std::string& name, std::string* out) const override {
@@ -434,7 +443,8 @@ struct InputImages final : rad::server::IMultimodal {
     }
 };
 
-std::vector<float> execute_multimodal(const Kernels& kernels, const json& test) {
+std::vector<float> execute_multimodal(const Kernels& kernels, const json& test,
+                                      bool rerank = false) {
     const auto vision = golden("nemotron35_vision.json");
     auto processor = image_processor();
     json indices = json::array();
@@ -462,6 +472,10 @@ std::vector<float> execute_multimodal(const Kernels& kernels, const json& test) 
         prompts.push_back(std::move(media));
     }
     auto mk = vision_meta();
+    if (rerank)
+        mk.set("architectures", "Mistral3ForSequenceClassification")
+            .set("pooling", "avg")
+            .set("text_config.pooling", "avg");
     auto ctx = build_ctx();
     ctx.max_tok = 64;
     ctx.max_seqs = 4;
@@ -507,8 +521,14 @@ std::vector<float> execute_multimodal(const Kernels& kernels, const json& test) 
     auto weights = golden().at("weights");
     for (const auto& entry : vision["weights"].items())
         weights[entry.key()] = entry.value();
-    auto out = execute_graph(kernels, weights, b, c, batch).at("pooled");
-    out.resize((size_t)batch.n_seq * 16);
+    if (rerank)
+        weights["language_model.score.weight"] = golden("nemotron35_rerank.json")["head"];
+    json mapped = json::object();
+    for (const auto& entry : weights.items())
+        mapped[(rerank && entry.key() != "language_model.score.weight" ? "model." : "") +
+               entry.key()] = entry.value();
+    auto out = execute_graph(kernels, mapped, b, c, batch).at("pooled");
+    out.resize((size_t)batch.n_seq * (rerank ? 1 : 16));
     return out;
 }
 } // namespace
@@ -976,7 +996,7 @@ TEST(nemotron35_pixtral_rejects_incomplete_encoder_passes_and_unsupported_proces
     nemotron35_embed::Pixtral vision;
     rad::arch::Names nm("");
     RadBuilder b;
-    REQUIRE_EQ(vision.declare(&b, mk.meta(), &ctx, nm, 16, 2), RAD_OK);
+    REQUIRE_EQ(vision.declare(&b, mk.meta(), &ctx, nm, nm, 16, 2), RAD_OK);
     int32_t hh = 2, ww = 3;
     uint16_t pixel = 0;
     int32_t coord[16]{}, cu[] = {0, 4};
@@ -1273,6 +1293,196 @@ TEST(nemotron35_image_injection_rejects_missing_or_out_of_bounds_batch_fields_be
         nemotron35_embed::step(&c, &batch);
         CHECK(!c.step_fail.empty());
         CHECK(c.issues.empty());
+    }
+}
+
+TEST(nemotron35_reranker_declares_a_scalar_head_without_changing_embedding_pooling) {
+    auto mk = vision_meta(true);
+    mk.set("architectures", "Mistral3ForSequenceClassification")
+        .set("pooling", "avg")
+        .set("text_config.pooling", "avg");
+    auto ctx = build_ctx();
+    ctx.max_seqs = 16;
+    ctx.max_tok = 131072;
+    ctx.max_enc_patches = 64;
+    RadBuilder b;
+    CHECK_OK(nemotron35_embed::declare(&b, mk.meta(), &ctx));
+    REQUIRE(b.pooled);
+    CHECK_EQ(b.bufs[b.pooled - 1].d.shape[1], 1);
+    CHECK_EQ(b.logits, (rad_buf)0);
+    CHECK(b.kv_groups.empty());
+    CHECK_EQ(count_op(b, "seg_mean_bf16_sum"), 1);
+    CHECK_EQ(count_op(b, "seg_mean"), 0);
+    CHECK_EQ(count_op(b, "logits_gemm"), 1);
+    const auto* map = find_map(b, "score.weight");
+    REQUIRE(map);
+    CHECK_EQ(map->src[0], std::string("language_model.score.weight"));
+    REQUIRE(find_map(b, "token_embd.weight"));
+    CHECK_EQ(find_map(b, "token_embd.weight")->src[0],
+             std::string("model.language_model.embed_tokens.weight"));
+    REQUIRE(find_map(b, "v.patch.weight"));
+    CHECK_EQ(find_map(b, "v.patch.weight")->src[0],
+             std::string("model.vision_tower.patch_conv.weight"));
+    CHECK(rad::server::nemotron35_rerank_meta(mk.meta()));
+    CHECK(!rad::server::nemotron35_retrieval_meta(mk.meta()));
+    RadBuilder quantized;
+    quantized.encs.emplace_back("score.weight", rad_enc_plain(RAD_I8));
+    CHECK_EQ(nemotron35_embed::declare(&quantized, mk.meta(), &ctx), RAD_E_UNSUPPORTED);
+    auto plain = vision_meta(true);
+    RadBuilder embedding;
+    CHECK_OK(nemotron35_embed::declare(&embedding, plain.meta(), &ctx));
+    CHECK_EQ(embedding.bufs[embedding.pooled - 1].d.shape[1], 4096);
+    CHECK_EQ(count_op(embedding, "seg_mean"), 1);
+    CHECK_EQ(count_op(embedding, "seg_mean_bf16_sum"), 0);
+    CHECK_EQ(count_op(embedding, "logits_gemm"), 0);
+    mk.set("pooling", "last");
+    RadBuilder bad;
+    CHECK_EQ(nemotron35_embed::declare(&bad, mk.meta(), &ctx), RAD_E_UNSUPPORTED);
+}
+
+TEST(nemotron35_reranker_scores_match_independent_native_text_and_image_oracles) {
+    const auto fixture = golden("nemotron35_rerank.json");
+    auto weights = golden()["weights"];
+    weights["language_model.score.weight"] = fixture["head"];
+    for (const char* name : host_libraries()) {
+        Kernels kernels(name);
+        for (const auto& c : fixture["cases"]) {
+            const auto actual = execute(kernels, weights, c, true);
+            REQUIRE_EQ(actual.size(), c["scores"].size());
+            for (size_t i = 0; i < actual.size(); ++i)
+                CHECK_NEAR(actual[i], c["scores"][i].get<float>(), .01);
+        }
+        for (const auto& c : fixture["multimodal"]) {
+            const auto actual = execute_multimodal(kernels, c, true);
+            REQUIRE_EQ(actual.size(), c["scores"].size());
+            for (size_t i = 0; i < actual.size(); ++i)
+                CHECK_NEAR(actual[i], c["scores"][i].get<float>(), .01);
+        }
+    }
+}
+
+TEST(nemotron35_reranker_pool_rounds_the_sum_before_dividing_and_preserves_pitches) {
+    const auto f = golden("nemotron35_rerank.json")["pool"];
+    const auto bits = f["bf16"].get<std::vector<uint16_t>>();
+    const auto want = f["expected"].get<std::vector<uint16_t>>();
+    for (const char* name : host_libraries()) {
+        Kernels kernels(name);
+        std::vector<uint16_t> x(10 * 9, 0x4321), y(2 * 10, 0x4321);
+        for (int r = 0; r < 10; ++r)
+            std::copy_n(bits.data() + r * 7, 7, x.data() + r * 9);
+        auto tx = tensor(x.data(), RAD_BF16, {10, 9});
+        tx.shape[1] = 7;
+        auto ty = tensor(y.data(), RAD_BF16, {2, 10});
+        ty.shape[1] = 7;
+        int32_t cu[] = {0, 3, 10};
+        RadTensor ts[] = {tx, tensor(cu, RAD_I32, {3}), ty};
+        RadParam ps[] = {RAD_INT("M", 64), RAD_INT("n", 7), RAD_STR("dtype", "bf16")};
+        RadArgs a{};
+        a.t = ts;
+        a.n_t = 3;
+        a.p = ps;
+        a.n_p = 3;
+        const auto* op = kernels.get("seg_mean_bf16_sum");
+        CHECK_OK(op->launch(&a, nullptr));
+        for (int r = 0; r < 2; ++r)
+            for (int i = 0; i < 10; ++i)
+                CHECK_EQ(y[r * 10 + i], i < 7 ? want[r * 7 + i] : (uint16_t)0x4321);
+        const auto before = y;
+        cu[1] = 0;
+        CHECK_EQ(op->launch(&a, nullptr), RAD_E_INVAL);
+        CHECK(y == before);
+        cu[1] = 11;
+        CHECK_EQ(op->launch(&a, nullptr), RAD_E_INVAL);
+        CHECK(y == before);
+        cu[1] = 3;
+        ts[0].stride[0] = INT64_MAX;
+        CHECK_EQ(op->launch(&a, nullptr), RAD_E_SHAPE);
+        CHECK(y == before);
+        ts[0] = tx;
+        ts[0].data = nullptr;
+        CHECK_EQ(op->launch(&a, nullptr), RAD_E_INVAL);
+        CHECK(y == before);
+    }
+}
+
+TEST(nemotron35_reranker_parser_matches_the_native_pair_template_and_context_boundary) {
+    InputTokenizer tok;
+    InputEmbedder embed;
+    embed.rerank = true;
+    embed.config.set("architectures", "Mistral3ForSequenceClassification");
+    InputImages images;
+    rad::server::OaiDeps deps;
+    deps.tok = &tok;
+    deps.embed = &embed;
+    deps.mm = &images;
+    rad::server::OaiLimits lim;
+    lim.max_ctx = 32768;
+    lim.allow_image = true;
+    for (const auto& c : golden("nemotron35_rerank.json")["http"]) {
+        json doc = c["document"];
+        if (!c["image"].is_null()) {
+            json parts = json::array();
+            if (!doc.is_null())
+                parts.push_back({{"type", "text"}, {"text", doc}});
+            const uint8_t byte = c["image"].get<uint8_t>();
+            parts.push_back(
+                {{"type", "image_url"},
+                 {"image_url",
+                  {{"url", "data:image/png;base64," + rad::server::base64_encode(&byte, 1)}}}});
+            doc = {{"content", parts}};
+        }
+        const auto body = json({{"query", c["query"]}, {"documents", json::array({doc})}}).dump();
+        rad::server::OaiRequest out;
+        rad::server::ApiError err;
+        CHECK_OK(rad::server::parse_rerank_request(body, deps, lim, &out, &err));
+        REQUIRE_EQ(out.prompts.size(), (size_t)1);
+        CHECK_EQ(out.prompts[0].text, c["rendered"].get<std::string>());
+        CHECK(!tok.added);
+        const int64_t length = (int64_t)out.prompts[0].tokens.size();
+        for (int delta : {-1, 0, 1}) {
+            auto bounded = lim;
+            bounded.max_ctx = length + delta;
+            rad::server::OaiRequest r;
+            const int rc = rad::server::parse_rerank_request(body, deps, bounded, &r, &err);
+            if (delta < 0)
+                CHECK_EQ(rc, RAD_E_INVAL);
+            else
+                CHECK_OK(rc);
+        }
+        rad::server::OaiRequest wrong;
+        CHECK_EQ(rad::server::parse_embeddings_request(R"({"input":"x"})", deps, lim, &wrong, &err),
+                 RAD_E_UNSUPPORTED);
+    }
+}
+
+TEST(nemotron35_reranker_head_keeps_the_native_fp32_score) {
+    const auto f = golden("nemotron35_rerank.json");
+    auto head = f["head"]["bf16"].get<std::vector<uint16_t>>();
+    for (const char* name : host_libraries()) {
+        Kernels kernels(name);
+        for (const auto& c : f["cases"]) {
+            std::vector<uint16_t> pooled;
+            for (const auto& row : c["pooled"])
+                for (const auto& v : row)
+                    pooled.push_back(rad_f32_to_bf16(v.get<float>()));
+            const int64_t M = (int64_t)c["pooled"].size();
+            std::vector<float> output((size_t)M, 0);
+            RadTensor ts[] = {tensor(pooled.data(), RAD_BF16, {M, 16}),
+                              tensor(head.data(), RAD_BF16, {1, 16}),
+                              tensor(output.data(), RAD_F32, {M, 1})};
+            RadParam ps[] = {RAD_INT("M", M), RAD_INT("n_embd", 16), RAD_INT("n_vocab", 1),
+                             RAD_STR("dtype", "bf16")};
+            RadArgs a{};
+            a.t = ts;
+            a.n_t = 3;
+            a.p = ps;
+            a.n_p = 4;
+            CHECK_OK(kernels.get("logits_gemm")->launch(&a, nullptr));
+            for (int64_t i = 0; i < M; ++i) {
+                const double want = c["head_only_scores"][i];
+                CHECK_NEAR(output[(size_t)i], want, 1e-5 + 1e-5 * std::abs(want));
+            }
+        }
     }
 }
 

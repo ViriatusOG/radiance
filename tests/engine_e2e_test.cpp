@@ -2349,9 +2349,11 @@ json nemotron_fixture(const char* name) {
 /* The same BF16 parameters as the component oracle, now read by the real checkpoint loader.
  * Extra vocabulary rows only make the byte tokenizer usable for HTTP input; the oracle cases
  * use the original 32 rows. No test executor or media adapter participates in these tests. */
-bool write_nemotron(const std::string& dir) {
+bool write_nemotron(const std::string& dir, bool rerank = false) {
     json weights = nemotron_fixture("nemotron35.json")["weights"];
     weights.update(nemotron_fixture("nemotron35_vision.json")["weights"]);
+    if (rerank)
+        weights["language_model.score.weight"] = nemotron_fixture("nemotron35_rerank.json")["head"];
     std::vector<tiny::Tensor> ts;
     for (auto it = weights.begin(); it != weights.end(); ++it) {
         auto shape = it.value()["shape"].get<std::vector<int64_t>>();
@@ -2363,7 +2365,9 @@ bool write_nemotron(const std::string& dir) {
                 bits.insert(bits.end(), original.begin() + row % 32 * 16,
                             original.begin() + (row % 32 + 1) * 16);
         }
-        tiny::Tensor t{it.key(), "BF16", shape, {}};
+        const std::string key =
+            (rerank && it.key() != "language_model.score.weight" ? "model." : "") + it.key();
+        tiny::Tensor t{key, "BF16", shape, {}};
         t.bytes.resize(bits.size() * 2);
         std::memcpy(t.bytes.data(), bits.data(), t.bytes.size());
         ts.push_back(std::move(t));
@@ -2416,6 +2420,11 @@ bool write_nemotron(const std::string& dir) {
                    {"multimodal_projector_bias", false},
                    {"projector_hidden_act", "gelu"},
                    {"vision_feature_layer", -1}};
+    if (rerank) {
+        config["architectures"] = {"Mistral3ForSequenceClassification"};
+        config["pooling"] = "avg";
+        config["text_config"]["pooling"] = "avg";
+    }
     json tok = json::parse(tiny::tokenizer_json());
     json vocab = json::object();
     for (int c = 0; c < 256; ++c)
@@ -2860,6 +2869,215 @@ TEST(nemotron35_real_weights_match_the_offline_transformers_reference) {
     REQUIRE_EQ(s.stop(), 0);
     if (const char* output = std::getenv("RAD_NEMOTRON_SERVER_LOG"))
         REQUIRE(tiny::write_text(output, s.output()));
+}
+
+TEST(nemotron35_rerank_endpoint_loads_the_native_head_and_returns_text_image_scores) {
+    tiny::TempDir d("e2e_nemotron_rerank");
+    REQUIRE(d.ok());
+    REQUIRE(write_nemotron(d.path, true));
+    const auto fixture = nemotron_fixture("nemotron35_rerank.json");
+    const auto vision = nemotron_fixture("nemotron35_vision.json");
+    for (const char* kernels : nemotron_kernels()) {
+#if !defined(__x86_64__)
+        if (std::string(kernels) == "libavx")
+            continue;
+#endif
+        Server s;
+        auto args = nemotron_args;
+        args.insert(args.end(), {"--kernels", kernels});
+        if (!s.start(d.path, args, nemotron_env())) {
+            fprintf(stderr, "    reranker startup log:\n%s\n", s.output().c_str());
+            REQUIRE(false);
+        }
+        for (const auto& c : fixture["http"]) {
+            const bool image = !c["image"].is_null();
+            if (image && !rad::mm::decoder_available())
+                continue;
+            json doc = c["document"];
+            if (image) {
+                json parts = json::array();
+                if (!doc.is_null())
+                    parts.push_back({{"type", "text"}, {"text", doc}});
+                parts.push_back(nemotron_image(vision["images"][c["image"].get<size_t>()]));
+                doc = {{"content", parts}};
+            }
+            const json body = {{"query", c["query"]}, {"documents", json::array({doc})}};
+            int status = 0;
+            const auto reply = post(s.port, "/rerank", body, &status);
+            if (status != 200)
+                fprintf(stderr, "    rerank HTTP %d: %s\n", status, reply.dump().c_str());
+            REQUIRE_EQ(status, 200);
+            REQUIRE_EQ(reply["results"].size(), (size_t)1);
+            const double actual = reply["results"][0]["relevance_score"];
+            CHECK_NEAR(actual, c["scores"][0].get<double>(), .01);
+            CHECK_EQ(reply["usage"]["prompt_tokens"].get<size_t>(),
+                     c["inputs"][0]["tokens"].size());
+            CHECK_EQ(reply["results"][0]["index"].get<int>(), 0);
+            json batch = body;
+            batch["documents"] = json::array({doc, doc, doc});
+            const auto many = post(s.port, "/v1/rerank", batch, &status);
+            REQUIRE_EQ(status, 200);
+            REQUIRE_EQ(many["results"].size(), (size_t)3);
+            for (int i = 0; i < 3; ++i) {
+                CHECK_EQ(many["results"][i]["index"].get<int>(), i);
+                CHECK_NEAR(many["results"][i]["relevance_score"].get<double>(), actual, 1e-5);
+            }
+        }
+        int status = 0;
+        post(s.port, "/v1/embeddings", {{"input", "A"}}, &status);
+        CHECK_EQ(status, 501);
+        const auto valid = json({{"query", "C"}, {"documents", {"A"}}});
+        post(s.port, "/rerank", {{"query", "C"}, {"documents", {"A"}}, {"use_activation", true}},
+             &status);
+        CHECK_EQ(status, 400);
+        post(s.port, "/rerank", valid, &status);
+        CHECK_EQ(status, 200);
+        REQUIRE_EQ(s.stop(), 0);
+    }
+}
+
+TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
+    const char* path = std::getenv("RAD_NEMOTRON_RERANK_REAL_FIXTURE");
+    if (!path || !*path)
+        SKIP("set RAD_NEMOTRON_RERANK_REAL_FIXTURE for pinned native weights");
+    const auto fixture = json::parse(tiny::read_text(path));
+    const auto validation = fixture["validation"];
+    for (const char* kernels : nemotron_kernels()) {
+#if !defined(__x86_64__)
+        if (std::string(kernels) == "libavx")
+            continue;
+#endif
+        if (!nemotron_device() && std::string(kernels) != "libavx")
+            continue;
+        std::vector<std::string> args = {"--max-model-len",
+                                         validation["context"].dump(),
+                                         "--max-num-batched-tokens",
+                                         validation["batch_tokens"].dump(),
+                                         "--max-num-seqs",
+                                         "4",
+                                         "--mm-max-patches",
+                                         validation["patches"].dump(),
+                                         "--kernels",
+                                         kernels};
+        Server s;
+        const std::string checkpoint = fixture["checkpoint"];
+        auto env = nemotron_env();
+        env.insert(env.end(), {"RADIANCE_HOST_VRAM_MIB=24576", "OMP_NUM_THREADS=4"});
+        if (!s.start(checkpoint, args, env)) {
+            fprintf(stderr, "    real reranker startup log:\n%s\n", s.output().c_str());
+            REQUIRE(false);
+        }
+        std::vector<double> actual;
+        double maximum = 0, squared = 0;
+        for (const auto& c : fixture["cases"]) {
+            int status = 0;
+            const auto reply = post(s.port, "/rerank", c["request"], &status);
+            if (status != 200)
+                fprintf(stderr, "    rerank HTTP %d: %s\n", status, reply.dump().c_str());
+            REQUIRE_EQ(status, 200);
+            REQUIRE_EQ(reply["results"].size(), (size_t)1);
+            const double score = reply["results"][0]["relevance_score"];
+            const double expected = c["score"];
+            actual.push_back(score);
+            const double delta = std::abs(score - expected);
+            maximum = std::max(maximum, delta);
+            squared += delta * delta;
+            CHECK(std::isfinite(score));
+            CHECK(delta <= .05);
+            CHECK_EQ(reply["usage"]["prompt_tokens"].get<size_t>(), c["tokens"].size());
+            fprintf(stderr, "    %s native=%.9g actual=%.9g error=%.9g\n",
+                    c["name"].get<std::string>().c_str(), expected, score, delta);
+        }
+        CHECK(std::sqrt(squared / actual.size()) <= .02);
+        const auto stats = [&]() {
+            Call c;
+            std::string body;
+            if (!c.send(s.port, "GET", "/stats", "") || c.read(&body) != 200)
+                return json();
+            return json::parse(body);
+        };
+        for (const auto& group : fixture["ranking_groups"]) {
+            const auto indices = group["cases"].get<std::vector<int>>();
+            json body = fixture["cases"][indices[0]]["request"];
+            body["documents"] = json::array();
+            for (int i : indices)
+                body["documents"].push_back(fixture["cases"][i]["request"]["documents"][0]);
+            int status = 0;
+            const auto before = stats();
+            const double tokens_before = metric(s.port, "radiance:prefill_tokens_total");
+            const auto batch = post(s.port, "/v1/rerank", body, &status);
+            REQUIRE_EQ(status, 200);
+            REQUIRE_EQ(batch["results"].size(), indices.size());
+            const auto after = stats();
+            REQUIRE(before.is_object() && after.is_object());
+            const int64_t steps = after["steps"].get<int64_t>() - before["steps"].get<int64_t>();
+            // Ready text can run while image documents wait for their encoder pass.
+            CHECK_EQ(steps, group.value("steps", (int64_t)1));
+            CHECK_EQ(after["total_requests"].get<int64_t>() -
+                         before["total_requests"].get<int64_t>(),
+                     (int64_t)indices.size());
+            CHECK_EQ(metric(s.port, "radiance:prefill_tokens_total") - tokens_before,
+                     batch["usage"]["prompt_tokens"].get<double>());
+            fprintf(stderr,
+                    "    %s: %zu pairs completed in %lld whole-input step(s), %lld tokens\n",
+                    group["language"].get<std::string>().c_str(), indices.size(), (long long)steps,
+                    batch["usage"]["prompt_tokens"].get<long long>());
+            for (const auto& row : batch["results"]) {
+                const int i = row["index"];
+                REQUIRE(i >= 0 && (size_t)i < indices.size());
+                CHECK_NEAR(row["relevance_score"].get<double>(), actual[indices[i]], 1e-5);
+            }
+            for (int a : indices)
+                for (int b : indices) {
+                    const double margin = fixture["cases"][a]["score"].get<double>() -
+                                          fixture["cases"][b]["score"].get<double>();
+                    if (margin > .10)
+                        CHECK(actual[a] > actual[b]);
+                }
+        }
+        if (nemotron_device()) {
+            // Repeated geometries with changed contents exercise recording, audit and playback;
+            // no model-specific replay disable or debug synchronization changes the pass.
+            for (int repeat = 0; repeat < 6; ++repeat)
+                for (int i : {0, 1, 12, 13}) {
+                    int status = 0;
+                    const auto reply =
+                        post(s.port, "/rerank", fixture["cases"][i]["request"], &status);
+                    REQUIRE_EQ(status, 200);
+                    CHECK_NEAR(reply["results"][0]["relevance_score"].get<double>(), actual[i],
+                               1e-5);
+                }
+            Call abandoned;
+            REQUIRE(
+                abandoned.send(s.port, "POST", "/rerank", fixture["cases"][11]["request"].dump()));
+            ::close(abandoned.fd);
+            abandoned.fd = -1;
+            int status = 0;
+            const auto recovered = post(s.port, "/rerank", fixture["cases"][0]["request"], &status);
+            REQUIRE_EQ(status, 200);
+            CHECK_NEAR(recovered["results"][0]["relevance_score"].get<double>(), actual[0], 1e-5);
+        }
+        const auto final = stats();
+        if (nemotron_device()) {
+            REQUIRE(final.contains("passes"));
+            CHECK(final["passes"]["recorded"].get<int64_t>() > 0);
+            CHECK(final["passes"]["audited"].get<int64_t>() > 0);
+            CHECK(final["passes"]["played"].get<int64_t>() > 0);
+            fprintf(stderr, "    replay counters: %s\n", final["passes"].dump().c_str());
+        }
+        if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_OUTPUT"))
+            REQUIRE(tiny::write_text(output, json({{"scores", actual},
+                                                   {"stats", final},
+                                                   {"max_abs_error", maximum},
+                                                   {"RMSE", std::sqrt(squared / actual.size())}})
+                                                     .dump(2) +
+                                                 "\n"));
+        fprintf(stderr, "    native rerank maxAbs=%.9g RMSE=%.9g\n", maximum,
+                std::sqrt(squared / actual.size()));
+        REQUIRE_EQ(s.stop(), 0);
+        if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
+            REQUIRE(tiny::write_text(output, s.output()));
+    }
 }
 
 RAD_TEST_MAIN()

@@ -21,7 +21,7 @@ plugin claims.
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
-| `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B and 8B: native BF16 bidirectional text/image encoders with a Pixtral tower, retrieval formatting and normalized mean pooling, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
+| `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, and the E2B/E4B form at one rank, with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
@@ -934,6 +934,39 @@ English/Spanish/Japanese retrieval groups. Separate synthetic capacity checks co
 32768-token input, four full 1B inputs in one 131072-token step and a default maximum image.
 They do not establish native accuracy at maximum context/resolution. Native INT8/Q8, GGUF and
 TP2 remain unimplemented.
+
+**Nemotron 3.5 Rerank 8B.** The same plugin recognizes the native
+`Mistral3ForSequenceClassification` checkpoint, pinned at
+`f88f8d9104726747791283ab156d2fcdb29e90a7`. It uses its own weights, the 8B text/vision
+geometry above under `model.*`, and a bias-free `language_model.score.weight` [1,4096] head. Native
+pooling stores the masked sum in BF16 before division, then stores the mean in BF16.
+The separate `seg_mean_bf16_sum` operation preserves this seam without changing
+embedding pooling. `logits_gemm` projects the mean and BF16 head to an FP32 scalar;
+this is pooled output, with no generation sampler or KV cache. The endpoints return
+raw logits, including negative values, rather than normalized embeddings.
+
+The supported per-pair context remains 32768, including query/document prefixes and
+images. The native training template requires text queries and at most one image
+per document. The image, context and configured capacity distinctions above apply.
+Stored tiny reranker fixtures and the opt-in native reference generator are
+`tests/mknemotron35rerankgolden.py` and `tests/mknemotron35rerankrealreference.py`.
+Both are offline tools; runtime/build/tests never download a checkpoint or execute
+remote model code. CPU component gates include exact BF16 pool results and scalar
+error <=.01 for the tiny text/image graphs. Native validation uses raw-score error
+and ranking gates rather than embedding cosine tolerances.
+
+```sh
+python3 tests/mknemotron35rerankrealreference.py /models/Nemotron-3.5-Rerank-8B-BF16 /tmp/rerank-reference.json --sdpa-audit
+RAD_NEMOTRON_RERANK_REAL_FIXTURE=/tmp/rerank-reference.json \
+  RAD_NEMOTRON_DEVICE=1 RADIANCE_HOME="$PWD/build/radiance_home" \
+  build/tests/engine_e2e_test nemotron35_rerank_real
+```
+
+Download the pinned revision above; an optional local `asset-manifest.json` is verified
+when present. Standard Hugging Face revision metadata is also recognized; absent metadata
+is recorded as unknown. The full-model gates are raw-score maximum absolute error <=.05,
+RMSE <=.02, individual/batched difference <=1e-5 and preserved ranking for native margins
+>.10. Omit `RAD_NEMOTRON_DEVICE` for CPU execution, as above.
 
 ---
 

@@ -765,6 +765,7 @@ int r4d_rad_mul             (const RadArgs*, RadStream);
 int r4d_rad_mul_weight      (const RadArgs*, RadStream);
 int r4d_rad_act_mul         (const RadArgs*, RadStream);
 int r4d_rad_seg_mean        (const RadArgs*, RadStream);
+int r4d_rad_seg_mean_bf16_sum(const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope    (const RadArgs*, RadStream);
 int r4d_rad_cast_widen      (const RadArgs*, RadStream);
 int r4d_rad_cast_f16        (const RadArgs*, RadStream);

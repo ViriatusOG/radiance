@@ -54,6 +54,22 @@ __global__ void validate(const int* x, int64_t stride, int64_t plane, int M, int
   *valid = 1;
 }
 
+__global__ void pooled_mean(const uint16_t* x, int64_t xl, int64_t xs, const int* cu, int64_t cs,
+                            uint16_t* y, int64_t yl, int64_t ys, int S, int N, const int* valid) {
+  if (*valid != 1)
+    return;
+  const int64_t c = (int64_t)blockIdx.x * NT + threadIdx.x;
+  if (c >= N)
+    return;
+  for (int64_t s = blockIdx.y; s < S; s += gridDim.y) {
+    const int begin = cu[s * cs], end = cu[(s + 1) * cs];
+    float sum = 0;
+    for (int r = begin; r < end; ++r)
+      sum += bf2f(x[(int64_t)r * xl + c * xs]);
+    y[s * yl + c * ys] = f32_to_bf16(narrow(sum) / (float)(end - begin));
+  }
+}
+
 __global__ void scale(uint16_t* x, int64_t ld, int64_t cs, const int* pos, int64_t ps, int M, int n,
                       int original, float beta, const int* valid) {
   if (*valid != 1) return;
@@ -285,6 +301,24 @@ extern "C" void r4d_rotary_fini(void* p) {
 }
 extern "C" int64_t r4d_nemotron_scratch(const RadArgs*) {
   return 4;
+}
+extern "C" int r4d_rad_seg_mean_bf16_sum(const RadArgs* a, RadStream stream) {
+  if (!rad_args_have(a, 3))
+    return RAD_E_INVAL;
+  const auto &x = a->t[0], &cu = a->t[1], &y = a->t[2];
+  const int64_t M = x.rank == 2 ? x.shape[0] : 0, N = r4d_geti_or(a, "n", 0),
+                S = cu.rank == 1 && cu.shape[0] > 1 ? cu.shape[0] - 1 : 0;
+  if (M <= 0 || M > INT_MAX || M > r4d_geti_or(a, "M", 0) || N <= 0 || N > INT_MAX || S <= 0 ||
+      S > INT_MAX || !matrix(x, M, N) || !matrix(y, S, N) || !indices(cu, S + 1))
+    return RAD_E_SHAPE;
+  int rc = prepare(a, stream, cu, (int)M, 2, (int)S, INT_MAX);
+  if (rc < 0)
+    return rc;
+  hipLaunchKernelGGL(pooled_mean, dim3((N + NT - 1) / NT, std::min<int64_t>(S, 65535)), dim3(NT), 0,
+                     (hipStream_t)stream, (const uint16_t*)x.data, x.stride[0], x.stride[1],
+                     (const int*)cu.data, cu.stride[0], (uint16_t*)y.data, y.stride[0], y.stride[1],
+                     (int)S, (int)N, (const int*)a->scratch);
+  return finish();
 }
 extern "C" int r4d_rad_position_scale(const RadArgs* a, RadStream stream) {
   if (!rad_args_have(a, 2)) return RAD_E_INVAL;

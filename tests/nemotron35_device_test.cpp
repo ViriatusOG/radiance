@@ -329,4 +329,36 @@ TEST(nemotron35_device_patch_projection_588_tail_and_pitched_rows) {
                     {pi("M", 128), pi("N", N), pi("K", 588), ps("dtype", "bf16")}, 2, 128, true);
         }
 }
+
+TEST(nemotron35_device_rerank_pool_bf16_sum_rounding_ragged_strides_and_tails) {
+    if (!device())
+        SKIP("explicit R9700 card run required");
+    for (int N : {7, 37, 257, 4096}) {
+        Buffer x(RAD_BF16, 10, N, 2 * N + 3, 2), y(RAD_BF16, 3, N, 2 * N + 7, 2);
+        x.fill(3508);
+        auto cu = Buffer::ids({0, 3, 9, 10});
+        compare("seg_mean_bf16_sum", {&x, cu.get(), &y},
+                {pi("M", 64), pi("n", N), ps("dtype", "bf16")}, 2, 0, true);
+    }
+}
+
+TEST(nemotron35_device_rerank_pool_full_context_and_sequence_grid_boundary) {
+    if (!device())
+        SKIP("explicit R9700 card run required");
+    for (bool many : {false, true}) {
+        const int M = many ? 65539 : 32768, S = many ? M : 3, N = 7;
+        Buffer x(RAD_BF16, M, N, 11), y(RAD_BF16, S, N, 13);
+        x.fill(3509);
+        std::vector<int> lengths = {0, 257, 16384, M};
+        if (many) {
+            lengths.resize(M + 1);
+            for (int i = 0; i <= M; ++i)
+                lengths[i] = i;
+        }
+        auto cu = Buffer::ids(lengths);
+        compare("seg_mean_bf16_sum", {&x, cu.get(), &y},
+                {pi("M", M), pi("n", N), ps("dtype", "bf16")}, 2, 0, true);
+    }
+}
+
 RAD_TEST_MAIN()

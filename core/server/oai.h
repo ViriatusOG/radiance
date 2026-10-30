@@ -59,7 +59,7 @@ std::string json_dump(const json& j);
 
 /* ================================================================== a parsed request */
 
-enum class Endpoint { Chat, Completion, Embedding };
+enum class Endpoint { Chat, Completion, Embedding, Rerank };
 
 /* The API a chat request came in through, which decides the shape of its answer. Every shape is
  * parsed into the same chat request (Anthropic's is translated first, anthropic_to_chat) and
@@ -160,6 +160,10 @@ struct OaiRequest {
     int64_t dimensions = 0;
     /* /v1/embeddings: a soft-token budget for the request's images, 0 the server's. */
     int32_t image_tokens = 0;
+    /* /rerank: original document order is retained through scheduler batching. */
+    std::vector<json> rerank_documents;
+    int64_t top_n = 0;
+    bool return_documents = true;
 
     /* `images_config`: which of the checkpoint's picture modes a request's pictures get, and the
      * sizes it states (Unlimited-OCR's gundam and base modes). 0 keeps the processor's choice
@@ -308,6 +312,9 @@ int check_embedding_template(const IEmbedder* embed, bool overridden, std::strin
 /* Embeddings: fills `out->prompts` with one entry per input. */
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err);
+bool is_reranker(const IEmbedder* embed);
+int parse_rerank_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
+                         OaiRequest* out, ApiError* err);
 
 /* ================================================================== responses */
 
@@ -392,6 +399,8 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
                                  const UsageOut& u, const TimingsOut& t = TimingsOut());
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
                             const UsageOut& u);
+std::string rerank_body(const OaiRequest& r, const std::vector<std::vector<float>>& scores,
+                        const UsageOut& u);
 /* One model entry: what /v1/models lists and /v1/models/:id returns. */
 struct ModelCard {
     std::string id;

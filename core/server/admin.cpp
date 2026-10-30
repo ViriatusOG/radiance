@@ -6,8 +6,8 @@
  * None of these touch the step path (no admission, no Sink, no cancellation); each is answered on
  * the HTTP thread before it returns, so they are kept out of server.cpp.
  *
- * Deliberately absent, answering 404: vLLM's /pooling, /classify, /score and /rerank (no
- * classifier or cross-encoder head), /sleep, /wake_up and /is_sleeping (no sleep mode; weights
+ * Deliberately absent, answering 404: vLLM's /pooling, /classify and /score,
+ * /sleep, /wake_up and /is_sleeping (no sleep mode; weights
  * are placed once, spec §5), /invocations (a SageMaker envelope), stored Responses-API responses
  * (would need a conversation store), and llama-server's /slots and /lora-adapters (a runtime LoRA
  * adapter is chosen per request by `model`; vLLM's load and unload routes are in server.cpp).
@@ -383,14 +383,16 @@ HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
 /* ================================================================== capabilities */
 json Server::capabilities() const {
     json caps;
-    caps["chat"]      = deps_.chat != nullptr;
-    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
-    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
+    const bool rerank = is_reranker(deps_.embed);
+    caps["chat"]      = !rerank && deps_.chat != nullptr;
+    caps["tools"]     = !rerank && deps_.chat && deps_.chat->supports_tools();
+    caps["reasoning"] = !rerank && deps_.chat && deps_.chat->supports_reasoning();
     /* An image model reads pictures only for edits and writes no text a grammar could constrain,
      * whatever its conditioning network's processor would take. */
     const bool img = opt_.image_model || opt_.video_model;
-    caps["grammar"]   = !img && deps_.grammar != nullptr;
-    caps["embedding"] = deps_.embed != nullptr;
+    caps["grammar"]   = !img && !rerank && deps_.grammar != nullptr;
+    caps["embedding"] = deps_.embed != nullptr && !rerank;
+    if (rerank) caps["rerank"] = true;
     caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
     caps["video"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Video);
     caps["audio"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Audio);

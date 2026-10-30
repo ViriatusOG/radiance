@@ -212,6 +212,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
+| `seg_mean_bf16_sum` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (BF16 sum, then BF16 quotient) |
 | `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
 | `pool_cols` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean column a window of k columns) |
 | `relu` | `M`(range) `n` `dtype` | `x` → `y` |
@@ -290,6 +291,13 @@ rounded to `y`'s dtype before the product, as the unfused pair stores it.
 **`seg_mean`** is mean pooling over a ragged batch: row `s` of `y` is the mean of `x`'s rows
 `[cu[s], cu[s+1])`, summed in double and rounded once. `M` is the step's token count and bands the
 op; the segment count is `cu_seqlens`' length less one. An empty segment is a zero row.
+
+**`seg_mean_bf16_sum`** preserves the two BF16 stores of Nemotron 3.5 Rerank's masked
+mean: sum the segment in f32, round the sum to BF16, divide by its valid-token count,
+then round the quotient to BF16. Input and output are BF16; cumulative lengths are
+int32, begin at zero, end at the active input row count and describe nonempty segments.
+Pitched rows are supported. This is a separate operation so `seg_mean` and existing
+embedding models keep their one-rounding contract.
 
 **`pool_rows`** is a vision pooler over windows laid out consecutively: row `r` of `y` is the mean
 of `x`'s rows `[r*k, r*k + k)`, summed in f32 and rounded to `y`'s dtype, then times `mult` and

@@ -168,3 +168,10 @@ https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16/tree/781e779ee4ca9c2d2a
 The checkpoint's governing license is OpenMDW-1.1, retained in
 tests/data/chat/nemotron35/LICENSE. The tokenizer fixture is a subset preserving source token
 IDs and the BPE entries needed by the test corpus; it is not the complete serving tokenizer.
+
+tests/data/chat/nemotron35/rerank-template.jinja comes from NVIDIA's
+Nemotron-3.5-Rerank-8B-BF16 checkpoint, revision
+f88f8d9104726747791283ab156d2fcdb29e90a7:
+https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16/tree/f88f8d9104726747791283ab156d2fcdb29e90a7
+It is covered by the same retained OpenMDW-1.1 license.
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
