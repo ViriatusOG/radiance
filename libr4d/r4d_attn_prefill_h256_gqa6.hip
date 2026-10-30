@@ -679,7 +679,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     }
 
     if (!live) return;
-    l_i += swap16(l_i);
+    // fetch-inactive: the split store reads l_i under `if (h == 0)` only, so the exchange may be sunk
+    // into that half; swap16_fi still reads the partner's half of the row sum (#328).
+    l_i += swap16_fi(l_i);
     if constexpr (SPLIT) {
         // Unnormalised: the merge weighs segments by 2^(m - max m) and applies v_descale itself.
         r4d_prefill_store_partial<NKS, HEAD_DIM>(a, qoff + qpos, qhead, sp, acc, m_ref, l_i, h);

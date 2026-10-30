@@ -608,7 +608,9 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     }
 
     if (!live) return;
-    const float lrow = l_i + swap16(l_i);
+    // fetch-inactive: the f32 partials read lrow under `if (h == 0)` only (see the prefill kernel's
+    // epilogue, #328).
+    const float lrow = l_i + swap16_fi(l_i);
     const int tok = qoff + qrow;
     const size_t idx = (size_t)(tok * a.q_heads + qhead) * splits + sp;
     const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * splits;

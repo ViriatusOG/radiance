@@ -150,6 +150,16 @@ __device__ __forceinline__ unsigned long long r4d_xor_lane_u64(unsigned long lon
 // broadcast lane 0.
 __device__ __forceinline__ float swap16(float x) { return r4d_xor_lane<16>(x); }
 
+// The same exchange with fetch-inactive set. swap16 assumes every lane is active; where only one half
+// consumes the result (a store under `if (h == 0)`), a compiler may sink the exchange into that half,
+// and with fi = 0 a lane then reads its own value for the inactive partner's. fi = 1 reads the
+// partner's register whatever exec says, so a pair sum stays a pair sum. Identical to swap16 with
+// every lane active.
+__device__ __forceinline__ float swap16_fi(float x) {
+    return __uint_as_float((uint32_t)__builtin_amdgcn_permlanex16(
+        (int)__float_as_uint(x), (int)__float_as_uint(x), 0x76543210u, 0xFEDCBA98u, true, false));
+}
+
 // A wave32 sum on DPP instead of the LDS crossbar. `__shfl_xor` is a `ds_bpermute_b32` on gfx1201
 // at any offset, queued behind other LDS traffic; where little arithmetic separates reductions, a
 // five-stage shuffle butterfly dominates the run. Offsets 8..1 use row_xmask (dpp_ctrl 0x160 | N)
