@@ -151,9 +151,9 @@ vendor/cpp-httplib/httplib.h
 vendor/cpp-httplib/httplib.cpp
 vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp-httplib/*
 
-    Header-only JSON, byte for byte as lifted, and the HTTP library at cpp-httplib v0.46.1 SPLIT from
-    upstream's single ~20,400-line header into a .h/.cpp pair, so one translation unit pays for it.
-    Apart from the split the httplib pair matched upstream exactly when it was lifted; the split itself
+    Header-only JSON, byte for byte as lifted, and the HTTP library at cpp-httplib v0.64.0 SPLIT from
+    upstream's single ~24,300-line header into a .h/.cpp pair, so one translation unit pays for it.
+    Apart from the split the httplib pair matches upstream exactly when it was lifted; the split itself
     drops two decorative `// ----` separator comment lines, moves `inline` from definitions to
     declarations, and adds the .cpp's `#include "httplib.h"` and namespace brace. The only difference
     from upstream for both is the PATH: llama.cpp nests them one directory deeper
@@ -168,19 +168,24 @@ vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp
     vendor/CMakeLists.txt sets, so a future disagreement between them would have been invisible --
     the copy nobody builds is the copy nobody checks.
 
-    Upstream is several majors ahead of v0.46.1 now — 0.46.1 is what llama.cpp carried at the lifted
-    commit. The lift is owed; when it happens, the patch below must be re-checked against the newer
-    library's own keep-alive refusal and exception handling (its serve_guarded makes the provider-side
-    catch core/server/http.cpp carries redundant), not just re-applied.
+    Upstream tracked: cpp-httplib tag v0.64.0 (yhirose/cpp-httplib); the split pair as carried by
+    llama.cpp commit 1ab23c33b ("vendor : update cpp-httplib to 0.64.0 (#31400)"). Earlier this pair
+    sat at v0.46.1 -- what llama.cpp carried at the lifted commit -- and carried patches/0022; the
+    bump retires most of that patch, because 0.64.0 natively closes the connection on every 4xx/5xx
+    response (the "Connection: close" option is honored by a scope_exit in write_response), skips
+    the keep-alive drain for any response that committed to close, bounds the drain that does run
+    (CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH, the connection timeout as a total max_timeout, and a
+    close for a part-read body), and routes exceptions from the pre-routing handler and the
+    WebSocket upgrade through the exception handler. What survives is the budget the library still
+    ties to the connection's own timeout and cannot lower without capping uploads too: see below.
 
-    LOCAL CHANGES: patches/0022-httplib-a-refusal-closes-the-socket-and-the-drain-keeps-a-deadline.patch
+    LOCAL CHANGES: patches/0022-httplib-the-drain-keeps-a-five-second-budget.patch
 
-    On 0022: the API-key gate answers 401 before a handler runs, so the refused request's body sits
-    unread on the keep-alive socket and upstream's anti-smuggling drain reads it byte by byte — one
-    byte per socket timeout paces a whole worker, and the attacker chooses the pace. 0022 hands every
-    such refusal a closed connection (the unread bytes die with it, which is also what makes the drain
-    moot) and gives a drain that does run a 5 s budget — per packet gap and in total — after which the
-    connection closes too.
+    On 0022: a response whose body the handler left unread drains on the keep-alive socket, and
+    0.64.0 bounds that drain only by the connection's read timeout -- the same knob that bounds a
+    whole request's reads, uploads included, so radiance cannot simply lower it. A client dribbling
+    one byte per gap paces a worker for that full timeout after the response was already sent.
+    0022 caps the drain's total budget at 5 s (or the connection timeout, whichever is smaller).
 
 
 REWRITTEN INTO core/ INSTEAD
@@ -589,24 +594,22 @@ PATCH SERIES
       tools=0 tool_calls=0, as 0006 describes: every request with `tools` was refused.
       tests/chat_test.cpp (a_dotted_integer_is_an_index_as_in_jinja2).
 
-  patches/0022-httplib-a-refusal-closes-the-socket-and-the-drain-keeps-a-deadline.patch
+  patches/0022-httplib-the-drain-keeps-a-five-second-budget.patch
 
       vendor/cpp-httplib/, not vendor/llama/: applies from vendor/cpp-httplib/ with `patch -p1`.
 
       Upstream's tail of process_request() drains an unconsumed framed body to keep it from being
-      read back as the next request on a keep-alive connection. The drain has two ways to be
-      weaponed against this server. A request the API-key gate refused (401 answered before any
-      handler saw it) has a whole body sitting unread, and the drain will wait for it: the stream's
-      read wait (30 s here) bounds each packet gap, not the drain, so a client that dribbles one
-      byte per timeout holds that worker for as long as it likes, on a socket that was never going to
-      be used again. And the same dribble works on any 404 with a body — the drain there has a
-      purpose, but no bound.
+      read back as the next request on a keep-alive connection. Since v0.64.0 the library bounds
+      that drain -- a byte cap (CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH), the connection's read
+      timeout as a total max_timeout, an immediate close for a body left partway -- and closes the
+      connection on every 4xx/5xx response, skipping the drain there entirely. What it cannot
+      bound tighter is the drain's time, because the timeout it uses is the same knob that bounds
+      a whole request's reads: lowering it to hurry a drain along would cap slow uploads just as
+      hard. A client dribbling one byte per packet gap still paces a worker for that full timeout
+      on a socket that was never going to be used again.
 
-      The patch closes the connection on every 401 that left a framed body unread — `Connection:
-      close` on the refusal itself, and the socket shut after it — and gives every drain that does
-      run a 5 s budget, bounded twice: the stream's read wait shortened for the drain (the WebSocket
-      upgrade already used set_read_timeout for exactly this) and a steady_clock deadline in the
-      discard provider for the total. Past either, the connection is
-      closed and the unread bytes die with it. The socket's own read timeout is restored after, so
-      the next keep-alive request is unaffected. Tests: transport_test
-      (a_refusal_closes_the_connection, the_inflight_body_budget).
+      The patch gives the drain its own budget: five seconds total, or the connection's read
+      timeout when that is shorter. Past it the stream read fails, the drain gives up, and the
+      connection closes with the unread bytes still on it. Tests: transport_test
+      (a_stalled_drain_dies_on_its_deadline, a_refusal_closes_the_connection,
+      the_inflight_body_budget).

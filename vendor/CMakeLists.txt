@@ -41,7 +41,7 @@ target_include_directories(rad_vendor_llama SYSTEM PUBLIC
   # llama/src/unicode.h (codepoint tables), so core/ always spells the vendor path in full.
   ${CMAKE_CURRENT_SOURCE_DIR}/llama/common)
 
-# cpp-httplib 0.46.1 is a split header/source library, so it is compiled. TLS is off: the server
+# cpp-httplib 0.64.0 is a split header/source library, so it is compiled. TLS is off: the server
 # speaks plain HTTP and TLS termination belongs to a proxy in front of it.
 add_library(rad_vendor_httplib STATIC cpp-httplib/httplib.cpp)
 target_compile_options(rad_vendor_httplib PRIVATE -w)
