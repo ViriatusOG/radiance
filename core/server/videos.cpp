@@ -320,8 +320,12 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             if (p.name == "target" || p.name == "conditions" ||
                 ((p.name == "loras" || p.name == "lora") && !p.data.empty() &&
                  (p.data[0] == '[' || p.data[0] == '{'))) {
-                v = json::parse(p.data, nullptr, false);
-                if (v.is_discarded())
+                /* Bounded like every other untrusted parse: a form field under the body cap can
+                 * be brackets alone, and the deep tree's teardown would take the process with
+                 * it. Over-budget or over-deep reads as a bad parse. */
+                bool over = false, deep = false;
+                v = parse_json_bounded(p.data, 0, &over, &deep);
+                if (v.is_discarded() || over || deep)
                     return error_response(err_bad(p.name, "expected JSON"), req.peer);
             }
             body[p.name] = v;

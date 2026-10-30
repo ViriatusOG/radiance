@@ -3912,6 +3912,28 @@ TEST(messages_return_a_tool_call_as_a_tool_use_block) {
     CHECK(f.tmpl.last_n_tools == 1);
 }
 
+/* `arguments` is model output, and the buffered body parses it behind the depth-capped scan
+ * the streaming path applies: neither the recursive parse nor the tree's teardown bounds depth
+ * on its own, and a model made to cooperate can name a tool and nest fifty thousand brackets.
+ * Too deep reads as an empty input, as a discarded parse did; a shallow one rides whole. */
+TEST(messages_empty_a_tool_use_input_too_deep_to_parse) {
+    OaiRequest r;
+    r.id = "msg_test";
+    r.model = "test-model";
+    ChoiceOut c;
+    UsageOut u;
+    c.msg.tool_calls.push_back({ "call_1", "get_weather",
+                                 "{\"city\":" + std::string(50000, '[') +
+                                 std::string(50000, ']') + "}" });
+    const json j = json::parse(anthropic_message_body(r, c, u));
+    CHECK_EQ(j["content"][0]["type"].get<std::string>(), std::string("tool_use"));
+    CHECK_EQ(j["content"][0]["name"].get<std::string>(), std::string("get_weather"));
+    CHECK_EQ(j["content"][0]["input"].dump(), std::string("{}"));
+    c.msg.tool_calls[0].arguments = "{\"city\":\"Paris\"}";
+    const json k = json::parse(anthropic_message_body(r, c, u));
+    CHECK_EQ(k["content"][0]["input"].dump(), std::string(R"({"city":"Paris"})"));
+}
+
 TEST(messages_turns_a_tool_result_back_into_a_tool_message) {
     Fixture f;
     f.sched.reply = "sunny";

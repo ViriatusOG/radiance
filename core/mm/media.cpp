@@ -327,6 +327,12 @@ int decode_image(const uint8_t* data, size_t n, int64_t max_pixels, Frame* out, 
     SwsContext* sws = nullptr;
     bool got = false;
     const int s = decode_frames(in, [&](int64_t, const AVFrame* f) -> int {
+        /* The decoded frame, not the header's size, is what gets converted: a container whose
+         * bitstream disagrees with its declared dimensions must not slip past the cap. */
+        if ((int64_t)f->width * f->height > max_pixels) {
+            *why = "the decoded image is larger than the server's pixel limit";
+            return RAD_E_INVAL;
+        }
         const int c = to_rgb(f, &sws, out, why);
         if (c < 0) return c;
         got = true;
@@ -355,6 +361,12 @@ int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRG
     SwsContext* sws = nullptr;
     bool got = false;
     const int s = decode_frames(in, [&](int64_t, const AVFrame* f) -> int {
+        /* Re-check the decoded frame against the cap, as decode_image and the video path do:
+         * the bitstream, not the header, decides what the converter allocates. */
+        if ((int64_t)f->width * f->height > max_pixels) {
+            *why = "the decoded image is larger than the server's pixel limit";
+            return RAD_E_INVAL;
+        }
         const int c = to_rgba(f, &sws, out, why);
         if (c < 0) return c;
         got = true;

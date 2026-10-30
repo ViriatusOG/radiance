@@ -3989,8 +3989,15 @@ std::string anthropic_message_body(const OaiRequest& r, const ChoiceOut& c, cons
     if (!r.continued.empty() && text.rfind(r.continued, 0) == 0) text.erase(0, r.continued.size());
     if (!text.empty()) blocks.push_back(json{ { "type", "text" }, { "text", text } });
     for (const ToolCall& tc : c.msg.tool_calls) {
-        json in = json::parse(tc.arguments, nullptr, false);
-        if (in.is_discarded() || !in.is_object()) in = json::object();
+        /* The same bound the streaming path applies: `arguments` is model output, and
+         * json_complete's depth-capped scan must run before nlohmann's recursion and its
+         * teardown, neither of which bounds depth on its own. Too deep or incomplete reads as
+         * an empty input, as a discarded parse did. */
+        json in = json::object();
+        if (json_complete(tc.arguments)) {
+            json v = json::parse(tc.arguments, nullptr, false);
+            if (!v.is_discarded() && v.is_object()) in = std::move(v);
+        }
         blocks.push_back(json{ { "type", "tool_use" }, { "id", tc.id }, { "name", tc.name },
                                { "input", in } });
     }

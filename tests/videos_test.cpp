@@ -368,6 +368,34 @@ TEST(a_form_creates_a_video_too) {
     CHECK_EQ(v.f->srv->router().dispatch(q).status, 400);
 }
 
+/* A form field that carries JSON is parsed under a value budget and a depth cap, like every
+ * other untrusted text: a field of brackets alone sits well inside the body cap and would take
+ * the worker down at the deep tree's teardown. Over-deep and over-budget read as a bad parse. */
+TEST(a_form_field_of_brackets_is_refused_rather_than_parsed) {
+    Videos v;
+    const std::string deep = std::string(4096, '[');
+    for (const char* field : { "target", "conditions", "loras" }) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/videos";
+        q.form = { FormPart{ "prompt", "", "", "a boat" }, FormPart{ field, "", "", deep } };
+        CHECK_EQ(v.f->srv->router().dispatch(q).status, 400);
+    }
+    /* Over the value budget but shallow, on the same gate. */
+    std::string wide = "[";
+    for (int i = 0; i < (1 << 20) + 2; ++i) wide += (i ? "," : "") + std::string("1");
+    wide += "]";
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "a boat" }, FormPart{ "target", "", "", wide } };
+    CHECK_EQ(v.f->srv->router().dispatch(q).status, 400);
+    /* And a well-formed one still parses: it reaches the schema, not the parse refusal. */
+    q.form = { FormPart{ "prompt", "", "", "a boat" },
+               FormPart{ "target", "", "", "{\"short_edge\":256}" } };
+    CHECK_EQ(v.f->srv->router().dispatch(q).status, 200);
+}
+
 /* The job's life: queued at once, completed with progress 100 and an expiry, the MP4 and its
  * first frame served; listing it, deleting it, and a 404 after. */
 TEST(a_video_job_completes_and_serves_its_file) {
