@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -98,7 +99,9 @@ struct Fixture {
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
         prog.meta.n_ctx_train = 4096;
-        prog.meta.n_vocab = 512;
+        /* Above the 1000 + i the requests below spell: admission refuses ids past the
+         * vocabulary, and these prompts must be admissible. */
+        prog.meta.n_vocab = 65536;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -1279,6 +1282,30 @@ TEST(a_scored_request_names_real_vocabulary_rows) {
     CHECK_EQ(rc[2], RAD_E_INVAL);
     CHECK_EQ(rc[3], RAD_E_INVAL);
     CHECK(!kept->may_speculate);
+}
+
+/* The prompt itself names real vocabulary rows too: raw id arrays arrive verbatim from the
+ * request body, and an id past the embedding table must die at admission, never staged into a
+ * pass — the embedding gather would fail the step, a failed step is a device fault, and a
+ * device fault stops the engine (spec §17). One bad number must not be a server kill. */
+TEST(a_prompt_names_real_vocabulary_rows) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int32_t n_vocab = (int32_t)f.prog.meta.n_vocab;
+    std::unique_ptr<Request> rs[5];
+    const std::vector<std::vector<int32_t>> ids = { { 1, 2, n_vocab - 1 }, { n_vocab }, { -1 },
+                                                    { 7, INT32_MAX }, { 0, 1, 2, n_vocab + 9 } };
+    int rc[5] = { -1, -1, -1, -1, -1 };
+    for (int i = 0; i < 5; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt = ids[(size_t)i];
+    }
+    f.sch.add_all(rs, 5, rc);
+    CHECK_EQ(rc[0], RAD_OK);
+    for (int i = 1; i < 5; ++i) CHECK_EQ(rc[i], RAD_E_INVAL);
 }
 
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
@@ -6361,6 +6388,49 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     f.commit_plain();
     CHECK_EQ(f.kv.free_blocks(0), before);
     CHECK_EQ((int)f.sch.find(a)->output.size(), 2);   /* the step ahead emitted nothing */
+}
+
+/* A SCORED row (Request::token_scores) the step in flight brings to max_tokens gets no step issued
+ * ahead: it would be a forward pass for a request that finishes at the commit. The step after the
+ * commit is planned as usual. */
+TEST(no_step_is_issued_ahead_for_a_scored_request_the_step_in_flight_finishes) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    auto r = f.request(40, /*max_tokens=*/2);
+    r->speculation_fixed = true;
+    r->token_scores = std::make_shared<TokenScores>();
+    r->token_scores->tokens = { 1, 2 };
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() == nullptr);
+    f.commit_plain();                              /* the second token: finished */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 2);
+    CHECK(f.sch.step() == nullptr);
+}
+
+/* A row without token_scores whose step in flight leaves a token to decode is an ordinary decode:
+ * the step ahead is issued. (A request any step in flight finishes gets none, scored or not.) */
+TEST(a_non_scored_row_keeps_the_step_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    auto r = f.request(40, /*max_tokens=*/3);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() != nullptr);
+    f.commit_plain();
+    f.sch.promote_next();
+    f.commit_plain();                              /* the step ahead: the third token */
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 3);
 }
 
 /* ================================================================== terminal paths */

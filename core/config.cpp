@@ -821,7 +821,14 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--host"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->host = v; }
         else if (S("--port"))                  { if (!num(0, 65535, &c->port)) return RAD_E_INVAL; }
-        else if (S("--api-key"))               { if (!(v = need(i))) return RAD_E_INVAL; c->api_key = v; }
+        else if (S("--api-key")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* An empty key is no key: --api-key "" or --api-key "$UNSET_VAR" must not start a
+             * server that looks guarded and answers everything keyless. */
+            if (!*v) { RAD_ERR("--api-key takes a non-empty key; an empty value guards nothing");
+                       return RAD_E_INVAL; }
+            c->api_key = v;
+        }
         else if (S("--served-model-name")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
