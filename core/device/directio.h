@@ -11,9 +11,16 @@
  * (rad_format.h), so every mover read takes the unbounced path. The bounce is for other callers.
  */
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 namespace rad {
+
+/* Bytes the drive has returned through this reader, monotonically. The stall
+ * watchdog (aql.cpp) counts this alongside the queues' read indices: a host wait
+ * that moves nothing anywhere -- no queue advanced, no read came back -- is the
+ * only one that reports a stall. */
+inline std::atomic<uint64_t> dio_progress{0};
 
 enum {
     RAD_DIO_READ   = 1,

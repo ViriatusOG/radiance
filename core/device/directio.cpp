@@ -40,7 +40,9 @@ int64_t pread_some(int fd, void* dst, int64_t bytes, int64_t off) {
 int pread_exact(int fd, void* dst, int64_t bytes, int64_t off) {
     const int64_t got = pread_some(fd, dst, bytes, off);
     if (got < 0) return (int)got;
-    return got == bytes ? RAD_OK : RAD_E_IO;
+    if (got != bytes) return RAD_E_IO;
+    dio_progress.fetch_add((uint64_t)bytes, std::memory_order_relaxed);
+    return RAD_OK;
 }
 
 int pwrite_exact(int fd, const void* src, int64_t bytes, int64_t off) {

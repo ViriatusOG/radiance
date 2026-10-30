@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "aql.h"
+#include "directio.h"
 #include "rad_format.h"
 #include "../rad_internal.h"
 
@@ -650,12 +651,19 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
  * nothing will decrement, or a kernel that faulted silently); the packet at the read index says
  * which. */
 /* Sum of every queue's read index. It only grows, so an unchanged sum means no queue moved. */
-/* How long a host wait may see no queue advance before it reports the queues; see dump_queues. */
+/* How long a host wait may see no progress before it reports the queues; see dump_queues. The
+ * watchdog is progress-aware -- read_progress counts the drive reader's bytes beside the queues'
+ * read indices -- so a period that moves nothing anywhere is a hang however slow the model's
+ * drives are, and the threshold needs no tuning per deployment. */
 constexpr uint32_t kStallMs = 5000;
 
 uint64_t read_progress() {
+    /* Queue read indices plus the drive reader's byte count: the file tier's reads legitimately
+     * park every queue for seconds at a time (one rank spins at the all-reduce while the other is
+     * still reading its layer off the drive), and the bytes coming back are the progress that
+     * makes such a wait not a stall. */
+    uint64_t n = rad::dio_progress.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(G().streams_mu);
-    uint64_t n = 0;
     for (Stream* s : G().streams) n += hsa_queue_load_read_index_scacquire(s->q);
     return n;
 }
@@ -871,7 +879,8 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
  * video generator's denoising pass for tens of them. So the queues' read indices are sampled once
  * every stall period and only a period in which none advanced reports, with the packet each queue
  * is on: a hung kernel, or a queue the driver evicted and could not restore. A wait that keeps
- * moving says nothing. */
+ * moving says nothing. The drive reader's byte count is progress too (read_progress), so a wait
+ * parked on the file tier's drive reads never reports. */
 struct Stall {
     const char* where;
     uint32_t n = 0;
@@ -895,7 +904,7 @@ struct Stall {
         if (sampled && p == progress) {
             told = true;
             dump_queues(where);
-            RAD_ERR("device: no queue has advanced in the %u s since: the GPU is not running the "
+            RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
                     "packet named above -- a hung kernel, or a queue the driver evicted and could "
                     "not restore (amdgpu cwsr_enable=0 is one cause)", kStallMs / 1000);
             return;
@@ -2509,10 +2518,10 @@ struct DmaQueue {
     bool                ever_held = false;       /* a stream has held this card's link at least once */
     std::atomic<bool>   tried{false};            /* dma_open has run, for the startup report */
     std::string         why;                     /* why it failed */
-    /* For a queue whose lists each end by writing their number to `fin` (the expert prefetch's),
-     * the room check uses the end of the last finished list as a lower bound on what the engine
-     * has read. The engine's written-back read pointer can stop moving on such a queue while the
-     * engine runs on, and a ring the host thinks full would wait forever. */
+    /* For a queue whose lists each end by writing their number to `fin` (the lane's and the
+     * expert prefetch's), the room check uses the end of the last finished list as a lower bound
+     * on what the engine has read. The engine's written-back read pointer can stop moving on such
+     * a queue while the engine runs on, and a ring the host thinks full would wait forever. */
     volatile uint32_t*  fin = nullptr;
     uint32_t            lists = 0;               /* lists handed over; list k ends at ends[k % kDmaEnds] */
     std::unique_ptr<uint64_t[]> ends;
@@ -2699,8 +2708,9 @@ void dump_dma_lanes() {
     for (int c = 0; c < kMaxDevices; ++c) {
         DmaQueue& q = g_dma[c];
         if (!q.tried.load(std::memory_order_acquire) || !q.ok) continue;
-        RAD_ERR("  device %d DMA lane: ring written %" PRIu64 " B, read %" PRIu64 " B; link gate %"
-                PRId64 " (%s), last hold issued %s", c, (uint64_t)q.w, (uint64_t)*q.rptr,
+        RAD_ERR("  device %d DMA lane: ring written %" PRIu64 " B, read %" PRIu64 " B; %u lists handed "
+                "over, %" PRIu32 " finished; link gate %" PRId64 " (%s), last hold issued %s",
+                c, (uint64_t)q.w, dma_read(&q), q.lists, q.fin ? *q.fin : 0u,
                 (int64_t)hsa_signal_load_relaxed(q.gate),
                 (hsa_signal_load_relaxed(q.gate) & 1) ? "held" : "free", q.held ? "on" : "off");
     }
@@ -2710,6 +2720,11 @@ void dump_dma_lanes() {
         RAD_ERR("  device %d prefetch DMA queue: ring written %" PRIu64 " B, read %" PRIu64 " B; %u lists "
                 "handed over, %u finished", c, (uint64_t)q.w, dma_read(&q), q.lists, q.fin ? *q.fin : 0u);
     }
+}
+
+/* Where the engine reads and writes a signal's value: the 64-bit word the CP decrements and polls. */
+inline uint64_t sig_value_addr(const Sig* g) {
+    return (uint64_t)g->h.handle + offsetof(amd_signal_t, value);
 }
 
 /* The card's queue, opened on first use; null (after one warning) if the driver refuses. */
@@ -2723,6 +2738,18 @@ DmaQueue* dma_queue(int ord) {
         q.why = why;
         q.tried.store(true, std::memory_order_release);
         if (q.ok) aql::g_dump_lanes = dump_dma_lanes;
+        if (q.ok) {
+            /* The engine's written-back read pointer can stop moving while the engine runs on (the
+             * expert prefetch's queue has the same quirk), and a ring the host thinks full would
+             * wait forever -- a large pool's load fill wedged exactly there. So every list ends by
+             * writing its number to a word the engine keeps advancing, which bounds the engine's
+             * progress from below without trusting the read pointer (dma_read). */
+            if (Sig* f = sig_get(false)) {
+                hsa_signal_silent_store_relaxed(f->h, 0);
+                q.ends.reset(new uint64_t[kDmaEnds]());
+                q.fin = (volatile uint32_t*)(uintptr_t)sig_value_addr(f);
+            }
+        }
         if (q.ok)
             RAD_INFO("device: card %d copy lists go to DMA engine 0 on a queue of this process's own "
                      "(%.1f ms to open)", ord,
@@ -2778,11 +2805,6 @@ void dma_kick(DmaQueue* q) {
     *q->wptr = q->w;
     _mm_sfence();
     *q->db = q->w;
-}
-
-/* Where the engine reads and writes a signal's value: the 64-bit word the CP decrements and polls. */
-inline uint64_t sig_value_addr(const Sig* g) {
-    return (uint64_t)g->h.handle + offsetof(amd_signal_t, value);
 }
 
 /* ------------------------------------------------- the expert prefetch's device half (rad_xp_*) */
@@ -3124,6 +3146,19 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
                 const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */,
                                             (uint32_t)oa, (uint32_t)(oa >> 32), 0u };
                 rc = dma_put(dq, fence, 4);
+            }
+            if (rc == RAD_OK && dq->fin) {
+                /* Name the list: the engine writes the number when everything before it is done,
+                 * which the room check trusts over the read pointer (see dma_read). */
+                const uint32_t k = dq->lists + 1;
+                const uint64_t fa = (uint64_t)(uintptr_t)dq->fin;
+                const uint32_t finf[4] = { kSdmaFence | (3u << 16) /* uncached */,
+                                           (uint32_t)fa, (uint32_t)(fa >> 32), k };
+                rc = dma_put(dq, finf, 4);
+                if (rc == RAD_OK) {
+                    dq->ends[k % kDmaEnds] = dq->w;
+                    dq->lists = k;
+                }
             }
             dma_kick(dq);
         }
