@@ -325,6 +325,37 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     CHECK_EQ(ask("HEAD / HTTP/1.1\r\nHost: t\r\n\r\n", /*head_only=*/true).status, 200);
 }
 
+/* A security-relevant header sent twice is a request built to be read two ways: this server
+ * reads the first copy, a proxy in front may read the last or join the two, and whichever one
+ * the disagreement lands on, the attacker picked it. Refused whole, before either reader —
+ * the key gate included — even when every copy carries a valid key. */
+TEST(a_duplicated_security_header_is_refused) {
+    LiveServer s(4, 1, [](ServerOptions& o) { o.api_key = "k"; });
+    REQUIRE(s.srv->port() > 0);
+    s.sched.hang = false;
+    s.sched.reply = "ok";
+    auto ask = [&](const std::string& req, bool head_only = false) {
+        return ::ask(s, req, head_only);
+    };
+    const Reply dup = ask(get("/v1/models",
+                              "Authorization: Bearer k\r\nAuthorization: Bearer k\r\n"));
+    CHECK_EQ(dup.status, 400);
+    CHECK(has(json::parse(dup.body, nullptr, false)["error"].value("message", std::string()),
+              "twice"));
+    /* Case variants count as two: they land on one lookup here, but no front-end need agree. */
+    CHECK_EQ(ask(get("/v1/models",
+                     "Authorization: Bearer k\r\nauthorization: Bearer k\r\n")).status, 400);
+    /* The probe exemption reads no header, and still does not carry a duplicated one: an
+     * Origin or X-Api-Key split is refused wherever it lands. */
+    CHECK_EQ(ask(get("/ping", "X-Api-Key: k\r\nX-Api-Key: wrong\r\n")).status, 400);
+    CHECK_EQ(ask("GET /ping HTTP/1.1\r\nHost: t\r\nOrigin: http://a\r\nOrigin: http://b\r\n\r\n")
+                 .status,
+             400);
+    /* One copy of each, however spelled, still works. */
+    CHECK_EQ(ask(get("/v1/models", "Authorization: Bearer k\r\n")).status, 200);
+    CHECK_EQ(ask(get("/v1/models", "Authorization: Bearer k\r\nX-Api-Key: k\r\n")).status, 200);
+}
+
 /* A 401 from the key gate ends the connection. The refused request's body was never read, and
  * keeping the socket alive makes those bytes somebody's problem: draining them hands the
  * refusing client a way to pace a worker — one byte per socket timeout, forever — and not

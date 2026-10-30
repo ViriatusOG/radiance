@@ -2230,7 +2230,11 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.id = opt_.model_id;
     c.created = started_at_;
     c.max_model_len = opt_.max_ctx;
-    c.root = opt_.model_path;
+    /* `root` is a path on this machine -- the one field of the card that describes the server's
+     * filesystem, and /v1/models is the first route a keyless scanner reaches. Keyless, it
+     * belongs to the operator alone, the rule /diagnostics and the LoRA admin follow; with a
+     * key, everyone who can pay the key already owns this model's card. */
+    if (!opt_.api_key.empty() || local_operator(req)) c.root = opt_.model_path;
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };

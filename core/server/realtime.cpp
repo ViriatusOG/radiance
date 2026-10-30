@@ -285,12 +285,14 @@ void Server::realtime_run(RealtimeSession& s, WsConn& ws) {
     try {
         server_closed = realtime_loop(s, ws);
     } catch (const std::exception& e) {
-        RAD_ERR("realtime %s failed: %s", s.id.c_str(), e.what());
+        /* e.what() is server-internal text that may quote client frames: sanitized to the log,
+         * and the socket's client gets the generic sentence, not the reason. */
+        RAD_ERR("realtime %s failed: %s", s.id.c_str(), log_sanitize(e.what()).c_str());
         ojson o = event("error");
         ojson err;
         err["type"] = "server_error";
         err["code"] = "internal_error";
-        err["message"] = std::string("the session failed: ") + e.what();
+        err["message"] = "the session failed; the reason is in the server log";
         err["param"] = nullptr;
         err["event_id"] = nullptr;
         o["error"] = std::move(err);

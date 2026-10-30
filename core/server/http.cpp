@@ -533,10 +533,12 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         catch (const std::exception& e) { what = e.what(); }
         catch (...) {}
         /* e.what() can carry request text (a path, a header): keep it off the log as an
-         * escape-sequence vector. */
+         * escape-sequence vector, and off the wire entirely -- the message a 500 carries back
+         * must not echo the request or name how the server broke; that is what the log is for. */
         RAD_ERR("server: %s", log_sanitize(what).c_str());
         res.status = 500;
-        res.set_content(error_body(req.path, 500, "internal_server_error", what),
+        res.set_content(error_body(req.path, 500, "internal_server_error",
+                                   "the server faulted on this request; the reason is in its log"),
                         "application/json");
     });
 
@@ -782,7 +784,10 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
                 try {
                     h(req, conn);
                 } catch (const std::exception& e) {
-                    RAD_ERR("server: %s on %s", e.what(), req.path.c_str());
+                    /* The path is client text and e.what() can carry some: both are log
+                     * vectors until sanitized, exactly as in the exception handler above. */
+                    RAD_ERR("server: %s on %s", log_sanitize(e.what()).c_str(),
+                            log_sanitize(req.path).c_str());
                     conn.close(1011, "internal error");
                 }
             },
@@ -802,6 +807,23 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * its body being read. */
     svr.set_pre_routing_handler([&router, gate, socket_gate, bridge,
                                  preflight](const httplib::Request& q, httplib::Response& s) {
+        /* A security-relevant header sent twice is a request built to be read two ways: this
+         * server reads the first copy, a proxy in front may read the last or join them, and any
+         * disagreement over a key, an Origin or the Host the keyless routes pin to depends on
+         * which reader you ask. Refuse the whole request rather than pick a reader.
+         * (Duplicated Content-Length is httplib's own rejection, in read_headers.) The lookup
+         * is case-insensitive, so `Authorization` beside `authorization` counts as two. */
+        for (const char* h : {"Host", "Authorization", "X-Api-Key", "Origin"}) {
+            if (q.get_header_value_count(h) > 1) {
+                RAD_INFO("req refused from %s:%d -> 400 invalid_request_error: duplicate %s header",
+                         q.remote_addr.c_str(), q.remote_port, h);
+                s.status = 400;
+                s.set_content(error_body(q.path, 400, "invalid_request_error",
+                                         std::string("the ") + h + " header was sent twice"),
+                              "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
         /* A WebSocket upgrade to a socket route is left to httplib, which then answers 101 and
          * runs the route's socket handler. */
         if (is_socket_upgrade(q) && router.socket_for(q.path))

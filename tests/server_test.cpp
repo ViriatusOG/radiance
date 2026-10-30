@@ -2748,6 +2748,42 @@ TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
     CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
 }
 
+/* `root` names where the model sits on the server's disk. Keyless it is the operator's own
+ * information -- the rule /diagnostics follows -- and with a key it travels with the key: the
+ * gate admitted the caller, so the card is theirs. */
+TEST(the_models_root_path_follows_the_key) {
+    Fixture f(true, 262144, "/models/m.rad");
+    HttpRequest remote;
+    remote.path = "/v1/models";
+    remote.peer = "192.168.1.20:50122";
+    remote.headers["Host"] = "box.example:8000";
+    CHECK(!json::parse(f.srv->router().dispatch(remote).body)["data"][0].contains("root"));
+    /* The rebinding page: a loopback socket, an attacker's Origin and Host -- the pair the
+     * loopback predicate exists for, and no path to the disk path. */
+    HttpRequest rebinding;
+    rebinding.path = "/v1/models";
+    rebinding.peer = "127.0.0.1:50122";
+    rebinding.headers["Host"] = "evil.test:8000";
+    rebinding.headers["Origin"] = "http://evil.test:8000";
+    CHECK(!json::parse(f.srv->router().dispatch(rebinding).body)["data"][0].contains("root"));
+    HttpRequest local;
+    local.path = "/v1/models";
+    local.peer = "127.0.0.1:50122";
+    local.headers["Host"] = "localhost:8000";
+    CHECK_EQ(json::parse(f.srv->router().dispatch(local).body)["data"][0]
+                 .value("root", std::string()),
+             std::string("/models/m.rad"));
+    /* Keyed. The gate ran before the router, so the caller is admitted whoever dialled them;
+     * in-process dispatch stands in for the gate here, and `remote` now reads its path. */
+    Fixture k(Fixture::Tweak{ [](ServerOptions& o, Deps&) {
+        o.model_path = "/models/m.rad";
+        o.api_key = "k";
+    } });
+    CHECK_EQ(json::parse(k.srv->router().dispatch(remote).body)["data"][0]
+                 .value("root", std::string()),
+             std::string("/models/m.rad"));
+}
+
 TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
     Fixture f;
     const json info = json::parse(f.get("/server_info").body)["capabilities"];
