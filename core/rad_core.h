@@ -1057,6 +1057,10 @@ struct Config {
     /* --allow-host, repeatable: Host names the keyless loopback-only routes accept beside the
      * loopback names themselves, for operators who reach the box by another name. */
     std::vector<std::string> allow_hosts;
+    /* --trusted-proxy, repeatable: CIDRs whose sockets may vouch for the caller behind them
+     * through X-Forwarded-For. The vouched address names who the log and audit talk about --
+     * it grants nothing: loopback, the Host name and the key stay the guards' whole world. */
+    std::vector<std::string> trusted_proxies;
     /* --served-model-name: the id /v1/models lists, a response names when its request named none,
      * and the metrics carry. Empty takes the container's own name. A request may still name any
      * model: one model is loaded and every request is served by it. */

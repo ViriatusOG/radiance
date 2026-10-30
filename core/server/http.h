@@ -36,7 +36,16 @@ struct HttpRequest {
     std::map<std::string, std::string, CiLess> headers;
     std::map<std::string, std::string> query;
     std::map<std::string, std::string> params;           /* from a ":name" route segment */
-    std::string peer;                                    /* "addr:port"; empty in-process */
+    std::string peer;                                    /* "addr:port"; empty in-process. The
+                                                            ATTRIBUTED caller: with --trusted-proxy
+                                                            and an X-Forwarded-For, the address the
+                                                            proxy chain names; the port is always
+                                                            the last hop's -- the chain carries no
+                                                            port. For logs and audit, never for
+                                                            authority. */
+    std::string raw_peer;                                /* "addr:port" of the socket peer as the
+                                                            kernel saw it; empty in-process. The
+                                                            only address the guards read. */
     /* Steady-clock nanoseconds at which the whole body had arrived. The server's own time for
      * the request starts here, before parsing, so network time is excluded. -1 in-process. */
     int64_t     t_received_ns = -1;
@@ -50,7 +59,9 @@ struct HttpRequest {
     /* The first form part named `k` (a field or a file), or null. */
     const FormPart* part(const std::string& k) const;
     bool        peer_gone() const { return closed && closed(); }
-    /* True for 127.0.0.0/8, ::1, an IPv4-mapped 127.x address, and an in-process request. */
+    /* True when raw_peer is 127.0.0.0/8, ::1, an IPv4-mapped 127.x address, or absent (the
+     * in-process request). Reads the socket, never the attributed peer: a proxy an operator
+     * vouched for can name any caller it likes; that changes the log line, not the guard. */
     bool        peer_is_loopback() const;
     /* True when the request comes from a browser on another origin: an `Origin` header whose
      * authority differs from `Host`. Scripts send no Origin, so this never fires for curl or an
@@ -67,6 +78,28 @@ struct HttpRequest {
      * an in-process dispatch and as remote for a socket, which always carries one. */
     bool        host_is_loopback() const;
 };
+
+/* Whether `cidr` is in the one form --trusted-proxy takes: numeric "addr/prefix", prefix within
+ * its family. Config refuses anything else at startup, so a typo cannot silently unvouch a
+ * proxy; ip_in_cidr treats the same rejection as simply no match. */
+bool cidr_valid(const std::string& cidr);
+
+/* True when the numeric address `addr` (no port, no zone) falls inside `cidr`. Families must
+ * agree: this is not RFC 6052 translation, an IPv4 peer is not inside an IPv6 network that
+ * happens to embed it. */
+bool ip_in_cidr(const std::string& addr, const std::string& cidr);
+
+/* The caller a proxy chain vouches for. `raw_addr` is the socket peer (no port), `xff` the
+ * request's X-Forwarded-For value ("" when there is none), `trusted` the vouched CIDRs.
+ * Nothing is read from the header unless the socket itself belongs to a vouched CIDR -- an
+ * unvouched peer can name any address it likes and names none. Then the chain is walked from
+ * the right (the hop nearest us, which our vouched proxy appended): the first entry that no
+ * vouched CIDR covers is the caller; a chain of only vouched hops ends at its leftmost entry,
+ * the original client as the outermost proxy saw it. Malformed entries stop the walk where
+ * they stand -- the chain is reported, not interpreted, and the log sanitizer owns the bytes.
+ * Fallback is `raw_addr`, always. */
+std::string attributed_client(const std::string& raw_addr, const std::string& xff,
+                              const std::vector<std::string>& trusted);
 
 struct HttpResponse {
     int         status = 200;
@@ -203,6 +236,10 @@ struct TransportOptions {
     size_t      max_inflight_body_bytes = 0;
     std::string api_key;                  /* "" disables the check */
     bool        cors = true;
+    /* --trusted-proxy, repeatable: CIDRs whose sockets may vouch for their caller through
+     * X-Forwarded-For. Empty: no socket vouches for anything and peer always equals raw_peer.
+     * Attribution rewrites the logged caller, never an authority -- see HttpRequest::peer. */
+    std::vector<std::string> trusted_proxies;
 };
 
 /* Idle workers kept for TransportOptions::n_threads: that many, one per hardware thread for 0,

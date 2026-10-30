@@ -127,6 +127,22 @@ TEST(allow_host_repeats_and_refuses_the_empty_name) {
     CHECK(c.allow_hosts[0] == "box" && c.allow_hosts[1] == "box.example");
 }
 
+/* --trusted-proxy repeats: the sockets inside these networks may name the client behind them
+ * for the log. Anything but a numeric network with a prefix is refused at startup, because a
+ * typo there silently unvouches a proxy -- the server would keep answering through it and log
+ * the proxy on every line, with nothing to show for the flag. */
+TEST(trusted_proxy_repeats_and_refuses_anything_but_a_cidr) {
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "127.0.0.1" }), RAD_E_INVAL);        /* no prefix */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "127.0.0.0/33" }), RAD_E_INVAL);     /* out of family */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "::1/129" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "proxy.internal/32" }), RAD_E_INVAL);/* not numeric */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "[::1]/128" }), RAD_E_INVAL);        /* URL form, not CIDR */
+    Config c;
+    CHECK_EQ(parse({ "--trusted-proxy", "127.0.0.0/8", "--trusted-proxy", "::1/128" }, &c), 0);
+    CHECK(c.trusted_proxies.size() == 2);
+    CHECK(c.trusted_proxies[0] == "127.0.0.0/8" && c.trusted_proxies[1] == "::1/128");
+}
+
 /* A flag written last with no argument is refused rather than reading past argv. */
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
@@ -510,6 +526,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
+        { "--trusted-proxy", { "127.0.0.0/8" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },

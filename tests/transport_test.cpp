@@ -356,6 +356,98 @@ TEST(a_duplicated_security_header_is_refused) {
     CHECK_EQ(ask(get("/v1/models", "Authorization: Bearer k\r\nX-Api-Key: k\r\n")).status, 200);
 }
 
+/* ================================================================== attribution */
+
+/* What --trusted-proxy takes is a network, and ip_in_cidr is the one reader of it: an operator
+ * who typed 127.0.0.1 without a prefix was refused at startup (config_test); what reaches here
+ * is a CIDR, and a near-miss address must still miss. */
+TEST(a_vouched_network_covers_exactly_the_addresses_it_names) {
+    CHECK(cidr_valid("127.0.0.0/8"));
+    CHECK(cidr_valid("::1/128"));
+    CHECK(cidr_valid("0.0.0.0/0"));
+    CHECK(!cidr_valid("127.0.0.1"));        /* no prefix */
+    CHECK(!cidr_valid("127.0.0.0/33"));     /* outside the family */
+    CHECK(!cidr_valid("::1/129"));
+    CHECK(!cidr_valid("box.example/32"));   /* names are not vouched, only numbers */
+    CHECK(ip_in_cidr("127.0.0.1", "127.0.0.0/8"));
+    CHECK(ip_in_cidr("127.8.9.10", "127.0.0.0/8"));
+    CHECK(!ip_in_cidr("128.0.0.1", "127.0.0.0/8"));
+    CHECK(ip_in_cidr("::1", "::1/128"));
+    CHECK(ip_in_cidr("2001:db8::7", "2001:db8::/32"));
+    CHECK(!ip_in_cidr("2001:db9::7", "2001:db8::/32"));
+    CHECK(ip_in_cidr("8.8.8.8", "0.0.0.0/0"));
+    /* Families do not translate: an IPv4 socket is not inside an IPv6 network that embeds its
+     * bytes, and a vouched ::ffff:0:0/96 does not vouch for 1.2.3.4. An operator who means
+     * both writes both. */
+    CHECK(!ip_in_cidr("1.2.3.4", "::ffff:1.2.3.4/128"));
+    CHECK(!ip_in_cidr("::1", "127.0.0.0/8"));
+}
+
+/* X-Forwarded-For read the way a chain is actually appended to: our proxy's own entry is the
+ * last one, so the walk starts at the right and each vouched hop admits its neighbour to the
+ * left. The socket vouches for the header — a caller nobody vouched for names no one. */
+TEST(the_chain_is_walked_right_to_left_and_the_socket_vouches_for_it) {
+    const std::vector<std::string> proxy{"10.0.0.0/8"};
+    /* An unvouched socket carrying a confident header: the header is noise. */
+    CHECK_EQ(attributed_client("198.51.100.9", "203.0.113.7", proxy), std::string("198.51.100.9"));
+    /* A vouched proxy naming an ordinary caller. */
+    CHECK_EQ(attributed_client("10.0.0.1", "203.0.113.7", proxy), std::string("203.0.113.7"));
+    /* Two hops, the rightmost one unvouched: that is the caller our proxy saw, and the walk
+     * stops there — it never reads past a name it cannot vouch for, so an attacker who injects
+     * an extra left-hand hop is never believed. */
+    CHECK_EQ(attributed_client("10.0.0.1", "203.0.113.7, 192.0.2.1", proxy), std::string("192.0.2.1"));
+    /* A chain of only vouched hops bottoms out at the leftmost: the client as the outermost
+     * proxy saw it. */
+    CHECK_EQ(attributed_client("10.0.0.1", "10.0.0.9, 10.0.0.2", proxy), std::string("10.0.0.9"));
+    /* No header, or no vouched proxy: the socket, always as a fallback and always by default. */
+    CHECK_EQ(attributed_client("10.0.0.1", "", proxy), std::string("10.0.0.1"));
+    CHECK_EQ(attributed_client("10.0.0.1", "203.0.113.7", {}), std::string("10.0.0.1"));
+    /* Garbage and empty entries: the chain is reported, not interpreted, and the log line
+     * owns the bytes. */
+    CHECK_EQ(attributed_client("10.0.0.1", "garbage, 10.0.0.2", proxy), std::string("garbage"));
+    CHECK_EQ(attributed_client("10.0.0.1", ",  , 203.0.113.7", proxy), std::string("203.0.113.7"));
+    CHECK_EQ(attributed_client("10.0.0.1", " , ", proxy), std::string("10.0.0.1"));
+    /* IPv6 chains. */
+    const std::vector<std::string> lo{"::1/128"};
+    CHECK_EQ(attributed_client("::1", "2001:db8::5", lo), std::string("2001:db8::5"));
+}
+
+/* A vouched proxy changes who the log talks about and nothing else. This is the whole attack
+ * the peer split exists for: with --trusted-proxy armed on its own loopback, a proxy that is
+ * told (or tricked) into forwarding X-Forwarded-For would otherwise hand the loopback guards —
+ * the keyless /diagnostics, the admin routes — to any caller it can carry. The guard reads the
+ * socket; the named address changes not one answer. */
+TEST(a_vouched_proxy_names_the_caller_without_becoming_the_authority) {
+    LiveServer s(4, 1, [](ServerOptions& o) {
+        o.diagnostics_json = [] { return std::string(R"({"findings":[]})"); };
+        o.trusted_proxies = {"127.0.0.1/32"};
+    });
+    REQUIRE(s.srv->port() > 0);
+    /* The socket is loopback; the vouched proxy vouches for 203.0.113.7. The log carries the
+     * named address (checked at the unit level above); the guard still answers it as the
+     * socket it is. */
+    CHECK_EQ(ask(s, "GET /diagnostics HTTP/1.1\r\nHost: localhost\r\n"
+                    "X-Forwarded-For: 203.0.113.7\r\n\r\n")
+                 .status,
+             200);
+    /* And the default posture, once: no --trusted-proxy, an X-Forwarded-For from wherever is
+     * simply not read — the same request over the same socket reads the same. */
+    LiveServer plain(4, 1, [](ServerOptions& o) {
+        o.diagnostics_json = [] { return std::string(R"({"findings":[]})"); };
+    });
+    REQUIRE(plain.srv->port() > 0);
+    CHECK_EQ(ask(plain, "GET /diagnostics HTTP/1.1\r\nHost: localhost\r\n"
+                        "X-Forwarded-For: 203.0.113.7\r\n\r\n")
+                 .status,
+             200);
+    /* A cross-origin browser through the vouched proxy reads cross-origin exactly as it does
+     * without the header: attribution adds no Origin and removes no guard. */
+    CHECK_EQ(ask(s, "GET /diagnostics HTTP/1.1\r\nHost: localhost\r\n"
+                    "Origin: http://evil.test\r\nX-Forwarded-For: 203.0.113.7\r\n\r\n")
+                 .status,
+             403);
+}
+
 /* A 401 from the key gate ends the connection. The refused request's body was never read, and
  * keeping the socket alive makes those bytes somebody's problem: draining them hands the
  * refusing client a way to pace a worker — one byte per socket timeout, forever — and not

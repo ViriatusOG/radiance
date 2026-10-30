@@ -2130,6 +2130,7 @@ by 0.002-0.003 nats.
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
 | `--api-key-env NAME` | — | read the API key from the environment variable `NAME` instead of the command line, where every process on the machine reads it in `ps`; an unset or empty `NAME` refuses startup like an empty `--api-key` |
 | `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
+| `--trusted-proxy CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -3835,6 +3836,20 @@ public name into the address bar is therefore refused; `localhost`, a `127.x` ad
 tunnel pass. If you reach the box by another name from the box itself, list it: `--allow-host box`
 (repeatable). A local user on the server's own console is admitted either way — the boundary is
 against remote callers, not against whoever owns the machine.
+
+Behind a reverse proxy every socket arrives as the proxy, and every log line names it instead of
+the caller. `--trusted-proxy 127.0.0.0/8` (repeatable; a numeric network with a prefix, like
+`::1/128`) vouches for those networks: a request whose socket belongs to a vouched network is
+attributed to the client it names, reading `X-Forwarded-For` from the right and skipping vouched
+hops — the first address no vouched network covers is the caller, a chain of only vouched hops
+ends at its leftmost, and anything else falls back to the socket. Attribution is not authority:
+the guards above read the socket and never the named address, so a proxy on loopback hands the
+loopback-only routes to none of its clients — it only puts their addresses in the log where the
+proxy's would stand. An `X-Forwarded-For` from an unvouched socket is never read: the header
+says nothing until the machine sending it has been named. (This is why the server parses the
+header itself rather than arming the HTTP library's own trusted-proxy support: that support
+rewrites the very address the handlers read as the socket peer, so one over-broad vouched
+network would move the guard, not just the log line.)
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:

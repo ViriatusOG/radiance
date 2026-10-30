@@ -2756,6 +2756,7 @@ TEST(the_models_root_path_follows_the_key) {
     HttpRequest remote;
     remote.path = "/v1/models";
     remote.peer = "192.168.1.20:50122";
+    remote.raw_peer = remote.peer;
     remote.headers["Host"] = "box.example:8000";
     CHECK(!json::parse(f.srv->router().dispatch(remote).body)["data"][0].contains("root"));
     /* The rebinding page: a loopback socket, an attacker's Origin and Host -- the pair the
@@ -2763,12 +2764,14 @@ TEST(the_models_root_path_follows_the_key) {
     HttpRequest rebinding;
     rebinding.path = "/v1/models";
     rebinding.peer = "127.0.0.1:50122";
+    rebinding.raw_peer = rebinding.peer;
     rebinding.headers["Host"] = "evil.test:8000";
     rebinding.headers["Origin"] = "http://evil.test:8000";
     CHECK(!json::parse(f.srv->router().dispatch(rebinding).body)["data"][0].contains("root"));
     HttpRequest local;
     local.path = "/v1/models";
     local.peer = "127.0.0.1:50122";
+    local.raw_peer = local.peer;
     local.headers["Host"] = "localhost:8000";
     CHECK_EQ(json::parse(f.srv->router().dispatch(local).body)["data"][0]
                  .value("root", std::string()),
@@ -3097,6 +3100,7 @@ TEST(diagnostics_without_a_key_answers_loopback_only) {
         HttpRequest q;
         q.path = "/diagnostics";
         q.peer = peer;
+        q.raw_peer = peer;
         if (host) q.headers["Host"] = host;
         if (origin) q.headers["Origin"] = origin;
         return s.router().dispatch(q).status;
@@ -3148,6 +3152,7 @@ TEST(state_changing_routes_without_a_key_answer_the_machine_only) {
         q.path = "/sessions";
         q.query["label"] = "conv-1";
         q.peer = peer;
+        q.raw_peer = peer;
         if (host) q.headers["Host"] = host;
         return s.router().dispatch(q).status;
     };
@@ -3156,6 +3161,7 @@ TEST(state_changing_routes_without_a_key_answer_the_machine_only) {
         q.method = "POST";
         q.path = "/reset_prefix_cache";
         q.peer = peer;
+        q.raw_peer = peer;
         if (host) q.headers["Host"] = host;
         return s.router().dispatch(q).status;
     };
@@ -4908,10 +4914,12 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         q.path = "/admin/control-vector";
         q.body = R"({"enabled":true})";
         q.peer = "192.168.1.20:50122";
+        q.raw_peer = q.peer;
         q.headers["Host"] = "127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(q).status, 403);
         CHECK(!def);
         q.peer = "127.0.0.1:50122";
+        q.raw_peer = q.peer;
         q.headers["Host"] = "localhost:8000";
         CHECK_EQ(f.srv->router().dispatch(q).status, 200);
         CHECK(def);
@@ -4930,6 +4938,7 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         x.path = "/admin/control-vector";
         x.body = R"({"enabled":false})";
         x.peer = "127.0.0.1:50122";
+        x.raw_peer = x.peer;
         x.headers["Origin"] = "http://evil.test";
         x.headers["Host"]   = "127.0.0.1:8080";
         CHECK_EQ(f.srv->router().dispatch(x).status, 403);
@@ -4942,6 +4951,7 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         HttpRequest g2;
         g2.path = "/admin/control-vector";
         g2.peer = "192.168.1.20:50122";
+        g2.raw_peer = g2.peer;
         g2.headers["Host"] = "box.example:8000";
         CHECK_EQ(f.srv->router().dispatch(g2).status, 403);
         HttpRequest g3;

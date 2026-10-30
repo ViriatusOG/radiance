@@ -186,6 +186,9 @@ struct ServerOptions {
     /* Extra Host authorities the keyless "loopback only" guards accept (--allow-host): names an
      * operator reaches the box by that the loopback IP check cannot know. Case-insensitive. */
     std::vector<std::string> local_hosts;
+    /* --trusted-proxy: CIDRs whose sockets may name the client behind them via X-Forwarded-For.
+     * Attribution for the log; no guard reads it. See TransportOptions::trusted_proxies. */
+    std::vector<std::string> trusted_proxies;
     bool        cors = true;
 
     /* The transport's timeouts and body bound. See TransportOptions. */
