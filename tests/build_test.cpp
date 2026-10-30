@@ -467,6 +467,40 @@ TEST(schema_mismatches_are_named) {
     CHECK_EQ(b.status(), RAD_E_SCHEMA);
 }
 
+/* declare_scores binds the scored readout: bf16 hidden rows and a bf16 head table of the same
+ * width, and the table must COVER the vocabulary — the readout indexes it by token id, and the
+ * scheduler's admission bound is meta.n_vocab, so a short table is a device fault waiting in the
+ * last block of the vocabulary, not a refusal. Rows past the vocabulary are padding and read
+ * fine. */
+TEST(declare_scores_wants_a_table_that_covers_the_vocabulary) {
+    NEED_PLUGIN(reg)
+    RadModelMeta m = make_meta();
+    m.n_vocab = 8192;
+    Builder b(reg, m, make_ctx());
+
+    RadBufDecl hd{};
+    hd.dtype = RAD_BF16;
+    hd.rank  = 2;
+    hd.shape[0] = 512;
+    hd.shape[1] = 4096;
+    hd.kind = RAD_BUF_TRANSIENT;
+    hd.domain = RAD_DOMAIN_DEVICE;
+    const rad_buf hidden = b.decl_buffer("hout", &hd);
+    REQUIRE(hidden > 0);
+
+    const rad_weight short_t = decl_w(b, "tok.short", 4096, 4096);    /* rows < n_vocab */
+    CHECK_EQ(b.declare_scores(hidden, short_t), RAD_E_INVAL);
+    CHECK(has(b.errors().back(), "under the 8192-token vocabulary"));
+
+    const rad_weight narrow = decl_w(b, "tok.narrow", 8192, 2048);    /* width != hidden's */
+    CHECK_EQ(b.declare_scores(hidden, narrow), RAD_E_INVAL);
+
+    const rad_weight full   = decl_w(b, "tok.full", 8192, 4096);
+    CHECK_OK(b.declare_scores(hidden, full));
+    const rad_weight padded = decl_w(b, "tok.padded", 9216, 4096);    /* rows > n_vocab: fine */
+    CHECK_OK(b.declare_scores(hidden, padded));
+}
+
 TEST(no_schema_names_the_near_miss) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());

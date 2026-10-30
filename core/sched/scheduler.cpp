@@ -334,9 +334,24 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
         return RAD_E_FULL;
     }
     /* A scored prompt names real vocabulary rows and needs one step's decision; drafts would be
-     * proposed for a continuation nobody reads. */
+     * proposed for a continuation nobody reads.
+     *
+     * The candidate COUNT is capped as well as their values: a scored step stages the union of
+     * every staged request's candidate list as hidden and table rows in one pinned host buffer,
+     * so the lists are that buffer's size and must not be a client's choice. d1's questions name
+     * their prompt's written answers -- a few dozen at most -- so the cap leaves every real
+     * decision request far under it and refuses only the pathological. A step whose union still
+     * outgrows the pinned pool survives: Engine::stage_scored_rows cancels the scored requests
+     * rather than the engine. */
+    static const size_t kMaxScoredCandidates = 4096;
     if (r->token_scores) {
         if (r->embed || r->token_scores->tokens.empty()) return RAD_E_INVAL;
+        if (r->token_scores->tokens.size() > kMaxScoredCandidates) {
+            RAD_WARN("request %llu refused: %zu scored candidate ids, over the cap of %zu",
+                     (unsigned long long)r->id, r->token_scores->tokens.size(),
+                     kMaxScoredCandidates);
+            return RAD_E_INVAL;
+        }
         for (int32_t t : r->token_scores->tokens)
             if (t < 0 || t >= prog_->meta.n_vocab) return RAD_E_INVAL;
         r->may_speculate = false;

@@ -634,7 +634,7 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
-        if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
+        if (const int ss = stage_scored_rows(plan, so, cancel); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
          * touches only request state and host grammar automata; Sampler::run issues the uploads
@@ -683,7 +683,9 @@ int Engine::step_loop() {
         return RAD_OK;
         };
 
-        cancel.clear();
+        /* No clear here: `cancel` is empty when the step's staging begins (applied and cleared at
+         * the join below), and stage_scored_rows may already have filled it — a scored request
+         * whose pinned rows could not be allocated rides the same deferred path. */
         int bst = RAD_OK;
 
         /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
@@ -1198,16 +1200,25 @@ int Engine::save_checkpoints() {
  * to the host before the sampler can rewrite it in place. stage_scored_rows picks the rows while
  * every rank is parked; issue_scored_rows copies one row per rank stream ahead of its sampler;
  * collect_scored_rows reads each request's ids after the step's wait, before the commit. A whole
- * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id. */
-int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
+ * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id.
+ *
+ * The pinned host buffer is grow-only and its growth is the one part of staging that can fail
+ * on resources rather than on a broken program: then the scored requests are the ones cancelled
+ * (into `cancel`, applied the way the sampler's cancellations are), not the engine — a request
+ * whose scores the box cannot hold is that request's failure, and every other row on this step
+ * and every other connection on the server keeps running. */
+int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
+                              std::vector<uint64_t>& cancel) {
     score_rows_.clear();
     score_only_ = false;
     score_ids_.clear();
     if (embedding_) return RAD_OK;
+    std::vector<uint64_t> scored;
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const Request* r = plan.e[i].req;
         if (so.first_row[i] < 0 || !r || !r->token_scores || !r->output.empty()) continue;
         score_rows_.push_back({ so.first_row[i], r->token_scores.get() });
+        scored.push_back(r->id);
     }
     if (score_rows_.empty()) return RAD_OK;
     const int64_t n = (int64_t)score_rows_.size();
@@ -1224,6 +1235,8 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
         std::sort(score_ids_.begin(), score_ids_.end());
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
+    bool host_failed = false;
+    int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
         const int64_t width = rk->sampler.config().n_vocab_local;
         /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
@@ -1238,12 +1251,17 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
         rk->score_host = static_cast<float*>(
             rad_dev_alloc(rows * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
         rk->score_rows_cap = rk->score_host ? rows : 0;
-        if (!rk->score_host) {
-            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)rows);
-            return RAD_E_NOMEM;
-        }
+        if (!rk->score_host) { host_failed = true; failed_rows = rows; break; }
     }
     if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    if (host_failed) {
+        RAD_ERR("scored rows: no pinned memory for %lld logits rows; cancelling the scored "
+                "requests, not the engine", (long long)failed_rows);
+        cancel.insert(cancel.end(), scored.begin(), scored.end());
+        score_rows_.clear();
+        score_only_ = false;
+        score_ids_.clear();
+    }
     return RAD_OK;
 }
 

@@ -1153,6 +1153,16 @@ int Builder::declare_scores(rad_buf hidden, rad_weight table) {
             w.name.c_str());
         return RAD_E_INVAL;
     }
+    /* The table must cover the vocabulary: the scored readout indexes it by token id (the
+     * scheduler bounds candidate ids by meta.n_vocab), and a table a few thousand rows short
+     * would turn the last block of the vocabulary into a read off the end of a weight — a device
+     * fault, not a refusal. More rows than the vocabulary is padding and reads fine. */
+    if (w.decl.shape[0] < prog_.meta.n_vocab) {
+        err(RAD_E_INVAL, "declare_scores: the table ('%s') has %lld rows, under the %lld-token "
+            "vocabulary the scored readout indexes it by", w.name.c_str(),
+            (long long)w.decl.shape[0], (long long)prog_.meta.n_vocab);
+        return RAD_E_INVAL;
+    }
     prog_.score_hidden = hidden;
     prog_.score_table  = table;
     return RAD_OK;

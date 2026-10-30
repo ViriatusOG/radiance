@@ -1284,6 +1284,29 @@ TEST(a_scored_request_names_real_vocabulary_rows) {
     CHECK(!kept->may_speculate);
 }
 
+/* The candidate COUNT is capped as well as their values: a scored step stages the union of
+ * these lists as pinned host rows, so their size must not be a client's choice at the seam.
+ * 4096 is orders above what a decision request names (its written answers, a few dozen), so
+ * exactly the cap admits and one past it is refused by name. */
+TEST(a_scored_request_names_at_most_the_candidate_cap) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    std::unique_ptr<Request> rs[2];
+    for (int i = 0; i < 2; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt.assign(16, 7);
+        rs[i]->token_scores = std::make_shared<TokenScores>();
+        rs[i]->token_scores->tokens.assign(4096 + i, 1);
+    }
+    int rc[2] = { -1, -1 };
+    f.sch.add_all(rs, 2, rc);
+    CHECK_EQ(rc[0], RAD_OK);         /* exactly the cap */
+    CHECK_EQ(rc[1], RAD_E_INVAL);    /* one past it */
+}
+
 /* The prompt itself names real vocabulary rows too: raw id arrays arrive verbatim from the
  * request body, and an id past the embedding table must die at admission, never staged into a
  * pass -- the embedding gather would fail the step, a failed step is a device fault, and a

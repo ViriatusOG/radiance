@@ -330,7 +330,7 @@ private:
     bool                 score_only_ = false;
     std::vector<int32_t> score_ids_;
     int64_t              score_embd_ = 0;
-    int  stage_scored_rows(const StepPlan& plan, const StepOut& so);
+    int  stage_scored_rows(const StepPlan& plan, const StepOut& so, std::vector<uint64_t>& cancel);
     int  issue_scored_rows(Rank& r);
     int  collect_scored_rows();
 
