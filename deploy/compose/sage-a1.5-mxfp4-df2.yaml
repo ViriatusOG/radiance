@@ -14,7 +14,7 @@ services:
     container_name: radiance-sage-a1.5-mxfp4-df2
     command: >
       --model /models/sage-a1.5-mxfp4-df2.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2 --max-num-seqs 10 --max-model-len 262144 --kv-cache-dtype fp8
       --gpu-headroom-mib 96
       --num-speculative-tokens auto --max-num-batched-tokens 2048

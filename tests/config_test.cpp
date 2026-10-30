@@ -102,6 +102,21 @@ TEST(an_empty_api_key_is_refused) {
     CHECK(c.api_key == "k");
 }
 
+/* --api-key-env reads the key where `ps` cannot: the empty-value refusal's sibling is the
+ * never-set one -- a compose environment: or unit Environment= line with a typo'd name must
+ * refuse at startup, not serve keyless under a guarded-looking command line. */
+TEST(an_api_key_env_that_is_unset_is_refused_and_one_that_is_set_is_the_key) {
+    unsetenv("RAD_TEST_KEY_ENV");
+    CHECK_EQ(parse_fresh({ "--api-key-env", "RAD_TEST_KEY_ENV" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--api-key-env", "" }), RAD_E_INVAL);
+    setenv("RAD_TEST_KEY_ENV", "s3cret", 1);
+    Config c;
+    CHECK_EQ(parse({ "--api-key-env", "RAD_TEST_KEY_ENV" }, &c), 0);
+    CHECK(c.api_key == "s3cret");
+    CHECK(c.api_key_env == "RAD_TEST_KEY_ENV");
+    unsetenv("RAD_TEST_KEY_ENV");
+}
+
 /* --allow-host repeats: the loopback-only routes take the set of names, and an empty one is
  * a hole cut by a typo, so it is refused like the empty key. */
 TEST(allow_host_repeats_and_refuses_the_empty_name) {
@@ -467,6 +482,7 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
+        { "--model-revision", { "v1.2" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
@@ -492,6 +508,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
+        { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -549,6 +566,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
  * setting. */
 TEST(every_listed_option_parses_and_is_reported_as_given) {
     LogGuard lg;
+    /* --api-key-env resolves at parse time and fails closed on an unset name, so the inventory
+     * needs the variable it names to exist. */
+    setenv("RAD_KEY_ENV_INVENTORY", "inventory-key", 1);
     const auto opts = usage_options();
     CHECK(opts.size() > 90);
     const std::vector<std::string> names = diag::config_option_names();

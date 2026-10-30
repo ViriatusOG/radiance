@@ -14,7 +14,7 @@ services:
     container_name: radiance-glm53-flash
     command: >
       --model /models/glm53-flash-mxfp4.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 8 --placement all_vram --gpu-headroom-mib 1024 --embedding-placement vram
       --max-num-seqs 8 --max-model-len 32768
       --max-num-batched-tokens 4096 --prefill-span 4

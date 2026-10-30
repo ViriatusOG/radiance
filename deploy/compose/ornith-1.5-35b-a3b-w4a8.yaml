@@ -8,7 +8,7 @@ services:
     container_name: radiance-ornith-1.5-35b-a3b-w4a8
     command: >
       --model /models/ornith-1.5-35b-a3b-w4a8.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2 --max-num-seqs 8 --max-model-len 262144 --kv-cache-dtype fp8
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
       --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5

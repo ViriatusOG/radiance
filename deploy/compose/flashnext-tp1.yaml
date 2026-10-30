@@ -15,7 +15,7 @@ services:
     container_name: radiance-flashnext-tp1
     command: >
       --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 1 --max-num-seqs 4 --max-model-len 200000
       --placement expert_tiered --host-pool-mib 43000 --gpu-headroom-mib 96
       --kv-cache-dtype fp8

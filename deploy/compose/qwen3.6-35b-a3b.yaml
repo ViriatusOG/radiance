@@ -6,5 +6,5 @@ services:
     container_name: radiance-qwen3.6-35b-a3b
     command: >
       --model /models/qwen3.6-35b-a3b-fp8.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8

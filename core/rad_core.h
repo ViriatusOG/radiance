@@ -787,6 +787,8 @@ struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
+    std::string model_revision;        /* --model-revision: the hub revision a repo id fetches;
+                                          empty = the repo's moving default branch */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
@@ -1049,6 +1051,9 @@ struct Config {
     /* --api-key: the bearer key every request but the probes and the dashboard page must carry.
      * Empty serves without one. */
     std::string api_key;
+    /* --api-key-env: the environment variable api_key was read from, recorded so the config
+     * report can say where the key came from. Empty when the key came from the command line. */
+    std::string api_key_env;
     /* --allow-host, repeatable: Host names the keyless loopback-only routes accept beside the
      * loopback names themselves, for operators who reach the box by another name. */
     std::vector<std::string> allow_hosts;

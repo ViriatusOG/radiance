@@ -15,6 +15,6 @@ services:
       - ./gemma3.jinja:/templates/gemma3.jinja:ro
     command: >
       --model /models/translategemma-27b-mxfp4-gptq.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2 --max-num-seqs 8 --max-model-len 16384 --kv-cache-dtype fp8
       --override-chat-template /templates/gemma3.jinja

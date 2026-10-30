@@ -12,7 +12,15 @@
 # A changed file is fetched again even at the same size. A complete run records each file's content
 # key (the LFS sha256, or the size for a small file) in <dest>/.hfget-manifest, and a later run
 # compares the listing against it. The manifest is written only when every file arrived, so its
-# presence means the directory is a complete copy of some revision.
+# presence means the directory is a complete copy of some revision. An LFS file's key is verified:
+# the download is hashed and compared against the oid the listing claims before the file is kept,
+# so the hub cannot hand back one file for another and a resumed transfer cannot splice into a
+# plausible size.
+#
+# A file whose listed name would land outside the destination -- absolute, carrying a `..`
+# segment, holding control characters, or naming hfget's own manifest -- is not a repo listing:
+# the whole listing is refused. Skipping such an entry silently would leave a directory that
+# reads as complete and is not.
 #
 # Exit status: 0 complete; 3 nothing on disk was changed (the listing could not be read, or what is
 # still to fetch does not fit), so a complete earlier copy is intact; anything else, a transfer
@@ -35,6 +43,13 @@ set -e
 # sh cannot export a function, so each file is a re-entry of this script under `xargs -P`.
 if [ -n "$HFGET_CHILD" ]; then
     size=${1%%	*}; rest=${1#*	}; oid=${rest%%	*}; path=${rest#*	}
+    # The parent has vetted every name; this holds anyway, because $out is written straight
+    # from it and an escape writes outside the directory the operator named.
+    case "$path" in
+        ""|/*|*/|.|..|../*|*/../*)
+            echo "hfget: refusing a file named '$path', which does not land inside the destination" >&2
+            exit 1;;
+    esac
     key=${oid:-$size}                                  # LFS: sha256, non-LFS: size
     out=$HFGET_DEST/$path
     man=$HFGET_DEST/.hfget-manifest
@@ -63,6 +78,17 @@ if [ -n "$HFGET_CHILD" ]; then
     fi
     got=$(wc -c < "$out")
     [ "$got" = "$size" ] || { echo "hfget: $path is $got bytes, listing says $size" >&2; exit 1; }
+    # An LFS name carries the sha256 the hub claims. Believe it only after computing it: the
+    # size check alone would take a swapped file at the same length, and a spliced resume at a
+    # resumed length. A mismatch deletes the file -- a fresh transfer is the only repair -- and
+    # nothing reaches the manifest.
+    if [ -n "$oid" ]; then
+        got=$(sha256sum "$out" | awk '{print $1}')
+        [ "$got" = "${oid#sha256:}" ] || {
+            echo "hfget: $path hashes to $got, the listing claims ${oid#sha256:}" >&2
+            rm -f "$out"
+            exit 1; }
+    fi
     printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
     exit 0
 fi
@@ -75,6 +101,7 @@ rev=${3:-main}
 jobs=${HFGET_JOBS:-4}
 command -v jq >/dev/null || { echo "hfget: jq is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "hfget: curl is required" >&2; exit 2; }
+command -v sha256sum >/dev/null || { echo "hfget: sha256sum is required to verify LFS files" >&2; exit 2; }
 
 echo "hfget: listing $repo@$rev"
 # The listing is paginated (fifty entries per page, next page in a `Link: ...; rel="next"`
@@ -108,6 +135,16 @@ while [ -n "$api" ]; do
     [ "$page" -gt 200 ] && { echo "hfget: listing did not terminate after 200 pages" >&2; exit 1; }
 done
 echo "hfget: $page page(s) of listing"
+# A file name that does not land inside the destination is not a listing oddity: an absolute
+# path, a `..` segment, a control character (a tab splices one entry into two fields of the
+# transfer list), or a name shadowing hfget's own manifest, which the next run would read back
+# as its record of verified content. Name the entry and stop; skipping silently would leave a
+# directory that reads as complete and is not.
+bad=$(printf '%s' "$listing" | jq -r '[.[] | select(.type == "file")
+       | select((.path | test("(^/|(^|/)\\.\\.(/|$))"))
+             or (.path | test("[[:cntrl:]]"))
+             or (.path | test("(^|/)[.]hfget-manifest")))] | map(.path) | join(", ")')
+[ -n "$bad" ] && { echo "hfget: the listing names '$bad', which does not land inside the destination" >&2; exit 1; }
 have_st=$(printf '%s' "$listing" | jq '[.[] | select(.path | endswith(".safetensors"))] | length')
 sel='.[] | select(.type == "file")'
 [ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|msgpack|h5|onnx|onnx_data|gguf)$") or test("(^|/)(pytorch_model|consolidated)[^/]*\\.pth$")) | not)'

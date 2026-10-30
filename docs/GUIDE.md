@@ -340,7 +340,13 @@ It needs only `curl` and `jq`. Re-running resumes: a file whose local size match
 short one is continued. When a repo carries `.safetensors`, other weight formats (`.bin`, ONNX, GGUF,
 ...) are not fetched. `HF_TOKEN` authenticates a gated or private repo; `HFGET_JOBS` sets concurrency
 (default 4). A complete fetch records each file's content key (its LFS sha256, or a small file's size)
-in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. The
+in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. An LFS
+file's recorded key is verified, not just claimed: the download is hashed and compared against
+the sha256 the listing names before the file is kept. A listing that names a file outside the
+destination — an absolute path, a `..` segment — is refused whole rather than half-obeyed.
+Fetch what you will serve from a revision you chose: without `--model-revision` a repo id tracks
+the repo's `main` branch, so a restart can bring weights nobody reviewed; name a tag or a
+commit sha. The
 free-space check counts only what is still to fetch.
 
 `--model` also takes a repo id:
@@ -2029,6 +2035,7 @@ by 0.002-0.003 nats.
 |---|---|
 | `--model PATH` | required: the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
+| `--model-revision REV` | the hub revision a repo id is fetched at — a branch, tag, full commit sha or `refs/pr/N`. Default the repo's moving `main` branch; a deployment that must not restart onto weights nobody reviewed should name a tag or a sha (§3.1) |
 | `--control-vector off\|on\|disabled` | `disabled` (and no flag at all) loads nothing, declares no projection op and refuses a request that asks; `off` loads the vector found for this model and starts requests off; `on` starts them on. Refused at startup when the model's plugin does not apply control vectors or no compatible file is found (§4.10) |
 | `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
 | `--kernels LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
@@ -2121,6 +2128,7 @@ by 0.002-0.003 nats.
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
+| `--api-key-env NAME` | — | read the API key from the environment variable `NAME` instead of the command line, where every process on the machine reads it in `ps`; an unset or empty `NAME` refuses startup like an empty `--api-key` |
 | `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |

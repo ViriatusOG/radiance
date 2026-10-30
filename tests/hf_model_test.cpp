@@ -254,6 +254,146 @@ TEST(a_pth_that_is_not_the_weights_again_is_fetched_beside_the_safetensors) {
     CHECK(!fs::exists(root.path + "/pytorch_model.bin"));
 }
 
+/* A listing that names a file outside the destination -- absolute, or a `..` segment -- is not
+ * a listing of a repo at all, so hfget.sh refuses the whole thing rather than half-obeying it:
+ * silently skipping the entry would leave a directory that reads as complete and is not, and
+ * the manifest would certify it. */
+const char* kEscapeListing =
+    "#!/bin/sh\n"
+    "for a in \"$@\"; do case \"$a\" in *api/models*)\n"
+    "  printf '[{\"type\":\"file\",\"path\":\"../escape.bin\",\"size\":1},"
+    "{\"type\":\"file\",\"path\":\"kept.bin\",\"size\":1}]'; exit 0;; esac; done\n"
+    "exit 22\n";
+
+TEST(a_listing_naming_a_path_outside_the_destination_is_refused) {
+    NEED_ARTIFACT(hfget_beside_this_binary());
+    if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
+    TempDir root;
+    REQUIRE(!root.path.empty());
+    FakeCurl curl(kEscapeListing);
+    const std::string cmd = "sh '" + hfget_beside_this_binary() +
+                            "' radiance-test-owner/radiance-test-model '" + root.path +
+                            "' >/dev/null 2>'" + root.path + "/err'";
+    CHECK(std::system(cmd.c_str()) != 0);
+    CHECK(!fs::exists(root.path + "/escape.bin"));
+    CHECK(!fs::exists(root.path + "/kept.bin"));          /* the whole listing is refused */
+    CHECK(!fs::exists(root.path + "/.hfget-manifest"));
+    std::string err;
+    if (FILE* e = std::fopen((root.path + "/err").c_str(), "r")) {
+        char buf[256];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf - 1, e)) > 0) { buf[n] = '\0'; err += buf; }
+        std::fclose(e);
+    }
+    CHECK(has(err, "does not land inside the destination"));
+}
+
+/* An LFS file's oid is the hub's claim about its bytes; the download is kept only once those
+ * bytes hash to it -- the size check alone would take a swapped file of the same length, and a
+ * spliced resume at any length the hub likes. A mismatch deletes the file and fails the run;
+ * a match lands in the manifest, which is what makes "warm" mean verified-warm after. */
+const char* kBadOid =
+    "#!/bin/sh\n"
+    "out=''; url=''; prev=''\n"
+    "for a in \"$@\"; do\n"
+    "  [ \"$prev\" = -o ] && out=\"$a\"\n"
+    "  case \"$a\" in https://*) url=\"$a\";; esac\n"
+    "  prev=\"$a\"\n"
+    "done\n"
+    "case \"$url\" in *api/models*)\n"
+    "  printf '[{\"type\":\"file\",\"path\":\"big.bin\",\"size\":10,"
+    "\"lfs\":{\"oid\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}]';"
+    " exit 0;; esac\n"
+    "[ -n \"$out\" ] && printf 0123456789 > \"$out\"\n"
+    "exit 0\n";
+
+const char* kGoodOid =
+    "#!/bin/sh\n"
+    "out=''; url=''; prev=''\n"
+    "for a in \"$@\"; do\n"
+    "  [ \"$prev\" = -o ] && out=\"$a\"\n"
+    "  case \"$a\" in https://*) url=\"$a\";; esac\n"
+    "  prev=\"$a\"\n"
+    "done\n"
+    "case \"$url\" in *api/models*)\n"
+    "  oid=$(printf 0123456789 | sha256sum | cut -d' ' -f1)\n"
+    "  printf '[{\"type\":\"file\",\"path\":\"big.bin\",\"size\":10,\"lfs\":{\"oid\":\"%s\"}}]'"
+    " \"$oid\"; exit 0;; esac\n"
+    "[ -n \"$out\" ] && printf 0123456789 > \"$out\"\n"
+    "exit 0\n";
+
+TEST(an_lfs_file_that_does_not_hash_to_its_oid_is_not_kept) {
+    NEED_ARTIFACT(hfget_beside_this_binary());
+    if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
+    if (!on_path("sha256sum")) SKIP("no sha256sum on PATH, which hfget.sh needs");
+    TempDir root;
+    REQUIRE(!root.path.empty());
+    const std::string fetch = "sh '" + hfget_beside_this_binary() +
+                              "' radiance-test-owner/radiance-test-model '" + root.path +
+                              "' >/dev/null 2>'" + root.path + "/err'";
+    {
+        FakeCurl curl(kBadOid);
+        CHECK(std::system(fetch.c_str()) != 0);
+        CHECK(!fs::exists(root.path + "/big.bin"));        /* deleted, not left to be resumed */
+        CHECK(!fs::exists(root.path + "/.hfget-manifest"));
+        std::string err;
+        if (FILE* e = std::fopen((root.path + "/err").c_str(), "r")) {
+            char buf[256];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof buf - 1, e)) > 0) { buf[n] = '\0'; err += buf; }
+            std::fclose(e);
+        }
+        CHECK(has(err, "hashes to"));
+    }
+    {
+        FakeCurl curl(kGoodOid);
+        CHECK_EQ(std::system(fetch.c_str()), 0);
+        CHECK(fs::exists(root.path + "/big.bin"));
+        CHECK_EQ(fs::file_size(root.path + "/big.bin"), 10u);
+        CHECK(fs::exists(root.path + "/.hfget-manifest"));  /* the verified copy is certified */
+    }
+}
+
+/* --model-revision names the revision the fetch reads: the pinned ref is the one listed, and
+ * an unpinned fetch reads the repo's moving default branch -- which a deployment must be able
+ * to refuse outright rather than restart onto. */
+const char* kPinnedOnly =
+    "#!/bin/sh\n"
+    "out=''; url=''; prev=''\n"
+    "for a in \"$@\"; do\n"
+    "  [ \"$prev\" = -o ] && out=\"$a\"\n"
+    "  case \"$a\" in https://*) url=\"$a\";; esac\n"
+    "  prev=\"$a\"\n"
+    "done\n"
+    "case \"$url\" in *api/models*/tree/refs/pr/42*)\n"
+    "  printf '[{\"type\":\"file\",\"path\":\"m.rad\",\"size\":10}]'; exit 0;; esac\n"
+    "case \"$url\" in *api/models*) exit 22;; esac\n"
+    "[ -n \"$out\" ] && printf 0123456789 > \"$out\"\n"
+    "exit 0\n";
+
+TEST(the_pinned_revision_is_the_revision_fetched) {
+    NEED_ARTIFACT(hfget_beside_this_binary());
+    if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
+    TempDir root;
+    REQUIRE(!root.path.empty());
+    FakeCurl curl(kPinnedOnly);
+    const std::string repo = "radiance-test-owner/radiance-test-model";
+    auto resolve = [&](const char* rev, std::string* model) {
+        Config c;
+        c.model = repo;
+        c.download_dir = root.path;
+        if (rev) c.model_revision = rev;
+        bool ok = false;
+        stderr_of([&] { ok = resolve_hf_model(c); });
+        *model = c.model;
+        return ok;
+    };
+    std::string model;
+    CHECK(!resolve(nullptr, &model));              /* main: this hub has nothing there */
+    CHECK(resolve("refs/pr/42", &model));
+    CHECK_EQ(model, root.path + "/" + repo + "/m.rad");
+}
+
 /* With no --download-dir and neither XDG_CACHE_HOME nor HOME there is nowhere to fetch to, which
  * is refused by name before anything runs. */
 TEST(a_repo_id_with_nowhere_to_fetch_to_is_refused) {

@@ -7,7 +7,7 @@ services:
     container_name: radiance-nemotron-3.5-bolt-e4b-bf16-tp1
     command: >
       --model /models/nemotron-3.5-bolt-e4b-bf16.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 1 --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype bf16
       --num-speculative-tokens 7 --mm-max-patches 2520 --vision-tower-placement ram
       --temp 1.0 --top-p 0.95 --top-k 64 --chat-template-kwargs '{"enable_thinking":false}'

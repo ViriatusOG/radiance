@@ -23,11 +23,19 @@ services:
     group_add:
       - "${RENDER_GID:?set RENDER_GID in .env}"
       - "${VIDEO_GID:?set VIDEO_GID in .env}"
+    # The API key reaches the server through the container's environment, read by
+    # --api-key-env, not its command line: argv is world-readable in `ps` and /proc, the
+    # environment only by the process itself and root. The :? still fails closed on an unset
+    # value, at compose-parse time, before any container starts.
+    environment:
+      RADIANCE_API_KEY: ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
     # Docker's default seccomp profile refuses io_uring (used for the n-gram table's reads from the
     # model file) and the NUMA binding calls (mbind, set_mempolicy) the ROCm runtime makes for
-    # host memory.
+    # host memory. seccomp-radiance.json beside this file is Docker's default plus exactly those
+    # calls; point RADIANCE_SECCOMP at it (absolute host path) to run confined, and audit your
+    # own card stack before you do -- unset, the service runs unconfined, as it always has.
     security_opt:
-      - seccomp=unconfined
+      - seccomp=${RADIANCE_SECCOMP:-unconfined}
     ulimits:
       memlock: -1
     volumes:

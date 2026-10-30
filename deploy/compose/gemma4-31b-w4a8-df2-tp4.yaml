@@ -28,7 +28,7 @@ services:
     container_name: radiance-gemma4-31b-w4a8-df2-tp4
     command: >
       --model /models/gemma4-31b-dense-w4a8-df2-qkv.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 4 --max-num-seqs 16 --max-model-len 65536 --kv-cache-dtype fp8
       --num-speculative-tokens auto --max-num-batched-tokens 8192
       --busy-prefill-chunk 512 --prefill-interleave 1

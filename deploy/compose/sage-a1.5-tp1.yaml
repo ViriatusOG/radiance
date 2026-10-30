@@ -13,7 +13,7 @@ services:
     container_name: radiance-sage-a1.5-tp1
     command: >
       --model /models/sage-a1.5-fp8.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 1 --max-num-seqs 1 --max-model-len 262144 --kv-cache-dtype fp8
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
       --placement expert_tiered --host-pool-mib 8192

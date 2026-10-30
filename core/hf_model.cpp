@@ -51,15 +51,18 @@ std::string hfget_path() {
     return fs::is_regular_file(p, ec) ? p.lexically_normal().string() : std::string();
 }
 
-/* The script's exit status, or -1 when it could not be run. */
-int run_hfget(const std::string& script, const std::string& repo, const std::string& dest) {
+/* The script's exit status, or -1 when it could not be run. `rev` empty leaves the script's own
+ * default: the repo's moving default branch. */
+int run_hfget(const std::string& script, const std::string& repo, const std::string& dest,
+              const std::string& rev) {
     const pid_t pid = fork();
     if (pid < 0) {
         RAD_ERR("hfget: fork: %s", std::strerror(errno));
         return -1;
     }
     if (pid == 0) {
-        const char* argv[] = { "sh", script.c_str(), repo.c_str(), dest.c_str(), nullptr };
+        const char* argv[] = { "sh", script.c_str(), repo.c_str(), dest.c_str(),
+                               rev.empty() ? nullptr : rev.c_str(), nullptr };
         execv("/bin/sh", const_cast<char* const*>(argv));
         std::fprintf(stderr, "hfget: /bin/sh: %s\n", std::strerror(errno));
         _exit(127);
@@ -134,7 +137,7 @@ bool resolve_hf_model(Config& c) {
     }
     RAD_INFO("model: %s is not a path here; fetching it as a Hugging Face repo into %s",
              repo.c_str(), dest.c_str());
-    const int rc = run_hfget(script, repo, dest);
+    const int rc = run_hfget(script, repo, dest, c.model_revision);
     if (rc != 0) {
         if (rc == 3 && cached) {
             RAD_WARN("model: %s could not be checked for changes (hfget.sh, above); serving the "

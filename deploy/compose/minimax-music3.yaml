@@ -8,5 +8,5 @@ services:
     container_name: radiance-minimax-music3
     command: >
       --model /models/minimax-music3-bf16.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2

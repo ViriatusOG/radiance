@@ -8,6 +8,6 @@ services:
     container_name: radiance-qwen3.8-27b-paro
     command: >
       --model /models/qwen3.8-27b-paro-int4.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 1 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8
       --max-num-batched-tokens 2048 --embedding-placement ram --host-pool-mib 3072

@@ -7,6 +7,6 @@ services:
     container_name: radiance-minicpm5-2b
     command: >
       --model /models/minicpm5-2b-fp8.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8
       --gpu-headroom-mib 160 --max-num-batched-tokens 512

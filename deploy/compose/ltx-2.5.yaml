@@ -15,5 +15,5 @@ services:
       ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
     command: >
       --model /models/ltx-2.5-distilled-fp8.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 1 --vision-tower-placement ram

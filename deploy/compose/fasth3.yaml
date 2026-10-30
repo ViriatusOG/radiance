@@ -12,5 +12,5 @@ services:
     container_name: radiance-fasth3
     command: >
       --model /models/fasth3-8-step-v2-fp8.rad
-      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --host :: --port ${PORT:-8000} --api-key-env RADIANCE_API_KEY
       --tp 2 --vision-tower-placement ram
