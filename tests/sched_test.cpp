@@ -1725,6 +1725,48 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     f.commit_plain();
 }
 
+/* Every program carries a sentinel KV group at index 0: decl.kind 0 (RAD_KV_FULL), block size 1, no
+ * layers, and the manager's plan for it pages nothing, so it holds no blocks. The gate must not ask
+ * that group for the prompt's blocks: it has none to give, and the preempted request would wait
+ * for ever (engine_e2e_test's preemption case hung on it, with nothing left running). Here the
+ * group is appended, not at index 0, so the fixture's bindings stay where they are. */
+TEST(a_preempted_prefill_ignores_a_kv_group_that_holds_no_blocks) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    KVGroupInfo none;                        /* as the sentinel: kind 0, no block size, no layers */
+    none.name = "none";
+    f.prog.kv_groups.push_back(none);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 26, 64);
+    const size_t ng = f.prog.kv_groups.size() - 1;
+    f.kv.geom.g[ng].paged = false;           /* the manager pages nothing there ... */
+    f.kv.total[ng] = 0;                      /* ... and owns no block of it */
+    f.kv.freelist[ng].clear();
+    f.kv.refcnt[ng].clear();
+    for (int k = 63; k >= 0; --k) f.kv.state_free[ng].push_back(k);
+    f.cfg.preempt_wait_ms = 60000;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 2);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);                /* B's next block: B is preempted */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* A's blocks are back and nothing runs: B prefills its whole prompt again. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    f.commit_plain();
+}
+
 /* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
  * preempting the lowest-priority running request before the step is planned, so it cannot queue
  * forever behind a long decode (the 710 s stall in the daily's log). */

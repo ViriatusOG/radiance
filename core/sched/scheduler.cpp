@@ -1509,7 +1509,10 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
-        if (!gg.paged) continue;
+        /* A group the manager gives no blocks (the sentinel at index 0, which KVGeom reads as a
+         * full group of block size 1) asks nothing: ensure() skips it the same way. Counting it
+         * wanted the whole prompt from a pool of none and kept a preempted request out for good. */
+        if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
                        (int64_t)kv_->block_table(r.id, (int32_t)g).size();
         if (need < 0) need = 0;
