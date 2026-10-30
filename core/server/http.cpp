@@ -656,24 +656,64 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
             [st](bool ok) { if (st->on_close) st->on_close(ok); });
     };
 
+    /* The sum of buffered bodies across all connections, and its budget. Bodies are buffered
+     * whole before parse, admission or any accounting sees them, so the per-request cap alone
+     * bounds none of the total: a few hundred concurrent large POSTs is an OOM that reaches the
+     * engine before any 429 does. Over budget, the body is refused mid-read with a 429. */
+    const size_t inflight_limit =
+        o.max_inflight_body_bytes ? o.max_inflight_body_bytes : 8 * o.max_body_bytes;
+    auto inflight = std::make_shared<std::atomic<size_t>>(0);
+
     /* A body is read straight into the string the handler parses. httplib's own Request hands
      * it out only const, so it would be copied and held twice. A multipart body (an image
      * upload) is read part by part, each into its own string, under the same limit. */
-    auto read_and_bridge = [bridge](const httplib::Request& q, httplib::Response& s,
-                                    const httplib::ContentReader& read) {
+    auto read_and_bridge = [bridge, inflight, inflight_limit](const httplib::Request& q,
+                                                              httplib::Response& s,
+                                                              const httplib::ContentReader& read) {
         std::string body;
         std::vector<FormPart> form;
+        /* Every byte appended is held against the budget until the handler is done with the
+         * body it belongs to; the guard releases the whole reservation on any exit. */
+        size_t held = 0;
+        struct Releaser {
+            std::shared_ptr<std::atomic<size_t>> n;
+            size_t* held;
+            ~Releaser() { n->fetch_sub(*held); }
+        } releaser{inflight, &held};
+        bool over = false;
+        auto room = [&](size_t n) {
+            held += n;
+            if (inflight->fetch_add(n) + n <= inflight_limit) return true;
+            over = true;
+            return false;
+        };
         const bool ok = q.is_multipart_form_data()
             ? read([&form](const httplib::FormData& f) {
                        form.push_back(FormPart{ f.name, f.filename, f.content_type, {} });
                        return true;
                    },
-                   [&form](const char* p, size_t n) {
+                   [&form, &room](const char* p, size_t n) {
+                       if (!room(n)) return false;
                        if (!form.empty()) form.back().data.append(p, n);
                        return true;
                    })
-            : read([&body](const char* p, size_t n) { body.append(p, n); return true; });
+            : read([&body, &room](const char* p, size_t n) {
+                       if (!room(n)) return false;
+                       body.append(p, n);
+                       return true;
+                   });
         if (!ok) {
+            if (over) {
+                /* The summed budget, not the per-request cap: name it so the client reads the
+                 * retry for what it is, not as its own file having grown too large. */
+                s.status = 429;
+                s.set_header("Retry-After", "5");
+                s.set_content(error_body(q.path, 429, "rate_limit_error",
+                                         "the server is holding more request bodies than its "
+                                         "total buffering budget allows; retry shortly"),
+                              "application/json");
+                return;
+            }
             /* httplib has already set 413 for a body over the limit; anything else is a peer
              * that stopped sending partway. */
             if (s.status < 0) {

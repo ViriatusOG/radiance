@@ -276,6 +276,7 @@ int Server::run() {
     t.write_timeout_s = opt_.write_timeout_s;
     t.keep_alive_timeout_s = opt_.keep_alive_timeout_s;
     t.max_body_bytes = opt_.max_body_bytes;
+    t.max_inflight_body_bytes = opt_.max_inflight_body_bytes;
     return transport_.serve(router_, t);
 }
 

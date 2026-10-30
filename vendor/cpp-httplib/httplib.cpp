@@ -8453,6 +8453,20 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
                                       : StatusCode::PartialContent_206;
     }
 
+    // LOCAL CHANGE (radiance): a request the API-key gate refused (401
+    // answered before any handler saw it) has no further use for this
+    // connection, and must not keep one: its unread body would otherwise be
+    // drained on the keep-alive socket, which hands the refusing client a
+    // way to pace this worker — one byte per socket timeout, indefinitely.
+    // Say close on the response itself and end the connection; the unread
+    // bytes die with it, which is also what makes the drain below moot for
+    // the refusal.
+    if (res.status == StatusCode::Unauthorized_401 && !req.body_consumed_ &&
+        detail::has_framed_body(req)) {
+      close_connection = true;
+      connection_closed = true;
+    }
+
     // Serve file content by using a content provider
     auto file_open_error = false;
     if (!res.file_content_path_.empty()) {
@@ -8499,14 +8513,30 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 
   // Drain any unconsumed framed body to prevent request smuggling on
   // keep-alive. Without framing there is no body to drain — reading would
-  // consume the next request (issue #2450).
+  // consume the next request (issue #2450). A 401 refusal never gets here
+  // with a live connection (see the LOCAL CHANGE above).
+  //
+  // LOCAL CHANGE (radiance): the drain is bounded by a deadline, twice
+  // over — per packet gap (the stream's read wait shortened to 5 s for the
+  // drain: the connection's own 30 s bounds a gap, not the drain, and a
+  // client dribbling one byte per timeout would pace this worker
+  // indefinitely) and in total (the provider stops once 5 s have passed).
+  // Past either, the connection is closed and the unread bytes die with it.
   if (!req.body_consumed_ && detail::has_framed_body(req)) {
+    constexpr time_t kDrainBudgetSec = 5;
+    strm.set_read_timeout(kDrainBudgetSec, 0);
+    const auto drain_until = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(kDrainBudgetSec);
     int dummy_status;
     if (!detail::read_content(
             strm, req, payload_max_length_, dummy_status, nullptr,
-            [](const char *, size_t, size_t, size_t) { return true; }, false)) {
+            [drain_until](const char *, size_t, size_t, size_t) {
+              return std::chrono::steady_clock::now() < drain_until;
+            },
+            false)) {
       connection_closed = true;
     }
+    strm.set_read_timeout(read_timeout_sec_, read_timeout_usec_);
   }
 
   return ret;

@@ -195,6 +195,12 @@ struct TransportOptions {
     int         write_timeout_s = 600;
     int         keep_alive_timeout_s = 5; /* an idle connection's hold on a worker between requests */
     size_t      max_body_bytes = 512ull << 20;   /* images arrive base64 inside the JSON body */
+    /* The sum of bodies being buffered across all connections at once. The per-request cap says
+     * nothing about the sum, and a request's body is fully buffered before parse, admission or
+     * any memory accounting sees it; over budget, a body is refused 429 rather than pushed into
+     * RAM until the OOM killer chooses which process dies. 0 takes 8 concurrent bodies at the
+     * per-request cap. */
+    size_t      max_inflight_body_bytes = 0;
     std::string api_key;                  /* "" disables the check */
     bool        cors = true;
 };

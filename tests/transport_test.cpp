@@ -325,6 +325,86 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     CHECK_EQ(ask("HEAD / HTTP/1.1\r\nHost: t\r\n\r\n", /*head_only=*/true).status, 200);
 }
 
+/* A 401 from the key gate ends the connection. The refused request's body was never read, and
+ * keeping the socket alive makes those bytes somebody's problem: draining them hands the
+ * refusing client a way to pace a worker — one byte per socket timeout, forever — and not
+ * draining them leaves them to be read back as the next request. The refusal closes the socket
+ * instead, which buries the body with it, and says so on the response itself. */
+TEST(a_refusal_closes_the_connection) {
+    LiveServer s(4, 1, [](ServerOptions& o) { o.api_key = "k"; });
+    REQUIRE(s.srv->port() > 0);
+    s.sched.hang = false;
+    s.sched.reply = "ok";
+    const std::string body = "{\"prompt\":\"" + std::string(4096, 'x') + "\"}";
+    const int fd = s.open(post("/v1/completions", body, "Authorization: Bearer wrong\r\n"));
+    REQUIRE(fd >= 0);
+    const Reply r = read_reply(fd);
+    CHECK_EQ(r.status, 401);
+    CHECK_EQ(r.header("Connection"), std::string("close"));
+    /* Nothing follows the response: the server is done with this connection, however much of
+     * the body the client had already pushed at it. */
+    char c;
+    CHECK_EQ(::recv(fd, &c, 1, 0), (ssize_t)0);
+    /* And the very next connection lives — the pool is not, and the request that carries the
+     * key still reads normally. */
+    CHECK_EQ(ask(s, post("/v1/completions", body, "Authorization: Bearer k\r\n")).status, 200);
+}
+
+/* A drain that does run dies on its deadline. A GET carries its framed body to no handler at
+ * all — the router answers it in pre-routing, unread — and the anti-smuggling drain reads that
+ * body only to discard it. The connection's own 30 s read timeout bounds each packet gap, not
+ * the drain, so without a deadline a client dribbling one byte per gap holds a worker on a
+ * request that was already answered. With it: five seconds, then the connection. */
+TEST(a_stalled_drain_dies_on_its_deadline) {
+    LiveServer s(4, 1);
+    REQUIRE(s.srv->port() > 0);
+    const int fd = s.open("GET /health HTTP/1.1\r\nHost: t\r\nContent-Length: 200\r\n\r\n"
+                          "xxxxxxxxxxxxxxxx", 12);
+    REQUIRE(fd >= 0);
+    CHECK(has(status_line(fd), " 200 "));    /* health answered before the drain began */
+    const auto t0 = std::chrono::steady_clock::now();
+    char c;
+    const ssize_t n = ::recv(fd, &c, 1, 0);  /* ends when the drain gives up, not at 30 s */
+    const int64_t secs = (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+    CHECK_EQ(n, (ssize_t)0);
+    CHECK(secs >= 4 && secs <= 9);
+}
+
+/* The per-request body cap says nothing about the SUM of bodies buffering at once, and every
+ * byte of a body lands in RAM before parsing, admission or any accounting sees it. The summed
+ * budget refuses the newcomer with a 429 naming itself, and releases the reservation when the
+ * stalled peer goes — the next body of the same size then fits. */
+TEST(the_inflight_body_budget_refuses_the_newcomer_and_releases_the_stallers) {
+    LiveServer s(4, 1, [](ServerOptions& o) { o.max_inflight_body_bytes = 256; });
+    REQUIRE(s.srv->port() > 0);
+    s.sched.hang = false;
+    s.sched.reply = "ok";
+
+    /* A: 200 bytes announced, 120 sent, then silence. The worker sits in the read holding 120. */
+    const int a = s.open("POST /v1/completions HTTP/1.1\r\nHost: t\r\n"
+                         "Content-Type: application/json\r\nContent-Length: 200\r\n\r\n"
+                         + std::string(120, 'x'));
+    REQUIRE(a >= 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    /* B: a complete, modest 200-byte body — under its own cap, over the shared budget. */
+    const std::string body = "{\"prompt\":\"" + std::string(200 - 13, 'x') + "\"}";
+    REQUIRE_EQ(body.size(), (size_t)200);
+    const Reply over = ask(s, post("/v1/completions", body));
+    CHECK_EQ(over.status, 429);
+    CHECK_EQ(over.header("Retry-After"), std::string("5"));
+    CHECK(has(over.body, "budget"));
+    CHECK(!has(over.body, "too large"));    /* not dressed up as the per-request cap */
+
+    /* A hangs up; its bytes come off the budget with it. */
+    ::close(a);
+    s.fds.erase(std::find(s.fds.begin(), s.fds.end(), a));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const Reply fit = ask(s, post("/v1/completions", body));
+    CHECK_EQ(fit.status, 200);
+}
+
 /* A refusal the transport writes itself on an Anthropic path (the key gate's 401, a body over
  * the limit, a wrong method, an unknown path below /v1/messages) is in Anthropic's envelope, as
  * the handlers' refusals there are; the same refusal elsewhere stays OpenAI's. */

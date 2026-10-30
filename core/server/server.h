@@ -193,6 +193,9 @@ struct ServerOptions {
     int         write_timeout_s = 600;
     int         keep_alive_timeout_s = 5;
     size_t      max_body_bytes = 512ull << 20;
+    /* The sum of in-flight request bodies across connections; 0 takes the transport's default
+     * (eight bodies at the per-request cap). See TransportOptions. */
+    size_t      max_inflight_body_bytes = 0;
 };
 
 class Server {
