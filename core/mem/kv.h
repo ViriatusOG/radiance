@@ -454,6 +454,9 @@ public:
 
     /* Whether `seq` can grow to `n_tokens` without taking blocks from another sequence. */
     bool can_grow(uint64_t seq, int64_t n_tokens) const;
+    /* Drop every sequence's state slot and put back any slot neither free nor held. The
+     * scheduler calls this only when nothing is running (IKVManager::release_idle_states). */
+    int release_idle_states();
 
     /* Blocks a paged group can still hand out, including the lendable part. */
     int64_t available_blocks(int32_t group) const;

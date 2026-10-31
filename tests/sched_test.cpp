@@ -1752,6 +1752,131 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     f.commit_plain();
 }
 
+/* The whole-recompute predicate counts blocks the cache can lend back, not entries it already
+ * holds. With nothing running, the old gate never entered its victim loop, so a pool filled by
+ * finished conversations kept an overdue preempted request in Preempted forever -- the daily's
+ * "deadlocked at preempted" incident. The overdue pass reclaims cache entries before judging fit. */
+TEST(a_preempted_prefill_reclaims_cache_blocks_with_no_running_request) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(287, 64, /*priority=*/0);
+    const uint64_t a = f.submit(128, 64, /*priority=*/5);
+
+    /* Both prompts fill the pool; B's next token is refused and B is preempted. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), (size_t)2);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    f.commit_plain();
+
+    /* Nothing runs after A goes: B is the only sequence, at zero, overdue. Put the pool's free
+     * blocks in the cache so B's whole recompute no longer fits the free list alone. */
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    f.pc.seed(160);                          /* 10 blocks cached, 16 left free */
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK(f.pc.evict_calls > 0);
+    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    f.commit_plain();
+}
+
+/* A leaked state slot (held by nobody, missing from the free list) used to make can_grow false
+ * forever once nothing was running. The overdue pass puts the slot back and admits. */
+TEST(an_idle_overdue_prefill_reclaims_a_leaked_state_slot) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/4);
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 2;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(287, 64, /*priority=*/0);
+    const uint64_t a = f.submit(128, 64, /*priority=*/5);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+
+    for (size_t i = 0; i < f.kv.gs.size(); ++i)
+        if (!f.kv.geom.g[i].paged) f.kv.state_free[i].clear();
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    f.commit_plain();
+}
+
+/* can_grow on an id the manager has forgotten is false. That must not park an idle engine:
+ * admit adds the sequence. */
+TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/4);
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 2;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(287, 64, /*priority=*/0);
+    const uint64_t a = f.submit(128, 64, /*priority=*/5);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    f.kv.seqs.erase(b);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK(f.kv.has_sequence(b));
+    f.commit_plain();
+}
+
+/* Two prefills that cannot both stay up. Resetting the higher-priority one so the lower one can
+ * start just swaps who is at zero, and the higher one is admitted again. The higher one must
+ * finish its prompt and keep it. */
+TEST(a_preempted_prefill_does_not_reset_a_higher_priority_prefill) {
+    Fixture f;
+    f.build(/*blocks=*/18, /*states=*/64, /*max_tok=*/256);
+    f.cfg.checkpoint_interval = 64;
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 2;
+    CHECK_OK(f.start());
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 6;
+    f.pc.seed(96);
+
+    const uint64_t a = f.submit(192, 16, /*priority=*/5);
+    const uint64_t b = f.submit(128, 16, /*priority=*/0);
+
+    int64_t a_peak = 0;
+    bool a_reset = false;
+    for (int i = 0; i < 8; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+        const Request* ra = f.sch.find(a);
+        if (!ra) continue;
+        if (ra->n_computed < a_peak) a_reset = true;
+        if (ra->n_computed > a_peak) a_peak = ra->n_computed;
+    }
+    CHECK(!a_reset);
+    CHECK(a_peak >= 192);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+}
+
 /* Every program carries a sentinel KV group at index 0: decl.kind 0 (RAD_KV_FULL), block size 1, no
  * layers, and the manager's plan for it pages nothing, so it holds no blocks. The gate must not ask
  * that group for the prompt's blocks: it has none to give, and the preempted request would wait
@@ -1795,6 +1920,7 @@ TEST(a_preempted_prefill_ignores_a_kv_group_that_holds_no_blocks) {
 }
 
 /* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
+
  * preempting the lowest-priority running request before the step is planned, so it cannot queue
  * forever behind a long decode (the 710 s stall in the daily's log). */
 TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
@@ -1814,19 +1940,19 @@ TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
     f.commit_plain();
 
-    /* B's blocks are back in the pool; the old gate wants B's whole prompt plus one block of
-     * headroom beside A's next token, so it cannot admit B without a victim. */
+    /* B is the lower priority. Making room for it by resetting A just swaps who is at zero, and
+     * A is re-admitted at once. B stays queued; A keeps what it has built. */
     CHECK(f.sch.step() != nullptr);
-    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
-    CHECK_EQ(f.sch.metrics().preemptions, 2);
-    CHECK_EQ(f.sch.metrics().preempted_waiting, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    CHECK(f.sch.find(a)->n_computed > 0);
     f.commit_plain();
 }
 
-/* Several overdue preempted prefills: reclaiming for the head alone is not enough. Keep forcing
- * the lowest-priority runner until one overdue request can prefill, so the rest of the queue
- * cannot sit in Preempted behind a head that still does not fit. */
+/* A lower-priority overdue prefill may stay queued while a higher-priority runner keeps its
+ * blocks. Forcing that runner off just swaps who is at zero. The priority-5 request must not be
+ * the one left in Preempted while someone else still runs. */
 TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);   /* 20 x 16 = 320 tokens */
@@ -1846,9 +1972,11 @@ TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
         if (!f.sch.step()) break;
         f.commit_plain();
     }
-    CHECK(f.sch.metrics().preempted_waiting == 0 || f.sch.metrics().preempt_forced > 0);
+    const Request* ra = f.sch.find(a);
+    CHECK(ra);
+    CHECK(ra->state != ReqState::Preempted || f.sch.metrics().running == 0);
     CHECK(f.sch.metrics().running + f.sch.metrics().preempted_waiting > 0);
-    (void)a; (void)b; (void)c;
+    (void)b; (void)c;
 }
 
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {

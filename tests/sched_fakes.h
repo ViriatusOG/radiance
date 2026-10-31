@@ -89,6 +89,7 @@ struct FakeKV : IKVManager {
     std::vector<std::vector<int32_t>> refcnt;      /* per group, per block */
     std::vector<int64_t> total;
     std::vector<std::vector<int32_t>> state_free;  /* per group */
+    std::vector<int64_t> n_state_slots;            /* per group, 0 if paged */
 
     struct Seq {
         std::vector<std::vector<int32_t>> blocks;  /* per group */
@@ -110,6 +111,7 @@ struct FakeKV : IKVManager {
         refcnt.assign(gs.size(), {});
         total.assign(gs.size(), 0);
         state_free.assign(gs.size(), {});
+        n_state_slots.assign(gs.size(), 0);
         for (size_t i = 0; i < gs.size(); ++i) {
             if (geom.g[i].paged) {
                 total[i] = blocks_per_paged_group;
@@ -117,6 +119,7 @@ struct FakeKV : IKVManager {
                 for (int64_t b = blocks_per_paged_group - 1; b >= 0; --b)
                     freelist[i].push_back((int32_t)b);
             } else {
+                n_state_slots[i] = n_states;
                 for (int64_t k = n_states - 1; k >= 0; --k) state_free[i].push_back((int32_t)k);
             }
         }
@@ -276,6 +279,31 @@ struct FakeKV : IKVManager {
             }
         }
         return true;
+    }
+    /* IKVManager::release_idle_states. A test leaks a slot by clearing state_free; the next idle
+     * overdue step must put it back rather than wait forever. */
+    int release_idle_states() override {
+        int n = 0;
+        for (auto& kv : seqs) {
+            for (size_t i = 0; i < gs.size(); ++i) {
+                if (geom.g[i].paged || kv.second.state[i] < 0) continue;
+                state_free[i].push_back(kv.second.state[i]);
+                kv.second.state[i] = -1;
+                ++n;
+            }
+        }
+        for (size_t i = 0; i < gs.size(); ++i) {
+            if (geom.g[i].paged || n_state_slots[i] <= 0) continue;
+            std::vector<char> seen((size_t)n_state_slots[i], 0);
+            for (int32_t s : state_free[i])
+                if (s >= 0 && s < n_state_slots[i]) seen[(size_t)s] = 1;
+            for (int64_t s = 0; s < n_state_slots[i]; ++s) {
+                if (seen[(size_t)s]) continue;
+                state_free[i].push_back((int32_t)s);
+                ++n;
+            }
+        }
+        return n;
     }
     int64_t available_blocks(int32_t g) const override {
         return g >= 0 && g < (int32_t)freelist.size() ? (int64_t)freelist[(size_t)g].size() : 0;

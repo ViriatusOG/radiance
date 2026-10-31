@@ -79,8 +79,14 @@ struct IKVManager {
      * instead of deadlocking the engine (spec §17). */
     virtual bool can_ever_fit(int64_t n_tokens) const = 0;
 
-    /* Whether `seq` can be grown to `n_tokens` without taking blocks from another sequence. */
+    /* Whether `seq` can be grown to `n_tokens` without taking blocks from another sequence.
+     * A sequence the manager does not know is not a refusal: the caller adds it first. */
     virtual bool can_grow(uint64_t seq, int64_t n_tokens) const = 0;
+    /* Return state slots no running sequence holds, and any slot neither free nor held.
+     * The caller guarantees nothing is running. A slot held by a zeroed or forgotten sequence
+     * would otherwise keep an overdue preempted prefill waiting forever (spec §17). Returns
+     * how many slots were put back. A manager with no state leaves this as a no-op. */
+    virtual int release_idle_states() { return 0; }
 
     /* How many blocks a paged group can still hand out, including those lent to the expert slab
      * and recallable on demand. */
@@ -343,6 +349,7 @@ struct KVBinding final : IKVManager {
     int  preempt(uint64_t s) override               { return m->preempt(s); }
     bool can_ever_fit(int64_t n) const override     { return m->can_ever_fit(n); }
     bool can_grow(uint64_t s, int64_t n) const override { return m->can_grow(s, n); }
+    int  release_idle_states() override                 { return m->release_idle_states(); }
     const std::vector<int32_t>& block_table(uint64_t s, int32_t g) const override {
         return m->block_table(s, g);
     }

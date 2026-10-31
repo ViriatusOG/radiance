@@ -1238,8 +1238,26 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
      * headroom for every sequence already running. Admitting it on a shortfall is what turns
      * preemption into a loop: it prefills a chunk, the pool refuses the next step, it is taken
-     * back to zero, and the same chunk is attempted again. */
-    if (r.state == ReqState::Preempted && !preempted_can_prefill(s)) return kAdmitWait;
+     * back to zero, and the same chunk is attempted again. The predicate counts blocks the cache
+     * can lend back, not cache-held entries, so an overdue request reclaims first; a fresh one
+     * reclaims inside ensure() below. */
+    if (r.state == ReqState::Preempted) {
+        if (preempt_wait_overdue(s)) {
+            int rounds = 0;
+            while (!preempted_can_prefill(s) && rounds < kEvictRounds &&
+                   cfg_.prefix_cache && pc_ && pc_->evict(kEvictBlocks) > 0)
+                ++rounds;
+            /* Nothing else is running, so a missing state slot will not come back by waiting.
+             * Put leaked slots back, then admit. A recompute the empty pool cannot hold is
+             * failed below (spec §17) rather than left in kAdmitWait, which parks the engine. */
+            if (!preempted_can_prefill(s) && running_.empty())
+                (void)kv_->release_idle_states();
+        }
+        if (!preempted_can_prefill(s)) {
+            if (!(running_.empty() && preempt_wait_overdue(s) && kv_->can_ever_fit(s.seq_len())))
+                return kAdmitWait;
+        }
+    }
 
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
 
@@ -1511,17 +1529,18 @@ void Scheduler::undo_hit(SchedReq& s) {
 }
 
 /* Whether a preempted request can be admitted without becoming the next victim. The first
- * requirement is the whole recompute's blocks; the second is one block per running sequence for
- * the step after this one. Without that headroom, a decode step takes the block this prefill
- * just reserved, the pool refuses the next chunk, and preempt_back() puts it back to zero again. */
+ * requirement is the whole recompute's blocks. The second is the blocks every running sequence
+ * still needs: a prefill must be able to finish its prompt, and every runner keeps one block
+ * past that. Counting only the next token admits this recompute against the loan those remaining
+ * chunks still need; the next ensure then fails and preempt_back() resets that prefill to zero,
+ * which is the loop. */
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len();
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
-        /* A group the manager gives no blocks (the sentinel at index 0, which KVGeom reads as a
-         * full group of block size 1) asks nothing: ensure() skips it the same way. Counting it
+        /* A group the manager gives no blocks (the sentinel at index 0) asks nothing. Counting it
          * wanted the whole prompt from a pool of none and kept a preempted request out for good. */
         if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
@@ -1530,18 +1549,22 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
         for (int32_t slot : running_) {
             const SchedReq& rs = *reqs_[(size_t)slot];
             if (!rs.req) continue;
-            const int64_t next = rs.req->n_computed + 1;
-            const int64_t rows = (next + gg.block_size - 1) / gg.block_size;
-            const int64_t extra = rows - (int64_t)kv_->block_table(rs.req->id, (int32_t)g).size();
-            need += 1;                       /* the step after this one keeps its block */
-            if (extra > 0) need += extra;    /* and the block its next token already needs */
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;                       /* one block past that, so the next step is not the victim */
         }
         if (need > kv_->available_blocks((int32_t)g)) return false;
     }
 
     /* Stateful groups: the recompute needs its state slots back, and every running sequence must
-     * keep the slot it already holds. */
-    if (!kv_->can_grow(r.id, target)) return false;
+     * keep the slot it already holds. A sequence the manager does not know is not a refusal:
+     * admit_one adds it, and can_grow on a missing id is false forever. */
+    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];
         if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
@@ -1580,9 +1603,16 @@ const RadBatch* Scheduler::step() {
     /* A preempted prefill waits for the whole-recompute gate so it cannot loop. That wait is
      * bounded here, for every overdue preempted request, not only the queue head: a head that
      * still cannot fit after one victim must not leave the rest of the queue waiting forever.
-     * Reclaim cache blocks once, then preempt the lowest-priority running request until one
-     * overdue request can prefill or nothing is left running. The admission pass below sees the
-     * reclaimed blocks; nothing is planned for a victim this step. */
+     * Reclaim cache blocks first (not just once: even with nothing running, cached conversations
+     * can hold the pool and the admission predicate below counts only blocks the cache can lend
+     * back), then preempt a running request until one overdue request can prefill or nothing is
+     * left running. The admission pass below sees the reclaimed blocks; nothing is planned for a
+     * victim this step.
+     *
+     * A request still prefilling its prompt is never a victim while another running request is
+     * decoding: killing it throws away a mostly built recompute, and three long prefills over a
+     * pool that fits two is exactly when that reset repeats. Past this gate a decoder can still
+     * be preempted after its prompt is built. */
     bool overdue = false;
     for (int32_t slot : waiting_) {
         const SchedReq& s = *reqs_[(size_t)slot];
@@ -1592,26 +1622,61 @@ const RadBatch* Scheduler::step() {
         }
     }
     if (overdue) {
-        bool evicted = false;
-        while (!running_.empty()) {
-            SchedReq* fit = nullptr;
+        int evict_rounds = 0;
+        bool released_states = false;
+        for (;;) {
+            bool fit = false;
             for (int32_t slot : waiting_) {
                 SchedReq& s = *reqs_[(size_t)slot];
                 if (!s.req || s.req->state != ReqState::Preempted || !preempt_wait_overdue(s))
                     continue;
-                if (preempted_can_prefill(s)) { fit = &s; break; }
+                if (preempted_can_prefill(s)) { fit = true; break; }
             }
             if (fit) break;
-            if (!evicted && pc_ && cfg_.prefix_cache) {
-                (void)pc_->evict(kEvictBlocks);
-                evicted = true;
+            if (evict_rounds < kEvictRounds && pc_ && cfg_.prefix_cache &&
+                pc_->evict(kEvictBlocks) > 0) {
+                ++evict_rounds;
                 continue;
             }
-            const SchedReq& victim = *reqs_[(size_t)running_.back()];
+            if (running_.empty()) {
+                /* One reclaim of state slots no runner holds. Waiting again changes nothing. */
+                if (!released_states && kv_->release_idle_states() > 0) {
+                    released_states = true;
+                    continue;
+                }
+                break;
+            }
+            /* The victim is a decoding request the overdue waiter is ahead of (higher priority, or
+             * the same priority and an earlier arrival). Killing a request the waiter is not ahead
+             * of just swaps who is at zero: that request is re-admitted at once and the prefill
+             * resets forever. A runner still building its prompt is never a victim. */
+            int32_t waiter = -1;
+            for (int32_t slot : waiting_) {
+                const SchedReq& s = *reqs_[(size_t)slot];
+                if (s.req && s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
+                    waiter = slot;           /* waiting_ is sorted: the first is the one ahead */
+                    break;
+                }
+            }
+            int32_t victim = -1;
+            for (int32_t slot : running_) {
+                const Request& r = *reqs_[(size_t)slot]->req;
+                if (r.n_computed < (int64_t)r.prompt.size()) continue;
+                if (waiter >= 0 && ahead_of(waiter, slot)) victim = slot;
+            }
+            if (victim < 0) break;
+            const SchedReq& v = *reqs_[(size_t)victim];
             RAD_DEBUG("step: preempted prefill overdue; preempting the lowest-priority running "
                       "request %llu",
-                      victim.req ? (unsigned long long)victim.req->id : 0ull);
+                      v.req ? (unsigned long long)v.req->id : 0ull);
             ++m_.preempt_forced;
+            /* preempt_back() always takes running_.back(); move the chosen victim there. Popping
+             * it leaves the rest of running_ in its sorted order. */
+            int32_t back = running_.back();
+            if (victim != back) {
+                running_.erase(std::find(running_.begin(), running_.end(), victim));
+                running_.push_back(victim);
+            }
             preempt_back();
         }
     }
@@ -1923,6 +1988,18 @@ const RadBatch* Scheduler::step() {
             admit_full_ = 0;
             const int as = admit_one(s, budget, areserve);
             if (as == kAdmitWait) { ++at; continue; }
+            /* An overdue preempted prefill on an idle engine that still cannot be admitted will
+             * not become admissible by waiting: nothing is running to finish and free the pool.
+             * Fail it (spec §17) and ask the next request, instead of parking the step loop. */
+            if (as < 0 && running_.empty() && s.req && s.req->state == ReqState::Preempted &&
+                preempt_wait_overdue(s)) {
+                RAD_WARN("request %llu failed: overdue preempted prefill could not be admitted "
+                         "with nothing running (%s)",
+                         (unsigned long long)s.req->id, rad_strerror(as));
+                close_request(s, ReqState::Failed, "preempt_admission", false, true, as,
+                              "overdue preempted prefill could not be admitted on an idle engine");
+                continue;
+            }
             if (as < 0) break;                     /* head of line: do not admit behind it */
             if (admit_full_ > s.sched_tokens && capped_at < 0) {
                 capped_at = (int32_t)plan_.e.size();

@@ -797,11 +797,12 @@ private:
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
-    /* A preempted request waits until the pool can hold its WHOLE remaining recompute plus one
-     * block of headroom for every running sequence; otherwise admitting it now just gets it
-     * preempted again next step and the prefill loops. `preempt_wait_overdue` bounds that wait
-     * for every overdue preempted request: after --preempt-wait-ms the scheduler reclaims cache
-     * blocks and preempts lowest-priority running requests until one of them can prefill. */
+    /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
+     * of every running prefill, and one block of headroom per runner. Admitting it against only
+     * the next token steals the blocks a running prefill still needs and preempt_back() resets
+     * that prefill to zero — the loop. `preempt_wait_overdue` bounds the wait for every overdue
+     * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
+     * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
     bool preempted_can_prefill(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
