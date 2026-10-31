@@ -3895,7 +3895,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.15.0
+I STARTUP REPORT -- radiance 1.15.1
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
