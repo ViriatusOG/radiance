@@ -1350,6 +1350,27 @@ int Engine::declare() {
                        : "the model carries no vision tower");
     }
 
+    /* --prefill-interleave not given: auto:1, decode-only steps for as long as a chunk step took,
+     * so decoders keep about half their rate while prompts prefill (measured on Flash-Next: 8
+     * decoders beside a 64K prefill, 12 -> 41 tokens/s each). Not where the schedule must not
+     * follow timing (--deterministic) or nothing decodes beside a prefill (a generator's passes,
+     * KL mode's scoring); an explicit N or auto[:SHARE] is kept as given. */
+    if (!cfg_.prefill_interleave_set) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        const char* none = pb.gen_rows > 0 ? "a generator: its passes carry no decode rows"
+                         : cfg_.kld() ? "KL mode scores documents and decodes nothing" : nullptr;
+        if (none || cfg_.deterministic) {
+            decide("--prefill-interleave", "0", none ? none : "--deterministic keeps a "
+                   "timing-independent schedule (--prefill-interleave N or auto overrides it)");
+        } else {
+            cfg_.prefill_interleave = -1;
+            cfg_.prefill_interleave_share = 1.0;
+            decide("--prefill-interleave", "auto:1", "decode-only steps for as long as a chunk "
+                   "step took while prompts prefill beside decoding sequences");
+        }
+    }
+
     /* Control vectors are resolved before any rank declares, because the plugin reads the
      * direction table from RadBuildCtx. Only `--control-vector off|on` loads one; without it
      * nothing is looked for and the graph declares no projection op. With it, a plugin that does

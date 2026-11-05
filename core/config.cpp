@@ -78,8 +78,8 @@ static const Flag g_flags[] = {
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
                                         "sequences decode, at most 64; auto fits them in a quarter\n"
                                         "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
-                                        "0 (default) lets every step\n"
-                                        "carry a chunk" },
+                                        "0 lets every step carry a chunk; served default auto:1\n"
+                                        "(0 under --deterministic, KL mode, generators)" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -575,6 +575,7 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--prefill-interleave"))    {
             if (!(v = need(i))) return RAD_E_INVAL;
+            c->prefill_interleave_set = true;
             if (!std::strcmp(v, "auto")) { c->prefill_interleave = -1; c->prefill_interleave_share = 0.25; }
             else if (!std::strncmp(v, "auto:", 5)) {
                 /* auto:SHARE -- decode-only steps for up to SHARE x a chunk step's time, 0 < SHARE <= 4 */
