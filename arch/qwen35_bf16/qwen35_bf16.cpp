@@ -12,7 +12,10 @@
  *
  * The unquantised release (quantisation descriptor ""), every projection a bf16 GEMM. The
  * block-scaled fp8 release is qwen35_fp8's. The lm_head is declared at whatever the model holds,
- * so a recipe-made block-fp8 head uses the fp8 logits kernel.
+ * so a recipe-made block-fp8 head uses the fp8 logits kernel. Likewise each trunk linear: one
+ * packed losslessly as `bf16x12` (data/recipes/q38-27b-bf16x12-df2.recipe) is read by gemm_nt at
+ * that dtype, which gives the bf16 GEMM's bytes from about three quarters of the weight's
+ * (decl_linear_bf16 in rad_arch.h).
  *
  * ============================== THE SHAPE, AT 27B ==============================
  *

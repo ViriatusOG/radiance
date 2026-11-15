@@ -10179,6 +10179,111 @@ TEST(qwen35_bf16_steps_lint_clean_with_a_dflash2_drafter) {
     CHECK_EQ(q.draft_depth, 0);
 }
 
+/* data/recipes/q38-27b-bf16x12-df2.recipe's encodings: the nine linears of the bf16 blocks packed
+ * as bf16x12, everything else plain. Each packed linear is declared over every plane at its codes'
+ * dtype (no view, the shape, shard and row parts as before) and its gemm_nt reads bf16x12
+ * (decl_linear_bf16). Every other weight, op and parameter is the plain container's, the drafter's
+ * included, at one rank and two. A linear the recipe leaves bf16 (down here) keeps the bf16 GEMM,
+ * and a model holding every weight plain declares what one with no encodings does. The drafter's
+ * keys come first: its names contain the trunk's. Its head is u2 in both, as in every recipe
+ * (codes=u2 zero=u8 group=128 scale=f16): a head the container holds plain is a bf16 head of its
+ * own, declared without the scale view (rad_block_dflash2.h). */
+TEST(qwen35_bf16_reads_a_bf16x12_trunk_at_bf16x12_and_changes_nothing_else) {
+    RadEncoding x12;
+    rad_enc_clear(&x12);
+    rad_enc_copy_str(x12.scheme, "bf16x12");
+    rad_enc_add_plane(&x12, "codes", RAD_U8, 1, 1);
+    rad_enc_add_plane(&x12, "d", RAD_U4, 1, 1);
+    rad_enc_add_plane(&x12, "e", RAD_U8, 1, 32);
+    rad_enc_add_table(&x12, "esc", RAD_BF16, 64, 32);
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+    REQUIRE(rad_enc_valid(&u2));
+    static const char* const kLinears[] = { "attn_qg.weight", "attn_k.weight", "attn_v.weight",
+                                            "attn_output.weight", "ssm_in.weight", "ssm_z.weight",
+                                            "ssm_out.weight", "ffn_gate_up.weight",
+                                            "ffn_down.weight" };
+    auto trunk_linear = [](const std::string& n, const char* t) {
+        const size_t k = std::strlen(t);
+        return n.rfind("blk.", 0) == 0 && n.size() > k && n.compare(n.size() - k, k, t) == 0;
+    };
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+
+    /* `b` against `a`: the weights packed in `b` are those `packed` names; `*read_x12` counts
+     * b's gemm_nt at bf16x12. */
+    auto same_but_packed = [&](const RadBuilder& a, const RadBuilder& b,
+                               const std::function<bool(const std::string&)>& packed,
+                               int* read_x12) {
+        *read_x12 = -1;
+        REQUIRE_EQ(a.weights.size(), b.weights.size());
+        for (size_t i = 0; i < a.weights.size(); ++i) {
+            const RecWeight &x = a.weights[i], &y = b.weights[i];
+            REQUIRE_EQ(x.name, y.name);
+            const bool p = packed(y.name);
+            CHECK_EQ(y.d.dtype, p ? (uint32_t)RAD_U8 : x.d.dtype);
+            if (p) CHECK(x.d.dtype == RAD_BF16 && !y.d.source && !y.d.planes);
+            CHECK((x.d.source == nullptr) == (y.d.source == nullptr));
+            CHECK((x.d.planes == nullptr) == (y.d.planes == nullptr));
+            REQUIRE_EQ(x.d.rank, y.d.rank);
+            for (uint32_t r = 0; r < x.d.rank; ++r) CHECK_EQ(x.d.shape[r], y.d.shape[r]);
+            CHECK(x.d.access == y.d.access && x.d.shard == y.d.shard &&
+                  x.d.optional == y.d.optional && x.d.group.layer == y.d.group.layer &&
+                  x.d.group.expert == y.d.group.expert && x.d.group.slot == y.d.group.slot);
+            REQUIRE_EQ(x.d.n_row_parts, y.d.n_row_parts);
+            for (int r = 0; r < x.d.n_row_parts; ++r) CHECK_EQ(x.d.row_parts[r], y.d.row_parts[r]);
+        }
+        *read_x12 = 0;
+        REQUIRE_EQ(a.ops.size(), b.ops.size());
+        for (size_t i = 0; i < a.ops.size(); ++i) {
+            const RecOp &x = a.ops[i], &y = b.ops[i];
+            REQUIRE_EQ(x.op, y.op);
+            CHECK(x.w == y.w && x.reads == y.reads && x.writes == y.writes);
+            const bool p = y.op == "gemm_nt" && y.w.size() == 1 &&
+                           packed(b.weights[y.w[0] - 1].name);
+            *read_x12 += p;
+            REQUIRE_EQ(x.p.size(), y.p.size());
+            for (size_t k = 0; k < x.p.size(); ++k) {
+                const RecParam &u = x.p[k], &v = y.p[k];
+                CHECK(u.key == v.key && u.kind == v.kind && u.ival == v.ival && u.ihi == v.ihi &&
+                      u.dval == v.dval);
+                if (p && u.key == "dtype")
+                    CHECK(u.sval == "bf16" && v.sval == "bf16x12");
+                else
+                    CHECK_EQ(u.sval, v.sval);
+            }
+        }
+    };
+
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank)
+            for (bool keep_down : { false, true }) {
+                RadBuildCtx ctx = spec_ctx(rank, world, 7);
+                RadBuilder a, b, c;
+                b.encs = { { "dflash.draft_head", u2 }, { "dflash.", plain } };
+                for (const char* t : kLinears)
+                    b.encs.push_back({ t, keep_down && !std::strcmp(t, "ffn_down.weight") ? plain
+                                                                                       : x12 });
+                c.encs = { { "dflash.draft_head", u2 }, { "", plain } };
+                REQUIRE_EQ(qwen35_bf16::declare(&a, df.meta(), &ctx), RAD_OK);
+                REQUIRE_EQ(qwen35_bf16::declare(&b, df.meta(), &ctx), RAD_OK);
+                REQUIRE_EQ(qwen35_bf16::declare(&c, df.meta(), &ctx), RAD_OK);
+                auto packed = [&](const std::string& n) {
+                    for (const char* t : kLinears)
+                        if (trunk_linear(n, t))
+                            return !(keep_down && !std::strcmp(t, "ffn_down.weight"));
+                    return false;
+                };
+                /* The 8-layer fixture: q|gate, k, v and o in 2 attention layers, in, z and out in
+                 * 6 delta-net layers, gate|up and down in 8 feed-forwards. */
+                int n = 0;
+                same_but_packed(a, b, packed, &n);
+                CHECK_EQ(n, 2 * 4 + 6 * 3 + 8 * (keep_down ? 1 : 2));
+                same_but_packed(a, c, [](const std::string&) { return false; }, &n);
+                CHECK_EQ(n, 0);
+            }
+}
+
 /* What a step issues at two ranks: one ar_rmsnorm per folded boundary (rad_norm_bf16.h), and the
  * standalone all-reduce and add only where `x` is read between blocks: after a drafter tap layer
  * and after the last layer (the final norm), besides the embedding's all-reduce. Exact wire here,

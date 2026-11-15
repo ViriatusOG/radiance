@@ -132,19 +132,21 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
 
     w_norm   = decl_w(b, nm.f("blk.%d.attn_norm.weight", l),   RAD_F32,  {g.n_embd},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_qg     = decl_w(b, nm.f("blk.%d.attn_qg.weight", l),     RAD_BF16, {qg_dim, g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
-    w_k      = decl_w(b, nm.f("blk.%d.attn_k.weight", l),      RAD_BF16, {kv_dim, g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
-    w_v      = decl_w(b, nm.f("blk.%d.attn_v.weight", l),      RAD_BF16, {kv_dim, g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
+    const LinearBF16 qg = decl_linear_bf16(b, g, nm.f("blk.%d.attn_qg.weight", l),
+                                           {qg_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    const LinearBF16 kp = decl_linear_bf16(b, g, nm.f("blk.%d.attn_k.weight", l),
+                                           {kv_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    const LinearBF16 vp = decl_linear_bf16(b, g, nm.f("blk.%d.attn_v.weight", l),
+                                           {kv_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    w_qg = qg.w; w_k = kp.w; w_v = vp.w;
     /* One gain vector shared by every head, so replicated across ranks. */
     w_q_norm = decl_w(b, nm.f("blk.%d.attn_q_norm.weight", l), RAD_F32,  {g.head_dim},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     w_k_norm = decl_w(b, nm.f("blk.%d.attn_k_norm.weight", l), RAD_F32,  {g.head_dim},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_o      = decl_w(b, nm.f("blk.%d.attn_output.weight", l), RAD_BF16, {g.n_embd, q_dim},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
+    const LinearBF16 out = decl_linear_bf16(b, g, nm.f("blk.%d.attn_output.weight", l),
+                                            {g.n_embd, q_dim}, RAD_SHARD_COL, grp_layer(l));
+    w_o = out.w;
 
     /* ---- ops, in run order except attn_paged (see there). Each states its read and write sets,
      * from which the buffer planner computes liveness. */
@@ -153,17 +155,17 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
 
     op_qg = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", qg_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", qg.dtype)),
                    RAD_WEIGHTS(w_qg)),
                {w.h}, {w.qg});
     op_kp = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", kv_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", kp.dtype)),
                    RAD_WEIGHTS(w_k)),
                {w.h}, {w.k});
     op_vp = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", kv_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", vp.dtype)),
                    RAD_WEIGHTS(w_v)),
                {w.h}, {w.v});
 
@@ -245,7 +247,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
 
     op_o = rw(b, RAD_OP(b, "gemm_nt",
                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
-                             RAD_INT("K", q_dim), RAD_STR("dtype", g.dtype)),
+                             RAD_INT("K", q_dim), RAD_STR("dtype", out.dtype)),
                   RAD_WEIGHTS(w_o)),
               {w.attn}, {w.h});
 

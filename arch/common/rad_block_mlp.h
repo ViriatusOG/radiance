@@ -71,17 +71,20 @@ inline int MlpBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, c
 
     w_norm    = decl_w(b, nm.f("blk.%d.ffn_norm.weight", l),    RAD_F32,  {g.n_embd},
                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_gate_up = decl_w(b, nm.f("blk.%d.ffn_gate_up.weight", l), RAD_BF16, {2 * g.n_ff, g.n_embd},
-                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l), 0, {g.n_ff, g.n_ff});
-    w_down    = decl_w(b, nm.f("blk.%d.ffn_down.weight", l),    RAD_BF16, {g.n_embd, g.n_ff},
-                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
+    const LinearBF16 gu = decl_linear_bf16(b, g, nm.f("blk.%d.ffn_gate_up.weight", l),
+                                           {2 * g.n_ff, g.n_embd}, RAD_SHARD_ROW, grp_layer(l),
+                                           {g.n_ff, g.n_ff});
+    const LinearBF16 dn = decl_linear_bf16(b, g, nm.f("blk.%d.ffn_down.weight", l),
+                                           {g.n_embd, g.n_ff}, RAD_SHARD_COL, grp_layer(l));
+    w_gate_up = gu.w;
+    w_down    = dn.w;
 
     RAD_ARCH_TRY(nq.declare(b, g, w_norm, w.x, w.h, fold, ar_in));
     op_norm = nq.op_norm;
 
     op_gate_up = rw(b, RAD_OP(b, "gemm_nt",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", 2 * g.n_ff),
-                                   RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                                   RAD_INT("K", g.n_embd), RAD_STR("dtype", gu.dtype)),
                         RAD_WEIGHTS(w_gate_up)),
                     {w.h}, {w.gate_up});
 
@@ -93,7 +96,7 @@ inline int MlpBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, c
 
     op_down = rw(b, RAD_OP(b, "gemm_nt",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
-                                RAD_INT("K", g.n_ff), RAD_STR("dtype", g.dtype)),
+                                RAD_INT("K", g.n_ff), RAD_STR("dtype", dn.dtype)),
                      RAD_WEIGHTS(w_down)),
                  {w.ffn}, {w.h});
 

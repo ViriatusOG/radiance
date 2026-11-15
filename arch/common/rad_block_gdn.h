@@ -177,11 +177,13 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
 
     w_norm     = decl_w(b, nm.f("blk.%d.attn_norm.weight", l),      RAD_F32,  {g.n_embd},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_in       = decl_w(b, nm.f("blk.%d.ssm_in.weight", l),         RAD_BF16, {in_dim, g.n_embd},
-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l), 0,
-                        {cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.n_head_v, cfg.n_head_v});
-    w_z        = decl_w(b, nm.f("blk.%d.ssm_z.weight", l),          RAD_BF16, {v_dim, g.n_embd},
-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
+    const LinearBF16 in = decl_linear_bf16(b, g, nm.f("blk.%d.ssm_in.weight", l),
+                                           {in_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l),
+                                           {cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.n_head_v,
+                                            cfg.n_head_v});
+    const LinearBF16 z  = decl_linear_bf16(b, g, nm.f("blk.%d.ssm_z.weight", l),
+                                           {v_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    w_in = in.w; w_z = z.w;
     /* The depthwise convolution shards with its channels. The checkpoint ships [conv_dim, 1, 4];
      * the depthwise group extent is squeezed at convert. Qwen3.5's conv1d has bias=False, so the
      * bias operand is passed absent. */
@@ -196,18 +198,19 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     /* One gain vector over head_v shared by every head, so replicated. */
     w_out_norm = decl_w(b, nm.f("blk.%d.ssm_norm.weight", l),       RAD_F32,  {cfg.head_v},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_out      = decl_w(b, nm.f("blk.%d.ssm_out.weight", l),        RAD_BF16, {g.n_embd, v_dim},
-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
+    const LinearBF16 out = decl_linear_bf16(b, g, nm.f("blk.%d.ssm_out.weight", l),
+                                            {g.n_embd, v_dim}, RAD_SHARD_COL, grp_layer(l));
+    w_out = out.w;
 
     RAD_ARCH_TRY(nq.declare(b, g, w_norm, w.x, w.h, fold, ar_in));
     op_norm = nq.op_norm;
     op_in = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", in_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", in.dtype)),
                    RAD_WEIGHTS(w_in)), {w.h}, {w.in});
     op_z  = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", v_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", z.dtype)),
                    RAD_WEIGHTS(w_z)), {w.h}, {w.z});
 
     /* ---- the chunked path (prefill). `chunk` is RAD_DERIVED on gdn_kkt_solve and gdn_chunk_scan
@@ -265,7 +268,7 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
 
     op_out = rw(b, RAD_OP(b, "gemm_nt",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
-                               RAD_INT("K", v_dim), RAD_STR("dtype", g.dtype)),
+                               RAD_INT("K", v_dim), RAD_STR("dtype", out.dtype)),
                     RAD_WEIGHTS(w_out)),
                 {w.o}, {w.h});
     if (g.world > 1)
