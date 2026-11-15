@@ -1428,9 +1428,11 @@ TEST(a_decode_step_issues_both_layer_types_in_order) {
                                   "sigmoid", "mul", "gemm_nt", "add" };
             for (const char* s : seq) want.push_back(s);
         } else {
-            /* Decode takes the recurrent path, which folds in the gated norm. */
-            const char* seq[] = { "rmsnorm", "gemm_nt", "gemm_nt",
-                                  "gdn_conv_update", "gdn_recurrent_update", "gemm_nt", "add" };
+            /* Decode takes the recurrent path, which folds in the gated norm. In a pure decode
+             * step z (the second gemm_nt) follows the convolution, so it runs beside that kernel
+             * rather than beside in (rad_block_gdn.h). */
+            const char* seq[] = { "rmsnorm", "gemm_nt", "gdn_conv_update", "gemm_nt",
+                                  "gdn_recurrent_update", "gemm_nt", "add" };
             for (const char* s : seq) want.push_back(s);
         }
         for (const char* s : { "rmsnorm", "gemm_nt", "silu_mul", "gemm_nt", "add" })

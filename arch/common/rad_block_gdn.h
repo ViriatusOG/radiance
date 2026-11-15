@@ -3,9 +3,10 @@
  * Hybrid models are the normal case (spec §7.2): Qwen3.5-27B has 48 GDN layers to 16
  * full-attention ones. This block composes with AttnGatedBF16 and MlpBF16 in one plugin.
  *
- *   rmsnorm -> in gemm ([q|k|v|a|b]) -> z gemm
- *     prefill: gdn_conv_prep -> gdn_kkt_solve -> gdn_chunk_scan -> gdn_gated_rmsnorm
- *     decode:  gdn_conv_update -> gdn_recurrent_update       (which folds the gated norm)
+ *   rmsnorm -> in gemm ([q|k|v|a|b])
+ *     prefill: z gemm -> gdn_conv_prep -> gdn_kkt_solve -> gdn_chunk_scan -> gdn_gated_rmsnorm
+ *     decode:  gdn_conv_update -> z gemm -> gdn_recurrent_update   (which folds the gated norm)
+ *   (z after the convolution in a pure decode step; a mixed step issues it first, as prefill)
  *   -> out gemm -> [all_reduce] -> residual add
  *
  * The two paths branch on phase, which spec §10 allows: both sequences are declared, resolved
@@ -286,10 +287,6 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t conv_dim = cfg.conv_dim();
     const int64_t H        = cfg.n_head_v;
 
-    nq.step(c, T);
-    RAD_ISSUE(c, op_in,   brows(w.h, T), RAD_W(w_in),   brows(w.in, T));
-    RAD_ISSUE(c, op_z,    brows(w.h, T), RAD_W(w_z),    brows(w.z, T));
-
     /* Each path runs over its own run of sequences (details in rad_block_gdn_fp8.h's step()). The
      * step is sorted decode-first and every kernel derives grid and rows from cu_seqlens, which
      * holds absolute offsets: the prefill half gets `cu + D` with token operands at their base,
@@ -297,6 +294,21 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
      * slice. */
     int64_t D = 0, DT = 0;
     batch_split(batch, &D, &DT);
+
+    /* In a pure decode step z goes after the convolution. in and z read only the normed input, so
+     * the engine runs z beside in when it follows in, and at decode heights the two then share
+     * the memory and both stretch: on two R9700s at Qwen3.8-27B's verify shape, ~145 us each
+     * against ~72 and ~43 apart. The convolution reads only in's output, so z behind it runs
+     * beside that small kernel instead, and the recurrent update, which reads z, waits for it.
+     * Only the order of two independent launches changes, so the bytes do not: measured
+     * 166 -> 142 us from in to the recurrent update, and 1.6 ms off a 47 ms step, with the same
+     * greedy text. A prefill or mixed step keeps z beside in: there it is a large GEMM, and the
+     * order was measured at decode only. */
+    const bool z_late = D > 0 && D == S;
+
+    nq.step(c, T);
+    RAD_ISSUE(c, op_in,   brows(w.h, T), RAD_W(w_in),   brows(w.in, T));
+    if (!z_late) RAD_ISSUE(c, op_z, brows(w.h, T), RAD_W(w_z), brows(w.z, T));
     /* The decode half's band. In a mixed step max_q_len is the prefill chunk's; in a pure decode
      * step it is already right, so a batch leaving max_q_len_decode zero still works there. */
     const int32_t qd = batch->phase == RAD_PHASE_MIXED ? batch->max_q_len_decode : batch->max_q_len;
@@ -310,6 +322,7 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     praw(cv_idx, RAD_I32, D), praw(batch->num_accepted, RAD_I32, D),
                     praw(batch->cu_seqlens, RAD_I32, D + 1),
                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT));
+        if (z_late) RAD_ISSUE(c, op_z, brows(w.h, T), RAD_W(w_z), brows(w.z, T));
         /* a and b are the last 2*n_head_v columns of the projection row, read in place. The
          * recurrent kernel folds the gated norm, so it takes z and the gain. */
         RAD_ISSUE_N(c, op_recur, qd,
