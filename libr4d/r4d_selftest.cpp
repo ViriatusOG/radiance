@@ -21236,17 +21236,25 @@ static void project_perf(const Plugin& pl, int64_t M, int iters) {
 /* logits_gemm_bf16_cols against logits_gemm_bf16 on the same operands: the column form must give
  * the block-per-column row's bytes. M from one row to past the 8-row chunk, a vocabulary not a
  * multiple of the four columns a wave takes, an activation row pitch past n_embd, and a NaN and
- * signed zeros in the activation, which the per-thread sums must carry the same way. With `iters`
- * both rows are also timed at GLM-5.3's TP8 slice, where the weight is past the last-level cache
- * and every launch reads it from memory. */
-static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters = 0) {
+ * signed zeros in the activation, which the per-thread sums must carry the same way. K is one of
+ * the row's two widths: 4096, two chunks a thread, and 5120, where half the block kernel's threads
+ * hold three. With `iters` both rows are also timed at the slice the caller names (GLM-5.3's TP8
+ * head is 19360 x 4096, Qwen3.8-27B's TP2 head 124160 x 5120), where the weight is past the
+ * last-level cache and every launch reads it from memory. */
+static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters = 0,
+                              int64_t K = 4096) {
     const RadKernelInfo* ref = find(pl, "logits_gemm_bf16");
     const RadKernelInfo* cols = find(pl, "logits_gemm_bf16_cols");
     if (!ref || !cols) {
         ok("logits_gemm_bf16_cols", false, "row absent");
         return;
     }
-    const int64_t K = 4096, xp = K + 8;
+    if (K != 4096 && K != 5120) {
+        ok(fmt("logits_gemm_bf16_cols n_embd=%lld", (long long)K).c_str(), false,
+           "the row serves n_embd 4096 and 5120");
+        return;
+    }
+    const int64_t xp = K + 8;
     std::vector<uint16_t> hx((size_t)(M * xp), 0), hw((size_t)(N * K));
     for (int64_t r = 0; r < M; ++r)
         for (int64_t k = 0; k < K; ++k)
@@ -21276,10 +21284,13 @@ static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters 
     st_memset(dy, 0x5a, got.size());
     run_case(cols, ts, ps);
     st_memcpy(got.data(), dy, got.size(), hipMemcpyDeviceToHost);
-    ok(fmt("logits_gemm_bf16_cols M=%lld N=%lld: the bytes of logits_gemm_bf16", (long long)M,
-           (long long)N)
+    size_t bad = 0;
+    for (size_t i = 0; i < got.size(); i += 4)
+        if (std::memcmp(&got[i], &want[i], 4)) ++bad;
+    ok(fmt("logits_gemm_bf16_cols n_embd=%lld M=%lld N=%lld: the bytes of logits_gemm_bf16",
+           (long long)K, (long long)M, (long long)N)
            .c_str(),
-       got == want);
+       bad == 0, fmt("%zu of %lld logits differ", bad, (long long)(M * N)));
     if (iters > 0) {
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
@@ -21292,8 +21303,8 @@ static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters 
         for (const RadKernelInfo* r : { ref, cols }) {
             for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
             const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-            std::printf("  %-22s M=%-3lld %9.1f us  %6.1f GB/s of weight\n", r->name, (long long)M,
-                        us, bytes / (us * 1e3));
+            std::printf("  %-22s M=%-3lld K=%lld N=%lld %9.1f us  %6.1f GB/s of weight\n", r->name,
+                        (long long)M, (long long)K, (long long)N, us, bytes / (us * 1e3));
         }
     }
     dfree_all();
@@ -35465,6 +35476,10 @@ static void device_phase(const Plugin& pl) {
                                  (int64_t)17 })
             logits_cols_check(pl, M, 2051);
         logits_cols_check(pl, 6, 19360);
+        for (const int64_t M : { (int64_t)1, (int64_t)2, (int64_t)6, (int64_t)8, (int64_t)9,
+                                 (int64_t)17 })
+            logits_cols_check(pl, M, 2051, 0, 5120);
+        logits_cols_check(pl, 8, 19360, 0, 5120);
     }
     /* The IQR head and embedding table, at their codes' width. */
     if (sel("logits_gemm_iqr") || sel("logit_rerank_iqr")) {
@@ -36034,8 +36049,9 @@ static void usage(void) {
                 "  --perfkda M [iters]:  kda_update at GLM's TP8 shape: prefill of M tokens (one\n"
                 "             sequence, and three anchored) and the 8x6 verify step, timed.\n"
                 "  --perfproject M [iters]:  mla_project at GLM's TP8 shape, both modes, timed.\n"
-                "  --perflogits M [iters]:  logits_gemm_bf16 and logits_gemm_bf16_cols at\n"
-                "             GLM-5.3's TP8 head slice (19360 x 4096), M rows, bytes compared.\n"
+                "  --perflogits M [iters] [n_embd] [n_vocab]:  logits_gemm_bf16 and\n"
+                "             logits_gemm_bf16_cols over M rows, bytes compared, at GLM-5.3's TP8\n"
+                "             head slice (4096 19360) or another (5120 124160 is Qwen3.8-27B's TP2).\n"
                 "  --perfmla M blocks heads [iters] [fill]:  MLA attention without the oracle, so\n"
                 "             a 2048-row prefill chunk at 2k/8k context fits (blocks 513/2049).\n"
                 "             The wave row and the matrix row at both key loads (paired tiles at\n"
@@ -36105,7 +36121,7 @@ int main(int argc, char** argv) {
     long long ar8_n = -1;
     int ar8_it = 200;
     const char* ar8_dt = "bf16";
-    long long lg_m = 0;
+    long long lg_m = 0, lg_k = 4096, lg_n = 19360;
     int lg_it = 200;
     const char* ar8_forms = "lockstep";
     const char* ar8_w = nullptr;
@@ -36329,10 +36345,12 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d)
                 (kda ? kda_it : proj_it) = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perflogits")) {
-            /* Both bf16 head rows at GLM-5.3's TP8 slice over M rows. */
+            /* Both bf16 head rows over M rows, at GLM-5.3's TP8 slice or the one named. */
             if (i + 1 >= argc) { usage(); return 2; }
             lg_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_k = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_n = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfmtp")) {
             /* The draft head's entry at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -36580,7 +36598,7 @@ int main(int argc, char** argv) {
     if (lg_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        logits_cols_check(pl, lg_m, 19360, lg_it);
+        logits_cols_check(pl, lg_m, lg_n, lg_it, lg_k);
 #else
         skip("bf16 head timing", "built without HIP");
 #endif

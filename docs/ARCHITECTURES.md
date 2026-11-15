@@ -308,6 +308,7 @@ vision: 27 blocks, hidden 1152, 16 heads -> head_dim 72, patch 16, out_hidden_si
 | recurrent state fp32 | `gdn_recurrent_update_k128_v128_bf16_fp32state` |
 | gated attention, interleaved q/gate | `qk_norm_rope_gate` (reads the q/gate interleave off the operand's row pitch) |
 | GDN gated norm over an interleaved z | `gdn_gated_norm_had_quant_i8` (`zgrp`/`zblk`) |
+| a bf16 head at hidden 5120 | `logits_gemm_bf16_cols` (a wave per four vocabulary columns, the bytes of `logits_gemm_bf16`; at the TP2 slice and eight rows 2157 us against 4289 on an R9700) |
 | vision head_dim 72 | `attn_vit_h72_bf16` |
 
 ## Tensor names: the FP8 safetensors checkpoint

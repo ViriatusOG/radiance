@@ -1072,7 +1072,7 @@ int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, 
 // that compares neighbouring probabilities. K must be a multiple of 8.
 int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N, int a_ld, int c_ld,
                          long stream);
-// The same bytes from a wave per four vocabulary columns; K must be 4096.
+// The same bytes from a wave per four vocabulary columns; K must be 4096 or 5120.
 int r4d_logits_gemm_bf16_cols(long a, long w, long c, int M, int K, int N, int a_ld, int c_ld,
                               long stream);
 // Scatter into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim]: K at [.., d], V at
