@@ -1281,4 +1281,365 @@ TEST(a_quantisers_own_scheme_decodes_through_its_hook_and_only_while_it_is_loade
     CHECK(why.find("radtest-halves") != std::string::npos);
 }
 
+/* ------------------------------------------------------------------ bf16x12
+ *
+ * A bf16 weight packed losslessly (lq_bf16x12.cpp): the sign and mantissa a byte, the exponent a
+ * nibble below its 32-block's largest, and each block that cannot pack whole in an escape table.
+ * Lossless means every bf16 code, so the cases run all 65536 through packed and raw blocks and
+ * compare bits, NaN payloads included. The planes are what a kernel library's relayout reads, so
+ * they are also checked as the format states them, not only through the decoder, which shares the
+ * quantiser's idea of them. */
+namespace {
+
+uint16_t bf16_code(unsigned sign, unsigned field, unsigned mant) {
+    return (uint16_t)(sign << 15 | field << 7 | mant);
+}
+
+/* f32 values holding bf16 codes, bit for bit. */
+std::vector<float> from_bf16(const std::vector<uint16_t>& h) {
+    std::vector<float> v(h.size());
+    for (size_t i = 0; i < h.size(); ++i) {
+        const uint32_t u = (uint32_t)h[i] << 16;
+        std::memcpy(&v[i], &u, 4);
+    }
+    return v;
+}
+
+/* The decoded values whose bits are not their code's; -1 for a decode of the wrong size. */
+int64_t bits_off(const std::vector<float>& d, const std::vector<uint16_t>& h) {
+    if (d.size() != h.size()) return -1;
+    int64_t off = 0;
+    for (size_t i = 0; i < h.size(); ++i) {
+        uint32_t u;
+        std::memcpy(&u, &d[i], 4);
+        off += u != (uint32_t)h[i] << 16;
+    }
+    return off;
+}
+
+/* A weight whose blocks all pack: exponent fields 118-127, splitmix signs and mantissas. */
+std::vector<uint16_t> narrow_bf16(int64_t n, uint64_t seed) {
+    std::vector<uint16_t> h((size_t)n);
+    uint64_t z = seed;
+    for (uint16_t& v : h) {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        x ^= x >> 31;
+        v = bf16_code((unsigned)(x >> 63), 118u + (unsigned)((x >> 8) % 10u), (unsigned)x & 0x7Fu);
+    }
+    return h;
+}
+
+/* The u32 in a block's first four d bytes: a raw block's row of the escape table. */
+uint32_t esc_index(const Quantised& q, int64_t K, int64_t r, int64_t b) {
+    uint32_t idx;
+    std::memcpy(&idx, q.planes[1].data() + r * (K / 2) + b * 16, 4);
+    return idx;
+}
+
+/* The planes against the format as it is stated, block by block in row-major order: a packed
+ * block's E, codes and offsets; a raw block's 0xFF, zero codes, index (the count of raw blocks
+ * before it) and table row; and the table's unused rows zero. Returns the elements that differ,
+ * and the raw blocks in `raw`. */
+int64_t x12_planes_off(const Quantised& q, int64_t R, int64_t K, const std::vector<uint16_t>& h,
+                       int64_t* raw) {
+    const uint8_t* codes = q.planes[0].data();
+    const uint8_t* d = q.planes[1].data();
+    const uint8_t* e = q.planes[2].data();
+    const uint8_t* esc = q.planes[3].data();
+    const int64_t nb = K / 32, cap = q.enc.plane[3].extent[0];
+    int64_t off = 0, n = 0;
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint16_t* x = &h[(size_t)(r * K + b * 32)];
+            const uint8_t* c = codes + r * K + b * 32;
+            const uint8_t* db = d + r * (K / 2) + b * 16;
+            unsigned hi = 0, lo = 255;
+            for (int i = 0; i < 32; ++i) {
+                hi = std::max(hi, (x[i] >> 7) & 0xFFu);
+                lo = std::min(lo, (x[i] >> 7) & 0xFFu);
+            }
+            if (hi == 0xFFu || hi - lo > 15) {
+                off += e[r * nb + b] != 0xFF;
+                off += esc_index(q, K, r, b) != (uint32_t)n;
+                for (int i = 4; i < 16; ++i) off += db[i] != 0;
+                for (int i = 0; i < 32; ++i) {
+                    uint16_t t = 0;
+                    if (n < cap) std::memcpy(&t, esc + (n * 32 + i) * 2, 2);
+                    off += c[i] != 0;
+                    off += n >= cap || t != x[i];
+                }
+                ++n;
+                continue;
+            }
+            off += e[r * nb + b] != hi;
+            for (int i = 0; i < 32; ++i) {
+                off += c[i] != ((x[i] >> 15) << 7 | (x[i] & 0x7F));
+                off += ((db[i / 2] >> (4 * (i & 1))) & 0xFu) != hi - ((x[i] >> 7) & 0xFFu);
+            }
+        }
+    for (int64_t t = n; t < cap; ++t)
+        for (int i = 0; i < 64; ++i) off += esc[t * 64 + i] != 0;
+    *raw = n;
+    return off;
+}
+
+}  /* namespace */
+
+TEST(bf16x12_round_trips_every_bf16_code_through_packed_and_raw_blocks) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* x12 = quantizer("bf16x12");
+    REQUIRE(x12 != nullptr);
+    const int64_t R = 64, C = 1024;
+    int64_t raw = -1;
+
+    /* In code order a block holds one sign and one exponent field, so it packs with every offset
+     * 0, field 0 included (the zeros and subnormals, under E = 0), except the eight blocks of field
+     * 0xFF, the infinities and NaNs, which are raw. */
+    std::vector<uint16_t> h((size_t)(R * C));
+    for (size_t v = 0; v < h.size(); ++v) h[v] = (uint16_t)v;
+    Opts o;
+    Quantised q = quantise(x12, o, "blk.0.ffn_down.weight", R, C, from_bf16(h));
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(enc_name(q.enc),
+             std::string("bf16x12:codes=u8[1x1],d=u4[1x1],e=u8[1x32],esc=bf16{64x32}"));
+    CHECK_EQ(bits_off(decode(q, R, C), h), (int64_t)0);
+    CHECK_EQ(x12_planes_off(q, R, C, h, &raw), (int64_t)0);
+    CHECK_EQ(raw, (int64_t)8);
+
+    /* Each block two codes of each of 16 consecutive fields, so every offset 0-15 occurs, at
+     * different places in different blocks, and fields 0-15 hold the zeros and subnormals under
+     * E = 15. The 128 blocks over fields 240-255 are raw, and esc = 128/2048 fills the table. */
+    {
+        int64_t i = 0;
+        for (unsigned g = 0; g < 16; ++g)
+            for (unsigned k = 0; k < 128; ++k)
+                for (unsigned j = 0; j < 32; ++j) {
+                    const unsigned sm = 2 * k + j / 16;
+                    h[(size_t)i++] = bf16_code(sm >> 7, 16 * g + (j % 16 + k) % 16, sm & 0x7F);
+                }
+        std::vector<uint8_t> seen(65536, 0);
+        for (uint16_t v : h) seen[v]++;
+        CHECK(std::all_of(seen.begin(), seen.end(), [](uint8_t s) { return s == 1; }));
+    }
+    Opts full;
+    full.f("esc", 128.0 / 2048.0);
+    q = quantise(x12, full, "blk.0.ffn_down.weight", R, C, from_bf16(h));
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(q.enc.plane[3].extent[0], (int64_t)128);
+    CHECK_EQ(bits_off(decode(q, R, C), h), (int64_t)0);
+    CHECK_EQ(x12_planes_off(q, R, C, h, &raw), (int64_t)0);
+    CHECK_EQ(raw, (int64_t)128);
+}
+
+/* The edges of a packed block, a block a row: 16 binades pack (offsets 0-15) and 17 do not; a zero
+ * packs under a largest field of 15 and makes its block raw above that; an infinity makes its
+ * block raw, and the largest finite field packs. Raw blocks take the table's rows in order. */
+TEST(bf16x12_packs_sixteen_binades_and_escapes_seventeen) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* x12 = quantizer("bf16x12");
+    REQUIRE(x12 != nullptr);
+    const int64_t R = 6, C = 32;
+    std::vector<uint16_t> h((size_t)(R * C));
+    for (unsigned j = 0; j < 32; ++j) {
+        const unsigned s = j & 1, m = (j * 37) & 0x7F;
+        h[0 * 32 + j] = bf16_code(s, 100 + j % 16, m);
+        h[1 * 32 + j] = bf16_code(s, 100 + j % 17, m);
+        h[2 * 32 + j] = j == 5 ? 0x0000 : bf16_code(s, 15 - j % 3, m);
+        h[3 * 32 + j] = j == 5 ? 0x8000 : bf16_code(s, 16, m);
+        h[4 * 32 + j] = j == 9 ? 0xFF80 : bf16_code(s, 127, m);
+        h[5 * 32 + j] = bf16_code(s, j == 30 ? 239 : 254, m);
+    }
+    Opts o;
+    Quantised q = quantise(x12, o, "blk.0.attn_k.weight", R, C, from_bf16(h));
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(q.enc.plane[3].extent[0], (int64_t)6);       /* at most a row a block */
+    CHECK_EQ(bits_off(decode(q, R, C), h), (int64_t)0);
+    int64_t raw = -1;
+    CHECK_EQ(x12_planes_off(q, R, C, h, &raw), (int64_t)0);
+    CHECK_EQ(raw, (int64_t)3);
+    const unsigned want_e[6] = { 115, 0xFF, 15, 0xFF, 0xFF, 254 };
+    for (int64_t r = 0; r < R; ++r) CHECK_EQ((unsigned)q.planes[2][(size_t)r], want_e[r]);
+    CHECK_EQ(esc_index(q, C, 1, 0), 0u);
+    CHECK_EQ(esc_index(q, C, 3, 0), 1u);
+    CHECK_EQ(esc_index(q, C, 4, 0), 2u);
+}
+
+/* A weight with more raw blocks than its table holds is refused at convert, naming the weight and
+ * the option that sizes the table, rather than written wrong. At exactly the table's size it
+ * converts, and a larger esc= takes the weight that was refused. */
+TEST(bf16x12_refuses_by_name_a_weight_with_more_raw_blocks_than_its_table) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* x12 = quantizer("bf16x12");
+    REQUIRE(x12 != nullptr);
+    const int64_t R = 32, C = 1024;                   /* 1024 blocks; esc=0.125 holds 128 */
+    const std::vector<uint16_t> h0 = narrow_bf16(R * C, 21);
+    /* the first n blocks raw: one value 16 fields below the narrowest block's largest */
+    auto with_raw = [&](int64_t n) {
+        std::vector<uint16_t> h = h0;
+        for (int64_t b = 0; b < n; ++b) h[(size_t)(b * 32 + 7)] = bf16_code(0, 102, 5);
+        return h;
+    };
+    Opts o;
+    o.f("esc", 0.125);
+    const std::vector<uint16_t> at_cap = with_raw(128);
+    Quantised q = quantise(x12, o, "blk.59.attn_k.weight", R, C, from_bf16(at_cap));
+    REQUIRE_EQ(q.status, RAD_OK);
+    int64_t raw = -1;
+    CHECK_EQ(x12_planes_off(q, R, C, at_cap, &raw), (int64_t)0);
+    CHECK_EQ(raw, (int64_t)128);
+
+    const std::vector<uint16_t> over = with_raw(129);
+    const std::string err = stderr_of([&] {
+        q = quantise(x12, o, "blk.59.attn_k.weight", R, C, from_bf16(over));
+    });
+    CHECK_EQ(q.status, (int)RAD_E_FULL);
+    CHECK(has(err, "blk.59.attn_k.weight") && has(err, "129 of its 1024 blocks are raw"));
+    CHECK(has(err, "esc=0.125 gives its escape table 128"));
+
+    Opts more;
+    more.f("esc", 0.2);
+    q = quantise(x12, more, "blk.59.attn_k.weight", R, C, from_bf16(over));
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(q.enc.plane[3].extent[0], (int64_t)205);
+    CHECK_EQ(bits_off(decode(q, R, C), over), (int64_t)0);
+}
+
+/* Lossless only for bf16: an f32 with low bits set is refused, the value named. */
+TEST(bf16x12_refuses_a_value_that_is_not_a_bf16) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* x12 = quantizer("bf16x12");
+    REQUIRE(x12 != nullptr);
+    const int64_t R = 4, C = 64;
+    std::vector<float> w = from_bf16(narrow_bf16(R * C, 5));
+    w[(size_t)(2 * C + 37)] = 0.1f;                   /* 0x3DCCCCCD */
+    Opts o;
+    Quantised q;
+    const std::string err = stderr_of([&] { q = quantise(x12, o, "blk.3.ffn_down.weight", R, C, w); });
+    CHECK_EQ(q.status, (int)RAD_E_INVAL);
+    CHECK(has(err, "blk.3.ffn_down.weight") && has(err, "row 2, column 37 is not a bf16"));
+}
+
+/* The decode hook reads any rows, and a rank's share alone: a column half or a row range of each
+ * tiled plane with the whole table, as tensor parallelism cuts them, since an index counts from the
+ * weight's first row and every share carries the whole table. A malformed block is RAD_E_FORMAT,
+ * not a read past the table, and another scheme is left to its own decoder. */
+TEST(bf16x12_decodes_through_its_hook_any_rows_and_a_ranks_share) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* x12 = quantizer("bf16x12");
+    REQUIRE(x12 != nullptr);
+    const int64_t R = 48, C = 256, nb = C / 32;
+    std::vector<uint16_t> h = narrow_bf16(R * C, 9);
+    /* 55 raw blocks of 384, in both halves of the rows and of the columns; the table holds 64 */
+    for (int64_t b = 0; b < R * nb; b += 7) h[(size_t)(b * 32 + b % 32)] = bf16_code(1, 90, 3);
+    Opts o;
+    const Quantised q = quantise(x12, o, "blk.0.ssm_out.weight", R, C, from_bf16(h));
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK_EQ(bits_off(decode(q, R, C), h), (int64_t)0);
+
+    std::vector<const void*> pd;
+    for (auto& p : q.planes) pd.push_back(p.data());
+    EncodedView v;
+    enc_view(q.enc, R, C, pd.data(), &v);
+    std::vector<float> part((size_t)(4 * C));
+    REQUIRE_EQ(enc_decode_rows(v, 5, 4, part.data()), RAD_OK);
+    CHECK_EQ(bits_off(part, std::vector<uint16_t>(h.begin() + 5 * C, h.begin() + 9 * C)),
+             (int64_t)0);
+
+    /* rows [r0, r1) and columns [c0, c1) of each tiled plane, and the table whole */
+    auto share = [&](int64_t r0, int64_t r1, int64_t c0, int64_t c1) {
+        const int64_t per[3] = { 1, 2, 32 };          /* values a byte of codes, d and e */
+        Quantised s;
+        s.enc = q.enc;
+        for (int k = 0; k < 3; ++k) {
+            const int64_t row = C / per[k], b0 = c0 / per[k], b1 = c1 / per[k];
+            std::vector<uint8_t> p;
+            for (int64_t r = r0; r < r1; ++r)
+                p.insert(p.end(), q.planes[(size_t)k].begin() + r * row + b0,
+                         q.planes[(size_t)k].begin() + r * row + b1);
+            s.planes.push_back(std::move(p));
+        }
+        s.planes.push_back(q.planes[3]);
+        std::vector<uint16_t> want;
+        for (int64_t r = r0; r < r1; ++r)
+            want.insert(want.end(), h.begin() + r * C + c0, h.begin() + r * C + c1);
+        return bits_off(decode(s, r1 - r0, c1 - c0), want);
+    };
+    CHECK_EQ(share(0, R, C / 2, C), (int64_t)0);
+    CHECK_EQ(share(0, R, 0, C / 2), (int64_t)0);
+    CHECK_EQ(share(R / 2, R, 0, C), (int64_t)0);
+
+    /* a raw block's index past the table, and a packed block's offset above its E */
+    auto refused = [&](Quantised m) {
+        std::vector<const void*> md;
+        for (auto& p : m.planes) md.push_back(p.data());
+        EncodedView mv;
+        enc_view(m.enc, R, C, md.data(), &mv);
+        std::vector<float> out((size_t)(R * C));
+        std::string why;
+        return enc_decode_rows(mv, 0, R, out.data(), &why) == RAD_E_FORMAT && has(why, "bf16x12");
+    };
+    {
+        Quantised m = q;
+        const uint32_t past = (uint32_t)q.enc.plane[3].extent[0];
+        REQUIRE_EQ((int)m.planes[2][0], 0xFF);
+        std::memcpy(m.planes[1].data(), &past, 4);
+        CHECK(refused(m));
+    }
+    {
+        Quantised m = q;
+        REQUIRE((int)m.planes[2][1] != 0xFF);
+        m.planes[2][1] = 0;
+        CHECK(refused(m));
+    }
+
+    RadEncoding other = rad_enc_affine(RAD_I8, RAD_BF16, 1, 32);
+    const RadQuantWeight qw = weight_of("x", R, C);
+    std::vector<float> out((size_t)(R * C));
+    CHECK_EQ(x12->decode(&other, &qw, pd.data(), 0, R, out.data()), (int)RAD_E_UNSUPPORTED);
+}
+
+/* What it takes: a weight of whole 32-blocks, with a table of max(64, ceil(blocks x esc)) rows and
+ * at most a row a block (Qwen3.8-27B's attn_k and gate_up at the default 0.004 among them); a
+ * vector or a ragged row is declined and kept as it is, and an esc= outside [0, 1] refused. */
+TEST(bf16x12_sizes_its_table_from_the_shape_and_declines_what_it_cannot_pack) {
+    NEED_LIBQUANT();
+    const RadQuantizerInfo* x12 = quantizer("bf16x12");
+    REQUIRE(x12 != nullptr);
+    auto cap = [&](int64_t rows, int64_t cols, double esc) -> int64_t {
+        Opts o;
+        if (esc >= 0) o.f("esc", esc);
+        const RadQuantWeight w = weight_of("blk.0.attn_k.weight", rows, cols);
+        RadEncoding e;
+        if (x12->encoding(o.data(), o.n(), &w, &e) != RAD_OK) return -1;
+        return e.plane[3].extent[0];
+    };
+    CHECK_EQ(cap(256, 4096, -1), (int64_t)132);
+    CHECK_EQ(cap(1024, 5120, -1), (int64_t)656);
+    CHECK_EQ(cap(34816, 5120, -1), (int64_t)22283);
+    CHECK_EQ(cap(64, 1024, 0.0), (int64_t)64);
+    CHECK_EQ(cap(4, 64, -1), (int64_t)8);
+    CHECK_EQ(cap(16, 64, 1.0), (int64_t)32);
+
+    RadEncoding e;
+    Opts none;
+    RadQuantWeight vec = weight_of("blk.0.attn_norm.weight", 1, 5120);
+    vec.rank = 1;
+    vec.shape[0] = 5120;
+    CHECK_EQ(x12->encoding(none.data(), none.n(), &vec, &e), (int)RAD_E_UNSUPPORTED);
+    const RadQuantWeight ragged = weight_of("blk.0.ssm_conv1d.weight", 10240, 4);
+    CHECK_EQ(x12->encoding(none.data(), none.n(), &ragged, &e), (int)RAD_E_UNSUPPORTED);
+    for (double bad : { -0.1, 1.5 }) {
+        Opts o;
+        o.f("esc", bad);
+        const RadQuantWeight w = weight_of("blk.0.attn_k.weight", 64, 1024);
+        int st = RAD_OK;
+        const std::string err = stderr_of([&] { st = x12->encoding(o.data(), o.n(), &w, &e); });
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(err, "blk.0.attn_k.weight") && has(err, "esc="));
+    }
+}
+
 RAD_TEST_MAIN()

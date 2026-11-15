@@ -769,6 +769,7 @@ Each algorithm pairs with any grid it makes sense for, and a recipe names all th
 | `ggml` | llama.cpp's own searches, imatrix-weighted | its legacy, K- and I-quant types | each type's affine form |
 | `m2xfp4` | M2XFP's weight-side Sg-EM: per group of 32, each subgroup of 8's extra mantissa k in {0..3} and the shared exponent's bias in {-1, 0, 1} (`adaptive=0` pins the bias, `wide=1` widens it to {-2..2}) chosen by least squared error, the OCP exponent and its rounding otherwise the MXFP4 grid's | none of the grid options | its own scheme `m2xfp4`, which it decodes: MXFP4's codes and E8M0 exponent plus a u8 metadata byte a group (arXiv 2601.19213) |
 | `cast` | a float in another float dtype | none | `plain` |
+| `bf16x12` | a lossless repacking of bf16: each exponent a 4-bit offset below its 32-block's largest, a block spanning more than 15 kept whole in an escape table (`esc=`) | none | `bf16x12`, a scheme of its own, decoded by its hook |
 
 The grid is `codes` (integers to 32 bits, fp8/6/4) or `table` (a codebook: NF4, IQ4_NL's values,
 the `w4nl` table Flash-Next's experts are served in and its 32-level `w5nl` and 64-level `w6nl`

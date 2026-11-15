@@ -752,4 +752,58 @@ TEST(the_bf16_df2_recipe_quantises_the_drafter_only) {
     CHECK(has_opt(dh, "zero", "u8"));
 }
 
+/* The bf16x12 recipe as it ships: the nine trunk linears qwen35_bf16 declares are packed
+ * losslessly (bf16x12, at its default table size), the drafter is decided by the bf16-df2
+ * recipe's own rules, so --reuse can take its weights from that container, and the head, the
+ * embedding, the norms, the delta net's other parameters and the vision tower keep the
+ * checkpoint's bf16. */
+TEST(the_bf16x12_df2_recipe_packs_the_trunk_and_quantises_the_drafter_as_bf16_df2_does) {
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    auto load = [&](const char* file, Recipe* r) {
+        std::ifstream in(dir + "/" + file);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::string why;
+        return in.good() && r->add_text(text, file, &why) == RAD_OK;
+    };
+    Recipe r, df2;
+    REQUIRE(load("q38-27b-bf16x12-df2.recipe", &r));
+    REQUIRE(load("q38-27b-bf16-df2.recipe", &df2));
+    CHECK_EQ(r.rules().size(), (size_t)17);
+
+    const char* trunk[] = { "blk.3.attn_qg.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                            "blk.3.attn_output.weight", "blk.0.ssm_in.weight",
+                            "blk.47.ssm_z.weight", "blk.62.ssm_out.weight",
+                            "blk.0.ffn_gate_up.weight", "blk.63.ffn_down.weight" };
+    for (const char* n : trunk) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("bf16x12"));
+        CHECK(m->options.empty());
+    }
+    /* A drafter linear is decided by its own rule, not a trunk pattern. */
+    const char* drafter[] = { "dflash.draft_head.weight", "dflash.fc.weight",
+                              "dflash.blk.0.attn_q.weight", "dflash.blk.4.attn_k.weight",
+                              "dflash.blk.4.attn_v.weight", "dflash.blk.4.attn_output.weight",
+                              "dflash.blk.0.ffn_gate_up.weight", "dflash.blk.4.ffn_down.weight" };
+    for (const char* n : drafter) {
+        const RecipeRule* a = r.match(n);
+        const RecipeRule* b = df2.match(n);
+        REQUIRE(a != nullptr && b != nullptr);
+        CHECK_EQ(a->pattern, b->pattern);
+        CHECK_EQ(a->quantizer, b->quantizer);
+        CHECK(a->options == b->options);
+    }
+    const char* kept[] = { "output.weight", "token_embd.weight", "output_norm.weight",
+                           "blk.3.attn_norm.weight", "blk.3.attn_q_norm.weight",
+                           "blk.3.attn_k_norm.weight", "blk.47.ffn_norm.weight",
+                           "blk.47.ssm_conv1d.weight", "blk.47.ssm_a_log", "blk.47.ssm_dt.bias",
+                           "blk.47.ssm_norm.weight", "v.blk.0.qkv.weight", "v.blk.0.proj.weight",
+                           "dflash.norm.weight", "dflash.hidden_norm.weight",
+                           "dflash.blk.0.attn_norm.weight", "dflash.sel_proj.weight",
+                           "dflash.blk.0.attn_conv_proj.weight" };
+    for (const char* n : kept)
+        CHECK(r.match(n) == nullptr);
+}
+
 RAD_TEST_MAIN()
