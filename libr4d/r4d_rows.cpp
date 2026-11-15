@@ -9133,6 +9133,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   /* No opd_shape, for logit_rerank's reason: the declared shape and the stored row differ. */
   nullptr, r4d_rad_unrelayout_iqr_logits },
 
+{ "logit_rerank_bf16", "logit_rerank", "select",
+  "logit_rerank over a plain bf16 head: the same candidates rescored against logits_gemm_bf16's rows",
+  "logit_rerank's: any M, R <= 32, bf16 x and the bf16 lm_head as stored, [n_vocab][n_embd]",
+  "bf16 in, f32 values + i32 ids out, ties to the lower id",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLogitRerank), NOTUNE,
+  nullptr, nullptr, r4d_rad_logit_rerank_bf16, nullptr,
+  /* No layout hooks: a hookless row takes only a single-plane weight, so it serves a plain bf16
+   * head and never an fp8, int8 or Q8_0 one, which keep their rows. */
+  nullptr, nullptr },
+
 { "rowtopk_merge", "row_topk_merge", "select",
   "the global top-R of world_size all-gathered per-rank candidate sets",
   "any M, R <= 32; `gathered` is [M, world_size * R, 2] f32 pairs, an int32 id in the first slot; "

@@ -9709,10 +9709,12 @@ bool each_gemm_nt_once(const RadBuilder& b, const RadCtx& c) {
 }
 
 /* The engine steps a serial-drafter or block-drafter model runs, each linted whole: decode,
- * prefill, a mixed step, and a verify followed by the drafter's passes. */
+ * prefill, a mixed step, and a verify followed by the drafter's passes. `short_block` false for a
+ * block drafter whose architecture declares no short block (rad_drafter_short_block is its own
+ * choice). */
 template <class Fn>
 void lint_qwen35_fp8_family(Fn declare, StepFn step, const RadModelMeta* meta, int max_spec,
-                            bool block_drafter, int64_t block) {
+                            bool block_drafter, int64_t block, bool short_block = true) {
     for (int world : { 1, 2 })
         for (int rank = 0; rank < world; ++rank) {
             RadBuilder b;
@@ -9739,7 +9741,7 @@ void lint_qwen35_fp8_family(Fn declare, StepFn step, const RadModelMeta* meta, i
             const auto v = run_passes(b, step, all, rank, world);
             CHECK_PASSES(b, v);
             for (size_t i = 1; i < v.size(); ++i) CHECK(each_gemm_nt_once(b, *v[i]));
-            if (!block_drafter || block <= 4) continue;
+            if (!block_drafter || block <= 4 || !short_block) continue;
             /* The short block (rad_drafter_short_block): a query pass staged at 4 rows a sequence
              * runs the short ops, its selector proposing 3; a block with no ops fails the step. */
             CHECK_EQ(b.drafter_short, 4);
@@ -10083,6 +10085,69 @@ TEST(qwen35_fp8_dflash2_head_128_drafter_declares_no_prologue_fold) {
         if (o.op == "qkv_norm_rope_kv_store" && pint(&o, "head_dim") == 128) ++folds_128;
     CHECK_EQ(folds_128, 0);
     CHECK_EQ(count_op(b, "add_rmsnorm"), 2 * 2);
+}
+
+/* qwen35_bf16 declares the same drafter for a bf16 container converted with --draft-model, beside
+ * a trunk whose ops are the same with the drafter as without it: the tap copies are all it adds
+ * there. The trunk is compared by op and parameters; buffer handles move with the taps' buffer. */
+TEST(qwen35_bf16_declares_a_dflash2_drafter_beside_an_unchanged_trunk) {
+    MetaKV plain(qwen35_meta());
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+    RadBuilder a, b;
+    RadBuildCtx ctx = spec_ctx(0, 1, 7);
+    REQUIRE_EQ(qwen35_bf16::declare(&a, plain.meta(), &ctx), RAD_OK);
+    REQUIRE_EQ(qwen35_bf16::declare(&b, df.meta(), &ctx), RAD_OK);
+    CHECK_EQ((int)a.drafter.kind, (int)RAD_DRAFT_NONE);
+    CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+    CHECK_EQ(b.drafter_name, std::string("dflash2"));
+    CHECK_EQ(b.drafter.depth, 7);
+    CHECK_EQ(b.drafter.block, 8);
+    const RecBuf* src = find_b(b, "dflash_src");
+    REQUIRE(src != nullptr);
+    CHECK_EQ(src->d.shape[1], 3 * 5120);
+    CHECK_EQ(count_op(b, "cast"), 1);
+    /* The bf16 head rescores the drafter's candidates (logit_rerank_bf16 reads it). */
+    CHECK_EQ(count_op(b, "logit_rerank"), 1);
+    std::set<int> drafted;
+    for (const auto& [layer, g] : b.binds)
+        if (g == (rad_kvgroup)b.kv_groups.size()) drafted.insert(layer);
+    CHECK(drafted == (std::set<int>{ 8, 9 }));
+
+    std::vector<const RecOp*> ta, tb;
+    for (const auto& o : a.ops) ta.push_back(&o);
+    for (const auto& o : b.ops) {
+        if (o.op == "cast") continue;
+        tb.push_back(&o);
+        if (o.op == "logits_gemm") break;
+    }
+    REQUIRE_EQ(ta.size(), tb.size());
+    for (size_t i = 0; i < ta.size(); ++i) {
+        CHECK_EQ(ta[i]->op, tb[i]->op);
+        CHECK_EQ(ta[i]->w.size(), tb[i]->w.size());
+        REQUIRE_EQ(ta[i]->p.size(), tb[i]->p.size());
+        for (size_t k = 0; k < ta[i]->p.size(); ++k) {
+            const RecParam &x = ta[i]->p[k], &y = tb[i]->p[k];
+            CHECK(x.key == y.key && x.kind == y.kind && x.ival == y.ival && x.ihi == y.ihi &&
+                  x.dval == y.dval && x.sval == y.sval);
+        }
+    }
+}
+
+/* Its engine steps (verify, context pass, query pass) lint clean at one and two ranks, and the
+ * probe fixes the depth at the trained block, or answers 0 for a container without a drafter. */
+TEST(qwen35_bf16_steps_lint_clean_with_a_dflash2_drafter) {
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+    /* No short block: qwen35_bf16 does not call rad_drafter_short_block, so its graph is the
+     * drafter's own block alone. */
+    lint_qwen35_fp8_family(qwen35_bf16::declare, qwen35_bf16::step, df.meta(), 7, true, 8, false);
+    RadArchProbe p{};
+    CHECK_OK(qwen35_bf16::probe(df.meta(), &p));
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    MetaKV plain(qwen35_meta());
+    RadArchProbe q{};
+    CHECK_OK(qwen35_bf16::probe(plain.meta(), &q));
+    CHECK_EQ(q.draft_depth, 0);
 }
 
 /* =============================== gemma3: TranslateGemma 27B's trunk =========================== */

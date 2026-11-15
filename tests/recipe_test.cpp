@@ -719,4 +719,37 @@ TEST(the_ling_flash_iq8r_w4nl64_recipe_decides_the_model_it_was_written_for) {
     for (const char* n : kept) CHECK(r.match(n) == nullptr);
 }
 
+/* The bf16 recipe with the drafter as it ships: only the drafter's weights have rules, so the trunk,
+ * the embedding and the lm_head keep the checkpoint's bf16, and qwen35_bf16 serves the container. */
+TEST(the_bf16_df2_recipe_quantises_the_drafter_only) {
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/q38-27b-bf16-df2.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "q38-27b-bf16-df2.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)8);
+
+    const char* kept[] = { "blk.3.attn_qg.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                           "blk.3.attn_output.weight", "blk.47.ssm_inz.weight",
+                           "blk.47.ssm_ab.weight", "blk.47.ssm_out.weight",
+                           "blk.47.ffn_gate_up.weight", "blk.47.ffn_down.weight", "output.weight",
+                           "token_embd.weight", "output_norm.weight" };
+    for (const char* n : kept)
+        CHECK(r.match(n) == nullptr);
+    for (const char* n : { "dflash.fc.weight", "dflash.blk.1.attn_q.weight",
+                           "dflash.blk.1.attn_output.weight", "dflash.blk.1.ffn_down.weight" }) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK(has_opt(m, "codes", "fp4_e2m1"));
+        CHECK(has_opt(m, "scale", "e8m0"));
+    }
+    const RecipeRule* dh = r.match("dflash.draft_head.weight");
+    REQUIRE(dh != nullptr);
+    CHECK(has_opt(dh, "codes", "u2"));
+    CHECK(has_opt(dh, "zero", "u8"));
+}
+
 RAD_TEST_MAIN()

@@ -17691,6 +17691,94 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     ok(rn.c_str(), bad == 0, std::to_string(bad) + " wrong ids, values or orderings");
 }
 
+/* logit_rerank over a plain bf16 head (logit_rerank_bf16, for qwen35_bf16's drafter): the head as
+ * logits_gemm_bf16 stores it, [N][K] bf16 with no layout hook, against a host dot product of the
+ * same bf16 values. Each row has R candidates, the last an id past this rank's rows, which must
+ * come back a pad (-1, sorted last). With `voff` the ids are global, as row_topk reports them under
+ * vocab-parallel drafting, and the pair plane the merge reads must carry the same (id, value). */
+static void bf16_rerank_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M, int64_t voff) {
+    const std::string tag = " [N=" + std::to_string(N) + " K=" + std::to_string(K) + " M=" +
+                            std::to_string(M) + " vocab_off=" + std::to_string(voff) + "]";
+    const std::string rn = "logit_rerank_bf16 vs host ref over the bf16 head" + tag;
+    const RadKernelInfo* rr = find(pl, "logit_rerank_bf16");
+    if (!rr) { ok(rn.c_str(), false, "row absent"); return; }
+    ok("logit_rerank_bf16 has no layout hook (a single-plane head only)",
+       !rr->layout && !rr->relayout);
+
+    std::vector<uint16_t> wb((size_t)N * K), xb((size_t)M * K);
+    std::vector<float> wf((size_t)N * K), xf((size_t)M * K);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c) {
+            const float v = std::ldexp(1.0f, (int)((r % 5) - 2)) *
+                            (0.031f * (float)((r * 37 + c * 11) % 61) - 0.9f);
+            wb[(size_t)(r * K + c)] = h_to_bf16(v);
+            wf[(size_t)(r * K + c)] = h_bf16(wb[(size_t)(r * K + c)]);
+        }
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t c = 0; c < K; ++c) {
+            xb[(size_t)(m * K + c)] = h_to_bf16(0.017f * (float)((m * 53 + c * 7) % 83) - 0.7f);
+            xf[(size_t)(m * K + c)] = h_bf16(xb[(size_t)(m * K + c)]);
+        }
+    std::vector<double> ref((size_t)(M * N));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0;
+            for (int64_t c = 0; c < K; ++c)
+                acc += (double)wf[(size_t)(n * K + c)] * xf[(size_t)(m * K + c)];
+            ref[(size_t)(m * N + n)] = acc;
+        }
+
+    const int64_t R = std::min<int64_t>(8, N);
+    std::vector<int32_t> cand((size_t)(M * R));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t r = 0; r < R; ++r)
+            cand[(size_t)(m * R + r)] =
+                (int32_t)(voff + (r == R - 1 ? N : (m * 131 + r * 977) % N));
+    void* d_w  = dalloc(wb.size() * 2);
+    void* d_x  = dalloc(xb.size() * 2);
+    void* d_in = dalloc(cand.size() * 4);
+    void* d_oi = dalloc(cand.size() * 4);
+    void* d_ov = dalloc(cand.size() * 4);
+    void* d_pr = dalloc(cand.size() * 8);
+    if (!d_w || !d_x || !d_in || !d_oi || !d_ov || !d_pr) { ok(rn.c_str(), false, "hipMalloc failed"); return; }
+    st_memcpy(d_w, wb.data(), wb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_x, xb.data(), xb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_in, cand.data(), cand.size() * 4, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { N, K }),
+                                  T(d_in, RAD_I32, { M, R }), T(d_oi, RAD_I32, { M, R }),
+                                  T(d_ov, RAD_F32, { M, R }) };
+    if (voff) ts.push_back(T(d_pr, RAD_F32, { M, R, 2 }));
+    const int rc = launch_row(rr, ts, { PI("M", M), PI("R", R), PI("n_vocab", N), PI("n_embd", K),
+                                        PI("vocab_off", voff), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok(rn.c_str(), false, "rc=" + std::to_string(rc)); return; }
+    std::vector<int32_t> oi(cand.size());
+    std::vector<float> ov(cand.size()), pr(cand.size() * 2);
+    st_memcpy(oi.data(), d_oi, oi.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(ov.data(), d_ov, ov.size() * 4, hipMemcpyDeviceToHost);
+    if (voff) st_memcpy(pr.data(), d_pr, pr.size() * 4, hipMemcpyDeviceToHost);
+    int64_t bad = 0;
+    for (int64_t m = 0; m < M; ++m) {
+        double amax = 0;
+        for (int64_t n = 0; n < N; ++n) amax = std::max(amax, std::fabs(ref[(size_t)(m * N + n)]));
+        for (int64_t r = 0; r < R; ++r) {
+            const int32_t id = oi[(size_t)(m * R + r)];
+            const float v = ov[(size_t)(m * R + r)];
+            if (voff) {
+                int32_t pid;
+                std::memcpy(&pid, &pr[(size_t)(m * R + r) * 2], sizeof pid);
+                bad += pid != id || pr[(size_t)(m * R + r) * 2 + 1] != v;
+            }
+            if (r == R - 1) { bad += id != -1; continue; }      /* the pad sorts last */
+            const bool known = std::find(cand.begin() + m * R, cand.begin() + m * R + R - 1, id) !=
+                               cand.begin() + m * R + R - 1;
+            bad += !known ||
+                   std::fabs((double)v - ref[(size_t)(m * N + (id - voff))]) > 1e-3 * amax + 1e-4;
+            if (r > 0) bad += v > ov[(size_t)(m * R + r - 1)];
+        }
+    }
+    ok(rn.c_str(), bad == 0, std::to_string(bad) + " wrong ids, values, orderings or pairs");
+}
+
 /* ---- the decode GEMM, timed ------------------------------------------------------------------
  *
  * Timing per shape for rows rad-tune cannot reach (the fp8a8 rows declare no axes).
@@ -35413,6 +35501,13 @@ static void device_phase(const Plugin& pl) {
             fp8_logits_numeric(pl, 5120, 5120, M, true);
         for (const int64_t M : { (int64_t)1, (int64_t)8 })
             fp8_logits_numeric(pl, 2560, 2560, M, true);
+    }
+    /* The plain bf16 head's rescoring: one rank, the second of two (global ids, the pair plane),
+     * and a K that is not a whole number of 128-column blocks. */
+    if (sel("logit_rerank_bf16")) {
+        bf16_rerank_numeric(pl, 1024, 5120, 7, 0);
+        bf16_rerank_numeric(pl, 1024, 5120, 7, 1024);
+        bf16_rerank_numeric(pl, 640, 2504, 3, 0);
     }
 
     gate_had_case(pl, 37, 256);
