@@ -556,6 +556,29 @@ TEST(reuse_of_an_unchanged_checkpoint_writes_the_same_file) {
     CHECK(tiny::read_text(d / "r.rad") == tiny::read_text(w.base));
 }
 
+TEST(reuse_only_copies_matching_planes_and_refuses_fresh_conversion) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_reuse_only");
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "ok.rad", "--recipe", w.recipe, "--reuse", w.base,
+                                  "--reuse-only" }, &log), 0);
+    CHECK(has(log, "--reuse: 15 weight(s)"));
+    CHECK(tiny::read_text(d / "ok.rad") == tiny::read_text(w.base));
+    REQUIRE(tiny::write_text(d / "changed.recipe",
+                             std::string("blk.0.attn_qkv.weight rtn codes=i8 group=128 scale=bf16 "
+                                         "transform=fwht128 clamp=sym rule=search\n") +
+                                 tiny::kLlamaI8Recipe));
+    CHECK(convert(w.ckpt, { "-o", d / "bad.rad", "--recipe", d / "changed.recipe",
+                            "--reuse", w.base, "--reuse-only" }, &log) != 0);
+    CHECK(has(log, "--reuse-only: no matching source"));
+    CHECK_EQ(convert(w.ckpt, { "-o", d / "missing.rad", "--recipe", w.recipe, "--reuse-only" },
+                     &log), 2);
+    CHECK_EQ(convert(w.ckpt, { "--recipe", w.recipe, "--reuse", w.base, "--reuse-only",
+                               "--in-place" }, &log), 2);
+    CHECK(tiny::read_text(d / "ok.rad") == tiny::read_text(w.base));
+}
+
 /* --reuse matches on how a weight was converted, not on its source bytes, so a changed tensor is
  * copied stale unless --changed names it; named, exactly the weights that read it are converted
  * again. */
