@@ -3056,6 +3056,178 @@ static void check_moe_numerics() {
 #endif
 }
 
+/* ================================================================== causal_conv1d, by value
+ *
+ * LFM2's and LFM3's short convolution against a host mirror of libref/ref_ple.cpp's depthwise
+ * causal convolution (ported from libhalo's causal_conv1d_cases): the taps summed in f64 in ref's
+ * order over the same bf16 bytes, the store narrowed to bf16, and the window rewritten by ref's
+ * rule -- `num_accepted` present shifts the read down by one and puts the step's inputs behind it,
+ * absent keeps the last width-1 inputs at offset zero. y is compared to a relative L2 (the kernel
+ * accumulates in f32); the window, a copy of input bytes, byte for byte; and the rows of a
+ * sequence that writes nothing (empty, or on slot -1) must keep their NaN fill.
+ */
+namespace convnum {
+using namespace moenum;
+
+struct ConvCase {
+    long long n = 0, wid = 0, slots = 1, state_len = 0;
+    std::vector<int32_t> cu, sidx, hini, nacc;           /* sidx/hini/nacc empty: absent */
+    std::vector<uint16_t> x, w, st;                       /* x [T, n], w [n, wid], st [slots, n, state_len] */
+    std::vector<double> y;                                /* the answer, [T, n] */
+    std::vector<char> live;
+    long long T() const { return cu.empty() ? 0 : cu.back(); }
+};
+
+void model(ConvCase& c) {
+    const long long hist = c.wid - 1, N = (long long)c.cu.size() - 1, T = c.T();
+    c.y.assign((size_t)(T * c.n), 0.0);
+    c.live.assign((size_t)T, 0);
+    for (long long s = 0; s < N; ++s) {
+        const long long bos = c.cu[s], slen = c.cu[s + 1] - bos;
+        if (slen <= 0) continue;
+        const long long slot = c.sidx.empty() ? s : c.sidx[s];
+        if (slot < 0) continue;
+        const bool warm = c.hini.empty() || c.hini[s] != 0;
+        const long long off = c.nacc.empty() ? 0 : (long long)c.nacc[s] - 1;
+        for (long long ch = 0; ch < c.n; ++ch) {
+            const long long base = (slot * c.n + ch) * c.state_len;
+            float h[8] = {};
+            for (long long i = 0; i < hist; ++i) h[i] = warm ? bf16_to_f32(c.st[base + off + i]) : 0.0f;
+            for (long long t = 0; t < slen; ++t) {
+                c.live[bos + t] = 1;
+                double acc = 0.0;
+                for (long long j = 0; j < c.wid; ++j) {
+                    const long long src = t - hist + j;
+                    const double v = src >= 0 ? (double)bf16_to_f32(c.x[(bos + src) * c.n + ch])
+                                              : (double)h[src + hist];
+                    acc += v * (double)bf16_to_f32(c.w[ch * c.wid + j]);
+                }
+                c.y[(bos + t) * c.n + ch] = acc;
+            }
+            if (!c.nacc.empty()) {
+                uint16_t keep[8] = {};
+                for (long long i = 0; i + 1 < hist; ++i) keep[i] = warm ? c.st[base + off + i + 1] : 0;
+                for (long long i = 0; i + 1 < hist; ++i) c.st[base + i] = keep[i];
+                for (long long t = 0; t < slen && hist - 1 + t < c.state_len; ++t)
+                    c.st[base + hist - 1 + t] = c.x[(bos + t) * c.n + ch];
+            } else {
+                uint16_t keep[8] = {};
+                for (long long i = 0; i < hist; ++i) {
+                    const long long src = slen - hist + i;
+                    keep[i] = src >= 0 ? c.x[(bos + src) * c.n + ch]
+                                       : (warm ? c.st[base + off + src + hist] : (uint16_t)0);
+                }
+                for (long long i = 0; i < hist; ++i) c.st[base + i] = keep[i];
+            }
+        }
+    }
+}
+
+/* Upload, launch, model, compare. `dil` > 0 adds a `dilation` parameter (a refusal case). */
+int run(Launch fn, ConvCase& c, const char* what, long long dil = 0, bool report = true) {
+    const long long T = c.T();
+    Dev dv;
+    std::vector<uint16_t> ynan((size_t)(T * c.n), 0x7fc0u);
+    RadTensor cs{};
+    cs.data = dv.put(c.st.data(), c.st.size() * 2); cs.dtype = RAD_BF16; cs.rank = 3;
+    cs.shape[0] = c.slots; cs.shape[1] = c.n; cs.shape[2] = c.state_len;
+    cs.stride[2] = 1; cs.stride[1] = c.state_len; cs.stride[0] = c.n * c.state_len;
+    auto opt = [&](const std::vector<int32_t>& v) {
+        return v.empty() ? RadTensor{} : vec(dv.put(v.data(), v.size() * 4), RAD_I32, (long long)v.size());
+    };
+    RadTensor t[8] = { dense(dv.put(c.x.data(), c.x.size() * 2), RAD_BF16, T, c.n),
+                       dense(dv.put(c.w.data(), c.w.size() * 2), RAD_BF16, c.n, c.wid),
+                       cs,
+                       vec(dv.put(c.cu.data(), c.cu.size() * 4), RAD_I32, (long long)c.cu.size()),
+                       opt(c.sidx), opt(c.hini), opt(c.nacc),
+                       dense(dv.put(ynan.data(), ynan.size() * 2), RAD_BF16, T, c.n) };
+    std::vector<RadParam> p = { pi("M", T), pi("n", c.n), pi("width", c.wid), ps("dtype", "bf16") };
+    if (dil) p.push_back(pi("dilation", dil));
+    RadArgs a{ t, 8, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+    const int rc = fn(&a, nullptr);
+    hipDeviceSynchronize();
+    if (!report) return rc;
+    if (rc != 0) { fail("%s: the launch returned %d", what, rc); return rc; }
+    std::vector<uint16_t> y((size_t)(T * c.n)), st(c.st.size());
+    hipMemcpy(y.data(), t[7].data, y.size() * 2, hipMemcpyDeviceToHost);
+    hipMemcpy(st.data(), cs.data, st.size() * 2, hipMemcpyDeviceToHost);
+    model(c);
+    std::vector<double> ref;
+    std::vector<uint16_t> got;
+    long long dead_moved = 0;
+    for (long long r = 0; r < T; ++r)
+        for (long long ch = 0; ch < c.n; ++ch) {
+            const uint16_t g = y[r * c.n + ch];
+            if (c.live[r]) { ref.push_back(c.y[r * c.n + ch]); got.push_back(g); }
+            else dead_moved += g != 0x7fc0u;
+        }
+    compare(what, ref, got, 2e-3);
+    long long sdiff = 0;
+    for (size_t i = 0; i < st.size(); ++i) sdiff += st[i] != c.st[i];
+    if (sdiff) fail("%s: the window after the step: %lld of %zu values differ", what, sdiff, st.size());
+    else ok("%s: the window after the step, byte for byte", what);
+    if (dead_moved) fail("%s: %lld values written in rows no sequence commits", what, dead_moved);
+    return 0;
+}
+
+}  // namespace convnum
+
+static void check_conv_numerics() {
+    std::printf("== causal_conv1d, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: causal_conv1d is not run");
+#else
+    using namespace convnum;
+    auto fn = (Launch)dlsym(g_h, "r3d_rad_causal_conv1d");
+    if (!fn) { fail("r3d_rad_causal_conv1d is missing"); return; }
+    /* No device is a skip, as in run_row: a build machine runs the static phase alone. */
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    uint32_t st = 0xC0417D1u;
+    auto rnd = [&](float sc) { st = st * 1664525u + 1013904223u;
+                               return f32_to_bf16((((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * sc); };
+    auto fill = [&](ConvCase& c, int with_state) {
+        const long long T = c.T();
+        c.x.resize((size_t)(T * c.n)); c.w.resize((size_t)(c.n * c.wid));
+        c.st.resize((size_t)(c.slots * c.n * c.state_len));
+        for (auto& v : c.x) v = rnd(2.0f);
+        for (auto& v : c.w) v = rnd(1.0f);
+        for (auto& v : c.st) v = with_state ? rnd(2.0f) : 0;
+    };
+    {   /* LFM2's band at prefill: an empty sequence, a cold window over stale bytes, a slot of -1. */
+        ConvCase c; c.n = 2048; c.wid = 3; c.slots = 3; c.state_len = 2;
+        c.cu = { 0, 0, 3, 12, 15 }; c.sidx = { 0, 2, 0, -1 }; c.hini = { 1, 0, 1, 1 };
+        fill(c, 1);
+        run(fn, c, "causal_conv1d prefill, width 3: empty, cold, warm and slot -1 sequences");
+    }
+    {   /* A decode step with drafts (num_accepted), then the step after it reading at offset zero. */
+        ConvCase c; c.n = 1024; c.wid = 3; c.slots = 2; c.state_len = 2 + 3;
+        c.cu = { 0, 4, 8 }; c.sidx = { 1, 0 }; c.hini = { 1, 1 }; c.nacc = { 2, 4 };
+        fill(c, 1);
+        run(fn, c, "causal_conv1d decode, width 3, num_accepted 2 and 4, a window of 5");
+    }
+    {   /* The widest and narrowest the row takes. */
+        ConvCase c; c.n = 512; c.wid = 8; c.slots = 1; c.state_len = 7; c.cu = { 0, 10 };
+        fill(c, 1);
+        run(fn, c, "causal_conv1d prefill, width 8, 7 values of history");
+        ConvCase d; d.n = 512; d.wid = 2; d.slots = 1; d.state_len = 1; d.cu = { 0, 5 };
+        fill(d, 1);
+        run(fn, d, "causal_conv1d prefill, width 2, one value of history");
+    }
+    {   /* The refusals: a dilation is not this op's; a window shallower than width - 1. */
+        ConvCase c; c.n = 256; c.wid = 3; c.slots = 1; c.state_len = 2; c.cu = { 0, 4 };
+        fill(c, 1);
+        const int r1 = run(fn, c, "", 2, false);
+        if (r1 == RAD_E_INVAL) ok("causal_conv1d refuses a dilation of 2");
+        else fail("causal_conv1d: a dilation of 2 returned %d, not RAD_E_INVAL", r1);
+        ConvCase d = c; d.state_len = 1; fill(d, 1);
+        const int r2 = run(fn, d, "", 0, false);
+        if (r2 == RAD_E_SHAPE) ok("causal_conv1d refuses a window shallower than width - 1");
+        else fail("causal_conv1d: a window of 1 at width 3 returned %d, not RAD_E_SHAPE", r2);
+    }
+#endif
+}
+
 int main(int argc, char** argv) {
     /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
      * even when output goes to a file or pipe. */
@@ -3092,6 +3264,7 @@ int main(int argc, char** argv) {
         check_band_reach();
         check_shapes();
         check_moe_numerics();
+        check_conv_numerics();
 
         const int n = rows();
         int passed = 0, failed = 0;
