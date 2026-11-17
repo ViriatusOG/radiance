@@ -656,6 +656,10 @@ static const RadOpSchema kSchemas[] = {
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is GemmaRMSNorm's `1 +`, "
            "added to the gain in f32; `mult` scales the normed row before its one rounding. No "
            "gain operand at all means a gain of 1 and a `wadd` of 0."),
+    SCHEMA("rmsnorm_rows", pRmsNorm, oRmsNorm,
+           "the same norm under its row-form name: a plugin written for libr4d's short-row launch "
+           "(LFM2's and LFM3's q/k head norms) resolves here, and libr3d launches it as `rmsnorm` "
+           "(byte-identical)."),
     SCHEMA("layernorm", pLayernorm, oLayernorm,
            "y = (x - mean) / sqrt(var + eps) * w + b, the mean and the variance taken in two "
            "passes over the row."),
@@ -683,6 +687,9 @@ static const RadOpSchema kSchemas[] = {
            "Rotary positions applied in place to a fused qkv row: q heads, then the key heads, the "
            "value heads untouched. `mode` is neox, gptj, mrope, imrope or axial; the yarn, llama3 "
            "and ladder parameters adjust the frequency ladder."),
+    SCHEMA("rope_rows", pRope, oRope,
+           "the same rotation under its row-form name: a plugin written for libr4d's one-angle-a-"
+           "(token, pair) launch resolves here, and libr3d launches it as `rope` (byte-identical)."),
     SCHEMA("kv_store", pKvStore, oKvStore,
            "K and V into a paged cache at slot_mapping's slots, converting to the cache's dtype. A "
            "negative slot is skipped; the cache is [blocks, kv_heads, block_size, 2*head_dim]."),
@@ -1627,6 +1634,18 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_rmsnorm, nullptr, nullptr, nullptr,
   r3d_shape_rmsnorm },
 
+/* rmsnorm under its row-form name (libr4d's rmsnorm_rows): the same launch, so a per-head q/k
+ * norm declared for the rows form has a device row on this part too. */
+{ "rmsnorm_rows_bf16", "rmsnorm_rows", "norm",
+  "root-mean-square norm with a gain, two passes over the row, under its row-form name",
+  "any n; a workgroup a row (a wave for a head-wide row); the sum of squares accumulates in f32 "
+  "and only the store narrows; byte-identical to rmsnorm",
+  "bf16 x and y, bf16 or f32 gain, fp32 reduction",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormBf16), NOTUNE,
+  nullptr, nullptr, r3d_rad_rmsnorm, nullptr, nullptr, nullptr,
+  r3d_shape_rmsnorm },
+
 { "layernorm_bf16", "layernorm", "norm",
   "layer norm with a gain and an optional bias, mean and variance in two passes",
   "any n; a workgroup a row; both passes accumulate in f32",
@@ -1809,8 +1828,19 @@ static const RadKernelInfo kKernels[] = {
 
 { "rope_bf16", "rope", "attn",
   "rotary positions applied in place to a fused qkv row, neox and gptj pair layouts",
-  "head_dim even; rotary_dim optional and even, defaulting to head_dim; a wave a head; the "
-  "angles from accurate powf and sincosf, the position divided by `scale`",
+  "head_dim even; rotary_dim optional and even, defaulting to head_dim; the `rotary` and the "
+  "proportional `head` ladder; a wave a head; the angles from accurate powf and sincosf, the "
+  "position divided by `scale`",
+  "bf16 qkv in place, i32 positions, fp32 angles",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRope), NOTUNE,
+  nullptr, nullptr, r3d_rad_rope, nullptr, nullptr, nullptr, r3d_shape_rope },
+
+/* rope under its row-form name (libr4d's rope_rows): the same launch. */
+{ "rope_rows_bf16", "rope_rows", "attn",
+  "rotary positions applied in place, one thread a rotated pair, under its row-form name",
+  "head_dim even; rotary_dim optional and even; the `rotary` and the proportional `head` ladder "
+  "(LFM3's partial rotary on its full layers); neox and gptj pairings; byte-identical to rope",
   "bf16 qkv in place, i32 positions, fp32 angles",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cRope), NOTUNE,

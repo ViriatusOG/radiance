@@ -100,9 +100,10 @@ int r3d_fill(long y, int M, int n, int y_ld, int dt, float v, long stream);
 /* In-place rotary on a fused qkv row: q, then k; v is untouched. `mode` is R3D_ROPE_NEOX or
  * R3D_ROPE_GPTJ; `rot` the rotary width (<= head_dim, even). `scale` divides the position: the
  * angle of pair i is (pos / scale) * theta^-i, as in ref_rope. YaRN's magnitude (`yarn_factor`) is not
- * implemented. `pos` is M i32 positions, one per row. */
+ * implemented. `pos` is M i32 positions, one per row. `den` is the width the ladder is measured in:
+ * rot (or 0) for ref's `rotary` ladder, head_dim for its proportional `head` ladder. */
 int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head, int n_head_kv, float theta,
-                  float scale, int mode, int rot, int qkv_ld, long stream);
+                  float scale, int mode, int rot, int den, int qkv_ld, long stream);
 
 /* K and V into a paged cache at slot_mapping's slots. The cache is [blocks, kv_heads, block_size,
  * 2*head_dim] with the strides the shim reads off the operand (sb/sh/so/sd). A negative slot is

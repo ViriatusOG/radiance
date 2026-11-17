@@ -394,6 +394,16 @@ static void check_shapes() {
         { "fill", { PI("M", 8), PI("n", 4096), PS("dtype", "bf16"), PF("value", 0.0) } },
         { "rope", { PI("M", 8), PI("head_dim", 128), PI("n_head", 32), PI("n_head_kv", 8),
                     PF("theta", 500000.0), PF("scale", 1.0), PS("mode", "neox") } },
+        /* The row forms as LFM2 and LFM3 declare them: the q/k head norms over rows of head_dim
+         * (64 and 128), and q rotated as a q-only row (n_head_kv 0); LFM3's full layers turn 64 of
+         * 128 channels on the proportional ladder. */
+        { "rmsnorm_rows", { PI("M", 8 * 32), PI("n", 64), PF("eps", 1e-5), PS("dtype", "bf16") } },
+        { "rmsnorm_rows", { PI("M", 8 * 16), PI("n", 128), PF("eps", 1e-5), PS("dtype", "bf16") } },
+        { "rope_rows", { PI("M", 8), PI("head_dim", 64), PI("n_head", 32), PI("n_head_kv", 0),
+                         PF("theta", 1000000.0), PF("scale", 1.0), PS("mode", "neox") } },
+        { "rope_rows", { PI("M", 8), PI("head_dim", 128), PI("n_head", 16), PI("n_head_kv", 0),
+                         PF("theta", 1000000.0), PF("scale", 1.0), PS("mode", "neox"),
+                         PI("rotary_dim", 64), PS("ladder", "head") } },
         { "kv_store", { PI("M", 8), PI("head_dim", 128), PI("n_head_kv", 8), PI("block_size", 32),
                         PS("kv_dtype", "bf16") } },
         { "embed_lookup", { PI("M", 8), PI("n_embd", 4096), PI("n_vocab", 128256),
