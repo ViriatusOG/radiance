@@ -186,8 +186,11 @@ int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s);
 int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s);
 
 /* --- r3d_ple_conv.hip: PLE's dilated depthwise convolution, its silu and the residual add that
- * finishes the layer: one thread a channel, the conv window rewritten in the same launch. */
+ * finishes the layer: one thread a channel, the conv window rewritten in the same launch.
+ * causal_conv1d is the same kernel with no activation, no residual and dilation one (LFM2's and
+ * LFM3's short convolution). */
 int r3d_rad_ple_conv(const RadArgs* a, RadStream s);
+int r3d_rad_causal_conv1d(const RadArgs* a, RadStream s);
 
 /* --- r3dh_gdn_recurrent_update.hip (libhalo's): the gated-delta-net recurrent state update at
  * decode against the paged state cache, in either state form (per_candidate or anchor). */

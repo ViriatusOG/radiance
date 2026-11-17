@@ -333,6 +333,19 @@ static const RadOperandSpec oPleConv[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
 };
+/* causal_conv1d: libref's schema, ple_conv's without `dilation` and `resid`. */
+static const RadParamSpec pCausalConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oCausalConv[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
 
 static const RadParamSpec pExpertScale[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
                                              P_STR("dtype") };
@@ -801,6 +814,10 @@ static const RadOpSchema kSchemas[] = {
            "Absent, every token commits: the read is at offset zero and the last "
            "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
            "`resid` absent drops the add and leaves the plain convolution."),
+    SCHEMA("causal_conv1d", pCausalConv, oCausalConv,
+           "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
+           "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
+           "The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's."),
     SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
            "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
            "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
@@ -1414,6 +1431,10 @@ static const RadConstraint cGdnConvUpdW4[] = { C_GE("q_len", 1), C_EQ("head_k", 
 static const RadConstraint cPleConv[]   = { C_IN("dtype", "bf16"), C_GE("width", 1),
                                             C_LE("width", 5), C_GE("dilation", 1),
                                             C_LE("dilation", 4) };
+/* Undilated, so the history is width-1 <= 7: inside both the kernel's 8 taps (kPcMaxW) and its
+ * 16-slot write-back window (kPcMaxHist). Width 1 has no history and no model declares it. */
+static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
+                                             C_LE("width", 8) };
 static const RadConstraint cGdnRecurrent[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
                                               C_EQ("head_v", 128) };
 static const RadConstraint cKdaUpdate[] = {
@@ -2292,6 +2313,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cPleConv), NOTUNE,
   nullptr, nullptr, r3d_rad_ple_conv, nullptr, nullptr, nullptr, nullptr },
+
+/* LFM2's and LFM3's short convolution on the same kernel: its SILU=false arm, no residual, the
+ * family of ple_conv beside which it sits. */
+{ "causal_conv1d_bf16", "causal_conv1d", "norm",
+  "depthwise causal conv with no activation (ple_conv's kernel); one thread a channel",
+  "width 2 to 8, undilated",
+  "bf16 activations, weights and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cCausalConv), NOTUNE,
+  nullptr, nullptr, r3d_rad_causal_conv1d, nullptr, nullptr, nullptr, nullptr },
 
 { "expert_scale_bf16", "expert_scale", "moe",
   "Each routing weight times its expert's own per-expert scale, in place",

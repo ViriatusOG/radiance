@@ -1663,6 +1663,66 @@ static int build_gdn_conv_update(Case& c, const RadOpSchema* s) {
     return 0;
 }
 
+/* causal_conv1d at LFM2's band: two sequences in one prefill chunk (cu 0, 11, 19), width 3 over
+ * 2048 channels, each sequence on its own state slot with a history to read (has_init 1), and no
+ * num_accepted, so every token commits and the window is rewritten. `cu` and the slots are
+ * offsets the kernel follows, so they are built here rather than drawn. */
+static int build_causal_conv1d(Case& c, const RadOpSchema* s) {
+    const long long T = 19, N = 2, n = 2048, W = 3, SL = W - 1, SLOTS = 2;
+    if (s->n_operands != 8) { fail("causal_conv1d: the schema has %d operands, not 8",
+                                   s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                            { "width", RAD_P_INT, W, 0, nullptr, 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, "bf16", 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x2C0F1D35u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> hx(T * n), hw(n * W), hcs(SLOTS * n * SL), hy(T * n, 0x7fc0u);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hw) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hcs) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    const int cuv[N + 1] = { 0, 11, (int)T };
+    const int sidxv[N] = { 1, 0 }, hiv[N] = { 1, 1 };
+
+    struct { uint32_t dt; long long nel; const void* src; } qd[8] = {
+        { RAD_BF16, T * n, hx.data() },              // x
+        { RAD_BF16, n * W, hw.data() },              // w
+        { RAD_BF16, SLOTS * n * SL, hcs.data() },    // conv_state [SLOTS, n, SL]
+        { RAD_I32,  N + 1, cuv },                    // cu
+        { RAD_I32,  N, sidxv },                      // cache_idx
+        { RAD_I32,  N, hiv },                        // has_init
+        { RAD_I32,  0, nullptr },                    // num_accepted, absent: a prefill
+        { RAD_BF16, T * n, hy.data() }               // y, NaN until written
+    };
+    for (int o = 0; o < 8; ++o) {
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        if (!qd[o].nel) continue;
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("causal_conv1d: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (hipMemcpy(d, qd[o].src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+            fail("causal_conv1d: hipMemcpy in failed"); return 1;
+        }
+        t.data = d; t.dtype = qd[o].dt;
+        switch (o) {
+            case 0: case 7: t.rank = 2; t.shape[0] = T; t.shape[1] = n;
+                            t.stride[1] = 1; t.stride[0] = n; break;
+            case 1: t.rank = 2; t.shape[0] = n; t.shape[1] = W; t.stride[1] = 1; t.stride[0] = W; break;
+            case 2: t.rank = 3; t.shape[0] = SLOTS; t.shape[1] = n; t.shape[2] = SL;
+                    t.stride[2] = 1; t.stride[1] = SL; t.stride[0] = n * SL; break;
+            default: t.rank = 1; t.shape[0] = qd[o].nel; t.stride[0] = 1; break;
+        }
+    }
+    return 0;
+}
+
 static int build_expert_scale(Case& c, const RadOpSchema* s) {
     const long long M = 3, K = 4, NE = 8;
     if (s->n_operands != 3) { fail("expert_scale: the schema has %d operands, not 3",
@@ -2445,6 +2505,7 @@ static int run_row(int i) {
         : (0 == std::strcmp(k->name, "gdn_gated_norm_had_quant_i8")) ? 8
         : (0 == std::strcmp(k->name, "gdn_conv_prep_w4_h128")) ? 9
         : (0 == std::strcmp(k->name, "gdn_conv_update_w4_h128")) ? 10
+        : (0 == std::strcmp(k->name, "causal_conv1d_bf16")) ? 24
         : (0 == std::strcmp(k->name, "gdn_recurrent_update_k128_v128")) ? 11
         : (0 == std::strcmp(k->name, "gdn_conv_recurrent_update_k128_v128")) ? 23
         : (0 == std::strcmp(k->name, "expert_scale_bf16")) ? 12
@@ -2476,6 +2537,7 @@ static int run_row(int i) {
                         : hand == 8 ? build_gdn_gated_norm_hq(c, s)
                         : hand == 9 ? build_gdn_conv_prep(c, s)
                         : hand == 10 ? build_gdn_conv_update(c, s)
+                        : hand == 24 ? build_causal_conv1d(c, s)
                         : hand == 11 ? build_gdn_recurrent(c, s)
                         : hand == 23 ? build_gdn_conv_recurrent(c, s)
                         : hand == 12 ? build_expert_scale(c, s)
