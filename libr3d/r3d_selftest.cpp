@@ -3202,7 +3202,7 @@ static void check_conv_numerics() {
         fill(c, 1);
         run(fn, c, "causal_conv1d prefill, width 3: empty, cold, warm and slot -1 sequences");
     }
-    {   /* A decode step with drafts (num_accepted), then the step after it reading at offset zero. */
+    {   /* A decode step with drafts (num_accepted) over a window of width - 1 + 3. */
         ConvCase c; c.n = 1024; c.wid = 3; c.slots = 2; c.state_len = 2 + 3;
         c.cu = { 0, 4, 8 }; c.sidx = { 1, 0 }; c.hini = { 1, 1 }; c.nacc = { 2, 4 };
         fill(c, 1);
@@ -3226,6 +3226,85 @@ static void check_conv_numerics() {
         const int r2 = run(fn, d, "", 0, false);
         if (r2 == RAD_E_SHAPE) ok("causal_conv1d refuses a window shallower than width - 1");
         else fail("causal_conv1d: a window of 1 at width 3 returned %d, not RAD_E_SHAPE", r2);
+    }
+#endif
+}
+
+/* ---- rope, by value -----------------------------------------------------------------------------
+ * run_row launches the rope rows with their required params only and checks that the output is
+ * finite, so neither `ladder` nor a partial `rotary_dim` is exercised there. This case is libhalo's
+ * (rope_ladder_case): an f32 mirror of libref's rotation at the three ladders. `head` is the
+ * proportional ladder: pair i is (i, i + head_dim/2), the exponent's divisor is head_dim, and the
+ * pairs from rotary_dim/2 on do not turn. Q and K heads rotate; the V head must come back byte
+ * for byte. */
+static void check_rope_numerics() {
+    std::printf("== rope, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: rope is not run");
+#else
+    using namespace moenum;
+    auto fn = (Launch)dlsym(g_h, "r3d_rad_rope");
+    if (!fn) { fail("r3d_rad_rope is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long M = 5, hd = 64, rot = 32, n_head = 2, nkv = 1, n_rope = n_head + nkv;
+    const long long row = (n_head + 2 * nkv) * hd;
+    const float theta = 10000.0f;
+    const std::vector<int32_t> pos = { 0, 1, 7, 128, 4096 };
+    for (const char* lad : { (const char*)nullptr, "rotary", "head" }) {
+        const bool head = lad && !std::strcmp(lad, "head");
+        const long long den = head ? hd : rot, off = head ? hd / 2 : rot / 2;
+        char what[96];
+        std::snprintf(what, sizeof(what), "rope neox, head_dim 64, rotary_dim 32, ladder %s",
+                      lad ? lad : "absent");
+        std::vector<uint16_t> x((size_t)(M * row));
+        for (long long i = 0; i < M * row; ++i) {
+            float v = (float)(((i * 5) % 17) - 8) / 9.0f;
+            if (i % 13 == 0) v *= 4.0f;                        /* a few big channels */
+            x[(size_t)i] = f32_to_bf16(v);
+        }
+        Dev dv;
+        RadTensor t[2] = { dense(dv.put(x.data(), x.size() * 2), RAD_BF16, M, row),
+                           vec(dv.put(pos.data(), pos.size() * 4), RAD_I32, M) };
+        std::vector<RadParam> p = { pi("M", M), pi("head_dim", hd), pi("n_head", n_head),
+                                    pi("n_head_kv", nkv),
+                                    RadParam{ "theta", RAD_P_F64, 0, 0, nullptr, (double)theta },
+                                    RadParam{ "scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
+                                    ps("mode", "neox"), pi("rotary_dim", rot) };
+        if (lad) p.push_back(ps("ladder", lad));
+        RadArgs a{ t, 2, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = fn(&a, nullptr);
+        hipDeviceSynchronize();
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<uint16_t> got(x.size());
+        hipMemcpy(got.data(), t[0].data, got.size() * 2, hipMemcpyDeviceToHost);
+        std::vector<double> ref;
+        std::vector<uint16_t> y;
+        long long v_moved = 0;
+        for (long long m = 0; m < M; ++m) {
+            const size_t base = (size_t)(m * row);
+            for (long long h = 0; h < n_rope; ++h) {
+                std::vector<double> w((size_t)hd);
+                for (long long e = 0; e < hd; ++e) w[(size_t)e] = bf16_to_f32(x[base + h * hd + e]);
+                for (long long i = 0; i < rot / 2; ++i) {
+                    const float x0 = bf16_to_f32(x[base + h * hd + i]);
+                    const float x1 = bf16_to_f32(x[base + h * hd + i + off]);
+                    const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
+                    const float sn = sinf((float)pos[(size_t)m] * inv);
+                    const float cs = cosf((float)pos[(size_t)m] * inv);
+                    w[(size_t)i] = x0 * cs - x1 * sn;
+                    w[(size_t)(i + off)] = x0 * sn + x1 * cs;
+                }
+                for (long long e = 0; e < hd; ++e) {
+                    ref.push_back(w[(size_t)e]); y.push_back(got[base + h * hd + e]);
+                }
+            }
+            for (long long e = 0; e < hd; ++e)
+                v_moved += got[base + n_rope * hd + e] != x[base + n_rope * hd + e];
+        }
+        compare(what, ref, y, 2e-3);
+        if (v_moved) fail("%s: %lld values of the V head moved", what, v_moved);
+        else ok("%s: the V head byte for byte", what);
     }
 #endif
 }
@@ -3376,6 +3455,7 @@ int main(int argc, char** argv) {
         check_shapes();
         check_moe_numerics();
         check_conv_numerics();
+        check_rope_numerics();
         check_gemm_device_weight();
 
         const int n = rows();
