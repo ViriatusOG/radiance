@@ -275,6 +275,12 @@ std::vector<std::string> program_ops(bool tp) {
         else                  append(v, gdn_layer_ops(tp, mix_fold, !tp));
         append(v, mlp_ops(tp, tp, !tp || l == 7));
     }
+    /* At two ranks, after the layers, the weight reads beside the decode reductions (qwen35_bf16's
+     * kPfGateUpBytes and the rest): each layer's gate_up and the next GEMM after its feed-forward,
+     * and a delta net's out. */
+    if (tp)
+        for (int l = 0; l < 8; ++l)
+            for (int i = 0; i < ((l + 1) % 4 == 0 ? 2 : 3); ++i) v.push_back("prefetch");
     v.push_back("rmsnorm");
     /* gather_rows before the lm_head: the sampler needs one row per sequence, and the widest GEMM
      * over every prefill token would be n_tok/n_seq times the work and an 8 GiB logits buffer
@@ -10246,6 +10252,220 @@ TEST(qwen35_bf16_declares_no_ar_rmsnorm_under_calibration) {
         if (calib) CHECK_EQ(count_op(b, "ar_rmsnorm"), 0);
         else       CHECK(count_op(b, "ar_rmsnorm") > 0);
     }
+}
+
+/* At two ranks a decode step reads the next GEMM's leading weight bytes beside each reduction
+ * (kPfGateUpBytes and the rest): gate_up's after the mixer, the next layer's first GEMM after the
+ * feed-forward (after the last layer the lm_head's), and the delta net's out before its recurrent
+ * update. Each read rides lane 1 behind a join from lane 0, right after the GEMM before it, and
+ * lane 0 goes on to the reduction or the update. A verify of one or two sequences reads; one of
+ * three (24 rows), a prompt and a mixed step do not. The drafter's query pass reads its own, its
+ * context pass none. */
+TEST(qwen35_bf16_reads_the_next_weights_beside_its_decode_reductions) {
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(0, 2, 7);
+    REQUIRE_EQ(qwen35_bf16::declare(&b, df.meta(), &ctx), RAD_OK);
+    auto wname = [&](const RecOp* o) {
+        return o && o->w.size() == 1 ? b.weights[o->w[0] - 1].name : std::string("-");
+    };
+    /* a read: the GEMM before it > the weight read : MiB > the lane-0 op after it */
+    auto site = [](const std::string& gemm, const std::string& read, int64_t mib,
+                   const std::string& next) {
+        return gemm + ">" + read + ":" + std::to_string(mib) + ">" + next;
+    };
+
+    /* The 8-layer fixture: full attention at 3 and 7, the drafter's taps after 1, 3 and 5, so the
+     * feed-forwards of 1, 3, 5 and 7 issue their own all-reduce and the others leave it to the
+     * next norm's ar_rmsnorm. */
+    std::vector<std::string> want;
+    for (int l = 0; l < 8; ++l) {
+        const std::string bl = "blk." + std::to_string(l) + ".";
+        if ((l + 1) % 4) {
+            want.push_back(site(bl + "ssm_z.weight", bl + "ssm_out.weight", 12,
+                                "gdn_recurrent_update"));
+            want.push_back(site(bl + "ssm_out.weight", bl + "ffn_gate_up.weight", 12, "ar_rmsnorm"));
+        } else {
+            want.push_back(site(bl + "attn_output.weight", bl + "ffn_gate_up.weight", 12,
+                                "ar_rmsnorm"));
+        }
+        const std::string nx = "blk." + std::to_string(l + 1) + ".";
+        const std::string next = l == 7            ? std::string("output.weight")
+                               : (l + 2) % 4 == 0  ? nx + "attn_qg.weight"
+                                                   : nx + "ssm_in.weight";
+        const bool own_ar = l == 1 || l == 3 || l == 5 || l == 7;
+        want.push_back(site(bl + "ffn_down.weight", next, 8, own_ar ? "all_reduce" : "ar_rmsnorm"));
+    }
+
+    /* A pass's reads as sites; every other issue is on lane 0. */
+    auto reads = [&](const RadCtx& c) {
+        std::vector<std::string> got;
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            const RecOp* o = b.op_of(c.issues[i].op);
+            if (!o || o->op != "prefetch") {
+                CHECK_EQ(c.issues[i].lane, 0);
+                continue;
+            }
+            CHECK_EQ(c.issues[i].lane, 1);
+            if (i == 0 || i + 1 == c.issues.size()) {
+                got.push_back("a read at the pass's end");
+                continue;
+            }
+            CHECK(ordered(c, i - 1, i));
+            const int64_t bytes = pint(o, "bytes");
+            CHECK_EQ(bytes % (1 << 20), (int64_t)0);
+            const RecOp* g = b.op_of(c.issues[i - 1].op);
+            const RecOp* n = b.op_of(c.issues[i + 1].op);
+            CHECK(g && g->op == "gemm_nt");
+            got.push_back(site(wname(g), wname(o), bytes >> 20, n ? n->op : std::string("-")));
+        }
+        return got;
+    };
+    for (int seqs : { 1, 2 }) {
+        const auto k = kit(b, std::vector<int>((size_t)seqs, 8), {});
+        const auto v = run_passes(b, qwen35_bf16::step, { k.get() }, 0, 2);
+        CHECK_PASSES(b, v);
+        CHECK_EQ(join(reads(*v[0])), join(want));
+        CHECK_EQ(v[0]->joins.size(), want.size());
+        CHECK_EQ(races(b, *v[0]), 0);
+    }
+
+    /* three sequences (24 rows), a prompt and a mixed step: no read and no join */
+    const auto k3 = kit(b, { 8, 8, 8 }, {}), kp = kit(b, {}, { 32 }), km = kit(b, { 8 }, { 6 });
+    for (const Kit* k : { k3.get(), kp.get(), km.get() }) {
+        const auto v = run_passes(b, qwen35_bf16::step, { k }, 0, 2);
+        CHECK_PASSES(b, v);
+        CHECK_EQ(count_issued(issued_ops(b, *v[0]), "prefetch"), 0);
+        CHECK(v[0]->joins.empty());
+    }
+
+    /* The drafter's query pass reads beside its all-reduces at 12 MiB (rad_block_dflash2.h): o,
+     * the feed-forward's coefficient projection and gate_up, then the next layer's attention
+     * coefficient projection and q, after the last layer the draft head. Its context pass reads
+     * none. */
+    const auto ver = kit(b, { 8 }, {});
+    const auto cp = context_pass(b, *ver);
+    const auto qp = query_pass(b, 1, 8, 7);
+    const auto vd = run_passes(b, qwen35_bf16::step, { ver.get(), cp.get(), qp.get() }, 0, 2);
+    CHECK_PASSES(b, vd);
+    REQUIRE_EQ(vd.size(), (size_t)3);
+    CHECK_EQ(count_issued(issued_ops(b, *vd[1]), "prefetch"), 0);
+    std::vector<std::string> dread;
+    for (const RecIssue& r : vd[2]->issues) {
+        const RecOp* o = b.op_of(r.op);
+        if (!o || o->op != "prefetch") continue;
+        CHECK_EQ(r.lane, 1);
+        CHECK_EQ(pint(o, "bytes"), (int64_t)12 << 20);
+        dread.push_back(wname(o));
+    }
+    CHECK_EQ(join(dread),
+             join({ "dflash.blk.0.attn_output.weight", "dflash.blk.0.ffn_conv_proj.weight",
+                    "dflash.blk.0.ffn_gate_up.weight", "dflash.blk.1.attn_conv_proj.weight",
+                    "dflash.blk.1.attn_q.weight", "dflash.blk.1.attn_output.weight",
+                    "dflash.blk.1.ffn_conv_proj.weight", "dflash.blk.1.ffn_gate_up.weight",
+                    "dflash.draft_head.weight" }));
+    /* and nothing else is declared: 22 the trunk's, 9 the drafter's */
+    CHECK_EQ(count_op(b, "prefetch"), 22 + 9);
+}
+
+/* Where launches chain (rad_chain_on) every read is the chained form on lane 0, right behind the
+ * GEMM before it, with no join, and the delta net's out read is not declared: in front of the
+ * plain recurrent update it would run in series with it. The other reads are those above. */
+TEST(qwen35_bf16_reads_on_lane_0_and_skips_the_out_read_where_launches_chain) {
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+    const ChainOn chain(1);
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(0, 2, 7);
+    REQUIRE_EQ(qwen35_bf16::declare(&b, df.meta(), &ctx), RAD_OK);
+    auto wname = [&](const RecOp* o) {
+        return o && o->w.size() == 1 ? b.weights[o->w[0] - 1].name : std::string("-");
+    };
+    auto site = [](const std::string& gemm, const std::string& read, int64_t mib,
+                   const std::string& next) {
+        return gemm + ">" + read + ":" + std::to_string(mib) + ">" + next;
+    };
+    std::vector<std::string> want;
+    for (int l = 0; l < 8; ++l) {
+        const std::string bl = "blk." + std::to_string(l) + ".";
+        want.push_back(site(bl + ((l + 1) % 4 ? "ssm_out.weight" : "attn_output.weight"),
+                            bl + "ffn_gate_up.weight", 12, "ar_rmsnorm"));
+        const std::string nx = "blk." + std::to_string(l + 1) + ".";
+        const std::string next = l == 7            ? std::string("output.weight")
+                               : (l + 2) % 4 == 0  ? nx + "attn_qg.weight"
+                                                   : nx + "ssm_in.weight";
+        const bool own_ar = l == 1 || l == 3 || l == 5 || l == 7;
+        want.push_back(site(bl + "ffn_down.weight", next, 8, own_ar ? "all_reduce" : "ar_rmsnorm"));
+    }
+    for (int seqs : { 1, 2 }) {
+        const auto k = kit(b, std::vector<int>((size_t)seqs, 8), {});
+        const auto v = run_passes(b, qwen35_bf16::step, { k.get() }, 0, 2);
+        CHECK_PASSES(b, v);
+        const RadCtx& c = *v[0];
+        std::vector<std::string> got;
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            CHECK_EQ(c.issues[i].lane, 0);
+            const RecOp* o = b.op_of(c.issues[i].op);
+            if (!o || o->op != "prefetch") continue;
+            REQUIRE(i > 0 && i + 1 < c.issues.size());
+            CHECK(ordered(c, i - 1, i));
+            const RecOp* g = b.op_of(c.issues[i - 1].op);
+            const RecOp* n = b.op_of(c.issues[i + 1].op);
+            CHECK(g && g->op == "gemm_nt");
+            got.push_back(site(wname(g), wname(o), pint(o, "bytes") >> 20,
+                               n ? n->op : std::string("-")));
+        }
+        CHECK_EQ(join(got), join(want));
+        CHECK(c.joins.empty());
+        CHECK_EQ(races(b, c), 0);
+    }
+    /* 16 the trunk's (22 less the six delta-net layers' out reads), 9 the drafter's */
+    CHECK_EQ(count_op(b, "prefetch"), 16 + 9);
+}
+
+/* None of those reads at one rank, under --weight-prefetch off (the drafter's included), or where
+ * no library serves `prefetch`. With them off, a verify and the drafter's two passes issue what
+ * they issue with them, less the reads, and no join. */
+TEST(qwen35_bf16_declares_no_weight_reads_at_one_rank_or_under_weight_prefetch_off) {
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+    struct Case { int world; bool off, no_op; int reads; };
+    for (const Case& k : { Case{ 2, false, false, 22 + 9 }, Case{ 1, false, false, 0 },
+                           Case{ 2, true, false, 0 }, Case{ 2, false, true, 0 } }) {
+        RadBuilder b;
+        if (k.no_op) b.undeclared.insert("prefetch");
+        RadBuildCtx ctx = spec_ctx(0, k.world, 7);
+        ctx.weight_prefetch_off = k.off ? 1 : 0;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen35_bf16::declare(&b, df.meta(), &ctx); }), RAD_OK);
+        CHECK_EQ(count_op(b, "prefetch"), k.reads);
+    }
+
+    std::vector<std::string> ops[2][3];   /* [off][verify, context pass, query pass] */
+    size_t joins[2][3] = {};
+    for (int off : { 0, 1 }) {
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(0, 2, 7);
+        ctx.weight_prefetch_off = off;
+        REQUIRE_EQ(qwen35_bf16::declare(&b, df.meta(), &ctx), RAD_OK);
+        const auto ver = kit(b, { 8 }, {});
+        const auto cp = context_pass(b, *ver);
+        const auto qp = query_pass(b, 1, 8, 7);
+        const auto v = run_passes(b, qwen35_bf16::step, { ver.get(), cp.get(), qp.get() }, 0, 2);
+        CHECK_PASSES(b, v);
+        REQUIRE_EQ(v.size(), (size_t)3);
+        for (size_t p = 0; p < 3; ++p) {
+            ops[off][p]   = issued_ops(b, *v[p]);
+            joins[off][p] = v[p]->joins.size();
+        }
+    }
+    for (size_t p = 0; p < 3; ++p) {
+        std::vector<std::string> rest;
+        for (const std::string& s : ops[0][p])
+            if (s != "prefetch") rest.push_back(s);
+        CHECK_EQ(joins[0][p], (size_t)count_issued(ops[0][p], "prefetch"));   /* one a read */
+        CHECK_EQ(joins[1][p], (size_t)0);
+        CHECK_EQ(join(ops[1][p]), join(rest));
+    }
+    CHECK_EQ(count_issued(ops[0][0], "prefetch"), 22);
+    CHECK_EQ(count_issued(ops[0][2], "prefetch"), 9);
 }
 
 /* =============================== gemma3: TranslateGemma 27B's trunk =========================== */

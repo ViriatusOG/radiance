@@ -111,6 +111,18 @@ struct GdnBF16 {
      * and this block may leave its own to the next block's norm (`ar_out`, NormBF16::takes_ar). */
     NormBF16 nq{};
     bool ar_out = false;
+    /* Set by the architecture after declare, `prefetch`es (decl_prefetch, rad_arch.h); 0 where
+     * none is declared:
+     *   op_pf / pf_w  of the next GEMM's leading weight bytes, issued after out and before this
+     *                 block's own all-reduce where it issues one, so it is beside the reduction
+     *                 whether this block or the next norm runs it (prefetch_beside);
+     *   op_pf_out     of the out-projection's leading bytes beside the decode recurrent update (as
+     *                 GdnFP8::op_pf_out), issued right before it in a pure decode step of at most
+     *                 pf_out_seqs sequences. */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
+    rad_op     op_pf_out = 0;
+    int64_t    pf_out_seqs = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
                  rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s,
@@ -323,6 +335,11 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     praw(batch->cu_seqlens, RAD_I32, D + 1),
                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT));
         if (z_late) RAD_ISSUE(c, op_z, brows(w.h, T), RAD_W(w_z), brows(w.z, T));
+        /* The recurrent update runs one workgroup per (sequence, head) and leaves the card's
+         * memory mostly idle, so the out-projection's leading bytes are read beside it
+         * (prefetch_beside: on the second lane, behind a join from lane 0). The join follows z,
+         * which the update reads, so it orders nothing the update did not wait for. */
+        if (op_pf_out && z_late && D <= pf_out_seqs) prefetch_beside(c, op_pf_out, w_out, T);
         /* a and b are the last 2*n_head_v columns of the projection row, read in place. The
          * recurrent kernel folds the gated norm, so it takes z and the gain. */
         RAD_ISSUE_N(c, op_recur, qd,
@@ -370,6 +387,8 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_out_norm), brow_slice(w.o, DT, PT, v_dim));
     }
     RAD_ISSUE(c, op_out, brows(w.o, T), RAD_W(w_out), brows(w.h, T));
+    /* Decode steps only: a prompt's rows never take the reads (rad_arch.h, kPrefetchRows). */
+    prefetch_beside(c, op_pf, pf_w, batch->phase == RAD_PHASE_DECODE ? T : INT64_MAX);
     if (op_ar && !(ar_out && ar_wire_is_exact(g, T)))
         RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));

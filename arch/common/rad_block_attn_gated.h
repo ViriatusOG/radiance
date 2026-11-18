@@ -74,6 +74,12 @@ struct AttnGatedBF16 {
      * and this block may leave its own to the next block's norm (`ar_out`, NormBF16::takes_ar). */
     NormBF16 nq{};
     bool ar_out = false;
+    /* Set by the architecture after declare: a `prefetch` of the next GEMM's leading weight bytes
+     * (decl_prefetch, rad_arch.h), issued after o and before this block's own all-reduce where it
+     * issues one, so it is beside the reduction whether this block or the next norm runs it
+     * (prefetch_beside). 0 where none is declared. */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
                  int64_t rotary_dim, const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -309,6 +315,8 @@ inline void AttnGatedBF16::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_gate, brows(w.attn, T), brows(w.gate, T), brows(w.attn, T));
 
     RAD_ISSUE(c, op_o, brows(w.attn, T), RAD_W(w_o), brows(w.h, T));
+    /* Decode steps only: a prompt's rows never take the reads (rad_arch.h, kPrefetchRows). */
+    prefetch_beside(c, op_pf, pf_w, batch->phase == RAD_PHASE_DECODE ? T : INT64_MAX);
     if (op_ar && !(ar_out && ar_wire_is_exact(g, T)))
         RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));

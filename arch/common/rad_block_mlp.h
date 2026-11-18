@@ -46,6 +46,12 @@ struct MlpBF16 {
     NormBF16 nq{};
     /* The next block's norm takes this block's all-reduce where it can (NormBF16::takes_ar). */
     bool ar_out = false;
+    /* Set by the architecture after declare: a `prefetch` of the next GEMM's leading weight bytes
+     * (decl_prefetch, rad_arch.h), issued after down and before this block's own all-reduce where
+     * it issues one, so it is beside the reduction whether this block or the next norm runs it
+     * (prefetch_beside). 0 where none is declared. */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
 
     /* `fold` / `ar_in`: the norm takes the previous block's delta / and its all-reduce.
      * `add_out`: issue this block's add here. `ar_out_`: leave the all-reduce to the next norm. */
@@ -120,6 +126,8 @@ inline void MlpBF16::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_gate_up, brows(w.h, T),       RAD_W(w_gate_up), brows(w.gate_up, T));
     RAD_ISSUE(c, op_act,     brows(w.gate_up, T), brows(w.ffn, T));
     RAD_ISSUE(c, op_down,    brows(w.ffn, T),     RAD_W(w_down),    brows(w.h, T));
+    /* Decode steps only: a prompt's rows never take the reads (rad_arch.h, kPrefetchRows). */
+    prefetch_beside(c, op_pf, pf_w, batch->phase == RAD_PHASE_DECODE ? T : INT64_MAX);
     if (op_ar && !(ar_out && ar_wire_is_exact(g, T)))
         RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));

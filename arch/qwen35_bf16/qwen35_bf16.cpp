@@ -60,6 +60,43 @@ namespace qwen35_bf16 {
 
 using namespace rad::arch;
 
+/* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h), at more than one
+ * rank. A decode-height all-reduce leaves the card's memory idle for its round trip, so the next
+ * GEMM's leading weight bytes are read into the on-die cache then, as qwen35_fp8 and gemma4_bf16
+ * do. Each read is issued inside its block, after the block's last GEMM and before its own
+ * all-reduce, so it is beside the reduction whether the block or the next norm (ar_rmsnorm) runs
+ * it:
+ *   kPfGateUpBytes  of gate_up, after the mixer's o or out
+ *   kPfNextBytes    of the next layer's first GEMM (q|gate, or the delta net's in; the lm_head
+ *                   after the last layer), after down
+ *   kPfOutBytes     of the delta net's out-projection, beside its decode recurrent update, which
+ *                   runs one workgroup per (sequence, head) and leaves the memory mostly idle; in a
+ *                   pure decode step of at most kPfOutSeqs sequences (qwen35_fp8's bound); only
+ *                   where launches do not chain (below)
+ *   kPfDraftBytes  of each GEMM the DFlash2 drafter's reads name (Dflash2::Config::prefetch),
+ *                   qwen35_fp8's size
+ * Decode steps only, up to kPrefetchRows rows: one or two sequences' verify. Qwen3.8-27B bf16x12 +
+ * DFlash2 at depth 7, TP2 on two R9700s, one stream, seven greedy prompts, two interleaved server
+ * starts each: 43.95 ms a step without the reads, 41.76 with these sizes (-5.0 %), the text
+ * byte-identical. A verify pass's packed GEMMs took 2.2 ms less and its all-reduces 0.66 ms more
+ * (ar_rmsnorm 17.4 -> 22.7 us beside a read); each read starts ~6 us after its GEMM and reads at
+ * ~330 GB/s beside the reduction; the drafter's pass took 2.51 -> 2.38 ms. Of the other (gate_up,
+ * next, out) sizes in MiB, (12, 12, 8) was within 0.1 ms at more bytes a pass and (12, 6, 15)
+ * 0.12 ms slower; in an earlier round (8, 16, 8) and (16, 20, 12) ran 0.44 and 0.34 ms slower than
+ * (12, 12, 8): a next read longer than the reduction runs on into the GEMM it feeds.
+ *
+ * Where launches chain (rad_chain_on) every read goes on lane 0 as the chained form right behind
+ * its GEMM (prefetch_beside). There the out read would sit in front of the recurrent update, a
+ * plain launch, which waits for it, so the read runs in series with the update instead of beside
+ * it; none is declared. The same bf16x12 + DFlash2 deployment, chained, three interleaved server
+ * starts each: 41.10 ms a step with the out read, 40.72 without it (-0.38 ms, faster in each of
+ * the three rounds), the text byte-identical. */
+constexpr int64_t kPfGateUpBytes = (int64_t)12 << 20;
+constexpr int64_t kPfNextBytes   = (int64_t)8 << 20;
+constexpr int64_t kPfOutBytes    = (int64_t)12 << 20;
+constexpr int64_t kPfOutSeqs     = 4;
+constexpr int64_t kPfDraftBytes  = (int64_t)12 << 20;
+
 /* One trunk layer, of one of two kinds; both small structs are held rather than a union. `full`
  * is the only branch in step(), and it is fixed per layer by the model. */
 struct Layer {
@@ -151,6 +188,9 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DFlash2"));
 
     Dflash2::Config dc{};
+    /* The drafter's reads beside its all-reduces (kPfDraftBytes; the block declares them at more
+     * than one rank), none under --weight-prefetch off, as gemma4_bf16 declares them. */
+    dc.prefetch = ctx->weight_prefetch_off ? 0 : kPfDraftBytes;
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -713,6 +753,44 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    /* ---- the weight reads beside the decode all-reduces (kPfGateUpBytes and the rest), after
+     * every weight they read is declared. At more than one rank, where there are reductions to sit
+     * beside, and none under --weight-prefetch off. Each takes at most its weight's first N x K
+     * bytes (this rank's shape): r4d_rad_prefetch clamps a read to its tensor only where the stored
+     * dtype has a width, a packed weight's dtype is libr4d's own (rad_dtype_bits answers 0), and
+     * a bf16x12 weight's first region, a byte an element, is N x K long. */
+    int64_t n_pf = 0;
+    if (g.world > 1 && !ctx->weight_prefetch_off && rad_op_declared(b, "prefetch")) {
+        auto read = [&](rad_weight w, int64_t want, int64_t n, int64_t k) {
+            const rad_op op = decl_prefetch(b, w, std::min(want, n * k));
+            n_pf += op != 0;
+            return op;
+        };
+        for (int64_t l = 0; l < m.n_main; ++l) {
+            Layer& lay = m.layers[(size_t)l];
+            /* gate_up's, issued after the mixer's last GEMM */
+            const rad_op gu = read(lay.mlp.w_gate_up, kPfGateUpBytes, 2 * g.n_ff, g.n_embd);
+            if (lay.full) { lay.attn.op_pf = gu; lay.attn.pf_w = lay.mlp.w_gate_up; }
+            else          { lay.gdn.op_pf  = gu; lay.gdn.pf_w  = lay.mlp.w_gate_up; }
+            /* the next layer's first GEMM, issued after down; after the last layer the lm_head */
+            if (l + 1 < m.n_main) {
+                const Layer& nx = m.layers[(size_t)l + 1];
+                lay.mlp.pf_w  = nx.full ? nx.attn.w_qg : nx.gdn.w_in;
+                lay.mlp.op_pf = read(lay.mlp.pf_w, kPfNextBytes,
+                                     nx.full ? 2 * g.q_dim() : gc.in_dim(), g.n_embd);
+            } else {
+                lay.mlp.pf_w  = m.w_lm_head;
+                lay.mlp.op_pf = read(m.w_lm_head, kPfNextBytes, g.n_vocab, g.n_embd);
+            }
+            /* the delta net's out-projection, beside its recurrent update; none where launches
+             * chain, which would put the read in series with the plain update (above) */
+            if (!lay.full && !rad_chain_on()) {
+                lay.gdn.op_pf_out   = read(lay.gdn.w_out, kPfOutBytes, g.n_embd, gc.v_dim());
+                lay.gdn.pf_out_seqs = kPfOutSeqs;
+            }
+        }
+    }
+
     m.op_final_norm = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                         RAD_F64("eps", g.eps), RAD_F64("wadd", final_wadd), RAD_STR("dtype", g.dtype)),
@@ -764,6 +842,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     rad_note(b, "logits for at most %lld sampled rows a step (of %lld tokens): gather_rows "
                 "selects RadBatch::out_ids before the lm_head", (long long)g.max_logit_rows,
              (long long)g.max_tok);
+    if (n_pf > 0 && rad_chain_on())
+        rad_note(b, "%lld weight reads beside the decode all-reduces (the first %lld MiB of "
+                    "gate_up, %lld of the next layer's first GEMM; none of the delta net's out, "
+                    "since launches chain), on decode steps of up to %lld rows",
+                 (long long)n_pf, (long long)(kPfGateUpBytes >> 20),
+                 (long long)(kPfNextBytes >> 20), (long long)kPrefetchRows);
+    else if (n_pf > 0)
+        rad_note(b, "%lld weight reads beside the decode all-reduces and recurrent updates (the "
+                    "first %lld MiB of gate_up, %lld of the next layer's first GEMM, %lld of the "
+                    "delta net's out), on decode steps of up to %lld rows",
+                 (long long)n_pf, (long long)(kPfGateUpBytes >> 20),
+                 (long long)(kPfNextBytes >> 20), (long long)(kPfOutBytes >> 20),
+                 (long long)kPrefetchRows);
     if (nextn > 0)
         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not declared: the only drafter "
                     "this plugin runs is a DFlash2 one under `draft.`", (long long)nextn);
