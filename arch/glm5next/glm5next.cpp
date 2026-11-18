@@ -624,6 +624,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             return RAD_E_UNSUPPORTED;
         }
     }
+    /* The draft layer's IQ8R and IQR wiring is not yet covered (its names are under the draft
+     * scope and it reads the trunk's pairs from its own join), so an IQ8R container is served
+     * without it until it is. */
+    if (m.trunk_rot && ctx->max_spec > 0) {
+        fprintf(stderr, "radiance: glm5next: the MTP draft layer of an IQ8R trunk is not served yet; "
+                        "`num-speculative-tokens: 0` serves the model without it (and rad-convert "
+                        "--max-spec 0 converts it without it)\n");
+        return RAD_E_UNSUPPORTED;
+    }
     if (m.trunk_rot && m.form == GlmMla::Form::rows) {
         fprintf(stderr, "radiance: glm5next: the MLA row form (tp-attn-rows) views its head-form "
                         "weights, which an IQ8R trunk's int8 linears cannot; serve the head form\n");

@@ -1970,6 +1970,15 @@ TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {
     CHECK_EQ(declare({ { "ffn_gate_up_exps", glm_iqr() }, { "ffn_down_exps", glm_iqr() } }, 0),
              RAD_E_UNSUPPORTED);
     CHECK_EQ(declare(glm_v2_encs(glm_iqr()), 2048), RAD_E_UNSUPPORTED);
+    /* The draft layer is not served on an IQ8R trunk yet. */
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = glm_v2_encs(glm_iqr());
+    RadBuildCtx ctx = spec_ctx(0, 4, 3);
+    ctx.max_tok = 256;
+    ctx.max_seqs = 4;
+    ctx.max_ctx = 32768;
+    CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
 }
 
 /* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
