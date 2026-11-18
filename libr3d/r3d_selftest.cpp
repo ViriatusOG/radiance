@@ -3309,6 +3309,127 @@ static void check_rope_numerics() {
 #endif
 }
 
+/* ---- attn_paged decode at depth, by value --------------------------------------------------------
+ * One query row over a 4,096-key context, the shape a decode step has and rad-kbench's attention
+ * shape (context = q_len) does not. The row's scratch hook is called the way the builder calls it,
+ * with the params and no tensors, and must size the split-KV partials: a hook that returns 0 makes
+ * the shim fall back to one slice, which is correct and several times slower, so nothing else
+ * notices. The launch is then checked against a host mirror of the reference (scores and sums in
+ * double), with the partials and without (one slice), full causal and under a window.
+ * The window is chosen so that its first three keys are the last three of a slice, at any slice
+ * count from 2 to 32: the real row sees three keys of that slice and the idle row slots, which sit
+ * at later positions, see none, the case in which every lane must still stage the tile. */
+static void check_attn_depth() {
+    std::printf("== attn_paged decode at depth, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: attention is not run");
+#else
+    using namespace moenum;
+    const RadKernelInfo* k = nullptr;
+    for (int i = 0; i < rows(); ++i)
+        if (row_at(i) && !std::strcmp(row_at(i)->name, "attn_paged_bf16_decode")) k = row_at(i);
+    if (!k || !k->launch) { fail("attn_paged_bf16_decode is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long hd = 128, nh = 16, gqa = 4, kvh = nh / gqa, bs = 16, ctx = 4096 - 9;
+    const long long nb = (ctx + bs - 1) / bs;
+    const float scale = 1.0f / std::sqrt((float)hd);
+    std::vector<uint16_t> q((size_t)(nh * hd)), kv((size_t)(nb * kvh * bs * 2 * hd));
+    uint32_t seed = 0x1234567u;
+    auto draw = [&](float amp) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        return amp * ((float)(seed & 0xffff) / 32768.0f - 1.0f);
+    };
+    for (auto& v : q) v = f32_to_bf16(draw(1.5f));
+    std::vector<int32_t> bt((size_t)nb), su = { (int32_t)ctx };
+    for (long long b = 0; b < nb; ++b) bt[(size_t)b] = (int32_t)((b * 37 + 5) % nb);   /* a permutation */
+    for (long long i = 0; i < (long long)kv.size(); ++i)
+        kv[(size_t)i] = f32_to_bf16(draw((i / hd) % 2 ? 2.0f : 1.5f));                 /* K then V a slot */
+    const long long edge = (nb / 2) * bs - 3;          /* three keys under a slice boundary */
+    for (long long window : { 0LL, ctx - edge }) {
+        std::vector<RadParam> p = { pi("q_len", 1), pi("head_dim", hd), pi("gqa", gqa),
+                                    pi("block_size", bs), pi("causal", 1), pi("window", window),
+                                    pi("n_head", nh), pi("max_seqs", 1), pi("max_ctx", nb * bs),
+                                    ps("q_dtype", "bf16"), ps("kv_dtype", "bf16"),
+                                    RadParam{ "scale", RAD_P_F64, 0, 0, nullptr, (double)scale } };
+        /* The builder's call: params, no tensors. */
+        RadArgs pa{ nullptr, 0, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const long long bytes = k->scratch ? (long long)k->scratch(&pa) : 0;
+        const long long need = nh * 8 * 132 * 4;     /* eight slices of one row's partials */
+        if (bytes < need)
+            fail("attn_paged decode, window %lld: the scratch hook gives %lld bytes from the params "
+                 "alone, eight slices need %lld", window, bytes, need);
+        else ok("attn_paged decode, window %lld: the scratch hook gives %lld bytes from the params "
+                "alone", window, bytes);
+        /* The host mirror. */
+        std::vector<double> ref((size_t)(nh * hd));
+        const long long pos = ctx - 1, j0 = window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0;
+        for (long long h = 0; h < nh; ++h) {
+            const long long kh = h / gqa;
+            std::vector<double> sc((size_t)ctx, 0.0);
+            double mx = -1e300;
+            for (long long j = j0; j < ctx; ++j) {
+                const uint16_t* slot = kv.data() + ((bt[(size_t)(j / bs)] * kvh + kh) * bs + j % bs) * 2 * hd;
+                double d = 0;
+                for (long long e = 0; e < hd; ++e)
+                    d += (double)bf16_to_f32(q[(size_t)(h * hd + e)]) * (double)bf16_to_f32(slot[e]);
+                sc[(size_t)j] = d * (double)scale;
+                mx = std::max(mx, sc[(size_t)j]);
+            }
+            double sum = 0;
+            std::vector<double> acc((size_t)hd, 0.0);
+            for (long long j = j0; j < ctx; ++j) {
+                const uint16_t* slot = kv.data() + ((bt[(size_t)(j / bs)] * kvh + kh) * bs + j % bs) * 2 * hd;
+                const double w = std::exp(sc[(size_t)j] - mx);
+                sum += w;
+                for (long long e = 0; e < hd; ++e) acc[(size_t)e] += w * (double)bf16_to_f32(slot[hd + e]);
+            }
+            for (long long e = 0; e < hd; ++e) ref[(size_t)(h * hd + e)] = acc[(size_t)e] / sum;
+        }
+        std::vector<uint16_t> first;
+        for (int split : { 1, 0 }) {
+            Dev dv;
+            RadTensor t[8] = {};
+            t[0].data = dv.put(q.data(), q.size() * 2); t[0].dtype = RAD_BF16; t[0].rank = 3;
+            t[0].shape[0] = 1; t[0].shape[1] = nh; t[0].shape[2] = hd;
+            t[0].stride[0] = nh * hd; t[0].stride[1] = hd; t[0].stride[2] = 1;
+            t[7] = t[0]; t[7].data = dv.put(nullptr, q.size() * 2);
+            t[1].data = dv.put(kv.data(), kv.size() * 2); t[1].dtype = RAD_BF16; t[1].rank = 4;
+            t[1].shape[0] = nb; t[1].shape[1] = kvh; t[1].shape[2] = bs; t[1].shape[3] = 2 * hd;
+            t[1].stride[0] = kvh * bs * 2 * hd; t[1].stride[1] = bs * 2 * hd; t[1].stride[2] = 2 * hd;
+            t[1].stride[3] = 1;
+            t[2] = dense(dv.put(bt.data(), bt.size() * 4), RAD_I32, 1, nb);
+            t[3] = vec(dv.put(su.data(), 4), RAD_I32, 1);
+            RadArgs a{ t, 8, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+            if (split && bytes > 0) {
+                a.scratch = dv.put(nullptr, (size_t)bytes);
+                a.scratch_bytes = bytes;
+            }
+            char what[112];
+            std::snprintf(what, sizeof(what), "attn_paged decode, context %lld, window %lld, %s", ctx,
+                          window, split ? "with the partials" : "one slice (no scratch)");
+            const int rc = k->launch(&a, nullptr);
+            hipDeviceSynchronize();
+            if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+            std::vector<uint16_t> got(q.size());
+            hipMemcpy(got.data(), t[7].data, got.size() * 2, hipMemcpyDeviceToHost);
+            compare(what, ref, got, 2e-3);
+            if (split) first = got;
+            else if (!first.empty()) {
+                long long far = 0;
+                for (size_t i = 0; i < got.size(); ++i) {
+                    const double a0 = bf16_to_f32(first[i]), a1 = bf16_to_f32(got[i]);
+                    if (!(std::fabs(a0 - a1) <= 0.02 * std::fabs(a1) + 1e-4)) ++far;
+                }
+                if (far) fail("attn_paged decode, window %lld: %lld values far apart between the split "
+                              "launch and one slice", window, far);
+                else ok("attn_paged decode, window %lld: the split launch and one slice agree", window);
+            }
+        }
+    }
+#endif
+}
+
 /* ---- a plain weight the host cannot read -------------------------------------------------------
  * The engine maps weights through its own pool (core/device/aql.cpp), and on an integrated GPU (a
  * Radeon 860M) the host cannot read those pages, where hipMalloc's can be. Until 2026-11-18
@@ -3456,6 +3577,7 @@ int main(int argc, char** argv) {
         check_moe_numerics();
         check_conv_numerics();
         check_rope_numerics();
+    check_attn_depth();
         check_gemm_device_weight();
 
         const int n = rows();
