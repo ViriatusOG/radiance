@@ -1229,16 +1229,16 @@ extern "C" void r3d_cfg_topk(const RadArgs* a, R3dTopkCfg* out) {
  * from, capped at 16 MiB. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
  * `scratch == nullptr`), which is the cost of the split. */
 static int64_t attn_scratch(const RadArgs* a) {
-    /* Sized from the shape: a scratch hook runs at declare, when the operands' shapes are bound
-     * but every tensor's `data` is still null. A hook that required data would answer 0 and the
-     * split pass would find no buffer. gemm_scratch sizes from RadParam dims for the same reason. */
-    if (!a || a->n_t < 1 || a->t[0].rank == 0) return 0;
-    long long n_head = 0, head_dim = 0;
-    const int64_t nh = rad_args_geti(a, "n_head", &n_head) ? n_head : 0;
-    if (!rad_args_geti(a, "head_dim", &head_dim) || !head_dim || !nh) return 0;
-    const long long rows = rad_tensor_numel(&a->t[0]) / (nh * head_dim);
-    if (rows <= 0) return 0;
-    const long long want = rows * nh * 8 * 132 * (long long)sizeof(float);
+    /* Sized from the geometry alone: the builder calls a scratch hook at declare with the band's
+     * params and no tensors (rad_builder.cpp), so a hook that read an operand's shape would answer
+     * 0, the shim would halve the slice count to 1 and one wave a KV head would walk the whole
+     * context. The decode band is q_len <= 16 (cAttnBf16Decode), so the query rows are at most
+     * 16 * max_seqs; 8 is pick_splits' widest count. gemm_scratch sizes from RadParam dims for
+     * the same reason. */
+    long long n_head = 0, max_seqs = 0;
+    if (!a || !rad_args_geti(a, "n_head", &n_head) || n_head <= 0) return 0;
+    if (!rad_args_geti(a, "max_seqs", &max_seqs) || max_seqs < 1) max_seqs = 1;
+    const long long want = 16 * max_seqs * n_head * 8 * 132 * (long long)sizeof(float);
     const long long cap = 16LL << 20;
     return want < cap ? want : cap;
 }
