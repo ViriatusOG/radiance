@@ -980,6 +980,115 @@ void shape_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* Raw i8 latent rows contain two f16 scales, which a homogeneous integer fill cannot draw.
+ * Both libraries receive the same bytes; hand-computed D2/D512 answers also prevent a shared
+ * missing-scale implementation from passing solely because the libraries agree. */
+void mla_latent_cases(std::vector<Hand>& hs) {
+    for (int64_t d : { 2LL, 512LL })
+        for (int part : { -1, 0, 1 }) {
+            const int64_t row = d + 4;
+            std::vector<uint8_t> cache((size_t)(4 * row));
+            auto put = [&](int t, int a, int b, float s0, float s1) {
+                const int64_t at = t * row;
+                cache[(size_t)at] = (uint8_t)(int8_t)a;
+                cache[(size_t)(at + d / 2)] = (uint8_t)(int8_t)b;
+                const uint16_t sc[] = { rad_f32_to_f16(s0), rad_f32_to_f16(s1) };
+                std::memcpy(cache.data() + at + d, sc, sizeof sc);
+            };
+            put(0, 1, 2, 2, 3);
+            put(1, 3, 1, 1, 4);
+            put(2, 127, 127, NAN, NAN);
+            put(3, 127, 127, NAN, NAN);
+            const double w = part < 0 ? 0.5 : part == 0 ? 1 / (1 + std::exp(1.0))
+                                                                    : 1 / (1 + std::exp(-2.0));
+            const std::string name = "i8 MLA analytical D" + std::to_string(d) + " qhalf " +
+                                     std::to_string(part);
+            Hand h(name.c_str(), "mla_attn", 1e-5);
+            h.dense(RAD_F32, { 1, 1, d }, [=](int64_t c) {
+                 return part >= 0 && c == part * (d / 2) ? 1.0f : 0.0f;
+             })
+             .raw(RAD_I8, { 1, 1, 4, row }, cache.data())
+             .dense(RAD_I32, { 1, 1 }, [](int64_t) { return 0.0f; })
+             .idx({ 2 })
+             .dense(RAD_F32, { 1, 1, d }, [](int64_t) { return -1.0f; }, true)
+             .pi("M", 32).pi("latent_dim", d).pi("heads", 1).pi("blocks", 1).pi("block_size", 4)
+             .pf("scale", 1).ps("dtype", "f32").ps("kv_dtype", "i8");
+            h.oracle_opd = 4;
+            h.oracle_tol = 1e-5;
+            h.oracle.assign((size_t)d, 0);
+            h.oracle[0] = (float)(2 * w + 3 * (1 - w));
+            h.oracle[(size_t)(d / 2)] = (float)(6 * w + 4 * (1 - w));
+            hs.push_back(std::move(h));
+        }
+
+    struct Shape { int64_t rows, heads; };
+    const Shape shapes[] = { { 1, 1 }, { 1, 8 }, { 3, 16 }, { 3, 64 }, { 32, 1 }, { 32, 8 } };
+    for (const Shape& sh : shapes)
+        for (uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 })
+            for (bool padded : { false, true }) {
+                constexpr int64_t d = 512, bs = 4, pages = 3, blocks = 3;
+                const int64_t row = d + 4 + (padded ? 3 : 0), page = bs * row + (padded ? 5 : 0);
+                std::vector<uint8_t> cache((size_t)(pages * page), 0x5a);
+                for (int64_t p = 0; p < pages; ++p)
+                    for (int64_t t = 0; t < bs; ++t) {
+                        const int64_t at = p * page + t * row;
+                        const float s0 = p == 2 && t == 0 ? 0.0f : 0.015f * (float)(1 + p + t);
+                        const float s1 = 0.003f * (float)(1 + 2 * p + t);
+                        for (int64_t c = 0; c < d; ++c) {
+                            const int code = (int)(((p * bs + t) * 37 + c * 13) % 255) - 127;
+                            cache[(size_t)(at + c)] = (uint8_t)(int8_t)(c < d / 2 && s0 == 0 ? 0 : code);
+                        }
+                        const uint16_t sc[] = { rad_f32_to_f16(s0), rad_f32_to_f16(s1) };
+                        // The padded case deliberately puts some f16 scales at odd addresses.
+                        std::memcpy(cache.data() + at + d, sc, sizeof sc);
+                    }
+                const int64_t qh = d + (padded ? 3 : 0), qr = sh.heads * qh + (padded ? 5 : 0);
+                const int64_t oh = d + (padded ? 5 : 0), orow = sh.heads * oh + (padded ? 7 : 0);
+                const std::string name = "i8 MLA " + std::to_string(sh.rows) + "x" +
+                    std::to_string(sh.heads) + (dt == RAD_F32 ? " f32" : " bf16") +
+                    (padded ? " padded byte pitches" : " tight 516-byte rows");
+                Hand h(name.c_str(), "mla_attn", dt == RAD_F32 ? 1e-5 : 0.01);
+                h.view(dt, { sh.rows, sh.heads, d }, { qr, qh, 1 }, sh.rows * qr,
+                       [](int64_t i) { return (float)((int)(i % 31) - 15) / 64.0f; })
+                 .bytes(RAD_I8, { pages, 1, bs, d + 4 }, { page, bs * row, row, 1 },
+                        pages * page, std::move(cache), false)
+                 .dense(RAD_I32, { sh.rows, blocks }, [](int64_t i) {
+                     const int64_t r = i / blocks;
+                     if (r % 5 == 2) return i % blocks == 0 ? -1.0f : 99.0f;
+                     return (float)((i % blocks + 2 + r) % pages);
+                 })
+                 .dense(RAD_I32, { sh.rows }, [](int64_t r) {
+                     const int lengths[] = { 5, 0, 12, 3, 4, 7, 1, 15, -1 };
+                     return (float)lengths[r % 9];
+                 })
+                 .view(dt, { sh.rows, sh.heads, d }, { orow, oh, 1 }, sh.rows * orow,
+                       [](int64_t) { return -0.25f; }, true)
+                 .pi("M", 2048).pi("latent_dim", d).pi("heads", sh.heads).pi("blocks", blocks)
+                 .pi("block_size", bs).pf("scale", 0.0625)
+                 .ps("dtype", dt == RAD_F32 ? "f32" : "bf16").ps("kv_dtype", "i8");
+                hs.push_back(std::move(h));
+            }
+
+    // Both libraries must reject malformed i8 layouts without writing any output.
+    for (int bad = 0; bad < 5; ++bad) {
+        const int64_t d = bad == 1 ? 3 : 2, width = bad == 0 ? d : d + 4;
+        const int64_t token = bad == 3 ? width - 1 : width;
+        const int64_t page = bad == 4 ? 4 * token - 1 : 4 * token;
+        const std::string name = "i8 MLA refused layout " + std::to_string(bad);
+        Hand h(name.c_str(), "mla_attn", 0);
+        h.dense(RAD_F32, { 1, 1, d }, [](int64_t) { return 0.0f; })
+         .bytes(RAD_I8, { 1, 1, 4, width }, { page, page, token, bad == 2 ? 2 : 1 },
+                64, std::vector<uint8_t>(64, 0), false)
+         .dense(RAD_I32, { 1, 1 }, [](int64_t) { return 0.0f; })
+         .idx({ 1 })
+         .dense(RAD_F32, { 1, 1, d }, [](int64_t) { return -71.0f; }, true)
+         .pi("M", 1).pi("latent_dim", d).pi("heads", 1).pi("blocks", 1).pi("block_size", 4)
+         .pf("scale", 1).ps("dtype", "f32").ps("kv_dtype", "i8")
+         .refuses(bad < 2 ? RAD_E_SHAPE : RAD_E_STRIDE);
+        hs.push_back(std::move(h));
+    }
+}
+
 /* ================================================================== bit patterns and formats */
 void format_cases(std::vector<Hand>& hs) {
     const auto zero = [](int64_t) { return 0.0f; };
@@ -4947,6 +5056,7 @@ void audio_cases(std::vector<Hand>& hs) {
 bool hand_cases(const Check& ck) {
     std::vector<Hand> hs;
     shape_cases(hs);
+    mla_latent_cases(hs);
     format_cases(hs);
     anchor_cases(hs);
     packed_cases(hs);

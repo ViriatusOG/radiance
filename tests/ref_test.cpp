@@ -625,6 +625,159 @@ TEST(mla_attention_reads_an_e4m3_latent_cache_as_its_values) {
     CHECK_EQ(out.at(1), 2);
 }
 
+/* These expectations come from two decoded latent vectors, not a second attention call.
+ * D512 embeds the D2 example at channels 0 and 256, across the two separately scaled halves. */
+TEST(mla_attention_reads_both_i8_latent_half_scales_in_qk_and_pv) {
+    for (int64_t d : { 2LL, 512LL }) {
+        T q(RAD_F32, { 1, 1, d }), kv(RAD_I8, { 2, 1, 4, d + 4 });
+        T bt(RAD_I32, { 1, 2 }), len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, d });
+        bt.n({ 1, 0 });
+        len.n({ 2 });
+        auto put = [&](int token, int a, int b, float s0, float s1) {
+            const int64_t base = (4 + token) * (d + 4); // page 1, not a dense prefix
+            std::fill(kv.mem.begin() + base, kv.mem.begin() + base + d, 0);
+            kv.mem[(size_t)base] = (uint8_t)(int8_t)a;
+            kv.mem[(size_t)(base + d / 2)] = (uint8_t)(int8_t)b;
+            const uint16_t bits[] = { f32_to_f16(s0), f32_to_f16(s1) };
+            std::memcpy(kv.mem.data() + base + d, bits, sizeof bits);
+        };
+        put(0, 1, 2, 2, 3); // z0 = (2,6)
+        put(1, 3, 1, 1, 4); // z1 = (3,4)
+        // Invisible rows contain NaN scales: reading past length cannot accidentally pass.
+        put(2, 127, 127, NAN, NAN);
+        put(3, 127, 127, NAN, NAN);
+        A a;
+        a.t(q).t(kv).t(bt).t(len).t(out).i("M", 32).i("latent_dim", d).i("heads", 1)
+         .i("blocks", 2).i("block_size", 4).d("scale", 1).s("dtype", "f32").s("kv_dtype", "i8");
+        for (int part : { -1, 0, 1 }) {
+            std::fill(q.mem.begin(), q.mem.end(), 0);
+            if (part >= 0) st_dt(RAD_F32, q.t.data, part * (d / 2), 1);
+            const double w = part < 0 ? 0.5 : part == 0 ? 1 / (1 + std::exp(1.0))
+                                                                    : 1 / (1 + std::exp(-2.0));
+            REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+            for (int64_t c = 0; c < d; ++c) {
+                const double want = c == 0 ? 2 * w + 3 * (1 - w)
+                                    : c == d / 2 ? 6 * w + 4 * (1 - w) : 0;
+                CHECK_NEAR(out.at(c), want, 2e-6);
+            }
+        }
+        // A single token exposes the exact F32 product, including signed codes and a scale
+        // whose product is not BF16. Quantization's zero-scale half must stay zero too.
+        put(0, -127, 127, 0.3333f, 0.001f);
+        len.n({ 1 });
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        CHECK_EQ(out.at(0), -127.0f * f16_to_f32(f32_to_f16(0.3333f)));
+        CHECK_EQ(out.at(d / 2), 127.0f * f16_to_f32(f32_to_f16(0.001f)));
+        put(0, 0, -127, 0, 0.125f);
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        CHECK_EQ(out.at(0), 0);
+        CHECK_EQ(out.at(d / 2), -15.875f);
+        len.n({ 0 });
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        for (int64_t c = 0; c < d; ++c) CHECK_EQ(out.at(c), 0);
+        len.n({ 2 });
+        bt.n({ -1, 99 });
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        for (int64_t c = 0; c < d; ++c) CHECK_EQ(out.at(c), 0);
+    }
+}
+
+TEST(mla_attention_reads_a_latent_written_by_the_i8_kv_store) {
+    constexpr int64_t D = 512, HD = D / 2, BS = 4;
+    T k(RAD_BF16, { BS, 1, HD }), v(RAD_BF16, { BS, 1, HD });
+    T slots(RAD_I32, { BS }), kv(RAD_I8, { 2, 1, BS, D + 4 });
+    for (int64_t t = 0; t < BS; ++t)
+        for (int64_t c = 0; c < HD; ++c) {
+            st_dt(RAD_BF16, k.t.data, t * HD + c, (float)(t + 1));
+            st_dt(RAD_BF16, v.t.data, t * HD + c, (float)(-2 * (t + 1)));
+        }
+    slots.n({ 4, 5, 6, 7 });
+    A store;
+    store.t(k).t(v).t(slots).t(kv).i("M", BS).i("head_dim", HD).i("n_head_kv", 1)
+         .i("block_size", BS).s("kv_dtype", "i8");
+    REQUIRE_EQ(run("kv_store", store), RAD_OK);
+    T q(RAD_F32, { 1, 1, D }), bt(RAD_I32, { 1, 1 }), len(RAD_I32, { 1 });
+    T out(RAD_F32, { 1, 1, D });
+    bt.n({ 1 });
+    len.n({ BS });
+    A a;
+    a.t(q).t(kv).t(bt).t(len).t(out).i("M", 1).i("latent_dim", D).i("heads", 1)
+     .i("blocks", 1).i("block_size", BS).d("scale", 0.0625).s("dtype", "f32").s("kv_dtype", "i8");
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    float want[2] = {};
+    for (int t = 0; t < BS; ++t) {
+        want[0] += 127.0f * f16_to_f32(f32_to_f16((float)(t + 1) / 127.0f));
+        want[1] -= 127.0f * f16_to_f32(f32_to_f16((float)(2 * (t + 1)) / 127.0f));
+    }
+    for (int64_t c = 0; c < D; ++c) CHECK_EQ(out.at(c), want[c >= HD] / BS);
+}
+
+TEST(mla_i8_latent_refuses_a_missing_scale_plane_odd_dimension_or_overlapping_rows) {
+    T q(RAD_F32, { 1, 1, 512 }), kv(RAD_I8, { 1, 1, 4, 516 });
+    T bt(RAD_I32, { 1, 1 }), len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, 512 });
+    len.n({ 1 });
+    std::fill(out.mem.begin(), out.mem.end(), 0x5a);
+    const auto before = out.mem;
+    auto refused = [&](RadTensor cache, int64_t d, int rc) {
+        A a;
+        a.t(q).t(kv).t(bt).t(len).t(out).i("M", 1).i("latent_dim", d).i("heads", 1)
+         .i("blocks", 1).i("block_size", 4).d("scale", 1).s("dtype", "f32").s("kv_dtype", "i8");
+        a.ts[0].shape[2] = a.ts[4].shape[2] = d;
+        a.ts[1] = cache;
+        CHECK_EQ(run("mla_attn", a), rc);
+        CHECK(out.mem == before);
+    };
+    RadTensor bad = kv.t;
+    bad.shape[3] = 512;
+    refused(bad, 512, RAD_E_SHAPE);
+    bad = kv.t;
+    bad.shape[3] = 515;
+    refused(bad, 511, RAD_E_SHAPE);
+    bad = kv.t;
+    bad.stride[3] = 2;
+    refused(bad, 512, RAD_E_STRIDE);
+    bad = kv.t;
+    bad.stride[2] = 515;
+    refused(bad, 512, RAD_E_STRIDE);
+    bad = kv.t;
+    bad.stride[0] = 4 * 516 - 1;
+    refused(bad, 512, RAD_E_STRIDE);
+}
+
+TEST(mla_latent_shape_keeps_queries_wide_and_appends_only_i8_scale_bytes) {
+    const RadKernelInfo* k = kern("mla_attn");
+    REQUIRE(k && k->opd_shape);
+    for (const char* cache : { "", "bf16", "fp8_e4m3", "i8" }) {
+        A a;
+        a.i("M", 3).i("latent_dim", 512).i("heads", 16).i("blocks", 2).i("block_size", 4)
+         .d("scale", 0.0625).s("dtype", "bf16");
+        if (*cache) a.s("kv_dtype", cache);
+        const RadArgs* args = a.get();
+        RadOpdDesc q{}, kv{}, out{};
+        REQUIRE_EQ(k->opd_shape(args->p, args->n_p, 0, &q), RAD_OK);
+        REQUIRE_EQ(k->opd_shape(args->p, args->n_p, 1, &kv), RAD_OK);
+        REQUIRE_EQ(k->opd_shape(args->p, args->n_p, 4, &out), RAD_OK);
+        CHECK_EQ(q.dtype, (uint32_t)RAD_BF16);
+        CHECK_EQ(out.dtype, (uint32_t)RAD_BF16);
+        CHECK_EQ(q.shape[2], 512LL);
+        CHECK_EQ(out.shape[2], 512LL);
+        CHECK_EQ(kv.rank, 4u);
+        CHECK_EQ(kv.shape[0], 6LL);
+        CHECK_EQ(kv.shape[2], 4LL);
+        const bool i8 = !std::strcmp(cache, "i8");
+        const uint32_t want_dt = i8 ? (uint32_t)RAD_I8 : !std::strcmp(cache, "fp8_e4m3")
+                                                      ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
+        CHECK_EQ(kv.dtype, want_dt);
+        CHECK_EQ(kv.shape[3], i8 ? 516LL : 512LL);
+    }
+    A odd;
+    odd.i("M", 1).i("latent_dim", 511).i("heads", 1).i("blocks", 1).i("block_size", 4)
+       .d("scale", 1).s("dtype", "bf16").s("kv_dtype", "i8");
+    const RadArgs* args = odd.get();
+    RadOpdDesc kv{};
+    CHECK_EQ(k->opd_shape(args->p, args->n_p, 1, &kv), RAD_E_UNSUPPORTED);
+}
+
 TEST(dsa_score_relu_is_per_head_before_signed_weights_and_masks_invalid_history) {
     T q(RAD_F8E4M3, { 2, 2, 2 }), qs(RAD_F32, { 2, 2 }), gate(RAD_F32, { 2, 2 });
     T k(RAD_F8E4M3, { 3, 2 }), ks(RAD_F32, { 3 }), bt(RAD_I32, { 2, 3 });

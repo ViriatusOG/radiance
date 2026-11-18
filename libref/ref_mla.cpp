@@ -141,19 +141,34 @@ int ref_mla_attn_paged(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* The two halves are parts of one latent vector, not separate attention K and V vectors.
+ * The i8 KV ABI puts their f16 scales after all D signed codes; base is a byte offset. */
+static inline void mla_i8_scales(const RadTensor& kv, int64_t base, int64_t d, float (&s)[2]) {
+    uint16_t bits[2];
+    std::memcpy(bits, (const uint8_t*)kv.data + base + d, sizeof bits);
+    s[0] = rad_f16_to_f32(bits[0]);
+    s[1] = rad_f16_to_f32(bits[1]);
+}
+
 int ref_mla_attn(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const auto &q = a->t[0], &kv = a->t[1], &bt = a->t[2], &len = a->t[3], &out = a->t[4];
     const int64_t d = p_int(a, "latent_dim", 0), h = p_int(a, "heads", 0),
                   bs = p_int(a, "block_size", 0);
     const float scale = p_f32(a, "scale", 0);
+    const bool i8 = kv.dtype == RAD_I8;
     if (d < 1 || d > 2048 || h < 1 || bs < 1 || !std::isfinite(scale) || scale <= 0 ||
         q.rank != 3 || q.shape[0] < 1 || q.shape[1] != h || q.shape[2] != d || kv.rank != 4 ||
-        kv.shape[1] != 1 || kv.shape[2] != bs || kv.shape[3] != d || bt.rank != 2 ||
+        kv.shape[1] != 1 || kv.shape[2] != bs || kv.shape[3] != d + (i8 ? 4 : 0) || bt.rank != 2 ||
         bt.shape[0] != q.shape[0] || len.rank != 1 || len.shape[0] != q.shape[0] || out.rank != 3 ||
         out.shape[0] != q.shape[0] || out.shape[1] != h || out.shape[2] != d ||
         bt.dtype != RAD_I32 || len.dtype != RAD_I32)
         return RAD_E_SHAPE;
+    if (i8 && d % 2) return RAD_E_SHAPE;
+    // Metadata is byte-addressed and contiguous after the codes. Row/page padding is legal.
+    if (i8 && (kv.stride[3] != 1 || kv.stride[2] < d + 4 ||
+               kv.stride[0] / bs < kv.stride[2]))
+        return RAD_E_STRIDE;
     for (int i = 0; i < 5; ++i)
         if (!a->t[i].data) return RAD_E_INVAL;
 #pragma omp parallel for schedule(static)
@@ -169,10 +184,14 @@ int ref_mla_attn(const RadArgs* a, RadStream) {
                        : page * kv.stride[0] + (token % bs) * kv.stride[2];
         };
         auto dot = [&](int64_t base) -> float {
+            float s[2] = {};
+            if (i8) mla_i8_scales(kv, base, d, s);
             float v = 0;
-            for (int64_t c = 0; c < d; ++c)
-                v += ldt(&q, r * q.stride[0] + head * q.stride[1] + c * q.stride[2]) *
-                     ldt(&kv, base + c * kv.stride[3]);
+            for (int64_t c = 0; c < d; ++c) {
+                const float k = i8 ? (float)((const int8_t*)kv.data)[base + c] * s[c >= d / 2]
+                                   : ldt(&kv, base + c * kv.stride[3]);
+                v += ldt(&q, r * q.stride[0] + head * q.stride[1] + c * q.stride[2]) * k;
+            }
             return v * scale;
         };
         float max = -INFINITY;
@@ -186,7 +205,13 @@ int ref_mla_attn(const RadArgs* a, RadStream) {
             if (base < 0) continue;
             const float w = std::exp(dot(base) - max);
             den += w;
-            for (int64_t c = 0; c < d; ++c) val[c] += w * ldt(&kv, base + c * kv.stride[3]);
+            float s[2] = {};
+            if (i8) mla_i8_scales(kv, base, d, s);
+            for (int64_t c = 0; c < d; ++c) {
+                const float v = i8 ? (float)((const int8_t*)kv.data)[base + c] * s[c >= d / 2]
+                                   : ldt(&kv, base + c * kv.stride[3]);
+                val[c] += w * v;
+            }
         }
         for (int64_t c = 0; c < d; ++c)
             stt(&out, r * out.stride[0] + head * out.stride[1] + c * out.stride[2],

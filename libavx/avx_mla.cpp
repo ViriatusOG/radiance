@@ -147,19 +147,34 @@ AVX_KERNEL(mla_attn_paged) {
     return RAD_OK;
 }
 
+/* The two halves are parts of one latent vector, not separate attention K and V vectors.
+ * The i8 KV ABI puts their f16 scales after all D signed codes; base is a byte offset. */
+static inline void mla_i8_scales(const RadTensor& kv, int64_t base, int64_t d, float (&s)[2]) {
+    uint16_t bits[2];
+    std::memcpy(bits, (const uint8_t*)kv.data + base + d, sizeof bits);
+    s[0] = rad_f16_to_f32(bits[0]);
+    s[1] = rad_f16_to_f32(bits[1]);
+}
+
 AVX_KERNEL(mla_attn) {
     if (!rad_args_have(a, 5)) return RAD_E_INVAL;
     const auto &q = a->t[0], &kv = a->t[1], &bt = a->t[2], &len = a->t[3], &out = a->t[4];
     const int64_t d = p_int(a, "latent_dim", 0), h = p_int(a, "heads", 0),
                   bs = p_int(a, "block_size", 0);
     const float scale = p_f32(a, "scale", 0);
+    const bool i8 = kv.dtype == RAD_I8;
     if (d < 1 || d > 2048 || h < 1 || bs < 1 || !std::isfinite(scale) || scale <= 0 ||
         q.rank != 3 || q.shape[0] < 1 || q.shape[1] != h || q.shape[2] != d || kv.rank != 4 ||
-        kv.shape[1] != 1 || kv.shape[2] != bs || kv.shape[3] != d || bt.rank != 2 ||
+        kv.shape[1] != 1 || kv.shape[2] != bs || kv.shape[3] != d + (i8 ? 4 : 0) || bt.rank != 2 ||
         bt.shape[0] != q.shape[0] || len.rank != 1 || len.shape[0] != q.shape[0] || out.rank != 3 ||
         out.shape[0] != q.shape[0] || out.shape[1] != h || out.shape[2] != d ||
         bt.dtype != RAD_I32 || len.dtype != RAD_I32)
         return RAD_E_SHAPE;
+    if (i8 && d % 2) return RAD_E_SHAPE;
+    // Metadata is byte-addressed and contiguous after the codes. Row/page padding is legal.
+    if (i8 && (kv.stride[3] != 1 || kv.stride[2] < d + 4 ||
+               kv.stride[0] / bs < kv.stride[2]))
+        return RAD_E_STRIDE;
     for (int i = 0; i < 5; ++i)
         if (!a->t[i].data) return RAD_E_INVAL;
     AVX_PARALLEL_FOR_IF(q.shape[0] * h * d * bt.shape[1] * bs >= AVX_PAR_MIN)
@@ -179,7 +194,14 @@ AVX_KERNEL(mla_attn) {
                 ld_int_dt(bt.dtype, bt.data, r * bt.stride[0] + (j / bs) * bt.stride[1]);
             if (page < 0 || page >= kv.shape[0]) continue;
             const int64_t base = page * kv.stride[0] + (j % bs) * kv.stride[2];
-            for (int64_t c = 0; c < d; ++c) key[c] = ldt(&kv, base + c * kv.stride[3]);
+            if (i8) {
+                float s[2];
+                mla_i8_scales(kv, base, d, s);
+                const int8_t* codes = (const int8_t*)kv.data + base;
+                for (int64_t c = 0; c < d; ++c) key[c] = (float)codes[c] * s[c >= d / 2];
+            } else {
+                for (int64_t c = 0; c < d; ++c) key[c] = ldt(&kv, base + c * kv.stride[3]);
+            }
             vf acc = vf_zero();
             int64_t c = 0;
             for (; c + VF_N <= d; c += VF_N)

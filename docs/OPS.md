@@ -3481,6 +3481,16 @@ not the latent width (GLM: `1/sqrt(256)` against a latent of 512). `kv_dtype`, w
 cache's dtype and may differ from `dtype`: `fp8_e4m3` is a cache `kv_store` wrote at its default
 descale of 1, so each code is read as the value itself.
 
+The host implementations also read `kv_dtype=i8`: `latent_dim` D must be even and the cache is
+`[pages, 1, block_size, D+4]` bytes per row. The first D bytes are signed int8 codes; the next two
+bytes are an f16 scale for channels `[0,D/2)`, followed by an f16 scale for `[D/2,D)`. This is
+`kv_store`'s ordinary int8 layout at `head_dim=D/2`, with the two halves of the latent supplied as
+its K and V inputs. Each latent value is its signed code times its half's scale in f32; **both**
+scales participate in QK and PV, and the softmax denominator is the sum of unscaled probabilities.
+Queries and outputs keep `dtype` and width D. The i8 row's channels are contiguous, but token/page
+pitches may contain padding. No BF16 rounding is inserted after dequantization. This host contract
+does not enable an i8 `mla_attn` device row or GLM's i8-cache deployment option.
+
 libr4d has three `mla_attn` rows, all at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
 matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
 heads are the WMMA tile's rows, so all of them share each latent load, and the probabilities enter
