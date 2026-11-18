@@ -50,6 +50,8 @@
 #include <cstdarg>
 #include <cerrno>
 #include <cmath>
+#include <csetjmp>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -3228,6 +3230,115 @@ static void check_conv_numerics() {
 #endif
 }
 
+/* ---- a plain weight the host cannot read -------------------------------------------------------
+ * The engine maps weights through its own pool (core/device/aql.cpp), and on an integrated GPU (a
+ * Radeon 860M) the host cannot read those pages, where hipMalloc's can be. Until 2026-11-18
+ * rad_gemm_run looked for a joined-planes header through every weight's address on the host, so
+ * the first prefill GEMM of a bf16 model faulted there, while this selftest, whose weights come
+ * from hipMalloc, passed. This case maps the weight with HIP's virtual memory calls and grants
+ * access to the device only; the host's read is caught (SIGSEGV) and reported as a FAIL. */
+#ifdef RAD_HAVE_HIP
+namespace devw {
+
+sigjmp_buf g_jb;
+volatile sig_atomic_t g_armed = 0;
+void on_segv(int) { if (g_armed) siglongjmp(g_jb, 1); signal(SIGSEGV, SIG_DFL); raise(SIGSEGV); }
+
+/* fn() with SIGSEGV caught: 1 when it faulted, else 0 and *rc its return. */
+template <class F> int guarded(F fn, int* rc) {
+    struct sigaction sa{}, old{};
+    sa.sa_handler = on_segv; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old);
+    int faulted = 0;
+    if (sigsetjmp(g_jb, 1) == 0) { g_armed = 1; *rc = fn(); }
+    else faulted = 1;
+    g_armed = 0;
+    sigaction(SIGSEGV, &old, nullptr);
+    return faulted;
+}
+
+struct DeviceOnly {
+    void* p = nullptr; size_t size = 0; hipMemGenericAllocationHandle_t h{}; int stage = 0;
+    ~DeviceOnly() {
+        if (stage >= 3) (void)hipMemUnmap(p, size);
+        if (stage >= 2) (void)hipMemAddressFree(p, size);
+        if (stage >= 1) (void)hipMemRelease(h);
+    }
+    /* 0, or the failing call's status */
+    int map(size_t bytes) {
+        hipMemAllocationProp prop{};
+        prop.type = hipMemAllocationTypePinned;
+        prop.location.type = hipMemLocationTypeDevice; prop.location.id = 0;
+        size_t g = 0;
+        if (int e = hipMemGetAllocationGranularity(&g, &prop, hipMemAllocationGranularityMinimum)) return e;
+        if (!g) return -1;
+        size = (bytes + g - 1) / g * g;
+        if (int e = hipMemCreate(&h, size, &prop, 0)) return e;
+        stage = 1;
+        if (int e = hipMemAddressReserve(&p, size, 0, nullptr, 0)) return e;
+        stage = 2;
+        if (int e = hipMemMap(p, size, 0, h, 0)) return e;
+        stage = 3;
+        hipMemAccessDesc ad{};
+        ad.location.type = hipMemLocationTypeDevice; ad.location.id = 0;
+        ad.flags = hipMemAccessFlagsProtReadWrite;
+        if (int e = hipMemSetAccess(p, size, &ad, 1)) return e;
+        return 0;
+    }
+};
+
+}  // namespace devw
+#endif
+
+static void check_gemm_device_weight() {
+    std::printf("== gemm_nt_bf16_tiled, a plain weight the host cannot read\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: not run");
+#else
+    using namespace moenum;
+    using namespace devw;
+    auto fn = (int (*)(const RadArgs*, RadStream))dlsym(g_h, "r3d_rad_gemm_nt_bf16_tiled");
+    if (!fn) { fail("r3d_rad_gemm_nt_bf16_tiled is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long M = 32, N = 64, K = 128;   /* M >= 17: the tiled row's band */
+    uint32_t st = 0x6E3D17u;
+    auto rnd = [&](float sc) { st = st * 1664525u + 1013904223u;
+                               return f32_to_bf16((((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * sc); };
+    std::vector<uint16_t> x((size_t)(M * K)), w((size_t)(N * K)), ynan((size_t)(M * N), 0x7fc0u);
+    for (auto& v : x) v = rnd(2.0f);
+    for (auto& v : w) v = rnd(1.0f);
+    DeviceOnly dw;
+    if (int e = dw.map(w.size() * 2)) { skip("HIP's virtual memory calls are not available here (status %d)", e); return; }
+    if (hipMemcpy(dw.p, w.data(), w.size() * 2, hipMemcpyHostToDevice) != hipSuccess) {
+        fail("copying the weight into device-only memory failed"); return; }
+    int probe = 0;
+    if (!guarded([&] { return (int)*(volatile const uint8_t*)dw.p; }, &probe)) {
+        skip("the host can read device-only memory on this machine, so the case proves nothing here"); return; }
+    Dev dv;
+    RadTensor t[3] = { dense(dv.put(x.data(), x.size() * 2), RAD_BF16, M, K),
+                       dense(dw.p, RAD_BF16, N, K),
+                       dense(dv.put(ynan.data(), ynan.size() * 2), RAD_BF16, M, N) };
+    std::vector<RadParam> p = { pi("M", M), pi("N", N), pi("K", K), ps("dtype", "bf16") };
+    RadArgs a{ t, 3, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+    int rc = 0;
+    if (guarded([&] { return fn(&a, nullptr); }, &rc)) {
+        fail("the shim read the weight's bytes on the host (SIGSEGV)"); return; }
+    (void)hipDeviceSynchronize();
+    if (rc != 0) { fail("the launch returned %d", rc); return; }
+    std::vector<uint16_t> y((size_t)(M * N));
+    if (hipMemcpy(y.data(), t[2].data, y.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) { fail("copying y back failed"); return; }
+    std::vector<double> ref((size_t)(M * N));
+    for (long long m = 0; m < M; ++m)
+        for (long long n = 0; n < N; ++n) {
+            double s = 0;
+            for (long long k = 0; k < K; ++k) s += (double)bf16_to_f32(x[m * K + k]) * bf16_to_f32(w[n * K + k]);
+            ref[m * N + n] = s;
+        }
+    compare("gemm_nt_bf16_tiled, M 32 N 64 K 128, the weight device-only", ref, y, 2e-3);
+#endif
+}
+
 int main(int argc, char** argv) {
     /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
      * even when output goes to a file or pipe. */
@@ -3265,6 +3376,7 @@ int main(int argc, char** argv) {
         check_shapes();
         check_moe_numerics();
         check_conv_numerics();
+        check_gemm_device_weight();
 
         const int n = rows();
         int passed = 0, failed = 0;
