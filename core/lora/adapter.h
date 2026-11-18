@@ -28,9 +28,11 @@
 #include "lora.h"
 #include "../format/safetensors.h"
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <string>
@@ -67,11 +69,13 @@ public:
     const std::vector<std::pair<std::string, std::string>>& skipped() const { return skipped_; }
     /* The most common kind among the modules, for messages ("LoRA", "LoHa", ...). */
     const char* kind_name() const;
+    const std::map<std::string, const StTensor*>& biases() const { return biases_; }
 
 private:
     int group_tensors(const std::string& path, std::string* err);
     SafeTensorsFile st_;
     std::vector<FileModule> mods_;
+    std::map<std::string, const StTensor*> biases_;
     std::vector<std::pair<std::string, std::string>> skipped_;
 };
 
@@ -153,6 +157,17 @@ struct Strength {
     std::shared_ptr<const AdapterFile> file;
     double                             weight = 1.0;
 };
+
+/* Add a checkpoint-order bias to a private BF16 copy of the base operand. An empty map is
+ * identity; a mapped operand may select a strict subset. compose_biases validates known full
+ * source dimensions. All mapping bounds are checked before any output element is changed. */
+int apply_bias_delta(const std::vector<float>& delta, const std::vector<int64_t>& source_rows,
+                     std::vector<uint16_t>* values, std::string* err);
+
+/* Collect per-module bias deltas at the requested strengths, in checkpoint row order. */
+int compose_biases(const KeyMap& km, const std::vector<Strength>& ads,
+                   const std::set<std::string>& supported, std::vector<std::string>* skipped,
+                   std::map<std::string, std::vector<float>>* out, std::string* err);
 
 /* What compose() did, for the log and the client. */
 struct ComposeReport {

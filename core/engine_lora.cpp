@@ -248,7 +248,12 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
         }
         for (const lora::FileModule& m : f->modules())
             if (m.kind == lora::FileModule::LORA && m.t[0]) rank = std::max(rank, (int)m.t[0]->shape[0]);
-        if (placed == 0) {
+        std::vector<std::string> skipped_biases;
+        std::map<std::string, std::vector<float>> bias_deltas;
+        RAD_TRY(lora::compose_biases(*lora_keys_, {{name, f, 1.0}}, gen_bias_modules_,
+                                   &skipped_biases, &bias_deltas, err));
+        if (first.empty() && !skipped_biases.empty()) first = skipped_biases.front();
+        if (placed == 0 && bias_deltas.empty()) {
             *err = fmt("none of its %zu modules is a module of this model (%s)", f->modules().size(),
                        first.c_str());
             return RAD_E_NOTFOUND;
@@ -305,7 +310,7 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
 }
 
 int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
-                      std::string* err) {
+                      std::string* err, const LoraReplacements* replacements) {
     /* Each rank on a stream of its own: the compute stream may be recording a pass. */
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         Rank& r = *ranks_[ri];
@@ -352,6 +357,15 @@ int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>
                 rad_memcpy_async(db, ps.b.data(), bb, st) < 0 ||
                 rad_memcpy_async(ds, ps.scale.data(), sb, st) < 0)
                 rc = RAD_E_DEVICE;
+        }
+        if (replacements && rc >= 0) {
+            for (const auto& [buffer, values] : (*replacements)[ri]) {
+                auto* dst = static_cast<uint16_t*>(r.ctx.buf_ptr(buffer));
+                if (!dst) { rc = RAD_E_STATE; break; }
+                rc = rad_memcpy_async(dst + slot * values.size(), values.data(),
+                                      values.size() * sizeof(uint16_t), st);
+                if (rc < 0) break;
+            }
         }
         const int sy = rad_stream_sync(st);
         rad_stream_destroy(st);
@@ -409,10 +423,38 @@ std::vector<std::string> Engine::lora_names() const {
 /* ================================================================== generator adapters */
 int Engine::gen_lora_start() {
     /* Every slot's run of the slot-row table holds its own index (Program::lora_rows). */
+    std::map<std::string, size_t> bias_rank_count;
+    std::map<std::string, size_t> mixer_rank_count;
     for (auto& rp : ranks_) {
         Rank& r = *rp;
-        const Program& P = r.program;
+        Program& P = r.program;
+        // Replacement slots live on the device. A weight used by a host op must keep its
+        // original pointer, even if a device op also reads that weight.
+        if (!device_is_host()) {
+            for (size_t op = 1; op < P.ops.size(); ++op)
+                if (r.ctx.op_domain((rad_op)op) == RAD_DOMAIN_HOST)
+                    for (rad_weight weight : P.ops[op].weights)
+                        P.lora_replacements.erase(weight);
+        }
+        std::set<std::string> rank_biases;
+        for (const auto& [weight, replacement] : P.lora_replacements)
+            if (!replacement.row_mixer) rank_biases.insert(replacement.module);
+        for (const auto& name : rank_biases) ++bias_rank_count[name];
+        std::set<std::string> rank_mixers;
+        for (const auto& [weight, replacement] : P.lora_replacements)
+            if (replacement.row_mixer) rank_mixers.insert(replacement.module);
+        for (const auto& name : rank_mixers) ++mixer_rank_count[name];
+        RAD_TRY(rad_dev_set(r.device));
+        for (const auto& [weight, bias] : P.lora_replacements) {
+            auto& base = r.lora_base_weights[weight];
+            base.resize((size_t)bias.rows);
+            const void* src = r.ctx.weight_ptr(weight);
+            if (!src) return RAD_E_STATE;
+            RAD_TRY(rad_memcpy_async(base.data(), src, bias.rows * 2, r.ctx.stream()));
+            RAD_TRY(rad_stream_sync(r.ctx.stream()));
+        }
         if (!P.lora_rows || P.lora_rows_n <= 0) continue;
+        RAD_TRY(rad_dev_set(r.device));
         const int S = cfg_.lora.slots();
         std::vector<int32_t> v((size_t)(S * P.lora_rows_n));
         for (int s = 0; s < S; ++s)
@@ -429,6 +471,20 @@ int Engine::gen_lora_start() {
         rad_stream_destroy(st);
         if (rc < 0 || sy < 0) return RAD_E_DEVICE;
     }
+    // A projector adapter must reach every rank that serves the model.
+    for (auto& rank : ranks_) {
+        auto& replacements = rank->program.lora_replacements;
+        for (auto it = replacements.begin(); it != replacements.end();) {
+            if (it->second.row_mixer && mixer_rank_count[it->second.module] != ranks_.size()) {
+                rank->lora_base_weights.erase(it->first);
+                it = replacements.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const auto& [name, count] : bias_rank_count)
+        if (count == ranks_.size()) gen_bias_modules_.insert(name);
     lora_keys_ = std::make_unique<lora::KeyMap>(ranks_[0]->program, ranks_[0]->lora_sites);
     for (const auto& [name, path] : cfg_.lora.adapters) {
         std::string err;
@@ -444,6 +500,53 @@ int Engine::gen_lora_start() {
     return RAD_OK;
 }
 
+int Engine::gen_lora_prepare_replacements(
+    const std::map<std::string, lora::Composite>& modules,
+    const std::map<std::string, std::vector<float>>& deltas,
+    LoraReplacements* replacements, std::string* err) const {
+    replacements->resize(ranks_.size());
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        const auto& r = *ranks_[i];
+        std::set<std::string> matched;
+        for (const auto& [weight, bias] : r.program.lora_replacements) {
+            auto data = r.lora_base_weights.at(weight);
+            const auto delta = deltas.find(bias.module);
+            if (bias.row_mixer) {
+                if (const auto it = modules.find(bias.module); it != modules.end()) {
+                    const auto& factors = it->second;
+                    if (factors.rows != 1 || factors.K != bias.rows) {
+                        *err = "adapter shape disagrees with row mixer " + bias.module;
+                        return RAD_E_SHAPE;
+                    }
+                    for (int64_t i = 0; i < bias.rows; ++i) {
+                        float adjustment = 0;
+                        for (int64_t j = 0; j < factors.r; ++j)
+                            adjustment += factors.B[(size_t)j] * factors.A[(size_t)(j * factors.K + i)];
+                        data[(size_t)i] = rad_f32_to_bf16(rad_bf16_to_f32(data[(size_t)i]) + adjustment);
+                    }
+                }
+            } else if (delta != deltas.end()) {
+                const int status = lora::apply_bias_delta(delta->second, bias.source_rows, &data, err);
+                if (status < 0) {
+                    *err = bias.module + ": " + *err;
+                    return status;
+                }
+                matched.insert(delta->first);
+            }
+            (*replacements)[i].push_back({bias.slots, std::move(data)});
+        }
+        if (matched.size() != deltas.size()) {
+            for (const auto& [module, values] : deltas) {
+                (void)values;
+                if (!matched.count(module)) {
+                    *err = "no supported bias operand for " + module;
+                    return RAD_E_UNSUPPORTED;
+                }
+            }
+        }
+    }
+    return RAD_OK;
+}
 
 // A published slot owns its packed weights. Only explicitly loaded adapters
 // keep source bytes between requests. A cache hit needs just a revision check.
@@ -573,7 +676,9 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     std::map<std::string, lora::Composite> comp;
     lora::ComposeReport rep;
     RAD_TRY(lora::compose(*lora_keys_, ss, rank, &comp, &rep, err));
-    if (rep.modules == 0) {
+    std::map<std::string, std::vector<float>> biases;
+    RAD_TRY(lora::compose_biases(*lora_keys_, ss, gen_bias_modules_, &rep.skipped, &biases, err));
+    if (rep.modules == 0 && biases.empty()) {
         *err = "none of the adapters' modules is a module of this model" +
                (rep.unplaced.empty() ? std::string() : " (" + rep.unplaced[0] + ")");
         return RAD_E_NOTFOUND;
@@ -591,7 +696,9 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
         /* Pools past the last one a site names hold nothing (lora_declare's dropped GEMMs). */
         packed[ri].resize(ranks_[ri]->program.lora_pools.size());
     }
-    RAD_TRY(lora_copy(sl, packed, err));
+    LoraReplacements replacements;
+    RAD_TRY(gen_lora_prepare_replacements(comp, biases, &replacements, err));
+    RAD_TRY(lora_copy(sl, packed, err, &replacements));
     /* The ranks each pool takes in this slot, before a pass can name the slot (the publish). */
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         Program& P = ranks_[ri]->program;

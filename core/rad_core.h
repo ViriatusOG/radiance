@@ -399,6 +399,14 @@ public:
     /* A generator's slots pack each combination's ranks from j = 0: the ranks pool p takes in
      * slot s at [p * S + s], 0 for a pool the combination does not reach (no adapter op runs). */
     std::vector<int32_t>       lora_rused;
+    struct LoraReplacement {
+        rad_buf slots = 0;
+        int64_t rows = 0;
+        bool row_mixer = false;
+        std::vector<int64_t> source_rows;
+        std::string module;
+    };
+    std::map<rad_weight, LoraReplacement> lora_replacements;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at

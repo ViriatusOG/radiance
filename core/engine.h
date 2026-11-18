@@ -324,9 +324,17 @@ public:
 private:
     /* A generator keeps explicitly loaded files and snapshots discovered files on a cache miss. */
     int gen_lora_start();
+    struct LoraReplacement {
+        rad_buf buffer;
+        std::vector<uint16_t> values;
+    };
+    using LoraReplacements = std::vector<std::vector<LoraReplacement>>;
+    int gen_lora_prepare_replacements(const std::map<std::string, lora::Composite>& modules,
+                                      const std::map<std::string, std::vector<float>>& deltas,
+                                      LoraReplacements* replacements, std::string* err) const;
     /* Every rank's packed bytes into `slot` of its pools, each rank on a stream of its own. */
     int lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
-                  std::string* err);
+                  std::string* err, const LoraReplacements* replacements = nullptr);
     bool                        lora_gen_ = false;
     std::unique_ptr<lora::KeyMap> lora_keys_;
     mutable std::mutex          lora_lib_mu_;
@@ -341,6 +349,7 @@ private:
                              std::string* err, const FileRevision* expected = nullptr) const;
     std::map<std::string, AdapterEntry> lora_lib_;
     std::set<std::string> unloaded_gen_adapters_;
+    std::set<std::string> gen_bias_modules_; // Bias operands supported on every tensor-parallel rank.
     uint64_t next_adapter_version_ = 1;
 private:
     std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */

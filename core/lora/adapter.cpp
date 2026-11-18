@@ -13,6 +13,7 @@
 #include <limits>
 #include <regex>
 #include <thread>
+#include <sys/stat.h>
 #include <unordered_map>
 
 namespace rad {
@@ -277,7 +278,7 @@ const Suffix kSuffix[] = {
     { ".oft_diag", -2, 0, "an OFT rotation" },
     { ".oft_R.weight", -2, 0, "an OFT rotation" },
     { ".boft_R", -2, 0, "a BOFT rotation" },
-    { ".diff_b", -3, 0, "a bias delta" },
+    { ".diff_b", -4, 0, nullptr },
     { ".w_norm", -3, 0, "a norm's weight delta" },
     { ".b_norm", -3, 0, "a norm's bias delta" },
     { ".lora_B.bias", -3, 0, "a bias on lora_B" },
@@ -290,6 +291,7 @@ const Suffix kSuffix[] = {
 /* ================================================================== the file */
 int AdapterFile::open(const std::string& path, std::string* err) {
     mods_.clear();
+    biases_.clear();
     skipped_.clear();
     if (st_.open(path) != RAD_OK) return fail(err, RAD_E_IO, path + ": cannot open as safetensors");
     return group_tensors(path, err);
@@ -298,6 +300,7 @@ int AdapterFile::open(const std::string& path, std::string* err) {
 int AdapterFile::open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err,
                                 const FileRevision* expected) {
     mods_.clear();
+    biases_.clear();
     skipped_.clear();
     const int opened = st_.open_snapshot(path, max_bytes, expected);
     if (opened < 0)
@@ -305,6 +308,7 @@ int AdapterFile::open_snapshot(const std::string& path, uint64_t max_bytes, std:
     const int grouped = group_tensors(path, err);
     if (grouped < 0) {
         mods_.clear();
+        biases_.clear();
         skipped_.clear();
         st_.close();
     }
@@ -326,6 +330,7 @@ int AdapterFile::group_tensors(const std::string& path, std::string* err) {
         if (hit->kind == -2)
             return fail(err, RAD_E_UNSUPPORTED, fmt("%s: %s is %s; that kind of adapter is not "
                                                     "served", path.c_str(), t.name.c_str(), hit->why));
+        if (hit->kind == -4) { biases_.emplace(key, &t); continue; }
         if (hit->kind == -3) { skipped_.push_back({ t.name, hit->why }); continue; }
         if (hit->kind == -1) { alphas[key] = &t; continue; }
         FileModule& m = by[key];
@@ -363,11 +368,12 @@ int AdapterFile::group_tensors(const std::string& path, std::string* err) {
                                                missing));
         mods_.push_back(m);
     }
-    if (mods_.empty()) return fail(err, RAD_E_FORMAT, path + ": no adapter modules in the file");
+    if (mods_.empty() && biases_.empty()) return fail(err, RAD_E_FORMAT, path + ": no adapter modules in the file");
     return RAD_OK;
 }
 
 const char* AdapterFile::kind_name() const {
+    if (mods_.empty()) return "bias";
     int n[4] = { 0, 0, 0, 0 };
     for (const FileModule& m : mods_) ++n[m.kind];
     const int k = (int)(std::max_element(n, n + 4) - n);
@@ -677,6 +683,8 @@ KeyMap::KeyMap(const Program& prog, const std::vector<Site>& sites) : prog_(&pro
             }
             adaptable_[src.module] = { rows, s.K_full > 0 ? s.K_full : -1 };
         }
+    for (const auto& [weight, replacement] : prog.lora_replacements)
+        if (replacement.row_mixer) adaptable_[replacement.module] = {1, replacement.rows};
     for (const LoraRoot& r : prog.lora_roots) {
         Root R;
         R.native = r.native;
@@ -799,6 +807,59 @@ struct Part {
 };
 
 }  /* namespace */
+
+int apply_bias_delta(const std::vector<float>& delta, const std::vector<int64_t>& source_rows,
+                     std::vector<uint16_t>* values, std::string* err) {
+    if (!values) return fail(err, RAD_E_INVAL, "bias destination is missing");
+    if (source_rows.empty()) {
+        if (delta.size() != values->size())
+            return fail(err, RAD_E_SHAPE, "bias shape disagrees with the destination");
+    } else {
+        if (source_rows.size() != values->size())
+            return fail(err, RAD_E_SHAPE, "bias row mapping does not cover the destination");
+        for (int64_t row : source_rows)
+            if (row < 0 || static_cast<uint64_t>(row) >= delta.size())
+                return fail(err, RAD_E_SHAPE, "bias row mapping exceeds the source");
+    }
+    for (size_t i = 0; i < values->size(); ++i) {
+        const size_t row = source_rows.empty() ? i : static_cast<size_t>(source_rows[i]);
+        (*values)[i] = rad_f32_to_bf16(rad_bf16_to_f32((*values)[i]) + delta[row]);
+    }
+    return RAD_OK;
+}
+
+int compose_biases(const KeyMap& km, const std::vector<Strength>& ads,
+                   const std::set<std::string>& supported, std::vector<std::string>* skipped,
+                   std::map<std::string, std::vector<float>>* out, std::string* err) {
+    out->clear();
+    for (const auto& ad : ads) {
+        for (const auto& [key, t] : ad.file->biases()) {
+            std::string why;
+            const auto targets = km.resolve(key, &why);
+            if (targets.size() != 1 || targets[0].from_lo || targets[0].from_hi ||
+                targets[0].to_lo || !supported.count(targets[0].module)) {
+                skipped->push_back(ad.name + ": unsupported bias target " + key);
+                continue;
+            }
+            const auto& name = targets[0].module;
+            const int64_t expected = km.rows(name);
+            if (!float_dtype(t->dtype) || t->shape.size() != 1 || t->shape[0] <= 0 ||
+                (expected > 0 && t->shape[0] != expected))
+                return fail(err, RAD_E_SHAPE, ad.name + ": invalid bias shape or dtype for " + key);
+            const int64_t rows = t->shape[0];
+            auto& delta = (*out)[name];
+            if (!delta.empty() && delta.size() != (size_t)rows)
+                return fail(err, RAD_E_SHAPE, ad.name + ": inconsistent bias shape for " + key);
+            delta.resize((size_t)rows);
+            for (int64_t i = 0; i < rows; ++i) {
+                delta[(size_t)i] += (float)(ad.weight * elem(*t, i));
+                if (!std::isfinite(delta[(size_t)i]))
+                    return fail(err, RAD_E_INVAL, ad.name + ": nonfinite bias for " + key);
+            }
+        }
+    }
+    return RAD_OK;
+}
 
 int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
             std::map<std::string, Composite>* out, ComposeReport* rep, std::string* err) {
