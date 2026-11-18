@@ -581,6 +581,27 @@ int r3d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return pick(out, operand, list, R3D_GEMM_Q_NOPERAND);
 }
 
+/* The int8 trunk grid (i8a8, i8a8h), as libref describes it: quant_act_i8g's (or its rotated
+ * twin's) row-major codes with an f32 scale per (row, `group` of K), against int8 codes [N, K]
+ * with a bf16 scale per (row, `group` of K). No zero point, so both sums are absent. */
+int r3d_shape_gemm_nt_q_i8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    if (M <= 0 || N <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    int64_t group = gi(p, n_p, "group", 0);
+    if (group <= 0) group = R3D_W8_GROUP;
+    if (K % group) return RAD_E_UNSUPPORTED;
+    const int64_t kb = K / group;
+    RadOpdDesc list[R3D_GEMM_Q_NOPERAND];
+    list[0] = opd((uint32_t)RAD_I8, M, K);                               /* a */
+    list[1] = in_unit(opd((uint32_t)RAD_F32, M, kb));                    /* a_scale */
+    list[2] = opd((uint32_t)RAD_I8, N, K);                               /* b */
+    list[3] = in_unit(opd((uint32_t)RAD_BF16, N, kb));                   /* b_scale */
+    list[4] = opd((uint32_t)RAD_BF16, M, N);                             /* y */
+    list[5] = opd_none();                                                /* a_sum */
+    list[6] = opd_none();                                                /* b_ref */
+    return pick(out, operand, list, R3D_GEMM_Q_NOPERAND);
+}
+
 /* The OCP-MXFP4 grid, as libref describes it: an e2m1 weight [N, K], two a byte, with one e8m0
  * exponent per 32 of K ([N, K/32]); `b_ref` is the same exponent plane, accepted and ignored. The
  * activation is the fp8a8 row's: E4M3 against one f32 per (row, 128 of K), drawn in (0, 1). Both

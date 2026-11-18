@@ -1543,11 +1543,11 @@ static const RadConstraint cGemmQFp8a16[] = { C_IN("dtype", "fp8a16"),
 static const RadConstraint cGemmQFp8a8[]  = { C_IN("dtype", "fp8a8"),
                                               C_EQ("group", R3D_FP8_BLOCK), C_GE("M", 1),
                                               C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
-/* The int8 GEMM's constraints. No row uses them: a row must name an entry point the library
- * defines, or the plugin fails to load. */
-static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8"),
+/* The int8 trunk GEMM: i8a8 and its rotated twin i8a8h are one launch (the rotation is in the
+ * stored weight and in the activation's quantiser). Every M: the kernel tiles M itself. */
+static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8 i8a8h"),
                                               C_EQ("group", R3D_W8_GROUP), C_GE("M", 1),
-                                              C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
+                                              C_DIV("K", 128), C_GE("N", 1) };
 
 /* ================================================================== the rows
  *
@@ -2707,6 +2707,22 @@ static const RadKernelInfo kKernels[] = {
    ROW(cGemmQW8A8M64), NOTUNE,
    nullptr, nullptr, r3d_rad_gemm_nt_q_w8a8_m64,
    nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_w8a8 },
+
+{ "gemm_nt_q_i8a8", "gemm_nt_q", "gemm",
+  "the int8 trunk grid (i8a8, and i8a8h, its rotated twin): signed int8 codes against row-major "
+  "int8 activations, the group's integer sub-sum scaled by the activation's (row, group) scale "
+  "and the weight's (row, group) scale",
+  "group 128, K a multiple of it, every M; a wave is a 16-column tile over one 16-row tile "
+  "(M <= 16) or two, the weight column loaded once per 16-k step; a block reads its weight rows "
+  "once, so a prefill chunk re-reads the weight once per 32 rows",
+  "I8 a row-major with an f32 scale per (row, 128 of K) -- quant_act_i8g's output, or "
+  "had_quant_act_i8g's at i8a8h; I8 codes b with a bf16 scale per (row, 128 of K), bf16 y, fp32 "
+  "accumulation in ascending group order; the sub-sums are exact integers under 2^24, and the "
+  "store is the only narrowing; no zero point, so no a_sum",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
+  ROW(cGemmQI8), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_i8a8,
+  nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_i8a8 },
 
     { "silu_mul_bf16", "silu_mul", "elem",
       "silu(gate) * up over one fused gate_up plane, the gate the first half",

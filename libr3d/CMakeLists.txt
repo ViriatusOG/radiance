@@ -74,6 +74,9 @@ set(R3D_UNITS
   # The w8a8 wave-matrix arm at prefill heights (17 <= M <= 127): two 16-row tiles a wave, the
   # weight column reused over the tiles, the group term the reference.
   "r3d_gemm_w8a8_nt_m64|"
+  # The int8 trunk GEMM (i8a8, i8a8h): the same wave-matrix walk over row-major codes, the
+  # activation's scale per (row, group) and a bf16 weight scale, at every M.
+  "r3d_gemm_i8a8|"
   # Paged attention at head_dim 128: the decode leg (one head group a workgroup, 16-token tiles,
   # split-KV) and the prefill leg (a 16-token query tile staged in LDS), over a bf16 or an E4M3
   # cache. The walk is shared; the tile is what a workgroup stages once and every wave consumes.

@@ -399,6 +399,7 @@ int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s);
 int r3d_shape_gemm_nt_q_w4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gemm_nt_q_i8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* The relayout writers for the three layout hooks, each delegating to rad_planes_relayout. The
  * loader converts a quantised weight into the joined operand the plan names, and only the row that
@@ -428,6 +429,7 @@ int r3d_rad_gemm_nt_bf16_tiled_alu(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_bf16_tiled_wmma(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_bf16_m64_wmma (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m64   (const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_i8a8       (const RadArgs* a, RadStream s);
 int r3d_shape_logits_gemm_bf16  (const RadParam*, int, int, RadOpdDesc*);
 
 /* --- r3d_model_bf16.hip: the fused MLP activation and the fused norm-quantiser --- */
