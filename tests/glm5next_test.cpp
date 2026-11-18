@@ -14,6 +14,58 @@
 /* GLM-5.3-Flash: its blocks (through the plugin's includes) and the plugin. */
 #include "../arch/glm5next/glm5next.cpp"
 
+/* ==================================================================== the 2.x container */
+
+/* The 2.x container's encodings: an IQ8R trunk (rotated int8, a u8 scale a 256 of K under a bf16
+ * scale a row) and IQR routed experts (the rotated computed trellis at one f32 scale a row). */
+static RadEncoding glm_iq8r() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&e, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+static RadEncoding glm_iqr() {
+    RadEncoding e{};
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
+    e.plane[t].block[0] = 128;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+/* The encodings by declared name: every trunk linear but KDA's (dense, MLA q_a/kv_a/q_b/output,
+ * shared experts) IQ8R, the routed experts `experts`, the rest as declared. The MLA layers' output
+ * projections are named by layer: KDA's share the name and stay bf16. */
+static std::vector<std::pair<std::string, RadEncoding>> glm_v2_encs(const RadEncoding& experts) {
+    const RadEncoding q = glm_iq8r();
+    std::vector<std::pair<std::string, RadEncoding>> e = {
+        { "ffn_gate_up_exps", experts }, { "ffn_down_exps", experts },
+        { "ffn_gate_up_shexp", q },      { "ffn_down_shexp", q },
+        { "ffn_gate_up.weight", q },     { "ffn_down.weight", q },
+        { "attn_q_a.weight", q },        { "attn_kv_a.weight", q },
+        { "attn_q_b.weight", q } };
+    for (int l = 3; l < 45; l += 4) e.push_back({ "blk." + std::to_string(l) + ".attn_output.", q });
+    return e;
+}
+static RadModelMeta glm_meta() {
+    static const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                                  "index_topk" };
+    static const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    return meta;
+}
+
 /* ==================================================================== the blocks */
 
 TEST(manifold_connections_preserve_saved_coefficients_and_use_a_separate_residual_destination) {
@@ -999,45 +1051,20 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
 
 /* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
  * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
- * counts and buffer rows smaller. The TP splits declare its ops whatever the step size and their
- * gathers' message as a range, in the head and the row form of the MLA. */
+ * counts and buffer rows smaller. The 2.x fixture is head-form only: an IQ8R trunk refuses the
+ * MLA row form. */
 TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
-    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                           "index_topk" };
-    const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    const RadModelMeta meta = glm_meta();
     const int world = 8, rank = 3;
-    for (int rows_split : { 0, 1 })
     for (int64_t R : { 256, 3072 }) {
         auto encs = [&](RadBuilder& b) {
             b.kv_block = 4;
-            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                       { "mtp.blk.45.ffn_down_exps", fp8 },
-                       { "ffn_gate_up_exps", mx },
-                       { "ffn_down_exps", mx },
-                       { "ffn_gate_up_shexp", mx },
-                       { "ffn_down_shexp", mx },
-                       { "ffn_gate_up.weight", fp8 },
-                       { "ffn_down.weight", fp8 } };
+            b.encs = glm_v2_encs(glm_iqr());
         };
-        RadBuildCtx c{};
-        c.rank = rank;
-        c.world_size = world;
+        RadBuildCtx c = spec_ctx(rank, world, 0);
         c.max_tok = 4096;
         c.max_seqs = 8;
         c.max_ctx = 32768;
-        c.max_spec = 3;
-        c.tp_attn_rows = rows_split;
         RadBuilder full;
         encs(full);
         REQUIRE_EQ(glm5next::declare(&full, &meta, &c), RAD_OK);
@@ -1842,56 +1869,6 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     }
 }
 
-/* The 2.x container's encodings: an IQ8R trunk (rotated int8, a u8 scale a 256 of K under a bf16
- * scale a row) and IQR routed experts (the rotated computed trellis at one f32 scale a row). */
-static RadEncoding glm_iq8r() {
-    RadEncoding e = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
-    rad_enc_add_plane(&e, "scale.1", RAD_BF16, 1, 0);
-    rad_enc_copy_str(e.transform, "fwht128");
-    return e;
-}
-static RadEncoding glm_iqr() {
-    RadEncoding e{};
-    rad_enc_clear(&e);
-    rad_enc_copy_str(e.scheme, "trellis");
-    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
-    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
-    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
-    e.plane[t].block[0] = 128;
-    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
-    rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
-    rad_enc_copy_str(e.transform, "fwht128");
-    return e;
-}
-/* The encodings by declared name: every trunk linear but KDA's (dense, MLA q_a/kv_a/q_b/output,
- * shared experts) IQ8R, the routed experts `experts`, the rest as declared. The MLA layers' output
- * projections are named by layer: KDA's share the name and stay bf16. */
-static std::vector<std::pair<std::string, RadEncoding>> glm_v2_encs(const RadEncoding& experts) {
-    const RadEncoding q = glm_iq8r();
-    std::vector<std::pair<std::string, RadEncoding>> e = {
-        { "ffn_gate_up_exps", experts }, { "ffn_down_exps", experts },
-        { "ffn_gate_up_shexp", q },      { "ffn_down_shexp", q },
-        { "ffn_gate_up.weight", q },     { "ffn_down.weight", q },
-        { "attn_q_a.weight", q },        { "attn_kv_a.weight", q },
-        { "attn_q_b.weight", q } };
-    for (int l = 3; l < 45; l += 4) e.push_back({ "blk." + std::to_string(l) + ".attn_output.", q });
-    return e;
-}
-static RadModelMeta glm_meta() {
-    static const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                                  "index_topk" };
-    static const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    return meta;
-}
-
 /* An IQ8R trunk with IQR experts declares at every rank count with whole experts, rotated int8
  * pairs at the trunk's 256 and the routed arm's 128, and KDA, the indexer and the router as they
  * were. Where the norms cannot write the codes (a CPU engine), each linear quantises the bf16 plane
@@ -2104,8 +2081,7 @@ RadBuildCtx glm53_vl_ctx(int rank, int world, int64_t patches, int max_spec = 3)
  * under tensor parallelism instead of once a rank. The linear groups travel in the checkpoint
  * store and carry no such flag. The flag is outside graph_hash(), so the pinned graphs stand. */
 TEST(glm53_declares_its_latent_and_index_caches_replicated) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
-    MetaKV mk = glm53_vl_meta();
+    const RadModelMeta meta = glm_meta();
     auto ends_with = [](const std::string& s, const char* t) {
         const size_t n = std::strlen(t);
         return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
@@ -2113,9 +2089,13 @@ TEST(glm53_declares_its_latent_and_index_caches_replicated) {
     for (int world : { 1, 2, 8 }) {
         for (int rank : { 0, world - 1 }) {
             RadBuilder b;
-            glm53_encs(b);
-            RadBuildCtx ctx = glm53_vl_ctx(rank, world, 0);
-            REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            RadBuildCtx ctx = spec_ctx(rank, world, 0);
+            ctx.max_tok = 512;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 4096;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
             REQUIRE_EQ(b.kv_groups.size(), 5u);
             int replicated = 0;
             for (const RecKV& g : b.kv_groups) {
@@ -2717,30 +2697,33 @@ const LoadedSchemas& loaded_schemas() {
 
 /* Every op the plugin issues carries as many operands as its schema declares, counted as
  * core/runtime/issue.cpp counts them (an absent optional operand is one of them), and every op it
- * declares names as many weights as rad_builder.cpp admits. The steps: at eight ranks and at
- * one, a mixed step over the split threshold (two decode rows beside a 498-row chunk), a step
- * under it, a six-row verify and six single-row decodes, each with its history pass and a draft
- * round, and a verify of eight sequences at 32k of context, where the indexer splits a decode.
- * The engine refuses a step at the first mismatch, which the recording fakes do not check, so a
- * missing optional operand reaches no other host test. */
+ * declares names as many weights as rad_builder.cpp admits. The 2.x fixture is head-form at
+ * max_spec 0, so it covers the same trunk steps without MTP or the vision tower: at eight ranks and
+ * at one, a mixed step over the split threshold (two decode rows beside a 498-row chunk), a step
+ * under it, a six-row verify and six single-row decodes, and a verify of eight sequences at 32k of
+ * context, where the indexer splits a decode. The engine refuses a step at the first mismatch,
+ * which the recording fakes do not check, so a missing optional operand reaches no other host
+ * test. */
 TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const LoadedSchemas& lib = loaded_schemas();
     if (lib.ops.empty()) {
         fprintf(stderr, "    no kernel library under $RADIANCE_HOME/kernels; nothing to count\n");
         return;
     }
-    MetaKV mk = glm53_vl_meta();
+    const RadModelMeta meta = glm_meta();
     std::set<std::string> uncovered, wrong;
     for (int world : { 8, 1 }) {
         const int rank = world == 8 ? 3 : 0;
         RadBuilder b;
-        glm53_encs(b);
-        RadBuildCtx ctx = glm53_vl_ctx(rank, world, 1024, 5);
+        b.kv_block = 4;
+        b.encs = glm_v2_encs(glm_iqr());
+        RadBuildCtx ctx = spec_ctx(rank, world, 0);
         ctx.max_tok = 4096;
         ctx.max_seqs = 8;
         ctx.max_ctx = 65536;
-        REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+        // Keep the multi-row KDA verifies and the split-decode logits without declaring MTP.
+        ctx.max_out_rows = 48;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
         for (const RecOp& r : b.ops) {
             auto it = lib.ops.find(r.op);
             if (it == lib.ops.end()) {
@@ -2758,17 +2741,10 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
                         world, r.op.c_str(), n_w, s.w_max, s.w_req, s.n_tab);
         }
         std::vector<std::unique_ptr<Kit>> kits;
-        auto with_drafts = [&](std::unique_ptr<Kit> k) {
-            auto his = history_pass(b, *k);
-            auto round = round_pass(b, k->b.n_seq, 2);
-            kits.push_back(std::move(k));
-            kits.push_back(std::move(his));
-            kits.push_back(std::move(round));
-        };
-        with_drafts(kit(b, { 1, 1 }, { 498 }, 100));
-        with_drafts(kit(b, {}, { 255 }));
-        with_drafts(kit(b, { 6 }, {}));
-        with_drafts(kit(b, std::vector<int>(6, 1), {}));
+        kits.push_back(kit(b, { 1, 1 }, { 498 }, 100));
+        kits.push_back(kit(b, {}, { 255 }));
+        kits.push_back(kit(b, { 6 }, {}));
+        kits.push_back(kit(b, std::vector<int>(6, 1), {}));
         {
             auto dec = kit(b, std::vector<int>(8, 6), {});
             const int64_t pitch = 8192;
