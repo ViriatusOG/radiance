@@ -1927,6 +1927,28 @@ TEST(glm53_v2_declares_an_iq8r_trunk_with_iqr_experts) {
         }
 }
 
+/* A protected bf16 expert pair among IQR experts is declared at the expert's own width (2048),
+ * not the dense layers' (12288), on one card where the experts are declared as one width slice. */
+TEST(glm53_v2_protected_experts_take_the_expert_width) {
+    const RadModelMeta meta = glm_meta();
+    RadBuilder b;
+    b.kv_block = 4;
+    const RadEncoding bf = rad_enc_plain(RAD_BF16);
+    b.encs = { { "blk.3.ffn_gate_up_exps.0.", bf }, { "blk.3.ffn_down_exps.0.", bf },
+               { "blk.3.ffn_gate_up_exps.1.", bf }, { "blk.3.ffn_down_exps.1.", bf } };
+    for (const auto& e : glm_v2_encs(glm_iqr())) b.encs.push_back(e);
+    RadBuildCtx ctx = spec_ctx(0, 1, 0);
+    ctx.max_tok = 256;
+    ctx.max_seqs = 4;
+    ctx.max_ctx = 32768;
+    REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+    const RecWeight* gu = find_w(b, "blk.3.ffn_gate_up_exps.0.weight");
+    const RecWeight* dn = find_w(b, "blk.3.ffn_down_exps.1.weight");
+    REQUIRE(gu && dn);
+    CHECK_EQ(gu->d.shape[0], 2 * 2048);
+    CHECK_EQ(dn->d.shape[1], 2048);
+}
+
 /* An IQ8R trunk's experts read its rotated int8 codes, so bf16 or unrotated experts beside it, and
  * IQR experts beside a bf16 trunk, are refused; so is the MLA row form, which views int8 weights. */
 TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {

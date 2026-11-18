@@ -495,7 +495,11 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         } else {
             s = m.moe_src[(size_t)l];
         }
-        RAD_ARCH_TRY(lay.moe.declare(b, nm, g, l, w, s, false, draft));
+        /* The MoE helper takes a protected bf16 expert's whole width from `n_ff_all`, which the
+         * model sets to the dense layers' 12288; an expert is 2048 wide. */
+        Geom mg = g;
+        mg.n_ff_all = GlmTp::expert_width(1);
+        RAD_ARCH_TRY(lay.moe.declare(b, nm, mg, l, w, s, false, draft));
     }
     if (!draft) RAD_ARCH_TRY(lay.ffn_hc.declare_post(b));
     return RAD_OK;
