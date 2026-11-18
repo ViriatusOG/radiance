@@ -425,6 +425,7 @@ static void check_shapes() {
         { "gated_had_quant_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "quant_cols_fp8", { PI("M", 32), PI("n", 128), PS("dtype", "bf16") } },
         { "had_quant_act_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "had_quant_act_i8g", { PI("M", 8), PI("n", 7680), PI("group", 128), PS("dtype", "bf16") } },
         { "gated_had_quant_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "rmsnorm_quant_i8", { PI("M", 8), PI("n", 128), PF("eps", 1e-6), PS("dtype", "bf16") } },
         { "gated_quant_fp8", { PI("M", 8), PI("n", 11008), PI("group", 128), PS("dtype", "bf16"),
