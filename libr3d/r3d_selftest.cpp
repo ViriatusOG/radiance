@@ -3431,6 +3431,122 @@ static void check_attn_depth() {
 #endif
 }
 
+/* ---- the int8 trunk, by value -------------------------------------------------------------------
+ * had_quant_act_i8g and gemm_nt_q at i8a8 against host mirrors of libref's arithmetic
+ * (had_quant_act_q8 / q8_group, quant_dot). The quantiser's scale must be amax / 127 of the
+ * unnormalised transform and 1 for an all-zero group; a code may sit one step from the mirror's
+ * where the device's reciprocal differs in its last place. The GEMM's group term is
+ * (sub * a_scale[m, g]) * b_scale[n, g], groups ascending, one bf16 store. */
+static void check_i8a8_numerics() {
+    std::printf("== the int8 trunk (had_quant_act_i8g, gemm_nt_q i8a8), by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: not run");
+#else
+    using namespace moenum;
+    auto qfn = (Launch)dlsym(g_h, "r3d_rad_had_quant_act_i8g");
+    auto gfn = (Launch)dlsym(g_h, "r3d_rad_gemm_nt_q_i8a8");
+    if (!qfn || !gfn) { fail("an int8 trunk entry point is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    uint32_t st = 0x18A8u;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return ((st >> 8) & 0xffffu) / 65536.0f - 0.5f; };
+
+    for (long long n : { 128LL, 2048LL, 7680LL }) {
+        const long long M = 3, G = n / 128;
+        char what[96];
+        std::snprintf(what, sizeof(what), "had_quant_act_i8g, n %lld, group 128, 3 rows", n);
+        std::vector<uint16_t> x((size_t)(M * n));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = f32_to_bf16(rnd() * ((i % 97) == 0 ? 40.0f : 3.0f));
+        if (G > 1) for (long long i = 0; i < 128; ++i) x[(size_t)(n + 128 + i)] = 0;   /* row 1, group 1: all zero */
+        std::vector<int8_t> q0((size_t)(M * n), (int8_t)0x55);
+        std::vector<float> s0((size_t)(M * G), -1.0f);
+        Dev dv;
+        RadTensor t[3] = { dense(dv.put(x.data(), x.size() * 2), RAD_BF16, M, n),
+                           dense(dv.put(q0.data(), q0.size()), RAD_I8, M, n),
+                           dense(dv.put(s0.data(), s0.size() * 4), RAD_F32, M, G) };
+        std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("group", 128), ps("dtype", "bf16") };
+        RadArgs a{ t, 3, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = qfn(&a, nullptr);
+        hipDeviceSynchronize();
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<int8_t> q(q0.size());
+        std::vector<float> sc(s0.size());
+        hipMemcpy(q.data(), t[1].data, q.size(), hipMemcpyDeviceToHost);
+        hipMemcpy(sc.data(), t[2].data, sc.size() * 4, hipMemcpyDeviceToHost);
+        long long off1 = 0, worse = 0, sbad = 0;
+        for (long long r = 0; r < M; ++r)
+            for (long long g = 0; g < G; ++g) {
+                float v[128];
+                for (int i = 0; i < 128; ++i) v[i] = bf16_to_f32(x[(size_t)(r * n + g * 128 + i)]);
+                for (int h = 1; h < 128; h <<= 1)
+                    for (int i = 0; i < 128; i += 2 * h)
+                        for (int j = i; j < i + h; ++j) {
+                            const float u = v[j], w = v[j + h];
+                            v[j] = u + w; v[j + h] = u - w;
+                        }
+                float amax = 0.0f;
+                for (int i = 0; i < 128; ++i) amax = std::max(amax, std::fabs(v[i]));
+                const float want = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f, inv = 1.0f / want;
+                if (sc[(size_t)(r * G + g)] != want) ++sbad;
+                for (int i = 0; i < 128; ++i) {
+                    float c = v[i] * inv;
+                    c = c > 127.0f ? 127.0f : (c < -127.0f ? -127.0f : c);
+                    const long long d = std::llabs((long long)std::nearbyint(c) -
+                                                   (long long)q[(size_t)(r * n + g * 128 + i)]);
+                    if (d == 1) ++off1; else if (d > 1) ++worse;
+                }
+            }
+        if (sbad == 0 && worse == 0 && off1 * 1000 <= M * n)
+            ok("%s: every scale exact, %lld of %lld codes one step off", what, off1, M * n);
+        else
+            fail("%s: %lld scales differ, %lld codes one step off, %lld further", what, sbad, off1, worse);
+    }
+
+    struct G8 { long long M, N, K; };
+    for (const G8& c : { G8{ 1, 144, 256 }, G8{ 5, 512, 2048 }, G8{ 16, 128, 7680 }, G8{ 40, 144, 512 },
+                         G8{ 70, 256, 384 } }) {
+        const long long G = c.K / 128;
+        char what[112];
+        std::snprintf(what, sizeof(what), "gemm_nt_q i8a8, M %lld N %lld K %lld", c.M, c.N, c.K);
+        std::vector<int8_t> a8((size_t)(c.M * c.K)), b8((size_t)(c.N * c.K));
+        std::vector<float> as((size_t)(c.M * G));
+        std::vector<uint16_t> bs((size_t)(c.N * G)), y0((size_t)(c.M * c.N), 0x7fc0u);
+        for (auto& v : a8) v = (int8_t)std::lrint(rnd() * 254.0f);
+        for (auto& v : b8) v = (int8_t)std::lrint(rnd() * 254.0f);
+        for (auto& v : as) v = 0.002f + (rnd() + 0.5f) * 0.02f;
+        for (auto& v : bs) v = f32_to_bf16(0.0005f + (rnd() + 0.5f) * 0.004f);
+        Dev dv;
+        RadTensor t[7] = { dense(dv.put(a8.data(), a8.size()), RAD_I8, c.M, c.K),
+                           dense(dv.put(as.data(), as.size() * 4), RAD_F32, c.M, G),
+                           dense(dv.put(b8.data(), b8.size()), RAD_I8, c.N, c.K),
+                           dense(dv.put(bs.data(), bs.size() * 2), RAD_BF16, c.N, G),
+                           dense(dv.put(y0.data(), y0.size() * 2), RAD_BF16, c.M, c.N),
+                           RadTensor{}, RadTensor{} };
+        std::vector<RadParam> p = { pi("M", c.M), pi("N", c.N), pi("K", c.K), pi("group", 128),
+                                    ps("dtype", "i8a8") };
+        RadArgs a{ t, 7, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = gfn(&a, nullptr);
+        hipDeviceSynchronize();
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<uint16_t> y(y0.size());
+        hipMemcpy(y.data(), t[4].data, y.size() * 2, hipMemcpyDeviceToHost);
+        std::vector<double> ref((size_t)(c.M * c.N));
+        for (long long m = 0; m < c.M; ++m)
+            for (long long n = 0; n < c.N; ++n) {
+                float acc = 0.0f;
+                for (long long g = 0; g < G; ++g) {
+                    int32_t sub = 0;
+                    for (long long k = g * 128; k < (g + 1) * 128; ++k)
+                        sub += (int32_t)a8[(size_t)(m * c.K + k)] * (int32_t)b8[(size_t)(n * c.K + k)];
+                    acc += ((float)sub * as[(size_t)(m * G + g)]) * bf16_to_f32(bs[(size_t)(n * G + g)]);
+                }
+                ref[(size_t)(m * c.N + n)] = acc;
+            }
+        compare(what, ref, y, 2e-3);
+    }
+#endif
+}
+
 /* ---- a plain weight the host cannot read -------------------------------------------------------
  * The engine maps weights through its own pool (core/device/aql.cpp), and on an integrated GPU (a
  * Radeon 860M) the host cannot read those pages, where hipMalloc's can be. Until 2026-11-18
@@ -3579,6 +3695,7 @@ int main(int argc, char** argv) {
         check_conv_numerics();
         check_rope_numerics();
     check_attn_depth();
+        check_i8a8_numerics();
         check_gemm_device_weight();
 
         const int n = rows();
