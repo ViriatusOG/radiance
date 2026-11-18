@@ -687,4 +687,105 @@ TEST(the_ling_flash_iq8r_w4nl64_recipe_decides_the_model_it_was_written_for) {
     for (const char* n : kept) CHECK(r.match(n) == nullptr);
 }
 
+/* Pin the shipped GLM recipe to the canonical names declared by glm5next and
+ * rad_block_glm_{kda,mla,indexer,router,mhc,vision,mtp}.h. Recipe::match is first-match:
+ * inspect its winning rule, rather than just looking for a suitable rule somewhere in the file.
+ * This is a recipe contract test, not a quantizer/format or IQ8R MTP execution test. */
+TEST(the_glm53_iqr_v4_recipe_decides_the_model_it_was_written_for) {
+    const std::string dir = std::string(__FILE__).substr(
+                                0, std::string(__FILE__).find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/glm53-iqr-v4.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "glm53-iqr-v4.recipe", &why), RAD_OK);
+
+    // Full option contracts catch, for example, a broad earlier IQ8R or cast rule winning.
+    const std::string iq8r = "rtn:block2=1x*,clamp=sym,codes=i8,group=256,rule=search,"
+                            "scale=u8,scale2=bf16,transform=fwht128";
+    auto trellis = [](const char* rows) {
+        return std::string("gptq:block=1x*,codes=u4,scale=f32,tcq=16,tcq_code=mad,") +
+               "tcq_gain=1.12,tcq_rows=" + rows + ",transform=fwht128";
+    };
+    const std::string gate_up = trellis("512"), down = trellis("1024");
+    auto expect = [&](const std::string& name, const std::string& wanted) {
+        const RecipeRule* m = r.match(name);
+        const std::string actual = m ? m->quantizer + ":" + m->options_text() : "<no rule>";
+        // Include the offending name in the assertion's values, even inside the expert loops.
+        CHECK_EQ(name + ": " + actual, name + ": " + wanted);
+    };
+    auto kept = [&](const std::string& name) { expect(name, "<no rule>"); };
+
+    // 45 trunk layers: three dense FFNs, then 42 x 288 routed experts. Layer 45 is MLA/MoE.
+    // Check both MTP spellings even though IQ8R serving currently requires --max-spec 0.
+    int mla_layers = 0;
+    for (int l = 0; l <= 45; ++l) {
+        const bool mla = l == 45 || l % 4 == 3;
+        if (mla) ++mla_layers;
+        for (const char* scope : { "", "mtp.", "mtp.mtp." }) {
+            if (l != 45 && *scope) continue;
+            const std::string b = std::string(scope) + "blk." + std::to_string(l) + ".";
+            kept(b + "attn_norm.weight");
+            kept(b + "ffn_norm.weight");
+            if (l < 3) {
+                expect(b + "ffn_gate_up.weight", iq8r);
+                expect(b + "ffn_down.weight", iq8r);
+            } else {
+                expect(b + "ffn_gate_up_shexp.weight", iq8r);
+                expect(b + "ffn_down_shexp.weight", iq8r);
+                for (int e = 0; e < 288; ++e) {
+                    const std::string suffix = std::to_string(e) + ".weight";
+                    expect(b + "ffn_gate_up_exps." + suffix, gate_up);
+                    expect(b + "ffn_down_exps." + suffix, down);
+                }
+                kept(b + "glm_router.weight");
+                kept(b + "glm_router.correction");
+            }
+            if (mla) {
+                for (const char* n : { "attn_q_a.weight", "attn_kv_a.weight",
+                                       "attn_q_b.weight", "attn_output.weight" })
+                    expect(b + n, iq8r);
+                // kv_b has a fixed wide reader; it must not hit the IQ8R trunk rules.
+                for (const char* n : { "attn_kv_b.weight", "attn_q_a_norm.weight",
+                                       "attn_kv_a_norm.weight", "index_query.weight",
+                                       "index_key_gate.weight", "index_head.weight",
+                                       "index_norm.weight", "index_norm.bias", "index_ape" })
+                    kept(b + n);
+            } else {
+                // All 34 KDA outputs share MLA's attn_output spelling but must stay wide.
+                for (const char* n : { "attn_qkv.weight", "attn_beta.weight",
+                                       "attn_forget_a.weight", "attn_forget_b.weight",
+                                       "attn_gate_a.weight", "attn_gate_b.weight",
+                                       "attn_output.weight", "ssm_conv.weight", "ssm_a",
+                                       "ssm_dt_bias", "ssm_norm.weight" })
+                    kept(b + n);
+            }
+            if (l != 45) {
+                for (const char* hc : { "hc_attn.", "hc_ffn." })
+                    for (const char* n : { "fn", "scale", "base" }) kept(b + hc + n);
+            }
+        }
+    }
+    CHECK_EQ(mla_layers, 12);  // Eleven trunk MLA layers plus the MTP layer.
+    for (const char* n : { "token_embd.weight", "output.weight", "output_norm.weight",
+                           "mtp.enorm.weight", "mtp.hnorm.weight", "mtp.eh_proj.weight",
+                           "mtp.output_norm.weight" })
+        kept(n);
+
+    // Vision declares its own BF16 linears; a broad *blk.* trunk rule must not catch these.
+    for (int l = 0; l < 24; ++l) {
+        const std::string b = "v.blk." + std::to_string(l) + ".";
+        for (const char* n : { "norm1.weight", "qkv.weight", "qkv.bias", "q_norm.weight",
+                               "k_norm.weight", "proj.weight", "proj.bias", "norm2.weight",
+                               "gate_up.weight", "gate_up.bias", "down.weight", "down.bias" })
+            kept(b + n);
+    }
+    for (const char* n : { "v.patch.weight", "v.patch.bias", "v.post_norm.weight",
+                           "v.downsample.weight", "v.downsample.bias", "v.merger.proj.weight",
+                           "v.merger.norm.weight", "v.merger.norm.bias",
+                           "v.merger.gate_up.weight", "v.merger.down.weight" })
+        kept(n);
+}
+
 RAD_TEST_MAIN()

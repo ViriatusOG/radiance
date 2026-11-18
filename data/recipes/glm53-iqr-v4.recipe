@@ -1,0 +1,53 @@
+# glm53-iqr-v4.recipe -- GLM-5.3-Flash from its block-FP8 release (zai-org/GLM-5.3-Flash) as
+# arch/glm5next serves it on a 2.x build: the routed experts as IQR-V4's computed trellis, every
+# other FP8 linear IQ8R, and everything the release keeps wide as it is stored.
+#
+#   rad-convert <GLM-5.3-Flash checkpoint> --recipe data/recipes/glm53-iqr-v4.recipe \
+#       --max-spec 0 --kv-cache-dtype bf16 -o glm53-flash-iqr-v4.rad
+#
+# --max-spec 0: the plugin does not serve the MTP draft layer on an IQ8R trunk yet, so the container
+# is converted without it; the rules below already name its weights for when it is.
+#
+#   - The routed experts (layers 3..44 and the MTP layer 45): u4 codes into the computed trellis
+#     (tcq=16 tcq_code=mad), each 128 of K rotated by fwht128, one f32 scale a row, the FFN's
+#     trellis runs of 512 rows for gate|up and 1024 for down (docs/IQR.md, IQR-V4). Read by the
+#     IQR grouped GEMM (moe_gemm_q over rotated int8 activations at one scale a 128).
+#   - IQ8R (docs/IQR.md, "IQ8R at one scale a 256 of K"): the dense layers 0..2's gate|up and down,
+#     the shared experts' gate|up and down, and the MLA layers' q_a, kv_a, q_b and output.
+#   - As stored (bf16 in the release, widened to f32 where the plugin declares f32): KDA's
+#     projections, convolutions and state, the MLA's kv_b, the DSA indexer, the routers, the norms,
+#     the mHC connections, the MTP head's eh_proj and norms, the embedding, lm_head and the vision
+#     tower. KDA stays bf16 by measurement: an int8 KDA's KL grows with position.
+#
+# No calibration data is read: GPTQ without a `calib=` directory rounds each weight to nearest on
+# its own (libquant/lq_gptq.h), so this is a round-to-nearest container from an FP8 source. Its
+# quality is to be measured against the 1.17 MXFP4/FP8 build before it is served.
+#
+# The MTP layer's weights are named under a draft scope (`mtp.blk.45...`), so every rule starts
+# with `*`. KDA layers name their output projection `attn_output` too, so the MLA layers' are
+# named one by one: first match decides, and a KDA output matching an IQ8R rule would be refused
+# by the plugin, which serves KDA bf16.
+
+*blk.*.ffn_gate_up_exps.*.weight     gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=512 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12
+*blk.*.ffn_down_exps.*.weight        gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=1024 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12
+
+*blk.*.ffn_gate_up_shexp.weight      rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.*.ffn_down_shexp.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.*.ffn_gate_up.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.*.ffn_down.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+
+*blk.*.attn_q_a.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.*.attn_kv_a.weight              rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.*.attn_q_b.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.3.attn_output.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.7.attn_output.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.11.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.15.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.19.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.23.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.27.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.31.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.35.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.39.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.43.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+*blk.45.attn_output.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
