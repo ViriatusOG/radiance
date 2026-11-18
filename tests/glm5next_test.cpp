@@ -66,6 +66,16 @@ static RadModelMeta glm_meta() {
     return meta;
 }
 
+/* Every declared weight is resolved by one map. A repeated target would make conversion-time
+ * resolution order-dependent; the checkpoint resolver takes maps for one name in declaration
+ * order. */
+static bool glm_maps_are_unique(const RadBuilder& b) {
+    std::set<std::string> seen;
+    for (const RecMap& m : b.maps)
+        if (!seen.insert(m.declared).second) return false;
+    return true;
+}
+
 /* ==================================================================== the blocks */
 
 TEST(manifold_connections_preserve_saved_coefficients_and_use_a_separate_residual_destination) {
@@ -1978,6 +1988,169 @@ TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {
     ctx.max_seqs = 4;
     ctx.max_ctx = 32768;
     CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+}
+
+/* Expert parallelism gives every rank a disjoint whole-expert window: no width spans, the router
+ * still scores all 288 experts, and each grouped table holds only that rank's experts. */
+TEST(glm53_v2_expert_parallel_declares_one_expert_window_per_rank) {
+    const RadModelMeta meta = glm_meta();
+    for (const int world : { 4, 8 }) {
+        const int64_t n_local = 288 / world;
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            RadBuildCtx ctx = spec_ctx(rank, world, 0);
+            ctx.max_tok = 256;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 32768;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK(glm_maps_are_unique(b));
+
+            const auto& m = *glm5next::models[rank];
+            const auto& c = m.moe_src[(size_t)3].cfg;
+            const int64_t base = rank * n_local;
+            CHECK_EQ(c.n_expert, n_local);
+            CHECK_EQ(c.n_expert_all, 288);
+            CHECK_EQ(c.expert_base, base);
+            CHECK_EQ(c.probed_expert, base);
+            CHECK_EQ(c.probed_count, 1);
+            CHECK_EQ(c.n_ff_exp, 2048);
+            CHECK_EQ(c.ff_lo[0], 0);
+            CHECK_EQ(c.ff_hi[0], 0);
+            CHECK_EQ(c.ff_lo[1], 0);
+            CHECK_EQ(c.ff_hi[1], 0);
+
+            /* Every owned expert has both projections; no neighbour's expert leaks onto this rank.
+             * EP weights are whole and have neither a width span nor row parts. */
+            for (int e = 0; e < 288; ++e) {
+                const bool owned = e >= base && e < base + n_local;
+                const auto gu = find_w(b, "blk.3.ffn_gate_up_exps." + std::to_string(e) + ".weight");
+                const auto dn = find_w(b, "blk.3.ffn_down_exps." + std::to_string(e) + ".weight");
+                CHECK_EQ(gu != nullptr, owned);
+                CHECK_EQ(dn != nullptr, owned);
+                if (!owned) continue;
+                REQUIRE(gu && dn);
+                CHECK_EQ(gu->d.shard, (int)RAD_SHARD_NONE);
+                CHECK_EQ(dn->d.shard, (int)RAD_SHARD_NONE);
+                CHECK(!gu->span_set && gu->d.n_row_parts == 0);
+                CHECK(!dn->span_set && dn->d.n_row_parts == 0);
+            }
+
+            /* Layer 3 has one gate-up and one down grouped GEMM. Each takes one code and one scale
+             * table entry for each regular expert (two parity classes). */
+            std::vector<const RecOp*> tables;
+            std::set<rad_weight> entries;
+            for (const auto& o : b.ops) {
+                if (o.op != "moe_gemm_q" || o.w.empty()) continue;
+                if (b.weights[(size_t)o.w.front() - 1].name.rfind("blk.3.ffn_", 0) != 0) continue;
+                tables.push_back(&o);
+                entries.insert(o.w.begin(), o.w.end());
+            }
+            REQUIRE_EQ(tables.size(), (size_t)2);
+            for (const auto* o : tables) {
+                CHECK_EQ(pint(o, "n_expert"), n_local);
+                CHECK_EQ(o->w.size(), (size_t)(2 * n_local));
+            }
+            CHECK_EQ(entries.size(), (size_t)(4 * n_local));
+            for (rad_weight h : entries) {
+                const auto& w = b.weights[(size_t)h - 1];
+                CHECK_EQ(w.d.shard, (int)RAD_SHARD_NONE);
+                CHECK(!w.span_set && w.d.n_row_parts == 0);
+            }
+        }
+    }
+}
+
+/* Protection is a whole-expert pair: both projections of a pair survive beside IQR, but one lone
+ * expert leaves an odd parity table, and a half-protected expert mixes encodings in one table. */
+TEST(glm53_v2_protected_bf16_experts_need_a_full_pair) {
+    const RadModelMeta meta = glm_meta();
+    const int base = 72;                 /* rank 1 of world 4 */
+    const RadEncoding bf = rad_enc_plain(RAD_BF16);
+    auto encs_with = [&](const std::vector<int>& gate_up, const std::vector<int>& down) {
+        auto encs = glm_v2_encs(glm_iqr());
+        for (int e : gate_up)
+            encs.insert(encs.begin(),
+                        { "blk.3.ffn_gate_up_exps." + std::to_string(e) + ".", bf });
+        for (int e : down)
+            encs.insert(encs.begin(), { "blk.3.ffn_down_exps." + std::to_string(e) + ".", bf });
+        return encs;
+    };
+    auto declare = [&](const std::vector<int>& gate_up, const std::vector<int>& down) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = encs_with(gate_up, down);
+        RadBuildCtx ctx = spec_ctx(1, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        const int rc = glm5next::declare(&b, &meta, &ctx);
+        if (rc == RAD_OK) CHECK(glm_maps_are_unique(b));
+        return rc;
+    };
+
+    /* Experts 72 and 73 are the rank's first local places (0 and 1). */
+    {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = encs_with({ 72, 73 }, { 72, 73 });
+        RadBuildCtx ctx = spec_ctx(1, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+        CHECK(glm_maps_are_unique(b));
+
+        const auto& m = *glm5next::models[1];
+        const auto& c = m.moe_src[(size_t)3].cfg;
+        CHECK_EQ(c.expert_base, base);
+        CHECK_EQ(c.probed_expert, base);
+        CHECK_EQ(c.probed_count, 3);       /* bf16, bf16, then the first IQR expert */
+        const std::vector<int64_t> want_prot{ 0, 1 };
+        CHECK(m.layers[3].moe.prot == want_prot);
+        CHECK_EQ(m.layers[3].moe.n_reg, 70);
+
+        for (int e : { 72, 73 }) {
+            const auto gu = find_w(b, "blk.3.ffn_gate_up_exps." + std::to_string(e) + ".weight");
+            const auto dn = find_w(b, "blk.3.ffn_down_exps." + std::to_string(e) + ".weight");
+            REQUIRE(gu && dn);
+            CHECK_EQ(gu->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(dn->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(gu->d.shape[0], 2 * 2048);
+            CHECK_EQ(dn->d.shape[1], 2048);
+            CHECK_EQ(gu->d.shard, (int)RAD_SHARD_NONE);
+            CHECK_EQ(dn->d.shard, (int)RAD_SHARD_NONE);
+            CHECK(!gu->span_set && gu->d.n_row_parts == 0);
+            CHECK(!dn->span_set && dn->d.n_row_parts == 0);
+        }
+
+        /* The sort's protect list uses the rank-local places, after its model-numbered base. */
+        /* The sort is moe_scatter, moe_scatter_inv or the fused router's: the op with the list. */
+        const RecOp* scatter = nullptr;
+        for (const auto& o : b.ops)
+            if (param(&o, "protect") && pint(&o, "expert_base") == base) { scatter = &o; break; }
+        REQUIRE(scatter);
+        CHECK_EQ(pint(scatter, "expert_base"), base);
+        CHECK_EQ(pstr(scatter, "protect"), "0,1");
+
+        std::vector<const RecOp*> tables;
+        for (const auto& o : b.ops) {
+            if (o.op != "moe_gemm_q" || o.w.empty()) continue;
+            if (b.weights[(size_t)o.w.front() - 1].name.rfind("blk.3.ffn_", 0) == 0)
+                tables.push_back(&o);
+        }
+        REQUIRE_EQ(tables.size(), (size_t)2);
+        for (const auto* o : tables) {
+            CHECK_EQ(pint(o, "n_expert"), 70);
+            CHECK_EQ(o->w.size(), (size_t)140);
+        }
+    }
+
+    /* One protected expert leaves 71 regular experts, which cannot form two parity tables. */
+    CHECK_EQ(stderr_of_rc([&] { return declare({ 72 }, { 72 }); }), RAD_E_INVAL);
+    /* Expert 73 has one BF16 projection and one IQR projection: no whole-expert encoding. */
+    CHECK_EQ(stderr_of_rc([&] { return declare({ 72, 73 }, { 72 }); }), RAD_E_DTYPE);
 }
 
 /* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
