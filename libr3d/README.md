@@ -60,7 +60,7 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `elem` | `add` (with `div`, and the broadcast band), `mul`, `silu`, `gelu`, `sigmoid`, `act_mul_{silu,gelu,sigmoid}`, `softmax`, `scale`, `fill` (bf16/f32/i32/i64), `gather_rows`, `scatter_rows`, bf16 and f32 where the op has both, plus seven `cast` pairs and `silu_mul_bf16` |
 | `attn` | `rope_bf16` (neox and gptj, in place over packed QKV), `rope_rows_bf16` (the same kernel under the row-form schema, with the proportional frequency ladder), `kv_store_{bf16,f16,fp8}`, `attn_paged_{bf16,fp8}_{decode,prefill}`: head_dim 128, split-KV combined in the same launch |
 | `kv` | `kv_len_trim_i32` (per-sequence context lengths less `trim`, the QSA slice's own last row), `qsa_tail_store_bf16` (the QSA indexer's tail into a per-layer linear KV state, ring addressed by position) |
-| `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w4a16asym_m64` and `gemm_nt_q_w5a16_m64` (4- and 5-bit codes against an f16 activation, 1..64 rows on the wave matrix), `gemm_nt_q_w8a8_{m16,m64}` (signed int8 weight, decode band and 17..127 prefill rows on the wave matrix), `gemm_nt_q_gated_fp8a8` |
+| `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w4a16asym_m64` and `gemm_nt_q_w5a16_m64` (4- and 5-bit codes against an f16 activation, 1..64 rows on the wave matrix), `gemm_nt_q_w8a8_{m16,m64}` (signed int8 weight, decode band and 17..127 prefill rows on the wave matrix), `gemm_nt_q_i8a8` (the int8 trunk grid, `i8a8` and its rotated twin `i8a8h`: row-major int8 activations with a scale per (row, 128 of K), a bf16 weight scale, every M), `gemm_nt_q_gated_fp8a8` |
 | `vocab` | `logits_gemm_bf16`: the head, read once per token, as bf16 or as E4M3 codes with a bf16 scale per 128x128 block; the `impl` axis picks the decode (the LDS table, the per-byte ALU formula) |
 | `quant` | `quant_act_fp8_bf16`, `quant_act_i8_bf16`, `quant_act_i8g_bf16`, `had_quant_act_{i8,fp8}_bf16` and `had_quant_act_i8g_bf16` (the same with a block Walsh-Hadamard rotation), `gated_had_quant_{i8,i8g,fp8}_bf16`, `gelu_mul_quant_i8_bf16`, `quant_cols_fp8_bf16`, `rmsnorm_quant_{fp8,i8}_bf16` (norm and quantiser in one pass), `gated_quant_fp8_bf16`, `dequant_fp8`, `dequant_e5m2`, `dequant_i8` |
 | `sample` | pre-filters `sample_{penalties,dry,ngram_ban,mask,logprobs}_f32`; spine `sample_{argmax,temp,topk,pick,topp,minp,typical,xtc}_f32` — f32 logits in and out, the draw the reference's in its order, the top-R scan single-pass (the plane read once) |
@@ -68,7 +68,7 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk; libhalo's kernel), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel; libhalo's), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update, per_candidate or anchor; libhalo's), `gdn_conv_recurrent_update_k128_v128` (the convolution and the recurrent update as one decode kernel, q/k/v never materialised; libhalo's) |
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
 
-The table holds 126 rows over 86 schemas; `r3d_selftest` checks every schema slot for slot against
+The table holds 127 rows over 86 schemas; `r3d_selftest` checks every schema slot for slot against
 the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
 [Tunable params](#tunable-params)); the rest are single-implementation.
 
@@ -463,6 +463,13 @@ The block table is the window the kernel may read: `jcap = min(max_ctx, cols * b
 last reachable index must lie inside the plane. `splits` is a maximum, resolved per sequence from its
 own `seqused`; the contract is that `splits = 1` is bit-identical to the reference and `splits > 1`
 is not (the last-bit difference is in the [Numerics](#numerics) divergence table).
+
+The decode rows size the partials in their scratch hook from `n_head` and `max_seqs` alone: the
+builder calls the hook with the params and no tensors. An arena smaller than the partials is not
+refused; the shim lowers `splits` until they fit, down to 1, which is correct and walks the whole
+context in one workgroup a head group. `rad-kbench`'s attention shape has a context equal to
+`q_len`, so it does not see depth; `r3d_selftest` runs a decode row over a 4,087-key context, with
+the partials and without, and checks the hook's size.
 
 ## Numerics
 
