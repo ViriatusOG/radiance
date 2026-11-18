@@ -57,6 +57,9 @@ struct Model {
      * Anything else stays whole: a plain bf16 expert cannot be sliced at all. */
     bool whole_experts = false;
     std::vector<Layer> layers;
+    /* Each routed layer's source and config, probed before any buffer is sized: the expert
+     * format decides the routed arm's code pair. Indexed by layer; 0..2 are dense and unused. */
+    std::vector<MoeFP8::Src> moe_src;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
     rad_buf h0 = 0, h1 = 0, x = 0, y = 0, post = 0, comb = 0, final_hidden = 0, logit_input = 0,
@@ -325,8 +328,63 @@ static int kv_groups(RadBuilder* b, Model& m) {
 }
 
 /* ------------------------------------------------------------------ one layer */
+/* A routed layer's source and config, before its probe. */
+static MoeFP8::Src moe_source(const Model& m, Names& nm, int l) {
+    const auto& g = m.g;
+    const char* pre = nm.ckpt("model.language_model.layers.%d", l);
+    MoeFP8::Src s;
+    s.norm = nm.ckpt("%s.post_attention_layernorm.weight", pre);
+    s.router = nm.ckpt("%s.mlp.gate.weight", pre);
+    s.router_bias = nm.ckpt("%s.mlp.gate.e_score_correction_bias", pre);
+    s.experts = nm.ckpt("%s.mlp.experts", pre);
+    s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
+    // EXPERT PARALLELISM AT TP: each rank owns 288/world WHOLE experts (the contiguous
+    // window [expert_base, expert_base+n_expert) of the checkpoint's numbering), which the
+    // helper declares RAD_SHARD_NONE -- unsharded, so an expert unit is file-direct and can
+    // live in the container's mapping or the file tier
+    // instead of needing VRAM+pinned-pool residency for all 151 GiB of them. The router
+    // stays replicated over n_expert_all; moe_scatter/router_topk_scatter drop slots
+    // outside the window (moe_scatter schema: "which is how EXPERT PARALLELISM is
+    // expressed"); the shared expert stays width-sharded on its own declaration path; the
+    // block's all-reduce sums the partials exactly as width TP did. At world 1 this
+    // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
+    s.cfg.n_expert_all = 288;
+    s.cfg.top_k = 8;
+    s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
+    if (m.whole_experts) {
+        s.cfg.n_expert = 288 / g.world;
+        // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
+        // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
+        const int ep_rank = g.rank < g.world ? g.rank : 0;
+        s.cfg.expert_base = ep_rank * (288 / g.world);
+        s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
+        s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
+    } else {
+        s.cfg.n_expert = 288;
+        s.cfg.n_ff_exp = GlmTp::expert_width(g.world);
+    }
+    s.cfg.rows = g.max_tok;
+    s.cfg.sigmoid_router = 1;
+    s.cfg.route_scale = 2.5;
+    s.cfg.swiglu_limit = 10;
+    s.cfg.shared_ungated = 1;
+    s.cfg.router_fuse = 1;
+    s.cfg.swiglu_quant = 1;
+    // At world 1 the width-slice declaration IS the whole model: keep the spans so the
+    // graph stays the pinned one. Whole experts need no width spans (split && ep is refused
+    // by the helper).
+    if (!m.whole_experts) {
+        for (int q = 0; q < 2; ++q) {
+            s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
+            s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
+        }
+    }
+    return s;
+}
+
 static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool draft) {
     const auto& g = m.g;
+    if (!draft && l >= 3 && (size_t)l >= m.moe_src.size()) return RAD_E_INVAL;
     lay.draft = draft;
     lay.full = draft || l % 4 == 3;
     const char* pre = nm.ckpt("model.language_model.layers.%d", l);
@@ -385,54 +443,15 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
     } else {
         auto w = m.mw;
         w.x = input;
+        /* The trunk's routed layers were probed before the buffers (declare); the draft layer is
+         * probed here, through its own names. */
         MoeFP8::Src s;
-        s.norm = nm.ckpt("%s.post_attention_layernorm.weight", pre);
-        s.router = nm.ckpt("%s.mlp.gate.weight", pre);
-        s.router_bias = nm.ckpt("%s.mlp.gate.e_score_correction_bias", pre);
-        s.experts = nm.ckpt("%s.mlp.experts", pre);
-        s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
-        // EXPERT PARALLELISM AT TP: each rank owns 288/world WHOLE experts (the contiguous
-        // window [expert_base, expert_base+n_expert) of the checkpoint's numbering), which the
-        // helper declares RAD_SHARD_NONE -- unsharded, so an expert unit is file-direct and can
-        // live in the container's mapping or the file tier
-        // instead of needing VRAM+pinned-pool residency for all 151 GiB of them. The router
-        // stays replicated over n_expert_all; moe_scatter/router_topk_scatter drop slots
-        // outside the window (moe_scatter schema: "which is how EXPERT PARALLELISM is
-        // expressed"); the shared expert stays width-sharded on its own declaration path; the
-        // block's all-reduce sums the partials exactly as width TP did. At world 1 this
-        // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
-        s.cfg.n_expert_all = 288;
-        s.cfg.top_k = 8;
-        s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
-        if (m.whole_experts) {
-            s.cfg.n_expert = 288 / g.world;
-            // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
-            // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
-            const int ep_rank = g.rank < g.world ? g.rank : 0;
-            s.cfg.expert_base = ep_rank * (288 / g.world);
-            s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
-            s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
+        if (draft) {
+            s = moe_source(m, nm, l);
+            RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
         } else {
-            s.cfg.n_expert = 288;
-            s.cfg.n_ff_exp = GlmTp::expert_width(g.world);
+            s = m.moe_src[(size_t)l];
         }
-        s.cfg.rows = g.max_tok;
-        s.cfg.sigmoid_router = 1;
-        s.cfg.route_scale = 2.5;
-        s.cfg.swiglu_limit = 10;
-        s.cfg.shared_ungated = 1;
-        s.cfg.router_fuse = 1;
-        s.cfg.swiglu_quant = 1;
-        // At world 1 the width-slice declaration IS the whole model: keep the spans so the
-        // graph stays the pinned one. Whole experts need no width spans (split && ep is refused
-        // by the helper).
-        if (!m.whole_experts) {
-            for (int q = 0; q < 2; ++q) {
-                s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
-                s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
-            }
-        }
-        RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
         RAD_ARCH_TRY(lay.moe.declare(b, nm, g, l, w, s, false, draft));
     }
     if (!draft) RAD_ARCH_TRY(lay.ffn_hc.declare_post(b));
@@ -525,6 +544,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
     m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
                                                    !experts_are_mxfp4(b, nm)));
+    /* ---- each routed layer's expert format, read before any buffer is declared: the format
+     * decides the routed arm's code pair (ffn_buffers). The probe declares the layer's first
+     * experts' name maps, which the layer's declare skips. */
+    m.moe_src.assign(45, MoeFP8::Src{});
+    for (int l = 3; l < 45; ++l) {
+        m.moe_src[(size_t)l] = moe_source(m, nm, l);
+        RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, m.moe_src[(size_t)l], &m.moe_src[(size_t)l].cfg));
+    }
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
     RAD_ARCH_TRY(mla_buffers(b, m));
