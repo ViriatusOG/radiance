@@ -797,6 +797,12 @@ a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, 
 every quantised format and an architecture plugin that changes quantisation changes one string, not
 its op names.
 
+`gemm_nt` at `dtype` `bf16x12` takes as `b` every plane of a `bf16x12` weight, libquant's lossless
+packing of a bf16 weight in 12.25 bits a value (`docs/TOOLS.md`), and its `y` is `bf16`'s over the
+decoded weight. libr4d's rows rebuild each value bit for bit (the prefill row into its scratch, for
+`gemm_bf16_nt_tiled`) and run the bf16 rows' arithmetic, so at the same split their bytes are
+`gemm_bf16_nt_m64`'s. No host library serves it.
+
 `gemm_nt_q` takes the activation scales as an operand because the quantiser produced them; a kernel
 that folds dequantisation into its epilogue still receives them. Being a quantiser's amax over its
 range, an `a_scale` entry is never negative, and a kernel may treat a block whose scale is zero as

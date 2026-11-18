@@ -541,6 +541,12 @@ int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
+/* The same GEMM over a bf16x12 weight (r4d_gemm_bf16x12_nt_m64.hip); m16 forwards to m64, and
+ * tiled unpacks the weight into its scratch for gemm_bf16_nt_tiled. */
+int r4d_rad_gemm_bf16x12_m16(const RadArgs*, RadStream);
+int r4d_rad_gemm_bf16x12_m64(const RadArgs*, RadStream);
+int r4d_rad_gemm_bf16x12_tiled(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_bf16x12_tiled_scratch(const RadArgs*);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);
@@ -693,8 +699,8 @@ int r4d_rad_sample_chain    (const RadArgs*, RadStream);
  *
  * RadLayoutFn / RadRelayoutFn / RadUnrelayoutFn (rad_abi.h, spec §4.3). r4d_fp8_layout.cpp holds
  * the fp8 families (block-fp8 codes in fragment order; the lm_head, hyper-connection and MTP rows
- * with scales in each row's tail), r4d_layout.cpp the packed integer ones. Each refuses an
- * encoding its kernel does not read. A family whose kernel reads the canonical plane unchanged
+ * with scales in each row's tail), r4d_layout.cpp the packed integer ones and bf16x12. Each refuses
+ * an encoding its kernel does not read. A family whose kernel reads the canonical plane unchanged
  * (the row-major fp8 matvec, the fp8 experts) has only the layout hook, to check its input. */
 #define R4D_HOOKS(name)                                                                         \
     int r4d_rad_layout_##name(const RadParam*, int, int, const RadEncoding*, const int*,       \
@@ -718,6 +724,7 @@ R4D_HOOKS(w4)
 R4D_HOOKS(w2a8)
 R4D_HOOKS(moe_w4)
 R4D_HOOKS(moe_w4_mod4)
+R4D_HOOKS(bf16x12)
 #undef R4D_HOOKS
 /* embed_lookup_bf16's check that its table is plain bf16 (r4d_fp8_layout.cpp), and the IQR
  * table's hooks and gather (r4d_iqr_layout.cpp, r4d_iqr_embed.hip). */

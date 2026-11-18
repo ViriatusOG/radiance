@@ -5201,6 +5201,19 @@ static const RadConstraint cGemmNt64[] = {
 static const RadConstraint cGemmNtTiled[] = {
     C_GE("M", 65), C_LE("M", 2147483647), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16"),
 };
+/* The same GEMM over a bf16x12 weight (r4d_gemm_bf16x12_nt_m64.hip): the skinny bands, K in whole
+ * 32-blocks. The M <= 16 row is the m64 row under its own name, so decode has a tuning entry of
+ * its own. */
+static const RadConstraint cGemmNtBf16x12M16[] = {
+    C_LE("M", 16), C_DIV("K", 32), C_IN("dtype", "bf16x12"),
+};
+static const RadConstraint cGemmNtBf16x12[] = {
+    C_LE("M", 65536), C_DIV("K", 32), C_IN("dtype", "bf16x12"),
+};
+/* Its prefill row: gemm_bf16_nt_tiled's band, over the weight unpacked into scratch. */
+static const RadConstraint cGemmNtBf16x12Tiled[] = {
+    C_GE("M", 65), C_LE("M", 65536), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16x12"),
+};
 /* The dense integer kernels take their group from a build constant and read no `group` argument.
  * A declaration at another group gets no kernel rather than a silent 128. */
 static const RadConstraint cGemmNtW4[] = {
@@ -5738,11 +5751,25 @@ static const RadTunable tGemmSkinny[] = {
   { "nt",  kGemmNt,  NELEM(kGemmNt),  1, "non-temporal weight loads" },
 };
 
+/* The bf16x12 rows: the skinny kernel's wv, sk and mb, and `form`, how an iteration loads its
+ * activation (r4d_gemm_bf16x12_nt_m64.hip). PRE holds an iteration's activation fragments beside
+ * its weight loads, MT * 32 VGPRs, so it exists at two row tiles or fewer. No npw or nt: the kernel
+ * reads neither. Only sk changes the bytes. */
+static const int64_t kGemmX12Form[] = { 0, 1, 2 };
+static const RadTunable tGemmBf16x12[] = {
+  { "wv",   kGemmWv, NELEM(kGemmWv), 1, "waves per block; wv*sk*32 must stay inside the block bound" },
+  { "sk",   kGemmSk, NELEM(kGemmSk), 0, "split-K segment count, reduced in LDS. 0 = the shape's own ladder" },
+  { "mb",   kGemmMb, NELEM(kGemmMb), 0, "16-row tiles one block covers; grid.y is ceil(ceil(M/16)/mb). 0 = all of them" },
+  { "form", kGemmX12Form, NELEM(kGemmX12Form), 0,
+    "1 = the activation loaded per block; 2 = an iteration's with its weight (PRE), mb <= 2 only. "
+    "0 = PRE where a block covers two row tiles or fewer" },
+};
+
 /* Geometry-only legality, so the tuner skips ~40% of the space without launching. wv*sk*32 is the
  * block's thread count, at most 1024 in hardware; the tighter per-MB/NPW bound depends on the row
  * and lives in r4d_gemm_args.h's block_bound(). K must divide into SK slices of the kernel's unit:
- * 16 for bf16, 128 where a quantised weight carries a scale per 128 K. cfg_for() refuses the same
- * combinations at issue. */
+ * 16 for bf16, 32 for bf16x12 (whole blocks), 128 where a quantised weight carries a scale per
+ * 128 K. cfg_for() refuses the same combinations at issue. */
 static int r4d_tune_valid_gemm(const RadParam* p, int n_p, const RadParam* c, int n_c) {
     long long wv = 1, sk = 0;
     for (int i = 0; i < n_c; ++i) {
@@ -5760,8 +5787,22 @@ static int r4d_tune_valid_gemm(const RadParam* p, int n_p, const RadParam* c, in
         else if (p[i].kind == RAD_P_STR && !std::strcmp(p[i].key, "dtype")) dt = p[i].sval;
     }
     if (K <= 0) return 1;                        /* K is not pinned in this band: cannot say */
-    const long long unit = (dt && !std::strcmp(dt, "bf16")) ? 16 : 128;
+    const long long unit = !dt ? 128 : !std::strcmp(dt, "bf16") ? 16
+                         : !std::strcmp(dt, "bf16x12") ? 32 : 128;
     return (K % (sk * unit)) == 0;
+}
+
+/* The bf16x12 rows': the skinny rule, and PRE at two row tiles or fewer. mb 0 is the law's, which
+ * is one tile in the decode band; where it resolves above two the launch refuses PRE. */
+static int r4d_tune_valid_gemm_bf16x12(const RadParam* p, int n_p, const RadParam* c, int n_c) {
+    long long form = 0, mb = 0;
+    for (int i = 0; i < n_c; ++i) {
+        if (c[i].kind != RAD_P_INT) continue;
+        if      (!std::strcmp(c[i].key, "form")) form = c[i].ival;
+        else if (!std::strcmp(c[i].key, "mb"))   mb = c[i].ival;
+    }
+    if (form == 2 && mb > 2) return 0;
+    return r4d_tune_valid_gemm(p, n_p, c, n_c);
 }
 
 /* --------------------------------------------------------------- the tiled GEMM's tile ladder
@@ -8516,6 +8557,47 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_gemm_bf16_tiled, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt },
 
+/* The bf16 GEMM over a bf16x12 weight. The layout hook lays the four planes out for the kernel
+ * (r4d_layout.cpp). No operand description: the weight is a stored form whose size the hook owns,
+ * and a fill is no valid packed weight. */
+{ "gemm_bf16x12_nt_m16", "gemm_nt", "gemm",
+  "gemm_bf16x12_nt_m64 at M <= 16, under its own name so the decode band has its own tuning entry",
+  "M <= 16; K divisible by SK*32; N, K otherwise runtime",
+  "bf16 A / C, bf16x12 W (12.25 bits a value, lossless), fp32 accumulate. BYTE-IDENTICAL to "
+  "gemm_bf16_nt_m64 over the decoded weight at the same wv, sk and mb",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_M16,
+  ROW(cGemmNtBf16x12M16), ROW(tGemmBf16x12), r4d_tune_valid_gemm_bf16x12,
+  nullptr, nullptr, r4d_rad_gemm_bf16x12_m16, nullptr, r4d_rad_layout_bf16x12,
+  r4d_rad_relayout_bf16x12, nullptr, r4d_rad_unrelayout_bf16x12 },
+
+{ "gemm_bf16x12_nt_m64", "gemm_nt", "gemm",
+  "skinny GEMM C[M,N] = A[M,K] @ W[N,K]^T over a bf16x12 weight: each B fragment rebuilt bit for "
+  "bit from a sign-and-mantissa byte and a 4-bit exponent offset a value and its 32-block's "
+  "exponent, or read from the escape table, then gemm_bf16_nt_m64's WMMA sequence, split and "
+  "reduction",
+  "any M -- MT row tiles a block and grid.y covers the rest; K divisible by SK*32; the PRE form "
+  "at MB <= 2",
+  "bf16 A / C, bf16x12 W (12.25 bits a value, lossless), fp32 accumulate. BYTE-IDENTICAL to "
+  "gemm_bf16_nt_m64 over the decoded weight at the same wv, sk and mb, in either form",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtBf16x12), ROW(tGemmBf16x12), r4d_tune_valid_gemm_bf16x12,
+  nullptr, nullptr, r4d_rad_gemm_bf16x12_m64, nullptr, r4d_rad_layout_bf16x12,
+  r4d_rad_relayout_bf16x12, nullptr, r4d_rad_unrelayout_bf16x12 },
+
+/* The prefill row stores the weight with the same hooks: every band of an op reads one stored
+ * form. */
+{ "gemm_bf16x12_nt_tiled", "gemm_nt", "gemm",
+  "the same GEMM at prefill row counts: the weight rebuilt bit for bit into the op's scratch as "
+  "bf16, then gemm_bf16_nt_tiled over it at gemm_bf16x12_nt_m64's untuned split",
+  "M > 64; N >= 128; K a multiple of 64; scratch of N*K bf16",
+  "bf16 A / C, bf16x12 W (12.25 bits a value, lossless), fp32 accumulate. BYTE-IDENTICAL to "
+  "gemm_bf16x12_nt_m64 untuned, and to gemm_bf16_nt_tiled over the decoded weight at the same "
+  "split",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_BF16_TILED,
+  ROW(cGemmNtBf16x12Tiled), ROW(tGemmBf16Tiled), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_bf16x12_tiled, r4d_rad_gemm_bf16x12_tiled_scratch,
+  r4d_rad_layout_bf16x12, r4d_rad_relayout_bf16x12, nullptr, r4d_rad_unrelayout_bf16x12 },
+
 { "gemm_w4a16_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with a 4-bit weight, 16x16x16 WMMA, split-K reduced in LDS",
   "M <= 64; N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order",
@@ -11126,6 +11208,9 @@ extern "C" int rad_kernel_chain(int i) {
         "gemm_iq8r_nt_m16", "had_quant_act_iq8r", "rmsnorm_had_quant_iq8r",
         "gated_had_quant_iq8r", "gate_had_quant_iq8r",
         "gemm_bf16_nt_m16", "gemm_bf16_nt_m64", "dflash_conv_t2_g16_bf16",
+        /* ...and the same GEMM over a bf16x12 weight at decode heights (its prefill row,
+         * gemm_bf16x12_nt_tiled, stays plain) */
+        "gemm_bf16x12_nt_m16", "gemm_bf16x12_nt_m64",
         "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
         /* the two-rank one-shot at a decode-sized message, and the rotated wire's row for the
          * messages under its size floor, which the exact kernel carries */
@@ -11366,4 +11451,7 @@ extern "C" void r4d_cfg_mv(const RadArgs* a, R4dMvCfg* out) {
 }
 extern "C" int r4d_cfg_rmsq8_reg(const RadArgs* a) {
     return TUNE(a, tRmsQ8, "reg");
+}
+extern "C" int r4d_cfg_bf16x12_form(const RadArgs* a) {
+    return TUNE(a, tGemmBf16x12, "form");
 }

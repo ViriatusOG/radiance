@@ -267,7 +267,9 @@ enum {
     R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9,
     /* Six-bit expert codes: row-major permuted low nibbles followed by the transposed fifth
      * magnitude bit and sign bit, one dword per 32 elements in each bit plane. */
-    R4D_DT_MOEW6      = RAD_DT_PLUGIN_BASE + 10
+    R4D_DT_MOEW6      = RAD_DT_PLUGIN_BASE + 10,
+    /* A bf16x12 weight as the bf16x12 GEMM rows read it: one buffer of four regions, below. */
+    R4D_DT_BF16X12    = RAD_DT_PLUGIN_BASE + 11
 };
 
 /* The grouped MoE GEMM's code tables, as the four dwords w4_e4m3's byte permutes read
@@ -331,6 +333,37 @@ static constexpr float kW6nlTable[64] = {
  * 2^-10.6 on Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl).
  * Under 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
 static constexpr float kW4G64Scale = 0x1p-13f;
+
+/* ================================================================== bf16x12's stored form
+ *
+ * libquant's `bf16x12` keeps a bf16 weight losslessly in blocks of 32 along K: each value's sign
+ * and mantissa (a byte) and its exponent field as an offset below the block's largest (4 bits),
+ * that largest field (a byte a block), and the blocks whose fields span more than 15 whole in an
+ * escape table (libquant/lq_bf16x12.cpp). The gemm_bf16x12 rows (_m16, _m64, _tiled) store it as
+ * one buffer of four regions, each starting on a multiple of R4D_X12_ALIGN:
+ *
+ *   SM   [N][K]     bytes   sign << 7 | mantissa
+ *   D    [N][K/2]   bytes   the offsets, two a byte
+ *   E    [N][K/32]  bytes   each block's largest exponent field; 0xFF marks a raw block
+ *   ESC  [cap][32]  bf16    the raw blocks, the whole table on every rank
+ *
+ * SM, D and each table row are in WMMA B-fragment order within a block, and a raw block's D holds
+ * its row of the table four times (r4d_gemm_bf16x12_nt_m64.hip states the order; r4d_layout.cpp
+ * writes it). A launch finds the regions from N and K; only the buffer's size depends on cap. */
+enum { R4D_X12_BLOCK = 32, R4D_X12_ALIGN = 256 };
+struct R4dX12Regions { long long sm, d, e, esc, bytes; };
+static inline long long r4d_x12_round(long long n) {
+    return (n + R4D_X12_ALIGN - 1) / R4D_X12_ALIGN * R4D_X12_ALIGN;
+}
+static inline R4dX12Regions r4d_x12_regions(long long N, long long K, long long cap) {
+    R4dX12Regions r;
+    r.sm = 0;
+    r.d = r4d_x12_round(N * K);
+    r.e = r.d + r4d_x12_round(N * K / 2);
+    r.esc = r.e + r4d_x12_round(N * (K / R4D_X12_BLOCK));
+    r.bytes = r.esc + r4d_x12_round(cap * R4D_X12_BLOCK * 2);
+    return r;
+}
 
 
 /* ================================================================== skinny-GEMM variants
@@ -415,6 +448,9 @@ void r4d_cfg_mv     (const RadArgs*, struct R4dMvCfg*);
 /* rmsnorm_quant_i8's decode form: 1 the row's operands in registers before the reductions, 0 the
  * pass-per-read kernel; the row's `reg` axis. */
 int  r4d_cfg_rmsq8_reg(const RadArgs*);
+/* The bf16x12 GEMM's activation loads: 0 with the weight's where a block covers two row tiles or
+ * fewer, else per block; 1 per block; 2 with the weight's (the row's `form` axis). */
+int  r4d_cfg_bf16x12_form(const RadArgs*);
 
 }  /* extern "C" */
 
