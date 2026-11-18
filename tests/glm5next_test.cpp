@@ -1842,6 +1842,136 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     }
 }
 
+/* The 2.x container's encodings: an IQ8R trunk (rotated int8, a u8 scale a 256 of K under a bf16
+ * scale a row) and IQR routed experts (the rotated computed trellis at one f32 scale a row). */
+static RadEncoding glm_iq8r() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&e, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+static RadEncoding glm_iqr() {
+    RadEncoding e{};
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
+    e.plane[t].block[0] = 128;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+/* The encodings by declared name: every trunk linear but KDA's (dense, MLA q_a/kv_a/q_b/output,
+ * shared experts) IQ8R, the routed experts `experts`, the rest as declared. The MLA layers' output
+ * projections are named by layer: KDA's share the name and stay bf16. */
+static std::vector<std::pair<std::string, RadEncoding>> glm_v2_encs(const RadEncoding& experts) {
+    const RadEncoding q = glm_iq8r();
+    std::vector<std::pair<std::string, RadEncoding>> e = {
+        { "ffn_gate_up_exps", experts }, { "ffn_down_exps", experts },
+        { "ffn_gate_up_shexp", q },      { "ffn_down_shexp", q },
+        { "ffn_gate_up.weight", q },     { "ffn_down.weight", q },
+        { "attn_q_a.weight", q },        { "attn_kv_a.weight", q },
+        { "attn_q_b.weight", q } };
+    for (int l = 3; l < 45; l += 4) e.push_back({ "blk." + std::to_string(l) + ".attn_output.", q });
+    return e;
+}
+static RadModelMeta glm_meta() {
+    static const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                                  "index_topk" };
+    static const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    return meta;
+}
+
+/* An IQ8R trunk with IQR experts declares at every rank count with whole experts, rotated int8
+ * pairs at the trunk's 256 and the routed arm's 128, and KDA, the indexer and the router as they
+ * were. Where the norms cannot write the codes (a CPU engine), each linear quantises the bf16 plane
+ * and the routed arm takes its own rotated copy of the block input. */
+TEST(glm53_v2_declares_an_iq8r_trunk_with_iqr_experts) {
+    const RadModelMeta meta = glm_meta();
+    for (const bool fed : { true, false })
+        for (const int world : { 1, 2, 4, 8 }) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            if (!fed) b.undeclared = { "rmsnorm_had_quant_i8g" };
+            RadBuildCtx ctx = spec_ctx(0, world, 0);
+            ctx.max_tok = 256;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 32768;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+            const int64_t T = 256;
+            const RecBuf* nq = find_b(b, "normalized.q8");
+            const RecBuf* ns = find_b(b, "normalized.s8");
+            REQUIRE(nq && ns);
+            CHECK_EQ(nq->d.dtype, (uint32_t)RAD_I8);
+            CHECK_EQ(ns->d.shape[1], 4096 / 256);
+            /* The E4M3 pair only where the norm cannot write the codes. */
+            CHECK_EQ(find_b(b, "normalized.q") != nullptr, !fed);
+            const RecBuf* eq = find_b(b, "expert_ff.q8");
+            const RecBuf* es = find_b(b, "expert_ff.s8");
+            REQUIRE(eq && es);
+            CHECK_EQ(eq->d.shape[0], 8 * T);
+            const int64_t FE = world == 1 ? 2048 : 2048;  /* whole experts at every world */
+            CHECK_EQ(eq->d.shape[1], FE);
+            CHECK_EQ(es->d.shape[1], FE / 128);
+            CHECK(find_b(b, "expert_ff.q") == nullptr);
+            CHECK_EQ(find_b(b, "normalized_rot.q8") != nullptr, !fed);
+            for (const char* n : { "q_low.q8", "expanded.q8", "dense_ff.q8", "shared_ff.q8" })
+                CHECK(find_b(b, n) != nullptr);
+            for (const char* n : { "expanded.q", "dense_ff.q", "shared_ff.q" })
+                CHECK(find_b(b, n) == nullptr);
+            /* The trunk's int8 GEMMs are IQ8R's; KDA's projections stay bf16 GEMMs. */
+            int iq8r = 0;
+            for (const auto& o : b.ops)
+                if (o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h") {
+                    CHECK_EQ(pint(&o, "group"), 256);
+                    ++iq8r;
+                }
+            /* 3 dense x 2 + 11 MLA x 4 + 42 shared x 2. */
+            CHECK_EQ(iq8r, 3 * 2 + 11 * 4 + 42 * 2);
+            CHECK(count_op(b, "moe_gemm_q") > 0);
+            CHECK(count_op(b, "gemm_nt") > 0);
+            CHECK(find_op(b, "quant_act_fp8") == nullptr);
+            /* A mixed step (two decode rows beside a 200-row prefill chunk) issues every op with
+             * the int8 pairs written before they are read. */
+            auto k = kit(b, { 1, 1 }, { 200 }, 300);
+            auto passes = run_passes(b, glm5next::step, { k.get() }, 0, world);
+            CHECK_PASSES(b, passes);
+        }
+}
+
+/* An IQ8R trunk's experts read its rotated int8 codes, so bf16 or unrotated experts beside it, and
+ * IQR experts beside a bf16 trunk, are refused; so is the MLA row form, which views int8 weights. */
+TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {
+    const RadModelMeta meta = glm_meta();
+    const auto declare = [&](const std::vector<std::pair<std::string, RadEncoding>>& encs,
+                             int rows) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = encs;
+        RadBuildCtx ctx = spec_ctx(0, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        ctx.tp_attn_rows = rows;
+        return glm5next::declare(&b, &meta, &ctx);
+    };
+    CHECK_EQ(declare(glm_v2_encs(rad_enc_plain(RAD_BF16)), 0), RAD_E_UNSUPPORTED);
+    CHECK_EQ(declare({ { "ffn_gate_up_exps", glm_iqr() }, { "ffn_down_exps", glm_iqr() } }, 0),
+             RAD_E_UNSUPPORTED);
+    CHECK_EQ(declare(glm_v2_encs(glm_iqr()), 2048), RAD_E_UNSUPPORTED);
+}
+
 /* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
  * and up, because a plain bf16 expert, even one protected among MXFP4 ones, cannot be sliced. */
 TEST(glm53_lays_out_its_experts_by_their_format) {

@@ -60,6 +60,15 @@ struct Model {
     /* Each routed layer's source and config, probed before any buffer is sized: the expert
      * format decides the routed arm's code pair. Indexed by layer; 0..2 are dense and unused. */
     std::vector<MoeFP8::Src> moe_src;
+    /* An IQ8R trunk (rotated int8 linears, one scale a `trunk_g8` of K), read from layer 0's dense
+     * gate_up before any buffer is sized: every activation a trunk linear reads then carries
+     * rotated int8 codes, and the routed experts read rotated int8 too (IQR). KDA, the indexer,
+     * the router and the MLA's kv_b stay as they are declared. `norm_fed`: the norms write those
+     * codes themselves (rmsnorm_had_quant_i8g); where they cannot, each linear quantises the bf16
+     * plane. */
+    bool trunk_rot = false;
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
+    bool norm_fed = false;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
     rad_buf h0 = 0, h1 = 0, x = 0, y = 0, post = 0, comb = 0, final_hidden = 0, logit_input = 0,
@@ -125,6 +134,31 @@ static rad_op norm(RadBuilder* b, const Geom& g, rad_weight w, rad_buf x, rad_bu
 }
 
 /* ------------------------------------------------------------------ the shared activations */
+/* A norm's code pair: E4M3 for a block-fp8 or bf16 trunk; for an IQ8R one rotated int8 codes at the
+ * trunk's group, written by the norm where `norm_fed`, else an E4M3 pair no linear reads beside
+ * int8 codes each linear writes from the bf16 plane (ActFP8::declare_pair). */
+static int norm_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64_t n) {
+    if (!m.trunk_rot) return a.declare_qs(b, m.nm, m.g, name, n);
+    RAD_ARCH_TRY(a.declare_qs(b, m.nm, m.g, name, n, 0, true, !m.norm_fed, m.trunk_g8));
+    a.q8_fed = a.q8_rot = m.norm_fed;
+    return RAD_OK;
+}
+/* A quantiser's code pair (the MLA's expanded output, the clamped products): for an IQ8R trunk the
+ * rotated int8 codes the block's own had_quant_act_i8g writes at `group`, and no E4M3 pair. */
+static int quant_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64_t n,
+                      int64_t rows = 0, int64_t group = 0) {
+    if (!m.trunk_rot) return a.declare_qs(b, m.nm, m.g, name, n, rows);
+    const int64_t g8 = group > 0 ? group : m.trunk_g8;
+    if (n % g8) {
+        fprintf(stderr, "radiance: glm5next: the IQ8R trunk keeps one scale a %lld of K, which "
+                        "does not divide this rank's %lld-wide '%s'\n",
+                (long long)g8, (long long)n, name);
+        return RAD_E_UNSUPPORTED;
+    }
+    RAD_ARCH_TRY(a.declare_qs(b, m.nm, m.g, name, n, rows, true, false, g8));
+    a.q8_fed = a.q8_rot = true;
+    return RAD_OK;
+}
 static int stream_buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -140,7 +174,7 @@ static int stream_buffers(RadBuilder* b, Model& m) {
     m.post = decl_b(b, nm.f("post"), RAD_F32, { T, 4 });
     m.comb = decl_b(b, nm.f("mix"), RAD_F32, { T, 16 });
     m.act.x = decl_b(b, nm.f("normalized"), RAD_BF16, { T, 4096 });
-    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normalized", 4096));
+    RAD_ARCH_TRY(norm_pair(b, m, m.act, "normalized", 4096));
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, 4096 }, RAD_BUF_PERSIST);
     m.logit_input = decl_b(b, nm.f("logit_input"), RAD_BF16, { g.max_logit_rows, 4096 });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
@@ -181,14 +215,14 @@ static int mla_buffers(RadBuilder* b, Model& m) {
     aw.q_raw = bf("q_raw", 1536);
     aw.kv_raw = bf("kv_raw", 512);
     aw.q_low.x = bf("q_low", 1536);
-    RAD_ARCH_TRY(aw.q_low.declare_qs(b, nm, g, "q_low", 1536));
+    RAD_ARCH_TRY(norm_pair(b, m, aw.q_low, "q_low", 1536));
     aw.latent = bf("latent", 512);
     aw.out = m.y;
     aw.core.q = bf("query", Q);
     aw.core.q_latent = decl_b(b, nm.f("q_latent"), RAD_BF16, { T, H, 512 });
     aw.core.attn_latent = decl_b(b, nm.f("attn_latent"), RAD_BF16, { T, H, 512 });
     aw.attn.x = bf("expanded", Q);
-    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "expanded", Q));
+    RAD_ARCH_TRY(quant_pair(b, m, aw.attn, "expanded", Q));
     aw.core.out = aw.attn.x;
     const int64_t part = g.world > 1 ? DsaCache::part_rows(T, g.world) : 0;
     const int64_t TQ = g.world > 1 ? std::max(T, g.world * part) : T;
@@ -262,7 +296,7 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     dw.h = m.act;
     dw.gate_up = bf("dense_gate_up", 2 * g.n_ff);
     dw.ffn.x = bf("dense_ff", g.n_ff);
-    RAD_ARCH_TRY(dw.ffn.declare_qs(b, nm, g, "dense_ff", g.n_ff));
+    RAD_ARCH_TRY(quant_pair(b, m, dw.ffn, "dense_ff", g.n_ff));
     auto& mw = m.mw;
     mw.x = m.x;
     mw.h = m.act;
@@ -284,11 +318,20 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     const int64_t FE = m.whole_experts ? 2048 : F;
     mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * FE });
     mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, FE });
-    RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", FE, T * 8));
+    /* An IQ8R trunk's routed arm is rotated int8 throughout: the gated product's codes at one
+     * scale a 128 of K, which the IQR grouped GEMM reads (MoeFP8::a8). Its gate_up reads the
+     * norm's own codes where the norm writes them, else a rotated copy of the block input that
+     * MoeFP8 writes once a layer (Wire::hr). */
+    RAD_ARCH_TRY(quant_pair(b, m, mw.eff, "expert_ff", FE, T * 8, RAD_FP8_BLOCK));
+    if (m.trunk_rot && !m.norm_fed) {
+        RAD_ARCH_TRY(mw.hr.declare_qs(b, nm, g, "normalized_rot", 4096, 0, true, false,
+                                      RAD_FP8_BLOCK));
+        mw.hr.q8_fed = mw.hr.q8_rot = true;
+    }
     mw.edn = decl_b(b, nm.f("expert_down"), RAD_BF16, { T * 8, 4096 });
     mw.sgu = bf("shared_gate_up", 2 * F);
     mw.sff.x = bf("shared_ff", F);
-    RAD_ARCH_TRY(mw.sff.declare_qs(b, nm, g, "shared_ff", F));
+    RAD_ARCH_TRY(quant_pair(b, m, mw.sff, "shared_ff", F));
     mw.sout = bf("shared_out", 4096);
     mw.sgate = bf("shared_one", 1);
     return RAD_OK;
@@ -552,6 +595,41 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.moe_src[(size_t)l] = moe_source(m, nm, l);
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, m.moe_src[(size_t)l], &m.moe_src[(size_t)l].cfg));
     }
+    /* ---- the trunk's stored form, read from layer 0's dense gate_up through that layer's own
+     * LinearFP8 (MlpFP8 then does not map it again). */
+    m.layers.resize(45);
+    {
+        const char* pre = nm.ckpt("model.language_model.layers.%d", 0);
+        RAD_ARCH_TRY(m.layers[0].dense.gate_up.probe(
+            b, nm, g, nm.f("blk.0.ffn_gate_up"),
+            { nm.ckpt("%s.mlp.gate_proj.weight", pre), nm.ckpt("%s.mlp.up_proj.weight", pre) }));
+        RadEncoding enc{};
+        m.trunk_rot = weight_enc(b, nm.f("blk.0.ffn_gate_up.weight"), &enc) &&
+                      linear_is_w8h(enc) && !linear_is_wnh(enc);
+        m.trunk_g8 = m.trunk_rot ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
+    }
+    for (int l = 3; l < 45; ++l) {
+        const MoeFP8::Config& c = m.moe_src[(size_t)l].cfg;
+        const bool int8_experts = c.expert_iqr || c.expert_i8;
+        if (m.trunk_rot && (c.expert_bf16 || !int8_experts)) {
+            fprintf(stderr, "radiance: glm5next: the trunk is IQ8R and layer %d's routed experts are "
+                            "%s; an IQ8R trunk's experts read its rotated int8 codes, so they are "
+                            "IQR or rotated int8\n",
+                    l, c.expert_bf16 ? "plain bf16" : "in another format");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (!m.trunk_rot && int8_experts) {
+            fprintf(stderr, "radiance: glm5next: layer %d's routed experts are rotated int8 and the "
+                            "trunk is not IQ8R; they read the trunk's rotated int8 codes\n", l);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    if (m.trunk_rot && m.form == GlmMla::Form::rows) {
+        fprintf(stderr, "radiance: glm5next: the MLA row form (tp-attn-rows) views its head-form "
+                        "weights, which an IQ8R trunk's int8 linears cannot; serve the head form\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    m.norm_fed = m.trunk_rot && rad_op_declared(b, "rmsnorm_had_quant_i8g") != 0;
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
     RAD_ARCH_TRY(mla_buffers(b, m));
@@ -618,9 +696,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     // with every buffer above. Its weight groups follow the 45 layers and the MTP layer's.
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, 4096, 46));
     rad_note(b,
-             "GLM-5.3: TP%d, 45 mHC layers, 34 KDA + 11 sparse MLA, mixed MXFP4/FP8, native MTP "
+             "GLM-5.3: TP%d, 45 mHC layers, 34 KDA + 11 sparse MLA, %s trunk, native MTP "
              "%s, vision %s",
-             world, m.have_mtp ? "enabled" : "disabled", m.media ? "enabled" : "disabled");
+             world, m.trunk_rot ? "IQ8R" : "bf16", m.have_mtp ? "enabled" : "disabled",
+             m.media ? "enabled" : "disabled");
     return RAD_OK;
 }
 
