@@ -1537,6 +1537,23 @@ static const RadOperandSpec oArRmsNormQuantFp8[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
 
+/* ar_rmsnorm: the same without the quantiser, for blocks whose linears read the bf16 norm output.
+ * No `group` (no codes) and no `wire` (the exact wire only); `y` is the norm output, required. */
+static const RadParamSpec pArRmsNorm[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "n",          RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+};
+static const RadOperandSpec oArRmsNorm[] = {
+    { "x",        RAD_OPD_INOUT,  0 },   /* the message and the input; receives the reduced sum */
+    { "residual", RAD_OPD_INOUT,  1 },
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "y",        RAD_OPD_OUT,    0 },
+};
+
 /* ar_rmsnorm_post_quant_fp8: the same with a sandwich post-norm of the reduced sum before the add
  * (Gemma 3's junction, arch/gemma3), on either wire. Its own op: an optional seventh operand on
  * ar_rmsnorm_quant_fp8 would break every plugin that issues that op's six. */
@@ -3920,6 +3937,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_rmsnorm_quant_fp8", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
            "quantisation that always follow it, in one kernel. Both wires."),
+    SCHEMA("ar_rmsnorm", pArRmsNorm, oArRmsNorm,
+           "ar_rmsnorm_quant_fp8 without the quantiser: the two-rank all-reduce of x and the "
+           "residual add and RMS norm after it, into a bf16 y, in one kernel. Exact wire only."),
     SCHEMA("ar_rmsnorm_had_quant_i8g", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce of x and rmsnorm_had_quant_i8g after it, in one kernel; "
            "either wire, as ar_rmsnorm_quant_fp8."),
@@ -5369,6 +5389,11 @@ static const RadConstraint cRmsNormQuantFp8[] = {
 static const RadConstraint cArRmsNormQuantFp8[] = {
     C_DIV("n", 8), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2),
+    C_P2P,
+};
+/* ar_rmsnorm: the same, with no group. */
+static const RadConstraint cArRmsNorm[] = {
+    C_DIV("n", 8), C_IN("dtype", "bf16"), C_EQ("world_size", 2),
     C_P2P,
 };
 /* The rotated int8 twins: `n DIV 128`, since a rotation block cannot straddle the end of a row
@@ -9694,6 +9719,23 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   /* `all_reduce` + `rmsnorm_quant_fp8`, both wires (r4d_fuse.cpp). */
   r4d_fuse_ar_rmsnorm_quant_fp8 },
 
+{ "ar_rmsnorm_bf16", "ar_rmsnorm", "norm",
+  "the two-rank all-reduce and the residual add and RMS norm that always follow it, in one kernel, "
+  "into a bf16 output: ar_rmsnorm_quant_fp8 without the quantiser, for a block whose linears read "
+  "the bf16 norm output",
+  "exactly 2 ranks; n a multiple of 8 and x unpitched, because x is the message and a block pushes "
+  "its rows as 16B words; the exact wire only; a block owns whole ROWS, so the block count is "
+  "clamped to M; the residual may be null, y may not",
+  "bf16 in and out; the reduced sum rounded to bf16 as the standalone exact all-reduce stores it, "
+  "the residual add rounded and stored as `add` does, and the norm taken of the stored row at "
+  "rmsnorm_bf16's width -- byte-identical to all_reduce + add + rmsnorm",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNorm), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm, nullptr, nullptr, nullptr,
+  r4d_shape_ar_rmsnorm, nullptr,
+  /* `all_reduce` + `add` + `rmsnorm` (r4d_fuse.cpp). */
+  r4d_fuse_ar_rmsnorm },
+
 { "ar_rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g", "quant",
   "the two-rank all-reduce and the residual add, RMS norm, 128-wide Hadamard and per-(row, 128) "
   "int8 quantisation that always follow it, in one kernel; the all-reduce's output is never read "
@@ -11060,6 +11102,8 @@ extern "C" int rad_kernel_chain(int i) {
          * tail form (the two-shot with the junction after it) only */
         "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8g", "ar_rmsnorm_quant_i8_4rank",
         "ar_rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_iq8r",
+        /* ...and its bf16 form (no quantiser) for the bf16 blocks' fold, at the same width */
+        "ar_rmsnorm_bf16",
         /* the 31B's full layers: the windowed attention and its merge (r4d_attn_paged_window.hip,
          * at decode heights) and the int8 quantiser before o_proj; h512 at every TP's gqa */
         "attn_qrow_h512_gqa2_i8kv", "attn_qrow_h512_gqa2_bf16kv",

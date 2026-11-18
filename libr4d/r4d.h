@@ -888,6 +888,15 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_
                                   int nblocks, int nthreads, int drain, int acq, int wire,
                                   long loc_pack, long loc_scale_off, long stage = 0,
                                   int group = 128, int chain = 0);
+// And with no quantiser (ar_rmsnorm): the reduction, the residual add and the norm into `y`
+// (required), bf16 only, the exact wire only, no post-norm. `chain`: the chained form at the decode
+// width (1024 threads), as r4d_ar_rmsnorm_had_quant_i8g's.
+int  r4d_ar_rmsnorm_bf16(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
+                         long seq_ctrs, long slot_stride16,
+                         long x, long res, long w, long y, int M, int n, float eps, float wadd,
+                         int w_f32, int r_ld, int y_ld, long stream,
+                         int nblocks, int nthreads, int drain, int acq, long stage = 0,
+                         int chain = 0);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8

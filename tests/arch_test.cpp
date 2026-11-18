@@ -206,8 +206,20 @@ RadModelMeta gemma4_draft_meta() {
  * rather than theta, and this plugin has none (see rad_block_attn_gated.h). Declaring it with
  * parameters its schema lacks would fail declare outright rather than fall back to the four ops it
  * stands for. */
-std::vector<std::string> attn_layer_ops(bool tp) {
-    std::vector<std::string> v = { "rmsnorm", "gemm_nt", "gemm_nt", "gemm_nt" };
+/* A bf16 block's input norm: `rmsnorm`, or with a fold (rad_norm_bf16.h, two ranks) the
+ * previous block's `add` before it and the fused `ar_rmsnorm` after it; a step issues one form. */
+void norm_ops(std::vector<std::string>& v, bool fold) {
+    if (fold) v.push_back("add");
+    v.push_back("rmsnorm");
+    if (fold) v.push_back("ar_rmsnorm");
+}
+
+/* `fold`: the block's norm takes the previous block's delta. `add_out`: the block declares its
+ * own closing add (without it the next block's norm folds it). */
+std::vector<std::string> attn_layer_ops(bool tp, bool fold = false, bool add_out = true) {
+    std::vector<std::string> v;
+    norm_ops(v, fold);
+    v.push_back("gemm_nt"); v.push_back("gemm_nt"); v.push_back("gemm_nt");
     v.push_back("rmsnorm"); v.push_back("rmsnorm");
     v.push_back("rope");    v.push_back("rope");
     v.push_back("attn_paged");
@@ -216,25 +228,30 @@ std::vector<std::string> attn_layer_ops(bool tp) {
     v.push_back("mul");
     v.push_back("gemm_nt");
     if (tp) v.push_back("all_reduce");
-    v.push_back("add");
+    if (add_out) v.push_back("add");
     return v;
 }
 
-std::vector<std::string> gdn_layer_ops(bool tp) {
-    std::vector<std::string> v = { "rmsnorm", "gemm_nt", "gemm_nt",
-                                   "gdn_conv_prep", "gdn_kkt_solve", "gdn_chunk_scan",
-                                   "gdn_gated_rmsnorm",
-                                   "gdn_conv_update", "gdn_recurrent_update",
-                                   "gemm_nt" };
+std::vector<std::string> gdn_layer_ops(bool tp, bool fold = false, bool add_out = true) {
+    std::vector<std::string> v;
+    norm_ops(v, fold);
+    for (const char* o : { "gemm_nt", "gemm_nt",
+                           "gdn_conv_prep", "gdn_kkt_solve", "gdn_chunk_scan",
+                           "gdn_gated_rmsnorm",
+                           "gdn_conv_update", "gdn_recurrent_update",
+                           "gemm_nt" })
+        v.push_back(o);
     if (tp) v.push_back("all_reduce");
-    v.push_back("add");
+    if (add_out) v.push_back("add");
     return v;
 }
 
-std::vector<std::string> mlp_ops(bool tp) {
-    std::vector<std::string> v = { "rmsnorm", "gemm_nt", "silu_mul", "gemm_nt" };
+std::vector<std::string> mlp_ops(bool tp, bool fold = false, bool add_out = true) {
+    std::vector<std::string> v;
+    norm_ops(v, fold);
+    for (const char* o : { "gemm_nt", "silu_mul", "gemm_nt" }) v.push_back(o);
     if (tp) v.push_back("all_reduce");
-    v.push_back("add");
+    if (add_out) v.push_back("add");
     return v;
 }
 
@@ -249,10 +266,14 @@ std::vector<std::string> program_ops(bool tp) {
      * the rest, and this collective sums the ranks into x. Hence 2 all_reduces per layer plus
      * one. */
     if (tp) v.push_back("all_reduce");
+    /* At two ranks every boundary folds (qwen35_bf16's layer_fold): a mixer past layer 0 takes
+     * the previous feed-forward's delta and a feed-forward its mixer's, and only the last
+     * feed-forward keeps its add, for the final norm. */
     for (int l = 0; l < 8; ++l) {
-        if ((l + 1) % 4 == 0) append(v, attn_layer_ops(tp));
-        else                  append(v, gdn_layer_ops(tp));
-        append(v, mlp_ops(tp));
+        const bool mix_fold = tp && l > 0;
+        if ((l + 1) % 4 == 0) append(v, attn_layer_ops(tp, mix_fold, !tp));
+        else                  append(v, gdn_layer_ops(tp, mix_fold, !tp));
+        append(v, mlp_ops(tp, tp, !tp || l == 7));
     }
     v.push_back("rmsnorm");
     /* gather_rows before the lm_head: the sampler needs one row per sequence, and the widest GEMM
@@ -10148,6 +10169,81 @@ TEST(qwen35_bf16_steps_lint_clean_with_a_dflash2_drafter) {
     RadArchProbe q{};
     CHECK_OK(qwen35_bf16::probe(plain.meta(), &q));
     CHECK_EQ(q.draft_depth, 0);
+}
+
+/* What a step issues at two ranks: one ar_rmsnorm per folded boundary (rad_norm_bf16.h), and the
+ * standalone all-reduce and add only where `x` is read between blocks: after a drafter tap layer
+ * and after the last layer (the final norm), besides the embedding's all-reduce. Exact wire here,
+ * the fixture's default, so decode and prefill both fold. */
+TEST(qwen35_bf16_folds_each_boundary_into_one_ar_rmsnorm_at_two_ranks) {
+    auto issued = [](const RadBuilder& b, const RadCtx& c, const char* op) {
+        int n = 0;
+        for (const std::string& o : issued_ops(b, c)) n += o == op;
+        return n;
+    };
+    MetaKV plain(qwen35_meta());
+    MetaKV df = with_dflash2(MetaKV(qwen35_meta()));
+    struct Case { MetaKV* m; int max_spec, arn, ar, add; };
+    /* 8 layers. Without a drafter: 8 feed-forwards and 7 mixers fold; the last layer keeps its
+     * add and all-reduce. With taps after layers 1, 3 and 5: those feed-forwards keep theirs too,
+     * and the mixers of layers 2, 4 and 6 do not fold. */
+    for (const Case& k : { Case{ &plain, 0, 15, 1 + 1, 1 }, Case{ &df, 7, 12, 1 + 4, 4 } }) {
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(0, 2, k.max_spec);
+        REQUIRE_EQ(qwen35_bf16::declare(&b, k.m->meta(), &ctx), RAD_OK);
+        const auto dec = kit(b, { 1, 1, 1, 1 }, {});
+        const auto pre = kit(b, {}, { 32, 32 });
+        for (const Kit* kt : { dec.get(), pre.get() }) {
+            const auto v = run_passes(b, qwen35_bf16::step, { kt }, 0, 2);
+            REQUIRE_EQ(v.size(), (size_t)1);
+            CHECK_EQ(issued(b, *v[0], "ar_rmsnorm"), k.arn);
+            CHECK_EQ(issued(b, *v[0], "all_reduce"), k.ar);
+            CHECK_EQ(issued(b, *v[0], "add"), k.add);
+        }
+    }
+}
+
+/* On a lossy wire a step whose message goes out compressed cannot take the exact-only
+ * ar_rmsnorm: there the producer issues its own all-reduce and the next norm `add` then `rmsnorm`,
+ * the three ops as before. A decode step below the floor still folds. */
+TEST(qwen35_bf16_falls_back_to_the_three_ops_where_the_wire_is_lossy) {
+    auto issued = [](const RadBuilder& b, const RadCtx& c, const char* op) {
+        int n = 0;
+        for (const std::string& o : issued_ops(b, c)) n += o == op;
+        return n;
+    };
+    MetaKV plain(qwen35_meta());
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx(0, 2);
+    ctx.tp_wire_lossy = 1;
+    ctx.tp_wire_min_bytes = 64 << 10;   /* decode's 4 x 5120 bf16 is under, prefill's 64 rows over */
+    REQUIRE_EQ(qwen35_bf16::declare(&b, plain.meta(), &ctx), RAD_OK);
+    const auto dec = kit(b, { 1, 1, 1, 1 }, {});
+    const auto pre = kit(b, {}, { 32, 32 });
+    const auto vd = run_passes(b, qwen35_bf16::step, { dec.get() }, 0, 2);
+    CHECK_EQ(issued(b, *vd[0], "ar_rmsnorm"), 15);
+    const auto vp = run_passes(b, qwen35_bf16::step, { pre.get() }, 0, 2);
+    CHECK_EQ(issued(b, *vp[0], "ar_rmsnorm"), 0);
+    CHECK_EQ(issued(b, *vp[0], "all_reduce"), 1 + 16);
+    CHECK_EQ(issued(b, *vp[0], "add"), 16);
+}
+
+/* Under calibration (--calib-dir) a step issues each block's input norm ahead of the block for the
+ * tap, so the blocks keep their own all-reduce and add: no ar_rmsnorm is declared at two ranks.
+ * Declare only; the tap's step needs a device. */
+TEST(qwen35_bf16_declares_no_ar_rmsnorm_under_calibration) {
+    MetaKV plain(qwen35_meta());
+    for (bool calib : { false, true }) {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx(0, 2);
+        if (calib) {
+            ctx.calib_dir    = "calib-test";
+            ctx.calib_tokens = 1 << 20;
+        }
+        REQUIRE_EQ(qwen35_bf16::declare(&b, plain.meta(), &ctx), RAD_OK);
+        if (calib) CHECK_EQ(count_op(b, "ar_rmsnorm"), 0);
+        else       CHECK(count_op(b, "ar_rmsnorm") > 0);
+    }
 }
 
 /* =============================== gemma3: TranslateGemma 27B's trunk =========================== */

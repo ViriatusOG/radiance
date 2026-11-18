@@ -42,6 +42,7 @@
 #define RAD_BLOCK_GDN_H
 
 #include "rad_arch.h"
+#include "rad_norm_bf16.h"
 
 #include <cmath>
 
@@ -105,14 +106,22 @@ struct GdnBF16 {
     rad_op op_conv_prep = 0, op_kkt = 0, op_scan = 0, op_gnorm = 0;   /* prefill */
     rad_op op_conv_update = 0, op_recur = 0;                          /* decode */
     rad_op op_out = 0, op_ar = 0, op_add = 0;
+    /* The fold (rad_norm_bf16.h): the norm may take the previous block's delta and all-reduce,
+     * and this block may leave its own to the next block's norm (`ar_out`, NormBF16::takes_ar). */
+    NormBF16 nq{};
+    bool ar_out = false;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
-                 rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s);
+                 rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s,
+                 bool fold = false, bool add_out = true,
+                 bool ar_in = false, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
-                            rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s) {
+                            rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s,
+                            bool fold, bool add_out, bool ar_in, bool ar_out_) {
+    ar_out = ar_out_;
     g = geom; cfg = c; w = wire; src = s; layer = l; kv_state = state; kv_conv = conv;
     if (cfg.n_head_k <= 0 || cfg.head_k <= 0 || cfg.n_head_v <= 0 || cfg.head_v <= 0 ||
         cfg.conv_width <= 0 || cfg.chunk <= 0)
@@ -177,10 +186,8 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     w_out      = decl_w(b, nm.f("blk.%d.ssm_out.weight", l),        RAD_BF16, {g.n_embd, v_dim},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
 
-    op_norm = rw(b, RAD_OP(b, "rmsnorm",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
-                     RAD_WEIGHTS(w_norm)), {w.x}, {w.h});
+    RAD_ARCH_TRY(nq.declare(b, g, w_norm, w.x, w.h, fold, ar_in));
+    op_norm = nq.op_norm;
     op_in = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", in_dim),
                               RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
@@ -256,11 +263,12 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                   RAD_INT("min_bytes", g.wire_min_bytes)),
                        RAD_NOWEIGHTS),
                    {w.h}, {w.h});
-    op_add = rw(b, RAD_OP(b, "add",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.x, w.h}, {w.x});
+    if (add_out)
+        op_add = rw(b, RAD_OP(b, "add",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS),
+                    {w.x, w.h}, {w.x});
     return RAD_OK;
 }
 
@@ -278,7 +286,7 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t conv_dim = cfg.conv_dim();
     const int64_t H        = cfg.n_head_v;
 
-    RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+    nq.step(c, T);
     RAD_ISSUE(c, op_in,   brows(w.h, T), RAD_W(w_in),   brows(w.in, T));
     RAD_ISSUE(c, op_z,    brows(w.h, T), RAD_W(w_z),    brows(w.z, T));
 
@@ -349,8 +357,9 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_out_norm), brow_slice(w.o, DT, PT, v_dim));
     }
     RAD_ISSUE(c, op_out, brows(w.o, T), RAD_W(w_out), brows(w.h, T));
-    if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
-    RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));
+    if (op_ar && !(ar_out && ar_wire_is_exact(g, T)))
+        RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));
 }
 
 }  /* namespace arch */

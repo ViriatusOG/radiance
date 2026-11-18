@@ -628,10 +628,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, g.n_ff * g.world,
                                std::max({ g.n_embd, q_dim * g.world, v_dim * g.world, g.n_ff * g.world })));
 
+    /* ---- where the residual adds happen. At two ranks with ar_rmsnorm, each block's norm takes
+     * the previous block's delta and all-reduce in one launch (rad_norm_bf16.h), placed by
+     * layer_fold() as in the fp8 trunk: a mixer folds the previous feed-forward's unless it is
+     * layer 0 or follows a drafter tap layer; a feed-forward always folds its mixer's, and keeps
+     * its own add on a tap layer and on the last layer, where the tap and the final norm read `x`.
+     * Otherwise (one rank, or a kernel library without the op) every block adds its own delta,
+     * as before. Byte-identical either way: ar_rmsnorm is all_reduce + add + rmsnorm.
+     *
+     * Not under calibration (--calib-dir): step() issues each block's input norm ahead of the
+     * block for the tap, which a folded norm would turn into a second all-reduce and add. */
+    const bool fold_ar = g.world == 2 && rad_op_declared(b, "ar_rmsnorm") && !m.calib.on;
+
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.full = is_full_attention(l, interval) ? 1 : 0;
+        const LayerFold f = fold_ar ? layer_fold(g, l, m.n_main, m.tap_layer, m.n_taps, false)
+                                    : LayerFold{};
+        const bool mix_fold = fold_ar && f.mix_fold;
 
         const char* pre = "model.language_model.layers";
         if (lay.full) {
@@ -644,7 +659,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             as.k_norm = nm.ckpt("%s.%lld.self_attn.k_norm.weight",    pre, (long long)l);
             as.o      = nm.ckpt("%s.%lld.self_attn.o_proj.weight",    pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
-            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as));
+            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
+                                          mix_fold, !fold_ar, mix_fold, fold_ar));
         } else {
             GdnBF16::Src gs{};
             gs.norm     = nm.ckpt("%s.%lld.input_layernorm.weight",           pre, (long long)l);
@@ -659,7 +675,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             gs.out      = nm.ckpt("%s.%lld.linear_attn.out_proj.weight",      pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_state));
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_conv));
-            RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs));
+            RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs,
+                                         mix_fold, !fold_ar, mix_fold, fold_ar));
         }
         if (m.calib.records(l)) {
             const std::string L = std::string(pre) + "." + std::to_string(l);
@@ -683,7 +700,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.gate = nm.ckpt("%s.%lld.mlp.gate_proj.weight",            pre, (long long)l);
         ms.up   = nm.ckpt("%s.%lld.mlp.up_proj.weight",              pre, (long long)l);
         ms.down = nm.ckpt("%s.%lld.mlp.down_proj.weight",            pre, (long long)l);
-        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms));
+        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, fold_ar, !fold_ar || f.mlp_add,
+                                     fold_ar, fold_ar && f.mlp_ar_out));
         if (m.calib.records(l)) {
             const std::string L = std::string(pre) + "." + std::to_string(l);
             lay.cs_mlp = (int)m.calib.sites.size();

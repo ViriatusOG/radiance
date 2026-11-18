@@ -2620,6 +2620,7 @@ device code.
 | op | params | operands |
 |---|---|---|
 | `ar_rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `ar_rmsnorm` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `y` |
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
@@ -2635,6 +2636,9 @@ the message and the input, and the reduced sum lands in it.
 `x` and the residual are the same bytes, and the codes are int8 for a weight at `i8a8h`.
 `ar_rmsnorm_quant_i8g` is `ar_rmsnorm_quant_i8` with `rmsnorm_quant_i8g`'s quantiser, at two
 ranks, with no `sp`; `out_bf16` may be `x`'s buffer, which then ends holding the norm output.
+`ar_rmsnorm` is `ar_rmsnorm_quant_fp8` with no quantiser, for blocks whose linears read the bf16
+norm output: `x` and the residual are the same bytes, `y` is `out_bf16`, and the whole is
+`all_reduce` + `add` + `rmsnorm`. Exact wire only, so it has no `wire`.
 
 `sp` on `ar_rmsnorm_quant_i8` (0 when absent) lets a row split the all-reduce around the
 junction: reduce-scatter, the junction on the rows this rank owns (`M` split evenly over the

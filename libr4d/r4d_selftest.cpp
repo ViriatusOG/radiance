@@ -35680,6 +35680,8 @@ static void device_phase(const Plugin& pl) {
     /* The same for its rotated int8 twin, whose norm half is rmsnorm_had_quant_i8g's. */
     skip_pair("ar_rmsnorm_had_quant_i8g", "two-rank fusion: needs a peer rank");
     skip_pair("ar_rmsnorm_had_quant_iq8r", "two-rank fusion: needs a peer rank");
+    /* And its bf16 form (ar_rmsnorm), whose norm half is the same device function unquantised. */
+    skip_pair("ar_rmsnorm_bf16", "two-rank fusion: needs a peer rank");
 
     dfree_all();
 }
