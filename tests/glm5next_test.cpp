@@ -1879,8 +1879,8 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     }
 }
 
-/* An IQ8R trunk with IQR experts declares at every rank count with whole experts, rotated int8
- * pairs at the trunk's 256 and the routed arm's 128, and KDA, the indexer and the router as they
+/* An IQ8R trunk with IQR experts declares at every rank count, its experts whole at one and two
+ * ranks and split by width at four and eight (as MXFP4's are), with rotated int8 pairs at the trunk's 256 and the routed arm's 128, and KDA, the indexer and the router as they
  * were. Where the norms cannot write the codes (a CPU engine), each linear quantises the bf16 plane
  * and the routed arm takes its own rotated copy of the block input. */
 TEST(glm53_v2_declares_an_iq8r_trunk_with_iqr_experts) {
@@ -1908,7 +1908,7 @@ TEST(glm53_v2_declares_an_iq8r_trunk_with_iqr_experts) {
             const RecBuf* es = find_b(b, "expert_ff.s8");
             REQUIRE(eq && es);
             CHECK_EQ(eq->d.shape[0], 8 * T);
-            const int64_t FE = world == 1 ? 2048 : 2048;  /* whole experts at every world */
+            const int64_t FE = world <= 2 ? 2048 : 2048 / world;  /* split by width from four */
             CHECK_EQ(eq->d.shape[1], FE);
             CHECK_EQ(es->d.shape[1], FE / 128);
             CHECK(find_b(b, "expert_ff.q") == nullptr);
@@ -2004,6 +2004,8 @@ TEST(glm53_v2_expert_parallel_declares_one_expert_window_per_rank) {
             ctx.max_tok = 256;
             ctx.max_seqs = 4;
             ctx.max_ctx = 32768;
+            /* IQR experts split by width at four and eight ranks; the drive tier keeps them whole. */
+            ctx.expert_file_tier = 1;
             REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
             CHECK(glm_maps_are_unique(b));
 

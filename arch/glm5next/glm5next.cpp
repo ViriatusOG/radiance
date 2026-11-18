@@ -53,7 +53,8 @@ struct Model {
     /* Routed experts whole on their rank (288/world of them) instead of split by width across
      * every rank. Whole experts can be read from the drive, which two cards need; at four and
      * eight the width split is the shape the MXFP4 kernels are tuned for (prefill runs about three
-     * times faster), so all-MXFP4 experts take it unless --weights-disk-tier asks for the drive.
+     * times faster), so all-MXFP4 or all-IQR experts take it unless --weights-disk-tier asks for
+     * the drive.
      * Anything else stays whole: a plain bf16 expert cannot be sliced at all. */
     bool whole_experts = false;
     std::vector<Layer> layers;
@@ -99,14 +100,18 @@ static thread_local std::unique_ptr<Model> probe_model;
  * name map, so it leaves the graph as it was. One expert in another format settles it: a protected
  * bf16 expert is served only whole. No answer means no container entry, and what is not known to
  * be MXFP4 stays whole. */
-static bool experts_are_mxfp4(RadBuilder* b, Names& nm) {
+/* Whether every routed expert can be split by width over the ranks: MXFP4 (format 8) or the IQR
+ * computed trellis (format 11), each a scale a row and K in whole 128-wide units, so a rank's 512
+ * columns of an expert's down projection are four whole units and its gate/up rows whole rows. */
+static bool experts_split_by_width(RadBuilder* b, Names& nm) {
     for (int l = 3; l < 45; ++l)
         for (int ge = 0; ge < 288; ++ge)
             for (const char* fmt : { "blk.%d.ffn_gate_up_exps.%d.weight",
                                      "blk.%d.ffn_down_exps.%d.weight" }) {
                 RadEncoding e{};
-                if (!weight_enc(b, nm.f(fmt, l, ge), &e) || MoeFP8::format_of(e) != 8)
-                    return false;
+                if (!weight_enc(b, nm.f(fmt, l, ge), &e)) return false;
+                const int f = MoeFP8::format_of(e);
+                if (f != 8 && f != 11) return false;
             }
     return true;
 }
@@ -590,7 +595,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
     m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
-                                                   !experts_are_mxfp4(b, nm)));
+                                                   !experts_split_by_width(b, nm)));
     /* ---- each routed layer's expert format, read before any buffer is declared: the format
      * decides the routed arm's code pair (ffn_buffers). The probe declares the layer's first
      * experts' name maps, which the layer's declare skips. */
