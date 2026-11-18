@@ -56,6 +56,10 @@ public:
     /* Opens and groups the file's tensors by module. Refuses a file holding a form whose effect
      * this engine cannot reproduce (DoRA's magnitude, OFT, Tucker cores), naming it. */
     int open(const std::string& path, std::string* err);
+    int open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err,
+                      const FileRevision* expected = nullptr);
+    const FileRevision& snapshot_revision() const { return st_.snapshot_revision(); }
+    uint64_t size_bytes() const { return st_.size_bytes(); }
     const std::string&             path() const { return st_.path(); }
     const std::vector<FileModule>& modules() const { return mods_; }
     /* Tensors that change no linear (a trained bias, a norm's weight), with why; reported, not
@@ -65,6 +69,7 @@ public:
     const char* kind_name() const;
 
 private:
+    int group_tensors(const std::string& path, std::string* err);
     SafeTensorsFile st_;
     std::vector<FileModule> mods_;
     std::vector<std::pair<std::string, std::string>> skipped_;

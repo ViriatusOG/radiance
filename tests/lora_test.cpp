@@ -1463,4 +1463,33 @@ TEST(nothing_here_touches_a_device) {
     CHECK_EQ(empty_registry().plugins().size(), (size_t)0);
 }
 
+
+TEST(a_matching_published_combination_wins_over_a_full_slot_table) {
+    std::atomic<uint64_t> epoch{0};
+    lora::SlotTable table;
+    table.reset(1, &epoch);
+    int32_t slot = -1;
+    uint64_t uid = 0;
+    std::shared_ptr<void> request;
+    bool all_held = true;
+    CHECK_EQ(table.acquire("same", &slot, &uid, &request, &all_held), RAD_E_NOTFOUND);
+    CHECK(!all_held);
+    // Another request publishes after the first cache miss. A single atomic lookup must
+    // acquire that exact combination, even though it occupies the only slot and is held.
+    int reserved = -1;
+    bool cooling = false;
+    std::string why;
+    REQUIRE_EQ(table.reserve("same", &reserved, &cooling, &why), RAD_OK);
+    const uint64_t published = table.publish(reserved, "same", "");
+    std::shared_ptr<void> other;
+    REQUIRE_EQ(table.acquire("same", &slot, &uid, &other), RAD_OK);
+    REQUIRE_EQ(table.acquire("same", &slot, &uid, &request, &all_held), RAD_OK);
+    CHECK(!all_held);
+    CHECK_EQ(uid, published);
+    CHECK_EQ(slot, reserved);
+    std::shared_ptr<void> missing;
+    CHECK_EQ(table.acquire("different", &slot, &uid, &missing, &all_held), RAD_E_NOTFOUND);
+    CHECK(all_held);
+}
+
 RAD_TEST_MAIN()

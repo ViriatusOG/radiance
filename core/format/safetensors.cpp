@@ -4,6 +4,7 @@
  */
 #include "safetensors.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -142,37 +143,115 @@ uint32_t st_dtype(const std::string& s) {
 
 }  /* namespace */
 
+namespace {
+FileRevision revision_of(const struct stat& st) {
+#ifdef __APPLE__
+    const auto& modified = st.st_mtimespec;
+    const auto& changed = st.st_ctimespec;
+#else
+    const auto& modified = st.st_mtim;
+    const auto& changed = st.st_ctim;
+#endif
+    return { static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+             static_cast<uint64_t>(st.st_size), modified.tv_sec, changed.tv_sec,
+             static_cast<int32_t>(modified.tv_nsec), static_cast<int32_t>(changed.tv_nsec) };
+}
+} // namespace
+
+int read_file_revision(const std::string& path, FileRevision* revision) {
+    if (!revision) return RAD_E_INVAL;
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) return RAD_E_IO;
+    *revision = revision_of(st);
+    return RAD_OK;
+}
+
 SafeTensorsFile::~SafeTensorsFile() { close(); }
 
 void SafeTensorsFile::close() {
     if (map_) ::munmap(map_, (size_t)map_bytes_);
     if (fd_ >= 0) ::close(fd_);
     map_ = nullptr; map_bytes_ = 0; fd_ = -1;
+    snapshot_revision_ = {};
     tensors_.clear(); index_.clear(); metadata_.clear(); path_.clear();
 }
 
 int SafeTensorsFile::open(const std::string& path) {
+    return open_file(path, nullptr);
+}
+
+int SafeTensorsFile::open_snapshot(const std::string& path, uint64_t max_bytes,
+                                    const FileRevision* expected) {
+    return open_file(path, &max_bytes, expected);
+}
+
+int SafeTensorsFile::read_snapshot(const std::string& path, uint64_t max_bytes,
+                                    const FileRevision* expected) {
+    struct stat before{};
+    if (::fstat(fd_, &before) != 0) return RAD_E_IO;
+    if (!S_ISREG(before.st_mode) || before.st_size < 8) return RAD_E_FORMAT;
+    const FileRevision revision = revision_of(before);
+    if (expected && revision != *expected) return RAD_E_STATE;
+    const uint64_t bytes = static_cast<uint64_t>(before.st_size);
+    if (bytes > max_bytes || bytes > SIZE_MAX) return RAD_E_FULL;
+
+    void* memory = ::mmap(nullptr, static_cast<size_t>(bytes), PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) return RAD_E_NOMEM;
+    map_ = static_cast<uint8_t*>(memory);
+    map_bytes_ = bytes;
+    for (uint64_t offset = 0; offset < bytes;) {
+        const auto count = static_cast<size_t>(std::min<uint64_t>(bytes - offset, 1 << 20));
+        const ssize_t got = ::pread(fd_, map_ + offset, count, static_cast<off_t>(offset));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return RAD_E_IO;
+        offset += static_cast<uint64_t>(got);
+    }
+
+    /* Check both the open file and its current pathname. If the source changed
+     * while copying, the caller can snapshot the new revision on retry. */
+    struct stat after{}, named{};
+    if (::fstat(fd_, &after) != 0 || ::stat(path.c_str(), &named) != 0) return RAD_E_IO;
+    if (revision != revision_of(after) || revision != revision_of(named)) return RAD_E_STATE;
+    if (::mprotect(map_, static_cast<size_t>(bytes), PROT_READ) != 0) return RAD_E_IO;
+    ::close(fd_);
+    fd_ = -1;
+    snapshot_revision_ = revision;
+    return RAD_OK;
+}
+
+int SafeTensorsFile::open_file(const std::string& path, const uint64_t* snapshot_limit,
+                                const FileRevision* expected) {
     close();
     path_ = path;
 
-    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (snapshot_limit ? O_NONBLOCK : 0));
     if (fd_ < 0) { RAD_ERR("%s: %s", path.c_str(), std::strerror(errno)); return RAD_E_IO; }
 
-    struct stat st{};
-    if (::fstat(fd_, &st) != 0) { RAD_ERR("%s: %s", path.c_str(), std::strerror(errno));
-                                  close(); return RAD_E_IO; }
-    map_bytes_ = (uint64_t)st.st_size;
-    if (map_bytes_ < 8) {
-        RAD_ERR("%s: %llu bytes -- too short to be safetensors", path.c_str(),
-                (unsigned long long)map_bytes_);
-        close();
-        return RAD_E_FORMAT;
-    }
+    if (snapshot_limit) {
+        const int status = read_snapshot(path, *snapshot_limit, expected);
+        if (status < 0) {
+            RAD_ERR("%s: could not snapshot safetensors: %s", path.c_str(), rad_strerror(status));
+            close();
+            return status;
+        }
+    } else {
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0) { RAD_ERR("%s: %s", path.c_str(), std::strerror(errno));
+                                      close(); return RAD_E_IO; }
+        map_bytes_ = (uint64_t)st.st_size;
+        if (map_bytes_ < 8) {
+            RAD_ERR("%s: %llu bytes -- too short to be safetensors", path.c_str(),
+                    (unsigned long long)map_bytes_);
+            close();
+            return RAD_E_FORMAT;
+        }
 
-    void* m = ::mmap(nullptr, (size_t)map_bytes_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (m == MAP_FAILED) { RAD_ERR("%s: mmap: %s", path.c_str(), std::strerror(errno));
-                           close(); return RAD_E_IO; }
-    map_ = (uint8_t*)m;
+        void* m = ::mmap(nullptr, (size_t)map_bytes_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (m == MAP_FAILED) { RAD_ERR("%s: mmap: %s", path.c_str(), std::strerror(errno));
+                               close(); return RAD_E_IO; }
+        map_ = (uint8_t*)m;
+    }
 
     uint64_t hlen = 0;
     std::memcpy(&hlen, map_, 8);

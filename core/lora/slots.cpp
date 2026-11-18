@@ -17,6 +17,7 @@ int SlotTable::size() const {
     return (int)slots_.size();
 }
 
+
 int SlotTable::reserve(const std::string& name, int* slot, bool* cooling, std::string* err) {
     std::lock_guard<std::mutex> lk(mu_);
     *slot = -1;
@@ -65,7 +66,8 @@ uint64_t SlotTable::publish(int slot, const std::string& name, const std::string
 }
 
 int SlotTable::acquire(const std::string& name, int32_t* slot, uint64_t* uid,
-                       std::shared_ptr<void>* hold) {
+                       std::shared_ptr<void>* hold, bool* all_held) {
+    if (all_held) *all_held = false;
     uint64_t u = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -76,6 +78,11 @@ int SlotTable::acquire(const std::string& name, int32_t* slot, uint64_t* uid,
             *slot = (int32_t)i;
             x.last_use = ++uses_;
             ++refs_[u];
+        }
+        if (!u && all_held) {
+            *all_held = !slots_.empty();
+            for (const Slot& x : slots_)
+                if (!x.uid || !refs_.count(x.uid)) { *all_held = false; break; }
         }
     }
     if (!u) return RAD_E_NOTFOUND;

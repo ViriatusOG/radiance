@@ -13,6 +13,16 @@
 
 namespace rad {
 
+/* Filesystem revision used to bind a discovered adapter's cache key to the descriptor
+ * whose bytes were copied. A pathname can switch away and back during an open. */
+struct FileRevision {
+    uint64_t device = 0, inode = 0, bytes = 0;
+    int64_t modified_seconds = 0, changed_seconds = 0;
+    int32_t modified_nanoseconds = 0, changed_nanoseconds = 0;
+    bool operator==(const FileRevision&) const = default;
+};
+int read_file_revision(const std::string& path, FileRevision* revision);
+
 struct StTensor {
     std::string          name;
     uint32_t             dtype = RAD_DT_INVALID;   /* RAD_* ; RAD_DT_INVALID if unrecognised */
@@ -38,6 +48,11 @@ public:
     SafeTensorsFile& operator=(const SafeTensorsFile&) = delete;
 
     int  open(const std::string& path);
+    /* Copy to private memory before parsing. Refuse files above max_bytes before allocation. */
+    int  open_snapshot(const std::string& path, uint64_t max_bytes,
+                       const FileRevision* expected = nullptr);
+    const FileRevision& snapshot_revision() const { return snapshot_revision_; }
+    uint64_t size_bytes() const { return map_bytes_; }
     void close();
 
     const StTensor*              find(const std::string& name) const;
@@ -46,6 +61,11 @@ public:
     const std::string&           path()     const { return path_; }
 
 private:
+    int open_file(const std::string& path, const uint64_t* snapshot_limit,
+                  const FileRevision* expected = nullptr);
+    int read_snapshot(const std::string& path, uint64_t max_bytes, const FileRevision* expected);
+    FileRevision snapshot_revision_{};
+
     int         fd_ = -1;
     uint8_t*    map_ = nullptr;
     uint64_t    map_bytes_ = 0;

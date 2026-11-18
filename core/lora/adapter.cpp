@@ -292,6 +292,26 @@ int AdapterFile::open(const std::string& path, std::string* err) {
     mods_.clear();
     skipped_.clear();
     if (st_.open(path) != RAD_OK) return fail(err, RAD_E_IO, path + ": cannot open as safetensors");
+    return group_tensors(path, err);
+}
+
+int AdapterFile::open_snapshot(const std::string& path, uint64_t max_bytes, std::string* err,
+                                const FileRevision* expected) {
+    mods_.clear();
+    skipped_.clear();
+    const int opened = st_.open_snapshot(path, max_bytes, expected);
+    if (opened < 0)
+        return fail(err, opened, path + ": could not snapshot adapter: " + rad_strerror(opened));
+    const int grouped = group_tensors(path, err);
+    if (grouped < 0) {
+        mods_.clear();
+        skipped_.clear();
+        st_.close();
+    }
+    return grouped;
+}
+
+int AdapterFile::group_tensors(const std::string& path, std::string* err) {
     std::map<std::string, FileModule> by;
     std::map<std::string, const StTensor*> alphas;
     for (const StTensor& t : st_.tensors()) {

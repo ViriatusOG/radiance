@@ -656,4 +656,72 @@ TEST(scalar_truncation_deflates_dependent_columns_without_changing_scale) {
         }
 }
 
+TEST(an_adapter_snapshot_keeps_factors_after_the_source_is_replaced) {
+    const std::string path = new_dir("genlora-snapshot") + "/one.safetensors";
+    const TW first = tensor("layer.lora_A.weight", "F32", {1, 8}, 1);
+    const TW second = tensor("layer.lora_A.weight", "F32", {1, 8}, 9);
+    const TW up = tensor("layer.lora_B.weight", "F32", {4, 1}, 2);
+    write_st(path, {first, up});
+    lora::AdapterFile snapshot;
+    std::string why;
+    REQUIRE_EQ(snapshot.open_snapshot(path, 1024 * 1024, &why), RAD_OK);
+    write_st(path, {second, up});
+    REQUIRE_EQ(snapshot.modules().size(), 1u);
+    lora::Delta old_delta;
+    REQUIRE_EQ(lora::module_delta(snapshot.modules()[0], 1.0, &old_delta, &why), RAD_OK);
+    CHECK(old_delta.A == first.v);
+    lora::AdapterFile current;
+    REQUIRE_EQ(current.open_snapshot(path, 1024 * 1024, &why), RAD_OK);
+    lora::Delta new_delta;
+    REQUIRE_EQ(lora::module_delta(current.modules()[0], 1.0, &new_delta, &why), RAD_OK);
+    CHECK(new_delta.A == second.v);
+    lora::AdapterFile bounded;
+    CHECK_EQ(bounded.open_snapshot(path, 8, &why), RAD_E_FULL);
+}
+
+
+TEST(a_snapshot_is_bound_to_the_expected_file_descriptor_revision) {
+    const std::string dir = new_dir("genlora-revision");
+    const std::string path = dir + "/one.safetensors", replacement = dir + "/replacement.safetensors";
+    const TW first = tensor("layer.lora_A.weight", "F32", {1, 8}, 1);
+    const TW second = tensor("layer.lora_A.weight", "F32", {1, 8}, 9);
+    const TW up = tensor("layer.lora_B.weight", "F32", {4, 1}, 2);
+    write_st(path, {first, up});
+    FileRevision expected;
+    REQUIRE_EQ(read_file_revision(path, &expected), RAD_OK);
+    lora::AdapterFile old;
+    std::string why;
+    REQUIRE_EQ(old.open_snapshot(path, 1024 * 1024, &why, &expected), RAD_OK);
+    CHECK(old.snapshot_revision() == expected);
+    write_st(replacement, {second, up});
+    FileRevision newer;
+    REQUIRE_EQ(read_file_revision(replacement, &newer), RAD_OK);
+    CHECK_EQ(expected.bytes, newer.bytes);
+    CHECK(expected != newer);
+    /* Deterministic descriptor mismatch: no rename timing is needed to exercise the ABA guard. */
+    lora::AdapterFile wrong;
+    CHECK_EQ(wrong.open_snapshot(replacement, 1024 * 1024, &why, &expected), RAD_E_STATE);
+    CHECK_EQ(wrong.size_bytes(), 0u);
+    CHECK(wrong.modules().empty());
+    REQUIRE_EQ(::rename(replacement.c_str(), path.c_str()), 0);
+    REQUIRE_EQ(read_file_revision(path, &newer), RAD_OK);
+    lora::AdapterFile current;
+    REQUIRE_EQ(current.open_snapshot(path, 1024 * 1024, &why, &newer), RAD_OK);
+    CHECK(current.snapshot_revision() == newer);
+    lora::Delta old_delta, new_delta;
+    REQUIRE_EQ(lora::module_delta(old.modules()[0], 1.0, &old_delta, &why), RAD_OK);
+    REQUIRE_EQ(lora::module_delta(current.modules()[0], 1.0, &new_delta, &why), RAD_OK);
+    CHECK(old_delta.A == first.v);
+    CHECK(new_delta.A == second.v);
+}
+
+TEST(adapter_snapshots_reject_non_regular_sources_without_blocking) {
+    const std::string pipe = new_dir("genlora-nonregular") + "/fifo";
+    REQUIRE_EQ(::mkfifo(pipe.c_str(), 0600), 0);
+    lora::AdapterFile file;
+    std::string why;
+    CHECK_EQ(file.open_snapshot(pipe, 1024 * 1024, &why), RAD_E_FORMAT);
+    CHECK_EQ(file.size_bytes(), 0u);
+}
+
 RAD_TEST_MAIN()
