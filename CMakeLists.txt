@@ -325,6 +325,8 @@ add_subdirectory(arch)
 # spechub: the linear-MTP coupling kernels (--draft-coupling). Built by default; without the flag
 # no op resolves to its rows.
 add_subdirectory(plugin/spechub)
+# glm: GLM-5.3-Flash's own fused kernels, ops only glm5next issues where a library declares them.
+add_subdirectory(plugin/glm)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()

@@ -334,7 +334,7 @@ set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
 # card, one at a time: a test that commits device memory fails beside another holding it, or beside
 # a server.
 if(RAD_HIP_FOUND)
-  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test)
+  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test glm_device_test)
     add_test(NAME ${n}_card COMMAND ${n} -perf_)
     set_tests_properties(${n}_card PROPERTIES
       LABELS gpu
@@ -342,6 +342,19 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
+endif()
+
+# glm_device_test holds the GLM plugin's fused device rows to libr4d's chains byte for byte on a
+# card (skips without one, or without the device rows); it needs both libraries' paths.
+if(TARGET glm AND TARGET glm_device_test)
+  target_link_libraries(glm_device_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(glm_device_test PRIVATE
+    RAD_GLM_LIB="${RAD_PLUGIN_OUT}/kernels/glm.so"
+    RAD_R4D_LIB="${RAD_PLUGIN_OUT}/kernels/libr4d.so")
+  add_dependencies(glm_device_test glm)
+  if(TARGET libr4d)
+    add_dependencies(glm_device_test libr4d)
+  endif()
 endif()
 
 # plugin_test's libr4d cases run against the shipped RDNA4 library. Only a build whose GPU
