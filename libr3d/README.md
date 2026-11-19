@@ -236,6 +236,17 @@ The GEMM band is covered by row count:
   split order). M ≤ 16 stays with the m16 rows, whose wave-per-run-of-columns shape is the right
   one there: the two ranges are complements, so neither competes for the other's band.
 
+The dot2 arms and the wave-matrix arms of these two rows do not round alike. Each is within one
+bf16 store step of libref on every launch, but the two families are not bit-identical to each
+other, so a tune cache that moves a shape from one family to the other changes a model's outputs
+at the bit level. Within a family the tiled row's arms agree bit for bit (gfx1152, LFM3-1.7B: arms
+0 and 1 give one record, arms 2 and 3 another). Neither family is the more accurate: over three
+long teacher-forced prompts the KL against an f32 reference differs by a ratio of 1.01 to 1.09,
+each 95% interval including 1. Single positions can still differ by far more than that: one
+position of one 721-token prompt read KL 0.005 on the dot2 arms and 2.08 on the wave-matrix arms,
+with every launch of both within the one-step bound. Evidence that is compared bit for bit, or
+judged at single positions, should name the tune cache it ran with.
+
 The quantised m64 prefill rows run on the wave matrix with the same tiling:
 `gemm_nt_q_w4a16asym_m64` (1..64 rows; unsigned 4-bit codes, an f16 scale and an integer zero per
 128 of K, against an f16 activation) and `gemm_nt_q_w5a16_m64` (1..64 rows; ParoQuant's int5: the
