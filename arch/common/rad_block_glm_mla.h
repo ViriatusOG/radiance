@@ -29,8 +29,8 @@ struct MlaLatent {
         int64_t heads = 16, head_dim = 256, latent_dim = 512, blocks = 513;
     };
     /* The attention over the latent cache, `rows` rows of `heads` heads. The cache is Geom::kv_dtype
-     * (bf16, or fp8_e4m3 under --kv-cache-dtype fp8); `kv_dtype` is stated only for a cache that is
-     * not bf16, so a bf16 build declares the op it always did. */
+     * (bf16, fp8_e4m3 under --kv-cache-dtype fp8, or i8); `kv_dtype` is stated only for a cache that
+     * is not bf16, so a bf16 build declares the op it always did. */
     static rad_op attn_op(RadBuilder* b, const Geom& g, int64_t rows, int64_t heads,
                           int64_t blocks, double scale) {
         if (g.kv_dtype && std::strcmp(g.kv_dtype, "bf16"))

@@ -346,7 +346,8 @@ static int kv_groups(RadBuilder* b, Model& m) {
     auto& nm = m.nm;
     RadKVGroupDecl d{};
     d.kind = RAD_KV_FULL;
-    // bf16, or E4M3 under --kv-cache-dtype fp8 (geometry); the other groups keep their own.
+    // bf16, E4M3 under --kv-cache-dtype fp8, or the int8 row under i8 (geometry); the other groups
+    // keep their own.
     d.dtype = rad_dtype_parse(g.kv_dtype);
     d.n_head_kv = 1;
     d.head_dim = 256;
@@ -537,7 +538,7 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
     /* --kv-cache-dtype names the latent cache's dtype only (kv_groups); declare refuses all but
-     * bf16 and fp8. */
+     * bf16, fp8 and i8. */
     g.kv_dtype = rad_dtype_name(rad_kv_cache_dtype(ctx, RAD_BF16));
     g.wire_exact = !ctx->tp_wire_lossy;
     g.wire_min_bytes = ctx->tp_wire_min_bytes;
@@ -578,11 +579,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ctx->max_spec);
         return RAD_E_UNSUPPORTED;
     }
-    /* fp8 narrows the latent attention cache to E4M3 at a descale of 1 (kv_groups); the index
-     * tail, the DSA index and the KDA caches keep their dtypes. */
-    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_F8E4M3) {
+    /* fp8 narrows the latent attention cache to E4M3 at a descale of 1, i8 to the ordinary int8
+     * cache row at head_dim 256 (each 256-wide half of the latent its own f16 scale; its device
+     * reader is the GLM kernel plugin's, plugin/glm) (kv_groups); the index tail, the DSA index and
+     * the KDA caches keep their dtypes. */
+    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_F8E4M3 &&
+        ctx->kv_dtype != RAD_I8) {
         fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin serves its latent "
-                        "attention cache in bf16 or fp8 only\n",
+                        "attention cache in bf16, fp8 or i8 only\n",
                 rad_dtype_name(ctx->kv_dtype));
         return RAD_E_UNSUPPORTED;
     }

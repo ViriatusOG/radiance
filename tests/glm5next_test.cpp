@@ -1961,6 +1961,68 @@ TEST(glm53_v2_protected_experts_take_the_expert_width) {
 
 /* An IQ8R trunk's experts read its rotated int8 codes, so bf16 or unrotated experts beside it, and
  * IQR experts beside a bf16 trunk, are refused; so is the MLA row form, which views int8 weights. */
+/* The 2.x container's latent cache at each --kv-cache-dtype: bf16 (default and stated), fp8 and the
+ * int8 row. Only the latent group narrows, at head_dim 256 and blocks of 4 on every rank; every MLA
+ * layer's store and its head-form attention name the cache (the attention states no kv_dtype at
+ * bf16, the op it always declared); the index tail, the DSA index and the KDA groups keep theirs.
+ * IQ8R serves the head form and no MTP layer, so 11 stores and 11 attentions a rank. f16 is
+ * refused. */
+TEST(glm53_v2_kv_cache_dtype_narrows_the_latent_group_only) {
+    const RadModelMeta meta = glm_meta();
+    struct Want { int dtype; uint32_t group; const char* store; const char* attn; };
+    const Want wants[] = {
+        { (int)RAD_DT_INVALID, RAD_BF16, "bf16", "<absent>" },
+        { (int)RAD_BF16, RAD_BF16, "bf16", "<absent>" },
+        { (int)RAD_F8E4M3, RAD_F8E4M3, "fp8_e4m3", "fp8_e4m3" },
+        { (int)RAD_I8, RAD_I8, "i8", "i8" },
+    };
+    for (const Want& w : wants)
+        for (const int world : { 1, 4, 8 })
+            for (int rank = 0; rank < world; rank += world > 1 ? world - 1 : 1) {
+                RadBuilder b;
+                b.kv_block = 4;
+                b.encs = glm_v2_encs(glm_iqr());
+                RadBuildCtx ctx = spec_ctx(rank, world, 0);
+                ctx.max_tok = 256;
+                ctx.max_seqs = 4;
+                ctx.max_ctx = 32768;
+                ctx.kv_dtype = w.dtype;
+                REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+                std::map<std::string, RadKVGroupDecl> groups;
+                for (const auto& g : b.kv_groups) groups[g.name] = g.d;
+                CHECK_EQ(groups["kv_latent"].dtype, w.group);
+                CHECK_EQ(groups["kv_latent"].head_dim, 256);
+                CHECK_EQ(groups["kv_latent"].n_head_kv, 1);
+                CHECK_EQ(groups["kv_index_tail"].dtype, (uint32_t)RAD_BF16);
+                CHECK_EQ(groups["kv_dsa_index"].dtype, (uint32_t)RAD_U8);
+                CHECK_EQ(groups["kv_kda"].dtype, (uint32_t)RAD_F32);
+                CHECK_EQ(groups["kv_kda_conv"].dtype, (uint32_t)RAD_BF16);
+                int stores = 0, attns = 0;
+                for (const auto& o : b.ops) {
+                    if (o.op == "kv_store" || o.op == "kv_store_streamed") {
+                        ++stores;
+                        CHECK_EQ(pstr(&o, "kv_dtype"), w.store);
+                    }
+                    if (o.op == "mla_attn") {
+                        ++attns;
+                        CHECK_EQ(pstr(&o, "kv_dtype"), w.attn);
+                        CHECK_EQ(pint(&o, "block_size"), 4);
+                    }
+                }
+                CHECK(stores >= 11);
+                CHECK_EQ(attns, 11);
+            }
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = glm_v2_encs(glm_iqr());
+    RadBuildCtx ctx = spec_ctx(0, 4, 0);
+    ctx.max_tok = 256;
+    ctx.max_seqs = 4;
+    ctx.max_ctx = 32768;
+    ctx.kv_dtype = RAD_F16;
+    CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+}
+
 /* The clamped SwiGLU in front of an int8 consumer is one swiglu_clamped_had_quant_i8g where a loaded
  * library declares it (the GLM kernel plugin), at the consumer's group: 128 for the routed and
  * shared experts, IQ8R's 256 for the dense down projections. Where none does, it is the pair it
