@@ -3503,12 +3503,16 @@ static void check_i8a8_numerics() {
             fail("%s: %lld scales differ, %lld codes one step off, %lld further", what, sbad, off1, worse);
     }
 
-    /* gemm_nt_q i8a8, bit for bit. Three host mirrors of an output: the reference's (two rounded
-     * multiplies, then the add: quant_dot), a fused one (the add takes the unrounded product, what
-     * a v_fmac does) and the other scale order ((sub * b_scale) * a_scale). The device must equal
-     * the first on every output. Each case counts the outputs the other two would move, and the two
-     * constructed cells must be moved by them on every output, so a pass says the case could have
-     * failed. The volatile temporaries keep the host's own compiler from fusing the mirror. */
+    /* gemm_nt_q i8a8, bit for bit. Four host mirrors of an output: the reference's (two rounded
+     * multiplies, then the add, groups ascending: quant_dot), a fused one (the add takes the
+     * unrounded product, what a v_fmac does), the other scale order ((sub * b_scale) * a_scale)
+     * and the reference's terms summed from the last group down. The device must equal the first
+     * on every output. Each case counts the outputs the other three would move. Random codes
+     * seldom land on a rounding boundary (a handful of outputs in a few hundred thousand), so the
+     * rounding and the order are carried by three constructed cells, each run on every kernel
+     * (M <= 16, 17 to 127, the tile from 128) and each required to be moved on every output by
+     * the mirror it is for: a pass of a cell says the case could have failed. The volatile
+     * temporaries keep the host's own compiler from fusing the mirror. */
     auto term = [](float acc, int32_t sub, float sa, float sb, int mode) -> float {
         if (mode == 2) { volatile float u = (float)sub * sb; volatile float q = u * sa; return acc + q; }
         volatile float u = (float)sub * sa;
@@ -3533,23 +3537,36 @@ static void check_i8a8_numerics() {
     }
     if (!o_found) fail("gemm_nt_q i8a8: no scale pair separates the three mirrors (the order cell cannot be built)");
 
-    struct G8 { long long M, N, K; int pad; int cell; };   /* cell: 0 random, 1 fused-add, 2 order */
+    /* cell: 0 random, 1 fused-add, 2 scale order, 3 group order. nt 0 launches the kernels'
+     * plain-load instantiation (the row has no tune axis, so an engine launch is always nt 1). */
+    struct G8 { long long M, N, K; int pad; int cell; int nt = 1; };
     for (const G8& c : { G8{ 1, 1, 128, 0, 0 },     G8{ 1, 143, 256, 1, 0 },   G8{ 5, 512, 2048, 0, 0 },
-                         G8{ 16, 17, 384, 1, 0 },   G8{ 16, 128, 7680, 0, 0 }, G8{ 17, 127, 256, 0, 0 },
+                         G8{ 16, 17, 384, 1, 0, 0 }, G8{ 16, 128, 7680, 0, 0 }, G8{ 17, 127, 256, 0, 0, 0 },
                          G8{ 33, 129, 2048, 1, 0 }, G8{ 127, 257, 128, 0, 0 }, G8{ 128, 143, 384, 1, 0 },
                          G8{ 129, 17, 2048, 0, 0 }, G8{ 257, 129, 256, 1, 0 }, G8{ 300, 144, 384, 0, 0 },
-                         G8{ 257, 143, 256, 0, 1 }, G8{ 33, 17, 256, 1, 2 } }) {
+                         G8{ 128, 1, 128, 0, 0 },   G8{ 255, 130, 256, 1, 0, 0 }, G8{ 256, 128, 7680, 0, 0 },
+                         G8{ 130, 131, 7680, 1, 0 }, G8{ 513, 255, 384, 0, 0 },
+                         G8{ 1, 17, 256, 0, 1 },    G8{ 33, 143, 256, 1, 1 },  G8{ 257, 143, 256, 0, 1 },
+                         G8{ 16, 17, 256, 1, 2 },   G8{ 33, 17, 256, 1, 2 },   G8{ 129, 17, 256, 1, 2 },
+                         G8{ 5, 17, 384, 0, 3 },    G8{ 33, 17, 384, 1, 3 },   G8{ 129, 143, 384, 1, 3 } }) {
         if (c.cell == 2 && !o_found) continue;
         const long long G = c.K / 128;
-        const long long a_ld = c.K + (c.pad ? 8 : 0), as_ld = G + (c.pad ? 3 : 0);
+        /* a's padded pitch is 12 mod 16: the rows start at every 4-byte phase of a 16-byte load. */
+        const long long a_ld = c.K + (c.pad ? 12 : 0), as_ld = G + (c.pad ? 3 : 0);
         const long long bs_ld = G + (c.pad ? 5 : 0), y_ld = c.N + (c.pad ? 7 : 0);
         char what[144];
-        std::snprintf(what, sizeof(what), "gemm_nt_q i8a8, M %lld N %lld K %lld%s%s", c.M, c.N, c.K,
-                      c.pad ? ", padded pitches" : "",
-                      c.cell == 1 ? ", the fused-add cell" : c.cell == 2 ? ", the order cell" : "");
+        std::snprintf(what, sizeof(what), "gemm_nt_q i8a8, M %lld N %lld K %lld%s%s%s", c.M, c.N, c.K,
+                      c.pad ? ", padded pitches" : "", c.nt ? "" : ", nt 0",
+                      c.cell == 1 ? ", the fused-add cell" : c.cell == 2 ? ", the order cell"
+                      : c.cell == 3 ? ", the group-order cell" : "");
         std::vector<int8_t> a8((size_t)(c.M * a_ld), (int8_t)0x55), b8((size_t)(c.N * c.K));
         std::vector<float> as((size_t)(c.M * as_ld), std::nanf(""));
-        std::vector<uint16_t> bs((size_t)(c.N * bs_ld), 0x7fc0u), y0((size_t)(c.M * y_ld), 0x7fc0u);
+        /* y has a guard row before its first row and one after its last: a store guard off by a
+         * row writes there, where the pitch canaries of the M rows do not look. y's canary is a
+         * finite word, not the NaN the scale padding holds: a stray store of a value computed from
+         * that padding would be the same NaN word and go unseen. */
+        const uint16_t kYCanary = 0x5a5au;
+        std::vector<uint16_t> bs((size_t)(c.N * bs_ld), 0x7fc0u), y0((size_t)((c.M + 2) * y_ld), kYCanary);
         auto A = [&](long long m, long long k) -> int8_t& { return a8[(size_t)(m * a_ld + k)]; };
         auto B = [&](long long n, long long k) -> int8_t& { return b8[(size_t)(n * c.K + k)]; };
         auto AS = [&](long long m, long long g) -> float& { return as[(size_t)(m * as_ld + g)]; };
@@ -3567,6 +3584,19 @@ static void check_i8a8_numerics() {
                 AS(m, g) = (0.002f + (rnd() + 0.5f) * 0.02f) * ((g & 1) ? 64.0f : 1.0f);
             for (long long n = 0; n < c.N; ++n) for (long long g = 0; g < G; ++g)
                 BS(n, g) = f32_to_bf16((0.0005f + (rnd() + 0.5f) * 0.004f) * ((g & 1) ? 1.0f / 64.0f : 1.0f));
+        } else if (c.cell == 3) {
+            /* Three groups: 2^25, then -2^25, then 1 (64 * 64 = 2^12 with an activation scale of
+             * 2^13; the weight's scale 1). Ascending, the first two cancel and 1 is stored (0x3f80);
+             * from the last group down, 1 - 2^25 rounds to -2^25 and 0 is stored. */
+            for (long long m = 0; m < c.M; ++m) for (long long k = 0; k < c.K; ++k) A(m, k) = 0;
+            for (long long m = 0; m < c.M; ++m) {
+                A(m, 0) = 64; A(m, 128) = 64; A(m, 256) = 1;
+                AS(m, 0) = 8192.0f; AS(m, 1) = 8192.0f; AS(m, 2) = 1.0f;
+            }
+            for (long long n = 0; n < c.N; ++n) {
+                B(n, 0) = 64; B(n, 128) = -64; B(n, 256) = 1;
+                for (long long g = 0; g < G; ++g) BS(n, g) = 0x3f80u;
+            }
         } else {
             /* One code pair a group. The fused-add cell: 1 from group 0, then 6710989 * 2^-31 * 1.25,
              * whose rounded product is 2^-8 + 2^-24: the sum ties to 1 + 2^-8 and stores 0x3f80, while
@@ -3585,21 +3615,27 @@ static void check_i8a8_numerics() {
         Dev dv;
         auto pitched = [](void* d, uint32_t dt, long long r, long long cols, long long ld) {
             RadTensor t = dense(d, dt, r, cols); t.stride[0] = ld; return t; };
+        void* yd = dv.put(y0.data(), y0.size() * 2);
         RadTensor t[7] = { pitched(dv.put(a8.data(), a8.size()), RAD_I8, c.M, c.K, a_ld),
                            pitched(dv.put(as.data(), as.size() * 4), RAD_F32, c.M, G, as_ld),
                            dense(dv.put(b8.data(), b8.size()), RAD_I8, c.N, c.K),
                            pitched(dv.put(bs.data(), bs.size() * 2), RAD_BF16, c.N, G, bs_ld),
-                           pitched(dv.put(y0.data(), y0.size() * 2), RAD_BF16, c.M, c.N, y_ld),
+                           pitched(yd ? (char*)yd + y_ld * 2 : nullptr, RAD_BF16, c.M, c.N, y_ld),
                            RadTensor{}, RadTensor{} };
+        if (!yd) { fail("%s: no device memory for y", what); continue; }
         std::vector<RadParam> p = { pi("M", c.M), pi("N", c.N), pi("K", c.K), pi("group", 128),
                                     ps("dtype", "i8a8") };
+        if (!c.nt) p.push_back(pi("nt", 0));
         RadArgs a{ t, 7, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
         const int rc = gfn(&a, nullptr);
         hipDeviceSynchronize();
         if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
-        std::vector<uint16_t> y(y0.size());
-        hipMemcpy(y.data(), t[4].data, y.size() * 2, hipMemcpyDeviceToHost);
-        long long bad = 0, fused = 0, swapped = 0, canary = 0, bm = -1, bn = -1;
+        std::vector<uint16_t> yg(y0.size());
+        hipMemcpy(yg.data(), (char*)t[4].data - y_ld * 2, yg.size() * 2, hipMemcpyDeviceToHost);
+        const uint16_t* y = yg.data() + y_ld;
+        long long bad = 0, fused = 0, swapped = 0, reversed = 0, canary = 0, guard = 0, bm = -1, bn = -1;
+        for (long long i = 0; i < y_ld; ++i) guard += (yg[(size_t)i] != kYCanary) + (y[(size_t)(c.M * y_ld + i)] != kYCanary);
+        std::vector<int32_t> subs((size_t)G);
         uint16_t bgot = 0, bwant = 0;
         for (long long m = 0; m < c.M; ++m) {
             for (long long n = 0; n < c.N; ++n) {
@@ -3607,26 +3643,32 @@ static void check_i8a8_numerics() {
                 for (long long g = 0; g < G; ++g) {
                     int32_t sub = 0;
                     for (long long k = g * 128; k < (g + 1) * 128; ++k) sub += (int32_t)A(m, k) * (int32_t)B(n, k);
+                    subs[(size_t)g] = sub;
                     for (int mode = 0; mode < 3; ++mode)
                         acc[mode] = term(acc[mode], sub, AS(m, g), bf16_to_f32(BS(n, g)), mode);
                 }
+                float rev = 0.0f;
+                for (long long g = G - 1; g >= 0; --g) rev = term(rev, subs[(size_t)g], AS(m, g), bf16_to_f32(BS(n, g)), 0);
                 const uint16_t want = f32_to_bf16(acc[0]), got = y[(size_t)(m * y_ld + n)];
                 if (f32_to_bf16(acc[1]) != want) ++fused;
                 if (f32_to_bf16(acc[2]) != want) ++swapped;
+                if (f32_to_bf16(rev) != want) ++reversed;
                 if (got != want) { if (!bad) { bm = m; bn = n; bgot = got; bwant = want; } ++bad; }
             }
-            for (long long n = c.N; n < y_ld; ++n) if (y[(size_t)(m * y_ld + n)] != 0x7fc0u) ++canary;
+            for (long long n = c.N; n < y_ld; ++n) if (y[(size_t)(m * y_ld + n)] != kYCanary) ++canary;
         }
         const long long nout = c.M * c.N;
-        if (c.cell && (fused != nout || (c.cell == 2 && swapped != nout)))
+        if ((c.cell == 1 && fused != nout) || (c.cell == 2 && (fused != nout || swapped != nout)) ||
+            (c.cell == 3 && reversed != nout))
             fail("%s: the cell does not discriminate (a fused add moves %lld of %lld outputs, the other "
-                 "scale order %lld)", what, fused, nout, swapped);
-        else if (bad || canary)
+                 "scale order %lld, the other group order %lld)", what, fused, nout, swapped, reversed);
+        else if (bad || canary || guard)
             fail("%s: %lld of %lld outputs differ from the reference (first at m %lld n %lld: 0x%04x, "
-                 "want 0x%04x), %lld written past a row's end", what, bad, nout, bm, bn, bgot, bwant, canary);
+                 "want 0x%04x), %lld written past a row's end, %lld in the guard rows", what, bad, nout, bm, bn,
+                 bgot, bwant, canary, guard);
         else
             ok("%s: %lld outputs bit-identical to the reference; a fused add would move %lld, the other "
-               "scale order %lld", what, nout, fused, swapped);
+               "scale order %lld, the other group order %lld", what, nout, fused, swapped, reversed);
     }
 #endif
 }
