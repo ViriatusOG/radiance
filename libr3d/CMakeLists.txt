@@ -225,6 +225,9 @@ add_executable(r3d_selftest ${CMAKE_CURRENT_SOURCE_DIR}/r3d_selftest.cpp)
 # Links the HIP runtime to allocate the device buffers it feeds the kernels.
 target_link_libraries(r3d_selftest PRIVATE radiance::abi ${CMAKE_DL_LIBS} ${RAD_HIP_RUNTIME})
 target_include_directories(r3d_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The by-value cases mirror libref's arithmetic on the host and compare bit for bit, so the mirrors
+# must round where libref rounds: no fused multiply-add from this compiler either.
+target_compile_options(r3d_selftest PRIVATE -ffp-contract=off)
 # The selftest's device phase (the per-row launch) needs the HIP runtime, which this build has.
 target_compile_definitions(r3d_selftest PRIVATE RAD_HAVE_HIP)
 set_target_properties(r3d_selftest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

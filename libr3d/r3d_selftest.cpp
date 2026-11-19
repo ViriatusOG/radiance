@@ -3436,7 +3436,8 @@ static void check_attn_depth() {
  * (had_quant_act_q8 / q8_group, quant_dot). The quantiser's scale must be amax / 127 of the
  * unnormalised transform and 1 for an all-zero group; a code may sit one step from the mirror's
  * where the device's reciprocal differs in its last place. The GEMM's group term is
- * (sub * a_scale[m, g]) * b_scale[n, g], groups ascending, one bf16 store. */
+ * (sub * a_scale[m, g]) * b_scale[n, g], each product rounded, groups ascending, one bf16 store,
+ * and the device's output is compared bit for bit. */
 static void check_i8a8_numerics() {
     std::printf("== the int8 trunk (had_quant_act_i8g, gemm_nt_q i8a8), by value\n");
 #ifndef RAD_HAVE_HIP
@@ -3502,25 +3503,93 @@ static void check_i8a8_numerics() {
             fail("%s: %lld scales differ, %lld codes one step off, %lld further", what, sbad, off1, worse);
     }
 
-    struct G8 { long long M, N, K; };
-    for (const G8& c : { G8{ 1, 144, 256 }, G8{ 5, 512, 2048 }, G8{ 16, 128, 7680 }, G8{ 40, 144, 512 },
-                         G8{ 70, 256, 384 } }) {
+    /* gemm_nt_q i8a8, bit for bit. Three host mirrors of an output: the reference's (two rounded
+     * multiplies, then the add: quant_dot), a fused one (the add takes the unrounded product, what
+     * a v_fmac does) and the other scale order ((sub * b_scale) * a_scale). The device must equal
+     * the first on every output. Each case counts the outputs the other two would move, and the two
+     * constructed cells must be moved by them on every output, so a pass says the case could have
+     * failed. The volatile temporaries keep the host's own compiler from fusing the mirror. */
+    auto term = [](float acc, int32_t sub, float sa, float sb, int mode) -> float {
+        if (mode == 2) { volatile float u = (float)sub * sb; volatile float q = u * sa; return acc + q; }
+        volatile float u = (float)sub * sa;
+        if (mode == 1) return std::fma((float)u, sb, acc);
+        volatile float q = u * sb;
+        return acc + q;
+    };
+    /* The order cell's scales: group 0 leaves exactly -16129, group 1 adds about +16129, so the
+     * sum is the last places of group 1's product. Searched, not typed: a pair is kept only when
+     * the fused mirror and the swapped mirror both store a bf16 other than the reference's. */
+    float o_sa = 0.0f; uint16_t o_sb = 0; bool o_found = false;
+    for (int i = 0; i < 200000 && !o_found; ++i) {
+        const uint16_t sbw = f32_to_bf16(0.75f + (rnd() + 0.5f) * 0.75f);
+        const float sb = bf16_to_f32(sbw);
+        float sa = 1.0f / sb;
+        const int steps = (int)std::lrint(rnd() * 16.0f);
+        for (int j = 0; j < std::abs(steps); ++j) sa = std::nextafter(sa, steps > 0 ? 4.0f : 0.0f);
+        uint16_t r[3];
+        for (int mode = 0; mode < 3; ++mode)
+            r[mode] = f32_to_bf16(term(term(0.0f, -16129, 1.0f, 1.0f, mode), 16129, sa, sb, mode));
+        if (r[0] != r[1] && r[0] != r[2]) { o_sa = sa; o_sb = sbw; o_found = true; }
+    }
+    if (!o_found) fail("gemm_nt_q i8a8: no scale pair separates the three mirrors (the order cell cannot be built)");
+
+    struct G8 { long long M, N, K; int pad; int cell; };   /* cell: 0 random, 1 fused-add, 2 order */
+    for (const G8& c : { G8{ 1, 1, 128, 0, 0 },     G8{ 1, 143, 256, 1, 0 },   G8{ 5, 512, 2048, 0, 0 },
+                         G8{ 16, 17, 384, 1, 0 },   G8{ 16, 128, 7680, 0, 0 }, G8{ 17, 127, 256, 0, 0 },
+                         G8{ 33, 129, 2048, 1, 0 }, G8{ 127, 257, 128, 0, 0 }, G8{ 128, 143, 384, 1, 0 },
+                         G8{ 129, 17, 2048, 0, 0 }, G8{ 257, 129, 256, 1, 0 }, G8{ 300, 144, 384, 0, 0 },
+                         G8{ 257, 143, 256, 0, 1 }, G8{ 33, 17, 256, 1, 2 } }) {
+        if (c.cell == 2 && !o_found) continue;
         const long long G = c.K / 128;
-        char what[112];
-        std::snprintf(what, sizeof(what), "gemm_nt_q i8a8, M %lld N %lld K %lld", c.M, c.N, c.K);
-        std::vector<int8_t> a8((size_t)(c.M * c.K)), b8((size_t)(c.N * c.K));
-        std::vector<float> as((size_t)(c.M * G));
-        std::vector<uint16_t> bs((size_t)(c.N * G)), y0((size_t)(c.M * c.N), 0x7fc0u);
-        for (auto& v : a8) v = (int8_t)std::lrint(rnd() * 254.0f);
-        for (auto& v : b8) v = (int8_t)std::lrint(rnd() * 254.0f);
-        for (auto& v : as) v = 0.002f + (rnd() + 0.5f) * 0.02f;
-        for (auto& v : bs) v = f32_to_bf16(0.0005f + (rnd() + 0.5f) * 0.004f);
+        const long long a_ld = c.K + (c.pad ? 8 : 0), as_ld = G + (c.pad ? 3 : 0);
+        const long long bs_ld = G + (c.pad ? 5 : 0), y_ld = c.N + (c.pad ? 7 : 0);
+        char what[144];
+        std::snprintf(what, sizeof(what), "gemm_nt_q i8a8, M %lld N %lld K %lld%s%s", c.M, c.N, c.K,
+                      c.pad ? ", padded pitches" : "",
+                      c.cell == 1 ? ", the fused-add cell" : c.cell == 2 ? ", the order cell" : "");
+        std::vector<int8_t> a8((size_t)(c.M * a_ld), (int8_t)0x55), b8((size_t)(c.N * c.K));
+        std::vector<float> as((size_t)(c.M * as_ld), std::nanf(""));
+        std::vector<uint16_t> bs((size_t)(c.N * bs_ld), 0x7fc0u), y0((size_t)(c.M * y_ld), 0x7fc0u);
+        auto A = [&](long long m, long long k) -> int8_t& { return a8[(size_t)(m * a_ld + k)]; };
+        auto B = [&](long long n, long long k) -> int8_t& { return b8[(size_t)(n * c.K + k)]; };
+        auto AS = [&](long long m, long long g) -> float& { return as[(size_t)(m * as_ld + g)]; };
+        auto BS = [&](long long n, long long g) -> uint16_t& { return bs[(size_t)(n * bs_ld + g)]; };
+        if (c.cell == 0) {
+            /* Random codes over the whole int8 range, a saturated group on one row and one
+             * column (sub = 127 * -128 * 128), an all-zero group, and scales that step 2^6
+             * between neighbouring groups, so a scale read from the group beside is far off. */
+            auto code = [&]() { const float u = rnd(); return (st & 0x3f00u) == 0 ? (int8_t)-128 : (int8_t)std::lrint(u * 254.0f); };
+            for (long long m = 0; m < c.M; ++m) for (long long k = 0; k < c.K; ++k) A(m, k) = code();
+            for (long long n = 0; n < c.N; ++n) for (long long k = 0; k < c.K; ++k) B(n, k) = code();
+            if (G > 1) for (long long k = 128; k < 256; ++k) { A(0, k) = 127; B(0, k) = -128; }
+            if (c.M > 2) for (long long k = 0; k < 128; ++k) A(2, k) = 0;
+            for (long long m = 0; m < c.M; ++m) for (long long g = 0; g < G; ++g)
+                AS(m, g) = (0.002f + (rnd() + 0.5f) * 0.02f) * ((g & 1) ? 64.0f : 1.0f);
+            for (long long n = 0; n < c.N; ++n) for (long long g = 0; g < G; ++g)
+                BS(n, g) = f32_to_bf16((0.0005f + (rnd() + 0.5f) * 0.004f) * ((g & 1) ? 1.0f / 64.0f : 1.0f));
+        } else {
+            /* One code pair a group. The fused-add cell: 1 from group 0, then 6710989 * 2^-31 * 1.25,
+             * whose rounded product is 2^-8 + 2^-24: the sum ties to 1 + 2^-8 and stores 0x3f80, while
+             * the unrounded product sits above the tie and stores 0x3f81. The order cell: see o_sa. */
+            for (long long m = 0; m < c.M; ++m) for (long long k = 0; k < c.K; ++k) A(m, k) = 0;
+            const int8_t a0 = c.cell == 1 ? 1 : 127, b0 = c.cell == 1 ? 1 : -127, b1 = c.cell == 1 ? 1 : 127;
+            for (long long m = 0; m < c.M; ++m) {
+                A(m, 0) = a0; A(m, 128) = a0;
+                AS(m, 0) = 1.0f; AS(m, 1) = c.cell == 1 ? std::ldexp(6710989.0f, -31) : o_sa;
+            }
+            for (long long n = 0; n < c.N; ++n) {
+                B(n, 0) = b0; B(n, 128) = b1;
+                BS(n, 0) = 0x3f80u; BS(n, 1) = c.cell == 1 ? (uint16_t)0x3fa0u : o_sb;
+            }
+        }
         Dev dv;
-        RadTensor t[7] = { dense(dv.put(a8.data(), a8.size()), RAD_I8, c.M, c.K),
-                           dense(dv.put(as.data(), as.size() * 4), RAD_F32, c.M, G),
+        auto pitched = [](void* d, uint32_t dt, long long r, long long cols, long long ld) {
+            RadTensor t = dense(d, dt, r, cols); t.stride[0] = ld; return t; };
+        RadTensor t[7] = { pitched(dv.put(a8.data(), a8.size()), RAD_I8, c.M, c.K, a_ld),
+                           pitched(dv.put(as.data(), as.size() * 4), RAD_F32, c.M, G, as_ld),
                            dense(dv.put(b8.data(), b8.size()), RAD_I8, c.N, c.K),
-                           dense(dv.put(bs.data(), bs.size() * 2), RAD_BF16, c.N, G),
-                           dense(dv.put(y0.data(), y0.size() * 2), RAD_BF16, c.M, c.N),
+                           pitched(dv.put(bs.data(), bs.size() * 2), RAD_BF16, c.N, G, bs_ld),
+                           pitched(dv.put(y0.data(), y0.size() * 2), RAD_BF16, c.M, c.N, y_ld),
                            RadTensor{}, RadTensor{} };
         std::vector<RadParam> p = { pi("M", c.M), pi("N", c.N), pi("K", c.K), pi("group", 128),
                                     ps("dtype", "i8a8") };
@@ -3530,19 +3599,34 @@ static void check_i8a8_numerics() {
         if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
         std::vector<uint16_t> y(y0.size());
         hipMemcpy(y.data(), t[4].data, y.size() * 2, hipMemcpyDeviceToHost);
-        std::vector<double> ref((size_t)(c.M * c.N));
-        for (long long m = 0; m < c.M; ++m)
+        long long bad = 0, fused = 0, swapped = 0, canary = 0, bm = -1, bn = -1;
+        uint16_t bgot = 0, bwant = 0;
+        for (long long m = 0; m < c.M; ++m) {
             for (long long n = 0; n < c.N; ++n) {
-                float acc = 0.0f;
+                float acc[3] = { 0.0f, 0.0f, 0.0f };
                 for (long long g = 0; g < G; ++g) {
                     int32_t sub = 0;
-                    for (long long k = g * 128; k < (g + 1) * 128; ++k)
-                        sub += (int32_t)a8[(size_t)(m * c.K + k)] * (int32_t)b8[(size_t)(n * c.K + k)];
-                    acc += ((float)sub * as[(size_t)(m * G + g)]) * bf16_to_f32(bs[(size_t)(n * G + g)]);
+                    for (long long k = g * 128; k < (g + 1) * 128; ++k) sub += (int32_t)A(m, k) * (int32_t)B(n, k);
+                    for (int mode = 0; mode < 3; ++mode)
+                        acc[mode] = term(acc[mode], sub, AS(m, g), bf16_to_f32(BS(n, g)), mode);
                 }
-                ref[(size_t)(m * c.N + n)] = acc;
+                const uint16_t want = f32_to_bf16(acc[0]), got = y[(size_t)(m * y_ld + n)];
+                if (f32_to_bf16(acc[1]) != want) ++fused;
+                if (f32_to_bf16(acc[2]) != want) ++swapped;
+                if (got != want) { if (!bad) { bm = m; bn = n; bgot = got; bwant = want; } ++bad; }
             }
-        compare(what, ref, y, 2e-3);
+            for (long long n = c.N; n < y_ld; ++n) if (y[(size_t)(m * y_ld + n)] != 0x7fc0u) ++canary;
+        }
+        const long long nout = c.M * c.N;
+        if (c.cell && (fused != nout || (c.cell == 2 && swapped != nout)))
+            fail("%s: the cell does not discriminate (a fused add moves %lld of %lld outputs, the other "
+                 "scale order %lld)", what, fused, nout, swapped);
+        else if (bad || canary)
+            fail("%s: %lld of %lld outputs differ from the reference (first at m %lld n %lld: 0x%04x, "
+                 "want 0x%04x), %lld written past a row's end", what, bad, nout, bm, bn, bgot, bwant, canary);
+        else
+            ok("%s: %lld outputs bit-identical to the reference; a fused add would move %lld, the other "
+               "scale order %lld", what, nout, fused, swapped);
     }
 #endif
 }
