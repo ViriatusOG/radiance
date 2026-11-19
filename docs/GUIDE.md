@@ -1107,9 +1107,28 @@ drafter at 1 / 4 / 8 sequences on two R9700s: Qwen3.6-35B-A3B 10.22 / 11.56 / 12
 Qwen3.8-Flash-Next 10.40 / 12.85 / 15.58. The row's layout and the kernels that read it are in
 [OPS.md](OPS.md#the-kv-cache-operand).
 
-`kv-cache-dtype: fp8` is GLM-5.3-Flash's alone (`glm5next`): it narrows the latent-attention cache
-to E4M3 at a descale of 1 (half its bf16 size); the DSA index, its key tail and the KDA caches keep
-their own widths. Every other model refuses it, naming `i8`.
+**GLM-5.3-Flash** (`arch/glm5next`) also serves `i8`: `plugin/glm` reads its 512-wide MLA latent
+as int8 codes with two f16 half scales, 516 bytes a token and layer. List the GLM library first:
+
+```yaml
+server:
+  kernels: glm,libr4d,libavx,libref
+models:
+  glm:
+    model: glm53-flash-iqr-v4.rad
+    kv-cache-dtype: i8
+    num-speculative-tokens: 0
+```
+
+The order is required: libr4d's bf16 MLA rows can otherwise match an i8 request before the GLM
+reader. `kv-cache-dtype: fp8` remains GLM-5.3-Flash's alone: E4M3 latent codes at a descale of 1.
+Both narrow only the latent cache; the DSA index, its key tail and the KDA caches keep their widths.
+Every other model refuses `fp8`, naming `i8`.
+
+Measured on TP4, four R9700s, against the 1.17 MXFP4 reference: i8 mean KL 0.149 and top-1
+agreement 87.14%, fp8 0.151 and 87.10%. These compare whole containers, not cache error alone.
+Single-stream decode was 61.8 / 62.0 tok/s for i8 / fp8; the i8 GPU reader was within 0.23% of
+libref. The matched BetterBench results and test paths are in [plugin/glm/README.md](../plugin/glm/README.md).
 
 **Many sequences.** Every model here serves `max-num-seqs` up to 32. A sequence holds only the
 blocks its tokens occupy, but two costs exist per sequence regardless:
@@ -2629,7 +2648,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 |---|---|---|
 | `memory.gpu-headroom-mib: N` | 96 | VRAM left unclaimed on every card |
 | `memory.gpu-memory-mib: N` | 0 (use `memory.gpu-headroom-mib`) | VRAM claimed on every card; inverse of `memory.gpu-headroom-mib`. Give one (§4.3) |
-| `kv-cache-dtype: T` | bf16 | `bf16` or `i8`, the int8 cache at half the bytes; `fp8` on GLM-5.3-Flash alone (§4.4) |
+| `kv-cache-dtype: T` | bf16 | `bf16` or `i8`; GLM i8 needs `server.kernels: glm,libr4d,libavx,libref` in that order. `fp8` remains GLM-5.3-Flash only (§4.4) |
 | `state-cache-dtype: T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `host-pool-mib: N` | 0 | pinned host tier for weights, in all: the ranks of a model pin equal shares of it (N / `tp` each) |
 | `kv-resident: N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
@@ -4748,7 +4767,7 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | `this kernel's amdgpu interface is 3.N ... a map here would never return` | The HIP 7.16 (ROCm 10.1) runtime waits for the kernel to finish every virtual-memory map on a page-table timeline, which amdgpu signals only from interface 3.64 (Linux 6.16) on; an older kernel never signals it, so the card runs without virtual memory management: the KV cache holds its whole carve and lends nothing to the experts (§4.3) | A 6.16 or later kernel, or an amdgpu-dkms driver of interface 3.64 or later |
 | `chat is 501` in the `serving on` line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
 | `does not read '<weight>' encoded <encoding>` at startup | No loaded kernel takes that weight's encoding for the op that reads it | Convert with a recipe that writes an encoding a loaded kernel reads, or load the library that reads it |
-| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can spare: a larger `host-pool-mib` (RAM permitting), `kv-cache-dtype: fp8`, or fewer or shorter sessions (§4.3) |
+| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can spare: a larger `host-pool-mib` (RAM permitting), `kv-cache-dtype: i8` (§4.4), or fewer or shorter sessions (§4.3) |
 | The server dies with no log line, on a request it had been serving fine | A kernel's first launch could not load its code object for lack of VRAM; HIP faults inside the launch instead of returning an error | Set `memory.gpu-headroom-mib` to the value the startup warning names (§4.3). `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
 | KV in VRAM stays high with one session and nothing moves | The host tier is off: it is sized, and without a size nothing is copied | Pass `prefix-cache-mib: N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi` and stop the other process. The budget is stated before allocation, so the log says what it asked for |
