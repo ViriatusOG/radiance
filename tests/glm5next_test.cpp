@@ -2949,10 +2949,13 @@ TEST(glm_tp_row_rule_rounds_to_whole_words_and_covers_a_step_once) {
 namespace {
 
 /* The op schemas the kernel libraries under $RADIANCE_HOME/kernels declare: libr4d's first, the
- * served vocabulary, then libref's for what it lacks. Empty without a home or a library, as
- * arch_test's libref vocabulary is. */
+ * served vocabulary, then libref's for what it lacks, then the GLM kernel plugin's own ops
+ * (plugin/glm, which glm5next issues only where that library declares them). Empty without a
+ * home or a library, as arch_test's libref vocabulary is. `n_required` is the count below which
+ * an issue is refused: the schema's operands less its trailing optional ones, which a caller may
+ * leave off (core/runtime/issue.cpp, the trailing-optional rule). */
 struct OpSpec {
-    int n_operands = 0, w_req = 0, w_max = 0, n_tab = 0;
+    int n_operands = 0, n_required = 0, w_req = 0, w_max = 0, n_tab = 0;
 };
 struct LoadedSchemas {
     std::map<std::string, OpSpec> ops;
@@ -2965,9 +2968,10 @@ const LoadedSchemas& loaded_schemas() {
     tried = true;
     const char* home = std::getenv("RADIANCE_HOME");
     if (!home) return s;
-    for (const char* lib : { "libr4d.so", "libref.so" }) {
+    for (const char* lib : { "libr4d.so", "libref.so", "glm.so" }) {
         const std::string path = std::string(home) + "/kernels/" + lib;
         void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h && !std::strcmp(lib, "glm.so")) continue;   /* the plugin is optional */
         if (!h) {
             fprintf(stderr, "    cannot load %s: %s\n", path.c_str(), dlerror());
             continue;
@@ -2980,6 +2984,10 @@ const LoadedSchemas& loaded_schemas() {
             if (!sc || !sc->op || s.ops.count(sc->op)) continue;
             OpSpec spec;
             spec.n_operands = sc->n_operands;
+            spec.n_required = sc->n_operands;
+            while (sc->operands && spec.n_required > 0 &&
+                   sc->operands[spec.n_required - 1].optional)
+                --spec.n_required;
             for (int k = 0; sc->operands && k < sc->n_operands; ++k) {
                 if (sc->operands[k].role == RAD_OPD_WTAB) {
                     ++spec.n_tab;
@@ -2997,7 +3005,8 @@ const LoadedSchemas& loaded_schemas() {
 
 }  /* namespace */
 
-/* Every op the plugin issues carries as many operands as its schema declares, counted as
+/* Every op the plugin issues carries as many operands as its schema declares, less any trailing
+ * optional ones it leaves off (moe_gemm_q's `split`, set only on a checkpoint-cut step), counted as
  * core/runtime/issue.cpp counts them (an absent optional operand is one of them), and every op it
  * declares names as many weights as rad_builder.cpp admits. The 2.x fixture is head-form at
  * max_spec 0, so it covers the same trunk steps without MTP or the vision tower: at eight ranks and
@@ -3072,11 +3081,14 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
                     uncovered.insert(op->op);
                     continue;
                 }
-                if ((int)issue.opd.size() != it->second.n_operands && wrong.insert(op->op).second)
+                const int n = (int)issue.opd.size();
+                if ((n < it->second.n_required || n > it->second.n_operands) &&
+                    wrong.insert(op->op).second)
                     fprintf(stderr,
-                            "    world %d pass %zu: '%s' issued with %zu operands; the schema "
-                            "declares %d\n",
-                            world, p, op->op.c_str(), issue.opd.size(), it->second.n_operands);
+                            "    world %d pass %zu: '%s' issued with %d operands; the schema "
+                            "declares %d (%d required)\n",
+                            world, p, op->op.c_str(), n, it->second.n_operands,
+                            it->second.n_required);
             }
     }
     CHECK(wrong.empty());
