@@ -17,7 +17,9 @@
  *
  *   acc += (sub * a_scale[m, g]) * b_scale[n, g]
  *
- * in f32, in ascending group order, then one bf16 store.
+ * in f32, in ascending group order, then one bf16 store. Each of the three operations rounds
+ * as the reference's does (two multiplies, then the add), so the row is bit-identical to
+ * libref's quant_dot, not merely inside gemm_nt_q's tolerance.
  *
  * ---- the shape of a block -------------------------------------------------------------------
  *
@@ -116,14 +118,20 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_i8a8_wmma_ker
                 sub = wmma_i8(v4int{ (int)aq.x, (int)aq.y, (int)aq.z, (int)aq.w },
                               v4int{ (int)bq.x, (int)bq.y, (int)bq.z, (int)bq.w }, sub);
             }
-            /* The group term, the reference's parentheses. The b_scale load, its drain, its
-             * convert, and the eight fmacs run as one asm block: the load goes straight from
-             * global, the drain is a vmcnt this asm owns, and the scale's register is written
-             * only by this block's global_load, so no fragment load can clobber it mid-group.
-             * v20 is named in the clobber because this LLVM aliases a constrained asm output
-             * with a dead input register; the clobber keeps every t/acc/sub register out of
-             * v20 across the block. The weight's scale is bf16: its f32 is the word shifted up
-             * 16. The activation's scale is this group's, one per (row, group). */
+            /* The group term, the reference's parentheses and the reference's roundings: the
+             * product (sub * a_scale) * b_scale is rounded to f32 and then added, a v_mul and a
+             * v_add, never a v_fmac. A fused multiply-add keeps the product unrounded, which
+             * lands about half the launches of a model one bf16 step from quant_dot at their
+             * worst element; libref and every unit here are built -ffp-contract=off, and an asm
+             * fmac is outside that flag's reach. The b_scale load, its drain, its convert and
+             * the eight terms run as one asm block: the load goes straight from global, the
+             * drain is a vmcnt this asm owns, and the scale's register is written only by this
+             * block's global_load, so no fragment load can clobber it mid-group. v20 (the scale)
+             * and v21 (the rounded product) are named in the clobber because this LLVM aliases a
+             * constrained asm output with a dead input register; the clobber keeps every
+             * t/acc/sub register out of both across the block. The weight's scale is bf16: its
+             * f32 is the word shifted up 16. The activation's scale is this group's, one per
+             * (row, group). */
             float t[8];
             #pragma unroll
             for (int g2 = 0; g2 < 8; ++g2) {
@@ -136,21 +144,29 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_i8a8_wmma_ker
                     "global_load_u16 v20, %[ga], off\n\t"
                     "s_waitcnt vmcnt(0)\n\t"
                     "v_lshlrev_b32_e32 v20, 16, v20\n\t"
-                    "v_fmac_f32_e32 %[a0], %[t0], v20\n\t"
-                    "v_fmac_f32_e32 %[a1], %[t1], v20\n\t"
-                    "v_fmac_f32_e32 %[a2], %[t2], v20\n\t"
-                    "v_fmac_f32_e32 %[a3], %[t3], v20\n\t"
-                    "v_fmac_f32_e32 %[a4], %[t4], v20\n\t"
-                    "v_fmac_f32_e32 %[a5], %[t5], v20\n\t"
-                    "v_fmac_f32_e32 %[a6], %[t6], v20\n\t"
-                    "v_fmac_f32_e32 %[a7], %[t7], v20"
+                    "v_mul_f32_e32 v21, %[t0], v20\n\t"
+                    "v_add_f32_e32 %[a0], %[a0], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t1], v20\n\t"
+                    "v_add_f32_e32 %[a1], %[a1], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t2], v20\n\t"
+                    "v_add_f32_e32 %[a2], %[a2], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t3], v20\n\t"
+                    "v_add_f32_e32 %[a3], %[a3], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t4], v20\n\t"
+                    "v_add_f32_e32 %[a4], %[a4], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t5], v20\n\t"
+                    "v_add_f32_e32 %[a5], %[a5], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t6], v20\n\t"
+                    "v_add_f32_e32 %[a6], %[a6], v21\n\t"
+                    "v_mul_f32_e32 v21, %[t7], v20\n\t"
+                    "v_add_f32_e32 %[a7], %[a7], v21"
                     : [a0] "+v"(acc[i][0]), [a1] "+v"(acc[i][1]), [a2] "+v"(acc[i][2]),
                       [a3] "+v"(acc[i][3]), [a4] "+v"(acc[i][4]), [a5] "+v"(acc[i][5]),
                       [a6] "+v"(acc[i][6]), [a7] "+v"(acc[i][7])
                     : [ga] "v"(ga),
                       [t0] "v"(t[0]), [t1] "v"(t[1]), [t2] "v"(t[2]), [t3] "v"(t[3]),
                       [t4] "v"(t[4]), [t5] "v"(t[5]), [t6] "v"(t[6]), [t7] "v"(t[7])
-                    : "v20");
+                    : "v20", "v21");
             }
         }
         group_barrier();                      // the next tile's stage must not race this one's reads
