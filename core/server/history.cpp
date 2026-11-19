@@ -61,7 +61,14 @@ double state_code(const std::string& s) {
 
 History::Row History::model_row(const json& s, const json* prev, double dt) {
     Row row;
-    put(row, "decode", num(s, "decode_tps"));
+    /* The engine's decode rate is its own recent average, so it keeps reporting the last
+     * healthy number while the device has advanced nothing: emit it only where the decode
+     * step counter proves the model stepped since the last sample, so a frozen queue reads
+     * as a gap in the chart and not as a plausible rate. A zero is a reading -- idle, or
+     * nothing accepted -- and never a leftover, so it always passes. */
+    if (const double d = num(s, "decode_tps");
+        std::isfinite(d) && (d == 0.0 || !prev || num0(s, "steps_decode") > num0(*prev, "steps_decode")))
+        put(row, "decode", d);
     put(row, "prefill", num(s, "prefill_tps"));
     put(row, "running", num(s, "running"));
     put(row, "waiting", num(s, "waiting"));

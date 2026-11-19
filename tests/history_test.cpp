@@ -75,6 +75,20 @@ TEST(two_stats_objects_yield_rates_over_the_time_between_them) {
     CHECK_EQ(of(idle, "reqRate"), 0.0);
 }
 
+/* A frozen queue: the engine's decode rate is its own recent average, so it keeps reporting
+ * the last healthy one after the device stopped advancing. That number is no better than a
+ * leftover: the chart must show a gap while the step counters stand still. */
+TEST(a_frozen_decode_rate_is_a_gap_not_a_stale_number) {
+    const json a = stats(7, 100, 2.2e9, 10), frozen = stats(7, 100, 2.2e9, 10);  /* nothing moved */
+    CHECK(!has(History::model_row(frozen, &a, 1.0), "decode"));
+    /* The engine's own zero is a reading -- idle, nothing accepted -- not a leftover. */
+    json idle = stats(7, 100, 2.2e9, 10);
+    idle["decode_tps"] = 0.0;
+    CHECK_EQ(of(History::model_row(idle, &a, 1.0), "decode"), 0.0);
+    /* One step in the interval proves the number is current. */
+    CHECK_EQ(of(History::model_row(stats(7, 101, 2.22e9, 10), &a, 1.0), "decode"), 120.5);
+}
+
 TEST(a_prompt_s_prefill_rate_is_its_fresh_tokens_over_its_own_prefill_time_once) {
     json a = stats(7, 100, 2.2e9, 10), b = stats(7, 100, 2.2e9, 10);
     b["requests"] = json::parse(R"([{"id": "r1", "state": "decode", "prompt": 5000, "cached": 1000, "prefill_s": 2.0}])");
