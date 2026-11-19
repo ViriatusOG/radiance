@@ -1961,6 +1961,49 @@ TEST(glm53_v2_protected_experts_take_the_expert_width) {
 
 /* An IQ8R trunk's experts read its rotated int8 codes, so bf16 or unrotated experts beside it, and
  * IQR experts beside a bf16 trunk, are refused; so is the MLA row form, which views int8 weights. */
+/* The clamped SwiGLU in front of an int8 consumer is one swiglu_clamped_had_quant_i8g where a loaded
+ * library declares it (the GLM kernel plugin), at the consumer's group: 128 for the routed and
+ * shared experts, IQ8R's 256 for the dense down projections. Where none does, it is the pair it
+ * replaces, swiglu_clamped then had_quant_act_i8g, and the fused op is never asked for. */
+TEST(glm53_v2_fuses_the_clamped_swiglu_where_a_library_declares_it) {
+    const RadModelMeta meta = glm_meta();
+    for (const bool declared : { true, false }) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = glm_v2_encs(glm_iqr());
+        if (!declared) b.undeclared = { "swiglu_clamped_had_quant_i8g" };
+        RadBuildCtx ctx = spec_ctx(0, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+        int fused = 0, clamped = 0, quant = 0;
+        std::set<long long> groups;
+        for (const auto& o : b.ops) {
+            if (o.op == "swiglu_clamped_had_quant_i8g") {
+                ++fused;
+                for (const auto& p : o.p)
+                    if (p.key == "group") groups.insert(p.ival);
+            }
+            if (o.op == "swiglu_clamped") ++clamped;
+            if (o.op == "had_quant_act_i8g") ++quant;
+        }
+        if (declared) {
+            /* Three dense layers and 42 routed ones (their routed and shared arms), plus the
+             * vision tower's own unquantised swiglu_clamped, which feeds no int8 consumer. */
+            CHECK(fused >= 3 + 2 * 42);
+            CHECK(groups == (std::set<long long>{ 128, 256 }));
+            CHECK(clamped < fused);
+        } else {
+            CHECK_EQ(fused, 0);
+            CHECK(clamped >= 3 + 2 * 42);
+            CHECK(quant >= clamped - 1);
+        }
+        CHECK(std::find(b.asked_undeclared.begin(), b.asked_undeclared.end(),
+                        "swiglu_clamped_had_quant_i8g") == b.asked_undeclared.end());
+    }
+}
+
 TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {
     const RadModelMeta meta = glm_meta();
     const auto declare = [&](const std::vector<std::pair<std::string, RadEncoding>>& encs,

@@ -541,7 +541,8 @@ struct GateQuantFP8 {
     rad_op op_quant = 0;
     bool clipped = false;
     /* Set before declare: serve the clamped path as one `swiglu_clamped_quant_fp8` where a loaded
-     * library declares it and it resolves (E4M3 codes only). Byte-identical to the pair. */
+     * library declares it and it resolves (E4M3 codes), or as one `swiglu_clamped_had_quant_i8g`
+     * (rotated int8 codes, the GLM plugin's). Byte-identical to the pair either way. */
     bool fuse_clamped = false;
     bool clamped_fused = false;
     /* Whether the bf16 product is written. A consumer of the bf16 value must request it
@@ -634,6 +635,24 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS);
+            if (op) {
+                const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
+                rad_op_reads(b, op, &gate_up, 1);
+                rad_op_writes(b, op, wr, want_x ? 3 : 2);
+                clamped_fused = true;
+                return RAD_OK;
+            }
+        }
+        /* Its rotated int8 twin, for an i8a8h consumer: declared only by the GLM kernel plugin
+         * (plugin/glm), byte-identical to swiglu_clamped + had_quant_act_i8g at the consumer's
+         * group. Without that plugin the pair below is issued as before. */
+        if (fuse_clamped && !step && !bf16 && hi8 && a.cq() && a.cs() &&
+            rad_op_declared(b, "swiglu_clamped_had_quant_i8g")) {
+            op = RAD_OP(b, "swiglu_clamped_had_quant_i8g",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                   RAD_F64("limit", limit), RAD_INT("group", a.cg()),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS);
             if (op) {
                 const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
                 rad_op_reads(b, op, &gate_up, 1);
