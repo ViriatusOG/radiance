@@ -45,7 +45,7 @@ extern "C" int rad_plugin_reference(void) { return 0; }
 
 extern "C" int rad_kernel_reference(int i) {
 #ifdef RAD_GLM_WITH_DEVICE
-    return (i >= 0 && i < RAD_GLM_N_OPS) ? 0 : 1;
+    return (i >= 0 && i < RAD_GLM_N_DEV) ? 0 : 1;
 #else
     (void)i;
     return 1;
@@ -57,23 +57,24 @@ extern "C" const RadOpSchema* rad_kernel_schema_at(int i) { return rad_glm_schem
 
 extern "C" int rad_kernel_count(void) {
 #ifdef RAD_GLM_WITH_DEVICE
-    return 2 * RAD_GLM_N_OPS;
+    return RAD_GLM_N_DEV + RAD_GLM_N_REF;
 #else
-    return RAD_GLM_N_OPS;
+    return RAD_GLM_N_REF;
 #endif
 }
 
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
 #ifdef RAD_GLM_WITH_DEVICE
-    static const RadKernelInfo dev[RAD_GLM_N_OPS] = {
+    static const RadKernelInfo dev[RAD_GLM_N_DEV] = {
         rad_glm_row(0, rad_glm_swiglu_quant_launch),
+        rad_glm_mla_i8_row(rad_glm_mla_i8_launch, rad_glm_mla_i8_scratch),
     };
-    if (i >= 0 && i < RAD_GLM_N_OPS) return &dev[i];
-    i -= RAD_GLM_N_OPS;
+    if (i >= 0 && i < RAD_GLM_N_DEV) return &dev[i];
+    i -= RAD_GLM_N_DEV;
 #endif
-    static const RadKernelInfo ref[RAD_GLM_N_OPS] = {
+    static const RadKernelInfo ref[RAD_GLM_N_REF] = {
         ref_row(0, rad_ref_glm_swiglu_quant, "ref_glm_swiglu_clamped_had_quant_i8g"),
     };
-    if (i < 0 || i >= RAD_GLM_N_OPS) return nullptr;
+    if (i < 0 || i >= RAD_GLM_N_REF) return nullptr;
     return &ref[i];
 }

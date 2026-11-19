@@ -40,6 +40,14 @@ const RadConstraint kSwigluQuantC[] = {
     RAD_CIN("dtype", "bf16"),
 };
 
+/* mla_attn's band at an int8 latent cache: libr4d's MLA geometry (latent 512, at most 64 heads,
+ * blocks of 4) with kv_dtype i8, which no libr4d row reads. */
+const RadConstraint kMlaI8C[] = {
+    RAD_CGE("M", 1),       RAD_CLE("M", 65535),   RAD_CEQ("latent_dim", 512),
+    RAD_CGE("heads", 1),   RAD_CLE("heads", 64),  RAD_CGE("blocks", 1),
+    RAD_CEQ("block_size", 4), RAD_CIN("dtype", "bf16"), RAD_CIN("kv_dtype", "i8"),
+};
+
 RadOpdDesc desc(uint32_t dt, int64_t rows, int64_t cols) {
     RadOpdDesc d;
     std::memset(&d, 0, sizeof d);
@@ -81,6 +89,25 @@ RadKernelInfo rad_glm_row(int i, RadLaunchFn launch) {
     r.launch = launch;
     r.opd_shape = rad_glm_swiglu_quant_shape;
     r.replaces = rad_glm_swiglu_quant_replaces;
+    return r;
+}
+
+RadKernelInfo rad_glm_mla_i8_row(RadLaunchFn launch, RadScratchFn scratch) {
+    RadKernelInfo r{};
+    r.name = "glm_mla_attn_i8kv";
+    r.op = "mla_attn";
+    r.family = "attn";
+    r.computes = "absorbed MLA over an int8 latent cache: a wave a (row, head), each key decoded "
+                 "to f32 by its half's f16 scale and used for the score and the value, split "
+                 "history merged from f32 partials";
+    r.shape = "latent_dim=512, heads<=64, block_size=4, cache rows of 516 bytes";
+    r.dtypes = "bf16 Q/output, i8 cache (codes and two f16 half scales a row), f32 softmax";
+    r.domain = RAD_DOMAIN_DEVICE;
+    r.priority = 100;
+    r.constraints = kMlaI8C;
+    r.n_constraints = (int)(sizeof kMlaI8C / sizeof kMlaI8C[0]);
+    r.launch = launch;
+    r.scratch = scratch;
     return r;
 }
 

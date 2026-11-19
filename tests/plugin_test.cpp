@@ -1111,6 +1111,63 @@ TEST(libr4d_resolves_the_mla_attention_by_rows) {
     CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 512, g)), "512:mla_attn_matrix_bf16 ");
 }
 
+/* Real plugin tables, selection only: no launch or init_instance. load_plugin/check_complete are
+ * core/plugin/registry.h:190-197; build_bands is :297-309. band_names above inspects the device
+ * winner, as libr4d_resolves_the_mla_attention_by_rows does. Host libraries after these two cannot
+ * change device selection, so only the glm/libr4d prefix of the hierarchy is needed here. */
+TEST(glm_i8_latent_selection_obeys_the_real_plugin_hierarchy) {
+    const std::string r4d = libr4d();
+    if (r4d.empty()) return;
+    const std::string glm = home() + "/kernels/glm.so";
+    if (access(glm.c_str(), R_OK) != 0) SKIP("no GLM plugin at %s", glm.c_str());
+    for (const bool glm_first : { true, false }) {
+        Registry r;
+        REQUIRE(r.load_plugin(glm_first ? glm : r4d, 0) >= 0);
+        REQUIRE(r.load_plugin(glm_first ? r4d : glm, 1) >= 0);
+        REQUIRE_EQ(r.check_complete(), RAD_OK); // MLA's schema comes from libr4d, possibly later.
+        bool glm_device = false, i8_reader = false, r4d_device = false;
+        for (const KernelRow& row : r.rows()) {
+            if (!row.info || row.info->domain != RAD_DOMAIN_DEVICE) continue;
+            glm_device |= row.plugin == "glm";
+            i8_reader |= row.plugin == "glm" &&
+                         std::string(row.info->name) == "glm_mla_attn_i8kv";
+            r4d_device |= row.plugin == "libr4d" &&
+                          std::string(row.info->name) == "mla_attn_bf16";
+        }
+        if (!glm_device) SKIP("glm.so has no selectable device rows (host-only build or code unavailable)");
+        if (!r4d_device) SKIP("libr4d.so has no selectable MLA device rows on this build/target");
+        REQUIRE(i8_reader); // A device build with stale/missing MLA registration must fail.
+        for (const int heads : { 1, 8, 16, 64 }) {
+            for (const char* kv : { "", "fp8_e4m3", "i8" }) {
+                Geometry g;
+                g.set_i("latent_dim", 512);
+                g.set_i("heads", heads);
+                g.set_i("blocks", 513);
+                g.set_i("block_size", 4);
+                g.set_f("scale", 0.0625);
+                g.set_s("dtype", "bf16");
+                if (*kv) g.set_s("kv_dtype", kv);
+                const bool i8 = std::string(kv) == "i8";
+                const std::string tile = heads == 64 ? "rows_" : heads == 1 ? "" : "matrix_";
+                const std::string want = i8 && glm_first ? "glm_mla_attn_i8kv"
+                    : "mla_attn_" + tile + (std::string(kv) == "fp8_e4m3" ? "fp8kv" : "bf16");
+                // Reversed hierarchy intentionally records the current hazard: libr4d's BF16
+                // rows omit kv_dtype and win for i8 too, regardless of glm's row priority.
+                // Those rows reject i8 tensors at launch; this test never launches them.
+                CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 2048, g)),
+                         std::string("2048:") + want + " ");
+            }
+        }
+        Geometry ff;
+        ff.set_i("n", 512);
+        ff.set_i("group", 128);
+        ff.set_f("limit", 10.0);
+        ff.set_s("dtype", "bf16");
+        CHECK_EQ(band_names(r.build_bands("swiglu_clamped_had_quant_i8g", "M", 1, 2048, ff)),
+                 std::string("2048:glm_swiglu_clamped_had_quant_i8g "));
+    }
+}
+
 /* GLM-5.3-Flash's MLA split by rows at eight ranks (arch/common/rad_block_glm_mla.h), with the
  * parameters its ops declare against the container's encodings (block fp8 at f32 scales): every
  * band of every op the row form adds resolves on the device, up to a 4096-token step's run of

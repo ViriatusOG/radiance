@@ -29,7 +29,7 @@ else()
                         "-DRAD_WITH_HIP=ON, or enable it after project()).")
   endif()
   rad_add_plugin(glm kernels SOURCES ${GLM_COMMON}
-                 HIP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/glm.hip)
+                 HIP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/glm.hip ${CMAKE_CURRENT_SOURCE_DIR}/glm_mla.hip)
   target_compile_definitions(glm PRIVATE RAD_GLM_WITH_DEVICE=1)
 endif()
 

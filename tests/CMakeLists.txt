@@ -350,8 +350,12 @@ if(TARGET glm AND TARGET glm_device_test)
   target_link_libraries(glm_device_test PRIVATE ${CMAKE_DL_LIBS})
   target_compile_definitions(glm_device_test PRIVATE
     RAD_GLM_LIB="${RAD_PLUGIN_OUT}/kernels/glm.so"
-    RAD_R4D_LIB="${RAD_PLUGIN_OUT}/kernels/libr4d.so")
+    RAD_R4D_LIB="${RAD_PLUGIN_OUT}/kernels/libr4d.so"
+    RAD_REF_LIB="${RAD_PLUGIN_OUT}/kernels/libref.so")
   add_dependencies(glm_device_test glm)
+  if(TARGET libref)
+    add_dependencies(glm_device_test libref)
+  endif()
   if(TARGET libr4d)
     add_dependencies(glm_device_test libr4d)
   endif()

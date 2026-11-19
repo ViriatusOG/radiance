@@ -16,7 +16,10 @@
 
 #include <cstdint>
 
-enum { RAD_GLM_N_OPS = 1 };
+/* RAD_GLM_N_OPS: the ops this plugin defines (their schemas). RAD_GLM_N_DEV: its device rows, which
+ * also serve ops others define (mla_attn, whose schema is libref's and libr4d's); RAD_GLM_N_REF: its
+ * host reference rows, for its own ops only (libref is mla_attn's reference). */
+enum { RAD_GLM_N_OPS = 1, RAD_GLM_N_DEV = 2, RAD_GLM_N_REF = 1 };
 
 /* swiglu_clamped_had_quant_i8g's resolved call. Strides in elements. */
 struct RadGlmSwigluQuantCall {
@@ -40,7 +43,12 @@ int rad_glm_swiglu_quant_shape(const RadParam* p, int n_p, int operand, RadOpdDe
 int rad_glm_swiglu_quant_replaces(const RadParam* p, int n_p, uint64_t present, int step,
                                   RadFuseStep* out);
 
+/* mla_attn at kv_dtype i8 (glm_mla.hip): the row for an op libref and libr4d define. */
+RadKernelInfo rad_glm_mla_i8_row(RadLaunchFn launch, RadScratchFn scratch);
+
 int rad_ref_glm_swiglu_quant(const RadArgs* a, RadStream s);
 #ifdef RAD_GLM_WITH_DEVICE
 extern "C" int rad_glm_swiglu_quant_launch(const RadArgs* a, RadStream s);
+extern "C" int rad_glm_mla_i8_launch(const RadArgs* a, RadStream s);
+extern "C" int64_t rad_glm_mla_i8_scratch(const RadArgs* a);
 #endif
