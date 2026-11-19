@@ -11,9 +11,9 @@
  *
  * ---- the group law --------------------------------------------------------------------------
  *
- * libref's quant_dot: a group's 128 products are |a * code| <= 127 * 127, their sum 2,064,512
- * an exact integer far inside i32, so the eight wmma steps of a group chain an i32 sub-sum with
- * no rounding, and the group term is
+ * libref's quant_dot: a group's 128 products are |a * code| <= 128 * 128, their sum at most 2^21,
+ * an exact integer far inside i32 and exact in f32, so the eight wmma steps of a group chain an
+ * i32 sub-sum with no rounding, and the group term is
  *
  *   acc += (sub * a_scale[m, g]) * b_scale[n, g]
  *
@@ -26,8 +26,8 @@
  * A wave is one 16-column tile of N over MT 16-row tiles of M; a block is eight waves, and the
  * grid is (N / 128, M / (16 * MT)). The B fragment (the weight column) is loaded once per 16-k
  * step and reused over the MT row tiles. MT is 1 for M <= 16 (decode: no second tile of clamped
- * duplicate rows) and 2 above. A block reads its 128 weight rows once, so the weight is read
- * ceil(M / (16 * MT)) times in all: a prefill chunk is served, at the cost of that re-read.
+ * duplicate rows) and 2 for 17 <= M < 128. A block reads its 128 weight rows once, so the weight
+ * is read ceil(M / (16 * MT)) times in all; from M = 128 the tile kernel below serves the launch.
  *
  * ---- the B pointer --------------------------------------------------------------------------
  *
@@ -36,8 +36,8 @@
  *
  * ---- the register budget --------------------------------------------------------------------
  *
- * As the w8a8 arm at MT = 2: about 66 VGPRs a lane, 528 for eight waves of the 1024 a gfx11
- * SIMD keeps.
+ * Read from the built object (.vgpr_count): 104 at MT = 1 and 117 at MT = 2, no spills, of the
+ * 128 a wave that eight waves a SIMD leave on gfx11.
  */
 
 #include <hip/hip_runtime.h>
@@ -183,6 +183,128 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_i8a8_wmma_ker
         }
 }
 
+/* The prefill tile: y[M,N] over 128 x 128 output tiles, the wave-matrix twin of the bf16 tile in
+ * r3d_vocab_bf16_wmma.hip. A block stages one scale group of both operands in LDS (128 activation
+ * rows and 128 weight rows, 128 codes each) and the 128 activation scales of the group; wave w owns
+ * columns [w*16, w*16+16) and all eight 16-row tiles. Per row tile the group's eight wave-matrix
+ * steps chain an exact i32 sub-sum, and the group closes into that tile's f32 accumulator with the
+ * reference's parentheses and roundings, written in C (this unit is built -ffp-contract=off):
+ *
+ *   acc = acc + ((float)sub * a_scale[m, g]) * b_scale[n, g]
+ *
+ * The weight is read ceil(M / 128) times in all, a quarter of the 32-row block's reads. Rows past
+ * M and columns past N are staged clamped to the last real one and dropped at the store.
+ *
+ * Registers: a block holds 34,304 bytes of LDS, and with that much the compiler does not hold the
+ * kernel to an eight-waves-a-SIMD budget (a draft declared so was allocated 256 registers). The
+ * kernel declares four waves a SIMD, 256 registers a wave, and the built object's .vgpr_count is
+ * 163 with no spill: 64 accumulators, the group's 32 weight-fragment registers (read from LDS
+ * once a group and kept over the eight row tiles), the sub-sum, an activation fragment and the
+ * store's addresses. */
+constexpr int kTM = 128;                      /* activation rows a block */
+constexpr int kTN = 128;                      /* weight rows (output columns) a block */
+constexpr int kGD = kGroup / 4;               /* dwords a staged row of one group */
+
+/* The activation's 16-byte load: the shim holds `a` and its pitch to 4 bytes, not 16. */
+typedef r3d_u32x4 r3d_u32x4_a4 __attribute__((aligned(4)));
+
+/* A value the optimiser cannot see through: an empty asm that takes and returns it in a VGPR. */
+__device__ __forceinline__ uint32_t lds_base(uint32_t v)
+{
+    asm volatile("" : "+v"(v));
+    return v;
+}
+
+template <bool NT>
+__global__ __launch_bounds__(kBlockThreads) R3D_WAVES(4) void gemm_i8a8_tile_kernel(
+    const int8_t* __restrict__ a, const float* __restrict__ sa, int sa_rb,
+    const uint8_t* __restrict__ B, int b_rb, const uint16_t* __restrict__ sb,
+    int sb_rb, uint16_t* __restrict__ Y,
+    int M, int N, int K, int a_ld, int y_ld)
+{
+    __shared__ __align__(16) uint32_t s_a[kTM * kPitch];
+    __shared__ __align__(16) uint32_t s_b[kTN * kPitch];
+    __shared__ float s_sa[kTM];
+
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & (kWave - 1);
+    const uint32_t wave = tid / kWave;
+    const uint32_t r = lane & 15;                   // the replicated row/column index
+
+    const int m0 = (int)blockIdx.y * kTM;
+    const int nb = (int)blockIdx.x * kTN;
+    const uint32_t n0 = (uint32_t)nb + wave * 16 + r;
+    const int n_real = (int)(n0 < (uint32_t)N ? n0 : (uint32_t)(N - 1));
+
+    v8float acc[kTM / 16];
+    #pragma unroll
+    for (int i = 0; i < kTM / 16; ++i) acc[i] = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+
+    /* The LDS row bases of this lane, one a row tile, each made opaque to the optimiser. Left
+     * visible, every read below is `one base + a constant up to 15 KB`, the 2-address LDS load
+     * reaches 1 KB, and the compiler keeps a register for the address of every pair of dwords
+     * (about 130 of them, hoisted out of the group loop). With an opaque base a row tile's 32
+     * dwords are within the load's own offset field. */
+    uint32_t ao[kTM / 16];
+    #pragma unroll
+    for (int rb = 0; rb < kTM / 16; ++rb) ao[rb] = lds_base((uint32_t)(rb * 16 + r) * kPitch);
+    const uint32_t bo = lds_base((wave * 16 + r) * kPitch);
+    const uint32_t so = lds_base(lane >> 4);
+
+    for (int g = 0; g < K / kGroup; ++g) {
+        const int kt = g * kGroup;
+
+        /* Stage the group: 16 bytes a thread a turn, the weight straight from its stored rows. */
+        for (int i = (int)tid; i < kTM * (kGD / 4); i += kBlockThreads) {
+            const int row = i / (kGD / 4), q = i % (kGD / 4);
+            const int rr = m0 + row;
+            const r3d_u32x4 v = *(const r3d_u32x4_a4*)(a + (size_t)(rr < M ? rr : M - 1) * a_ld + kt + 16 * q);
+            uint32_t* d = s_a + (size_t)row * kPitch + 4 * q;
+            d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+        }
+        for (int i = (int)tid; i < kTN * (kGD / 4); i += kBlockThreads) {
+            const int col = i / (kGD / 4), q = i % (kGD / 4);
+            const int nn = nb + col;
+            const r3d_u32x4 v = ldw<NT>(B + (size_t)(nn < N ? nn : N - 1) * b_rb + kt + 16 * q);
+            uint32_t* d = s_b + (size_t)col * kPitch + 4 * q;
+            d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+        }
+        if (tid < (uint32_t)kTM) {
+            const int rr = m0 + (int)tid;
+            s_sa[tid] = ldg_f32(sa + (size_t)(rr < M ? rr : M - 1) * sa_rb + g);
+        }
+        group_barrier();
+
+        const float sbv = bf16_to_f32((uint16_t)ldg_u16(sb + (size_t)n_real * sb_rb + g));
+        const uint32_t* bp = s_b + bo;
+        const float* sp = s_sa + so;
+        #pragma unroll
+        for (int rb = 0; rb < kTM / 16; ++rb) {
+            const uint32_t* ap = s_a + ao[rb];
+            v8int sub = v8int{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            #pragma unroll
+            for (int k = 0; k < kGD; k += 4)
+                sub = wmma_i8(v4int{ (int)ap[k], (int)ap[k + 1], (int)ap[k + 2], (int)ap[k + 3] },
+                              v4int{ (int)bp[k], (int)bp[k + 1], (int)bp[k + 2], (int)bp[k + 3] }, sub);
+            #pragma unroll
+            for (int g2 = 0; g2 < 8; ++g2) {
+                const float t = (float)sub[g2] * sp[rb * 16 + g2 * 2];
+                acc[rb][g2] = acc[rb][g2] + t * sbv;
+            }
+        }
+        group_barrier();                      // the next group's stage must not race these reads
+    }
+
+    if (n0 >= (uint32_t)N) return;
+    #pragma unroll
+    for (int rb = 0; rb < kTM / 16; ++rb)
+    #pragma unroll
+        for (int g2 = 0; g2 < 8; ++g2) {
+            const int m = m0 + rb * 16 + g2 * 2 + (int)(lane >> 4);
+            if (m < M) Y[(size_t)m * y_ld + n0] = f32_to_bf16(acc[rb][g2]);
+        }
+}
+
 }  // namespace
 
 /* ==================================================================================================
@@ -243,9 +365,21 @@ extern "C" int r3d_rad_gemm_nt_q_i8a8(const RadArgs* a, RadStream s)
     R3dGemmCfg c;
     r3d_cfg_gemm(a, &c);
 
+    const dim3 block(kBlockThreads);
+    if (M >= kTM) {
+        const dim3 tgrid((unsigned)((N + kTN - 1) / kTN), (unsigned)((M + kTM - 1) / kTM));
+#define R3D_I8A8T(NTV)                                                                            \
+    R3D_KLAUNCH((gemm_i8a8_tile_kernel<NTV>), tgrid, block, (hipStream_t)s,                       \
+                (const int8_t*)r3d_p(A), (const float*)r3d_p(AS), (int)asp,                       \
+                (const uint8_t*)r3d_p(B), (int)bp, (const uint16_t*)r3d_p(BS), (int)bsp,          \
+                (uint16_t*)r3d_wp(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp)
+        if (c.nt) R3D_I8A8T(true); else R3D_I8A8T(false);
+#undef R3D_I8A8T
+        return hipGetLastError() == hipSuccess ? RAD_OK : R3D_NO(RAD_E_DEVICE);
+    }
     const int mt = M <= 16 ? 1 : 2;
     const dim3 grid((unsigned)((N + kWaves * 16 - 1) / (kWaves * 16)),
-                    (unsigned)((M + mt * 16 - 1) / (mt * 16))), block(kBlockThreads);
+                    (unsigned)((M + mt * 16 - 1) / (mt * 16)));
 #define R3D_I8A8(NTV, MTV)                                                                        \
     R3D_KLAUNCH((gemm_i8a8_wmma_kernel<NTV, MTV>), grid, block, (hipStream_t)s,                   \
                 (const int8_t*)r3d_p(A), (const float*)r3d_p(AS), (int)asp,                       \

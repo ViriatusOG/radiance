@@ -2712,13 +2712,15 @@ static const RadKernelInfo kKernels[] = {
   "the int8 trunk grid (i8a8, and i8a8h, its rotated twin): signed int8 codes against row-major "
   "int8 activations, the group's integer sub-sum scaled by the activation's (row, group) scale "
   "and the weight's (row, group) scale",
-  "group 128, K a multiple of it, every M; a wave is a 16-column tile over one 16-row tile "
-  "(M <= 16) or two, the weight column loaded once per 16-k step; a block reads its weight rows "
-  "once, so a prefill chunk re-reads the weight once per 32 rows",
+  "group 128, K a multiple of it, every M; below M = 128 a wave is a 16-column tile over one "
+  "16-row tile (M <= 16) or two, the weight read from global at each step; from M = 128 a block "
+  "is a 128x128 output tile with a group of both operands staged in LDS, so a prefill chunk "
+  "reads the weight once per 128 rows",
   "I8 a row-major with an f32 scale per (row, 128 of K) -- quant_act_i8g's output, or "
   "had_quant_act_i8g's at i8a8h; I8 codes b with a bf16 scale per (row, 128 of K), bf16 y, fp32 "
   "accumulation in ascending group order; the sub-sums are exact integers under 2^24, and the "
-  "store is the only narrowing; no zero point, so no a_sum",
+  "store is the only narrowing; each group term rounds as quant_dot's (two multiplies, an add, "
+  "none fused), so the row is bit-identical to the reference; no zero point, so no a_sum",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
   ROW(cGemmQI8), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_i8a8,
