@@ -37,6 +37,8 @@
  * Vencode or Aencode pass a media into the lane before the prompt pass. Their rows take a
  * near-clean timestep, so the modulation table has a cell for every run of segments that share
  * one. A reference picture is also shown to the text encoder, through Qwen3-VL's vision tower.
+ * A song guide (ComfyUI's MiniMaxH3AddGuide) is a keyframe of the soundtrack alone: its latents
+ * pinned from its frame on, after any first and last frame, beside references or keyframes.
  *
  * ============================== A DISTILLED RELEASE ==============================
  *
@@ -380,7 +382,7 @@ enum { kEncMaxSide = 256, kEncMaxFrames = 289, kEncMaxSamples = 500000 };
  * the canvas's area. */
 enum { kEncOneFrames = ((int64_t)kDefW * kDefH + (int64_t)kEncMaxSide * kEncMaxSide - 1) /
                        ((int64_t)kEncMaxSide * kEncMaxSide) };
-enum { kEncSlotsV = 12, kEncSlotsA = 6 };
+enum { kEncSlotsV = 12, kEncSlotsA = 7 };
 enum { kEncSlotRowsV = 82 * (kEncMaxSide / 32) * (kEncMaxSide / 32),
        kEncSlotRowsA = kAudioCh * (kEncMaxSamples / kAudioHop) };
 
@@ -2231,8 +2233,9 @@ static bool aenc_geom(int64_t samples, int64_t ch, int32_t* out) {
 }
 
 /* A media's first row in b_evc / b_enca: nine pictures then three videos, three videos'
- * soundtracks then three standalone ones. A request with keyframes carries no references, so
- * its two keyframes take the first two pictures' rows. -1 for no slot. */
+ * soundtracks then three standalone ones and the song guide. A request with picture keyframes
+ * carries no references, so its two keyframes take the first two pictures' rows. -1 for no
+ * slot. */
 static int64_t venc_slot_row(int32_t kind, int32_t slot) {
     int64_t idx = -1;
     if (kind == RAD_ENC_IMAGE && slot >= 1 && slot <= 9) idx = slot - 1;
@@ -2244,6 +2247,7 @@ static int64_t aenc_slot_row(int32_t kind, int32_t slot) {
     int64_t idx = -1;
     if (kind == RAD_ENC_VAUDIO && slot >= 1 && slot <= 3) idx = slot - 1;
     else if (kind == RAD_ENC_AUDIO && slot >= 1 && slot <= 3) idx = 3 + slot - 1;
+    else if (kind == RAD_ENC_GUIDE && slot == 1) idx = 6;
     return idx < 0 ? -1 : idx * (int64_t)kEncSlotRowsA;
 }
 
@@ -3146,7 +3150,7 @@ static_assert((int)RAD_VREF_PICTURE == (int)kR2VRefImage &&
 static bool ref_pack_of(const RadVideoGeom* g, const int32_t* ref_tab, Ref2VAPack* p,
                         bool positions) {
     const int32_t nr = ref_tab[0], nk = ref_tab[1];
-    if (nr < 0 || nk < 0 || nr > 64 || nk > 2) return false;
+    if (nr < 0 || nk < 0 || nr > 64 || nk > 3) return false;
     std::vector<Ref2VARef> refs;
     std::vector<Ref2VAKeyframe> keys;
     const int32_t* w = ref_tab + 2;
@@ -3154,9 +3158,13 @@ static bool ref_pack_of(const RadVideoGeom* g, const int32_t* ref_tab, Ref2VAPac
         if (w[0] < RAD_VREF_PICTURE || w[0] > RAD_VREF_VIDEO || w[1] < 1) return false;
         refs.push_back(Ref2VARef{ w[0], w[2], w[3], w[4], w[5] });
     }
-    /* A keyframe is a picture: its soundtrack has no slot to be encoded into. */
+    /* The keyframes' slots: two pictures, the first and last frames', and one soundtrack, the
+     * song guide's. */
+    int32_t pics = 0, songs = 0;
     for (int32_t i = 0; i < nk; ++i, w += 3) {
-        if (w[2] != 0) return false;
+        pics += w[1] > 0;
+        songs += w[2] > 0;
+        if (pics > 2 || songs > 1) return false;
         keys.push_back(Ref2VAKeyframe{ w[0], w[1], w[2] });
     }
     const Ref2VAGeom pg{ (int)g->lat_frames, (int)g->lat_h, (int)g->lat_w, (int)g->n_audio };
@@ -3179,7 +3187,11 @@ static std::vector<Ref2VATagRun> ref_pads_of(const int32_t* ref_tab) {
 struct RefPart { int audio; int64_t row; };
 static void ref_parts(const int32_t* ref_tab, std::vector<RefPart>* out) {
     const int32_t nr = ref_tab[0], nk = ref_tab[1];
-    for (int32_t i = 0; i < nk; ++i) out->push_back({ 0, venc_slot_row(RAD_ENC_KEYFRAME, i + 1) });
+    const int32_t* k = ref_tab + 2 + 6 * (int64_t)nr;
+    for (int32_t i = 0, pic = 0; i < nk; ++i, k += 3) {
+        if (k[1] > 0) out->push_back({ 0, venc_slot_row(RAD_ENC_KEYFRAME, ++pic) });
+        if (k[2] > 0) out->push_back({ 1, aenc_slot_row(RAD_ENC_GUIDE, 1) });
+    }
     const int32_t* w = ref_tab + 2;
     for (int32_t i = 0; i < nr; ++i, w += 6) {
         const int32_t kind = w[0], slot = w[1];
@@ -3420,7 +3432,8 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
             }
             const int64_t row = parts[pi++].row;
             /* A soundtrack's slot holds a channel every kEncSlotRowsA / kAudioCh rows (step_aenc)
-             * and its segment the channels one after the other, n / 2 latents each. */
+             * and its segment the channels one after the other, n / 2 latents each: a song
+             * guide's are the encoded song's first, cut where the video ends. */
             if (aud)
                 for (int64_t ch = 0, t = n / kAudioCh; ch < kAudioCh; ++ch)
                     RAD_ISSUE_N(c, m.op_ain, t,

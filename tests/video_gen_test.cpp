@@ -1260,6 +1260,121 @@ TEST(reference_videos_and_soundtracks_are_encoded_into_the_table) {
     CHECK(tab == want);
 }
 
+/* A song guide (ComfyUI's MiniMaxH3AddGuide): one Aencode pass of its own kind, after the
+ * references', and a keyframe without a picture in the table, its soundtrack the song's latents
+ * cut to floor(n_audio - audio_rate / fps * frame), here 50 - 10 a frame. */
+TEST(a_song_guide_is_encoded_cut_and_pinned_as_a_keyframe) {
+    for (const int32_t frame : { 4, 0 }) {
+        VideoFixture f;
+        f.build();
+        CHECK_OK(f.start_refs());
+        std::string why;
+        auto r = f.req(2, 2);
+        r->refs.push_back(sound(gen::VideoRefMedia::AUDIO, "ref_audio_1", 1, 850));
+        gen::VideoRefMedia song = sound(gen::VideoRefMedia::GUIDE_AUDIO, "guide_audio", 1, 10000);
+        song.frame = frame;
+        r->refs.push_back(song);
+        CHECK_OK(f.drv.submit(std::move(r), &why));
+
+        std::string passes;
+        std::vector<int32_t> tab;
+        for (int i = 0; i < 3; ++i) {
+            const RadBatch* b = f.drv.next(i);
+            REQUIRE(b != nullptr);
+            const RadVideoGenBatch* V = b->vgen_b;
+            if (b->gen == RAD_GEN_PASS_AENCODE) {
+                passes += V->enc_kind == RAD_ENC_GUIDE ? "g" : "a";
+                CHECK_EQ(V->enc_slot, 1);
+                if (V->enc_kind == RAD_ENC_GUIDE) CHECK_EQ(V->enc_n_samples, (int64_t)10400);
+            } else {
+                passes += kind_of(b->gen);
+                tab.assign(V->ref_tab, V->ref_tab + 12);
+            }
+            f.answer(0);
+            CHECK_OK(f.drv.done());
+        }
+        CHECK_EQ(passes, std::string("agC"));
+        /* The song is 13 latents: cut to 10 from frame 4, whole from frame 0. */
+        const std::vector<int32_t> want = { 1, 1, RAD_VREF_AUDIO, 1, 0, 0, 0, 2,
+                                            frame, 0, frame == 4 ? 10 : 13, 0 };
+        CHECK(tab == want);
+    }
+}
+
+/* A song guide rides a latent upscale beside a keyframe: its latents do not depend on the size,
+ * so it is encoded once, before the prompt, with the keyframe's small picture; only the keyframe
+ * is encoded again after the upscale. */
+TEST(a_song_guide_is_encoded_once_under_an_upscale) {
+    VideoFixture f;
+    f.build();
+    f.prog.video_gen.upscale_max = 4.0;
+    f.prog.video_gen.upscale_refine = 1;
+    CHECK_OK(f.start_refs());
+    std::string why;
+    auto r = f.req(1, 4);
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    gen::VideoRefMedia kf = picture(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1, 64, 64);
+    kf.small_w = 32;
+    kf.small_h = 32;
+    kf.small_pixels.assign((size_t)32 * 32 * 3, 2.0f);
+    r->refs.push_back(kf);
+    gen::VideoRefMedia song = sound(gen::VideoRefMedia::GUIDE_AUDIO, "guide_audio", 1, 1600);
+    song.frame = 1;
+    r->refs.push_back(song);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    std::string kinds;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        kinds += b->gen == RAD_GEN_PASS_VENCODE ? 'E' : b->gen == RAD_GEN_PASS_AENCODE ? 'g'
+                                                                                        : kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VSTEP) {
+            /* The keyframe, then the guide: 2 latents from frame 1 of 3. */
+            CHECK_EQ(V->ref_tab[1], 2);
+            const int32_t want[6] = { 0, 1, 0, 1, 0, 2 };
+            for (int k = 0; k < 6; ++k) CHECK_EQ(V->ref_tab[2 + k], want[k]);
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(kinds, std::string("EgCSSUESAD"));
+}
+
+/* A song guide outside the video, a second one, or one without the audio encoder is refused at
+ * submit, by name. */
+TEST(a_song_guide_the_model_cannot_take_is_refused) {
+    std::string why;
+    auto song = [](int32_t frame) {
+        gen::VideoRefMedia m = sound(gen::VideoRefMedia::GUIDE_AUDIO, "guide_audio", 1, 800);
+        m.frame = frame;
+        return m;
+    };
+    VideoFixture f;
+    f.build();
+    CHECK_OK(f.start_refs());
+    auto r = f.req(2);
+    r->refs.push_back(song(5));
+    CHECK_EQ(f.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "outside the video's 5 frames"));
+    r = f.req(2);
+    r->refs.push_back(song(0));
+    r->refs.push_back(song(1));
+    CHECK_EQ(f.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "one song guide"));
+
+    VideoFixture g;
+    g.build();
+    CHECK_OK(g.start_refs(false));
+    r = g.req(2);
+    r->refs.push_back(song(0));
+    CHECK_EQ(g.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "guide_audio"));
+}
+
 /* Media the model cannot condition on are refused at submit, by name. */
 TEST(references_the_model_cannot_take_are_refused) {
     std::string why;

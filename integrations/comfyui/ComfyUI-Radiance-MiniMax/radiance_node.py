@@ -64,6 +64,14 @@ A task ignores the media it does not use, with a warning on the console. For `re
 Fill each kind in order, without gaps: the input's number is the reference's number in the
 request (`<Picture 2>`, `<Video 1>`).
 
+Every task also takes a song guide:
+
+- **guide_audio**: a song pinned as the clip's soundtrack from frame `guide_frame` on, so the
+  mouths follow its words (ComfyUI's Add Guide for MiniMax H3). The server reads at most 15.6 s
+  and cuts it where the clip ends. It needs a container with the audio VAE's encoder.
+- **guide_frame**: the frame the song starts at, 0 the first; a negative one counts from the end,
+  -1 the last. Used only with `guide_audio`.
+
 ## Inputs
 
 - **prompt**: a widget and an input; a connected string replaces the typed text. The model is
@@ -349,6 +357,12 @@ class RadianceMiniMax(io.ComfyNode):
                                tooltip="run the early steps at 1/2 or 1/4 of the size, with a "
                                        "container that has the latent upscaler"),
                 *images, *videos, *tracks, *audios,
+                io.Audio.Input("guide_audio", optional=True,
+                               tooltip="every task: a song pinned as the clip's soundtrack from "
+                                       "guide_frame on, cut where the clip ends"),
+                io.Int.Input("guide_frame", default=0, min=-9999, max=9999, step=1,
+                             tooltip="the frame guide_audio starts at; negative counts from the "
+                                     "end, -1 the last"),
                 io.Int.Input("timeout", default=1800, min=30, max=7200, step=30, advanced=True,
                              tooltip="seconds to wait for the job"),
             ],
@@ -370,7 +384,7 @@ class RadianceMiniMax(io.ComfyNode):
 
     @classmethod
     def execute(cls, server_url, model, task, prompt, resolution, aspect, seconds, seed,
-                num_inference_steps, sampler, shift, audio_shift, timeout=1800,
+                num_inference_steps, sampler, shift, audio_shift, guide_frame=0, timeout=1800,
                 latent_upscale="off", loras="none", lora_strength=1.0, lora2="none",
                 lora2_strength=1.0, **media):
         size = _resolve_size(resolution, aspect, media.pop("custom_size", ""))
@@ -411,6 +425,10 @@ class RadianceMiniMax(io.ComfyNode):
             parts += [(f, _image_png(images[i])) for i, f in enumerate(fields)
                       if images[i] is not None]
 
+        guide = media.get("guide_audio")
+        if guide is not None:
+            parts.append(("guide_audio", _audio_wav(guide)))
+
         data = {
             "model": model, "task": task, "prompt": prompt, "size": size,
             "seconds": str(seconds), "seed": str(seed),
@@ -419,6 +437,8 @@ class RadianceMiniMax(io.ComfyNode):
         }
         if latent_upscale != "off":
             data["latent_upscale"] = latent_upscale
+        if guide is not None:
+            data["guide_frame"] = str(guide_frame)
         adapters = [(name, strength) for name, strength in ((loras, lora_strength),
                                                              (lora2, lora2_strength))
                     if name and name != "none"]

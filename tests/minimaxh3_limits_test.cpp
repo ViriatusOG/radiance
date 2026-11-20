@@ -175,4 +175,29 @@ TEST(h3_declaration_obeys_chunk_thresholds_on_both_tensor_parallel_ranks) {
     REQUIRE(ctx.max_tok >= minimaxh3::max_step_rows(area, minimaxh3::kMinChunks));
     CHECK_EQ(minimaxh3::declare(&insufficient, meta.meta(), &ctx), RAD_E_INVAL);
 }
+/* A song guide is a keyframe of the soundtrack alone, after the first and last frames: the plugin
+ * lays it out, reads it from the guide's own soundtrack slot, and takes one. */
+TEST(h3_a_song_guide_keyframe_reads_its_own_soundtrack_slot) {
+    using namespace minimaxh3;
+    const RadVideoGeom g{ 64, 124, 37, 48, 84, 207 };   /* n_text, frames, latents, sound */
+    /* A standalone soundtrack reference, then a first frame and the guide at frame 100, no pads. */
+    std::vector<int32_t> tab = { 1, 2, RAD_VREF_AUDIO, 1, 0, 0, 0, 40, 0, 1, 0, 100, 0, 40, 0 };
+    Ref2VAPack p;
+    REQUIRE(ref_pack_of(&g, tab.data(), &p, false));
+    std::vector<RefPart> parts;
+    ref_parts(tab.data(), &parts);
+    REQUIRE_EQ(parts.size(), (size_t)3);
+    CHECK_EQ(parts[0].audio, 0);
+    CHECK_EQ(parts[0].row, venc_slot_row(RAD_ENC_KEYFRAME, 1));
+    CHECK_EQ(parts[1].audio, 1);
+    CHECK_EQ(parts[1].row, (int64_t)6 * kEncSlotRowsA);
+    CHECK_EQ(parts[2].row, aenc_slot_row(RAD_ENC_AUDIO, 1));
+    /* The guide's slot is past the six reference soundtracks' and inside the buffer. */
+    CHECK(aenc_slot_row(RAD_ENC_GUIDE, 1) + kEncSlotRowsA <= (int64_t)kEncSlotsA * kEncSlotRowsA);
+    CHECK_EQ(aenc_slot_row(RAD_ENC_GUIDE, 2), (int64_t)-1);
+    /* A second soundtrack keyframe has no slot. */
+    tab = { 0, 2, 0, 0, 40, 100, 0, 40, 0 };
+    CHECK(!ref_pack_of(&g, tab.data(), &p, false));
+}
+
 RAD_TEST_MAIN()

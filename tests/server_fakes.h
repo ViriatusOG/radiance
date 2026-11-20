@@ -483,9 +483,11 @@ struct FakeMultimodal : IMultimodal {
         }
         return RAD_OK;
     }
-    int encoder_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>* out,
-                      std::string*) override {
+    int64_t aenc_max = 0;   /* the last call's sample cap */
+    int encoder_audio(const uint8_t*, size_t, int32_t, int64_t max_samples,
+                      std::vector<float>* out, std::string*) override {
         ++n_aenc;
+        aenc_max = max_samples;
         out->assign((size_t)enc_n, 0.5f);
         return RAD_OK;
     }

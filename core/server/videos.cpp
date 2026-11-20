@@ -20,6 +20,10 @@
  * most 9), `ref_video_N` (3) with a soundtrack `ref_video_audio_N` and `ref_audio_N` (3), N from 1
  * without gaps within each kind. The parts carry the bytes: `input_reference` (but for i2va on a
  * model that starts from a picture) and non-empty `conditions` are refused.
+ * A model with the audio VAE's encoder also takes a song guide (ComfyUI's MiniMaxH3AddGuide): a
+ * file part `guide_audio` pinned as the soundtrack from frame `guide_frame` on (0 by default,
+ * negative from the end) and cut where the video ends, with any task. It is not named in the
+ * prompt. Keyframes and reference media still exclude each other.
  * A model with a length head (LTX-2.5's duration head) chooses the length of a request that names
  * none, or says `"seconds": "auto"`; the video object reports it once chosen. A model with more
  * than one decoder takes `decoder`, one of their names (LTX-2.5: `vae`, the default, or
@@ -258,13 +262,14 @@ int validate_refs(std::vector<gen::VideoRefMedia>& refs, const VideoGenInfo& inf
 }  /* namespace */
 
 /* A video model's capabilities on /v1/models and /server_info: the counts validate_refs applies,
- * the samplers and the model's shifts. */
+ * whether it takes a song guide, the samplers and the model's shifts. */
 void Server::video_caps(json& caps, const IVideoGen* gen) {
     const VideoGenInfo& info = gen->info();
     caps["video_max_text"]       = info.max_text;
     caps["video_max_ref_images"] = std::min(kMaxRefImages, (int32_t)info.max_ref_images);
     caps["video_max_ref_videos"] = std::min(kMaxRefVideos, (int32_t)info.max_ref_videos);
     caps["video_max_ref_audios"] = std::min(kMaxRefAudios, (int32_t)info.max_ref_audios);
+    caps["video_guide_audio"]    = info.max_enc_samples > 0;
     caps["video_samplers"] = json::array({ "euler", "res_multistep" });
     caps["video_shift"]       = info.shift_video;
     caps["video_audio_shift"] = info.shift_audio;
@@ -283,8 +288,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * since it may carry a file). Reference media and keyframes are file parts, collected here and
      * checked once the task is known. */
     std::vector<gen::VideoRefMedia> refs;
-    /* The keyframes, `first_frame` and `last_frame`. */
-    std::vector<gen::VideoRefMedia> keys;
+    /* The keyframes, `first_frame` and `last_frame`, and the song guide, `guide_audio`. */
+    std::vector<gen::VideoRefMedia> keys, guides;
     json body = json::object();
     std::vector<uint8_t> ref_bytes;
     bool has_ref = false;
@@ -293,6 +298,23 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             if (p.name == "input_reference" && !p.filename.empty()) {
                 ref_bytes.assign(p.data.begin(), p.data.end());
                 has_ref = true;
+                continue;
+            }
+            if (p.name == "guide_audio") {
+                if (p.filename.empty())
+                    return error_response(err_bad(p.name, "'guide_audio' must carry an audio "
+                                                          "file"), req.peer);
+                if (!guides.empty())
+                    return error_response(err_bad(p.name, "at most one guide_audio part"),
+                                          req.peer);
+                gen::VideoRefMedia m;
+                m.kind = gen::VideoRefMedia::GUIDE_AUDIO;
+                m.index = 1;
+                m.name = p.name;
+                m.filename = p.filename;
+                m.content_type = p.content_type;
+                m.data = p.data;
+                guides.push_back(std::move(m));
                 continue;
             }
             if (p.name == "first_frame" || p.name == "last_frame") {
@@ -344,7 +366,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps",
         "sampler", "shift", "audio_shift", "first_frame_mode",
-        "negative_prompt", "decoder", "loras", "lora",
+        "negative_prompt", "decoder", "loras", "lora", "guide_frame",
         /* RadVideoGenBatch::guidance_h's order */
         "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
         "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale", "audio_guidance_rescale",
@@ -484,6 +506,16 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                          "last_frame part");
         }
     }
+    /* The song guide needs the audio VAE's encoder; it goes with keyframes or reference media. */
+    if (has(body, "guide_frame") && guides.empty())
+        return bad("guide_frame", "guide_frame places a song guide: give a guide_audio part "
+                                  "with it");
+    if (!guides.empty()) {
+        if (info.max_enc_samples <= 0)
+            return bad("guide_audio", "this model has no audio encoder, so it cannot pin a song "
+                                      "guide");
+        if (guides[0].data.empty()) return bad("guide_audio", "'guide_audio' carries an empty file");
+    }
     /* How the first frame is fitted to the video: stretched, as ComfyUI does, or `center`, scaled
      * to cover it and cropped. The last frame is always cropped, as ComfyUI does. */
     bool first_center = false;
@@ -582,6 +614,19 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     /* The length the job reports until the model has chosen one. */
     const int64_t frames =
         info.frames_per_chunk * (chunks > 0 ? chunks : info.default_chunks) + info.frames_tail;
+    /* The song guide's first frame, a negative one counted from the end, as ComfyUI's frame_idx. */
+    if (!guides.empty() && has(body, "guide_frame")) {
+        double v = 0;
+        if (!number(body["guide_frame"], &v) || v != std::floor(v) || std::fabs(v) > 1e9)
+            return bad("guide_frame", "expected an integer, the video's frame the song starts at");
+        const int64_t at = v < 0 ? frames + (int64_t)v : (int64_t)v;
+        if (at < 0 || at >= frames)
+            return bad("guide_frame", "frame " + std::to_string((int64_t)v) + " is outside the "
+                                      "video's " + std::to_string(frames) + " frames: 0 to " +
+                                      std::to_string(frames - 1) + ", or -1 to -" +
+                                      std::to_string(frames) + " from the end");
+        guides[0].frame = (int32_t)at;
+    }
 
     std::unique_ptr<gen::VideoRequest> r = std::make_unique<gen::VideoRequest>();
     r->width = (int32_t)W;
@@ -721,6 +766,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     });
     r->refs.insert(r->refs.end(), keys.begin(), keys.end());
     const bool has_keys = !keys.empty();
+    /* The song guide last, as its kind sorts. */
+    r->refs.insert(r->refs.end(), guides.begin(), guides.end());
 
     /* Pixels as the VAE encoders take them: RGB in 0..255, frame after frame. */
     auto pixels = [](gen::VideoRefMedia& m, const std::vector<mm::Frame>& fr) {
@@ -913,9 +960,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
 
     /* ---- every reference as its VAE encoder takes it (the keyframes are done above): pictures and
-     * video frames fitted to the encoder's bounds, soundtracks as mono samples at the model's rate,
-     * one copy a channel. The driver pads both to the encoders' clips and hops. */
-    if ((ref2va || !keys.empty()) && deps_.mm) {
+     * video frames fitted to the encoder's bounds, soundtracks (the song guide's too) as mono
+     * samples at the model's rate, at most the encoder's, one copy a channel. The driver pads both
+     * to the encoders' clips and hops. */
+    if ((ref2va || !keys.empty() || !guides.empty()) && deps_.mm) {
         for (gen::VideoRefMedia& m : r->refs) {
             std::string why;
             const uint8_t* p = (const uint8_t*)m.data.data();
@@ -977,6 +1025,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     else if (keys.size() == 2) j->task = "fl2va";
     else if (!keys.empty())
         j->task = keys[0].kind == gen::VideoRefMedia::FIRST_FRAME ? "i2va" : "l2va";
+    else if (!guides.empty()) j->task = "t2va";
     j->ticket = std::make_shared<gen::VideoTicket>();
     r->ticket = j->ticket;
     const int64_t n_tok = (int64_t)r->tokens.size();

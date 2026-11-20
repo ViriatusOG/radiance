@@ -76,15 +76,18 @@ private:
 };
 
 /* A reference medium or a keyframe of a request: a picture, a video, a video's own soundtrack, a
- * standalone soundtrack, or the first or last frame. `index` is its number within its kind from
- * 1 (VIDEO_AUDIO i is VIDEO i's soundtrack); a keyframe's is its <Picture N> in the prompt, 1 the
- * first and 2 the last. */
+ * standalone soundtrack, the first or last frame, or a song guide (a soundtrack pinned from frame
+ * `frame` of the video on, a keyframe without a picture: ComfyUI's MiniMaxH3AddGuide). `index` is
+ * its number within its kind from 1 (VIDEO_AUDIO i is VIDEO i's soundtrack); a keyframe's is its
+ * <Picture N> in the prompt, 1 the first and 2 the last. */
 struct VideoRefMedia {
     enum Kind : int32_t {
-        IMAGE = 0, VIDEO = 1, VIDEO_AUDIO = 2, AUDIO = 3, FIRST_FRAME = 4, LAST_FRAME = 5
+        IMAGE = 0, VIDEO = 1, VIDEO_AUDIO = 2, AUDIO = 3, FIRST_FRAME = 4, LAST_FRAME = 5,
+        GUIDE_AUDIO = 6
     };
     Kind        kind = IMAGE;
     int32_t     index = 0;
+    int32_t     frame = 0;                      /* GUIDE_AUDIO: from 0 */
     std::string name, filename, content_type;   /* the form part's */
     std::string data;                           /* the file's bytes */
 
