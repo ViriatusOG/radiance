@@ -2744,16 +2744,20 @@ public:
     }
     ~RelayoutPool() {
         finish();
-        for (StagedWeight& s : items_) if (s.own) delete[] s.in;
+        for (StagedWeight& s : items_) if (s.own) {
+            if (bounded_host_inputs_) std::free(s.in);
+            else delete[] s.in;
+        }
         if (region_) ::munmap(region_, (size_t)budget_);
     }
 
     /* Inputs share one budget-sized region, reused as weights finish: fresh memory per input
      * would page-fault every 4 KiB, which dominates load CPU time. An input with no hole its size
      * (larger than the budget, or fragmentation) gets its own allocation. */
-    void start(int threads, int64_t budget) {
+    void start(int threads, int64_t budget, bool bounded_host_inputs = false) {
         budget_ = budget;
-        void* p = ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
+        bounded_host_inputs_ = bounded_host_inputs;
+        void* p = bounded_host_inputs_ ? MAP_FAILED : ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) {
             region_ = (uint8_t*)p;
@@ -2956,8 +2960,31 @@ public:
 
     bool failed() const { return failed_; }
     int64_t peak() const { return peak_; }
+    bool host_outputs_only() const {
+        return std::none_of(items_.begin(), items_.end(), [](const StagedWeight& w) { return w.dev; });
+    }
+    bool bounded_host_inputs() const { return bounded_host_inputs_; }
+    static int check_host_fill(const std::vector<StagedWeight>& items, int64_t budget) {
+        if (budget < 0) return RAD_E_INVAL;
+        int64_t input_bytes = 0;
+        for (const StagedWeight& s : items) {
+            if (!s.prog || s.wi >= s.prog->weights.size() || !s.clip) return RAD_E_STATE;
+            if (s.in_bytes < 0 || s.in_bytes > budget - input_bytes || s.in_bytes > INT64_MAX - 4095)
+                return RAD_E_FULL;
+            const int64_t rounded = std::max(align_up(s.in_bytes, (int64_t)4096), (int64_t)4096);
+            if (rounded > budget - input_bytes) return RAD_E_FULL;
+            input_bytes += rounded;
+            const WeightInfo& w = s.prog->weights[s.wi];
+            const auto parts = clip_parts(*s.clip, s.dst, w.stored_bytes);
+            const bool partial = !(parts.size() == 1 && parts[0].first == 0 && parts[0].second == w.stored_bytes);
+            if (partial && (!w.identity || w.widen || w.narrow) && w.stored_bytes > kHostOutputBytes)
+                return RAD_E_FULL;
+        }
+        return RAD_OK;
+    }
 
 private:
+    friend struct LoaderTransferTestAccess;
     void worker() {
         for (;;) {
             int i = -1;
@@ -2990,9 +3017,14 @@ private:
             StagedWeight& s = items_[(size_t)i];
             if (!failed_) input(i);
             const uint8_t* src[RAD_ENC_MAX_PLANES] = {};
-            for (int k = 0; k < s.prog->weights[s.wi].n_sel; ++k) src[k] = s.in + s.plane_off[k];
+            if (s.in)
+                for (int k = 0; k < s.prog->weights[s.wi].n_sel; ++k) src[k] = s.in + s.plane_off[k];
             const int st = failed_ ? RAD_E_STATE : run(s, src);
-            if (s.own) { delete[] s.in; s.in = nullptr; s.own = false; }
+            if (s.own) {
+                if (bounded_host_inputs_) std::free(s.in);
+                else delete[] s.in;
+                s.in = nullptr; s.own = false;
+            }
             std::lock_guard<std::mutex> lk(mu_);
             if (s.in) give_back(s.in - region_, align_up(s.in_bytes, kHole));
             s.in = nullptr;
@@ -3019,8 +3051,14 @@ private:
                     return;
                 }
             }
-            s.in = new uint8_t[(size_t)s.in_bytes];
-            s.own = true;
+            s.in = bounded_host_inputs_ ? (uint8_t*)std::aligned_alloc((size_t)kHole, (size_t)std::max(n, kHole))
+                                       : new uint8_t[(size_t)s.in_bytes];
+            s.own = s.in != nullptr;
+            if (!s.in) {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!failed_) { failed_ = true; status_ = RAD_E_NOMEM; }
+                room_.notify_all();
+            }
         });
         return s.in;
     }
@@ -3043,7 +3081,9 @@ private:
      * one row of a column share at a time. */
     void take(const Copy& c) {
         const LoadRun& q = c.q;
-        uint8_t* base = q.stage >= 0 ? input(q.stage) + (intptr_t)q.dst : q.dst;
+        uint8_t* base = q.stage >= 0 ? input(q.stage) : q.dst;
+        if (!base) return;
+        if (q.stage >= 0) base += (intptr_t)q.dst;
         int64_t got = 0;
         for (int64_t y = c.j0 > q.foff && q.sp > 0 ? (c.j0 - q.foff) / q.sp : 0; y < q.ny; ++y) {
             const int64_t ps = q.foff + y * q.sp;
@@ -3131,11 +3171,18 @@ private:
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
         }
+        const int64_t n = w.stored_bytes;
+        std::vector<std::pair<int64_t, int64_t>> parts;
+        if (s.clip) parts = clip_parts(*s.clip, s.dst, n);
+        else parts.push_back({ 0, n });
+        if (parts.empty()) return RAD_OK;
         /* Stored as read (only reached by a weight with no sweep, no dtype conversion). */
         if (w.identity && !w.widen && !w.narrow) {
-            const int64_t n = w.stored_bytes;
-            if (!s.dev) { std::memcpy(s.dst, src[0], (size_t)n); return RAD_OK; }
-            const int us = upload(s.dst, src[0], n, s.device);
+            int us = RAD_OK;
+            for (const auto& [off, len] : parts) {
+                if (!s.dev) std::memcpy(s.dst + off, src[0] + off, (size_t)len);
+                else if ((us = upload(s.dst + off, src[0] + off, len, s.device)) < 0) break;
+            }
             if (us < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
                                 s.device, rad_strerror(us));
             return us;
@@ -3143,15 +3190,25 @@ private:
         RadTensor pt[RAD_ENC_MAX_PLANES];
         weight_planes(w, pt);
         for (int k = 0; k < w.n_sel; ++k) pt[k].data = const_cast<uint8_t*>(src[k]);
-        const int64_t n = w.stored_bytes;
-        std::vector<std::pair<int64_t, int64_t>> parts;
-        if (s.clip) parts = clip_parts(*s.clip, s.dst, n);
-        else parts.push_back({ 0, n });
         /* Laid out in a ring piece the copies read directly; one larger than a piece can be laid
          * out in host memory and goes up a chunk at a time. */
         std::unique_ptr<uint8_t[]> tmp;
         PinRing::Piece pc;
         uint8_t* out = s.dst;
+        std::unique_lock<std::mutex> host_output(host_output_mu_, std::defer_lock);
+        std::unique_ptr<uint8_t, decltype(&std::free)> host_tmp(nullptr, &std::free);
+        const bool partial_host = !s.dev &&
+            !(parts.size() == 1 && parts[0].first == 0 && parts[0].second == n);
+        if (partial_host) {
+            /* A layout hook writes a whole weight; neighbouring chunks may be unmapped. Keep
+             * one bounded output scratch, within kRefillHost's allowance, then clip CPU writes.
+             * Oversized background batches stay available for an ordinary demand restore. */
+            if (n > kHostOutputBytes) return RAD_E_FULL;
+            host_output.lock();
+            host_tmp.reset((uint8_t*)std::aligned_alloc((size_t)kHole, (size_t)align_up(n, kHole)));
+            if (!host_tmp) return RAD_E_NOMEM;
+            out = host_tmp.get();
+        }
         if (s.dev) {
             if (n <= ring_.largest()) pc = ring_.take(n);
             if (pc) {
@@ -3198,6 +3255,9 @@ private:
             if (st == RAD_OK) st = gs;
             if (st < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
                                 s.device, rad_strerror(st));
+        } else if (partial_host) {
+            for (const auto& [off, len] : parts)
+                std::memcpy(s.dst + off, out + off, (size_t)len);
         }
         return st;
     }
@@ -3206,6 +3266,8 @@ private:
     std::unique_ptr<std::once_flag[]> once_;   /* per item: its input is made once */
     std::unique_ptr<std::atomic<int64_t>[]> left_;   /* per item: bytes the sweep has yet to deliver */
     PinRing                    ring_;
+    static constexpr int64_t kHostOutputBytes = (int64_t)1 << 30;
+    std::mutex                 host_output_mu_;
     static constexpr int64_t kHole = 4096;     /* every input starts on a page of its own */
     uint8_t*                   region_ = nullptr;
     std::map<int64_t, int64_t> holes_;        /* the region's free ranges, offset -> bytes */
@@ -3217,6 +3279,7 @@ private:
     std::vector<int>           out_;      /* copies outstanding out of each sweep window */
     int64_t budget_ = 0, held_ = 0, pending_ = 0, peak_ = 0;
     bool done_ = false;
+    bool bounded_host_inputs_ = false;
     bool audited_ = false;   /* finish() runs its delivery audit once; the destructor calls it again */
     std::atomic<bool> failed_{false};
     int status_ = RAD_OK;
@@ -3280,7 +3343,14 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         if (a.foff != b.foff) return a.foff < b.foff;
         return a.span > b.span;
     });
-    pool->plan_direct(runs);
+    const bool host_only = pool->bounded_host_inputs();
+    if (host_only) {
+        if (!pool->host_outputs_only() ||
+            std::any_of(runs.begin(), runs.end(), [](const LoadRun& r) { return r.dev; }))
+            return RAD_E_INVAL;
+        /* The preflight bounds all staged inputs together. Avoid per-worker direct-gather
+         * scratch, which otherwise survives until its worker exits and adds to that bound. */
+    } else pool->plan_direct(runs);
 
     /* Bytes the sweep reads, for the progress line: the union of the runs (not their sum under TP,
      * nor the file size, since the mapped tier is excluded). */
@@ -3303,7 +3373,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * piece approaches 64 MiB. */
     int64_t widest = 0;
     for (const LoadRun& q : runs) if (q.ny > 1 && q.wb > widest) widest = q.wb;
-    if (widest > window) window = align_up(widest, 4096);
+    if (!host_only && widest > window) window = align_up(widest, 4096);
 
     /* Read through gaps up to kSegGap instead of starting another read: with reads queued at
      * depth six, a quarter megabyte is about what another read costs the drive. A segment starts
@@ -3323,6 +3393,14 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     constexpr size_t  kLag   = 3;
     constexpr int64_t kPiece = 8 << 20;
     constexpr int64_t kBlk   = DirectFile::alignment();
+    auto take_window = [&]() -> void* {
+        return host_only ? std::aligned_alloc((size_t)kBlk, (size_t)(window + 2 * kBlk))
+                         : sweep_take(window + 2 * kBlk);
+    };
+    auto give_window = [&](void* p) {
+        if (host_only) std::free(p);
+        else sweep_give(p, window + 2 * kBlk);
+    };
     DirectFile dio;
     const size_t nr = devices.size();
     std::vector<RadStream> st(nr, nullptr);
@@ -3335,6 +3413,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
 
     const int rc = [&]() -> int {
         for (size_t k = 0; k < nr; ++k) {
+            if (host_only) continue;
             /* Streams and events belong to the device current at creation, so bind it here; the
              * copies themselves need no bind, since a stream carries its device. */
             RAD_TRY(rad_dev_set(devices[k]));
@@ -3356,7 +3435,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                     humanb(window).c_str(), kWin);
         };
         const auto pin0 = std::chrono::steady_clock::now();
-        buf[0] = sweep_take(window + 2 * kBlk);
+        buf[0] = take_window();
         if (!buf[0]) { no_window(); return RAD_E_NOMEM; }
         if (const double ps = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin0).count(); ps > 1.0)
             RAD_WARN("load: pinning the first %s staging window took %.1f s", humanb(window).c_str(), ps);
@@ -3604,7 +3683,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                     std::lock_guard<std::mutex> lk(rmu);
                     if (rstop || rerr < 0) return;
                 }
-                void* p = sweep_take(window + 2 * kBlk);
+                void* p = take_window();
                 {
                     std::lock_guard<std::mutex> lk(rmu);
                     if (!p) {
@@ -3677,7 +3756,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         }
 
         /* The last host synchronisation before serving (spec §5.4). */
-        for (size_t k = 0; k < nr; ++k) RAD_TRY(rad_stream_sync(st[k]));
+        for (size_t k = 0; k < nr; ++k) if (st[k]) RAD_TRY(rad_stream_sync(st[k]));
         for (int b = 0; b < kWin; ++b) pool->drain(b);
 
         const double s = std::chrono::duration<double>(
@@ -3710,7 +3789,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             fatal("load: failed sweep streams did not drain; refusing to recycle their pinned windows");
     }
     for (int b = 0; b < kWin; ++b) pool->drain(b);
-    for (int b = 0; b < kWin; ++b) sweep_give(buf[b], window + 2 * kBlk);
+    for (int b = 0; b < kWin; ++b) give_window(buf[b]);
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
     for (size_t k = 0; k < nr; ++k) if (st[k]) rad_stream_destroy(st[k]);
     *read_out = read_bytes;
@@ -4172,7 +4251,8 @@ int Engine::load_weights() {
 }
 
 int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
-                           const std::function<int()>& before_writes) {
+                           const std::function<int()>& before_writes,
+                           RefillDestination destination) {
     if (spans.empty()) return RAD_OK;
     if (!file_) {
         RAD_ERR("restore: %zu stretch(es) of weights to refill and no container to refill them from",
@@ -4180,6 +4260,7 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
         return RAD_E_STATE;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    const bool host_only = destination == RefillDestination::Host;
     std::vector<LoadRun> runs;
     std::vector<StagedWeight> staged;
     int64_t total = 0, n_weights = 0;
@@ -4226,7 +4307,7 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
             }
             const size_t run0 = runs.size(), staged0 = staged.size();
             RAD_TRY(plan_container_weight(*file_, *e, r->program, i, sh, r->index, r->device,
-                                          const_cast<uint8_t*>(at), true, runs, staged, &total));
+                                          const_cast<uint8_t*>(at), !host_only, runs, staged, &total));
             if (staged.size() > staged0) staged.back().clip = &on;
             /* A run stored as is keeps to the clip: its rows, or the parts of them, inside it. */
             std::vector<LoadRun> cut;
@@ -4260,12 +4341,27 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
     }
     std::vector<int> devices;
     for (auto& r : ranks_) devices.push_back(r->device);
+    if (host_only) {
+        /* This optional batch owns at most 2 GiB of inputs in total (no mapped input arena or
+         * per-worker gather scratch), 1 GiB of serialized partial-output scratch, and eight
+         * fixed 64 MiB ordinary read windows. Leave the rest of kRefillHost for metadata.
+         * Reject before mapping destination chunks; ordinary demand restores retain their path. */
+        const int checked = RelayoutPool::check_host_fill(staged, kRefillStaging);
+        if (checked < 0) {
+            if (checked == RAD_E_FULL)
+                device_set_error("host fill: this batch exceeds the bounded reconstruction staging; "
+                                 "its remaining chunks stay on the drive for demand restore");
+            return checked;
+        }
+        if (before_writes) RAD_TRY(before_writes());
+    }
     RelayoutPool pool(staged);
     const unsigned hw = std::thread::hardware_concurrency();
     const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
-    pool.start(workers, kRefillStaging);
+    pool.start(workers, kRefillStaging, host_only);
     int64_t read_bytes = 0;
-    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, before_writes);
+    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes,
+                                     host_only ? std::function<int()>{} : before_writes);
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
@@ -4301,7 +4397,6 @@ int64_t Engine::fill_host(int64_t max_bytes) {
     }
 
     if (chosen.empty()) return n;
-    if (const int rc = dev_page_fill_begin(owner_, chosen); rc < 0) return rc;
     /* Adjacent chunks as one stretch for the refill. */
     std::vector<PageSpan> spans;
     for (const PageSpan& c : chosen) {
@@ -4310,8 +4405,13 @@ int64_t Engine::fill_host(int64_t max_bytes) {
         else
             spans.push_back(c);
     }
-    const int rc = refill_weights(spans, "host fill");
-    dev_page_fill_end(owner_, chosen, rc == RAD_OK);
+    bool mapped = false;
+    const int rc = refill_weights(spans, "host fill", [&] {
+        const int status = dev_page_fill_begin(owner_, chosen);
+        mapped = status >= 0;
+        return status;
+    }, RefillDestination::Host);
+    if (mapped) dev_page_fill_end(owner_, chosen, rc == RAD_OK);
     return rc < 0 ? rc : n + got;
 }
 

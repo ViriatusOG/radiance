@@ -148,9 +148,9 @@ public:
      * container, whole weights at a time. The bytes filled, or a negative status. From the fleet's
      * thread, with the model idle. */
     int64_t fill_host(int64_t max_bytes);
-    /* Host memory a refill (a restore's or a host fill's) holds while it runs, at most: the
-     * relayout pool's staged inputs (kRefillStaging), its workers' output buffers and the sweep's
-     * pinned windows. The fleet keeps this much room for it. */
+    /* Host-room allowance for a refill's staged inputs, output scratch and read windows. CPU
+     * container warming preflights its aggregate inputs and partial output against this allowance;
+     * ordinary loading may still need a complete unusually large weight. */
     static constexpr int64_t kRefillStaging = (int64_t)2 << 30;
     static constexpr int64_t kRefillHost = (int64_t)4 << 30;
     /* What release_host_spare gave back and unpark will pin again. */
@@ -407,8 +407,10 @@ private:
      * dev_page_refilled) is read from the container and laid out again at its current address,
      * through the load's sweep and relayout pool. */
     /* `before_writes`, when set, runs once before the refill's first write into the spans. */
+    enum class RefillDestination { Device, Host };
     int refill_weights(const std::vector<PageSpan>& spans, const char* what = "restore",
-                       const std::function<int()>& before_writes = {});
+                       const std::function<int()>& before_writes = {},
+                       RefillDestination destination = RefillDestination::Device);
     /* dev_page_in (or the live form with `left`) and the refill of what it mapped back empty. */
     int page_back_in(int64_t* left);
     int configure_kv();

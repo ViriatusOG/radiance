@@ -694,6 +694,11 @@ New host-fill batches also wait while any model has an active response or retain
 lease. Continuous traffic can postpone warming; demand-driven restores still proceed. A request
 arriving during an already-started batch can overlap that batch. The GiB limit bounds its bytes,
 not its duration, and brief dashboard leases can also defer the next batch.
+Container-backed weights are filled with CPU copies and CPU relayouts, using ordinary read
+windows rather than GPU upload streams or pinned staging. Every output write stays inside the
+selected chunks. A background batch exceeding the reconstruction staging limits is skipped for
+the rest of that park; its missing chunks remain available for demand restore. The separate disk
+spill readback and foreground restore paths still use device transfers where needed.
 Such a copy is exact until the mover writes the chunk, so a park after the restore keeps it and
 leaves by the swap; once written, or dropped for room, the chunk is refilled from the container
 again. Nothing of it ever comes from the card.
