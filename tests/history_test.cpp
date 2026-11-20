@@ -32,8 +32,12 @@ double of(const History::Row& r, const std::string& k) {
 }
 bool has(const History::Row& r, const std::string& k) { return std::isfinite(of(r, k)); }
 
-json stats(int64_t started, double steps_decode, double step_ns_decode, double total_requests) {
+/* steps_prefill / steps_mixed stay 0 unless a test passes them: they are what proves a sample
+ * carried prefill work, and the prefill rate is withheld without that proof. */
+json stats(int64_t started, double steps_decode, double step_ns_decode, double total_requests,
+           double steps_prefill = 0, double steps_mixed = 0) {
     return json::parse(R"({"started_at": )" + std::to_string(started) + R"(, "decode_tps": 120.5, "prefill_tps": 900,
+        "steps_prefill": )" + std::to_string(steps_prefill) + R"(, "steps_mixed": )" + std::to_string(steps_mixed) + R"(,
         "running": 2, "waiting": 1, "preempted": 0, "in_flight": 3, "prefix_hit_rate": 0.75,
         "kv_bytes_used": 4000, "kv_bytes_total": 16000, "kv_tokens_used": 1000, "kv_tokens_cached": 250,
         "step_ns_decode_best": 21000000, "jobs": {"running": 0, "done": 0, "last_ms": 0},
@@ -134,6 +138,27 @@ TEST(the_encoder_figures_come_from_two_stats_objects_and_a_reset_is_a_gap) {
     const History::Row none = History::model_row(stats(7, 150, 3.3e9, 10), &a, 1.0);
     CHECK(!has(none, "encBusy"));
     CHECK(!has(none, "encWait"));
+}
+
+
+/* The same trap as the frozen decode rate, from the other side. The scheduler ages the prefill
+ * window only when NOTHING is stepping, so while the model decodes prefill_tps holds the last
+ * prompt's rate: on a live lane it drew a flat ~3,500 tok/s prefill line across four minutes the
+ * model spent decoding, and the page's graph joined the gaps around it and called it throughput. */
+TEST(a_held_prefill_rate_is_a_gap_not_a_steady_throughput) {
+    const json a = stats(7, 100, 2.2e9, 10);
+    /* Fifty decode steps and no prefill work: the number is a leftover, so it is not emitted. */
+    CHECK(!has(History::model_row(stats(7, 150, 3.3e9, 10), &a, 1.0), "prefill"));
+    /* One prefill-bearing step in the interval proves it is current. A mixed step carries a
+     * prefill chunk as well as decode rows, so either shape licenses the figure. */
+    CHECK_EQ(of(History::model_row(stats(7, 150, 3.3e9, 10, 1, 0), &a, 1.0), "prefill"), 900.0);
+    CHECK_EQ(of(History::model_row(stats(7, 150, 3.3e9, 10, 0, 1), &a, 1.0), "prefill"), 900.0);
+    /* The engine's own zero is a reading and always passes: the graph reads 0 through idle. */
+    json idle = stats(7, 100, 2.2e9, 10);
+    idle["prefill_tps"] = 0.0;
+    CHECK_EQ(of(History::model_row(idle, &a, 1.0), "prefill"), 0.0);
+    /* The ring's first sample has nothing to be gated against, so the figure stands. */
+    CHECK_EQ(of(History::model_row(stats(7, 100, 2.2e9, 10), nullptr, 0), "prefill"), 900.0);
 }
 
 TEST(the_fleet_row_holds_telemetry_states_and_bytes_per_card) {

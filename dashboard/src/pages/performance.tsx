@@ -37,13 +37,21 @@ const METRICS: Metric[] = [
     show: (s, h) => { const c = h.col("step") ?? []; const v = c.length ? c[c.length - 1] : null;
                     return [fin(v) ? fMs(v) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
     lines: [{ key: "step", label: "step", color: 1 }, { key: "stepBest", label: "best", dash: true }], fmt: fMs, tight: true },
-  // Newest sample, and nothing prefilled is itself a figure. The engine leaves prefillRate out of a
-  // sample that processed no prompt tokens, so h.last() walked back up to 300 samples and kept the
-  // tile showing the last rate that was measured for five minutes after the prompt finished. A rate
-  // that is idle reads 0 on this page; the dash is only for a ring with no sample yet. The two draft
-  // tiles keep freezing on purpose: acceptance and tokens-per-step are undefined, not 0, when a
-  // sample drafted nothing, and 0% reads as a drafter that stopped working.
-  { id: "prefill", kinds: "chat", label: "Prefill", unit: "tok/s", show: (_s, h) => { const c = h.col("prefillRate") ?? []; if (!c.length) return [DASH]; const v = c[c.length - 1]; return [fin(v) ? fTps(v) : fTps(0)] }, lines: one("prefillRate", "tokens a second"), fmt: fTps, join: true },
+  // Newest sample, and nothing prefilled is itself a figure. The engine left prefillRate out of a
+  // sample that processed no prompt tokens (and now gates `prefill` the same way), so h.last() walked
+  // back up to 300 samples and kept the tile showing the last rate that was measured for five minutes
+  // after the prompt finished. A rate that is idle reads 0 on this page; the dash is only for a ring
+  // with no sample yet. The two draft tiles keep freezing on purpose: acceptance and
+  // tokens-per-step are undefined, not 0, when a sample drafted nothing, and 0% reads as a drafter
+  // that stopped working.
+  // The graph reads the SAME column the tile does, and must not join across gaps. `join` is uPlot's
+  // spanGaps: right for sparse EVENTS (a job that finished), a lie for a RATE, because it draws a
+  // straight line between the values on either side of a gap -- two prefills minutes apart came out
+  // as a flat 3,500 tok/s line through the minutes the model spent decoding. `prefill` is prefill
+  // tokens a second over wall time, gated in history.cpp so a held gauge is absent rather than
+  // plotted, which is exactly how `decode` works; `prefillRate` stays what a prefill that DID run
+  // measured, and is what the drift clause uses to tell a prefill sample from a decode one.
+  { id: "prefill", kinds: "chat", label: "Prefill", unit: "tok/s", show: (_s, h) => { const c = h.col("prefill") ?? []; if (!c.length) return [DASH]; const v = c[c.length - 1]; return [fin(v) ? fTps(v) : fTps(0)] }, lines: one("prefill", "tokens a second"), fmt: fTps },
   // Time in the vision encoder. A model reading an image can sit here for seconds with its cards
   // busy and nothing stepping, which the decode and prefill lines alone show as idle.
   { id: "encode", kinds: "chat", label: "Vision encode", unit: "%",

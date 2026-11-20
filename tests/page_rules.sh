@@ -19,10 +19,11 @@ good() { echo "  ok   $1"; }
 echo "== a tile's figure is the newest sample, never the newest one that had a value =="
 # Series.last() scans back 300 samples (five minutes) for a non-null entry. The engine omits a
 # column from a sample that measured nothing -- history.cpp drops prefillRate when zero prompt
-# tokens were processed, step when no decode step ran, stepAny when no step ran -- so a tile built
-# on last() keeps the previous figure on screen long after the work stopped. Rates may then read 0
-# (that is what happened); a duration reads a dash, because 0 ms is a step that cannot exist.
-for col in step stepAny prefillRate; do
+# tokens were processed, prefill when no prefill-bearing step ran, step when no decode step ran,
+# stepAny when no step ran -- so a tile built on last() keeps the previous figure on screen long
+# after the work stopped. Rates may then read 0 (that is what happened); a duration reads a dash,
+# because 0 ms is a step that cannot exist.
+for col in step stepAny prefill prefillRate; do
   if grep -q "last(\"$col\")" "$PAGE"; then
     bad "\"$col\" is read with last(): the tile holds its stale figure while the column is null"
   else
@@ -41,6 +42,26 @@ echo "== a tile's detail line reads engine stats only =="
 grep -q 'of best' "$PAGE" \
   && bad "the page computes a percent-against-best drift figure" \
   || good "no page-side percent-against-best figure"
+
+echo "== a rate's graph never joins across its gaps, and matches its own tile =="
+# The prefill tile was on the other side of that bug: the graph drew prefillRate with uPlot's
+# spanGaps switched on (the `join` prop), so it connected the two values around every idle gap and
+# showed a flat ~3,500 tok/s prefill line across four minutes the lane spent decoding. Decode never
+# does that: its line comes from a column history.cpp withholds unless steps_decode advanced. So a
+# rate may join nothing -- `join` stays for sparse EVENTS (jobTime), where a gap is just a moment
+# with no event -- and the tile and its graph must read the same column, or the pair cannot be read
+# together (a tile at 0 beside a graph edge at 3,500 is two different figures, not a contradiction
+# the reader can resolve).
+if grep -qE '\{ id: "(prefill|decode|reqs|step)".*join: true' "$PAGE"; then
+  bad "a rate tile passes join: true -- spanGaps draws throughput across samples that measured none"
+else
+  good "the rate graphs leave a gap where nothing was measured"
+fi
+if grep -qE 'id: "prefill".*col\("prefill"\).*one\("prefill"' "$PAGE"; then
+  good "the Prefill tile and its graph read the same gated column"
+else
+  bad "the Prefill tile and its graph read different columns"
+fi
 
 echo "== a tile does not clip its own figure or its detail line =="
 # `truncate` is overflow:hidden + nowrap. On the detail line it cut the drift clause off after the

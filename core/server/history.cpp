@@ -69,7 +69,17 @@ History::Row History::model_row(const json& s, const json* prev, double dt) {
     if (const double d = num(s, "decode_tps");
         std::isfinite(d) && (d == 0.0 || !prev || num0(s, "steps_decode") > num0(*prev, "steps_decode")))
         put(row, "decode", d);
-    put(row, "prefill", num(s, "prefill_tps"));
+    /* The same trap as decode, from the other side. The scheduler's idle decay is keyed to the last
+     * step of ANY kind, so while the model only decodes the prefill window is never aged and
+     * prefill_tps keeps reporting the last prompt's rate: on a live lane that drew a flat
+     * ~3,500 tok/s prefill line across four minutes the model spent decoding. Emit it only where a
+     * prefill-bearing step proves prefill ran, or where it reads a true zero -- a zero is a reading
+     * and never a leftover. A mixed step carries a prefill chunk too, so it counts as progress. */
+    if (const double p = num(s, "prefill_tps");
+        std::isfinite(p) && (p == 0.0 || !prev
+                             || num0(s, "steps_prefill") + num0(s, "steps_mixed")
+                                    > num0(*prev, "steps_prefill") + num0(*prev, "steps_mixed")))
+        put(row, "prefill", p);
     put(row, "running", num(s, "running"));
     put(row, "waiting", num(s, "waiting"));
     put(row, "preempted", num(s, "preempted"));
