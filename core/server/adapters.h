@@ -168,6 +168,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
     o.step_ns_decode_best = m.step_ns_decode_best;
     o.step_ns_decode_recent = m.step_ns_decode_recent;
+    o.encode_items = m.encode_items;      o.encode_patches = m.encode_patches;
+    o.encode_ns = m.encode_ns;            o.encode_pending = m.encode_pending;
     return o;
 }
 

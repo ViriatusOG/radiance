@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <chrono>
 #include <set>
 #include <condition_variable>
@@ -159,14 +160,49 @@ double card_temp_mc(const std::string& hwmon) {
     return sysfs_number(hwmon + "/temp1_input");
 }
 
-/* What the driver reports of a card right now: busy share, power and temperature, on the routes of
- * a dashboard being watched and nowhere on a request's path. A card that reports none adds none. */
+/* The hwmon sensor `<kind>N_input` whose `<kind>N_label` reads `label`, -1 when none does. amdgpu
+ * labels its clocks (freq1 sclk, freq2 mclk) and temperatures (edge, junction, mem); the label,
+ * not the index, says which is which. */
+double hwmon_labelled(const std::string& hwmon, const char* kind, const char* label) {
+    for (int i = 1; i <= 8; ++i) {
+        const std::string t = hwmon + "/" + kind + std::to_string(i);
+        std::ifstream f(t + "_label");
+        std::string l;
+        if (!(f >> l) || l != label) continue;
+        return sysfs_number(t + "_input");
+    }
+    return -1;
+}
+
+/* The current level of a pp_dpm_* clock table, in MHz: the line the driver marks with `*`
+ * ("1: 2683Mhz *"). -1 when the file cannot be read or marks no line. */
+double dpm_current_mhz(const std::string& path) {
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.find('*') == std::string::npos) continue;
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) return -1;
+        char* end = nullptr;
+        const double v = std::strtod(line.c_str() + colon + 1, &end);
+        return end != line.c_str() + colon + 1 ? v : -1;
+    }
+    return -1;
+}
+
+/* What the driver reports of a card right now: busy shares, power, temperatures, clocks and fan, on
+ * the routes of a dashboard being watched and nowhere on a request's path. A figure the driver does
+ * not report adds no key: mem_busy_percent is missing on some amdgpu and kernel pairs, and a card
+ * with no fan of its own (a passive one) has no pwm1. The clocks are the hwmon averages, else the
+ * current DPM level, which is coarser: a level is a ceiling the firmware may run under. */
 void card_telemetry(int card, json& o) {
     namespace fs = std::filesystem;
     const std::string bdf = dev_pci_address(card);
     if (bdf.empty()) return;
     const std::string dev = "/sys/bus/pci/devices/" + bdf;
     if (const double busy = sysfs_number(dev + "/gpu_busy_percent"); busy >= 0) o["busy"] = busy / 100.0;
+    if (const double busy = sysfs_number(dev + "/mem_busy_percent"); busy >= 0) o["mem_busy"] = busy / 100.0;
+    double sclk_hz = -1, mclk_hz = -1;
     std::error_code ec;
     for (const auto& h : fs::directory_iterator(dev + "/hwmon", ec)) {
         const std::string hp = h.path().string();
@@ -174,8 +210,18 @@ void card_telemetry(int card, json& o) {
         if (uw < 0) uw = sysfs_number(hp + "/power1_input");
         if (uw >= 0) o["power_w"] = uw / 1e6;
         if (const double mc = card_temp_mc(hp); mc >= 0) o["temp_c"] = mc / 1000.0;
+        if (const double mc = hwmon_labelled(hp, "temp", "mem"); mc >= 0) o["temp_mem_c"] = mc / 1000.0;
+        sclk_hz = hwmon_labelled(hp, "freq", "sclk");
+        mclk_hz = hwmon_labelled(hp, "freq", "mclk");
+        const double pwm = sysfs_number(hp + "/pwm1"), pwm_max = sysfs_number(hp + "/pwm1_max");
+        if (pwm >= 0 && pwm_max > 0) o["fan_pct"] = std::min(100.0, pwm / pwm_max * 100.0);
+        else if (const double rpm = sysfs_number(hp + "/fan1_input"); rpm >= 0) o["fan_rpm"] = rpm;
         break;
     }
+    const double sclk = sclk_hz >= 0 ? sclk_hz / 1e6 : dpm_current_mhz(dev + "/pp_dpm_sclk");
+    const double mclk = mclk_hz >= 0 ? mclk_hz / 1e6 : dpm_current_mhz(dev + "/pp_dpm_mclk");
+    if (sclk >= 0) o["sclk_mhz"] = sclk;
+    if (mclk >= 0) o["mclk_mhz"] = mclk;
 }
 
 /* A fleet's hardware queues are opened while their card has room, never on a full one.

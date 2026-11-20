@@ -35,7 +35,12 @@ export interface FleetModel {
   capabilities?: Record<string, unknown>
   [k: string]: unknown
 }
-export interface FleetCard { card: number; name?: string; vram_bytes?: number; free_bytes?: number; busy?: number; power_w?: number; temp_c?: number; queues?: number; queues_idle?: number; queue_bytes?: number }
+export interface FleetCard {
+  card: number; name?: string; vram_bytes?: number; free_bytes?: number; busy?: number; power_w?: number; temp_c?: number; queues?: number; queues_idle?: number; queue_bytes?: number
+  /** Each only where the driver reports it: memory busy as a ratio, clocks in MHz, the memory's
+   * temperature beside the junction's, and the fan as a percentage of its full speed. */
+  mem_busy?: number; sclk_mhz?: number; mclk_mhz?: number; temp_mem_c?: number; fan_pct?: number
+}
 export interface Fleet {
   version: string; uptime_s: number
   models: FleetModel[]; cards: FleetCard[]
@@ -67,6 +72,9 @@ export interface Stats {
   requests?: RunningRequest[]
   experts?: Experts
   loras?: LoRAStat[]
+  // The vision encoder: images and patches encoded and the time spent on them (counters since the
+  // model loaded), and the images waiting for it now.
+  encode_items?: number; encode_patches?: number; encode_ns?: number; encode_pending?: number
 }
 export interface Session { id: number | string; label?: string; tokens: number; bytes: number; idle_s: number; on_device: number; on_host: number; moving: boolean; snapshots: number; resume_tokens: number; lora?: string }
 export interface Sessions {

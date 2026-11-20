@@ -170,6 +170,12 @@ struct SchedMetrics {
     /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+    /* The encoder: cumulative items, patches and nanoseconds, and the items waiting or being
+     * encoded now (rad::SchedMetrics::encode_items). */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
 };
 
 

@@ -22,6 +22,12 @@ static int64_t mono_us() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+/* Nanoseconds on the same clock, for the encoder's time (encodes_done). */
+static int64_t mono_ns() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 /* Reclaiming KV from the prefix cache for a request: at most kEvictRounds rounds of
  * kEvictBlocks blocks each. Bounded, because an unbounded loop on the scheduler thread stalls the
  * server silently; batched, so a large shortfall does not walk the LRU list block by block. */
@@ -2826,10 +2832,37 @@ bool Scheduler::encodes_pending() const {
     return !enc_want_.empty();
 }
 
+/* A pass of the encoder can run for seconds with no step, so no step publishes while it runs.
+ * Its start and end are published here instead, and the observers' copy carries the start
+ * (SchedMetrics::encode_started_ns): a reader adds the time since, and the encoder reads busy
+ * while it encodes rather than all at once when it is done. Both publications wait out a reader
+ * instead of skipping, and the end's counter update is made under pub_mu_, so no reader sees the
+ * pass ended and its time not yet added, or the time since its start larger than the pass. */
 void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
-    std::lock_guard<std::mutex> lk(mu_);
-    out->clear();
-    out->swap(enc_want_);
+    std::lock_guard<std::mutex> pk(pub_mu_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        out->clear();
+        out->swap(enc_want_);
+        if (out->empty()) return;
+        enc_active_ = (int64_t)out->size();
+        enc_started_ns_ = mono_ns();
+    }
+    publish_held();
+}
+
+void Scheduler::encodes_done(int64_t items, int64_t patches) {
+    std::lock_guard<std::mutex> pk(pub_mu_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!enc_started_ns_) return;
+        m_.encode_items += items;
+        m_.encode_patches += patches;
+        m_.encode_ns += mono_ns() - enc_started_ns_;
+        enc_started_ns_ = 0;
+        enc_active_ = 0;
+    }
+    publish_held();
 }
 
 /* ------------------------------------------------------------------ the step's head depth */
@@ -3952,9 +3985,15 @@ int32_t Scheduler::conv_window() const {
 }
 
 /* ------------------------------------------------------------------ metrics */
+/* The running encoder pass's time so far, added at read (take_encodes). */
+static SchedMetrics with_encode_in_flight(SchedMetrics m) {
+    if (m.encode_started_ns) m.encode_ns += mono_ns() - m.encode_started_ns;
+    return m;
+}
+
 SchedMetrics Scheduler::metrics() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return metrics_locked();
+    return with_encode_in_flight(metrics_locked());
 }
 
 void Scheduler::publish(bool idle) {
@@ -3973,9 +4012,22 @@ void Scheduler::publish(bool idle) {
     pub_at_us_ = now;
 }
 
+/* publish() with pub_mu_ already held by the caller, so it cannot be skipped (take_encodes). */
+void Scheduler::publish_held() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        scratch_m_ = metrics_locked();
+        scratch_reqs_.resize(reqs_.size());
+        scratch_reqs_.resize((size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+    }
+    pub_m_ = scratch_m_;
+    pub_reqs_.swap(scratch_reqs_);
+    pub_at_us_ = mono_us();
+}
+
 SchedMetrics Scheduler::observed_metrics() const {
     std::lock_guard<std::mutex> lk(pub_mu_);
-    return pub_m_;
+    return with_encode_in_flight(pub_m_);
 }
 
 int Scheduler::observed_requests(ReqStat* out, int max) const {
@@ -3996,6 +4048,9 @@ SchedMetrics Scheduler::metrics_locked() const {
         }
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;
+    /* Items asked for and not yet encoded, the ones being encoded now among them. */
+    m.encode_pending = (int64_t)enc_want_.size() + enc_active_;
+    m.encode_started_ns = enc_started_ns_;
     for (int32_t slot : waiting_)
         if (reqs_[(size_t)slot]->req->state == ReqState::Preempted) ++m.preempted_waiting;
 
