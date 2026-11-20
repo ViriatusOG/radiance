@@ -723,6 +723,7 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 |---|---|---|
 | `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `gated_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `swiglu_clamped_had_quant_i8g` | `M` `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `gate_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
@@ -742,6 +743,13 @@ one launch for a norm read by three projections (q, k and v), and none between t
 the down projection. `out_bf16` receives the unrotated value, for a bf16 consumer. `n` is a
 multiple of `group`. A rotated code read as a plain one, or the reverse, gives a model that runs
 and is wrong, so these are separate ops.
+
+`swiglu_clamped_had_quant_i8g` is `swiglu_clamped` with `had_quant_act_i8g`'s quantiser on its
+pass: each element is `swiglu_clamped`'s value at `limit`, rounded to bf16, then the `group`-wide
+rotation and int8 codes per (row, `group`), byte-identical to the pair. `group` is 128 or 256 and
+`n` a multiple of it. plugin/glm serves it (device and host rows); GateQuantFP8 issues it for a
+clamped gate feeding a rotated int8 pair only where a loaded library declares it, and otherwise
+runs the pair.
 
 `gate_had_quant_i8g` is `gate_quant_fp8`'s product (the gate in its own operand: a gated
 attention's gate is a column slice of the `[q|gate]` projection) with `had_quant_act_i8g`'s
@@ -3488,8 +3496,8 @@ bytes are an f16 scale for channels `[0,D/2)`, followed by an f16 scale for `[D/
 its K and V inputs. Each latent value is its signed code times its half's scale in f32; **both**
 scales participate in QK and PV, and the softmax denominator is the sum of unscaled probabilities.
 Queries and outputs keep `dtype` and width D. The i8 row's channels are contiguous, but token/page
-pitches may contain padding. No BF16 rounding is inserted after dequantization. This host contract
-does not enable an i8 `mla_attn` device row or GLM's i8-cache deployment option.
+pitches may contain padding. No BF16 rounding is inserted after dequantization. The device rows
+at `kv_dtype` `i8` are plugin/glm's (`plugin/glm/README.md`), not libr4d's.
 
 libr4d has three `mla_attn` rows, all at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
 matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
