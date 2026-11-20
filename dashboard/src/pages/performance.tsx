@@ -164,10 +164,13 @@ export function Performance({ scope, kind, slots, noun, model, cards }: { scope:
                 className={cn("relative -mb-px flex min-w-0 flex-col gap-1 border-r border-b px-4 py-3 text-left transition-colors outline-none last:border-r-0 hover:bg-accent/50 focus-visible:bg-accent/60", on && "bg-accent/40")}>
                 <span className="truncate text-xs font-medium text-muted-foreground">{m.id === "jdone" && noun ? noun : m.label}</span>
                 <span className="num flex items-baseline gap-1 text-xl leading-none font-semibold tracking-tight">
-                  <span className="truncate">{v}</span>
+                  {/* Not `truncate`: a flex child with it shrinks before its unit sibling, so a five-character
+                      figure came out as `12.91 ⋯`. This is the tile the Performance page actually draws -
+                      `Kpi` is the Overview/Requests/Sessions one. */}
+                  <span>{v}</span>
                   {(unit ?? m.unit) && <span className="text-xs font-normal text-muted-foreground">{unit ?? m.unit}</span>}
                 </span>
-                <span className="min-h-4 truncate text-xs text-muted-foreground">{det}</span>
+                <span className="min-h-4 text-xs text-muted-foreground break-words [overflow-wrap:anywhere]">{det}</span>
                 {on && <span className="absolute inset-x-0 bottom-0 h-0.5 bg-primary" />}
               </button>
             )

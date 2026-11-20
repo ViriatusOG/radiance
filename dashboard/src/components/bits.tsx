@@ -9,10 +9,10 @@ export function Kpi({ label, value, unit, detail, className }: { label: string; 
     <div className={cn("flex min-w-0 flex-col gap-1 rounded-xl border bg-card px-4 py-3.5", className)}>
       <span className="truncate text-xs font-medium text-muted-foreground">{label}</span>
       <span className="num flex items-baseline gap-1 text-2xl leading-none font-semibold tracking-tight">
-        <span className="truncate">{value}</span>
+        <span>{value}</span>
         {unit && <span className="text-sm font-normal text-muted-foreground">{unit}</span>}
       </span>
-      <span className="min-h-4 truncate text-xs text-muted-foreground">{detail}</span>
+      <span className="min-h-4 text-xs text-muted-foreground break-words [overflow-wrap:anywhere]">{detail}</span>
     </div>
   )
 }
