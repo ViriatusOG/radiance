@@ -237,6 +237,7 @@ public:
 
 private:
     friend struct EngineBaseWeightsTestAccess;
+    friend struct EngineQuietTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -549,6 +550,7 @@ private:
     int64_t                       xflex_settle();
     int                           xflex_grow_to(int64_t bytes, ExpertMemoryOps& memory);
     /* run_quiet's handoff to the step loop (quiet_service). */
+    std::mutex quiet_call_mu_;  /* one caller owns the pending callback through completion */
     std::mutex                    quiet_mu_;
     std::condition_variable       quiet_cv_;
     std::atomic<bool>             quiet_pending_{false};

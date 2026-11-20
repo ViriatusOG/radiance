@@ -914,6 +914,7 @@ int Engine::unpark_with(std::string* why, int64_t* left) {
 }
 
 int Engine::run_quiet(const std::function<int()>& fn) {
+    std::lock_guard<std::mutex> caller(quiet_call_mu_);
     std::unique_lock<std::mutex> lk(quiet_mu_);
     quiet_fn_ = &fn;
     quiet_done_ = false;
