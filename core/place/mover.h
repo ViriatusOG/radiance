@@ -537,6 +537,11 @@ public:
      * slots can be filled at once, while uncovered ones empty as their units drop and their
      * quarantine clears. loan_held() is how far into the lender's memory the slab still reaches;
      * the lender may not reuse those bytes until it has fallen to the loan. */
+    /* Published capacity, distinct from physically backed pages and held units. A recall
+     * must never turn surplus physical backing into a larger usable loan. */
+    int64_t loan_offered(int lender) const {
+        return lender >= 0 && lender < kLenders ? loan_[lender] : 0;
+    }
     int     set_loan(int lender, int64_t amount);
     int64_t loan_held(int lender) const;
     int64_t loan(int lender) const { return loan_[lender]; }

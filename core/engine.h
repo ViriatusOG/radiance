@@ -66,12 +66,16 @@ struct TierJob;
 struct StepSlot;
 class ExpertStats;   /* place/xstats.h */
 class XsTally;
+class ExpertMemoryOps;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
 
+struct EngineMemoryTestAccess;
+
 class Engine {
 public:
+    friend struct EngineMemoryTestAccess;
     explicit Engine(Config cfg);
     ~Engine();
 
@@ -136,6 +140,12 @@ public:
      * Set at bring-up. */
     bool one_step() const { return embedding_; }
     bool parked() const { return parked_.load(std::memory_order_acquire); }
+    /* A failed fence forbids paging and fallback unload until a later complete drain succeeds. */
+    int memory_fence_status() const { return memory_fence_status_.load(std::memory_order_acquire); }
+    int prepare_unload(); // only after all producer threads have joined
+    int retry_memory_fence();
+    bool producers_stopped() const { return producers_stopped_.load(std::memory_order_acquire); }
+    bool stopping() const { return stopping_.load(std::memory_order_acquire); }
     /* While parked, the linear-state snapshot store's pinned host memory goes back to the host:
      * the park emptied the prefix cache, so the store holds no snapshot, and the next unpark pins
      * it again before paging in (4 GiB pins in about 0.3 s, far less than the host copies of
@@ -489,6 +499,10 @@ private:
      * once it is idle with nothing in flight and waits there until hold_req_ clears. */
     std::atomic<bool>             hold_req_{false};
     std::atomic<bool>             hold_ack_{false};
+    std::atomic<int>              hold_status_{RAD_OK};
+    std::atomic<int>              memory_fence_status_{RAD_OK};
+    std::atomic<bool>             producers_stopped_{true};
+    std::atomic<bool>             map_fence_pending_{false};
     /* hold_point's wait: woken when the hold clears (hold_release) or the engine stops
      * (wake_hold). */
     std::mutex                    hold_mu_;
@@ -497,7 +511,11 @@ private:
     void                          hold_release();
     void                          wake_hold();
     int                           unpark_with(std::string* why, int64_t* left);
-    void                          drain_streams();
+    int                           drain_streams();
+    int                           drain_tier_streams();
+    int                           report_tier_jobs(std::vector<TierJob>& jobs,
+                                                   const std::vector<char>& ok, uint64_t now);
+    int                           release_deferred_quietly();
     std::vector<int>              rank_devices() const;   /* each rank's card, in rank order */
     server::Server*               srv_ = nullptr;   /* run_server's, while it runs */
     std::atomic<int64_t>          background_jobs_{0};  /* server::Deps::background */
@@ -509,7 +527,9 @@ private:
     int64_t                       flex_want_ = 0;
     bool                          flex_preempt_ = false;
     bool                          flex_kv_ = true;          /* the cache's flex may go too */
-    int64_t                       flex_got_ = -1;
+    int64_t                       flex_got_ = 0;
+    bool                          flex_done_ = false;
+    int                           flex_status_ = RAD_OK;
     uint64_t                      flex_room_ns_ = 0;
     void                          flex_service();
     void                          flex_room_tick(uint64_t now_ns);
@@ -527,6 +547,7 @@ private:
     void                          xflex_tick(bool busy);
     int64_t                       xflex_give(int64_t bytes);
     int64_t                       xflex_settle();
+    int                           xflex_grow_to(int64_t bytes, ExpertMemoryOps& memory);
     /* run_quiet's handoff to the step loop (quiet_service). */
     std::mutex                    quiet_mu_;
     std::condition_variable       quiet_cv_;

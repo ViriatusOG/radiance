@@ -326,6 +326,7 @@ public:
 
 private:
     friend struct FleetHostFillTestAccess;
+    friend struct FleetMemoryTestAccess;
     struct Model;
 
     /* The broker one load hands its engine: the fleet's grant, for that model. */
@@ -476,7 +477,7 @@ private:
      * coming back costs it, within [5 s, 30 s]. */
     bool   in_quantum(const Model& m, const server::Front::Activity& a, uint64_t now) const;
     bool   take_from(Model& victim, const std::map<int, int64_t>& want, const std::string& why);
-    void   unload(Model& m, int64_t drain_ms, const std::string& why);
+    bool   unload(Model& m, int64_t drain_ms, const std::string& why);
     /* 1 when `want` left, 0 when less could leave (nothing more to page out), -1 when the model
      * should unload instead (a park would cost more than its reload) or the park failed. */
     int    park(Model& m, const std::map<int, int64_t>& want, const std::string& why);
@@ -971,6 +972,11 @@ void Fleet::reclaim_flex(const Model& m, const std::map<int, int64_t>& need) {
             if (sh <= 0) break;
             const bool preempt = !experts && o->entry.priority < m.entry.priority;
             const int64_t got = o->engine->flex_release(sh, preempt, 10000, /*kv=*/!experts);
+            if (got < 0) {
+                RAD_WARN("model %s: flex recall failed; no released memory is credited: %s",
+                         o->entry.name.c_str(), rad_strerror((int)got));
+                continue;
+            }
             if (got > 0)
                 RAD_INFO("model %s: gave back %s of its %s flex for %s", o->entry.name.c_str(),
                          humanb(got).c_str(), experts ? "experts'" : "cache's", m.entry.name.c_str());
@@ -1206,8 +1212,7 @@ bool Fleet::take_from(Model& victim, const std::map<int, int64_t>& want, const s
     /* Short: what is left of it on the card is not pageable; make_room unloads a parked model
      * only as the last resort, so it keeps its copy. */
     if (r == 0) return false;
-    unload(victim, fc_.drain_timeout_ms, why);
-    return true;
+    return unload(victim, fc_.drain_timeout_ms, why);
 }
 
 int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string& why) {
@@ -1304,10 +1309,16 @@ int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string&
     return short_of ? 0 : 1;
 }
 
-void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
+bool Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     std::lock_guard<std::recursive_mutex> room(room_mu_);
     join_spill(m);
-    if (!m.engine) return;
+    if (!m.engine) return true;
+    if (m.engine->memory_fence_status() < 0 && !m.engine->stopping() &&
+        m.engine->retry_memory_fence() < 0) {
+        RAD_ERR("model %s: unload refused: a failed device fence still protects its memory",
+                m.entry.name.c_str());
+        return false;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     RAD_INFO("model %s: unloading: %s", m.entry.name.c_str(), why.c_str());
     std::map<int, int64_t> before;
@@ -1324,6 +1335,13 @@ void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     }
     m.engine->request_stop(drain_ms);
     if (m.serve.joinable()) m.serve.join();
+    if (m.engine->prepare_unload() < 0) {
+        /* All producers are joined, but the device can still read the allocations. Keeping
+         * this process serving other engines would conceal a terminal device failure. */
+        front_.fail(m.entry.name, "device streams did not drain during unload", 15000);
+        fatal("model %s: refusing unsafe unload after producer shutdown; exiting for restart",
+              m.entry.name.c_str());
+    }
     std::shared_ptr<Engine> gone;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1347,6 +1365,7 @@ void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     for (int c : was_on)
         if (card_quiet(c, &m)) (void)dev_stream_trim(c, kReserveQueues);
     RAD_INFO("model %s: unloaded in %.2f s", m.entry.name.c_str(), secs_since(t0));
+    return true;
 }
 
 void Fleet::join_spill(Model& m) {
@@ -1875,7 +1894,10 @@ void Fleet::restore_op(Model& m) {
     if (rrc < 0) {
         RAD_INFO("model %s: no room to come back on card(s) %s (%s); it loads fresh",
                  m.entry.name.c_str(), cards_str(m.cards).c_str(), why.c_str());
-        unload(m, 0, "it could not come back on its cards");
+        if (!unload(m, 0, "it could not come back on its cards")) {
+            front_.fail(m.entry.name, "device fence prevents restore reload", 15000);
+            return;
+        }
         room.unlock();
         load_op(m);
         return;
@@ -1897,7 +1919,10 @@ void Fleet::restore_op(Model& m) {
     host_reserve_.fetch_sub(Engine::kRefillHost);
     if (urc < 0) {
         RAD_ERR("model %s: could not come back: %s", m.entry.name.c_str(), w.c_str());
-        unload(m, 0, "it could not come back");
+        if (!unload(m, 0, "it could not come back")) {
+            front_.fail(m.entry.name, "device fence prevents restore reload", 15000);
+            return;
+        }
         room.unlock();
         load_op(m);
         return;
@@ -2399,7 +2424,8 @@ std::string Fleet::reload() {
     for (size_t i = 0; i < models_.size();) {
         Model& m = *models_[i];
         if (std::find(keep.begin(), keep.end(), m.entry.name) != keep.end()) { ++i; continue; }
-        unload(m, fc_.drain_timeout_ms, "removed from the file");
+        if (!unload(m, fc_.drain_timeout_ms, "removed from the file"))
+            return "model " + m.entry.name + ": device fence prevents removal";
         front_.remove(m.entry.name);
         history_.forget(m.entry.name);
         RAD_INFO("model %s: removed", m.entry.name.c_str());
@@ -2421,7 +2447,8 @@ std::string Fleet::reload() {
             continue;
         }
         if (m->entry.args != e.args || m->entry.cards != e.cards) {
-            unload(*m, fc_.drain_timeout_ms, "its configuration changed");
+            if (!unload(*m, fc_.drain_timeout_ms, "its configuration changed"))
+                return "model " + m->entry.name + ": device fence prevents reconfiguration";
             RAD_INFO("model %s: reconfigured", e.name.c_str());
             std::lock_guard<std::mutex> lk(mu_);
             m->claim = 0;
@@ -2825,7 +2852,10 @@ void Fleet::add_routes() {
                 int expect = kIdle;
                 if (!m->op.compare_exchange_strong(expect, unl ? kUnload : kEvict)) return std::string("busy");
                 std::string res;
-                if (unl) unload(*m, fc_.drain_timeout_ms, "asked by the admin route");
+                if (unl) {
+                    if (!unload(*m, fc_.drain_timeout_ms, "asked by the admin route"))
+                        res = "device fence prevents unload; memory remains owned";
+                }
                 else if (!m->parked && park(*m, {}, "asked by the admin route") < 0) res = "could not park (see the log)";
                 m->op.store(kIdle);
                 return res;

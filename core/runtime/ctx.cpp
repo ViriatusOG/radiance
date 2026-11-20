@@ -59,7 +59,15 @@ int Ctx::init(const CtxDesc& d) {
     return RAD_OK;
 }
 
+int Ctx::quiesce() {
+    if (stream_) RAD_TRY(rad_stream_sync(stream_));
+    if (lane1_) RAD_TRY(rad_stream_sync(lane1_));
+    return RAD_OK;
+}
+
 void Ctx::shutdown() {
+    if (quiesce() < 0)
+        fatal("refusing to free a runtime context whose compute streams did not drain");
     oracle_close();
     xp_close();
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
