@@ -1,11 +1,15 @@
 /* plugin/glm/glm.h -- GLM-5.3-Flash's own kernels, as a kernel plugin beside libr4d.
  *
- * One op so far, `swiglu_clamped_had_quant_i8g`: GLM's clamped SwiGLU (`swiglu_clamped`) and the
- * rotated int8 quantiser an i8a8h consumer reads (`had_quant_act_i8g`) in one pass. glm5next issues
- * it only where a loaded library declares it (GateQuantFP8::fuse_clamped, rad_op_declared), and no
- * other architecture issues it, so loading this plugin changes no other model's graph. Its bytes are
- * the chain's: each element is swiglu_clamped's expression rounded to bf16, then the 128-wide
- * Hadamard and the codes and scale had_quant_act_i8g writes over that bf16 row.
+ * Two things:
+ * - One op of its own, `swiglu_clamped_had_quant_i8g`: GLM's clamped SwiGLU (`swiglu_clamped`) and
+ *   the rotated int8 quantiser an i8a8h consumer reads (`had_quant_act_i8g`) in one pass. Its bytes
+ *   are the chain's: each element is swiglu_clamped's expression rounded to bf16, then the 128-wide
+ *   Hadamard and the codes and scale had_quant_act_i8g writes over that bf16 row. GateQuantFP8
+ *   issues it only where a loaded library declares it (fuse_clamped, rad_op_declared), for a clamped
+ *   gate (not `swiglu_step`) feeding a rotated int8 pair, so loading this plugin changes no other
+ *   model's graph today.
+ * - Device rows for the generic `mla_attn` at `kv_dtype` `i8` (glm_mla.hip), which no libr4d row
+ *   serves.
  *
  * The schema, the row, the argument reader, the operand shapes and the declared chain are here and
  * in glm.cpp; the device launch is glm.hip and the host reference ref_glm.cpp.

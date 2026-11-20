@@ -3,6 +3,8 @@
 `glm.so` is `arch/glm5next`'s kernel library, not an architecture plugin. Its GLM-only rows
 supplement libr4d; loading it first leaves other models' current kernel selections unchanged
 (`plugin/glm/exports.cpp`). Device rows target gfx1201; host-only builds carry the SwiGLU oracle.
+Like libr4d, it declines a machine whose KFD topology lists cards and none of them gfx12, so its
+schema cannot select a fused form there that no device row serves; with no card listed it loads.
 
 | op | row | work |
 |---|---|---|

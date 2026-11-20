@@ -6,8 +6,10 @@
 
 #include <array>
 #include <dlfcn.h>
+#include <filesystem>
 #include <map>
 #include <thread>
+#include <sys/stat.h>
 
 /* ==================================================================== the plugin under test */
 
@@ -3355,4 +3357,39 @@ TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
         }
         CHECK_EQ(wrong, 0);
     }
+}
+
+/* plugin/glm declines a machine whose cards are all another family's (rad_plugin_open, as libr4d
+ * does), so its schema cannot pick a fused form no device row serves there. Its check reads the
+ * KFD topology from a directory, here fake trees: no topology and a CPU node alone keep it, a
+ * gfx1151 card alone declines it, and any gfx12 card keeps it. */
+TEST(glm_plugin_declines_a_machine_with_only_another_familys_cards) {
+    const char* home = std::getenv("RADIANCE_HOME");
+    void* h = home ? dlopen((std::string(home) + "/kernels/glm.so").c_str(), RTLD_NOW | RTLD_LOCAL)
+                   : nullptr;
+    if (!h) SKIP("glm.so is not built here");
+    auto check = (int (*)(const char*))dlsym(h, "rad_glm_machine_check");
+    REQUIRE(check != nullptr);
+    REQUIRE(dlsym(h, "rad_plugin_open") != nullptr);
+    char tmpl[] = "/tmp/glm_kfd_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    const std::string root = tmpl;
+    int n = 0;
+    auto node = [&](const char* gfx) {
+        const std::string dir = root + "/" + std::to_string(n++);
+        REQUIRE(mkdir(dir.c_str(), 0700) == 0);
+        FILE* f = std::fopen((dir + "/properties").c_str(), "w");
+        REQUIRE(f != nullptr);
+        std::fprintf(f, "cpu_cores_count 0\ngfx_target_version %s\nnum_sdma_engines 2\n", gfx);
+        std::fclose(f);
+    };
+    CHECK_EQ(check((root + "/absent").c_str()), (int)RAD_OK);
+    node("0");                                    /* a CPU node */
+    CHECK_EQ(check(root.c_str()), (int)RAD_OK);
+    node("110501");                               /* gfx1151 */
+    CHECK_EQ(check(root.c_str()), (int)RAD_E_UNSUPPORTED);
+    node("120001");                               /* gfx1201 beside it */
+    CHECK_EQ(check(root.c_str()), (int)RAD_OK);
+    std::filesystem::remove_all(root);
+    dlclose(h);
 }
