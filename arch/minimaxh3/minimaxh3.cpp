@@ -3419,9 +3419,15 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                 return;
             }
             const int64_t row = parts[pi++].row;
+            /* A soundtrack's slot holds a channel every kEncSlotRowsA / kAudioCh rows (step_aenc)
+             * and its segment the channels one after the other, n / 2 latents each. */
             if (aud)
-                RAD_ISSUE_N(c, m.op_ain, n, brow_slice(m.b_enca, row, n, kAudioC), RAD_W(m.w_ain),
-                            RAD_W(m.b_ain), RAD_NONE, brow_slice(m.b_h, s.start, n, D));
+                for (int64_t ch = 0, t = n / kAudioCh; ch < kAudioCh; ++ch)
+                    RAD_ISSUE_N(c, m.op_ain, t,
+                                brow_slice(m.b_enca, row + ch * (kEncSlotRowsA / kAudioCh), t,
+                                           kAudioC),
+                                RAD_W(m.w_ain), RAD_W(m.b_ain), RAD_NONE,
+                                brow_slice(m.b_h, s.start + ch * t, t, D));
             else
                 RAD_ISSUE_N(c, m.op_vin, n, brow_slice(m.b_evc, row, n, kPatchVals),
                             RAD_W(m.w_vin), RAD_W(m.b_vin), RAD_NONE,
