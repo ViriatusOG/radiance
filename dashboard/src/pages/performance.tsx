@@ -26,7 +26,16 @@ const one = (key: string, label: string): Line[] => [{ key, label, color: 1 }]
 const METRICS: Metric[] = [
   { id: "decode", kinds: "chat", label: "Decode", unit: "tok/s", show: (s) => [fin(s.decode_tps) ? fTps(s.decode_tps) : DASH], lines: one("decode", "tokens a second"), fmt: fTps },
   { id: "step", kinds: "chat", label: "Step", unit: "ms",
-    show: (s, h) => { const v = h.last("step"); return [fin(v) ? (v >= 100 ? v.toFixed(0) : v.toFixed(2)) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
+    // Newest sample only: h.last() takes the newest NON-NULL one, so through a prefill stretch --
+    // where "step" is null because no decode step ran -- it kept printing the previous decode
+    // step under a heading that said nothing about being stale. Staleness is the one thing this
+    // tile must not ship. When the newest sample has no decode step the figure reads as –.
+    // The detail line is stock v2.2's: the engine's decode-step best, nothing else. The fork's
+    // drift clause (best · recent · a percent figure against the best) is deliberately NOT here:
+    // stock dropped it, and a poll mean read against a window best reads as a lie whenever one
+    // fast stretch beats the ruler (row b8070d47 — one burst sets the peak, a reload resets it).
+    show: (s, h) => { const c = h.col("step") ?? []; const v = c.length ? c[c.length - 1] : null;
+                    return [fin(v) ? fMs(v) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
     lines: [{ key: "step", label: "step", color: 1 }, { key: "stepBest", label: "best", dash: true }], fmt: fMs, tight: true },
   { id: "prefill", kinds: "chat", label: "Prefill", unit: "tok/s", show: (_s, h) => { const v = h.last("prefillRate"); return [fin(v) ? fTps(v) : DASH] }, lines: one("prefillRate", "tokens a second"), fmt: fTps, join: true },
   // Time in the vision encoder. A model reading an image can sit here for seconds with its cards
@@ -52,7 +61,7 @@ const METRICS: Metric[] = [
   { id: "tok", kinds: "chat", label: "Tokens per step", draft: true, show: (_s, h) => { const v = h.last("tokStep"); return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("tokStep", "tokens"), fmt: (v) => v.toFixed(2), tight: true },
   { id: "ethru", kinds: "embed", always: true, label: "Throughput", unit: "tok/s", show: (s) => [fin(s.prefill_tps) ? fTps(s.prefill_tps) : DASH], lines: one("prefill", "tokens a second"), fmt: fTps },
   { id: "erate", kinds: "embed", always: true, label: "Inputs", unit: "/s", show: (_s, h) => { const v = h.last("reqRate"); return [fin(v) ? fTps(v) : DASH] }, lines: one("reqRate", "inputs a second"), fmt: fTps },
-  { id: "estep", kinds: "embed", always: true, label: "Step", unit: "ms", show: (_s, h) => { const v = h.last("stepAny"); return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("stepAny", "step"), fmt: fMs, tight: true },
+  { id: "estep", kinds: "embed", always: true, label: "Step", unit: "ms", show: (_s, h) => { const c = h.col("stepAny") ?? []; const v = c.length ? c[c.length - 1] : null; return [fin(v) ? v.toFixed(2) : DASH] }, lines: one("stepAny", "step"), fmt: fMs, tight: true },
   { id: "eflight", kinds: "embed", always: true, label: "Active requests", show: (s) => [String(s.in_flight ?? 0)], lines: one("flight", "in flight"), fmt: (v) => fNum(v), integer: true },
   { id: "jrun", kinds: "gen", always: true, label: "Running", show: (s) => [String(s.jobs?.running ?? 0)], lines: one("jobRun", "running"), fmt: (v) => fNum(v), integer: true },
   { id: "jdone", kinds: "gen", always: true, label: "Completed", show: (s) => [fNum(s.jobs?.done), s.jobs?.failed ? s.jobs.failed + " failed" : ""], lines: one("jobDone", "made"), fmt: (v) => fNum(v), integer: true },
