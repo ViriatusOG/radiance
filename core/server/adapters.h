@@ -912,13 +912,13 @@ public:
         return p_->encoder_video(bytes, n, ratio, max_side, max_frames, out, why);
     }
 
-    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                      std::vector<float>* out, std::string* why) override {
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                      int64_t max_samples, std::vector<float>* out, std::string* why) override {
         if (!p_ || !mm::decoder_available()) {
             if (why) *why = "no audio decoder is available";
             return RAD_E_UNSUPPORTED;
         }
-        return p_->encoder_audio(bytes, n, rate, max_samples, out, why);
+        return p_->encoder_audio(bytes, n, rate, channels, max_samples, out, why);
     }
 
     int32_t audio_rate() const override {

@@ -52,7 +52,7 @@ int decode_video(const uint8_t*, size_t, SampleFn, const void*, int64_t, Video*,
 int h264_roundtrip(const Frame&, int32_t, Frame*, std::string* why) { return no_decoder(why); }
 bool h264_roundtrip_available() { return false; }
 int decode_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>*,
-                 std::string* why) {
+                 std::string* why, int32_t) {
     return no_decoder(why);
 }
 
@@ -688,7 +688,7 @@ struct AudioIn {
 }  /* namespace */
 
 int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_samples,
-                 std::vector<float>* out, std::string* why) {
+                 std::vector<float>* out, std::string* why, int32_t out_channels) {
     std::string w;
     if (!why) why = &w;
     out->clear();
@@ -698,6 +698,10 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
     AVCodecContext* dec = in.dec;
     const int channels = dec->ch_layout.nb_channels > 0 ? dec->ch_layout.nb_channels : 1;
     if (dec->sample_rate <= 0) { *why = "the audio stream states no sample rate"; return RAD_E_INVAL; }
+    /* Kept channels are gathered interleaved and laid channel-major at the end. */
+    const bool keep = out_channels > 1 && channels == out_channels;
+    std::vector<float> il;
+    auto frames = [&] { return keep ? (int64_t)(il.size() / channels) : (int64_t)out->size(); };
 
     /* Resampled at the source's own layout, float interleaved; the mono mean is taken after. A
      * layout the stream does not state is taken as `channels` unordered channels. */
@@ -720,7 +724,11 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
         uint8_t* dst = reinterpret_cast<uint8_t*>(buf.data());
         const int got = swr_convert(in.swr, &dst, cap, src, n_in);
         if (got < 0) { *why = "resampling failed (" + averr(got) + ")"; return RAD_E_INVAL; }
-        for (int i = 0; i < got && (int64_t)out->size() < max_samples; ++i) {
+        for (int i = 0; i < got && frames() < max_samples; ++i) {
+            if (keep) {
+                il.insert(il.end(), buf.begin() + (size_t)i * channels, buf.begin() + (size_t)(i + 1) * channels);
+                continue;
+            }
             float s = 0.0f;
             for (int c = 0; c < channels; ++c) s += buf[(size_t)i * channels + c];
             out->push_back(channels == 1 ? s : s / (float)channels);
@@ -738,7 +746,7 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
     }
     int st = RAD_OK;
     bool done = false;
-    while (!done && (int64_t)out->size() < max_samples) {
+    while (!done && frames() < max_samples) {
         e = av_read_frame(in.fmt, pkt);
         if (e < 0) {
             avcodec_send_packet(dec, nullptr);   /* drain */
@@ -756,10 +764,20 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
         if (e != AVERROR(EAGAIN) && e != AVERROR_EOF) { *why = "the audio would not decode (" + averr(e) + ")"; st = RAD_E_INVAL; break; }
     }
     /* Flush what the resampler still holds. */
-    if (st == RAD_OK && (int64_t)out->size() < max_samples) st = take(nullptr, 0);
+    if (st == RAD_OK && frames() < max_samples) st = take(nullptr, 0);
     av_packet_free(&pkt);
     av_frame_free(&f);
     if (st < 0) return st;
+    if (keep) {
+        const size_t m = il.size() / channels;
+        out->resize(il.size());
+        for (size_t i = 0; i < m; ++i)
+            for (int c = 0; c < channels; ++c) (*out)[c * m + i] = il[i * channels + c];
+    } else if (out_channels > 1) {
+        const size_t m = out->size();
+        out->resize(m * out_channels);
+        for (int32_t c = 1; c < out_channels; ++c) std::copy_n(out->begin(), m, out->begin() + c * m);
+    }
     if (out->empty()) { *why = "the audio decoded to no samples"; return RAD_E_INVAL; }
     return RAD_OK;
 }

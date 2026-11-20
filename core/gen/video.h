@@ -95,7 +95,7 @@ struct VideoRefMedia {
      * encoder's clips and hops. A picture's or video's frames, f32 [enc_frames, enc_h, enc_w, 3] RGB
      * in 0..255: a reference's sides multiples of the VAE's ratio within max_enc_side, aspect
      * kept, a keyframe at the video's size. A soundtrack, f32 [enc_channels, enc_n] at the
-     * model's rate, a mono one copied to every channel. */
+     * model's rate: the song guide's stereo kept, any other mono copied to every channel. */
     std::vector<float> enc_pixels;
     int32_t            enc_frames = 0, enc_h = 0, enc_w = 0;
     std::vector<float> enc_samples;

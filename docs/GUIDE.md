@@ -4177,8 +4177,8 @@ workflow, and is otherwise read off the parts:
 - **Song guide**: `guide_audio`, a soundtrack pinned from frame **`guide_frame`** of the video on
   (0 by default; a negative frame counts from the end, -1 the last), as ComfyUI's
   `MiniMaxH3AddGuide` pins one: the model takes it as the clip's own sound, so mouths follow its
-  words. It is read as the reference soundtracks are (mono, at most 15.6 s) and cut where the
-  video ends. It is not named in the prompt, and it goes with any task: with text alone, with
+  words. It is read in stereo, as ComfyUI's guide reads it (a mono song is copied to both
+  channels), at most 15.6 s, and cut where the video ends. It is not named in the prompt, and it goes with any task: with text alone, with
   keyframes or with reference media. A frame outside the video is refused naming `guide_frame`.
 
 A request carries keyframes or reference media, not both: each is shown to the text encoder as a

@@ -960,9 +960,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
 
     /* ---- every reference as its VAE encoder takes it (the keyframes are done above): pictures and
-     * video frames fitted to the encoder's bounds, soundtracks (the song guide's too) as mono
-     * samples at the model's rate, at most the encoder's, one copy a channel. The driver pads both
-     * to the encoders' clips and hops. */
+     * video frames fitted to the encoder's bounds, soundtracks at the model's rate, at most the
+     * encoder's: the song guide in stereo as ComfyUI's guide takes it (a mono song copied to both
+     * channels), the reference soundtracks mono, one copy a channel. The driver pads both to the
+     * encoders' clips and hops. */
     if ((ref2va || !keys.empty() || !guides.empty()) && deps_.mm) {
         for (gen::VideoRefMedia& m : r->refs) {
             std::string why;
@@ -980,15 +981,18 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                              (int32_t)info.max_enc_side,
                                              (int32_t)info.max_enc_frames, &fr, &why);
             else {
-                std::vector<float> mono;
-                if (deps_.mm->encoder_audio(p, n, (int32_t)info.sample_rate, info.max_enc_samples,
-                                            &mono, &why) < 0 || mono.empty())
+                const int32_t ch = (int32_t)info.channels;
+                const int32_t got =
+                    m.kind == gen::VideoRefMedia::GUIDE_AUDIO ? std::max(ch, 1) : 1;
+                std::vector<float> s;
+                if (deps_.mm->encoder_audio(p, n, (int32_t)info.sample_rate, got,
+                                            info.max_enc_samples, &s, &why) < 0 || s.empty())
                     return bad(m.name.c_str(), "'" + m.name + "' could not be decoded: " + why);
-                m.enc_channels = (int32_t)info.channels;
-                m.enc_n = (int64_t)mono.size();
+                m.enc_channels = ch;
+                m.enc_n = (int64_t)s.size() / got;
                 m.enc_samples.clear();
-                for (int32_t c = 0; c < m.enc_channels; ++c)
-                    m.enc_samples.insert(m.enc_samples.end(), mono.begin(), mono.end());
+                for (int32_t c = 0; c < ch; c += got)   /* `got` channels a copy */
+                    m.enc_samples.insert(m.enc_samples.end(), s.begin(), s.end());
                 continue;
             }
             if (st < 0 || fr.empty())

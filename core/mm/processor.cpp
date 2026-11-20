@@ -2780,9 +2780,9 @@ int Processor::encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int3
     return RAD_OK;
 }
 
-int Processor::encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                             std::vector<float>* out, std::string* why) const {
-    return decode_audio(bytes, n, rate, max_samples, out, why);
+int Processor::encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                             int64_t max_samples, std::vector<float>* out, std::string* why) const {
+    return decode_audio(bytes, n, rate, max_samples, out, why, channels);
 }
 
 namespace {

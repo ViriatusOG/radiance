@@ -609,6 +609,7 @@ TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
     CHECK_EQ(mm.n_ienc, 1);
     CHECK_EQ(mm.n_venc, 1);
     CHECK_EQ(mm.n_aenc, 2);
+    CHECK_EQ(mm.aenc_channels, 1);   /* reference soundtracks stay mono */
 
     const gen::VideoRequest& g = gen.last();
     REQUIRE_EQ(g.refs.size(), (size_t)4);   /* sorted (kind, index): image, video, video_audio, audio */
@@ -1049,9 +1050,9 @@ const FormPart kSong{ "guide_audio", "song.wav", "audio/wav", "RIFF" };
 
 }  /* namespace */
 
-/* A song guide (ComfyUI's MiniMaxH3AddGuide) rides a ref2va request: the song is decoded as the
- * reference soundtracks are, at most the encoder's samples, and reaches the generator last, at
- * its frame counted from the end (124 - 24). It is not named in the prompt. */
+/* A song guide (ComfyUI's MiniMaxH3AddGuide) rides a ref2va request: the song is decoded in
+ * stereo, channel-major, at most the encoder's samples, and reaches the generator last, at its
+ * frame counted from the end (124 - 24). It is not named in the prompt. */
 TEST(a_song_guide_rides_reference_media) {
     GuideServer s;
     HttpResponse r = s.post({ FormPart{ "task", "", "", "ref2va" },
@@ -1060,6 +1061,7 @@ TEST(a_song_guide_rides_reference_media) {
     REQUIRE_EQ(r.status, 200);
     CHECK_EQ(s.mm.n_aenc, 1);
     CHECK_EQ(s.mm.aenc_max, (int64_t)500000);
+    CHECK_EQ(s.mm.aenc_channels, 2);
     const gen::VideoRequest& g = s.gen.last();
     REQUIRE_EQ(g.refs.size(), (size_t)2);
     CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::IMAGE);
@@ -1069,6 +1071,8 @@ TEST(a_song_guide_rides_reference_media) {
     CHECK_EQ(g.refs[1].enc_channels, 2);
     CHECK_EQ(g.refs[1].enc_n, (int64_t)850);
     CHECK_EQ(g.refs[1].enc_samples.size(), (size_t)2 * 850);
+    CHECK_EQ(g.refs[1].enc_samples[0], 0.5f);     /* the left channel */
+    CHECK_EQ(g.refs[1].enc_samples[850], 1.5f);   /* the right, its own samples */
     std::vector<int32_t> want;
     auto chars = [&](const std::string& t) { for (unsigned char c : t) want.push_back((int32_t)c); };
     chars("<v>");
