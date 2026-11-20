@@ -21,6 +21,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | model | container | get it | fleet file |
 |---|---|---|---|
 | Qwen3.8-Flash-Next: IQR-V4 experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | `tp1.yaml`, `tp2.yaml` |
+| GLM-5.3-Flash: IQR-V4 experts, IQ8R trunk, int8 latent cache, four cards with the experts tiered to host memory | `glm53-flash-iqr-v4.rad` (159 GiB) | [download](https://huggingface.co/animusnull/glm-5.3-flash-iqr-v4) | `tp4.yaml` |
 | Qwen3.8-Flash-Next abliterated (refusals removed): IQR-V4 trunk (GPTQ), codebook experts (round to nearest), MTP, vision | `qwen3.8-flash-next-uncensored-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/davetha/qwen3.8-flash-next-uncensored-iqr-v4) | — |
 | Qwen3.8-27B IQ8R (rotated int8), DFlash2 drafter, vision | `qwen3.8-27b-iq8r-dflash.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iq8r-dflash) | `tp2.yaml` |
 | Qwen3.8-27B IQR-V4, 2.5 to 8 bits a weight ([docs/IQR.md](docs/IQR.md)), DFlash2 drafter, vision | `qwen3.8-27b-iq2r-v4.rad` .. `qwen3.8-27b-iq8r-v4.rad` (10 to 28 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4) | `tp1.yaml` (IQ4R-L) |
@@ -71,7 +72,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 ParoQuant, or whose experts read E4M3 activations, is refused at startup by the name of the first
 such weight. That is every FP8 and MXFP4 container of the models above, and the models that have
 no int8 container yet: Ornith-1.5 (35B-A3B and 122B), Sage-A1.5,
-NVIDIA-Nemotron-3.5-Bolt-74B-A9B, GLM-5.3-Flash, Ling-3.0-flash-Sante, Fish Audio drama-3 and
+NVIDIA-Nemotron-3.5-Bolt-74B-A9B, Ling-3.0-flash-Sante, Fish Audio drama-3 and
 Anima's FP8 container (Anima converted to bf16 is served). Each returns with an int8 container.
 A container with an int8 or bf16 trunk and a block-FP8 drafter (NVIDIA-Nemotron-3.5-Bolt-E4B,
 the Gemma 4 31B DFlash and DFlash2 containers, MiniCPM5-2B bf16) serves without the drafter
@@ -146,7 +147,7 @@ docker pull stilldeadcode/radiance
 git clone https://codeberg.org/StillDeadcode/radiance.git
 cp -r radiance/deploy/compose ~/radiance-compose && cd ~/radiance-compose
 cp .env.example .env                         # set RADIANCE_MODELS, RADIANCE_API_KEY, the GIDs
-docker compose -f tp2.yaml up -d             # two cards; tp1.yaml for one (RADIANCE_GPU)
+docker compose -f tp2.yaml up -d             # two cards; tp1.yaml for one (RADIANCE_GPU), tp4.yaml for four
 docker compose -f tp2.yaml logs -f
 docker compose -f tp2.yaml down
 ```
@@ -154,7 +155,7 @@ docker compose -f tp2.yaml down
 A file serves all its models from one container behind one port, and brings a model onto the cards
 when a request names it ([`docs/MULTIMODEL.md`](docs/MULTIMODEL.md)): a request's `model` is the
 entry's name (`flashnext`, `qwen3.8-27b`, `minicpm5-2b`, ...). The entries are in
-`tp1.radiance.yaml` and `tp2.radiance.yaml` beside the compose files, the server's configuration as
+`tp1.radiance.yaml`, `tp2.radiance.yaml` and `tp4.radiance.yaml` beside the compose files, the server's configuration as
 it reads it. Delete the entries of the containers
 you do not have; any other model from the table is added as an entry with its keys from the table
 under [Run without Docker](#run-without-docker). The two files take the same port, so run one at a
@@ -236,6 +237,7 @@ here.
 | Qwen3.8-Flash-Next, one card | `tp: 1, max-num-seqs: 4, max-model-len: 200000, placement: expert_tiered, host-pool-mib: 43000, gpu-headroom-mib: 96, kv-cache-dtype: i8, num-speculative-tokens: 3, max-num-batched-tokens: 4096, checkpoint-interval: 4096` |
 | Qwen3.8-Flash-Next, four ranks | `tp: 4, max-num-seqs: 8, max-model-len: 200000, placement: expert_tiered, host-pool-mib: 49152, gpu-headroom-mib: 96, kv-cache-dtype: i8, num-speculative-tokens: 3, max-num-batched-tokens: 2048` |
 | Qwen3.8-Flash-Next, three ranks (the shipped container as it is, [`docs/TP3.md`](docs/TP3.md)) | `tp: 3, max-num-seqs: 8, max-model-len: 200000, placement: expert_tiered, host-pool-mib: 24576, gpu-headroom-mib: 96, kv-cache-dtype: i8, num-speculative-tokens: 3, max-num-batched-tokens: 2048` |
+| GLM-5.3-Flash | `tp: 4, placement: expert_tiered, host-pool-mib: 65536, max-num-seqs: 4, max-model-len: 262144, max-num-batched-tokens: 2048, kv-cache-dtype: i8, num-speculative-tokens: 0, prefill-interleave: 4, prefix-cache-mib: 32768, gpu-headroom-mib: 96`, and `server.kernels: glm,libr4d,libavx,libref` |
 | Qwen3.8-27B IQ8R and IQR-V4, Qwen3.6-35B-A3B | `tp: 2, max-num-seqs: 32, max-model-len: 200000, kv-cache-dtype: i8` |
 | Qwen3.8-27B bf16 | `tp: 2, max-num-seqs: 8, max-model-len: 200000, kv-cache-dtype: i8` |
 | MiniCPM5-2B IQ8R and bf16 | `tp: 2, max-num-seqs: 32, max-model-len: 131072, kv-cache-dtype: i8, gpu-headroom-mib: 160, max-num-batched-tokens: 512` |

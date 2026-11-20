@@ -1,0 +1,71 @@
+# Four cards: GLM-5.3-Flash at TP4 behind one port (docs/MULTIMODEL.md). The entry's name is
+# the model id a request gives.
+#
+#   docker compose -f tp4.yaml up -d        start (it comes back after a reboot)
+#   docker compose -f tp4.yaml logs -f      follow the log
+#   docker compose -f tp4.yaml down         stop
+#
+# Settings come from .env beside this file (see .env.example).
+#
+# The models and their keys are tp4.radiance.yaml beside this file, the server's
+# configuration as it reads it (docs/MULTIMODEL.md, 4): Compose places it in the
+# container at /etc/radiance/radiance.yaml. The server listens on the port that file
+# names, 8000; the health check below asks the same port.
+name: radiance-tp4
+configs:
+  radiance:
+    file: ./tp4.radiance.yaml
+
+services:
+  radiance:
+    image: ${RADIANCE_IMAGE:-stilldeadcode/radiance:latest}
+    container_name: radiance-tp4
+    restart: unless-stopped
+    init: true
+    # Host networking: the server binds the host's own addresses, IPv4 and IPv6, with no NAT
+    # between it and a reverse proxy.
+    network_mode: host
+    # Run as the host user so files the server writes belong to that user, not root.
+    user: "${RADIANCE_UID:-1000}:${RADIANCE_GID:-1000}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:?set RENDER_GID in .env}"
+      - "${VIDEO_GID:?set VIDEO_GID in .env}"
+    # The API key reaches the server through the container's environment, read by the
+    # configuration's api-key-env, never written into it: the configuration sits in the compose
+    # file and the container's filesystem, the environment is readable only by the process itself
+    # and root. The :? fails closed on an unset value, at compose-parse time, before any container
+    # starts.
+    environment:
+      RADIANCE_API_KEY: ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+    # Docker's default seccomp profile refuses io_uring (used for the n-gram table's reads from the
+    # model file) and the NUMA binding calls (mbind, set_mempolicy) the ROCm runtime makes for
+    # host memory. seccomp-radiance.json beside this file is Docker's default plus exactly those
+    # calls; point RADIANCE_SECCOMP at it (absolute host path) to run confined, and audit your
+    # own card stack before you do -- unset, the service runs unconfined.
+    security_opt:
+      - seccomp=${RADIANCE_SECCOMP:-unconfined}
+    ulimits:
+      memlock: -1
+    volumes:
+      - ${RADIANCE_MODELS:?set RADIANCE_MODELS in .env}:/models:ro
+      - ${RADIANCE_CHAT_TEMPLATES:-../chat-templates}:/chat-templates:ro
+    configs:
+      - source: radiance
+        target: /etc/radiance/radiance.yaml
+    command: --config /etc/radiance/radiance.yaml
+    # A server finishes the step in flight and releases the cards on SIGTERM.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15m
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "5"
