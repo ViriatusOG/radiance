@@ -19,8 +19,13 @@ set(GLM_COMMON
     ${CMAKE_CURRENT_SOURCE_DIR}/ref_glm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/exports.cpp)
 
-if(NOT RAD_HIP_FOUND)
-  message(STATUS "glm: this radiance has no device build -- only the host reference is built")
+# The device sources are gfx12 code (they include libr4d's RDNA4 headers), so the device rows are
+# built for the gfx12 targets of the build alone, as libr4d's are; with none, the host rows only.
+if(RAD_HIP_FOUND)
+  rad_plugin_gpu_targets(GLM_GPU_TARGETS "^gfx12")
+endif()
+if(NOT RAD_HIP_FOUND OR NOT GLM_GPU_TARGETS)
+  message(STATUS "glm: no device build for gfx12 here -- only the host reference is built")
   rad_add_plugin(glm kernels SOURCES ${GLM_COMMON})
 else()
   get_property(glm_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
@@ -29,7 +34,8 @@ else()
                         "-DRAD_WITH_HIP=ON, or enable it after project()).")
   endif()
   rad_add_plugin(glm kernels SOURCES ${GLM_COMMON}
-                 HIP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/glm.hip ${CMAKE_CURRENT_SOURCE_DIR}/glm_mla.hip)
+                 HIP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/glm.hip ${CMAKE_CURRENT_SOURCE_DIR}/glm_mla.hip
+                 GPU_TARGETS ${GLM_GPU_TARGETS})
   target_compile_definitions(glm PRIVATE RAD_GLM_WITH_DEVICE=1)
 endif()
 

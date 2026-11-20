@@ -458,6 +458,11 @@ foreach(t arch_test breeze_arch_test glm5next_test nemotronh_test)
     add_dependencies(${t} libref)
   endif()
 endforeach()
+# glm5next_test also loads plugin/glm's glm.so when it is configured, for its schemas and its
+# machine check.
+if(TARGET glm AND TARGET glm5next_test)
+  add_dependencies(glm5next_test glm)
+endif()
 
 # kbench_mutant_test runs rad-kbench against the deliberately defective kernel libraries
 # (core/plugin/testplugin/kbmutant.cc) on the host backend, so it needs the tool, libref and the

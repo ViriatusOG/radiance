@@ -5,9 +5,10 @@
  * against the other and the reference gate keeps the host rows out of serving. On a machine with no
  * card only the host rows exist.
  *
- * Every op here is one only glm5next issues, and only where a loaded library declares it, so putting
- * this library first in `server.kernels` changes no other model's selection. The plugin declines a
- * machine whose cards are all another family's (rad_plugin_open, below).
+ * Its own op, swiglu_clamped_had_quant_i8g, is issued only where a loaded library declares it, and
+ * its mla_attn rows serve only `kv_dtype` `i8`, which no other row serves, so putting this library
+ * first in `server.kernels` changes no other model's selection. The plugin declines a machine whose
+ * cards are all another family's (rad_plugin_open, below).
  */
 #include "glm.h"
 #include "rad_abi_layout.h"
