@@ -972,6 +972,12 @@ endif()
 add_test(NAME artifact_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
+# The page rules that were each broken in production and are not visible to any C++ test: a tile
+# figure that goes stale, a drift clause that fires on a prefill sample, a tile that clips its own
+# figures. Cheap, and it needs neither Node nor a browser.
+add_test(NAME page_rules
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/page_rules.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(page_rules PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
   add_test(NAME vhead_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/vhead_test.py)
   set_tests_properties(vhead_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT})
