@@ -560,7 +560,7 @@ int main(int argc, char** argv) {
     }
 
     if (!vision_base.empty()) {
-        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() ||
+        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() || reuse_only ||
             !recipe_files.empty() || !quant_flags.empty() || !set_kv.empty() ||
             !arch_override.empty() || !tokjson.empty() || !tokjson2.empty() || !chat_tmpl.empty() ||
             !add_files.empty() || !draft_dir.empty() || !imat_path.empty() || !lora_paths.empty() ||
