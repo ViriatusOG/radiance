@@ -683,7 +683,7 @@ A key sits at one of these levels:
 | level | holds |
 |---|---|
 | `server:` | the listener and the process: `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `radiance-home`, `kernels`, `download-dir`, `log` (`info`, `debug` or `trace`), `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, `disk-tier`, a directory for parked models' copies, and `pinned-numa-node`, a NUMA node preferred for pinned host memory over the node nearest each card |
+| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, `disk-tier`, a directory for parked models' copies, `pinned-numa-node`, a NUMA node preferred for pinned host memory over the node nearest each card, and `queue-reserve: N` (1-24, default 8), the hardware queues each card keeps ready for its next stream at about 41 MiB of the card apiece |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive` |
 | `cards:` | `all` or a list of card indices the models may use |
 | `groups:` | `together` and `exclusive` lists of model names |

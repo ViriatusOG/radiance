@@ -140,6 +140,7 @@ memory:
   gpu-headroom-mib: 160    # per card, as before
   card-headroom-mib: {0: 4096}        # card 0 (the desktop's) keeps 4 GiB free instead
   host-mib: 40960          # pinned host RAM the fleet may hold: parked weights, KV host tier, pools
+  queue-reserve: 8         # hardware queues each card keeps ready; each costs ~41 MiB of the card
   disk-tier: /var/cache/radiance      # prefix-cache disk tier and park files
   # pinned-numa-node: 1    # prefer this node for pinned host memory (default: each card's own)
 
@@ -199,7 +200,7 @@ scheduler:
 |---|---|
 | `server:` | `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `log` (`info`/`debug`/`trace`), `radiance-home`, `kernels`, `download-dir`, `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
 | `cards:` | `all` or a list of card indices |
-| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier`, `pinned-numa-node` |
+| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier`, `pinned-numa-node`, `queue-reserve` (1-24, default 8: the HW queues a card keeps ready, §7.1) |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `stuck-exit`, `warm-up` |
 | `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park`, `cards` |
 | `groups:` | `together` / `exclusive` lists |
@@ -441,15 +442,18 @@ path (§3.1), so a closed stream's queue stays open for the card's next stream. 
 about 41 MiB of its card (the context save area), and opening one on a full card can stall the
 process for minutes, so the fleet opens queues only while a card has room: eight to a card at the
 start, and before each load as many as bring the kept ones back to eight, up to 24 open on a card.
+`memory.queue-reserve` sets that eight (1 to 24, default 8): a fleet whose entries claim whole
+cards (`gpu-memory-mib`, §4.3) is short of exactly the reserve's bytes on a handover, so 2 or 4 is
+the number for it, and the default is the number for a fleet that parks and restores, where a
+restore needs several queues at once on a card its neighbour has filled.
 Kept queues are closed in three places, all where the card has nothing that a queue destroy could
-disturb: down to four when an unload leaves the card, down to four when a model parks (a parked
-model holds no streams, and four is more than its restore takes), and down to four for a model that
-is short of exactly their memory after every other model has left (MiniMax-H3 on a 32 GB card).
-Eight of them is 328 MiB of a card held by an otherwise idle card, which is more than a model
-claiming a whole card (`gpu-memory-mib`, §4.3) can pay on its way back on: that reserve, left by an
-unload and reopened before the next load, was the memory that claim was short of. The next bring-up
-reopens what its own reservation leaves room for, and a card just left is the emptiest and safest
-moment to have needed none. `/admin/fleet` gives each card's `queues` and `queues_idle`.
+disturb: down to the reserve, or four whichever is smaller, when an unload leaves the card, the same
+when a model parks (a parked model holds no streams, and that is more than its restore's streams
+take), and down to that number again for a model that is short of exactly their memory after every
+other model has left (MiniMax-H3 on a 32 GB card). Eight of them is 328 MiB of a card held by an
+otherwise idle card. The next bring-up reopens what its own reservation leaves room for, and a card
+just left is the emptiest and safest moment to have needed none. `/admin/fleet` gives each card's
+`queues` and `queues_idle`, and the fleet says the reserve on one line at the start.
 
 ### 7.2 Park
 

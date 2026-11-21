@@ -242,16 +242,24 @@ void card_telemetry(int card, json& o) {
  * kMaxQueuesAhead: a file with that many streams at once opens the rest as its streams ask.
  * One model never parks, so its cards see no restores and it opens what it uses.
  *
- * A model that leaves a card quiet closes them back to kKeepQueues, on a park as on an unload, so
- * the reserve is never the reason the next entry cannot land: an entry that claims a whole card
- * (`gpu-memory-mib`) is short of exactly the reserve's bytes on its way back on, and the card is
- * emptiest, and so the safest moment to open late, the moment it is left. The next bring-up opens
- * what its own reservation leaves room for (Fleet::reopen_queues clips on it). */
+ * A model that leaves a card quiet closes them back to what the fleet keeps at its tightest, on a
+ * park as on an unload, so the reserve is never the reason the next entry cannot land: an entry
+ * that claims a whole card (`gpu-memory-mib`) is short of exactly the reserve's bytes on its way
+ * back on, and the card is emptiest, and so the safest moment to open late, the moment it is left.
+ * The next bring-up opens what its own reservation leaves room for (Fleet::reopen_queues clips on
+ * it).
+ *
+ * `memory.queue-reserve` sets this reserve from the file (Fleet::queue_reserve_), for a fleet whose
+ * entries claim whole cards; the tightest value stays 1, since a card with nothing ready opens its
+ * next stream's queue on whatever the resident model has left of the card, which is the case this
+ * reserve exists to avoid. */
 constexpr int64_t kQueueBytes     = 41 * kMiB;
 constexpr int     kReserveQueues  = 8;
 constexpr int     kMaxQueuesAhead = 24;
-/* What a model that needs nearly all of its cards leaves kept (Fleet::close_idle_queues). */
+/* What a model that needs nearly all of its cards leaves kept (Fleet::close_idle_queues), and what
+ * a model leaves on the cards it goes away from; the fleet clamps it to its own reserve. */
 constexpr int     kKeepQueues     = 4;
+static_assert(kMaxQueuesAhead == 24, "config.cpp bounds memory.queue-reserve at 24, this ceiling");
 
 /* `more` queues opened on card `c` beside the `idle` it keeps; how many were. A stream takes a
  * kept queue before it opens one, so the kept ones are held while the new ones are opened. */
@@ -561,6 +569,11 @@ private:
     server::Front     front_;
     std::vector<int>  cards_;
     int64_t           headroom_ = 96 * kMiB;
+    /* memory.queue-reserve: what each card holds ready, and the most an offload or a last-resort
+     * trim leaves behind (never more than the reserve, so a small reserve means small standing
+     * holdings rather than a reserve the trims overshoot). */
+    int               queue_reserve_ = kReserveQueues;
+    int               queue_keep_    = kKeepQueues;
     /* §8.6: the models still to warm, in order (under mu_; the scheduler thread changes it). */
     std::deque<std::string> warm_;
     std::string             warming_;     /* the one loading now, under mu_ */
@@ -601,6 +614,10 @@ Fleet::Fleet(FleetConfig fc)
         }
     }
     if (any) headroom_ = head;
+    if (fc_.queue_reserve > 0) {
+        queue_reserve_ = (int)std::min<int64_t>(fc_.queue_reserve, kMaxQueuesAhead);
+        queue_keep_ = std::min(kKeepQueues, queue_reserve_);
+    }
     if (fc_.host_mib > 0) {
         host_budget_ = fc_.host_mib * kMiB;
     } else {
@@ -894,14 +911,14 @@ void Fleet::trim_spares(const std::vector<int>& cards) {
     if (!gave.empty()) wait_pages(before, gave);
 }
 
-/* Card `c` holds kReserveQueues kept queues again, as far as its free room goes; under room_mu_.
+/* Card `c` holds the fleet's queue reserve again, as far as its free room goes; under room_mu_.
  * Before a load, whose room is made and not yet taken, and at the start. */
 void Fleet::reopen_queues(const std::vector<int>& cards) {
     if (fc_.models.size() < 2) return;
     for (int c : cards) {
         int open = 0, idle = 0;
         dev_stream_counts(c, &open, &idle);
-        int more = std::min(kReserveQueues - idle, kMaxQueuesAhead - open);
+        int more = std::min(queue_reserve_ - idle, kMaxQueuesAhead - open);
         more = (int)std::min<int64_t>(more, room_on(c) / kQueueBytes);
         if (more <= 0) continue;
         const int n = open_queues(c, more, idle);
@@ -960,7 +977,7 @@ int Fleet::close_idle_queues(const Model& m, const std::map<int, int64_t>& need)
     std::vector<int> closed;
     for (auto& [c, bytes] : need) {
         if (room_on(c) >= bytes || !card_quiet(c, &m)) continue;
-        if (const int k = dev_stream_trim(c, kKeepQueues); k > 0) {
+        if (const int k = dev_stream_trim(c, queue_keep_); k > 0) {
             n += k;
             closed.push_back(c);
         }
@@ -1365,7 +1382,7 @@ int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string&
     /* Its queues go with it: a parked model holds none, and the card is empty of work, which is
      * the one moment a queue may be destroyed without risk. Four are left for its restore's own
      * streams (two a rank, a third where it runs a second lane). */
-    (void)trim_quiet_queues(m, m.cards, kKeepQueues, "parked");
+    (void)trim_quiet_queues(m, m.cards, queue_keep_, "parked");
     if (got.host > 0) start_spill(m);
     return short_of ? 0 : 1;
 }
@@ -1425,7 +1442,7 @@ bool Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
      * streams held, and those of the models before it, are closed while nothing can launch there.
      * This was the reserve of eight, 328 MiB of a card held by an IDLE card, which is more than an
      * entry claiming a whole card can pay on its way back on. */
-    (void)trim_quiet_queues(m, was_on, kKeepQueues, "unloaded");
+    (void)trim_quiet_queues(m, was_on, queue_keep_, "unloaded");
     RAD_INFO("model %s: unloaded in %.2f s", m.entry.name.c_str(), secs_since(t0));
     return true;
 }
@@ -3101,7 +3118,10 @@ int Fleet::run() {
     front_.set_describe([this](const std::string& n) { return describe(n); });
     front_.set_metrics([this] { return metrics(); });
     add_routes();
-    RAD_INFO("fleet: %zu model(s) on card(s) %s; %s", fc_.models.size(), cards_str(cards_).c_str(),
+    RAD_INFO("fleet: %zu model(s) on card(s) %s; each card keeps %d hardware queue(s) ready (%s of "
+             "a card), an offload leaves %d; %s",
+             fc_.models.size(), cards_str(cards_).c_str(), queue_reserve_,
+             humanb((int64_t)queue_reserve_ * kQueueBytes).c_str(), queue_keep_,
              preload.empty() ? "each loads when a request first names it"
                              : (std::to_string(preload.size()) + " load now, the rest on demand").c_str());
 

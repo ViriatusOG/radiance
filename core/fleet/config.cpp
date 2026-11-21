@@ -391,6 +391,12 @@ int Reader::read_memory(const Item& sec, FleetConfig* out) {
             out->pinned_numa_node = (int)node;
             continue;
         }
+        /* The upper bound is the device's own ceiling on queues a card holds ahead of its streams
+         * (fleet.cpp kMaxQueuesAhead); a card holds no more whatever this says. */
+        if (k == "queue-reserve") {
+            if (int s = integer(it, 1, 24, &out->queue_reserve); s < 0) return s;
+            continue;
+        }
         if (k == "card-headroom-mib") {
             if (!it.node.is_map())
                 return fail(it.node, it.path + " takes a map of card ordinal to MiB, as {0: 4096}");
@@ -413,6 +419,7 @@ int Reader::read_memory(const Item& sec, FleetConfig* out) {
             valid.push_back("disk-tier");
             valid.push_back("card-headroom-mib");
             valid.push_back("pinned-numa-node");
+            valid.push_back("queue-reserve");
             return refuse_key(it, "memory", "memory", valid);
         }
         if (int s = flag_args(it, &memory_args_); s < 0) return s;
@@ -887,6 +894,10 @@ void print_reference(FILE* to) {
         "\ncards: all | [N, ...]                  the cards models may use\n"
         "\nmemory:\n"
         "  host-mib: N                          pinned host RAM the process may hold\n"
+        "  queue-reserve: N                     hardware queues each card keeps ready for its next\n"
+        "                                       stream, 1 to 24 (8). Each costs about 41 MiB of the\n"
+        "                                       card; lower it to give a model claiming a whole card\n"
+        "                                       the room, and do not lower it on a fleet that parks\n"
         "  disk-tier: DIR                       the prefix-cache disk tier and park files\n"
         "  pinned-numa-node: N                  prefer this NUMA node for pinned host memory\n"
         "                                       (default: the node nearest each card)\n");
