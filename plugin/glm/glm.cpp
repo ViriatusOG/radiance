@@ -127,7 +127,7 @@ int rad_glm_swiglu_quant_args(const RadArgs* a, RadGlmSwigluQuantCall* out) {
         limit <= 0)
         return RAD_E_SHAPE;
     const int64_t M = gu->rank == 2 ? gu->shape[0] : 0;
-    if (M < 1 || M > 65535 || !mat(gu, RAD_BF16, M, 2 * n) || !mat(q, RAD_I8, M, n) ||
+    if (M < 1 || M > INT32_MAX || !mat(gu, RAD_BF16, M, 2 * n) || !mat(q, RAD_I8, M, n) ||
         !mat(s, RAD_F32, M, n / group) || (y && !mat(y, RAD_BF16, M, n)))
         return RAD_E_SHAPE;
     RadGlmSwigluQuantCall c{};
