@@ -446,6 +446,11 @@ start, and before each load as many as bring the kept ones back to eight, up to 
 cards (`gpu-memory-mib`, §4.3) is short of exactly the reserve's bytes on a handover, so 2 or 4 is
 the number for it, and the default is the number for a fleet that parks and restores, where a
 restore needs several queues at once on a card its neighbour has filled.
+That is not a rounding trade. On a two-card box with four entries in one exclusive group and the chat
+seat claiming all of a card, the claim that failed on every handover back at the default eight -
+`the models that may leave did not free enough`, printed after the fleet had closed all eight queues
+under that demand - passes every leg at two, and ends a full tour with 266 MiB free on a card where it
+used to be left with about 51.
 Kept queues are closed in three places, all where the card has nothing that a queue destroy could
 disturb: down to the reserve, or four whichever is smaller, when an unload leaves the card, the same
 when a model parks (a parked model holds no streams, and that is more than its restore's streams
