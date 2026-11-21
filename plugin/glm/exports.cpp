@@ -95,6 +95,17 @@ extern "C" int rad_kernel_reference(int i) {
 #endif
 }
 
+/* Which rows chain (RadKernelChainFn): the device swiglu quantiser, whose chained form waits in
+ * r4d_chain_wait and so acquires for its scalar loads itself (2). */
+extern "C" int rad_kernel_chain(int i) {
+#ifdef RAD_GLM_WITH_DEVICE
+    return i == 0 ? 2 : 0;
+#else
+    (void)i;
+    return 0;
+#endif
+}
+
 extern "C" int rad_kernel_schema_count(void) { return rad_glm_schema_count(); }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) { return rad_glm_schema_at(i); }
 

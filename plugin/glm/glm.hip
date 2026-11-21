@@ -15,6 +15,8 @@
 #include "../../libr4d/r4d_emit.h"
 #include "../../libr4d/r4d_fwht.h"
 #include "../../libr4d/r4d_q8.h"
+#include "../../libr4d/r4d_args.h"
+#include "../../libr4d/r4d_chain.h"
 
 namespace {
 
@@ -22,11 +24,14 @@ constexpr uint32_t kWave = 32;
 
 __device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
-template <uint32_t SUB>
-__global__ __launch_bounds__(256) void swiglu_clamped_had_quant_kernel(
+/* CHAIN brackets the body with the chained launch's wait and add (libr4d/r4d_chain.h); every block
+ * runs to the end. The plain kernel and the chained one (r4dchain*) follow the body. */
+template <uint32_t SUB, bool CHAIN>
+__device__ __forceinline__ void swiglu_clamped_had_quant_body(
     const uint16_t* __restrict__ gu, int8_t* __restrict__ q, float* __restrict__ s,
     uint16_t* __restrict__ y, uint32_t n, uint32_t ngrp, uint32_t gu_ld, uint32_t q_ld,
     uint32_t s_ld, uint32_t y_ld, float limit) {
+    if (CHAIN) r4d_chain_wait();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const uint16_t* __restrict__ gr = gu + (size_t)row * gu_ld;
@@ -68,6 +73,22 @@ __global__ __launch_bounds__(256) void swiglu_clamped_had_quant_kernel(
         for (uint32_t b = 0; b < SUB; ++b)
             *(uint32_t*)(qr + c0[b]) = q8_pack4<true>(v[b][0], v[b][1], v[b][2], v[b][3], inv);
     }
+    if (CHAIN) r4d_chain_done();
+}
+
+template <uint32_t SUB>
+__global__ __launch_bounds__(256) void swiglu_clamped_had_quant_kernel(
+    const uint16_t* __restrict__ gu, int8_t* __restrict__ q, float* __restrict__ s,
+    uint16_t* __restrict__ y, uint32_t n, uint32_t ngrp, uint32_t gu_ld, uint32_t q_ld,
+    uint32_t s_ld, uint32_t y_ld, float limit) {
+    swiglu_clamped_had_quant_body<SUB, false>(gu, q, s, y, n, ngrp, gu_ld, q_ld, s_ld, y_ld, limit);
+}
+template <uint32_t SUB>
+__global__ __launch_bounds__(256) void r4dchain_glm_swiglu_clamped_had_quant(
+    const uint16_t* __restrict__ gu, int8_t* __restrict__ q, float* __restrict__ s,
+    uint16_t* __restrict__ y, uint32_t n, uint32_t ngrp, uint32_t gu_ld, uint32_t q_ld,
+    uint32_t s_ld, uint32_t y_ld, float limit) {
+    swiglu_clamped_had_quant_body<SUB, true>(gu, q, s, y, n, ngrp, gu_ld, q_ld, s_ld, y_ld, limit);
 }
 
 }  /* namespace */
@@ -84,8 +105,11 @@ extern "C" int rad_glm_swiglu_quant_launch(const RadArgs* a, RadStream stream) {
     /* A wave a group, at most eight a block: the width does not change the bits (no cross-wave
      * reduction, and the rotation is wave-local). */
     const uint32_t thr = (ngrp < 8u ? ngrp : 8u) * kWave;
+    /* Chained at the decode width only (RadKernelChainFn), as libr4d's quantisers are. */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && c.M <= 64;
 #define GLM_SQ(SUB_)                                                                               \
-    R4D_EMIT(stream, swiglu_clamped_had_quant_kernel<SUB_>, dim3((uint32_t)c.M), dim3(thr), 0,    \
+    R4D_EMIT(stream, (chain ? r4dchain_glm_swiglu_clamped_had_quant<SUB_>                          \
+                            : swiglu_clamped_had_quant_kernel<SUB_>), dim3((uint32_t)c.M), dim3(thr), 0, \
              c.gu, c.q, c.s, c.y, (uint32_t)c.n, ngrp, (uint32_t)c.gu_ld, (uint32_t)c.q_ld,        \
              (uint32_t)c.s_ld, (uint32_t)c.y_ld, c.limit)
     return c.group == 256 ? GLM_SQ(2u) : GLM_SQ(1u);
