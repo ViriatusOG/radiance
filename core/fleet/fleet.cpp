@@ -240,7 +240,13 @@ void card_telemetry(int card, json& o) {
  * fills, which live for seconds. Each queue takes about 41 MiB of VRAM for as long as it is open
  * (24 of them 0.99 GiB of a card, measured), so no more are opened ahead once a card has
  * kMaxQueuesAhead: a file with that many streams at once opens the rest as its streams ask.
- * One model never parks, so its cards see no restores and it opens what it uses. */
+ * One model never parks, so its cards see no restores and it opens what it uses.
+ *
+ * A model that leaves a card quiet closes them back to kKeepQueues, on a park as on an unload, so
+ * the reserve is never the reason the next entry cannot land: an entry that claims a whole card
+ * (`gpu-memory-mib`) is short of exactly the reserve's bytes on its way back on, and the card is
+ * emptiest, and so the safest moment to open late, the moment it is left. The next bring-up opens
+ * what its own reservation leaves room for (Fleet::reopen_queues clips on it). */
 constexpr int64_t kQueueBytes     = 41 * kMiB;
 constexpr int     kReserveQueues  = 8;
 constexpr int     kMaxQueuesAhead = 24;
@@ -503,8 +509,12 @@ private:
     void   wait_pages(const std::map<int, int64_t>& before, const std::map<int, int64_t>& expect);
     void   trim_spares(const std::vector<int>& cards);
     bool   card_quiet(int card, const Model* but);
+    /* Whether an op can put work on a card the model is not already on. */
+    static bool op_may_place(int op);
     int    close_idle_queues(const Model& m, const std::map<int, int64_t>& need);
     void   reopen_queues(const std::vector<int>& cards);
+    /* A model that leaves cards quiet closes their kept queues back to `keep`; the number closed. */
+    int    trim_quiet_queues(Model& m, const std::vector<int>& cards, int keep, const char* why);
 
     void   fail(Model& m, const std::string& why);
     bool   choose_cards(Model& m, const Config& cfg, std::vector<int>* out, std::string* why);
@@ -901,17 +911,38 @@ void Fleet::reopen_queues(const std::vector<int>& cards) {
     }
 }
 
-/* Whether nothing can launch on card `c` now but model `but` (null: nothing at all): no other
- * model has an engine with a rank there, parked or not, and none is on its way anywhere. Under
- * room_mu_, which a load or a return needs before it takes room. */
+/* Whether an op of a model's can put work on a card it is not already on. Only a load or a
+ * restore chooses cards, and while either is in flight the cards it chose are not yet known, so
+ * both answer for every card. A park, an unload, a yield, a fill or a promote works on the cards
+ * the model already holds. */
+bool Fleet::op_may_place(int op) {
+    return op == kLoad || op == kRestore;
+}
+
+/* Whether a queue of card `c` may be destroyed now, model `but` (null: no model) aside: which is
+ * what the two queue trims ask, and nothing else. Under room_mu_, which a load or a return needs
+ * before it takes room.
+ *
+ * Narrower than it looks, and deliberately so, because the wide form cost a full-card claim its
+ * queue reserve: a model parking, unloading, yielding or filling on the far side of the box held
+ * every card's kept queues closed, and the demand waiting on `c` failed with `the models that may
+ * leave did not free enough` five seconds after the fleet had opened queues ahead of its streams
+ * on a 31.2 GiB claim of a 31.36 GiB card (#484). A parked model does not answer either: it holds
+ * no streams, and no trim goes below kKeepQueues, which is more than its restore's streams take.
+ *
+ * What does answer for the card: a model in bring-up, which opens its streams there now; a load or
+ * a restore in flight, whose cards are not yet known; and a resident engine with a rank there. The
+ * device answers for the rest - a_stream_trim destroys nothing while any queue of the card holds a
+ * packet (core/device/aql.cpp). */
 bool Fleet::card_quiet(int c, const Model* but) {
     std::lock_guard<std::mutex> lk(mu_);
     for (const auto& o : models_) {
         if (o.get() == but) continue;
-        if (o->op.load() != kIdle || o->starting.load()) return false;
-        if (o->engine && (o->cards.empty() ||
-                          std::find(o->cards.begin(), o->cards.end(), c) != o->cards.end()))
-            return false;
+        if (o->starting.load()) return false;
+        const bool near = o->cards.empty() ||
+                          std::find(o->cards.begin(), o->cards.end(), c) != o->cards.end();
+        if (const int op = o->op.load(); op != kIdle && (op_may_place(op) || near)) return false;
+        if (o->engine && !o->parked && near) return false;
     }
     return true;
 }
@@ -938,6 +969,28 @@ int Fleet::close_idle_queues(const Model& m, const std::map<int, int64_t>& need)
         RAD_INFO("model %s: %d kept queue(s) closed on card(s) %s for the room they held (%s)",
                  m.entry.name.c_str(), n, cards_str(closed).c_str(),
                  humanb((int64_t)n * kQueueBytes).c_str());
+    return n;
+}
+
+/* Card `c`'s kept queues, closed down to `keep` while nothing can launch on it; the number
+ * closed, over `cards`. `m` is the model that just left (it answers for nothing on them). */
+int Fleet::trim_quiet_queues(Model& m, const std::vector<int>& cards, int keep, const char* why) {
+    std::lock_guard<std::recursive_mutex> room(room_mu_);
+    int n = 0;
+    std::vector<int> closed;
+    for (int c : cards)
+        if (card_quiet(c, &m)) {
+            const int k = dev_stream_trim(c, keep);
+            if (k > 0) {
+                n += k;
+                closed.push_back(c);
+            }
+        }
+    if (n > 0)
+        RAD_INFO("model %s: %s, %d kept queue(s) closed on card(s) %s (%s of the cards left free, "
+                 "%d kept for the next streams)",
+                 m.entry.name.c_str(), why, n, cards_str(closed).c_str(),
+                 humanb((int64_t)n * kQueueBytes).c_str(), keep);
     return n;
 }
 
@@ -1309,6 +1362,10 @@ int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string&
              humanb(got.disk).c_str(),
              got.quiet_s, got.slab_s, got.out_s, settle_s, humanb(host_held()).c_str(),
              humanb(host_budget_).c_str());
+    /* Its queues go with it: a parked model holds none, and the card is empty of work, which is
+     * the one moment a queue may be destroyed without risk. Four are left for its restore's own
+     * streams (two a rank, a third where it runs a second lane). */
+    (void)trim_quiet_queues(m, m.cards, kKeepQueues, "parked");
     if (got.host > 0) start_spill(m);
     return short_of ? 0 : 1;
 }
@@ -1364,10 +1421,11 @@ bool Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
         m.cards.clear();
         ++m.unloads;
     }
-    /* A card it leaves empty keeps the reserve of queues and no more: the queues its streams
-     * held, and those of the models before it, are closed while nothing can launch there. */
-    for (int c : was_on)
-        if (card_quiet(c, &m)) (void)dev_stream_trim(c, kReserveQueues);
+    /* A card it leaves empty keeps what its restore-class streams need and no more: the queues its
+     * streams held, and those of the models before it, are closed while nothing can launch there.
+     * This was the reserve of eight, 328 MiB of a card held by an IDLE card, which is more than an
+     * entry claiming a whole card can pay on its way back on. */
+    (void)trim_quiet_queues(m, was_on, kKeepQueues, "unloaded");
     RAD_INFO("model %s: unloaded in %.2f s", m.entry.name.c_str(), secs_since(t0));
     return true;
 }

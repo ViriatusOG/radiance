@@ -434,17 +434,22 @@ the slab's gain (§13.2) is a few percent at one client, more under load.
 | Non-expert weights | VRAM | unmapped; read again from the container | disk |
 | Experts | slab + host pool | slab unmapped, read again from the container; host pool kept | disk |
 | KV pool | committed | decommitted, and the prefix cache reset: a conversation's next turn prefills again | released |
-| Arena, staging, queues | committed | decommitted; queues kept | released |
+| Arena, staging, queues | committed | decommitted; kept queues trimmed to four | released |
 
 Queues are kept across a park and an unload: destroying a HW queue next to a busy card is the risky
 path (§3.1), so a closed stream's queue stays open for the card's next stream. An open queue holds
 about 41 MiB of its card (the context save area), and opening one on a full card can stall the
 process for minutes, so the fleet opens queues only while a card has room: eight to a card at the
 start, and before each load as many as bring the kept ones back to eight, up to 24 open on a card.
-Kept queues are closed in two places, both where no other model has anything on the card: down to
-eight when an unload leaves the card empty, and down to four for a model that is short of exactly
-their memory after every other model has left (MiniMax-H3 on a 32 GB card). `/admin/fleet` gives
-each card's `queues` and `queues_idle`.
+Kept queues are closed in three places, all where the card has nothing that a queue destroy could
+disturb: down to four when an unload leaves the card, down to four when a model parks (a parked
+model holds no streams, and four is more than its restore takes), and down to four for a model that
+is short of exactly their memory after every other model has left (MiniMax-H3 on a 32 GB card).
+Eight of them is 328 MiB of a card held by an otherwise idle card, which is more than a model
+claiming a whole card (`gpu-memory-mib`, §4.3) can pay on its way back on: that reserve, left by an
+unload and reopened before the next load, was the memory that claim was short of. The next bring-up
+reopens what its own reservation leaves room for, and a card just left is the emptiest and safest
+moment to have needed none. `/admin/fleet` gives each card's `queues` and `queues_idle`.
 
 ### 7.2 Park
 
