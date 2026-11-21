@@ -806,6 +806,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->tp_attn_rows_ok = 1;
     /* --kv-cache-dtype fp8: the latent attention cache as E4M3 (declare, kv_groups). */
     out->kv_fp8_ok = 1;
+    /* Nearly every launch of a decode pass depends on the one before it. Chained, at TP4 on four
+     * R9700 with a 64k context, the step went from 23.82 to 23.37 ms over four sequences and from
+     * 16.15 to 15.90 ms at one, with the same tokens out. */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
     return RAD_OK;
 }
 } // namespace glm5next
