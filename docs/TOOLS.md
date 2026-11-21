@@ -153,7 +153,7 @@ rad-convert [options] <input> -o <model.rad>
       --gpus LIST      the cards (HIP device numbers, comma separated) quantisers may run on;
                        large weights then run two at a time. The bytes are the host's
       --gpu-workers N  with --gpus, prefer N OpenMP workers for small trellis GPTQ jobs;
-                       N must leave at least one worker for other jobs
+                       N must leave at least one worker for other jobs and cannot exceed the cards in --gpus
       --plan-only      declare, plan every weight's encoding, print the plan, and stop
       --report N       the worst N quantisation errors to print (default 20)
   -v, --verbose
@@ -341,7 +341,7 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   most of a working day for a 27B dense model. `iters=50` takes a quarter of the time.
 - `--gpu-workers N` separates small trellis GPTQ jobs from other converter jobs: N OpenMP
   workers prefer the trellis queue and the rest prefer the host/copy queue; workers steal from the
-  other queue once their own is empty. It requires `--gpus` and at least one remaining host worker,
+  other queue once their own is empty. It requires `--gpus`, at most one worker per listed card, and at least one remaining host worker,
   e.g. `OMP_NUM_THREADS=8 rad-convert ... --gpus 0 --gpu-workers 4`. Large jobs retain their
   existing scheduling. The option can reduce starvation but cannot guarantee card utilization:
   Hessian preparation, storage, CPU work and the last few jobs may still leave cards idle.

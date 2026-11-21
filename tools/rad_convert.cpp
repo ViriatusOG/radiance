@@ -411,7 +411,7 @@ void usage() {
         "                       no quantiser plugin that has a device path, refused\n"
         "      --gpu-workers N  with --gpus, reserve N OpenMP workers for trellis GPTQ jobs;\n"
         "                       other workers process CPU jobs, either side can steal. N must\n"
-        "                       be less than OMP_NUM_THREADS. Default: one shared queue\n"
+        "                       be less than OMP_NUM_THREADS and at most the cards in --gpus. Default: one shared queue\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
@@ -611,9 +611,22 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    {
+        std::unordered_set<int> listed;
+        for (int g : gpus)
+            if (!listed.insert(g).second) {
+                std::fprintf(stderr, "rad-convert: --gpus lists card %d more than once\n", g);
+                return 2;
+            }
+    }
     if (gpu_workers) {
         if (gpus.empty()) {
             std::fprintf(stderr, "rad-convert: --gpu-workers needs --gpus\n"); return 2;
+        }
+        if ((size_t)gpu_workers > gpus.size()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers %d exceeds the %zu card(s) in --gpus\n",
+                         gpu_workers, gpus.size());
+            return 2;
         }
 #ifdef _OPENMP
         if (gpu_workers >= omp_get_max_threads()) {
