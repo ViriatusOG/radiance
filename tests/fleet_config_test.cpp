@@ -91,6 +91,21 @@ TEST(a_card_keeps_its_own_headroom) {
     CHECK(refused("models:\n  a: {model: /m/a.rad, card-headroom-mib: {0: 1}}\n"));
 }
 
+/* memory.pinned-numa-node: the node pinned host memory prefers, -1 (unset) for each card's own. */
+TEST(pinned_host_memory_can_name_its_node) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("memory:\n  host-mib: 4096\n  pinned-numa-node: 1\n"
+                   "models:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);
+    CHECK_EQ(fc.pinned_numa_node, 1);
+    CHECK_EQ(yload("models:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);
+    CHECK_EQ(fc.pinned_numa_node, -1);
+    CHECK(refused("memory:\n  pinned-numa-node: -1\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("memory:\n  pinned-numa-node: 1024\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("memory:\n  pinned-numa-node: node0\nmodels:\n  a: {model: /m/a.rad}\n"));
+    /* The fleet's own key: a model entry that names it is the misplaced message, not a misspelling. */
+    CHECK(refused("models:\n  a: {model: /m/a.rad, pinned-numa-node: 0}\n"));
+}
+
 TEST(structured_values_are_spelled_for_their_flag) {
     fleet::FleetConfig fc;
     CHECK_EQ(yload("models:\n  q:\n    model: /m/q.rad\n"

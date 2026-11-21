@@ -892,6 +892,7 @@ std::string dev_pci_address(int device) {
 }
 std::atomic<int64_t> dev_stuck_exit_ms{60000};
 std::atomic<bool> dev_engine_ready{false};
+std::atomic<int> dev_pinned_numa_node{-1};
 int64_t dev_stuck_ms() {
     const auto f = dev()->stuck_ms;
     return f ? f() : 0;

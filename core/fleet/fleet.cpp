@@ -576,6 +576,10 @@ private:
 Fleet::Fleet(FleetConfig fc)
     : fc_(std::move(fc)), front_(transport_options(fc_), fc_.keepalive_ms) {
     dev_stuck_exit_ms.store(fc_.stuck_exit_ms, std::memory_order_relaxed);
+    dev_pinned_numa_node.store(fc_.pinned_numa_node, std::memory_order_relaxed);
+    if (fc_.pinned_numa_node >= 0)
+        RAD_INFO("memory: pinned host memory prefers NUMA node %d (memory.pinned-numa-node), "
+                 "not the node nearest each card", fc_.pinned_numa_node);
     bool any = false;
     int64_t head = 0;
     for (const ModelEntry& e : fc_.models) {
@@ -2461,6 +2465,7 @@ std::string Fleet::reload() {
     }
     fc_ = std::move(nf);
     dev_stuck_exit_ms.store(fc_.stuck_exit_ms, std::memory_order_relaxed);
+    dev_pinned_numa_node.store(fc_.pinned_numa_node, std::memory_order_relaxed);
     for (const ModelEntry& e : fc_.models)
         if (e.pin) demand(e.name);
     RAD_INFO("reload: %s applied, %zu model(s)", fc_.path.c_str(), fc_.models.size());

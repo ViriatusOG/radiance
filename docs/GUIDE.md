@@ -683,7 +683,7 @@ A key sits at one of these levels:
 | level | holds |
 |---|---|
 | `server:` | the listener and the process: `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `radiance-home`, `kernels`, `download-dir`, `log` (`info`, `debug` or `trace`), `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, and `disk-tier`, a directory for parked models' copies |
+| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, `disk-tier`, a directory for parked models' copies, and `pinned-numa-node`, a NUMA node preferred for pinned host memory over the node nearest each card |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive` |
 | `cards:` | `all` or a list of card indices the models may use |
 | `groups:` | `together` and `exclusive` lists of model names |
@@ -2613,8 +2613,9 @@ by 0.002-0.003 nats.
 `radiance --help` prints these, by level. A key written here as `server.KEY` or `memory.KEY` belongs
 under that level; every other key belongs to a model's entry under `models:` (or to `defaults:`). A
 switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`, `pin`, `ttl`,
-`flex` and `park`, `memory.host-mib`, `memory.disk-tier`, and the `cards:`, `scheduler:` and
-`groups:` levels) are in [MULTIMODEL.md](MULTIMODEL.md). Grouped by purpose:
+`flex` and `park`, `memory.host-mib`, `memory.disk-tier`, `memory.pinned-numa-node`, and the
+`cards:`, `scheduler:` and `groups:` levels) are in [MULTIMODEL.md](MULTIMODEL.md). Grouped by
+purpose:
 
 **Model and plugins**
 
@@ -4843,6 +4844,7 @@ process, so that a restart policy brings the server back; `0` turns that off.
 | `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `server.radiance-home`; set but empty is unset |
 | `RADIANCE_KERNELS` | default kernel libraries, separated by `,` or `:`. Same as `server.kernels`, read by the engine and every tool by one rule, so a plugin validated with `rad-kbench` serves the same way without editing launchers; set but empty is unset |
 | `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` (default `info`) |
+| `RADIANCE_PINNED_NUMA_NODE` | same as `memory.pinned-numa-node` (below, §4.0) for a tool that reads no configuration file; the server's value comes from the file. Not a number, empty, or unset is unset |
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `model: <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `model: <owner/name>` fetches to without `server.download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |

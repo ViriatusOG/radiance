@@ -471,6 +471,11 @@ extern std::atomic<int64_t> dev_stuck_exit_ms;
  * disarms: the phase the flag exempts is only the engine's first. */
 extern std::atomic<bool> dev_engine_ready;
 
+/* The NUMA node GPU-accessible pinned host memory prefers, -1 for the node nearest each card.
+ * Set from `memory.pinned-numa-node` before serving (the fleet validates the number); the AQL
+ * backend reads it wherever it pins. A reload moves only what it pins after. */
+extern std::atomic<int> dev_pinned_numa_node;
+
 /* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves
  * that everything more than that many packets earlier has completed. Argument slots and tape

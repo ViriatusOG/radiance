@@ -141,6 +141,7 @@ memory:
   card-headroom-mib: {0: 4096}        # card 0 (the desktop's) keeps 4 GiB free instead
   host-mib: 40960          # pinned host RAM the fleet may hold: parked weights, KV host tier, pools
   disk-tier: /var/cache/radiance      # prefix-cache disk tier and park files
+  # pinned-numa-node: 1    # prefer this node for pinned host memory (default: each card's own)
 
 defaults:                  # merged under every model; a model's own keys win
   kv-cache-dtype: i8
@@ -198,7 +199,7 @@ scheduler:
 |---|---|
 | `server:` | `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `log` (`info`/`debug`/`trace`), `radiance-home`, `kernels`, `download-dir`, `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
 | `cards:` | `all` or a list of card indices |
-| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier` |
+| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier`, `pinned-numa-node` |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `stuck-exit`, `warm-up` |
 | `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park`, `cards` |
 | `groups:` | `together` / `exclusive` lists |
@@ -362,7 +363,10 @@ first and stay restorable from their host copies.
 ### 6.5 Host RAM ledger
 
 One pinned host budget (`memory.host-mib`) covers: parked weight copies (§7), the KV host tier, the
-expert host pools of tiered models, and the transit buffers. Unset, it is three quarters of the
+expert host pools of tiered models, and the transit buffers. Where that memory prefers to sit is
+`memory.pinned-numa-node`: a node number, where unset leaves every pinned range on the node nearest
+the card. A placement preference only (`MPOL_PREFERRED`), so a node with no memory places nothing
+and pages land on the first-touching node as they would unplaced. Unset, it is three quarters of the
 host's memory, or of the tightest memory cgroup the process sits in (a container's `--memory`),
 whichever is less. The room a load or park may take at a moment is the host's available memory, or
 less where such a cgroup leaves less, and a park never leaves less than 8 GiB of it. The KV host tier is shared between

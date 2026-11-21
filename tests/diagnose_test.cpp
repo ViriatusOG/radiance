@@ -822,14 +822,16 @@ TEST(environment_is_a_fixed_name_list) {
     char home[]       = "HOME=/root";
     char radfake[]    = "RADIATOR=not a prefix of RAD_ with a name";
     char vram[]       = "RADIANCE_HOST_VRAM_MIB=512";
-    char* env[] = { tp, omp, wait, suffix, key, home, radfake, vram, nullptr };
+    char pinned[]     = "RADIANCE_PINNED_NUMA_NODE=1";
+    char* env[] = { tp, omp, wait, suffix, key, home, radfake, vram, pinned, nullptr };
 
     const std::vector<std::string> v = diag::env_allowlist(env);
-    CHECK_EQ(v.size(), (size_t)4);
+    CHECK_EQ(v.size(), (size_t)5);
     CHECK(std::find(v.begin(), v.end(), "RADIANCE_LOG_STEPS") != v.end());
     CHECK(std::find(v.begin(), v.end(), "OMP_NUM_THREADS") != v.end());
     CHECK(std::find(v.begin(), v.end(), "OMP_WAIT_POLICY") != v.end());
     CHECK(std::find(v.begin(), v.end(), "RADIANCE_HOST_VRAM_MIB") != v.end());
+    CHECK(std::find(v.begin(), v.end(), "RADIANCE_PINNED_NUMA_NODE") != v.end());
     /* A suffix on an allowed name is not an allowed name: a prefix list would print this one. */
     for (const std::string& n : v) {
         CHECK(n.find('=') == std::string::npos);            /* names, never values */

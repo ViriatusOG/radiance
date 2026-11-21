@@ -1040,8 +1040,8 @@ std::vector<std::string> env_allowlist(char* const* env) {
         "HIP_VISIBLE_DEVICES",    "OMP_NUM_THREADS",       "OMP_WAIT_POLICY",
         "RADIANCE_CALIB_DIR",     "RADIANCE_CALIB_TOKENS", "RADIANCE_HOME",
         "RADIANCE_HOST_DEVICES",  "RADIANCE_HOST_VRAM_MIB", "RADIANCE_KERNELS",
-        "RADIANCE_LOG",           "RADIANCE_LOG_STEPS",    "RADIANCE_PROFILE_EVERY",
-        "RADIANCE_TUNE",          "ROCR_VISIBLE_DEVICES",
+        "RADIANCE_LOG",           "RADIANCE_LOG_STEPS",    "RADIANCE_PINNED_NUMA_NODE",
+        "RADIANCE_PROFILE_EVERY", "RADIANCE_TUNE",         "ROCR_VISIBLE_DEVICES",
     };
     std::vector<std::string> out;
     for (char* const* e = env; e && *e; ++e) {

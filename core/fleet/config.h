@@ -103,6 +103,9 @@ struct FleetConfig {
     /* memory: the per-card keys travel inside every model's flag list; these are the fleet's own. */
     int64_t     host_mib = 0;       /* 0 = not set */
     std::string disk_tier;
+    /* memory.pinned-numa-node: the NUMA node GPU-accessible pinned host memory prefers in place
+     * of the node nearest each card (dev_pinned_numa_node); -1, the default, names none. */
+    int         pinned_numa_node = -1;
     /* memory.card-headroom-mib: a card's own reserve, in MiB by card ordinal, in place of the
      * gpu-headroom-mib every other card keeps (the card that drives a desktop). */
     std::map<int, int64_t> card_headroom_mib;
