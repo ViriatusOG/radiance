@@ -460,10 +460,10 @@ static int declare_encoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         const VImg xc = x;
         const bool dn = i != 4;
         for (int r = 0; r < nres; ++r)
-            x = v.resblock(x, dims[(size_t)i + 1], nm.f("vae.encoder.down_blocks.%d.resnets.%d", i, r));
+            x = v.resblock(x, dims[(size_t)i + 1], nm.ckpt("vae.encoder.down_blocks.%d.resnets.%d", i, r));
         if (dn) {
             x = v.conv(x, dims[(size_t)i + 1], 3, 2, 1, "down",
-                       nm.f("vae.encoder.down_blocks.%d.downsampler.resample.1", i));
+                       nm.ckpt("vae.encoder.down_blocks.%d.downsampler.resample.1", i));
             v.shortcut(xc, x, td[(size_t)i] != 0.0 ? 2 : 1);
         } else {
             x = v.add(x, xc);
@@ -544,10 +544,10 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         const VImg xc = x;
         const bool upf = i != 4;
         for (int r = 0; r < nres + 1; ++r)
-            x = v.resblock(x, dims[(size_t)i + 1], nm.f("vae.decoder.up_blocks.%d.resnets.%d", i, r));
+            x = v.resblock(x, dims[(size_t)i + 1], nm.ckpt("vae.decoder.up_blocks.%d.resnets.%d", i, r));
         if (upf) {
             x = v.conv(x, dims[(size_t)i + 1], 3, 1, 2, "same",
-                       nm.f("vae.decoder.up_blocks.%d.upsampler.resample.1", i));
+                       nm.ckpt("vae.decoder.up_blocks.%d.upsampler.resample.1", i));
             v.shortcut(xc, x, tu[(size_t)i] != 0.0 ? 2 : 1);
         }
     }

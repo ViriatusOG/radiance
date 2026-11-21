@@ -1206,6 +1206,7 @@ AVX_KERNEL(l2norm_chan) {
     if (rows <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
     const float sq = (float)std::sqrt((double)n);
     const uint32_t dt = Y->dtype;
+    const bool round_length = p_int(a, "round_length", 0) != 0;
     /* gamma read at linear offsets, as libref reads its [C, 1, 1(, 1)] weight. */
     float* gam = (float*)scratch_raw((size_t)(n + 16) * sizeof(float));
     for (int64_t c = 0; c < n; ++c) gam[c] = ld_elem(G->data, G->dtype, c);
@@ -1215,7 +1216,8 @@ AVX_KERNEL(l2norm_chan) {
         float* buf = scratch_f32((size_t)(3 * n + 48));
         float *xs = buf, *v = buf + n + 16, *tmp = v + n + 16;
         const float* x = in_row(X, rowoff(X, r, n), n, xs);
-        const float nrm = std::max(std::sqrt(row_sumsq(x, n)), 1e-12f);
+        const float clamped = std::max(std::sqrt(row_sumsq(x, n)), 1e-12f);
+        const float nrm = round_length ? narrow1(dt, clamped) : clamped;
         const vf vn = vf_set1(nrm), vq = vf_set1(sq);
         int64_t c = 0;
         for (; c + VF_N <= n; c += VF_N) vf_storeu(v + c, vf_div(vf_loadu(x + c), vn));

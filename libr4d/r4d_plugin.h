@@ -1102,6 +1102,29 @@ int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_had_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 
+int r4d_rad_attn_umt5(const RadArgs*, RadStream);
+int r4d_rad_gelu_umt5(const RadArgs*, RadStream);
+
+int r4d_rad_wan_rope_table(const RadArgs*, RadStream);
+
+int r4d_rad_wan_rope(const RadArgs*, RadStream);
+
+int r4d_rad_wan_mod_norm(const RadArgs*, RadStream);
+
+int r4d_rad_wan_gated_add(const RadArgs*, RadStream);
+
+int r4d_rad_wan_unpatch(const RadArgs*, RadStream);
+
+int r4d_rad_wan_vae_frame_cu(const RadArgs*, RadStream);
+
+int r4d_rad_wan_vae_history(const RadArgs*, RadStream);
+
+int r4d_rad_wan_vae_expand(const RadArgs*, RadStream);
+
+int r4d_rad_timestep_embed_f64(const RadArgs*, RadStream);
+
+int r4d_rad_flow_unipc_step(const RadArgs*, RadStream);
+
 }  /* extern "C" */
 
 #endif /* RAD_R4D_PLUGIN_H */

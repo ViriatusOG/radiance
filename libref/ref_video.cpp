@@ -1,3 +1,5 @@
+#include "rad_wan_vae.h"
+#include "rad_wan_dit.h"
 /* ref_video.cpp -- the video generator's ops around its decoder (docs/OPS.md, "Video
  * generation"): the denoised latent's patch rows unfolded to voxels, the tiles a video decoder
  * runs over, gathered from the latent and stitched back into frames, and the rotary positions of
@@ -873,5 +875,223 @@ int ref_vtile_join(const RadArgs* a, RadStream) {
             stt(y, yb + c * ys, v);
         }
     }
+    return RAD_OK;
+}
+
+int ref_wan_rope_table(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    using namespace rad_wan_dit;
+    const RadTensor *grid = &a->t[0], *table = &a->t[1];
+    RAD_REF_TRY(check_grid(grid));
+    const auto* dims = static_cast<const int32_t*>(grid->data);
+    int64_t height, width, rows;
+    if (!latent_grid(dims, height, width, rows)) return RAD_E_SHAPE;
+    RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
+    auto* out = static_cast<float*>(table->data);
+    double inv[pairs];
+    for (int pair = 0; pair < pairs; ++pair) {
+        const int axis = pair_axis(pair);
+        const int count = axis == 0 ? time_pairs : spatial_pairs;
+        inv[pair] = 1.0 / std::pow(10000.0, (double)pair_in_axis(pair, axis) / count);
+    }
+    REF_PAR_FOR(rows * head_width)
+    for (int64_t row = 0; row < rows; ++row)
+        for (int pair = 0; pair < pairs; ++pair) {
+            const double angle = coordinate(row, pair_axis(pair), height, width) * inv[pair];
+            float* dst = out + row * table->stride[0] + 2 * pair;
+            dst[0] = static_cast<float>(std::cos(angle));
+            dst[1] = static_cast<float>(std::sin(angle));
+        }
+    return RAD_OK;
+}
+
+int ref_wan_rope(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    using namespace rad_wan_dit;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *table = &a->t[2];
+    const int64_t rows = q->shape[0], heads = p_int(a, "heads", 0);
+    if (heads < 1 || heads > 128) return RAD_E_SHAPE;
+    if (q->dtype != RAD_F32 && q->dtype != RAD_BF16) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(q, q->dtype, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(k, q->dtype, rows, heads * head_width));
+    RAD_REF_TRY(check_matrix(table, RAD_F32, rows, head_width));
+    REF_PAR_FOR(rows * heads * head_width)
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto* cs = static_cast<const float*>(table->data) + row * table->stride[0];
+        for (const RadTensor* x : {q, k})
+            for (int64_t h = 0; h < heads; ++h)
+                for (int i = 0; i < head_width; i += 2) {
+                    const int64_t off = row * x->stride[0] + h * head_width + i;
+                    const float re = ldt(x, off), im = ldt(x, off + 1);
+                    stt(x, off, re * cs[i] - im * cs[i + 1]);
+                    stt(x, off + 1, im * cs[i] + re * cs[i + 1]);
+                }
+    }
+    return RAD_OK;
+}
+
+int ref_wan_mod_norm(const RadArgs* a, RadStream) {
+    if (!have(a, 3) || !t_in(a, 4)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    using namespace rad_wan_dit;
+    const RadTensor *x = &a->t[0], *time = &a->t[1], *table = &a->t[2];
+    const RadTensor *split = t_in(a, 3), *y = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), rows = x->shape[0];
+    const int64_t group = p_int(a, "group", 0);
+    const bool head = group == -1, round = p_int(a, "round_norm", 0) != 0;
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n < 1 || n > 4096 || (group != -1 && group != 0 && group != 3) ||
+        !(eps > 0) || !std::isfinite(eps)) return RAD_E_SHAPE;
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(x, RAD_F32, rows, n));
+    RAD_REF_TRY(check_matrix(y, y->dtype, rows, n));
+    RAD_REF_TRY(check_modulation(time, table, split, n, head));
+    const int64_t first = split ? ldi(split, 0) : rows;
+    if (first < 0 || first > rows) return RAD_E_SHAPE;
+    const int64_t shift_row = head ? 0 : group;
+    const int64_t scale_row = head ? 0 : group + 1;
+    const auto* weights = static_cast<const float*>(table->data) + shift_row * n;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const auto* row = static_cast<const float*>(x->data) + r * x->stride[0];
+        const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+        float mean = 0.0f, variance = 0.0f;
+        for (int64_t c = 0; c < n; ++c) mean += row[c];
+        mean /= static_cast<float>(n);
+        for (int64_t c = 0; c < n; ++c) {
+            const float centered = row[c] - mean;
+            variance += centered * centered;
+        }
+        const float inverse = 1.0f / std::sqrt(variance / static_cast<float>(n) + eps);
+        for (int64_t c = 0; c < n; ++c) {
+            const float norm = (row[c] - mean) * inverse;
+            const float scale = weights[n + c] + mod[scale_row * n + c];
+            const float shift = weights[c] + mod[shift_row * n + c];
+            stt(y, r * y->stride[0] + c, (round ? round_dt(RAD_BF16, norm) : norm) * (1.0f + scale) + shift);
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_wan_gated_add(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    using namespace rad_wan_dit;
+    const RadTensor *x = &a->t[0], *update = &a->t[1];
+    const RadTensor *time = t_in(a, 2), *table = t_in(a, 3), *split = t_in(a, 4);
+    const int64_t n = p_int(a, "n", 0), rows = x->shape[0], gate = p_int(a, "gate", -1);
+    const bool gated = gate != -1;
+    if (n < 1 || n > 4096 || (gated && gate != 2 && gate != 5)) return RAD_E_SHAPE;
+    if (gated ? (!time || !table) : (time || table || split)) return RAD_E_INVAL;
+    RAD_REF_TRY(check_matrix(x, RAD_F32, rows, n));
+    RAD_REF_TRY(check_matrix(update, RAD_BF16, rows, n));
+    if (gated) RAD_REF_TRY(check_modulation(time, table, split, n, false));
+    const int64_t first = split ? ldi(split, 0) : rows;
+    if (first < 0 || first > rows) return RAD_E_SHAPE;
+    auto* state = static_cast<float*>(x->data);
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < n; ++c) {
+            float value = ldt(update, r * update->stride[0] + c);
+            if (gated) {
+                const int64_t off = gate * n + c;
+                const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+                value *= static_cast<const float*>(table->data)[off] + mod[off];
+            }
+            state[r * x->stride[0] + c] += value;
+        }
+    return RAD_OK;
+}
+
+int ref_wan_unpatch(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    using namespace rad_wan_dit;
+    const RadTensor *src = &a->t[0], *grid = &a->t[1], *dst = &a->t[2];
+    const int64_t channels = p_int(a, "n", 0);
+    RAD_REF_TRY(check_grid(grid));
+    if (channels < 1 || channels > 1024) return RAD_E_SHAPE;
+    const auto* dims = static_cast<const int32_t*>(grid->data);
+    int64_t height, width, rows;
+    if (!latent_grid(dims, height, width, rows)) return RAD_E_SHAPE;
+    if (src->dtype != RAD_F32 && src->dtype != RAD_BF16) return RAD_E_DTYPE;
+    RAD_REF_TRY(check_matrix(src, src->dtype, rows, 4 * channels));
+    RAD_REF_TRY(check_matrix(dst, RAD_F32, 4 * rows, channels));
+    auto* out = static_cast<float*>(dst->data);
+    REF_PAR_FOR(4 * rows * channels)
+    for (int64_t row = 0; row < 4 * rows; ++row)
+        for (int64_t c = 0; c < channels; ++c)
+            out[row * dst->stride[0] + c] =
+                ldt(src, unpack_offset(row, c, height, width, channels, src->stride[0]));
+    return RAD_OK;
+}
+
+int ref_wan_vae_frame_cu(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    const RadTensor *geom = &a->t[0], *y = &a->t[1];
+    RAD_REF_TRY(rad_wan_dit::check_grid(geom));
+    if (y->dtype != RAD_I32) return RAD_E_DTYPE;
+    if (y->rank != 1 || y->shape[0] < 2 || y->shape[0] > rad_wan_vae::max_chunk_frames + 1)
+        return RAD_E_SHAPE;
+    if (y->stride[0] != 1) return RAD_E_STRIDE;
+    int64_t plane = 0;
+    if (!rad_wan_vae::frame_plane(static_cast<const int32_t*>(geom->data), y->shape[0], plane))
+        return RAD_E_SHAPE;
+    auto* cu = static_cast<int32_t*>(y->data);
+    for (int32_t i = 0; i < y->shape[0]; ++i) cu[i] = static_cast<int32_t>(i * plane);
+    return RAD_OK;
+}
+
+int ref_wan_vae_history(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    const RadTensor *x = &a->t[0], *history = &a->t[1], *out = &a->t[2];
+    const int64_t mode = p_int(a, "temporal", 0), reset = p_int(a, "reset", 0);
+    if ((mode != 0 && mode != 1) || (reset != 0 && reset != 1)) return RAD_E_INVAL;
+    int64_t plane, frames;
+    RAD_REF_TRY(rad_wan_vae::check_history(x, history, out, mode != 0, plane, frames));
+    const int64_t channels = x->shape[1];
+    const auto* src = static_cast<const uint16_t*>(x->data);
+    auto* cache = static_cast<uint16_t*>(history->data);
+    auto* dest = static_cast<uint16_t*>(out->data);
+    REF_PAR_FOR(plane * channels)
+    for (int64_t i = 0; i < plane * channels; ++i) {
+        const int64_t pixel = i / channels, c = i % channels;
+        if (mode)
+            rad_wan_vae::history_cell<true>(src, cache, dest, pixel, c, plane, frames,
+                                            x->stride[0], history->stride[0], out->stride[0], reset != 0);
+        else
+            rad_wan_vae::history_cell<false>(src, cache, dest, pixel, c, plane, frames,
+                                             x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    }
+    return RAD_OK;
+}
+
+int ref_wan_vae_expand(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    if (p_int(a, "M", 0) <= 0) return RAD_E_SHAPE;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *out = &a->t[2];
+    const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t st = p_int(a, "st", 1), s = p_int(a, "s", 1), drop = p_int(a, "drop", 0);
+    const int64_t mode = p_int(a, "temporal", 0);
+    if (mode != 0 && mode != 1) return RAD_E_INVAL;
+    RAD_REF_TRY(rad_wan_dit::check_grid(geom));
+    RAD_REF_TRY(rad_wan_vae::check_expand(x, out, cin, cout, st, s, drop, mode != 0));
+    const auto* dims = static_cast<const int32_t*>(geom->data);
+    const int64_t rows = out->shape[0];
+    if (!rad_wan_vae::check_expand_grid(dims, x->shape[0], rows, st, s, drop))
+        return RAD_E_SHAPE;
+    const auto* input = static_cast<const uint16_t*>(x->data);
+    auto* output = static_cast<uint16_t*>(out->data);
+    REF_PAR_FOR(rows * cout)
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cout; ++c) {
+            const int64_t at = rad_wan_vae::expand_offset(r, c, dims[1], dims[2], cin, cout,
+                                                          st, s, drop, mode != 0, x->stride[0]);
+            output[r * out->stride[0] + c] = input[at];
+        }
     return RAD_OK;
 }

@@ -599,5 +599,50 @@ REF_SHAPE_FN(ref_sample_pick);
 REF_SHAPE_FN(ref_sample_argmax);
 REF_SHAPE_FN(ref_sample_logprobs);
 
+int ref_attn_umt5(const RadArgs*, RadStream);
+int ref_gelu_umt5(const RadArgs*, RadStream);
+REF_SHAPE_FN(ref_attn_umt5);
+REF_SHAPE_FN(ref_gelu_umt5);
+
+int ref_wan_rope_table(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_rope_table);
+
+int ref_wan_rope(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_rope);
+
+int ref_wan_mod_norm(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_mod_norm);
+
+int ref_wan_gated_add(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_gated_add);
+
+int ref_wan_unpatch(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_unpatch);
+
+int ref_wan_vae_frame_cu(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_vae_frame_cu);
+
+int ref_wan_vae_history(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_vae_history);
+
+int ref_wan_vae_expand(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_vae_expand);
+
+int ref_timestep_embed_f64(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_timestep_embed_f64);
+
+int ref_flow_unipc_step(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_flow_unipc_step);
+
 }  /* extern "C" */
 #endif /* RAD_REF_OPS_H */

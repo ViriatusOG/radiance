@@ -1,3 +1,4 @@
+#include "rad_umt5_gelu.h"
 // R4D -- the image generator's ops (docs/OPS.md, "Image generation"): a diffusion transformer's
 // adaptive norm and gated residual, the timestep embedding, the per-image latent lanes and the
 // flow-matching sampler over them, and the image decoder's convolution, channel norm, resampling
@@ -590,7 +591,7 @@ __global__ __launch_bounds__(kT) void chan_affine_kernel(
 // A wave a pixel: the sum of squares over its channels, then the three roundings.
 __global__ __launch_bounds__(kT) void l2norm_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
-    int64_t rows, int n, float sq, int silu) {
+    int64_t rows, int n, float sq, bool silu, bool round_length) {
     const int64_t r = (int64_t)blockIdx.x * (kT / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (r >= rows) return;
@@ -602,7 +603,10 @@ __global__ __launch_bounds__(kT) void l2norm_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) ss += f[j] * f[j];
     }
-    const float nrm = fmaxf(sqrtf(r4d_wave_sum(ss)), 1e-12f);
+    const float length = sqrtf(r4d_wave_sum(ss));
+    const float clamped = round_length ? (length < 1e-12f ? 1e-12f : length)
+                                       : fmaxf(length, 1e-12f);
+    const float nrm = round_length ? bfr(clamped) : clamped;
     uint16_t* yr = y + (size_t)r * n;
     for (int c = lane * 8; c < n; c += 256) {
         float f[8], gg[8];
@@ -677,6 +681,7 @@ __global__ __launch_bounds__(kT) void gelu_quick_kernel(const T* __restrict__ x,
     }
 }
 
+template<bool Umt5>
 __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int n, int x_ld, int y_ld) {
     const int r = blockIdx.x;
@@ -686,7 +691,8 @@ __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const float v = f[j];
-            f[j] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+            if constexpr (Umt5) f[j] = rad_umt5::gelu(v, bfr);
+            else f[j] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
         }
         st8(y + (size_t)r * y_ld + c, f);
     }
@@ -1000,6 +1006,18 @@ int parse_bf16_list(const char* s, float* out, int max, bool bf16 = true) {
         s = end;
     }
     return n;
+}
+
+__global__ __launch_bounds__(kT) void timestep_f64_kernel(
+    const float* __restrict__ t, float* __restrict__ y, int half, double max_period, int64_t y_ld) {
+    const int m = blockIdx.x;
+    const double position = t[m];
+    float* out = y + static_cast<int64_t>(m) * y_ld;
+    for (int i = threadIdx.x; i < half; i += kT) {
+        const double angle = position * pow(max_period, -static_cast<double>(i) / half);
+        out[i] = static_cast<float>(cos(angle));
+        out[half + i] = static_cast<float>(sin(angle));
+    }
 }
 
 }  // namespace
@@ -1602,10 +1620,11 @@ extern "C" int r4d_rad_l2norm_chan(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_STRIDE);
     const long long rows = r4d_numel(y) / n;
     if (rows <= 0 || r4d_numel(x) < rows * n) return R4D_NO(RAD_E_SHAPE);
+    const bool round_length = r4d_geti_or(a, "round_length", 0) != 0;
     hipLaunchKernelGGL(l2norm_kernel, dim3((unsigned)((rows + kT / 32 - 1) / (kT / 32))), dim3(kT),
                        0, (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)g->data,
                        (uint16_t*)y->data, (int64_t)rows, (int)n,
-                       (float)std::sqrt((double)n), silu);
+                       (float)std::sqrt((double)n), silu, round_length);
     return st_of(hipGetLastError());
 }
 
@@ -1680,7 +1699,8 @@ extern "C" int r4d_rad_gelu_quick(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
-extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) {
+template<bool Umt5>
+static int launch_gelu_tanh(const RadArgs* a, RadStream s) {
     const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(y)) return R4D_NO(RAD_E_DTYPE);
@@ -1688,10 +1708,13 @@ extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) {
     long long rx = 0, xl = 0, ry = 0, yl = 0;
     if (!rows8(x, n, &rx, &xl) || !rows8(y, n, &ry, &yl)) return R4D_NO(RAD_E_STRIDE);
     if (ry <= 0 || rx < ry) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(gelu_tanh_kernel, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
+    hipLaunchKernelGGL(gelu_tanh_kernel<Umt5>, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
                        (const uint16_t*)x->data, (uint16_t*)y->data, (int)n, (int)xl, (int)yl);
     return st_of(hipGetLastError());
 }
+
+extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) { return launch_gelu_tanh<false>(a, s); }
+extern "C" int r4d_rad_gelu_umt5(const RadArgs* a, RadStream s) { return launch_gelu_tanh<true>(a, s); }
 
 extern "C" int r4d_rad_scatter_add_rows(const RadArgs* a, RadStream s) {
     const RadTensor *v = r4d_opt(a, 0), *idx = r4d_opt(a, 1), *x = r4d_opt(a, 2);
@@ -1705,5 +1728,24 @@ extern "C" int r4d_rad_scatter_add_rows(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL(scatter_add_kernel, dim3((unsigned)rv), dim3(kT), 0, (hipStream_t)s,
                        (const uint16_t*)v->data, (const int*)idx->data, (uint16_t*)x->data, (int)n,
                        (int)vl, (int)xl);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_timestep_embed_f64(const RadArgs* a, RadStream s) {
+    const RadTensor *t = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!t || !y) return R4D_NO(RAD_E_INVAL);
+    if (t->dtype != RAD_F32 || y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const int64_t n = r4d_geti_or(a, "n", 0);
+    const double period = r4d_getf(a, "max_period", 10000.0);
+    const int64_t rows = y->shape[0], pitch = y->stride[0];
+    if (n <= 0 || n > INT32_MAX || (n & 1) || !(period > 0.0) || !std::isfinite(period) ||
+        y->rank != 2 || y->shape[1] != n || rows <= 0 || rows > INT32_MAX ||
+        (t->rank != 1 && (t->rank != 2 || t->shape[1] != 1)) || t->shape[0] < rows)
+        return R4D_NO(RAD_E_SHAPE);
+    if ((rows > 1 && t->stride[0] != 1) || y->stride[1] != 1 || pitch < n ||
+        pitch > (INT64_MAX / 4 - n) / rows) return R4D_NO(RAD_E_STRIDE);
+    hipLaunchKernelGGL(timestep_f64_kernel, dim3(static_cast<unsigned>(rows)), dim3(kT), 0,
+                       (hipStream_t)s, static_cast<const float*>(t->data), static_cast<float*>(y->data),
+                       static_cast<int>(n / 2), period, pitch);
     return st_of(hipGetLastError());
 }

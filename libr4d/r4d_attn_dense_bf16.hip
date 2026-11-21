@@ -1,3 +1,4 @@
+#include "rad_umt5_attention.h"
 // R4D dense attention, varlen over cu_seqlens segments, grouped-query: an encoder's, non-causal with
 // an optional two-sided window, i - j < window behind and j - i < wright ahead (wright is
 // `window_right`, or `window` for the symmetric |i - j| < window), or causal with an optional
@@ -34,6 +35,100 @@
 #include "r4d_dt16.h"
 
 #include <cmath>
+
+namespace {
+
+__device__ __forceinline__ float umt5_round_bf16(float x) {
+    return bf16_to_f32(f32_to_bf16(x));
+}
+
+// A wave owns one query row and head. Its scores stay in LDS so the
+// probabilities can round after the entire segment's f32 softmax.
+__global__ __launch_bounds__(32) void umt5_attention(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k,
+    const uint16_t* __restrict__ v, const int* __restrict__ cu,
+    const uint16_t* __restrict__ bias, uint16_t* __restrict__ out,
+    int rows, int segments, int64_t q_ld, int64_t k_ld, int64_t v_ld,
+    int64_t bias_ld, int64_t out_ld) {
+    constexpr int hd = rad_umt5::head_width;
+    __shared__ float scores[rad_umt5::max_tokens];
+    const int row = static_cast<int>(blockIdx.x);
+    const int head = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (cu[0] != 0 || cu[segments] != rows) return;
+    int lo = 0, hi = segments;
+    while (lo + 1 < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (cu[mid] <= row) lo = mid;
+        else hi = mid;
+    }
+    const int begin = cu[lo], end = cu[lo + 1];
+    if (begin < 0 || begin > row || end <= row || end > rows ||
+        end - begin > rad_umt5::max_tokens) return;
+    const int length = end - begin;
+    const int col = head * hd + lane;
+    const uint16_t* qr = q + row * q_ld + col;
+    const float q0 = bf16_to_f32(qr[0]), q1 = bf16_to_f32(qr[32]);
+    for (int j = 0; j < length; ++j) {
+        const uint16_t* kr = k + (begin + j) * k_ld + col;
+        float dot = q0 * bf16_to_f32(kr[0]) + q1 * bf16_to_f32(kr[32]);
+        for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_xor(dot, offset, 32);
+        if (lane == 0) {
+            const int bucket = rad_umt5::bucket(begin + j - row);
+            scores[j] = umt5_round_bf16(umt5_round_bf16(dot) + bf16_to_f32(bias[bucket * bias_ld + head]));
+        }
+    }
+    __syncthreads();
+    float max_score = -INFINITY;
+    for (int j = lane; j < length; j += 32) max_score = fmaxf(max_score, scores[j]);
+    for (int offset = 16; offset > 0; offset /= 2)
+        max_score = fmaxf(max_score, __shfl_xor(max_score, offset, 32));
+    __syncthreads();
+    float sum = 0.0f;
+    for (int j = lane; j < length; j += 32) {
+        const float weight = expf(scores[j] - max_score);
+        scores[j] = weight;
+        sum += weight;
+    }
+    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor(sum, offset, 32);
+    __syncthreads();
+    float value0 = 0.0f, value1 = 0.0f;
+    for (int j = 0; j < length; ++j) {
+        const float p = umt5_round_bf16(scores[j] / sum);
+        const uint16_t* vr = v + (begin + j) * v_ld + col;
+        value0 += p * bf16_to_f32(vr[0]);
+        value1 += p * bf16_to_f32(vr[32]);
+    }
+    uint16_t* dst = out + row * out_ld + col;
+    dst[0] = f32_to_bf16(value0);
+    dst[32] = f32_to_bf16(value1);
+}
+
+} // namespace
+
+extern "C" int r4d_rad_attn_umt5(const RadArgs* a, RadStream stream) {
+    const RadTensor* matrices[] = { r4d_opt(a, 0), r4d_opt(a, 1), r4d_opt(a, 2), r4d_opt(a, 5) };
+    const RadTensor *cu = r4d_opt(a, 3), *bias = r4d_opt(a, 4);
+    for (const RadTensor* matrix : matrices)
+        if (!matrix) return R4D_NO(RAD_E_INVAL);
+    if (!cu || !bias) return R4D_NO(RAD_E_INVAL);
+    if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
+    const int64_t heads = r4d_geti_or(a, "heads", 0), segments = cu->shape[0] - 1;
+    int64_t rows = 0;
+    const int status = rad_umt5::validate(matrices, cu, bias, heads, segments, rows);
+    if (status < 0) return R4D_NO(status);
+    hipLaunchKernelGGL(umt5_attention, dim3(static_cast<unsigned>(rows), static_cast<unsigned>(heads)),
+                       dim3(32), 0, (hipStream_t)stream,
+                       static_cast<const uint16_t*>(matrices[0]->data),
+                       static_cast<const uint16_t*>(matrices[1]->data),
+                       static_cast<const uint16_t*>(matrices[2]->data),
+                       static_cast<const int*>(cu->data), static_cast<const uint16_t*>(bias->data),
+                       static_cast<uint16_t*>(matrices[3]->data),
+                       static_cast<int>(rows), static_cast<int>(segments),
+                       matrices[0]->stride[0], matrices[1]->stride[0], matrices[2]->stride[0],
+                       bias->stride[0], matrices[3]->stride[0]);
+    return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}
 
 template<int HD, int GQA, int NQB, int DSPLIT, int TILE>
 __global__ __launch_bounds__(NQB * GQA * DSPLIT * 32)

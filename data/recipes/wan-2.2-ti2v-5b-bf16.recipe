@@ -1,0 +1,15 @@
+# Wan-AI/Wan2.2-TI2V-5B-Diffusers: the UMT5 encoder is already BF16.
+# The transformer and VAE source tensors are FP32. Keep Wan's time projections,
+# normalization gains, modulation tables and velocity head in FP32.
+# Patterns use the architecture's declared weight names.
+#
+# rad-convert <pinned Wan Diffusers directory> --recipe \
+#     data/recipes/wan-2.2-ti2v-5b-bf16.recipe -o wan-2.2-ti2v-5b-bf16.rad
+time.*                    cast dtype=f32
+dit.head.*                cast dtype=f32
+dit.block.*.table         cast dtype=f32
+dit.block.*.cross_norm.*  cast dtype=f32
+dit.block.*.norm_*.weight cast dtype=f32
+dit.*                    cast dtype=bf16
+text.*                   cast dtype=bf16
+vae.*                    cast dtype=bf16

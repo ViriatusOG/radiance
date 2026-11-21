@@ -869,7 +869,7 @@ __global__ __launch_bounds__(256)
 void r4d_attn_wide_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
                           const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
                           const int* __restrict__ cu, int num_seqs, float scale, int q_ld,
-                          int k_ld, int v_ld, int o_ld)
+                          int k_ld, int v_ld, int o_ld, int total)
 {
     typedef DT16<0> D;
     constexpr int DW = HD / 8;          // dims a wave
@@ -889,7 +889,9 @@ void r4d_attn_wide_kernel(const uint16_t* __restrict__ gq, const uint16_t* __res
 
     int seq = -1, q0 = 0;
     for (int s = 0, b = blockIdx.x; s < num_seqs; ++s) {
-        const int nb = (cu[s + 1] - cu[s] + 15) / 16;
+        const int first = cu[s], end = cu[s + 1];
+        if (first < 0 || end < first || end > total) return;
+        const int nb = (end - first + 15) / 16;
         if (b < nb) { seq = s; q0 = b * 16; break; }
         b -= nb;
     }
@@ -993,8 +995,7 @@ void r4d_attn_wide_kernel(const uint16_t* __restrict__ gq, const uint16_t* __res
     }
 }
 
-/* attn_dense at head_dim 768 or 1152 (image encoder/decoder mid block): one query head per KV
- * head, bidirectional. */
+/* Wide bidirectional attention for an image or video VAE mid block. */
 extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
     const RadTensor* q  = r4d_opt(a, 0);
     const RadTensor* k  = r4d_opt(a, 1);
@@ -1002,9 +1003,12 @@ extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
     const RadTensor* cu = r4d_opt(a, 3);
     const RadTensor* o  = r4d_opt(a, 4);
     if (!q || !k || !v || !cu || !o) return R4D_NO(RAD_E_INVAL);
+    if (q->dtype != RAD_BF16 || k->dtype != RAD_BF16 || v->dtype != RAD_BF16 ||
+        o->dtype != RAD_BF16 || cu->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(cu) || cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const long long hd = r4d_geti_or(a, "head_dim", 0);
-    if ((hd != 384 && hd != 512 && hd != 768 && hd != 1152) || r4d_geti_or(a, "gqa", 1) != 1 ||
+    if ((hd != 384 && hd != 512 && hd != 640 && hd != 768 && hd != 1024 && hd != 1152) ||
+        r4d_geti_or(a, "gqa", 1) != 1 ||
         r4d_geti_or(a, "causal", 0) != 0 ||
         r4d_geti_or(a, "window", 0) != 0 || r4d_geti_or(a, "block", 0) != 0 ||
         r4d_geti_or(a, "cu_div", 1) != 1)
@@ -1018,7 +1022,12 @@ extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_STRIDE);
     if (hk != nh || hv != nh || ho != nh) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
-    if ((q_ld | k_ld | v_ld | o_ld) & 7) return R4D_NO(RAD_E_STRIDE);
+    if ((q_ld | k_ld | v_ld | o_ld) & 7 || (reinterpret_cast<uintptr_t>(q->data) |
+        reinterpret_cast<uintptr_t>(k->data) | reinterpret_cast<uintptr_t>(v->data) |
+        reinterpret_cast<uintptr_t>(o->data)) & 15) return R4D_NO(RAD_E_STRIDE);
+    if (total > INT32_MAX - 64 || nh > 65535 || q_ld > INT32_MAX || k_ld > INT32_MAX ||
+        v_ld > INT32_MAX || o_ld > INT32_MAX || cu->shape[0] > INT32_MAX - (total + 15) / 16)
+        return R4D_NO(RAD_E_SHAPE);
     const int num_seqs = (int)(cu->shape[0] - 1);
     const float scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)hd));
     dim3 grid((unsigned)((total + 15) / 16 + num_seqs), (unsigned)nh);
@@ -1026,10 +1035,12 @@ extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL((r4d_attn_wide_kernel<HD>), grid, dim3(256), 0, (hipStream_t)s,           \
                        (const uint16_t*)q->data, (const uint16_t*)k->data,                        \
                        (const uint16_t*)v->data, (uint16_t*)o->data, (const int*)cu->data,        \
-                       num_seqs, scale, (int)q_ld, (int)k_ld, (int)v_ld, (int)o_ld)
+                       num_seqs, scale, (int)q_ld, (int)k_ld, (int)v_ld, (int)o_ld, (int)total)
     if (hd == 384)      R4D_WIDE(384);
     else if (hd == 512) R4D_WIDE(512);
+    else if (hd == 640) R4D_WIDE(640);
     else if (hd == 768) R4D_WIDE(768);
+    else if (hd == 1024) R4D_WIDE(1024);
     else                R4D_WIDE(1152);
 #undef R4D_WIDE
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);

@@ -4230,7 +4230,9 @@ int Engine::run_server() {
         in.shift_audio = vd.shift_audio;
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
-        in.step_evals = vd.sched_kind == 1;
+        in.step_evals = vd.sched_kind != 0;
+        in.unipc_only = vd.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC;
+        in.guidance_cfg_only = vd.guidance == RAD_VIDEO_GUIDANCE_CFG;
         in.guidance = vd.guidance != 0;
         for (int i = 0; i < 8; ++i) in.guidance_default[i] = vd.guidance_default[i];
         in.default_negative = pg.vgen_str.default_negative;

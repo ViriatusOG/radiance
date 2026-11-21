@@ -455,6 +455,10 @@ static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT(
                                            P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
+static const RadParamSpec pAttnUmt5[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oAttnUmt5[] = {
+    OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"), WGT("bias"), OUT("out"),
+};
 static const RadParamSpec pAttnCross[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                            P_INT("causal"), P_STR("dtype"), P_F64O("scale") };
 static const RadOperandSpec oAttnCross[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
@@ -929,7 +933,9 @@ static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
 static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
                                         P_STR("pad"), P_INT("up"), P_STR("dtype") };
-static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pL2Norm[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"), P_INTO("round_length"),
+};
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
                                             P_STR("dtype") };
@@ -1147,7 +1153,63 @@ static const RadOperandSpec oSubI32[] = { OPD("x"), OPD("s"), OUT("y") };
 static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 
 /* ================================================================== the schema table */
+static const RadParamSpec pWanTable[] = { P_INT("M"), P_STR("dtype") };
+static const RadParamSpec pWanRope[] = { P_INT("M"), P_INT("heads"), P_STR("dtype") };
+static const RadOperandSpec oWanTable[] = { OPD("geom"), OUT("table") };
+static const RadOperandSpec oWanRope[] = { INOUT("q"), INOUT("k"), OPD("table") };
+
+static const RadParamSpec pWanModNorm[] = { P_INT("M"), P_INT("n"), P_INT("group"),
+                                            P_F64O("eps"), P_INTO("round_norm"), P_STR("dtype") };
+static const RadParamSpec pWanGate[] = { P_INT("M"), P_INT("n"), P_INT("gate"), P_STR("dtype") };
+static const RadOperandSpec oWanModNorm[] = {
+    OPD("x"), OPD("time"), WGT("table"), OPD_O("split"), OUT("y"),
+};
+static const RadOperandSpec oWanGate[] = {
+    INOUT("x"), OPD("update"), OPD_O("time"), WGT_O("table"), OPD_O("split"),
+};
+
+static const RadOperandSpec oWanUnpatch[] = { OPD("patches"), OPD("geom"), OUT("velocity") };
+
+static const RadParamSpec pWanVaeFrameCu[] = { P_INT("M") };
+static const RadOperandSpec oWanVaeFrameCu[] = { OPD("geom"), OUT("cu") };
+static const RadParamSpec pWanVaeHistory[] = {
+    P_INT("M"), P_INT("temporal"), P_INT("reset"), P_STR("dtype"),
+};
+static const RadParamSpec pWanVaeExpand[] = {
+    P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("st"), P_INT("s"), P_INT("drop"),
+    P_INT("temporal"), P_STR("dtype"),
+};
+static const RadOperandSpec oWanVaeHistory[] = { OPD("x"), INOUT("history"), OUT("y") };
+static const RadOperandSpec oWanVaeExpand[] = { OPD("x"), OPD("geom"), OUT("y") };
+
+static const RadParamSpec pTimestepF64[] = { P_INT("M"), P_INT("n"), P_F64("max_period"),
+                                            P_STR("dtype") };
+
+static const RadOperandSpec oTimestepF64[] = { OPD("t"), OUT("y") };
+
+static const RadOperandSpec oFlowUniPC[] = { OPD("v"), OPD("coefficients"),
+                                             INOUT("history"), INOUT("x"), OPD_O("negative"), OPD_O("guidance") };
+
 static const RadOpSchema kSchemas[] = {
+{ "flow_unipc_step", ARR(pMnD), ARR(oFlowUniPC),
+  "Flow-prediction UniPC BH2 corrector and predictor. F32 history per row is "
+  "[last corrected sample | last clean estimate | older clean estimate]." },
+
+{ "timestep_embed_f64", ARR(pTimestepF64), ARR(oTimestepF64),
+  "sinusoidal embedding of unscaled timesteps, with f64 frequencies and trigonometry, f32 output." },
+
+{ "wan_vae_frame_cu", ARR(pWanVaeFrameCu), ARR(oWanVaeFrameCu), "Wan VAE per-frame attention offsets." },
+{ "wan_vae_history", ARR(pWanVaeHistory), ARR(oWanVaeHistory), "Wan VAE causal history and temporal taps." },
+{ "wan_vae_expand", ARR(pWanVaeExpand), ARR(oWanVaeExpand), "Wan VAE temporal shuffle and shortcut upsample." },
+
+{ "wan_unpatch", ARR(pMnD), ARR(oWanUnpatch), "Expand Wan head patches into F32 NDHWC velocity rows." },
+
+{ "wan_mod_norm", ARR(pWanModNorm), ARR(oWanModNorm), "Wan's timestep-modulated layer normalization." },
+{ "wan_gated_add", ARR(pWanGate), ARR(oWanGate), "Wan's FP32 residual update with an optional gate." },
+
+{ "wan_rope_table", ARR(pWanTable), ARR(oWanTable), "Wan's three-axis rotary coefficients." },
+{ "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to queries and keys." },
+
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is not in docs/OPS.md's elementwise table: "
   "it is GemmaRMSNorm's `1 +`, which Qwen3.5, Qwen3-Next and Gemma all need, and it defaults to 0. "
@@ -1595,6 +1657,9 @@ static const RadOpSchema kSchemas[] = {
   "window, or i - j < window and j - i < window_right with `window_right`; 0 none. `block` cuts "
   "a segment into blocks of that many rows from its start, each attending within itself; 0 "
   "none." },
+{ "attn_umt5", ARR(pAttnUmt5), ARR(oAttnUmt5),
+  "UMT5 BF16 bidirectional attention with an unscaled query-key dot and learned relative bias. "
+  "Each packed sequence uses its own key range and 32 signed distance buckets." },
 { "attn_cross", ARR(pAttnCross), ARR(oAttnCross),
   "attn_dense with each entry's keys a run of their own: queries rows [cu[s], cu[s+1]), keys and "
   "values rows [cu_k[s], cu_k[s+1]); with `causal` a query sees key j of its run when j <= its own "
@@ -1958,6 +2023,7 @@ static const RadOpSchema kSchemas[] = {
 { "to_rgba8", ARR(pMnD), ARR(oUnary),
   "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them: "
   "round(clamp(bf16(bf16(clamp(x) / 2) + 0.5), 0, 1) * 255), u8 out." },
+{ "gelu_umt5", ARR(pMnD), ARR(oUnary), "Wan UMT5's tanh GELU with BF16 intermediates." },
 { "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
 { "gelu_quick", ARR(pMnD), ARR(oUnary),
   "CLIP's quick_gelu, three roundings: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)." },
@@ -2345,6 +2411,27 @@ int ref_unrelayout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, cons
 #define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 / u6 codes into an f32 table, joined (w4nl* / w5nl* / w6nl*)"
 
 static const RadKernelInfo kKernels[] = {
+SIMPLE("ref_flow_unipc_step", "flow_unipc_step", "elem",
+       "flow-prediction UniPC BH2 corrector and predictor", DT_FLOAT, ref_flow_unipc_step),
+
+SIMPLE("ref_timestep_embed_f64", "timestep_embed_f64", "elem", "FP64 sinusoidal timestep embedding",
+       "f32", ref_timestep_embed_f64),
+
+SIMPLE("ref_wan_vae_frame_cu", "wan_vae_frame_cu", "elem",
+       "Wan VAE per-frame attention offsets.", "i32", ref_wan_vae_frame_cu),
+SIMPLE("ref_wan_vae_history", "wan_vae_history", "elem", "Wan VAE causal history", "bf16", ref_wan_vae_history),
+SIMPLE("ref_wan_vae_expand", "wan_vae_expand", "elem", "Wan VAE temporal shuffle and shortcut", "bf16", ref_wan_vae_expand),
+
+SIMPLE("ref_wan_unpatch", "wan_unpatch", "elem", "Wan patch velocity to voxel velocity", "bf16/f32", ref_wan_unpatch),
+
+SIMPLE("ref_wan_mod_norm", "wan_mod_norm", "norm", "Wan's timestep-modulated layer normalization",
+       "f32 input, f32 or bf16 output", ref_wan_mod_norm),
+SIMPLE("ref_wan_gated_add", "wan_gated_add", "elem", "Wan's FP32 residual update",
+       "f32 state and bf16 update", ref_wan_gated_add),
+
+SIMPLE("ref_wan_rope_table", "wan_rope_table", "elem", "Wan rotary coefficients", "f32", ref_wan_rope_table),
+SIMPLE("ref_wan_rope", "wan_rope", "elem", "Wan rotary on queries and keys", "bf16/f32", ref_wan_rope),
+
 SIMPLE("ref_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT,
        ref_rmsnorm),
 SIMPLE("ref_rmsnorm_p", "rmsnorm_p", "norm", "weightless RMS norm (no gain, plain x/rms)", DT_FLOAT,
@@ -2591,6 +2678,8 @@ ROW("ref_attn_paged_sink", "attn_paged_sink", "attn",
     nullptr, nullptr, ref_attn_paged_sink, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
+SIMPLE("ref_attn_umt5", "attn_umt5", "attn", "UMT5 signed relative-position attention",
+       "bf16, h64", ref_attn_umt5),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",
        "dense varlen attention, keys bounded apart from the queries (cu_k)", DT_FLOAT,
        ref_attn_cross),
@@ -2758,6 +2847,7 @@ SIMPLE("ref_d2s_add", "d2s_add", "elem", "an upsampling shortcut added in", DT_F
 SIMPLE("ref_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added in", DT_FLOAT,
        ref_s2d_avg_add),
 SIMPLE("ref_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, ref_to_rgba8),
+SIMPLE("ref_gelu_umt5", "gelu_umt5", "elem", "Wan UMT5 tanh GELU", "bf16", ref_gelu_umt5),
 SIMPLE("ref_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, ref_gelu_tanh),
 SIMPLE("ref_gelu_quick", "gelu_quick", "elem", "quick gelu", DT_FLOAT, ref_gelu_quick),
 SIMPLE("ref_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,

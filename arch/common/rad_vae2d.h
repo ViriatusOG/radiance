@@ -70,6 +70,7 @@ struct Vae {
     int64_t              halo = 0;
     std::vector<rad_buf> whole;
     VaeConvForm          form = VAE_CONV_2D;
+    bool                 round_norm_length = false;
     /* group_norm's statistics scratch, one for every GroupNorm op (they run one after another). */
     rad_buf              gn_stats = 0;
 
@@ -92,9 +93,10 @@ struct Vae {
                       grp_layer(first_group));
     }
 
-    /* y = conv(x): k x k, stride, `up` 2 reads x upsampled, `pad` same or down. */
+    /* y = conv(x): k x k, stride, `up` 2 reads x upsampled, `pad` same or down.
+     * A spatial weight has no time dimension, even in a causal VAE. */
     VImg conv(const VImg& x, int64_t cout, int k, int stride, int up, const char* pad,
-              const char* ckpt) {
+              const char* ckpt, bool spatial_weight = false) {
         VOp o;
         o.kind = VOp::CONV;
         o.x = x;
@@ -106,7 +108,7 @@ struct Vae {
         o.y = img(cout, lvl);
         o.k = k;
         o.w = wt(nm->f("%s.weight", ckpt), nm->ckpt("%s.weight", ckpt), { cout, x.ch, k, k },
-                 form == VAE_CONV_CAUSAL);
+                 form == VAE_CONV_CAUSAL && !spatial_weight);
         o.b = wt(nm->f("%s.bias", ckpt), nm->ckpt("%s.bias", ckpt), { cout });
         o.op = RAD_OP(b, "conv2d_nhwc",
                       RAD_PARAMS(RAD_RANGE("M", 1, px_at(lvl)), RAD_INT("cin", x.ch),
@@ -134,7 +136,7 @@ struct Vae {
         o.op = rw(b, RAD_OP(b, "l2norm_chan",
                             RAD_PARAMS(RAD_RANGE("M", 1, px_at(x.lvl)), RAD_INT("n", x.ch),
                                        RAD_STR("act", silu ? "silu" : "none"),
-                                       RAD_STR("dtype", "bf16")),
+                                       RAD_INT("round_length", round_norm_length), RAD_STR("dtype", "bf16")),
                             RAD_WEIGHTS(o.w)),
                   { x.buf }, { o.y.buf });
         ops.push_back(o);
@@ -172,18 +174,18 @@ struct Vae {
     /* A residual block, in -> out channels. */
     VImg resblock(const VImg& x, int64_t out, const char* ckpt) {
         VImg h = x;
-        if (x.ch != out) h = conv(x, out, 1, 1, 1, "same", nm->f("%s.conv_shortcut", ckpt));
-        VImg t = norm(x, true, nm->f("%s.norm1", ckpt), 4);
-        t = conv(t, out, 3, 1, 1, "same", nm->f("%s.conv1", ckpt));
-        t = norm(t, true, nm->f("%s.norm2", ckpt), 4);
-        t = conv(t, out, 3, 1, 1, "same", nm->f("%s.conv2", ckpt));
+        if (x.ch != out) h = conv(x, out, 1, 1, 1, "same", nm->ckpt("%s.conv_shortcut", ckpt));
+        VImg t = norm(x, true, nm->ckpt("%s.norm1", ckpt), 4);
+        t = conv(t, out, 3, 1, 1, "same", nm->ckpt("%s.conv1", ckpt));
+        t = norm(t, true, nm->ckpt("%s.norm2", ckpt), 4);
+        t = conv(t, out, 3, 1, 1, "same", nm->ckpt("%s.conv2", ckpt));
         return add(t, h);
     }
     /* The mid-block's single-head attention over every pixel. */
-    VImg attention(const VImg& x, const char* ckpt) {
+    VImg attention(const VImg& x, const char* ckpt, bool spatial_weights = false) {
         const int64_t C = x.ch;
-        VImg t = norm(x, false, nm->f("%s.norm", ckpt), 3);
-        VImg qkv = conv(t, 3 * C, 1, 1, 1, "same", nm->f("%s.to_qkv", ckpt));
+        VImg t = norm(x, false, nm->ckpt("%s.norm", ckpt), 3);
+        VImg qkv = conv(t, 3 * C, 1, 1, 1, "same", nm->ckpt("%s.to_qkv", ckpt), spatial_weights);
         VOp o;
         o.kind = VOp::ATTN;
         o.x = qkv;
@@ -197,7 +199,7 @@ struct Vae {
                             RAD_NOWEIGHTS),
                   { qkv.buf }, { o.y.buf });
         ops.push_back(o);
-        VImg p = conv(o.y, C, 1, 1, 1, "same", nm->f("%s.proj", ckpt));
+        VImg p = conv(o.y, C, 1, 1, 1, "same", nm->ckpt("%s.proj", ckpt), spatial_weights);
         return add(p, x);
     }
 

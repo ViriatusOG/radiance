@@ -1741,7 +1741,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
                          "length (%lld)", nm, (long long)d->max_text);
         return RAD_E_INVAL;
     }
-    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 || d->frames_tail < 0 ||
+    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 ||
+        d->frames_tail <= -d->frames_per_chunk ||
         d->latents_per_chunk <= 0 || d->latents_tail < 0 || d->dec_latents < d->latents_per_chunk ||
         d->min_chunks <= 0 || d->max_chunks < d->min_chunks || d->default_chunks < d->min_chunks ||
         d->default_chunks > d->max_chunks ||
@@ -1771,8 +1772,12 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->max_aspect, (long long)d->default_width, (long long)d->default_height);
         return RAD_E_INVAL;
     }
-    if (d->sample_rate <= 0 || d->audio_rate <= 0 || d->sample_rate % d->audio_rate != 0 ||
-        d->audio_channels <= 0 || d->audio_latent_channels <= 0) {
+    const bool has_audio = d->audio_channels > 0;
+    if (has_audio ? (d->sample_rate <= 0 || d->audio_rate <= 0 ||
+                     d->sample_rate % d->audio_rate != 0 || d->audio_latent_channels <= 0)
+                  : (d->sample_rate != 0 || d->audio_rate != 0 || d->audio_channels != 0 ||
+                     d->audio_latent_channels != 0 || d->audio_out != RAD_NULL_HANDLE ||
+                     d->audio_streams != 0 || d->max_ref_audios != 0 || d->max_enc_samples != 0)) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the soundtrack is out of range (%lld Hz "
                          "at %lld latents a second, %lld channels of %lld)", nm,
             (long long)d->sample_rate, (long long)d->audio_rate, (long long)d->audio_channels,
@@ -1781,7 +1786,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     }
     /* Form 1 (LTX-2's FlowMatchEulerDiscrete) steps both modalities the same sigmas and reads
      * no per-modality shift. */
-    const bool shifts = d->sched_kind == 1 || (d->shift_video > 0.0 && d->shift_audio > 0.0);
+    const bool shifts = d->sched_kind == 1 ||
+                        (d->shift_video > 0.0 && (!has_audio || d->shift_audio > 0.0));
     if (d->default_steps <= 0 || d->max_steps < d->default_steps || !shifts || d->max_lanes <= 0) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the sampler is incomplete (%lld steps by "
                          "default, %lld at most, shifts %g and %g, %lld lanes)", nm,
@@ -1789,9 +1795,19 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    /* Form 0 counts grid points, form 1 evaluations. */
+    if (d->sched_kind == RAD_VIDEO_SCHEDULE_UNIPC &&
+        (has_audio || d->n_rungs != 0 || d->dyn_shift != 0 || d->shift_terminal != 0.0 ||
+         d->upscale_max != 0.0 || d->max_steps > 1000 || !std::isfinite(d->shift_video) ||
+         d->shift_video > 100.0)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': UniPC needs video only, a shift in "
+                         "(0, 100] and up to 1000 evaluations, with no rungs, dynamic shifting "
+                         "or upscaler", nm);
+        return RAD_E_INVAL;
+    }
+    /* Form 0 counts grid points. Form 1 can declare trained evaluations. */
     const int64_t rung_steps = d->sched_kind == 1 ? d->n_rungs : d->n_rungs + 1;
-    if (d->sched_kind < 0 || d->sched_kind > 1 || d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
+    if (d->sched_kind < 0 || d->sched_kind > RAD_VIDEO_SCHEDULE_UNIPC ||
+        d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
         (d->n_rungs > 0 && (d->default_steps != rung_steps || d->max_steps != rung_steps))) {
         err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %lld "
                          "steps, which default_steps and max_steps must both be (%lld, %lld)", nm,
@@ -1827,7 +1843,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
     if (d->step_text_rows < 0 || d->step_text_rows > d->max_text * 64 || d->image_crf < 0 ||
         d->image_crf > 51 || (d->image_cond != 0 && d->image_cond != 1) ||
-        (d->guidance != 0 && d->guidance != 1)) {
+        (d->guidance != 0 && d->guidance != RAD_VIDEO_GUIDANCE_FULL &&
+         d->guidance != RAD_VIDEO_GUIDANCE_CFG)) {
         err(RAD_E_INVAL, "declare_video_generator '%s': step_text_rows %lld, image_cond %d, "
                          "image_crf %d (0..51) or guidance %d is out of range", nm,
             (long long)d->step_text_rows, (int)d->image_cond, (int)d->image_crf, (int)d->guidance);
@@ -1889,16 +1906,17 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
         return true;
     };
-    /* frames_out holds the last chunk, the largest, at the largest area; audio_out the longest
-     * soundtrack. */
-    const int64_t chunk_px = (d->frames_per_chunk + d->frames_tail) * d->max_area * 3;
-    const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
-    const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
-                            (2 * d->fps_num) + 1;
-    const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
-    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out") ||
-        !buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
-        return RAD_E_INVAL;
+    /* frames_out holds the largest chunk at the largest area; audio_out the longest soundtrack. */
+    const int64_t chunk_px = (d->frames_per_chunk + (d->max_chunks == 1 ? d->frames_tail : std::max<int64_t>(0, d->frames_tail))) * d->max_area * 3;
+    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out")) return RAD_E_INVAL;
+    if (has_audio) {
+        const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
+        const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
+                                (2 * d->fps_num) + 1;
+        const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
+        if (!buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
+            return RAD_E_INVAL;
+    }
     if (d->duration_out != RAD_NULL_HANDLE) {
         if (!buf_ok(d->duration_out, RAD_F32, 1, "duration_out")) return RAD_E_INVAL;
         if (!(d->duration_min > 0.0 && d->duration_max > d->duration_min) ||
