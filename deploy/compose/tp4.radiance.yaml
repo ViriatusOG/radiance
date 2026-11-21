@@ -8,9 +8,13 @@
 #
 # GLM-5.3-Flash (IQR-V4 experts, IQ8R trunk, int8 latent cache) on all four cards. The routed
 # experts that do not fit the cards sit in a pinned host pool of 64 GiB in all, and the prefix
-# cache holds 32 GiB more: the host needs 96 GiB of memory free for the two, plus the runtime's
-# own. Measured on four Radeon AI PRO R9700 (32 GB each): 58 tok/s decode, 100 tok/s over four
-# streams, about 2100 tok/s prefill to 128k tokens. It loads in about four minutes.
+# cache holds 32 GiB more. A prefix reaches past its attention cache only from a snapshot of the
+# linear-attention state, and 400 of them (141 MiB each over the four ranks) take 55 GiB more:
+# the host needs 151 GiB of memory free for the three, plus the runtime's own. On a replay of 32
+# conversations of 30k-token documents the 40 snapshots the server picks by default reused
+# 21% of the prompt tokens and 400 reused 76%. Measured on four Radeon AI PRO R9700 (32 GB
+# each): 64 tok/s decode, 130 tok/s over four streams, about 2550 tok/s prefill to 128k tokens.
+# It loads in about four minutes.
 server:
   host: "::"
   port: 8000
@@ -35,3 +39,4 @@ models:
     num-speculative-tokens: 0
     prefill-interleave: 4
     prefix-cache-mib: 32768
+    checkpoint-slots: 400
