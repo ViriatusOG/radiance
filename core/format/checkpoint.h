@@ -188,8 +188,10 @@ public:
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
      * describe the tool, not a served format. */
+    /* PerTensor: hf_quant_config.json's per-tensor parameter groups (Inkling 2's release), which
+     * decide each tensor's form and take precedence over config.json's quantization_config. */
     enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
-                        ModelOpt };
+                        ModelOpt, PerTensor };
     Import imports() const { return import_; }
     /* The form `name` is read in: a drafter merged by add_draft ships its own quantisation (a
      * ModelOpt NVFP4 drafter beside a bf16 target), so names under its prefix take that one. */
@@ -211,6 +213,15 @@ public:
      * one byte a group, as `weight_meta` ships it. Null for every other form. */
     const SrcTensor* import_meta(const std::string& name) const;
 
+    /* One expert of a PerTensor stacked tensor `name` ([E, N, K] experts, as the checkpoint ships
+     * them): its codes, its scales and, for NVFP4, its level (amax / denominator, one f32),
+     * unchanged from the file so that a recipe can keep them as stored. `level` is null for MXFP8,
+     * whose scales are the exponents a block of 32 carries. RAD_E_NOTFOUND when `name` is not a
+     * PerTensor expert stack; another error, with `why`, when the expert cannot be read (a missing
+     * companion, a scale shape that does not divide, a NaN scale or level). */
+    int import_expert(const std::string& name, int index, const SrcTensor** codes,
+                      const SrcTensor** scale, const SrcTensor** level, std::string* why);
+
 private:
     /* `owner` is the index's weight_map, if any: a tensor it places in another shard is skipped
      * here. */
@@ -224,6 +235,10 @@ private:
     int add_torch_files();
     int open_gguf(const std::string& path);
     void detect_import();
+    /* Inkling 2 stores each expert's gate and up rows interleaved (row 2i gate, 2i+1 up); the
+     * engine reads [gate; up]. Permutes w13 and its scale rows, owned, before anything reads them. */
+    int regroup_inkling_w13();
+    int regroup_inkling_static_w();
     /* The Ling GGUF's layouts the plugin's names expect, rebuilt at load so the container's
      * recipe never sees the source layout: the KDA layers' ssm_a (the exporter's exp(A_log))
      * logged back to ssm_a_raw, the MLA layers' head-last k_b and v_b fused into one
@@ -257,6 +272,12 @@ private:
     std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
     /* The metadata plane of an imported form that has one (ParoM2), by name. */
     std::unordered_map<std::string, const SrcTensor*> imported_meta_;
+    /* PerTensor: each stacked expert tensor's form by name ("nvfp4" or "mxfp8"), from the file's
+     * parameter groups. */
+    std::unordered_map<std::string, std::string> per_tensor_form_;
+    /* The per-tensor form's refusal, when the file's groups name a form this reader does not take
+     * for an expert stack (its message goes to import_why_). */
+    bool detect_per_tensor();
 };
 
 /* ================================================================== logical weights */
@@ -281,6 +302,9 @@ struct CkptWeight {
     std::string name;                         /* the logical (declared) name */
     std::vector<const SrcTensor*> pieces;     /* the codes, in concatenation order */
     std::vector<const SrcTensor*> scales;     /* FP8 only: one a piece */
+    /* PerTensor NVFP4 only: each piece's f32 level (one element), written as the `scale.1` plane;
+     * empty for every other weight. */
+    std::vector<const SrcTensor*> levels;
     int      concat_dim = 0;
     uint32_t rank = 0;
     int64_t  shape[RAD_MAX_RANK] = {0};       /* the logical shape */

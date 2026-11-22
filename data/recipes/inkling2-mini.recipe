@@ -1,0 +1,31 @@
+# inkling2-mini.recipe -- Inkling 2 Mini (Inkling2LoopForConditionalGeneration, model_type
+# inkling2_loop) as released: the NVFP4 experts kept as stored, the MXFP8 experts of the last four
+# layers re-quantised to rotated int8, everything else bf16. Served by arch/inkling2.
+#
+#   rad-convert /mnt/gostar_data/models/Inkling-2-Mini -o inkling2-mini.rad \
+#       --recipe data/recipes/inkling2-mini.recipe
+#
+#   - The release's hf_quant_config.json names each tensor's form (its parameter groups take
+#     precedence over config.json's quantization_config, which names ModelOpt's NVFP4 for the
+#     whole model). Layers 0..19 hold NVFP4 experts: e2m1 codes, an e4m3 scale per 16 of K and the
+#     expert's f32 level (amax over the file's divisor), imported as shipped. No rule matches them,
+#     so nothing is requantised.
+#   - Layers 20..23 hold MXFP8 experts: e4m3 codes with an e8m0 exponent per 32 of K, dequantised
+#     exactly and re-quantised to the rotated int8 grid of the flint recipes (i8a8h): one bf16 scale
+#     per (row, 128 of K), each 128 of K rotated by the unnormalised Hadamard before rounding and
+#     the 1/128 kept in the scale (`transform=fwht128`). Round to nearest with a scale search; no
+#     calibration data is read.
+#   - Every other weight stays as the checkpoint ships it: the attention projections, the short
+#     convolutions, the router, the cross-pass queries, the norms, the embedding and the lm_head
+#     (bf16 in the release). The vision tower (model.visual) is not converted by this recipe.
+#   - The rules name the expert tensors as the plugin declares them: `blk.L.eE.gu` (gate and up,
+#     [2 F, H]) and `blk.L.eE.dn` (down, [H, F]), one weight per expert.
+
+blk.20.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.20.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.21.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.21.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.22.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.22.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.23.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.23.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search

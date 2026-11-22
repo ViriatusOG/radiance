@@ -473,7 +473,14 @@ TEST(a_table_file_on_another_disk_is_filled_once_and_mapped_in_place_of_the_cont
     const RadFilePlane& pl = f.plane(*f.find("ngram.weight"), 0);
     const uint8_t* src = f.data(pl);
     const int64_t n = (int64_t)pl.bytes;
-    const std::string tab = radtest::tmp_path("tfile-table");
+    /* /proc/self/maps names a mapping by its resolved path, so compare against the resolved
+     * directory: $RAD_TEST_TMPDIR may go through a symlink (the build directory is one). */
+    const std::string tab_raw = radtest::tmp_path("tfile-table");
+    std::string tab = tab_raw;
+    if (char* r = ::realpath(tab_raw.substr(0, tab_raw.rfind('/')).c_str(), nullptr)) {
+        tab = std::string(r) + tab_raw.substr(tab_raw.rfind('/'));
+        std::free(r);
+    }
     ::unlink(tab.c_str());
 
     TableCopy a;

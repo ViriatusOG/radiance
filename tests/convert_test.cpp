@@ -1118,6 +1118,71 @@ TEST(plan_only_writes_nothing) {
     CHECK(!exists(d / "p.rad"));
 }
 
+/* Inkling 2's routed experts as the release stores them: e2m1 codes, an e4m3 scale per 16 of K and an
+ * f32 level per expert, named by hf_quant_config.json's nvfp4 parameter group. The plugin declares
+ * every layer's experts in that form (`nvfp4a8i8`), so a conversion with a recipe that
+ * touches none of them writes, and the writer checks each expert's slot order. */
+TEST(an_inkling2_nvfp4_expert_checkpoint_declares_in_its_stored_form) {
+    tiny::TempDir d("convert_nv");
+    REQUIRE(d.ok());
+    const std::string ckpt = d / "inkling";
+    REQUIRE(mkdir(ckpt.c_str(), 0755) == 0);
+    /* a hidden and a ffn width of 128: the stored int8 and the NVFP4 int8 activations are 128-wide */
+    tiny::Inkling2 s;
+    s.hidden = 128;
+    s.ffn = 128;
+    REQUIRE(tiny::write_inkling2(ckpt, s));
+
+    std::vector<tiny::Tensor> ts = tiny::read_safetensors(ckpt + "/model.safetensors");
+    REQUIRE(!ts.empty());
+    const int64_t E = s.experts, H = s.hidden, F = s.ffn;
+    /* e4m3 bytes 0.5, 1.0 and 2.0 in turn, and e2m1 codes that exercise every nibble */
+    const uint8_t e4m3[3] = { 0x30, 0x38, 0x40 };
+    auto nvfp4 = [&](const std::string& base, int64_t N, int64_t K, float amax) {
+        tiny::Tensor w{ base + "_weight", "U8", { E, N, K / 2 }, {} };
+        for (int64_t i = 0; i < E * N * K / 2; ++i) w.bytes.push_back((uint8_t)((i * 37 + 11) & 0xff));
+        tiny::Tensor sc{ base + "_weight_scale", "F8_E4M3", { E, N, K / 16 }, {} };
+        for (int64_t i = 0; i < E * N * K / 16; ++i) sc.bytes.push_back(e4m3[i % 3]);
+        tiny::Tensor a{ base + "_weight_amax", "F32", { E }, std::vector<uint8_t>((size_t)E * 4) };
+        for (int64_t e = 0; e < E; ++e) {
+            const float v = amax * (float)(e + 1);
+            std::memcpy(a.bytes.data() + e * 4, &v, 4);
+        }
+        tiny::Tensor dn{ base + "_weight_outer_scale_denominator", "F32", { 1 }, std::vector<uint8_t>(4) };
+        const float denom = 2.0f;
+        std::memcpy(dn.bytes.data(), &denom, 4);
+        return std::vector<tiny::Tensor>{ w, sc, a, dn };
+    };
+    std::vector<tiny::Tensor> out;
+    std::vector<std::string> names;
+    for (tiny::Tensor& t : ts) {
+        const bool expert = t.name.find(".mlp.experts.w13_weight") != std::string::npos ||
+                            t.name.find(".mlp.experts.w2_weight") != std::string::npos;
+        if (!expert) out.push_back(std::move(t));
+    }
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = "model.layers." + std::to_string(l) + ".mlp.experts.";
+        for (const tiny::Tensor& t : nvfp4(p + "w13", 2 * F, H, 3.0f)) out.push_back(t);
+        for (const tiny::Tensor& t : nvfp4(p + "w2", H, F, 6.0f)) out.push_back(t);
+        names.push_back(p + "w13_weight");
+        names.push_back(p + "w2_weight");
+    }
+    REQUIRE(tiny::write_safetensors(ckpt + "/model.safetensors", out));
+
+    std::string groups = "{\"model\":{\"parameter_groups\":[{\"compute_dtype\":\"nvfp4\",\"tensors\":[";
+    for (size_t i = 0; i < names.size(); ++i)
+        groups += (i ? ",\"" : "\"") + names[i] + "\"";
+    groups += "]}]}}";
+    REQUIRE(tiny::write_text(ckpt + "/hf_quant_config.json", groups));
+    const std::string recipe = d / "keep.recipe";
+    REQUIRE(tiny::write_text(recipe, "# every routed expert is kept as stored\n"));
+
+    std::string log;
+    // a full write, not plan-only: the writer checks that each expert's slots run 0..n-1 in order
+    CHECK_EQ(convert(ckpt, { "-o", d / "nv.rad", "--recipe", recipe }, &log), 0);
+    CHECK(exists(d / "nv.rad"));
+}
+
 /* A recipe or flag that cannot be honoured stops the run with status 2 before any file exists:
  * an unknown quantiser, option, or non-integer value, a recipe that cannot be read, an unset
  * $VARIABLE, a --set without `=`, and a KV dtype that is not bf16 or fp8. */
