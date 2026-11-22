@@ -434,8 +434,14 @@ __device__ __forceinline__ void codes16_to_f16x8(const uint8_t* p, float s, uint
  * each thread moves one K and one V chunk for fp8, two of each for bf16.
  *
  * Every offset is 32-bit and the launcher has checked that the whole cache fits in 2^31 elements:
- * 64-bit index arithmetic in this loop would exhaust the scalar registers (see Args). */
-template <bool FP8, int NTH>
+ * 64-bit index arithmetic in this loop would exhaust the scalar registers (see Args).
+ *
+ * WITHV is false in the first walk, which reads no V: the scores' maximum needs K alone, so the
+ * V half is neither loaded nor converted there. A bf16 V is staged as the cache's own pair words,
+ * because the second walk widens it to f32 with a shift (bf16w_lo / bf16w_hi), which is libref's
+ * value for every bf16 and costs no conversion; K stays f16 pairs, the dot2's operand. An E4M3 V
+ * stays f16 pairs: its descale is applied on the way in. */
+template <bool FP8, int NTH, bool WITHV>
 __device__ __forceinline__ void stage(Args const& A, uint32_t* sK, uint32_t* sV, int blk, int kh,
                                       float kds, float vds, int tid)
 {
@@ -458,20 +464,20 @@ __device__ __forceinline__ void stage(Args const& A, uint32_t* sK, uint32_t* sV,
         const int v0 = k0 + kHeadDim;
         uint32_t* dk = sK + slot * kPitch + c / 2;
         uint32_t* dv = sV + slot * kPitch + c / 2;
+        (void)v0; (void)dv;                                     /* unread when WITHV is false */
         if constexpr (FP8) {                                    /* codes: element and byte agree */
             codes16_to_f16x8(A.kv8 + k0, kds, dk);
-            codes16_to_f16x8(A.kv8 + v0, vds, dv);
+            if constexpr (WITHV) codes16_to_f16x8(A.kv8 + v0, vds, dv);
         } else {
             const r3d_u32x4 ka =
                 *(const __attribute__((address_space(1))) r3d_u32x4*)(const void*)(A.kv + k0);
-            const r3d_u32x4 va =
-                *(const __attribute__((address_space(1))) r3d_u32x4*)(const void*)(A.kv + v0);
             const uint32_t kd[4] = { ka.x, ka.y, ka.z, ka.w };
-            const uint32_t vd[4] = { va.x, va.y, va.z, va.w };
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                dk[j] = bf16x2_to_f16x2(kd[j]);
-                dv[j] = bf16x2_to_f16x2(vd[j]);
+            for (int j = 0; j < 4; ++j) dk[j] = bf16x2_to_f16x2(kd[j]);
+            if constexpr (WITHV) {
+                const r3d_u32x4 va =
+                    *(const __attribute__((address_space(1))) r3d_u32x4*)(const void*)(A.kv + v0);
+                dv[0] = va.x; dv[1] = va.y; dv[2] = va.z; dv[3] = va.w;
             }
         }
     }
@@ -728,7 +734,7 @@ void attn_kernel(const Args A)
     for (int b = b0; b < b1; ++b) {
         const int blk = (int)ld_ix(A.bt, (size_t)s * (size_t)A.bt_rs + (size_t)b * (size_t)A.bt_cs);
         group_barrier();
-        if (blk >= 0) stage<FP8, kNThr>(A, sK, sV, blk, kh, kds, vds, tid);
+        if (blk >= 0) stage<FP8, kNThr, false>(A, sK, sV, blk, kh, kds, vds, tid);
         group_barrier();
         if (blk < 0) continue;
         const int j0 = b * kBlock;
@@ -748,28 +754,37 @@ void attn_kernel(const Args A)
         }
     }
 
-    /* Walk two: the same scores, exponentiated against the maximum, accumulated ascending. */
-    if (mx > -INFINITY) {
-        for (int b = b0; b < b1; ++b) {
-            const int blk = (int)ld_ix(A.bt, (size_t)s * (size_t)A.bt_rs + (size_t)b * (size_t)A.bt_cs);
-            group_barrier();
-            if (blk >= 0) stage<FP8, kNThr>(A, sK, sV, blk, kh, kds, vds, tid);
-            group_barrier();
-            if (blk < 0) continue;
-            const int j0 = b * kBlock;
-            const int nu = j0 + kBlock <= jhi ? kBlock : (jhi > j0 ? jhi - j0 : 0);
-            const bool nomask = !CAUSAL && A.window <= 0;
-            for (int u = 0; u < nu; ++u) {
-                if (!nomask && !visible(j0 + u, pos, CAUSAL, A.window)) continue;
-                const float w = exp_ref(score_of(qf, sK + u * kPitch, A.scale) - mx);
-                sum += w;
-                const uint32_t* vp = sV + u * kPitch;
+    /* Walk two: the same scores, exponentiated against the maximum, accumulated ascending.
+     *
+     * Every lane stages every block, whether or not it has a visible key: the tile is the
+     * workgroup's, and a lane that sat the walk out would leave its share of it unstaged. An idle
+     * row slot sits at a later position than the real rows, so under a window it can see no key of
+     * a slice whose real rows still see a few; with V staged in this walk alone, its share of V
+     * would then never have been written. The barriers are likewise reached by every lane. */
+    for (int b = b0; b < b1; ++b) {
+        const int blk = (int)ld_ix(A.bt, (size_t)s * (size_t)A.bt_rs + (size_t)b * (size_t)A.bt_cs);
+        group_barrier();
+        if (blk >= 0) stage<FP8, kNThr, true>(A, sK, sV, blk, kh, kds, vds, tid);
+        group_barrier();
+        if (blk < 0 || !(mx > -INFINITY)) continue;
+        const int j0 = b * kBlock;
+        const int nu = j0 + kBlock <= jhi ? kBlock : (jhi > j0 ? jhi - j0 : 0);
+        const bool nomask = !CAUSAL && A.window <= 0;
+        for (int u = 0; u < nu; ++u) {
+            if (!nomask && !visible(j0 + u, pos, CAUSAL, A.window)) continue;
+            const float w = exp_ref(score_of(qf, sK + u * kPitch, A.scale) - mx);
+            sum += w;
+            const uint32_t* vp = sV + u * kPitch;
 #pragma unroll
-                for (int p = 0; p < kPairs; ++p) {
-                    const uint32_t q2 = vp[p];
-                    const int d = 2 * p;
+            for (int p = 0; p < kPairs; ++p) {
+                const uint32_t q2 = vp[p];
+                const int d = 2 * p;
+                if constexpr (FP8) {
                     acc[d] = acc[d] + w * f16_to_f32((uint16_t)(q2 & 0xffffu));
                     acc[d + 1] = acc[d + 1] + w * f16_to_f32((uint16_t)(q2 >> 16));
+                } else {
+                    acc[d] = acc[d] + w * bf16w_lo(q2);
+                    acc[d + 1] = acc[d + 1] + w * bf16w_hi(q2);
                 }
             }
         }

@@ -9,7 +9,7 @@ plugin claims.
 |---|---|---|---|
 | `arch/llama_fp8` | `llama` | `fp8_e4m3` | the plain LLaMA decoder under the `fp8_e4m3` descriptor; its linears go through `LinearFP8` (`arch/common/rad_fp8.h`), which refuses a block-fp8 weight at load |
 | `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made IQ8R by a recipe (`data/recipes/minicpm5-2b-iq8r.recipe`) or kept bf16. MiniCPM5-2B |
-| `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
+| `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16. A trunk linear packed losslessly as `bf16x12` (`data/recipes/q38-27b-bf16x12-df2.recipe`) is read by `gemm_nt` at `bf16x12`, with the same bytes. Optional DFlash2 drafter (`rad-convert --draft-model`). At more than one rank a decode step reads the next GEMM's leading weight bytes into the on-die cache beside each all-reduce, and where launches do not chain beside the delta net's recurrent update, as `qwen35_fp8` does (`weight-prefetch: off` declares none) |
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same under the `fp8_e4m3` descriptor, and the imported quantisations (an int4 W4A16 release, `data/recipes/q38-27b-w4a16.recipe`); a block-fp8 weight is refused at load |
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
@@ -308,6 +308,7 @@ vision: 27 blocks, hidden 1152, 16 heads -> head_dim 72, patch 16, out_hidden_si
 | recurrent state fp32 | `gdn_recurrent_update_k128_v128_bf16_fp32state` |
 | gated attention, interleaved q/gate | `qk_norm_rope_gate` (reads the q/gate interleave off the operand's row pitch) |
 | GDN gated norm over an interleaved z | `gdn_gated_norm_had_quant_i8` (`zgrp`/`zblk`) |
+| a bf16 head at hidden 5120 | `logits_gemm_bf16_cols` (a wave per four vocabulary columns, the bytes of `logits_gemm_bf16`; at the TP2 slice and eight rows 2157 us against 4289 on an R9700) |
 | vision head_dim 72 | `attn_vit_h72_bf16` |
 
 ## Tensor names: the FP8 safetensors checkpoint
@@ -2184,7 +2185,13 @@ kernels), its plain op runs instead (`rmsnorm`, `silu_mul`) and the first linear
 quantises it with `had_quant_act_i8g`: q for the four, gate/up, down. The head is plain int8
 (`codes=i8 group=128 scale=bf16`, `logits_gemm_i8`), which the drafter reads as its own head.
 
-The tower's weights are never quantised: a container that quantises them is refused by name.
+A vision linear is BF16, or int8 codes with a bf16 scale per (row, 128 of K)
+(`codes=i8 group=128 scale=bf16`, `museglimmer-30b-iq4r-s-v4-i8vision.recipe`). The int8 form
+quantises the BF16 activation with `quant_act_i8g` and reads it with `gemm_nt_q` at `i8a8` and
+`w_rb` 1 (`gemm_i8a8_row`): the weight stays the container's row-major bytes, so
+`vision-tower-placement ram` can read it in place. Bias, exact-erf GELU and the residual are
+separate BF16 ops. The patch stem (K 1176), position table, norms and biases stay BF16. Block
+FP8 is retired and refused by name, as is any other vision encoding.
 
 **Context extension.** The architecture takes it by mechanical means, and takes it well: 13 of
 the 52 layers are full-attention **NoPE** (`layer_rope_theta` 0 -- no positions at all) and the 39

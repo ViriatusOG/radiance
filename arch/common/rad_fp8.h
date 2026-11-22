@@ -882,6 +882,12 @@ struct LinearFP8 {
      * declared. A producer writes the bf16 plane only when asked, so the block must ask for it when
      * this is set; otherwise the linear reads unwritten arena bytes. */
     bool       reads_x = false;
+    /* Runtime LoRA detour: serve a rotated plain-int8 weight (lora_plain_view_enc) through a
+     * plain bf16 `gemm_nt` over the activation's bf16 plane, its weight declared as one view of
+     * the encoding's `codes` and `scale` planes that the reading kernel relayouts to plain bf16
+     * at load. Set before probe()/declare(); a no-op for every other encoding and for source
+     * names outside the trunk (lora_plain_view_src). See lora_plain_view_enc. */
+    bool       plain_bf16_view = false;
     bool       mapped  = false;   /* probe() made the name map; declare() does not make it again */
     /* The stored weight this linear's views take when it is not `<base>.weight`: a second linear
      * over one container entry, e.g. a whole projection beside its tensor-parallel slice. Set
@@ -1092,6 +1098,52 @@ inline W8hForm linear_w8h_form(const RadEncoding& e) {
 }
 inline bool linear_is_w8h(const RadEncoding& e) { return linear_w8h_form(e) != W8hForm::None; }
 
+/* ---- the plain bf16 view a runtime-LoRA build declares over a rotated int8 trunk weight ------
+ *
+ * The core's LoRA machinery attaches adapters at plain fp GEMMs (core/lora/lora.cpp op_is_site,
+ * issue #475: a plain GEMM over a transform-basis weight is a site, the kernel's relayout hook
+ * presenting the plain basis); the fused int8 GEMM a rotated trunk runs is opaque to it. A
+ * LinearFP8 whose `plain_bf16_view` is set therefore declares its weight as one view of the
+ * encoding's `codes` and `scale` planes (read as plain bf16, which the reading kernel's
+ * layout/relayout hook produces at load: FWHT_128(codes * scale), e.g. the lora_plain plugin)
+ * and its product as a plain `gemm_nt` over the activation's bf16 plane, into the same output.
+ *
+ * Eligible encodings are exactly what such a hook accepts: affine, fwht128, i8 codes [x 1] with
+ * a bf16 scale per [1 x 128], two planes and nothing else. IQ8R (u8 per 256 under a bf16 second
+ * level), narrower IQR codes, asymmetric and ParoQuant weights, and every plain or fp8 container
+ * keep their stock branch, declaration-for-declaration the tree's. Sources in the scopes core
+ * never targets (lora.cpp excluded_source: `mtp` / `draft` first components, vision and audio
+ * towers) also keep it: the MTP head's same-leaf siblings stay byte-identical i8a8h GEMMs. */
+inline bool lora_plain_view_enc(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2) return false;
+    if (std::strncmp(e.transform, "fwht128", RAD_ENC_STR) != 0) return false;
+    const RadEncPlane* c = rad_enc_plane(&e, "codes");
+    const RadEncPlane* s = rad_enc_plane(&e, "scale");
+    return c && s && c->dtype == RAD_I8 && c->block[1] == 1 &&
+           s->dtype == RAD_BF16 && s->block[0] == 1 && s->block[1] == RAD_FP8_BLOCK;
+}
+inline bool lora_plain_view_src(std::initializer_list<const char*> src) {
+    static const char* const kOff[] = { "mtp", "draft", "visual", "vision_tower", "vision_model",
+                                        "audio_tower", "audio_model", "embed_vision",
+                                        "embed_audio", "multi_modal_projector", "mm_projector" };
+    for (const char* q : src) {
+        if (!q || !*q) return false;
+        const size_t len = std::strlen(q);
+        for (size_t at = 0; at <= len;) {
+            size_t dot = len;
+            for (size_t i = at; i < len; ++i) if (q[i] == '.') { dot = i; break; }
+            for (const char* x : kOff) {
+                const size_t xl = std::strlen(x);
+                if (xl == dot - at && !std::strncmp(q + at, x, xl)) return false;
+            }
+            if (dot == len) break;
+            at = dot + 1;
+        }
+    }
+    return true;
+}
+
+
 /* A rotated asymmetric weight at four or five bits: u4 or u5 codes, an f16 scale and a u8 (or
  * code-width) zero point per 128 of K under the 128-wide Hadamard (libquant `codes=u5 zero=u8
  * group=128 scale=f16 transform=fwht128`). Read by gemm_nt_q at w4a8i8_asym / w5a8i8 over the
@@ -1237,13 +1289,17 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool known = weight_enc(b, wn, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
-    probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
+    /* The plain view reads the bf16 plane, not codes: pretending it were an int8 linear would
+     * tell the block its producer may skip the bf16 plane (GateQuantFP8's want_x). */
+    const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
+                      lora_plain_view_src(src);
+    probed_i8 = !view && known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
     probed_g8 = known ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
      * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
                                    linear_is_paro_m2xfp4(enc));
-    reads_x = g.w_bf16 || plain || probed_i8 || rotated || (known && linear_is_w4(enc));
+    reads_x = g.w_bf16 || plain || view || probed_i8 || rotated || (known && linear_is_w4(enc));
     return RAD_OK;
 }
 
@@ -1368,14 +1424,18 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * container keeps at checkpoint precision (e.g. the QSA indexer's projection, whose top-k is a
      * hard choice; 20 MB to keep exact). Row parts and uneven slices apply without block
      * constraints. */
-    bf16 = g.w_bf16 || plain;
+    /* The LoRA detour (plain_bf16_view): the same plain `gemm_nt`, over a rotated int8 weight's
+     * bf16-read view of its planes. */
+    const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
+                      lora_plain_view_src(src);
+    bf16 = g.w_bf16 || plain || view;
     if (bf16) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
                             "may\n", wn, stored);
             return RAD_E_INVAL;
         }
-        if (known && !plain) {
+        if (known && !plain && !view) {
             char en[256];
             rad_enc_format(&enc, en, sizeof en);
             fprintf(stderr, "radiance: '%s' is %s, but this linear runs as a plain bf16 GEMM "
@@ -1392,7 +1452,12 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         RowParts rp;
         RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
-        w = decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
+        /* A plain view over the stored encoding takes the codes' dtype and the logical extents
+         * (RadWeightDecl, spec §4.3); the reading kernel's layout hook relayouts the planes to
+         * plain bf16, the form the core's LoRA pools and weight_share expect (lora.cpp). */
+        w = view ? decl_view(b, wn, nullptr, "codes,scale", RAD_I8, { N, K }, access, shard, grp,
+                             rp.w, rp.n)
+                 : decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
         if (!w) return RAD_E_INVAL;
         if (span_hi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
         op = rw(b, RAD_OP(b, "gemm_nt",

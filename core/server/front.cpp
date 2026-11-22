@@ -384,14 +384,30 @@ std::vector<std::string> Front::names() const {
     return v;
 }
 
-std::shared_ptr<void> Front::lease_entry(Entry* e) {
+int64_t Front::adapter_leases(const std::string& name, const std::string& adapter) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& p : entries_)
+        if (p->name == name && !p->removed) {
+            const auto it = p->adapter_leases.find(adapter);
+            return it == p->adapter_leases.end() ? 0 : it->second;
+        }
+    return 0;
+}
+
+std::shared_ptr<void> Front::lease_entry(Entry* e, const std::string& adapter) {
     ++e->leases;
     ++e->uses;
     e->last_used_ns = rad_mono_ns();
-    return std::shared_ptr<void>(static_cast<void*>(e), [this](void* p) {
+    std::map<std::string, int64_t>* per = adapter.empty() ? nullptr : &e->adapter_leases;
+    if (per) ++(*per)[adapter];
+    return std::shared_ptr<void>(static_cast<void*>(e), [this, per, adapter](void* p) {
         std::lock_guard<std::mutex> lk(mu_);
         Entry* x = static_cast<Entry*>(p);
         --x->leases;
+        if (per) {
+            const auto it = per->find(adapter);
+            if (it != per->end()) --it->second;
+        }
         x->last_used_ns = rad_mono_ns();
         changed_.notify_all();
     });
@@ -511,7 +527,18 @@ Front::Got Front::lease(const std::string& model, const std::string& path, int64
         return Got::Refused;
     }
     *out = e;
-    *held = lease_entry(e);
+    /* A request may name an adapter within the model's name (`base:adapter`): the base's server
+     * runs it and the base's lease covers it, but what is running is the named tail. A model's
+     * own name carries no colon (the fleet's config reserves it), so a name that resolved
+     * through the colon rule carries the adapter as what stands after it. */
+    std::string adapter;
+    {
+        const size_t colon = model.find(':');
+        if (colon != std::string::npos && colon + 1 < model.size() &&
+            e->name == model.substr(0, colon))
+            adapter = model.substr(colon + 1);
+    }
+    *held = lease_entry(e, adapter);
     /* The whole wait began where *until_ns was set, the entry's timeout before its end. */
     const uint64_t began = *until_ns - (uint64_t)std::max<int64_t>(e->wait_ms, 0) * 1000000ull;
     const double waited = (double)(rad_mono_ns() - std::min(began, rad_mono_ns())) * 1e-9;

@@ -81,10 +81,12 @@
  *   about 50x slower than in VRAM, and an unprefetched managed head faults page by page because
  *   this ROCm does not migrate managed pages for read-mostly device access.
  *
- *   The container header picks the form: the shim calls `rad_planes_header(w)` and a plain bf16
- *   operand takes the bf16 path. The shim reads the header on the host (as `scaled_rows()` does)
- *   and the kernel reads the same bytes on the device, so the operand must be managed memory
- *   (prefetched) or hipHostMalloc; plain malloc faults on the kernel's first read.
+ *   The operand picks the form: a plain bf16 operand (rank 2) takes the bf16 path and its bytes
+ *   are not read on the host, since it may sit in device memory the host cannot read. Any other
+ *   operand is looked at for the container header (`rad_planes_header(w)`). The shim reads that
+ *   header on the host (as `scaled_rows()` does) and the kernel reads the same bytes on the
+ *   device, so a joined operand must be managed memory (prefetched) or hipHostMalloc; plain malloc
+ *   faults on the kernel's first read.
  *
  *   gfx1102 has no v_cvt_pk_f16_fp8 (clang lists the builtin but it expands to software), so the
  *   E4M3 decode uses r3d_fp8_dequant.h's 256-entry f16 table in LDS (512 bytes, eight reads per
@@ -603,8 +605,14 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
      * head, read as its two planes; no header means a plain bf16 head. The checks follow the
      * reference's `scaled_rows` in order: roles, then dtypes and blocks, then coverage (below,
      * once N and K are known).
+     * Only a joined head can carry a header, and it reaches the launch as rad_planes_layout stores
+     * it: one byte-addressed operand (rank 1, its codes' dtype) in the mapped tier, where the host
+     * reads it. A plain weight is a rank-2 bf16 tensor in device memory, which the host may not be
+     * able to read (the engine's weight pool on an integrated GPU, a Radeon 860M: the read faults),
+     * so its bytes are not looked at here.
      */
-    const RadPlanesHeader* ph = rad_planes_header(r3d_p(w));
+    const bool plain = w->dtype == RAD_BF16 && w->rank >= 2;
+    const RadPlanesHeader* ph = plain ? nullptr : rad_planes_header(r3d_p(w));
     if (ph) {
         if (!y_is_f32) return R3D_NO(RAD_E_DTYPE);   /* the bf16-y row takes a bf16 head only */
         if (rad_planes_find(r3d_p(w), "zero", nullptr))

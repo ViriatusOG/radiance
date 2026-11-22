@@ -225,6 +225,7 @@ public:
     uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
+    friend struct EngineBaseWeightsTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -383,6 +384,7 @@ private:
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
     int load_weights();
+    void seal_base_weights();
     /* After a page-in: every weight with a byte in `spans` (memory the page-in mapped back empty,
      * dev_page_refilled) is read from the container and laid out again at its current address,
      * through the load's sweep and relayout pool. */

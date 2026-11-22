@@ -55,6 +55,10 @@
  * merge is a real fold (not a view: the reference interleaves the four patches' channels, which
  * four consecutive rows do not spell), and its output is what the adapter reads.
  *
+ * A linear is BF16, or int8 with a bf16 scale per (row, 128 of K). The int8 form is what replaced
+ * block FP8: quant_act_i8g, then gemm_i8a8_row, which reads the container's own bytes so a tower
+ * placed in RAM is read in place. The patch stem, position table, norms and biases stay BF16.
+ *
  * Every rank runs the whole tower with replicated weights, as rad_block_vit.h's does, and the
  * weights are RAD_ACCESS_PER_REQUEST. Activations are sized by the pass (RadBuildCtx::
  * max_enc_patches rows), except in a sizing declare (shape_probe), where rows follow the probe's
@@ -64,6 +68,7 @@
 #define RAD_BLOCK_MUSEGLIMMER_VISION_H
 
 #include "rad_arch.h"
+#include "rad_fp8.h"
 
 #include <cmath>
 #include <cstdio>
@@ -72,6 +77,155 @@
 
 namespace rad {
 namespace arch {
+
+/* A vision linear is BF16, or int8 codes with a bf16 scale per (row, 128 of K): the form that
+ * replaced block FP8. The int8 path quantises the BF16 input with quant_act_i8g and reads it with
+ * gemm_i8a8_row (`w_rb` 1), whose weights stay the container's bytes so a tower on the mapped
+ * tier is read in place. Bias, the exact-erf GELU and the residual are separate BF16 ops, so the
+ * int8 path rounds once before the bias (the BF16 gemm_nt_bias fuses that epilogue). The patch
+ * stem, position table, norms and biases stay BF16; a linear whose K or N is not a whole 128 is
+ * refused rather than served by a fragment-order tile that the mapped tier cannot read. */
+struct MuseVisionAct {
+    rad_buf q = 0, s = 0;
+    int declare(RadBuilder* b, Names& nm, const char* name, int64_t rows, int64_t n) {
+        if (n % RAD_FP8_BLOCK) return RAD_E_SHAPE;
+        q = decl_b(b, nm.f("%s.q", name), RAD_I8, { rows, n });
+        s = decl_b(b, nm.f("%s.s", name), RAD_F32, { rows, n / RAD_FP8_BLOCK });
+        return q && s ? RAD_OK : RAD_E_INVAL;
+    }
+};
+
+struct MuseVisionLinear {
+    rad_weight w = 0, ws = 0, bias = 0;
+    rad_op op = 0, op_q = 0, op_bias = 0, op_gelu = 0, op_add = 0;
+    rad_buf x = 0, y = 0, tmp = 0, residual = 0;
+    MuseVisionAct a{};
+    int64_t N = 0, K = 0;
+    bool quant = false;
+
+    int weights(RadBuilder* b, Names& nm, const char* base, int64_t n, int64_t k,
+                RadWeightGroup group, std::initializer_list<const char*> src,
+                std::initializer_list<int64_t> parts = {}) {
+        N = n; K = k;
+        const char* wn = nm.f("%s.weight", base);
+        if (src.size() == 1) {
+            if (map_copy(b, wn, *src.begin()) < 0) return RAD_E_INVAL;
+        } else if (map_concat(b, wn, src) < 0) {
+            return RAD_E_INVAL;
+        }
+        RadEncoding enc{};
+        const bool known = weight_enc(b, wn, &enc);
+        const bool plain = !known || (rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
+                                       enc.plane[0].dtype == RAD_BF16);
+        const int64_t part_n = (int64_t)parts.size();
+        int64_t part_w[8] = {};
+        int pi = 0;
+        for (int64_t p : parts) {
+            if (pi >= 8) return RAD_E_INVAL;
+            part_w[pi++] = p;
+        }
+        if (plain) {
+            w = decl_w(b, wn, RAD_BF16, { N, K }, RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE,
+                       group, 0, parts);
+            return w ? RAD_OK : RAD_E_INVAL;
+        }
+        if (const char* gone = known ? linear_retired(enc) : nullptr)
+            return linear_refuse_retired(wn, gone);
+        if (!known || !linear_is_w8(enc)) {
+            char fmt[256];
+            if (known) rad_enc_format(&enc, fmt, sizeof fmt);
+            else std::snprintf(fmt, sizeof fmt, "an unknown encoding");
+            fprintf(stderr, "radiance: museglimmer vision: '%s' is %s; linears serve BF16 or "
+                            "int8 with a bf16 scale per (row, 128 of K)\n", wn, fmt);
+            return RAD_E_DTYPE;
+        }
+        if (N % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: museglimmer vision: '%s' is %lldx%lld; an int8 linear "
+                            "needs N and K in whole 128s\n", wn, (long long)N, (long long)K);
+            return RAD_E_SHAPE;
+        }
+        quant = true;
+        w = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, RAD_ACCESS_PER_REQUEST,
+                      RAD_SHARD_NONE, group, part_n ? part_w : nullptr, (int)part_n);
+        ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_BF16,
+                       { N, K / RAD_FP8_BLOCK }, RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, group,
+                       part_n ? part_w : nullptr, (int)part_n);
+        return w && ws ? RAD_OK : RAD_E_INVAL;
+    }
+
+    int ops(RadBuilder* b, int64_t rows, rad_buf in, rad_buf out, const MuseVisionAct& act,
+            rad_buf res = 0, rad_buf scratch = 0, const char* activation = "none") {
+        x = in; y = out; residual = res; tmp = res ? scratch : out; a = act;
+        if (!x || !y || !w || (res && !tmp)) return RAD_E_INVAL;
+        if (!quant) {
+            if (bias) {
+                op = res ? rw(b, RAD_OP(b, "gemm_nt_bias",
+                              RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                                         RAD_STR("dtype", "bf16"), RAD_STR("act", activation)),
+                              RAD_WEIGHTS(w, bias)), { x, res }, { y })
+                         : rw(b, RAD_OP(b, "gemm_nt_bias",
+                              RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                                         RAD_STR("dtype", "bf16"), RAD_STR("act", activation)),
+                              RAD_WEIGHTS(w, bias)), { x }, { y });
+            } else {
+                op = rw(b, RAD_OP(b, "gemm_nt",
+                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                                       RAD_STR("dtype", "bf16")), RAD_WEIGHTS(w)), { x }, { y });
+                if (std::strcmp(activation, "none")) return RAD_E_UNSUPPORTED;
+            }
+            return op ? RAD_OK : RAD_E_INVAL;
+        }
+        if (!a.q || !a.s) return RAD_E_INVAL;
+        op_q = rw(b, RAD_OP(b, "quant_act_i8g",
+                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", K),
+                                    RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
+                         RAD_NOWEIGHTS), { x }, { a.q, a.s });
+        op = rw(b, RAD_OP(b, "gemm_nt_q",
+                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                               RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8"),
+                               RAD_INT("w_rb", 1)),
+                    RAD_WEIGHTS(w, ws)),
+                { a.q, a.s }, { tmp });
+        if (bias)
+            op_bias = rw(b, RAD_OP(b, "table_add",
+                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", N), RAD_INT("L", 1),
+                                       RAD_STR("dtype", "bf16")), RAD_WEIGHTS(bias)),
+                         { tmp }, { tmp });
+        if (!std::strcmp(activation, "gelu"))
+            op_gelu = rw(b, RAD_OP(b, "gelu",
+                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", N),
+                                       RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS),
+                         { tmp }, { tmp });
+        else if (std::strcmp(activation, "none")) return RAD_E_UNSUPPORTED;
+        if (res)
+            op_add = rw(b, RAD_OP(b, "add",
+                           RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", N),
+                                      RAD_STR("dtype", "bf16")), RAD_NOWEIGHTS),
+                        { tmp, res }, { y });
+        return op_q && op && (!bias || op_bias) &&
+               (std::strcmp(activation, "gelu") || op_gelu) && (!res || op_add)
+                   ? RAD_OK : RAD_E_INVAL;
+    }
+
+    void step(RadCtx* c, int64_t rows) const {
+        if (!quant) {
+            if (bias)
+                RAD_ISSUE_N(c, op, rows, brows(x, rows), RAD_W(w), RAD_W(bias),
+                            residual ? brows(residual, rows) : RAD_NONE, brows(y, rows));
+            else
+                RAD_ISSUE_N(c, op, rows, brows(x, rows), RAD_W(w), brows(y, rows));
+            return;
+        }
+        RAD_ISSUE_N(c, op_q, rows, brows(x, rows), brows(a.q, rows), brows(a.s, rows));
+        /* a_sum and b_ref are the schema's optional tail; this grid reads neither. */
+        RAD_ISSUE_N(c, op, rows, brows(a.q, rows), brows(a.s, rows), RAD_W(w), RAD_W(ws),
+                    brows(tmp, rows), RAD_NONE, RAD_NONE);
+        if (op_bias) RAD_ISSUE_N(c, op_bias, rows, brows(tmp, rows), RAD_W(bias), brows(tmp, rows));
+        if (op_gelu) RAD_ISSUE_N(c, op_gelu, rows, brows(tmp, rows), brows(tmp, rows));
+        if (op_add) RAD_ISSUE_N(c, op_add, rows, brows(tmp, rows), brows(residual, rows),
+                                brows(y, rows));
+    }
+};
 
 struct MuseTower {
     /* Geometry, from the container's vision_config (never aliased: only the full prefix). The
@@ -86,17 +240,17 @@ struct MuseTower {
     struct Layer {
         bool full = false;     /* full_attention: frame-wide attention, NoPE-free (rotary runs
                                 * on every layer of this tower, full or window) */
-        rad_weight n1w = 0, n1b = 0, qkv_w = 0, qkv_b = 0, out_w = 0, out_b = 0;
-        rad_weight n2w = 0, n2b = 0, up_w = 0, up_b = 0, down_w = 0, down_b = 0;
-        rad_op ln1 = 0, qkv = 0, rope = 0, attn = 0, proj = 0, ln2 = 0, up = 0, down = 0;
+        rad_weight n1w = 0, n1b = 0, n2w = 0, n2b = 0;
+        MuseVisionLinear qkv, proj, up, down;
+        rad_op ln1 = 0, rope = 0, attn = 0, ln2 = 0;
         int64_t max_seg = 0;   /* the kernel band's longest segment */
     };
     std::vector<Layer> L;
     rad_weight w_patch = 0, w_pos = 0, lw_pre = 0, lb_pre = 0, lw_post = 0, lb_post = 0;
-    rad_weight w_a1 = 0, w_a2 = 0, w_proj = 0;
+    MuseVisionLinear a1, a2, proj;
+    MuseVisionAct a_width, a_ff, a_merged, a_projector;
     rad_op op_patch = 0, op_pos = 0, op_lpre = 0, op_wo = 0, op_gidx = 0, op_ginv = 0;
-    rad_op op_lpost = 0, op_merge = 0, op_m1 = 0, op_g1 = 0, op_m2 = 0, op_g2 = 0, op_proj = 0,
-           op_perc = 0;
+    rad_op op_lpost = 0, op_merge = 0, op_g1 = 0, op_g2 = 0, op_perc = 0;
     rad_buf b_x = 0, b_h = 0, b_p = 0, b_qkv = 0, b_att = 0, b_ff = 0;
     rad_buf b_idx = 0, b_inv = 0, b_pos = 0, b_cuw = 0;
     rad_buf b_mh = 0, b_m1 = 0, b_m2 = 0, b_out = 0;
@@ -251,6 +405,12 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
     auto bw = [&](const char* dn, const char* src, std::initializer_list<int64_t> shp,
                   RadWeightGroup g) -> rad_weight {
         if (map_copy(b, dn, src) < 0) return 0;
+        RadEncoding e{};
+        if (weight_enc(b, dn, &e) &&
+            !(rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16)) {
+            fprintf(stderr, "radiance: museglimmer vision: '%s' must remain BF16\n", dn);
+            return 0;
+        }
         return decl_w(b, dn, RAD_BF16, shp, ACC, RAD_SHARD_NONE, g);
     };
     w_patch = bw(nm.f("v.patch.weight"),
@@ -273,28 +433,33 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
         l.n1w   = bw(dn("norm1.weight"), src("norm1.weight"), { width }, g);
         l.n1b   = bw(dn("norm1.bias"), src("norm1.bias"), { width }, g);
         /* The reference's three biased projections, joined q | k | v into one GEMM. */
-        if (map_concat(b, dn("qkv.weight"),
-                       { src("attn.q_proj.weight"), src("attn.k_proj.weight"),
-                         src("attn.v_proj.weight") }) < 0)
-            return RAD_E_INVAL;
-        l.qkv_w = decl_w(b, dn("qkv.weight"), RAD_BF16, { 3 * width, width }, ACC,
-                         RAD_SHARD_NONE, g, 0, { width, width, width });
+        RAD_ARCH_TRY(l.qkv.weights(b, nm, dn("qkv"), 3 * width, width, g,
+                                   { src("attn.q_proj.weight"), src("attn.k_proj.weight"),
+                                     src("attn.v_proj.weight") }, { width, width, width }));
         if (map_concat(b, dn("qkv.bias"),
                        { src("attn.q_proj.bias"), src("attn.k_proj.bias"),
                          src("attn.v_proj.bias") }) < 0)
             return RAD_E_INVAL;
-        l.qkv_b = decl_w(b, dn("qkv.bias"), RAD_BF16, { 3 * width }, ACC, RAD_SHARD_NONE, g, 0,
-                         { width, width, width });
-        l.out_w = bw(dn("proj.weight"), src("attn.proj.weight"), { width, width }, g);
-        l.out_b = bw(dn("proj.bias"), src("attn.proj.bias"), { width }, g);
+        {
+            const char* qbn = dn("qkv.bias");
+            RadEncoding qb{};
+            if (weight_enc(b, qbn, &qb) &&
+                !(rad_enc_is(&qb, "plain") && qb.n_planes == 1 && qb.plane[0].dtype == RAD_BF16))
+                return RAD_E_DTYPE;
+            l.qkv.bias = decl_w(b, qbn, RAD_BF16, { 3 * width }, ACC, RAD_SHARD_NONE, g, 0,
+                                { width, width, width });
+        }
+        RAD_ARCH_TRY(l.proj.weights(b, nm, dn("proj"), width, width, g,
+                                    { src("attn.proj.weight") }));
+        l.proj.bias = bw(dn("proj.bias"), src("attn.proj.bias"), { width }, g);
         l.n2w   = bw(dn("norm2.weight"), src("norm2.weight"), { width }, g);
         l.n2b   = bw(dn("norm2.bias"), src("norm2.bias"), { width }, g);
-        l.up_w  = bw(dn("fc1.weight"), src("mlp.fc1.weight"), { ff, width }, g);
-        l.up_b  = bw(dn("fc1.bias"), src("mlp.fc1.bias"), { ff }, g);
-        l.down_w= bw(dn("fc2.weight"), src("mlp.fc2.weight"), { width, ff }, g);
-        l.down_b= bw(dn("fc2.bias"), src("mlp.fc2.bias"), { width }, g);
-        if (!l.n1w || !l.n1b || !l.qkv_w || !l.qkv_b || !l.out_w || !l.out_b || !l.n2w || !l.n2b ||
-            !l.up_w || !l.up_b || !l.down_w || !l.down_b)
+        RAD_ARCH_TRY(l.up.weights(b, nm, dn("fc1"), ff, width, g, { src("mlp.fc1.weight") }));
+        l.up.bias = bw(dn("fc1.bias"), src("mlp.fc1.bias"), { ff }, g);
+        RAD_ARCH_TRY(l.down.weights(b, nm, dn("fc2"), width, ff, g, { src("mlp.fc2.weight") }));
+        l.down.bias = bw(dn("fc2.bias"), src("mlp.fc2.bias"), { width }, g);
+        if (!l.n1w || !l.n1b || !l.qkv.bias || !l.proj.bias || !l.n2w || !l.n2b ||
+            !l.up.bias || !l.down.bias)
             return RAD_E_INVAL;
         l.full   = full[(size_t)i] != 0;
         l.max_seg = l.full ? ctx->max_enc_patches : win_seg;
@@ -303,15 +468,13 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
                  grp_model());
     lb_post = bw(nm.f("v.lnpost.bias"), nm.ckpt("model.vision_tower.ln_post.bias"), { width },
                  grp_model());
-    w_a1    = bw(nm.f("v.mlp.fc1.weight"), nm.ckpt("model.vision_adapter.fc1.weight"),
-                 { proj_ff, out_hidden }, grp_model());
-    w_a2    = bw(nm.f("v.mlp.fc2.weight"), nm.ckpt("model.vision_adapter.fc2.weight"),
-                 { proj_ff, proj_ff }, grp_model());
-    w_proj  = bw(nm.f("v.proj.weight"), nm.ckpt("model.vision_projection.weight"),
-                 { n_embd, proj_ff }, grp_model());
-    if (!w_patch || !w_pos || !lw_pre || !lb_pre || !lw_post || !lb_post || !w_a1 || !w_a2 ||
-        !w_proj)
-        return RAD_E_INVAL;
+    RAD_ARCH_TRY(a1.weights(b, nm, "v.mlp.fc1", proj_ff, out_hidden, grp_model(),
+                            { nm.ckpt("model.vision_adapter.fc1.weight") }));
+    RAD_ARCH_TRY(a2.weights(b, nm, "v.mlp.fc2", proj_ff, proj_ff, grp_model(),
+                            { nm.ckpt("model.vision_adapter.fc2.weight") }));
+    RAD_ARCH_TRY(proj.weights(b, nm, "v.proj", n_embd, proj_ff, grp_model(),
+                              { nm.ckpt("model.vision_projection.weight") }));
+    if (!w_patch || !w_pos || !lw_pre || !lb_pre || !lw_post || !lb_post) return RAD_E_INVAL;
 
     /* ---- activations. `mh` holds the merged rows: `pixtral_merge` folds each 2x2 block's four
      * patch rows into one row of mm * width in the reference's pixel_shuffle layout, and the
@@ -334,19 +497,17 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
         !b_mh || !b_m1 || !b_m2 || !b_out)
         return RAD_E_INVAL;
 
-    auto gemm_b = [&](int64_t rows, int64_t N, int64_t K, const char* a, rad_weight w,
-                      rad_weight bias) -> rad_op {
-        return RAD_OP(b, "gemm_nt_bias",
-                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_STR("dtype", "bf16"), RAD_STR("act", a)),
-                      RAD_WEIGHTS(w, bias));
-    };
-    auto gemm = [&](int64_t rows, int64_t N, int64_t K, rad_weight w) -> rad_op {
-        return RAD_OP(b, "gemm_nt",
-                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_STR("dtype", "bf16")),
-                      RAD_WEIGHTS(w));
-    };
+    bool width_i8 = false, ff_i8 = false;
+    for (const Layer& l : L) {
+        width_i8 |= l.qkv.quant || l.proj.quant || l.up.quant;
+        ff_i8 |= l.down.quant;
+    }
+    if (width_i8) RAD_ARCH_TRY(a_width.declare(b, nm, "v.i8_width", P, width));
+    if (ff_i8) RAD_ARCH_TRY(a_ff.declare(b, nm, "v.i8_ff", P, ff));
+    if (a1.quant) RAD_ARCH_TRY(a_merged.declare(b, nm, "v.i8_merged", R, mm * width));
+    if (a2.quant || proj.quant)
+        RAD_ARCH_TRY(a_projector.declare(b, nm, "v.i8_projector", R, proj_ff));
+
     auto lnorm = [&](int64_t rows, int64_t n, double e, rad_weight w, rad_weight bias) -> rad_op {
         return RAD_OP(b, "layernorm",
                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", e),
@@ -386,7 +547,7 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
                   { b_h, b_idx }, { b_p });
     for (Layer& l : L) {
         l.ln1  = rw(b, lnorm(P, width, 1e-5, l.n1w, l.n1b), { b_p }, { b_h });
-        l.qkv  = rw(b, gemm_b(P, 3 * width, width, "none", l.qkv_w, l.qkv_b), { b_h }, { b_qkv });
+        RAD_ARCH_TRY(l.qkv.ops(b, P, b_h, b_qkv, a_width));
         l.rope = rw(b, RAD_OP(b, "rope",
                               RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("head_dim", head_dim),
                                          RAD_INT("n_head", heads), RAD_INT("n_head_kv", heads),
@@ -403,10 +564,11 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
                     l.full ? std::initializer_list<rad_buf>{ b_qkv }
                            : std::initializer_list<rad_buf>{ b_qkv, b_cuw },
                     { b_att });
-        l.proj = rw(b, gemm_b(P, width, width, "none", l.out_w, l.out_b), { b_att, b_p }, { b_p });
+        /* b_h is the norm output qkv already consumed, so the residual GEMM may stage there. */
+        RAD_ARCH_TRY(l.proj.ops(b, P, b_att, b_p, a_width, b_p, b_h));
         l.ln2  = rw(b, lnorm(P, width, 1e-5, l.n2w, l.n2b), { b_p }, { b_h });
-        l.up   = rw(b, gemm_b(P, ff, width, "gelu", l.up_w, l.up_b), { b_h }, { b_ff });
-        l.down = rw(b, gemm_b(P, width, ff, "none", l.down_w, l.down_b), { b_ff, b_p }, { b_p });
+        RAD_ARCH_TRY(l.up.ops(b, P, b_h, b_ff, a_width, 0, 0, "gelu"));
+        RAD_ARCH_TRY(l.down.ops(b, P, b_ff, b_p, a_ff, b_p, b_h));
     }
     op_ginv  = rw(b, RAD_OP(b, "gather_rows",
                             RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", width),
@@ -423,20 +585,20 @@ inline int MuseTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBui
                             RAD_NOWEIGHTS),
                   { b_x }, { b_mh });
     /* The adapter: both linears bias-less, gelu between and after (the reference's
-     * act(fc2(act(fc1(x))))). */
-    op_m1    = rw(b, gemm(R, proj_ff, mm * width, w_a1), { b_mh }, { b_m1 });
+     * act(fc2(act(fc1(x))))). The GELU stays its own op, as it was on the BF16 path. */
+    RAD_ARCH_TRY(a1.ops(b, R, b_mh, b_m1, a_merged));
     op_g1    = rw(b, RAD_OP(b, "gelu",
                             RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", proj_ff),
                                        RAD_STR("dtype", "bf16")),
                             RAD_NOWEIGHTS),
                   { b_m1 }, { b_m2 });
-    op_m2    = rw(b, gemm(R, proj_ff, proj_ff, w_a2), { b_m2 }, { b_m1 });
+    RAD_ARCH_TRY(a2.ops(b, R, b_m2, b_m1, a_projector));
     op_g2    = rw(b, RAD_OP(b, "gelu",
                             RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", proj_ff),
                                        RAD_STR("dtype", "bf16")),
                             RAD_NOWEIGHTS),
                   { b_m1 }, { b_m2 });
-    op_proj  = rw(b, gemm(R, n_embd, proj_ff, w_proj), { b_m2 }, { b_out });
+    RAD_ARCH_TRY(proj.ops(b, R, b_m2, b_out, a_projector));
     /* perception_emb_norm: MuseGlimmerRMSNorm(eps = the TEXT model's rms_norm_eps, with_scale
      * False) -- no gain operand, no centered 1+. */
     op_perc  = rw(b, RAD_OP(b, "rmsnorm",
@@ -543,20 +705,16 @@ inline void MuseTower::step(RadCtx* c, const RadBatch* batch) const {
     for (size_t li = 0; li < L.size(); ++li) {
         const Layer& l = L[li];
         RAD_ISSUE_N(c, l.ln1, Pn, brows(b_p, Pn), RAD_W(l.n1w), RAD_W(l.n1b), brows(b_h, Pn));
-        RAD_ISSUE_N(c, l.qkv, Pn, brows(b_h, Pn), RAD_W(l.qkv_w), RAD_W(l.qkv_b), RAD_NONE,
-                    brows(b_qkv, Pn));
+        l.qkv.step(c, Pn);
         RAD_ISSUE_N(c, l.rope, Pn, brows(b_qkv, Pn), pos);
         RAD_ISSUE_N(c, l.attn, Pn,
                     bcol(b_qkv, 0, width, Pn), bcol(b_qkv, width, width, Pn),
                     bcol(b_qkv, 2 * width, width, Pn),
                     l.full ? cu : cuw, brows(b_att, Pn));
-        RAD_ISSUE_N(c, l.proj, Pn, brows(b_att, Pn), RAD_W(l.out_w), RAD_W(l.out_b),
-                    brows(b_p, Pn), brows(b_p, Pn));
+        l.proj.step(c, Pn);
         RAD_ISSUE_N(c, l.ln2, Pn, brows(b_p, Pn), RAD_W(l.n2w), RAD_W(l.n2b), brows(b_h, Pn));
-        RAD_ISSUE_N(c, l.up, Pn, brows(b_h, Pn), RAD_W(l.up_w), RAD_W(l.up_b), RAD_NONE,
-                    brows(b_ff, Pn));
-        RAD_ISSUE_N(c, l.down, Pn, brows(b_ff, Pn), RAD_W(l.down_w), RAD_W(l.down_b),
-                    brows(b_p, Pn), brows(b_p, Pn));
+        l.up.step(c, Pn);
+        l.down.step(c, Pn);
         if (li == 0) muse_tap(c, "v.blk0", b_p, Pn, width);
         if (li + 1 == L.size()) muse_tap(c, "v.blkL", b_p, Pn, width);
     }
@@ -567,12 +725,12 @@ inline void MuseTower::step(RadCtx* c, const RadBatch* batch) const {
     muse_tap(c, "v.lnpost", b_x, Pn, width);
     RAD_ISSUE_N(c, op_merge, Pn, brows(b_x, Pn), crd, brows(b_mh, Rn));
     muse_tap(c, "v.merge", b_mh, Rn, mm * width);
-    RAD_ISSUE_N(c, op_m1, Rn, brows(b_mh, Rn), RAD_W(w_a1), brows(b_m1, Rn));
+    a1.step(c, Rn);
     muse_tap(c, "v.fc1", b_m1, Rn, proj_ff);
     RAD_ISSUE_N(c, op_g1, Rn, brows(b_m1, Rn), brows(b_m2, Rn));
-    RAD_ISSUE_N(c, op_m2, Rn, brows(b_m2, Rn), RAD_W(w_a2), brows(b_m1, Rn));
+    a2.step(c, Rn);
     RAD_ISSUE_N(c, op_g2, Rn, brows(b_m1, Rn), brows(b_m2, Rn));
-    RAD_ISSUE_N(c, op_proj, Rn, brows(b_m2, Rn), RAD_W(w_proj), brows(b_out, Rn));
+    proj.step(c, Rn);
     muse_tap(c, "v.proj", b_out, Rn, n_embd);
     RAD_ISSUE_N(c, op_perc, Rn, brows(b_out, Rn), RAD_NONE, brows(b_out, Rn));
     muse_tap(c, "v.out", b_out, Rn, n_embd);

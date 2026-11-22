@@ -425,6 +425,18 @@ inline uint64_t owner_tag() {
     return me.v;
 }
 
+/* ring_errno: 0 when this process can make an io_uring ring, else the errno (defined below). */
+int ring_errno();
+
+/* True when this process reads the n-gram table with synchronous pread instead of a ring: the
+ * kernel, the sandbox, or a resource limit refused io_uring. pread() needs no ring: a positional
+ * read on a read-only file is safe from every thread. Every read is its own round trip, so the
+ * table reads slower; startup and serving work. avx_init_ngram says it once. */
+inline bool ring_sync_mode() {
+    static const bool sync = ring_errno() != 0;
+    return sync;
+}
+
 struct ReadRing {
     static constexpr unsigned kEntries = 4096;
     int            fd       = -1;
@@ -444,7 +456,7 @@ struct ReadRing {
         std::memset(&p, 0, sizeof p);
         p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
         const long r = syscall(__NR_io_uring_setup, kEntries, &p);
-        if (r < 0) { err = errno; return false; }
+        if (r < 0) { err = errno; entries = 1; return false; }  /* Sync-read mode keeps one span at a time. */
         fd      = (int)r;
         entries = p.sq_entries;
         sq_sz   = p.sq_off.array + (size_t)p.sq_entries * sizeof(unsigned);
@@ -489,6 +501,19 @@ struct ReadRing {
     int read_spans(const TableFile& tf, const SpanRead* r, unsigned count, long long n,
                    long long stride, uint8_t* bounce) {
         const long long A = tf.align;
+        if (ring_sync_mode()) {
+            for (unsigned i = 0; i < count; ++i) {
+                const long long a   = (long long)r[i].key & ~(A - 1);
+                const long long len = (((long long)r[i].key + n + A - 1) & ~(A - 1)) - a;
+                uint8_t* dst = bounce + (size_t)i * stride;
+                for (long long off = 0; off < len;) {
+                    const ssize_t got = ::pread(tf.fd, dst + off, (size_t)(len - off), (off_t)(a + off));
+                    if (got <= 0) return RAD_E_IO;
+                    off += got;
+                }
+            }
+            return RAD_OK;
+        }
         unsigned tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
         for (unsigned i = 0; i < count; ++i) {
             const long long a = (long long)r[i].key & ~(A - 1);
@@ -536,7 +561,10 @@ inline ReadRing* read_ring(int* why) {
         tried = true;
         std::unique_ptr<ReadRing> p(new ReadRing());
         if (p->init()) r = std::move(p);
-        else           err = p->err ? p->err : EIO;
+        else {
+            err = p->err ? p->err : EIO;
+            if (ring_sync_mode()) r = std::move(p);  /* The reader thread runs; its reads go through pread. */
+        }
     }
     if (!r && why) *why = err;
     return r.get();
@@ -921,6 +949,37 @@ int stream_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     uint8_t* bounce = g.bounce_for(depth * (size_t)stride, (size_t)A);
     int status = bounce ? RAD_OK : RAD_E_NOMEM;
     freebuf.clear();
+    if (status == RAD_OK && ring_sync_mode()) {
+        for (size_t i = 0; i < total; ++i) {
+            for (int u; (u = g_urgent_reads.load(std::memory_order_acquire)) > 0;)
+                g_urgent_reads.wait(u, std::memory_order_acquire);
+            const SpanRead& r = reads[i];
+            const long long a   = (long long)r.key & ~(A - 1);
+            const long long len = (((long long)r.key + n + A - 1) & ~(A - 1)) - a;
+            bool ok = true;
+            for (long long off = 0; off < len;) {
+                const ssize_t got = ::pread(tf.fd, bounce + off, (size_t)(len - off), (off_t)(a + off));
+                if (got <= 0) { ok = false; break; }
+                off += got;
+            }
+            if (!ok) { status = RAD_E_IO; break; }
+            const uint8_t* row = bounce + (r.key & (uint64_t)(A - 1));
+            std::memcpy(rc.data + (size_t)r.slot * (size_t)n, row, (size_t)n);
+            rc.ref[r.slot].store(1, std::memory_order_relaxed);
+            rc.word[r.slot].store(RowCache::ready(r.key), std::memory_order_release);
+            landed[i] = 1;
+            g_rows_read.fetch_add(1, std::memory_order_relaxed);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+        if (status != RAD_OK) {
+            for (size_t i = 0; i < total; ++i)
+                if (!landed[i]) rc.word[reads[i].slot].store(RowCache::EMPTY, std::memory_order_release);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+        return status;
+    }
     for (size_t d = 0; d < depth; ++d) freebuf.push_back((uint32_t)(depth - 1 - d));
     size_t next = 0, inflight = 0;
     unsigned pending = 0;                       /* queued in the SQ, not yet submitted */
@@ -1299,8 +1358,7 @@ extern "C" int avx_init_ngram(const RadParam* p, int n_p, int rank, int world_si
     if (!dt || std::strcmp(dt, "bf16") != 0) return RAD_OK;
     if (const int e = ring_errno()) {
         static std::once_flag said;
-        std::call_once(said, [e] { std::fprintf(stderr, "%s\n", ring_refusal(e).c_str()); });
-        return RAD_E_UNSUPPORTED;
+        std::call_once(said, [e] { std::fprintf(stderr, "%s The table reads fall back to synchronous pread: the model starts and serves, the n-gram reads are slower.\n", ring_refusal(e).c_str()); });
     }
 #else
     (void)p;

@@ -303,7 +303,8 @@ public:
      * n_computed); -1 means the sequence's current end. A WINDOW group recycles only blocks below
      * keep_from - window + 1, not below the window of the step's end, which would drop keys the
      * first rows of a multi-block prefill chunk still read. */
-    int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1);
+    int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1,
+                bool* waiting_for_fleet = nullptr);
 
     /* A WINDOW group's caps. A sequence holds the window behind the step's first query plus the
      * step's own tokens (at most window_blocks + ceil(max_tok / block) + 1), and one step carries
@@ -499,7 +500,13 @@ public:
      * loan it can still afford, and the slab owner drains to that before returning, so admission
      * is decided against the whole carve. Without a hook, lent blocks are not recalled and the
      * request gets RAD_E_FULL. */
-    void    set_reclaim(std::function<int(int64_t tokens)> f) { reclaim_ = std::move(f); }
+    void set_reclaim(std::function<int(int64_t tokens)> f) {
+        if (!f) { reclaim_ = {}; return; }
+        reclaim_ = [f = std::move(f)](int64_t tokens, bool*) { return f(tokens); };
+    }
+    void set_fleet_reclaim(std::function<int(int64_t tokens, bool* waiting)> f) {
+        reclaim_ = std::move(f);
+    }
 
     /* Copies the leader's loan onto a follower rank. Block ids are shared across ranks and only
      * rank 0 tracks sequences, so a follower takes the leader's mark instead of computing one;
@@ -795,7 +802,7 @@ private:
     /* Backs (or unbacks) every lendable group's stripes between the live marks of two loans. */
     int      flex_span(int64_t lo_loan, int64_t hi_loan, bool back);
     uint64_t seq_frees_ = 0;
-    std::function<int(int64_t)> reclaim_;
+    std::function<int(int64_t, bool*)> reclaim_;
     std::vector<int64_t>  live_;            /* per group: blocks the cache may hand out */
     std::vector<int64_t>  free_usable_;     /* per group: free ids below live_ */
     std::vector<int64_t>  bucket_blocks_;   /* per group: blocks one held_hist_ bucket covers */
@@ -808,7 +815,7 @@ private:
     int64_t  lent_blocks(size_t i, int64_t tokens) const;
     /* Moves every lendable group's mark to a loan of `tokens`, unchecked (set_loan checks). */
     void     apply_loan(int64_t tokens);
-    int  grow_for(int32_t g, int64_t blocks);
+    int  grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet = nullptr);
     void note_held(int32_t g, int32_t b, int delta);
     bool      configured_ = false;
     static const std::vector<int32_t> kNoBlocks;

@@ -39,8 +39,10 @@ export function Overview() {
   // the copies of parked ones. A server that does not say counts the copies alone.
   const copies = f.models.reduce((a, m) => a + (m.host_bytes ?? 0), 0)
   const hostBytes = f.host?.held_bytes ?? copies
-  const flight = f.models.reduce((a, m) => a + (m.in_flight ?? 0), 0)
-  const waiting = f.models.reduce((a, m) => a + (m.waiting ?? 0), 0)
+  // LoRA children are rows too, and a child's in-flight is part of its parent's: counting both
+  // twice would make one request look like two active ones. The KPI counts the work, in parents.
+  const flight = f.models.filter((m) => !m.parent).reduce((a, m) => a + (m.in_flight ?? 0), 0)
+  const waiting = f.models.filter((m) => !m.parent).reduce((a, m) => a + (m.waiting ?? 0), 0)
   const returns = f.models.reduce((a, m) => a + (m.restores ?? 0), 0)
   const power = f.cards.reduce((a, c) => a + (fin(c.power_w) ? c.power_w : 0), 0)
   const [cv, cu] = bytesParts(onCards)

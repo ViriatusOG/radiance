@@ -2,14 +2,18 @@
 // how much of the cache they hold, and which would resume and which would start over.
 import { Empty, Kpi, Panel, PartBar, type Part } from "@/components/bits"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { withModel, type Session, type Sessions } from "@/lib/api"
+import { withModel, splitModel, type Session, type Sessions } from "@/lib/api"
 import { bytesParts, fBytes, fDur, fNum } from "@/lib/format"
 import { useFetched } from "@/lib/fetched"
 
 export function SessionsView({ model }: { model: string }) {
   const { data: s, error } = useFetched<Sessions>(withModel("sessions", model), 5000)
   if (!s) return <Empty>{error ?? "Loading"}</Empty>
-  const list = (s.sessions ?? []).slice().sort((a, b) => a.idle_s - b.idle_s)
+  /* A LoRA child page lists the conversations whose newest turn ran under that adapter. The
+   * cache pools are the model's: every adapter's tokens sit in the same blocks. */
+  const { adapter } = splitModel(model)
+  const all = (s.sessions ?? []).slice().sort((a, b) => a.idle_s - b.idle_s)
+  const list = adapter ? all.filter((r) => r.lora === adapter) : all
   const linear = (s.linear?.checkpoints_written ?? 0) > 0 || list.some((r) => r.snapshots > 0)
   const live = list.filter((r) => !linear || r.resume_tokens > 0 || r.snapshots > 0)
   const cold = list.filter((r) => !live.includes(r))
@@ -26,7 +30,7 @@ export function SessionsView({ model }: { model: string }) {
           ? <Kpi label="Host memory in use" value={hv} unit={hu} detail={s.occupancy?.host_cap_bytes ? `of ${fBytes(s.occupancy.host_cap_bytes)}` : ""} />
           : <Kpi label="Prefix cache hits" value={s.prefix_hit_rate != null ? (s.prefix_hit_rate * 100).toFixed(1) : "–"} unit="%" detail="of prompt tokens reused" />}
       </div>
-      <Panel title="Will resume" description={live.length ? "Conversations whose next turn can reuse cached tokens, most recent first" : undefined} flush={live.length > 0}>
+      <Panel title="Will resume" description={live.length ? `Conversations whose next turn can reuse cached tokens${adapter ? ` (last turn under ${adapter})` : ""}, most recent first` : undefined} flush={live.length > 0}>
         {live.length ? <SessionTable rows={live} reuse={reuse} /> : <Empty>No cached conversations</Empty>}
       </Panel>
       {cold.length > 0 && (

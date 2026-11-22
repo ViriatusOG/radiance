@@ -3637,7 +3637,7 @@ int Checkpoint::bailingmoe3_layouts() {
         RAD_TRY(whole(sa, a3));
         raw.resize(a3.size());
         for (size_t i = 0; i < a3.size(); ++i)
-            raw[i] = std::logf(a3[i] > 0.0f ? a3[i] : 1.0f);
+            raw[i] = std::log(a3[i] > 0.0f ? a3[i] : 1.0f);
         RAD_TRY(add(fmt("blk.%lld.ssm_a_raw", (long long)l), sa->shape, std::move(raw)));
     }
 

@@ -690,6 +690,10 @@ from them in place). The highest priority goes first, then the most recently use
 engine (`Engine::fill_host`): host memory is mapped at the chunks (`dev_page_fill_begin`) and the
 weights in them are read from the container and laid out into it, as a restore's refill does, with
 every write clipped to the batch's chunks (a weight running into the next batch is read for each).
+New host-fill batches also wait while any model has an active response or retained background-job
+lease. Continuous traffic can postpone warming; demand-driven restores still proceed. A request
+arriving during an already-started batch can overlap that batch. The GiB limit bounds its bytes,
+not its duration, and brief dashboard leases can also defer the next batch.
 Such a copy is exact until the mover writes the chunk, so a park after the restore keeps it and
 leaves by the swap; once written, or dropped for room, the chunk is refilled from the container
 again. Nothing of it ever comes from the card.

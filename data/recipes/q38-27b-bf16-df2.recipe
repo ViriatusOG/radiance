@@ -1,0 +1,25 @@
+# q38-27b-bf16-df2.recipe -- Qwen3.8-27B at the checkpoint's own bf16, lm_head included, with the
+# DFlash2 drafter, served by qwen35_bf16.
+#
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-bf16-df2.recipe -o q38-27b-bf16-df2.rad
+#
+# No --set: the container states no quantisation, so qwen35_bf16 serves it and declares the drafter
+# when the deployment speculates. The trunk, the embedding and the lm_head stay as the checkpoint
+# holds them, so what is emitted is radiance's bf16 model (q38-27b-bf16.recipe makes the head int8
+# instead: half its bytes). The drafter's candidates are rescored against this bf16 head
+# (logit_rerank_bf16).
+#
+# The drafter as q38-27b-w8a8-df2.recipe makes it: its linears at MXFP4, and a 2-bit copy of the
+# target's head (u2 with a u8 zero, least-squares clip search) whose top 32 the engine rescores
+# against the target's head.
+
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0

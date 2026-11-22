@@ -132,6 +132,10 @@ public:
     bool detach(const std::string& name, int wait_ms);
 
     Activity activity(const std::string& name) const;
+    /* The leases a model's name now holds under the name `name:adapter` (the tail a request put
+     * after the colon). 0 when nothing runs under that suffix and 0 for a model that serves no
+     * adapter of that name: the Front counts names, and an unasked name has none. */
+    int64_t adapter_leases(const std::string& name, const std::string& adapter) const;
     /* Every model's name, in the order added. */
     std::vector<std::string> names() const;
 
@@ -201,6 +205,11 @@ private:
         bool                     removed = false;
         int64_t                  leases = 0;
         int64_t                  waiting = 0;
+        /* Leases taken under the name `name:adapter`, keyed by what the request put after the
+         * colon. The Front knows no adapters -- it counts the name a request asked by, so the
+         * suffix is just the name's tail. Only lease() fills this in; card reads, health reads
+         * and broadcast holds name no adapter. */
+        std::map<std::string, int64_t> adapter_leases;
         uint64_t                 last_used_ns = 0;
         uint64_t                 uses = 0;
         uint64_t                 waits = 0;
@@ -228,7 +237,9 @@ private:
     Got lease(const std::string& model, const std::string& path, int64_t wait_ms,
               uint64_t* until_ns, Entry** out, std::shared_ptr<void>* held, HttpResponse* refusal,
               bool operator_ok);
-    std::shared_ptr<void> lease_entry(Entry* e);
+    /* `adapter` is the tail of the requested name after the colon, empty when the request named
+     * the model itself: the lease then marks no adapter. */
+    std::shared_ptr<void> lease_entry(Entry* e, const std::string& adapter = "");
     std::shared_ptr<void> lease_quiet(Entry* e);
     HttpResponse forward(HttpRequest q);
     HttpResponse forward_waiting(HttpRequest q, const std::string& model);

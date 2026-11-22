@@ -3822,6 +3822,39 @@ TEST(the_lowest_free_block_is_the_one_handed_out) {
  * loan only on a timer would refuse it, and the scheduler waiting or preempting would never create
  * the demand that triggers the reclaim. So admission is decided against the whole carve, and the
  * recall happens on the path that needs it, through the slab owner. */
+TEST(admission_reports_only_recoverable_external_capacity_as_a_fleet_wait) {
+    Lender e;
+    REQUIRE_EQ(e.build(), RAD_OK);
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    const int64_t idle = e.kv.live_blocks(G_FULL);
+    const int64_t tokens = (idle + all) / 2 * e.bs();
+    /* The test pool is already backed; enable just the flex quota and callback protocol. */
+    e.kv.set_flex(1);
+    e.kv.set_flex_room(0);
+    CHECK_OK(e.kv.add_sequence(1));
+    bool waiting = false;
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
+    CHECK(waiting);
+    CHECK_EQ(e.kv.ensure(1, (all + 1) * e.bs(), -1, &waiting), RAD_E_FULL);
+    CHECK(!waiting);                              /* no future grant can exceed the full carve */
+    e.kv.set_flex_room(tokens);
+    bool deny = true;
+    e.kv.set_fleet_reclaim([&](int64_t, bool* pending) {
+        if (deny) { if (pending) *pending = true; return (int)RAD_E_FULL; }
+        return (int)RAD_OK;
+    });
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
+    CHECK(waiting);                               /* allowance was optimistic; actual grant denied */
+    e.kv.set_fleet_reclaim([](int64_t, bool*) { return (int)RAD_E_NOMEM; });
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_NOMEM);
+    CHECK(!waiting);                              /* a backing failure is an operational error */
+    deny = false;
+    e.kv.set_fleet_reclaim([&](int64_t, bool*) { return (int)RAD_OK; });
+    CHECK_OK(e.kv.ensure(1, tokens, -1, &waiting));
+    CHECK(!waiting);
+}
+
 TEST(a_request_past_the_mark_takes_the_loan_back) {
     Lender e;
     CHECK_OK(e.build());

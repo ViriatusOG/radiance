@@ -553,6 +553,11 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         }
     }
 
+    /* qwen4exp_lora: self_attn.o_proj is a LoRA-targeted module kind. Over a rotated int8
+     * container it runs as a plain bf16 GEMM over the kernel-relaid weight view (rad_fp8.h's
+     * LinearFP8::plain_bf16_view); every other container and the drafter's same-leaf siblings
+     * declare exactly what the tree declares. */
+    o.plain_bf16_view = true;
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
                            0, {}, o_span_lo, o_span_hi));

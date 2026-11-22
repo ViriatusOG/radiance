@@ -98,12 +98,20 @@ struct PrefillPlain {
  * columns is SB / kPFK staged tiles; the int32 sums run over all of them before the one fold
  * (|sum| <= 256 * 127 * 127 < 2^24, exact in the f32 conversion), so at 256 the tile folds half as
  * often. */
-template <bool I8, int RB, class Pre, bool ROWF = false, uint32_t SB = kBlock>
+/* ROWM: the weight and its per-row scales are the container's own bytes, not the fragment-order
+ * plane. A lane's 32 fragment bytes are four 8-byte gathers from one row (r4d_fp8_frag.h), and its
+ * eight scales are eight gathers a row apart. The MMA and the fold are the fragment tile's, so the
+ * bf16 product is that tile's. Vision declares this form (`w_rb` 1): a per-request tower can sit
+ * on the mapped tier, which reads the container where it lies and cannot take a relayout. */
+template <bool I8, int RB, class Pre, bool ROWF = false, uint32_t SB = kBlock, bool ROWM = false>
 __device__ __forceinline__ void gemm_8a8_prefill_body(
     const uint8_t* __restrict__ A, const float* __restrict__ Sa, const uint8_t* __restrict__ W,
     const uint16_t* __restrict__ Sw, uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
     uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld, const Pre& pre,
-    const float* __restrict__ Rs = nullptr, const float* __restrict__ Cf = nullptr) {
+    const float* __restrict__ Rs = nullptr, const float* __restrict__ Cf = nullptr,
+    uint32_t w_ld = 0) {
+    static_assert(!ROWM || (I8 && RB == 0 && !ROWF && SB == kBlock),
+                  "the container-form tile is the per-row int8 one");
     static_assert(!ROWF || RB == 32, "a row's scale and a block's factor fold as RB 32's one scale");
     static_assert(SB == kBlock || (I8 && RB == 0 && SB == 256u), "a 256 group is the per-row int8 tile's");
     constexpr uint32_t kTPB = SB / kPFK;   // staged tiles a scale block
@@ -147,7 +155,22 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
     const float* const ssrc = Sa + (size_t)min(m0 + tid % kPBM, M - 1u) * sa_ld;
     // This wave's weight tiles, kTileBytes a 64-k supertile, `ksuper` supertiles a tile row.
     const uint32_t wt0 = n0 / 16u + ww * kPTW;
-    const uint8_t* const wsrc = W + (size_t)wt0 * ksuper * kTileBytes + lane * kLaneBytes;
+    const uint8_t* const wsrc = ROWM ? nullptr
+                                     : W + (size_t)wt0 * ksuper * kTileBytes + lane * kLaneBytes;
+    const uint32_t wpitch = w_ld ? w_ld : K;
+    /* Lane l's 32 fragment bytes of tile i at k0: four 8-byte pieces of row (l & 15), at
+     * k0 + (l>>4)*8 + 16t. The same bytes frag_src names, so the MMA sees the fragment tile's A. */
+    auto row_stage = [&](uint32_t tile_i, uint32_t k0) -> Stage8 {
+        const uint32_t row = n0 + (ww * kPTW + tile_i) * 16u + (lane & 15u);
+        const uint8_t* src = W + (size_t)row * wpitch + k0 + (lane >> 4) * 8u;
+        uint2 fr[4];
+#pragma unroll
+        for (uint32_t t = 0; t < 4; ++t) fr[t] = *(const uint2*)(src + t * 16u);
+        Stage8 s;
+        s.v = make_uint4(fr[0].x, fr[0].y, fr[1].x, fr[1].y);
+        s.w = make_uint4(fr[2].x, fr[2].y, fr[3].x, fr[3].y);
+        return s;
+    };
     // Activation rows this wave reads from the staged tile, and the lane's column in each.
     const uint32_t arow = wa * kPTA * 16u;
 
@@ -173,7 +196,7 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
     Stage8 w0[kPTW], w1[kPTW];
 #pragma unroll
     for (uint32_t i = 0; i < kPTW; ++i)
-        w0[i] = stage8_load(wsrc + (size_t)i * ksuper * kTileBytes, true);
+        w0[i] = ROWM ? row_stage(i, 0u) : stage8_load(wsrc + (size_t)i * ksuper * kTileBytes, true);
     s_as[0][tid % kPBM] = ssrc[0];
     float scn = ssrc[min(1u, nkb - 1u)];
 
@@ -189,7 +212,8 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
         pa = stage8_load(asrc + c1, true);
 #pragma unroll
         for (uint32_t i = 0; i < kPTW; ++i)
-            nxt[i] = stage8_load(wsrc + ((size_t)i * ksuper + c1 / kSuperK) * kTileBytes, true);
+            nxt[i] = ROWM ? row_stage(i, c1)
+                          : stage8_load(wsrc + ((size_t)i * ksuper + c1 / kSuperK) * kTileBytes, true);
         if (half == kTPB - 1u) scn = ssrc[min(kb + 2u, nkb - 1u)];
 #pragma unroll
         for (uint32_t ks = 0; ks < kPFK / kK; ++ks) {
@@ -225,8 +249,23 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
                 wb[i] = bscale(Sw[((size_t)(wt0 + i) * nkb + kb) * 16u + (lane >> 4) * 8u]);
         } else if constexpr (I8) {
 #pragma unroll
-            for (uint32_t i = 0; i < kPTW; ++i)
-                w8[i] = *(const uint4*)(Sw + ((size_t)(wt0 + i) * nkb + kb) * 16u + (lane >> 4) * 8u);
+            for (uint32_t i = 0; i < kPTW; ++i) {
+                if constexpr (ROWM) {
+                    /* Eight bf16 scales, one a row, packed as the tile-major uint4 the fold reads. */
+                    const uint32_t row0 = n0 + (ww * kPTW + i) * 16u + (lane >> 4) * 8u;
+                    uint32_t pack[4];
+#pragma unroll
+                    for (uint32_t t = 0; t < 4; ++t) {
+                        const uint16_t s0 = Sw[(size_t)(row0 + 2u * t) * sw_ld + kb];
+                        const uint16_t s1 = Sw[(size_t)(row0 + 2u * t + 1u) * sw_ld + kb];
+                        pack[t] = (uint32_t)s0 | ((uint32_t)s1 << 16);
+                    }
+                    w8[i] = make_uint4(pack[0], pack[1], pack[2], pack[3]);
+                } else {
+                    w8[i] = *(const uint4*)(Sw + ((size_t)(wt0 + i) * nkb + kb) * 16u +
+                                            (lane >> 4) * 8u);
+                }
+            }
         } else {
             ws = bscale(Sw[(size_t)(n0 / kBlock) * sw_ld + kb]);
         }

@@ -924,7 +924,7 @@ int64_t KVManager::held_top(size_t i) const {
 /* Takes back enough of the loan that `blocks` more can be handed out, without limit: the request
  * is already admitted and the budget says it fits. Recalls the shortfall plus the buffer, so a
  * sequence growing a block at a time does not recall per block. */
-int KVManager::grow_for(int32_t g, int64_t blocks) {
+int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
     if (g < 0 || g >= (int32_t)plans_.size()) return RAD_E_INVAL;
     const KVGroupPlan& p = plans_[(size_t)g];
     if (!p.paged()) return RAD_OK;
@@ -943,7 +943,7 @@ int KVManager::grow_for(int32_t g, int64_t blocks) {
     int64_t keep = (p.n_blocks - live) * p.block_size;
     if (keep > loan_) keep = loan_;
     if (reclaim_) {
-        const int rc = reclaim_(keep);
+        const int rc = reclaim_(keep, waiting_for_fleet);
         if (rc == RAD_E_FULL) return rc;   /* a flex cache the fleet could not grow: the request waits */
         if (rc < 0) {
             RAD_ERR("KV group '%s': a request needs %lld more blocks and the expert slab could not "
@@ -1512,7 +1512,9 @@ void KVManager::trim_window(uint64_t id, int64_t keep_from) {
     recycle_window(s, keep_from);
 }
 
-int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
+int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from,
+                      bool* waiting_for_fleet) {
+    if (waiting_for_fleet) *waiting_for_fleet = false;
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
     if (n_tokens <= s->n_tokens) return RAD_OK;
@@ -1541,8 +1543,16 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                 if (bi >= 0 && bi < (int64_t)s->blocks[g].size()
                     && refcount_[g][(size_t)s->blocks[g][(size_t)bi]] > 1) need[g] += 1;
             }
-            if (need[g] > available_blocks((int32_t)g)) return RAD_E_FULL;
-            RAD_TRY(grow_for((int32_t)g, need[g]));
+            if (need[g] > available_blocks((int32_t)g)) {
+                /* The Fleet allowance can grow with no local request running. An impossible
+                 * full-pool requirement, or a state-slot shortage, is not such a wait. */
+                const int64_t full_free = free_blocks((int32_t)g) +
+                    std::max<int64_t>(p.n_blocks - live_blocks((int32_t)g), 0);
+                if (waiting_for_fleet && flex() && lendable((int32_t)g) && need[g] <= full_free)
+                    *waiting_for_fleet = true;
+                return RAD_E_FULL;
+            }
+            RAD_TRY(grow_for((int32_t)g, need[g], waiting_for_fleet));
         } else if (p.stateful() && s->state[g] < 0) {
             if (free_states_[g].empty()) return RAD_E_FULL;
         }

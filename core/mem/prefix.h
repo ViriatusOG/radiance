@@ -291,7 +291,8 @@ public:
                const std::vector<MMContentKey>& mm,
                const std::vector<std::vector<int32_t>>& blocks,
                int64_t n_tokens,
-               const std::string& label = std::string());
+               const std::string& label = std::string(),
+               int32_t lora_slot = -1);
 
     /* Release up to `n_entries` least recently used entries' KV references; returns how many went.
      * Entries a live sequence also holds are skipped, since releasing them frees nothing. With the

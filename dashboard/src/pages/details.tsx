@@ -7,7 +7,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { Switch } from "@/components/ui/switch"
-import { api, withModel, type Stats } from "@/lib/api"
+import { api, withModel, splitModel, type Stats } from "@/lib/api"
 import { fBytes, fNum } from "@/lib/format"
 import { useFetched } from "@/lib/fetched"
 
@@ -33,6 +33,8 @@ const kernelOf = (o: Op): Kernel | null => { for (const b of o.bands ?? []) { co
 const familyOf = (o: Op) => kernelOf(o)?.family || o.op
 
 export function Details({ model, stats }: { model: string; stats: Stats | null }) {
+  const { adapter } = splitModel(model)
+  const lora = adapter ? stats?.loras?.find((l) => l.name === adapter) : undefined
   const { data: g, error } = useFetched<Graph>(withModel("graph", model))
   const { data: info } = useFetched<Info>(withModel("server_info", model))
   const [query, setQuery] = useState("")
@@ -51,6 +53,7 @@ export function Details({ model, stats }: { model: string; stats: Stats | null }
     ["Ops", fNum(c.ops)], ["Weights", fNum(c.weights)],
   ]
   if (g.drafter?.name) facts.push(["Drafter", g.drafter.name], ["Draft depth", String(g.drafter.depth ?? "–")])
+  if (adapter) facts.push(["LoRA adapter", adapter], ["Runs on", splitModel(model).base], ["Served under it", fNum(lora?.requests)])
   if (e.tp_wire && (m.world ?? 1) > 1) facts.push(["Link between accelerators", String(e.tp_wire)])
   const mem: Part[] = ([["Weights", c.weight_bytes, 1], ["Activations", c.arena_bytes, 3], ["Host arena", c.host_arena_bytes, 5], ["Scratch", c.scratch_bytes, 6], ["KV cache", stats?.kv_bytes_total, 4]] as [string, number | undefined, number][])
     .filter(([, v]) => (v ?? 0) > 0).map(([label, v, i]) => ({ key: label, label, value: v!, color: `var(--series-${i})`, text: fBytes(v) }))

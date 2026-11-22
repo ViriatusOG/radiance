@@ -76,8 +76,17 @@ int Engine::run_encodes() {
             name.compare(name.size() - want.size(), want.size(), want) != 0) return false;
         return name.size() == want.size() || name[name.size() - want.size() - 1] == '.';
     };
+    /* What this run encodes, for the counters: an item another run already encoded is not. The
+     * run ends on every return, a failed one included, or the encoder would read busy forever. */
+    int64_t n_items = 0, n_patches = 0;
+    struct RunEnd {
+        Scheduler& s; const int64_t& items; const int64_t& patches;
+        ~RunEnd() { s.encodes_done(items, patches); }
+    } run_end{sched_, n_items, n_patches};
     for (auto& ip : items) {
         if (ip->encoded) continue;
+        ++n_items;
+        n_patches += ip->patch_at(ip->n_seg);
         const RadEncoderDecl& e = ip->kind == mm::Kind::Audio ? prog.audio_encoder : prog.encoder;
         ip->embd.assign((size_t)(ip->n_rows() * e.n_embd), 0);
         if (dump_dir && *dump_dir) dump(*ip, ".pix.bf16", ip->pixels.data(), ip->pixels.size());

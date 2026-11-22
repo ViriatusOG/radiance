@@ -151,6 +151,10 @@ struct Dash {
         sched.m.draft_depth_seen = 2;
         sched.m.draft_pos_reached[0] = 10; sched.m.draft_pos_accepted[0] = 8;
         sched.m.draft_pos_reached[1] = 8;  sched.m.draft_pos_accepted[1] = 2;
+        sched.m.encode_items = 3;
+        sched.m.encode_patches = 12000;
+        sched.m.encode_ns = 1500000000;
+        sched.m.encode_pending = 1;
         srv.reset(new Server(d, o));
     }
     json get(const char* path) {
@@ -209,6 +213,10 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);
     CHECK_EQ(s["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
     CHECK_EQ(s.value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
+    CHECK_EQ(s.value("encode_items", (int64_t)0), (int64_t)3);
+    CHECK_EQ(s.value("encode_patches", (int64_t)0), (int64_t)12000);
+    CHECK_EQ(s.value("encode_ns", (int64_t)0), (int64_t)1500000000);
+    CHECK_EQ(s.value("encode_pending", (int64_t)0), (int64_t)1);
 
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
     Dash g(true);
@@ -383,7 +391,7 @@ TEST(the_sampler_yields_every_charted_figure_from_the_stats_route) {
     for (const char* k : { "decode", "prefill", "running", "waiting", "preempted", "flight", "hit", "kvUsed", "kvCap",
                            "kvKept", "kvRead", "jobRun", "jobDone", "prefillRate", "reqRate", "stepAny", "step",
                            "accept", "tokStep", "lkAr", "lkUp", "lkDn", "lkSsd", "lkStream", "expHit", "expIn",
-                           "expOut" }) {
+                           "expOut", "encBusy", "encRate", "encPatch", "encWait" }) {
         CHECK(have.count(k) == 1);
         if (!have.count(k)) fprintf(stderr, "    the sampler yields no '%s' from /stats\n", k);
     }

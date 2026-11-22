@@ -182,8 +182,8 @@ __global__ __launch_bounds__(kPcThreads) R3D_WAVES(kPcWpS) void r3d_ple_conv_ker
 }
 
 /* The operand slots, in ple_conv's schema order. causal_conv1d is this kernel's SILU=false arm
- * with `resid` out of the schema and `dilation` fixed at one; its entry point and operand table
- * are not in this unit, so only ple_conv's positions are named here. */
+ * with `resid` out of the schema and `dilation` fixed at one; its slots are named beside its
+ * entry point at the end of this unit. */
 enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y };
 
 /* The launcher: the shape checks libr4d's r4d_rad_ple_conv makes, in the same order with the same
@@ -268,4 +268,16 @@ extern "C" int r3d_rad_ple_conv(const RadArgs* a, RadStream s) {
     return r3d_conv_launch(a, s, true, r3d_opt(a, PC_X), r3d_opt(a, PC_W), r3d_opt(a, PC_CS),
                            r3d_opt(a, PC_CU), r3d_opt(a, PC_RESID), r3d_opt(a, PC_CIDX),
                            r3d_opt(a, PC_HINIT), r3d_opt(a, PC_NACC), r3d_opt(a, PC_Y));
+}
+
+/* causal_conv1d (LFM2's and LFM3's short convolution): the SILU=false arm, no residual, and
+ * dilation one, which the schema has no parameter for, so the launcher's default holds. The
+ * operand slots are libref's causal_conv1d schema order: ple_conv's without `resid`. */
+enum { CC_X = 0, CC_W, CC_CS, CC_CU, CC_CIDX, CC_HINIT, CC_NACC, CC_Y };
+
+extern "C" int r3d_rad_causal_conv1d(const RadArgs* a, RadStream s) {
+    if (r3d_geti_or(a, "dilation", 1) != 1) return R3D_NO(RAD_E_INVAL);
+    return r3d_conv_launch(a, s, false, r3d_opt(a, CC_X), r3d_opt(a, CC_W), r3d_opt(a, CC_CS),
+                           r3d_opt(a, CC_CU), nullptr, r3d_opt(a, CC_CIDX), r3d_opt(a, CC_HINIT),
+                           r3d_opt(a, CC_NACC), r3d_opt(a, CC_Y));
 }

@@ -107,7 +107,9 @@ The options:
   the GPUs.
 - `--security-opt seccomp=unconfined`: Docker's default seccomp profile refuses io_uring and the
   NUMA binding calls the ROCm runtime makes for host memory. Qwen3.8-Flash-Next's n-gram embedding
-  table is read from the container through io_uring, so without this the model cannot serve.
+  table is read from the container through io_uring. Without this flag the table reads fall back
+  to synchronous pread: the model starts and serves, the n-gram reads are slower. The flag keeps
+  the fast path.
 - `--init`: an init process runs as PID 1 and forwards SIGTERM to the engine, which finishes its
   step and releases the cards.
 - `--ulimit memlock=-1`: where no device kernel gathers the n-gram table (a run on the host

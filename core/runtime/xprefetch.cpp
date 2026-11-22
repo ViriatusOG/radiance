@@ -8,6 +8,7 @@
 #include <cpuid.h>
 #include <cstring>
 #include <immintrin.h>
+#include <x86intrin.h>   // Clang keeps MONITORX/MWAITX here, not in immintrin.h
 #include <pthread.h>
 
 #if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP)

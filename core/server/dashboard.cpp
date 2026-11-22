@@ -130,6 +130,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         e["id"]        = s.id;
         e["model"]     = s.model;
         if (!s.label.empty()) e["label"] = s.label;
+        if (!s.lora.empty()) e["lora"] = s.lora;
         e["tokens"]    = s.n_tokens;
         e["bytes"]     = s.bytes;
         e["idle_s"]    = s.idle_s;
@@ -366,6 +367,22 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["draft_accept"]    = m.draft_acceptance;
         o["preemptions"]     = m.preemptions;
         o["total_requests"]  = m.total_requests;
+        /* Work attributed per runtime LoRA, by slot, named. A model serving several adapters
+         * shares every other counter; these are the ones that are not shared. */
+        {
+            const std::vector<std::string> lnames = deps_.sched->lora_names();
+            json lz = json::array();
+            for (size_t i = 0; i < lnames.size() && i < (size_t)SchedMetrics::MAX_LORA_SLOTS; ++i) {
+                json l;
+                l["name"]          = lnames[i];
+                l["requests"]      = m.loras[i].requests;
+                l["prompt_tokens"] = m.loras[i].prompt_tokens;
+                l["output_tokens"] = m.loras[i].output_tokens;
+                l["running"]       = m.loras[i].running;
+                lz.push_back(std::move(l));
+            }
+            o["loras"] = std::move(lz);
+        }
         o["steps"]           = m.steps;
         o["steps_prefill"]   = m.steps_prefill;
         o["steps_mixed"]     = m.steps_mixed;
@@ -382,6 +399,12 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["step_ns_decode_best"] = m.step_ns_decode_best;
         o["step_ns_decode_recent"] = m.step_ns_decode_recent;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
+        /* The encoder's time and work, which the step figures above do not show: it runs between
+         * steps. Emitted on every model, zero on one without an encoder. */
+        o["encode_items"]    = m.encode_items;
+        o["encode_patches"]  = m.encode_patches;
+        o["encode_ns"]       = m.encode_ns;
+        o["encode_pending"]  = m.encode_pending;
 
         /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
          * noise, over a reach of 40000 a broken draft round. */
@@ -415,6 +438,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             j["kv_blocks"] = q.kv_blocks;
             j["draft"]     = q.n_draft;
             j["slot"]      = q.slot;
+            if (!q.lora.empty()) j["lora"] = q.lora;
             j["age_s"]     = q.age_s;
             if (q.ttft_s >= 0) j["ttft_s"] = q.ttft_s;
             if (q.prefill_s >= 0) j["prefill_s"] = q.prefill_s;

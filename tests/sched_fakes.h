@@ -184,7 +184,15 @@ struct FakeKV : IKVManager {
         ring_floor.erase(id);
     }
 
+    uint64_t ensure_fail_id = 0;
+    int ensure_error = RAD_OK;
+    bool waiting_for_fleet = false;
+    int ensure_admission(uint64_t id, int64_t n, int64_t keep, bool* waiting) override {
+        *waiting = waiting_for_fleet;
+        return ensure_from(id, n, keep);
+    }
     int ensure(uint64_t id, int64_t n) override {
+        if (id == ensure_fail_id && ensure_error < 0) return ensure_error;
         auto it = seqs.find(id);
         if (it == seqs.end()) return RAD_E_NOTFOUND;
         Seq& q = it->second;

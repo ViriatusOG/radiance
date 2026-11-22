@@ -2,6 +2,8 @@
  *
  *   Rows     what two consecutive /stats objects yield: instantaneous figures from one, rates from
  *            the difference, and nothing where a counter did not move
+ *   Encoder  the encoder's busy share across a long pass, items a second and queue, and a gap where
+ *            a counter went back
  *   Fleet    a card's telemetry, a model's state and its bytes on each card
  *   Ring     an hour is kept, a value a sample did not yield is null, and `since` cuts
  *   Requests a request is recorded once when it finishes, seen done or gone between two samples
@@ -81,12 +83,52 @@ TEST(a_prompt_s_prefill_rate_is_its_fresh_tokens_over_its_own_prefill_time_once)
     CHECK(!has(History::model_row(b, &b, 1.0), "prefillRate"));
 }
 
+TEST(the_encoder_figures_come_from_two_stats_objects_and_a_reset_is_a_gap) {
+    json a = stats(7, 100, 2.2e9, 10), b = stats(7, 100, 2.2e9, 10);
+    a["encode_items"] = 4;  a["encode_patches"] = 4000; a["encode_ns"] = 1.0e9; a["encode_pending"] = 0;
+    b["encode_items"] = 6;  b["encode_patches"] = 7000; b["encode_ns"] = 2.5e9; b["encode_pending"] = 1;
+    const History::Row r = History::model_row(b, &a, 2.0);
+    CHECK_NEAR(of(r, "encBusy"), 0.75, 1e-12);       /* 1.5 s of encoding in two seconds */
+    CHECK_EQ(of(r, "encRate"), 1.0);
+    CHECK_EQ(of(r, "encPatch"), 1500.0);
+    CHECK_EQ(of(r, "encWait"), 1.0);
+    /* A 3 s pass read at 5 Hz: encode_ns grows as it runs, so every sample it spans reads fully
+     * busy and the busy area is the pass, not one spike at its end. */
+    json prev = b;
+    double area = 0;
+    for (int i = 1; i <= 15; ++i) {
+        json cur = prev;
+        cur["encode_ns"] = 2.5e9 + i * 0.2e9;
+        const double v = of(History::model_row(cur, &prev, 0.2), "encBusy");
+        CHECK_NEAR(v, 1.0, 1e-9);
+        area += v * 0.2;
+        prev = cur;
+    }
+    CHECK_NEAR(area, 3.0, 1e-9);
+    /* A sample a little shorter than the server's clock says (sampler jitter) reads as fully busy. */
+    json c = b;
+    c["encode_ns"] = 2.5e9 + 0.21e9;
+    CHECK_EQ(of(History::model_row(c, &b, 0.2), "encBusy"), 1.0);
+    /* The counters went back without a new start: no rate, not a negative one. The queue is
+     * instantaneous and still reads. */
+    const History::Row back = History::model_row(a, &b, 1.0);
+    CHECK(!has(back, "encBusy"));
+    CHECK(!has(back, "encRate"));
+    CHECK(!has(back, "encPatch"));
+    CHECK_EQ(of(back, "encWait"), 0.0);
+    /* A /stats object without the encoder's keys yields none of its figures. */
+    const History::Row none = History::model_row(stats(7, 150, 3.3e9, 10), &a, 1.0);
+    CHECK(!has(none, "encBusy"));
+    CHECK(!has(none, "encWait"));
+}
+
 TEST(the_fleet_row_holds_telemetry_states_and_bytes_per_card) {
     const json f = json::parse(R"({"models": [
         {"id": "a", "state": "resident", "cards": [0, 1], "vram_bytes_per_card": 1000},
         {"id": "b", "state": "parked", "cards": [1], "vram_bytes_per_card": 0},
         {"id": "c", "state": "cold"}],
-      "cards": [{"card": 0, "busy": 0.5, "power_w": 200, "temp_c": 60, "free_bytes": 7},
+      "cards": [{"card": 0, "busy": 0.5, "power_w": 200, "temp_c": 60, "free_bytes": 7, "mem_busy": 0.25,
+                 "sclk_mhz": 2653, "mclk_mhz": 1258, "temp_mem_c": 68, "fan_pct": 93},
                 {"card": 1, "free_bytes": 9}]})");
     const History::Row r = History::fleet_row(f);
     CHECK_EQ(of(r, "s:a"), 3.0);
@@ -95,7 +137,13 @@ TEST(the_fleet_row_holds_telemetry_states_and_bytes_per_card) {
     CHECK_EQ(of(r, "busy0"), 0.5);
     CHECK_EQ(of(r, "power0"), 200.0);
     CHECK_EQ(of(r, "temp0"), 60.0);
+    CHECK_EQ(of(r, "memb0"), 0.25);
+    CHECK_EQ(of(r, "sclk0"), 2653.0);
+    CHECK_EQ(of(r, "mclk0"), 1258.0);
+    CHECK_EQ(of(r, "tmem0"), 68.0);
+    CHECK_EQ(of(r, "fan0"), 93.0);
     CHECK(!has(r, "busy1"));                         /* not sampled is a gap, not a zero */
+    for (const char* k : { "memb1", "sclk1", "mclk1", "tmem1", "fan1" }) CHECK(!has(r, k));
     CHECK_EQ(of(r, "c0:a"), 1000.0);
     CHECK_EQ(of(r, "c1:a"), 1000.0);
     CHECK_EQ(of(r, "c0:b"), 0.0);                    /* a model with nothing on a card is an empty band */
@@ -126,6 +174,29 @@ TEST(a_value_a_sample_did_not_yield_is_null_and_an_empty_column_is_left_out) {
     CHECK(j["c"]["step"][0].is_null());              /* the first sample has no predecessor */
     CHECK_EQ(j["c"]["step"][1].get<double>(), 22.0);
     CHECK(!j["c"].contains("lkAr"));                 /* no link counters in these objects */
+}
+
+TEST(a_model_s_rows_carry_its_own_cards_figures_from_the_latest_fleet_sample) {
+    /* /history?model= answers callers the fleet's routes refuse, so a model's rows carry what its
+     * cards report, and only its cards'. */
+    History h;
+    h.fleet_sample(json::parse(R"({"models": [{"id": "m", "cards": [1, 2]}, {"id": "n", "cards": [0]}],
+        "cards": [{"card": 0, "busy": 0.5},
+                  {"card": 1, "busy": 1.0, "mem_busy": 0.35, "sclk_mhz": 2900, "fan_pct": 80},
+                  {"card": 2, "busy": 0.9, "temp_c": 70}]})"), 10.0);
+    h.model_sample("m", stats(7, 100, 2.2e9, 10), 10.0);
+    json j = h.model_since("m", 0);
+    CHECK_EQ(j["c"]["busy1"][0].get<double>(), 1.0);
+    CHECK_EQ(j["c"]["memb1"][0].get<double>(), 0.35);
+    CHECK_EQ(j["c"]["sclk1"][0].get<double>(), 2900.0);
+    CHECK_EQ(j["c"]["fan1"][0].get<double>(), 80.0);
+    CHECK_EQ(j["c"]["busy2"][0].get<double>(), 0.9);
+    CHECK_EQ(j["c"]["temp2"][0].get<double>(), 70.0);
+    CHECK(!j["c"].contains("busy0"));                /* another model's card */
+    CHECK(!j["c"].contains("memb2"));                /* a figure the card did not report */
+    /* A model the fleet names no cards for gets no card columns. */
+    h.model_sample("x", stats(7, 100, 2.2e9, 10), 10.0);
+    CHECK(!h.model_since("x", 0)["c"].contains("busy0"));
 }
 
 TEST(a_request_is_recorded_once_when_it_finishes) {

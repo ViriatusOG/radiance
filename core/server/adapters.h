@@ -158,9 +158,18 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.mixed_step_target_misses = m.mixed_step_target_misses;
     o.mixed_step_target_prefill_cap = m.mixed_step_target_prefill_cap;
     o.decode_rows_unspeculated = m.decode_rows_unspeculated;
+    for (int i = 0; i < (int)std::size(m.loras) && i < (int)std::size(o.loras); ++i) {
+        o.loras[i].requests      = m.loras[i].requests;
+        o.loras[i].prompt_tokens = m.loras[i].prompt_tokens;
+        o.loras[i].output_tokens = m.loras[i].output_tokens;
+        o.loras[i].running       = m.loras[i].running;
+        if (m.loras[i].requests || m.loras[i].running) o.n_loras = i + 1;
+    }
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
     o.step_ns_decode_best = m.step_ns_decode_best;
     o.step_ns_decode_recent = m.step_ns_decode_recent;
+    o.encode_items = m.encode_items;      o.encode_patches = m.encode_patches;
+    o.encode_ns = m.encode_ns;            o.encode_pending = m.encode_pending;
     return o;
 }
 
@@ -221,6 +230,13 @@ public:
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
+    /* The engine's LoRA slot names, indexed the same as ReqStat::lora_slot and the metrics'
+     * loras array. Wired by the engine beside the other callbacks. */
+    void set_lora_names(std::function<std::vector<std::string>()> f) { lora_names_ = std::move(f); }
+    std::vector<std::string> lora_names() const override {
+        return lora_names_ ? lora_names_() : std::vector<std::string>{};
+    }
+
     int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
                         SessionReleased* out) override {
         SessionRelease r;
@@ -267,12 +283,15 @@ public:
             occ->host_cap_bytes = held.host_cap_bytes;
         }
         const uint64_t now = rad_mono_ns();
+        const std::vector<std::string> lnames = lora_names();
         out->reserve(v.size());
         for (const IdleTiers::SessionInfo& s : v) {
             SessionStat o;
             o.id        = s.id;
             o.model     = s.model;
             o.label     = s.label;
+            o.lora      = s.last_lora_slot >= 0 && s.last_lora_slot < (int)lnames.size()
+                              ? lnames[(size_t)s.last_lora_slot] : std::string();
             o.n_tokens  = s.n_tokens;
             o.bytes     = s.bytes;
             o.idle_s    = now > s.last_used_ns  ? (double)(now - s.last_used_ns)  / 1e9 : 0.0;
@@ -293,6 +312,7 @@ public:
     int requests(std::vector<RequestStat>* out) const override {
         std::vector<Scheduler::ReqStat> raw(256);
         const int n = s_->observed_requests(raw.data(), (int)raw.size());
+        const std::vector<std::string> lnames = lora_names();
         out->clear();
         out->reserve((size_t)n);
         for (int i = 0; i < n; ++i) {
@@ -317,6 +337,8 @@ public:
             o.kv_tokens       = r.kv_tokens;
             o.n_draft         = r.n_draft;
             o.slot            = r.slot;
+            o.lora = r.lora_slot >= 0 && r.lora_slot < (int)lnames.size() ? lnames[(size_t)r.lora_slot]
+                                                                           : std::string();
             o.age_s           = r.age_s;
             o.ttft_s          = r.ttft_s;
             o.prefill_s       = r.prefill_s;
@@ -339,6 +361,7 @@ private:
     const IdleTiers*      tiers_ = nullptr;
     /* Ids start at 1: zero is the "no request" value the sink and the metrics use. */
     std::atomic<uint64_t> next_{1};
+    std::function<std::vector<std::string>()> lora_names_;
 };
 
 /* ================================================================== text */

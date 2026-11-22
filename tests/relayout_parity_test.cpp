@@ -186,9 +186,13 @@ const Hooks nMoeW4     { r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4,
                        r4d_rad_unrelayout_moe_w4 };
 const Hooks nMoeW4Mod4 { r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4,
                        r4d_rad_unrelayout_moe_w4_mod4 };
+const Hooks nX12       { r4d_rad_layout_bf16x12, r4d_rad_relayout_bf16x12,
+                       r4d_rad_unrelayout_bf16x12 };
 
-/* gemm_nt_q's operands and the other ops' weight slots, as the kernels number them */
-enum { B = 2, BSCALE = 3, BREF = 6, LM_W = 1, HC_DOWN = 2, HC_UP = 3, MTP_FCH = 4, MTP_FCE = 5 };
+/* gemm_nt_q's operands and the other ops' weight slots, as the kernels number them; NT_B is
+ * gemm_nt's weight */
+enum { B = 2, BSCALE = 3, BREF = 6, LM_W = 1, HC_DOWN = 2, HC_UP = 3, MTP_FCH = 4, MTP_FCE = 5,
+       NT_B = 1 };
 
 Opts fp8_grid() {
     Opts o;
@@ -442,6 +446,165 @@ TEST(the_tool_table_sizes_packed_weights_as_the_kernel_stores_them) {
         std::vector<rad::OpdShape> tab;
         CHECK_EQ(rad::rad_operand_shapes("gemm_nt_q", g, 7, M, &tab), RAD_OK);
         CHECK_EQ((int)tab.size(), 7);
+    }
+}
+
+namespace {
+
+const std::vector<const char*> kX12Planes = { "codes", "d", "e", "esc" };
+
+/* bf16 values (draw's, cut to bf16), with blocks libquant must keep whole: a value 2^-40 among
+ * ones near 2^-5, a zero, a negative zero, an infinity. */
+std::vector<float> x12_weight(int64_t R, int64_t C, uint64_t seed) {
+    std::vector<float> w = draw(R * C, seed, 20.0f);
+    for (float& v : w) {
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        u &= 0xFFFF0000u;
+        std::memcpy(&v, &u, 4);
+    }
+    w[(size_t)(1 * C + 2 * 32 + 5)] = std::ldexp(1.0f, -40);
+    w[(size_t)(4 * C + 7 * 32)] = 0.0f;
+    w[(size_t)(6 * C + 32 + 9)] = -0.0f;
+    w[(size_t)(9 * C + 31)] = INFINITY;
+    return w;
+}
+
+/* The four planes of `q`, an [R, C] weight or a share of one, through the bf16x12 hooks and back:
+ * the inverse gives the planes exactly, and the op oracle's reading of them (enc_selection_logical
+ * over all four, which decodes through libquant's hook) is `w` bit for bit. */
+void x12_reads_back(const char* label, Opts kp, const Quantised& q, int64_t R, int64_t C,
+                    const float* w) {
+    Selection s = select(q, R, C, kX12Planes);
+    RadLayout L{};
+    REQUIRE_EQ(r4d_rad_layout_bf16x12(kp.data(), kp.n(), NT_B, &q.enc, s.sel.data(), s.t.data(),
+                                      4, &L), RAD_OK);
+    std::vector<uint8_t> laid((size_t)L.bytes, 0xA5);
+    REQUIRE_EQ(r4d_rad_relayout_bf16x12(kp.data(), kp.n(), NT_B, &q.enc, s.sel.data(), s.t.data(),
+                                        4, laid.data(), L.bytes), RAD_OK);
+    std::vector<std::vector<uint8_t>> bufs;
+    Selection back = select(q, R, C, kX12Planes, &bufs);
+    REQUIRE_EQ(r4d_rad_unrelayout_bf16x12(kp.data(), kp.n(), NT_B, &q.enc, back.sel.data(),
+                                          laid.data(), L.bytes, back.t.data(), 4), RAD_OK);
+    for (size_t i = 0; i < bufs.size(); ++i) CHECK(bufs[i] == q.planes[(size_t)s.sel[i]]);
+    std::vector<int64_t> rows, cols;
+    std::vector<const void*> pd;
+    for (size_t k = 0; k < back.t.size(); ++k) {
+        rows.push_back(back.t[k].shape[0]);
+        cols.push_back(back.t[k].shape[1]);
+        pd.push_back(bufs[k].data());
+    }
+    std::vector<float> got((size_t)(R * C));
+    std::string why;
+    const int rc = rad::enc_selection_logical(q.enc, back.sel.data(), 4, rows.data(), cols.data(),
+                                              pd.data(), RAD_F32, R * C, got.data(), &why);
+    if (rc != RAD_OK) std::fprintf(stderr, "    %s: %s\n", label, why.c_str());
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK(std::memcmp(got.data(), w, (size_t)(R * C) * sizeof(float)) == 0);
+}
+
+/* What the bf16x12 relayout answers for `q`'s planes at [R, C]. */
+int x12_relaid(Opts kp, const Quantised& q, int64_t R, int64_t C) {
+    Selection s = select(q, R, C, kX12Planes);
+    RadLayout L{};
+    const int lrc = r4d_rad_layout_bf16x12(kp.data(), kp.n(), NT_B, &q.enc, s.sel.data(),
+                                           s.t.data(), 4, &L);
+    if (lrc != RAD_OK) return lrc;
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    return r4d_rad_relayout_bf16x12(kp.data(), kp.n(), NT_B, &q.enc, s.sel.data(), s.t.data(), 4,
+                                    dst.data(), L.bytes);
+}
+
+}  /* namespace */
+
+/* bf16x12, libquant's lossless 12-bit bf16, as the gemm_bf16x12 rows read it: one buffer of four
+ * regions, each 32-block in WMMA fragment order, a raw block's index four times in its offsets and
+ * the table rows in the same order. The inverse is exact and the oracle reads the weight back
+ * through it bit for bit, the whole weight and rank 1's column share alike, whose raw blocks index
+ * the whole table. What the kernel would misread is refused when the bytes are relaid, and a
+ * declaration of anything but the four planes of libquant's encoding at the op's N and K is refused
+ * at declare. */
+TEST(bf16x12_in_fragment_order_with_its_escape_table) {
+    NEED_LIBQUANT();
+    const int64_t N = 48, K = 512, nb = K / 32;
+    const std::vector<float> w = x12_weight(N, K, 31);
+    Opts kp, g;
+    kp.i("N", N).i("K", K).s("dtype", "bf16x12");
+    Quantised q;
+    golden("bf16x12", stored("bf16x12", nX12, kp, "bf16x12", g, "blk.0.ffn_down.weight", N, K, w,
+                             { { NT_B, kX12Planes } }, &q),
+           0xefb63402ec2023adull);
+    REQUIRE_EQ(q.status, RAD_OK);
+    x12_reads_back("bf16x12", kp, q, N, K, w.data());
+
+    /* Rank 1's columns, cut as the loader cuts them: every tiled plane's half, the table whole. */
+    Quantised h;
+    h.enc = q.enc;
+    h.planes.resize(4);
+    std::vector<float> wh((size_t)(N * K / 2));
+    for (int64_t r = 0; r < N; ++r) {
+        const auto cut = [&](int i, int64_t row_bytes) {
+            const uint8_t* src = q.planes[(size_t)i].data() + r * row_bytes + row_bytes / 2;
+            h.planes[(size_t)i].insert(h.planes[(size_t)i].end(), src, src + row_bytes / 2);
+        };
+        cut(0, K);
+        cut(1, K / 2);
+        cut(2, nb);
+        std::memcpy(&wh[(size_t)(r * K / 2)], &w[(size_t)(r * K + K / 2)], (size_t)K / 2 * 4);
+    }
+    h.planes[3] = q.planes[3];
+    Opts kh;
+    kh.i("N", N).i("K", K / 2).s("dtype", "bf16x12");
+    x12_reads_back("bf16x12 rank 1 of 2", kh, h, N, K / 2, wh.data());
+
+    /* Refused when relaid: a raw block's index past the table, a stray byte in its index padding or
+     * its codes, an offset above its block's E. An offset at E is a value, not a refusal. */
+    int64_t raw = -1, packed = -1;
+    for (int64_t i = 0; i < N * nb; ++i) {
+        if (q.planes[2][(size_t)i] == 0xFF && raw < 0) raw = i;
+        if (q.planes[2][(size_t)i] != 0xFF && packed < 0) packed = i;
+    }
+    REQUIRE(raw >= 0 && packed >= 0);
+    const uint32_t cap = (uint32_t)q.enc.plane[3].extent[0];
+    const size_t rd = (size_t)(raw / nb * (K / 2) + raw % nb * 16);
+    const size_t pd = (size_t)(packed / nb * (K / 2) + packed % nb * 16);
+    Quantised bad = q;
+    std::memcpy(&bad.planes[1][rd], &cap, 4);
+    CHECK_EQ(x12_relaid(kp, bad, N, K), RAD_E_FORMAT);
+    bad = q;
+    bad.planes[1][rd + 7] = 1;
+    CHECK_EQ(x12_relaid(kp, bad, N, K), RAD_E_FORMAT);
+    bad = q;
+    bad.planes[0][(size_t)(raw / nb * K + raw % nb * 32 + 3)] = 0x80;
+    CHECK_EQ(x12_relaid(kp, bad, N, K), RAD_E_FORMAT);
+    bad = q;
+    bad.planes[2][(size_t)packed] = 3;
+    std::memset(&bad.planes[1][pd], 0x33, 16);
+    CHECK_EQ(x12_relaid(kp, bad, N, K), RAD_OK);
+    bad.planes[1][pd + 5] = 0x34;
+    CHECK_EQ(x12_relaid(kp, bad, N, K), RAD_E_FORMAT);
+
+    /* Refused at declare: planes of another K, not every plane, another encoding. */
+    {
+        Opts k2;
+        k2.i("N", N).i("K", K / 2).s("dtype", "bf16x12");
+        Selection s = select(q, N, K, kX12Planes);
+        RadLayout L{};
+        CHECK_EQ(r4d_rad_layout_bf16x12(k2.data(), k2.n(), NT_B, &q.enc, s.sel.data(), s.t.data(),
+                                        4, &L), RAD_E_SHAPE);
+        Selection c = select(q, N, K, { "codes" });
+        CHECK_EQ(r4d_rad_layout_bf16x12(kp.data(), kp.n(), NT_B, &q.enc, c.sel.data(), c.t.data(),
+                                        1, &L), RAD_E_SHAPE);
+        RadEncoding f16 = q.enc;
+        f16.plane[3].dtype = RAD_F16;
+        CHECK_EQ(r4d_rad_layout_bf16x12(kp.data(), kp.n(), NT_B, &f16, s.sel.data(), s.t.data(),
+                                        4, &L), RAD_E_DTYPE);
+        const RadEncoding plain = rad_enc_plain(RAD_BF16);
+        const int sel0 = 0;
+        RadTensor t = s.t[0];
+        t.dtype = RAD_BF16;
+        CHECK_EQ(r4d_rad_layout_bf16x12(kp.data(), kp.n(), NT_B, &plain, &sel0, &t, 1, &L),
+                 RAD_E_DTYPE);
     }
 }
 

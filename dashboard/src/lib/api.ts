@@ -3,9 +3,15 @@
 // /sessions, /graph and /server_info are asked for once, when their view is opened.
 
 export interface Columns { [name: string]: (number | null)[] }
+/** A model served through a runtime LoRA reads as `base:adapter`; the tabs slice by adapter. */
+export const splitModel = (id: string): { base: string; adapter: string | null } => {
+  const i = id.lastIndexOf(":")
+  return i < 0 ? { base: id, adapter: null } : { base: id.slice(0, i), adapter: id.slice(i + 1) }
+}
+export interface LoRAStat { name: string; requests: number; prompt_tokens: number; output_tokens: number; running: number }
 export interface FinishedRequest {
   id: string; prompt: number; out: number; ctx: number
-  ttft: number | null; pf: number | null; tps: number | null; at: number
+  ttft: number | null; pf: number | null; tps: number | null; at: number; lora?: string
 }
 export interface HistoryBody<Live> {
   keep_s: number
@@ -29,7 +35,12 @@ export interface FleetModel {
   capabilities?: Record<string, unknown>
   [k: string]: unknown
 }
-export interface FleetCard { card: number; name?: string; vram_bytes?: number; free_bytes?: number; busy?: number; power_w?: number; temp_c?: number; queues?: number; queues_idle?: number; queue_bytes?: number }
+export interface FleetCard {
+  card: number; name?: string; vram_bytes?: number; free_bytes?: number; busy?: number; power_w?: number; temp_c?: number; queues?: number; queues_idle?: number; queue_bytes?: number
+  /** Each only where the driver reports it: memory busy as a ratio, clocks in MHz, the memory's
+   * temperature beside the junction's, and the fan as a percentage of its full speed. */
+  mem_busy?: number; sclk_mhz?: number; mclk_mhz?: number; temp_mem_c?: number; fan_pct?: number
+}
 export interface Fleet {
   version: string; uptime_s: number
   models: FleetModel[]; cards: FleetCard[]
@@ -43,7 +54,7 @@ export interface Fleet {
 // (tools/dashboard_embed.py copies these names into the compiled-in header).
 export interface RunningRequest {
   id: string | number; state: string; prompt: number; computed: number; cached: number; output: number
-  max: number; age_s: number; tps: number
+  max: number; age_s: number; tps: number; lora?: string
 }
 export interface DraftPosition { reached: number; rate: number }
 export interface ExpertTier { name: string; units: number; bytes: number }
@@ -60,8 +71,12 @@ export interface Stats {
   draft_positions?: DraftPosition[]
   requests?: RunningRequest[]
   experts?: Experts
+  loras?: LoRAStat[]
+  // The vision encoder: images and patches encoded and the time spent on them (counters since the
+  // model loaded), and the images waiting for it now.
+  encode_items?: number; encode_patches?: number; encode_ns?: number; encode_pending?: number
 }
-export interface Session { id: number | string; label?: string; tokens: number; bytes: number; idle_s: number; on_device: number; on_host: number; moving: boolean; snapshots: number; resume_tokens: number }
+export interface Session { id: number | string; label?: string; tokens: number; bytes: number; idle_s: number; on_device: number; on_host: number; moving: boolean; snapshots: number; resume_tokens: number; lora?: string }
 export interface Sessions {
   sessions: Session[]; enabled?: boolean
   pool?: { tokens_used: number; tokens_total: number; bytes_used: number; bytes_total: number }

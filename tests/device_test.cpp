@@ -2191,6 +2191,39 @@ TEST(an_allocation_its_owner_refills_parks_with_no_copy_and_comes_back_to_be_fil
     CHECK_EQ(a.first_bad(), -1);
 }
 
+/* Runtime LoRA state is a mutable arena allocation, separate from the container-backed base
+ * weights. Refilling base weights must neither discard nor overwrite the occupied adapter. */
+TEST(container_weights_and_mutable_adapters_survive_park_and_refill) {
+    if (!need_vmem()) return;
+    Paged weights(9125, kParkChunk + (3 << 20), 63u);
+    Paged adapter(9125, kParkChunk + (1 << 20), 79u);
+    REQUIRE(weights.d && adapter.d);
+    CHECK_OK(weights.upload());
+    rad::dev_page_seal(weights.d);
+    rad::dev_page_refilled(weights.d);
+    for (int round = 0; round < 2; ++round) {
+        fill(adapter.want.data(), adapter.n, (uint32_t)(79 + 2 * round));
+        CHECK_OK(adapter.upload());
+        rad::PageOut request;
+        request.host_budget = (int64_t)1 << 30;
+        rad::PageResult result;
+        CHECK_OK(rad::dev_page_out(weights.owner, request, &result));
+        CHECK(result.file >= weights.n);
+        CHECK(result.host >= adapter.n);
+        CHECK(result.host < weights.n + adapter.n);
+        CHECK_EQ(result.disk, 0);
+        std::vector<rad::PageSpan> refill;
+        CHECK_OK(rad::dev_page_in(weights.owner, &refill));
+        REQUIRE_EQ(refill.size(), (size_t)1);
+        CHECK(refill[0].p == (char*)weights.d);
+        CHECK(refill[0].bytes >= weights.n);
+        CHECK_EQ(adapter.first_bad(), -1);       /* its slot bytes already came back independently */
+        CHECK_OK(weights.upload());             /* the owner supplies the original base weights */
+        CHECK_EQ(weights.first_bad(), -1);
+        CHECK_EQ(adapter.first_bad(), -1);
+    }
+}
+
 /* A host fill of an allocation its owner refills: host memory mapped at its parked chunks, filled by
  * the owner (here a copy from the card's side, as the refill's DMA writes it), comes back over the
  * link with nothing handed back; the copy stays exact, so the next park leaves by the swap; once

@@ -155,18 +155,23 @@ const DeviceBackend* be() { return active_backend(); }
 struct Streams {
     std::map<int, RadStream> s;
     RadStream on(int device) {
-        rad_dev_set(device);
+        if (rad_dev_set(device) < 0) return nullptr;
         RadStream& x = s[device];
         if (!x && rad_stream_create(&x, 0) < 0) x = nullptr;
         return x;
     }
     int sync_all() {
-        for (auto& [d, x] : s)
-            if (x) {
-                rad_dev_set(d);
-                if (const int rc = rad_stream_sync(x); rc < 0) return rc;
-            }
-        return RAD_OK;
+        int status = RAD_OK;
+        for (auto& [d, x] : s) {
+            if (!x) continue;
+            const int selected = rad_dev_set(d);
+            if (selected < 0 && status >= 0) status = selected;
+            /* A stream owns its device: try its fence even if rebinding this thread failed,
+             * and visit every rank before returning the first error. */
+            const int rc = rad_stream_sync(x);
+            if (rc < 0 && status >= 0) status = rc;
+        }
+        return status;
     }
     ~Streams() {
         for (auto& [d, x] : s)
@@ -550,6 +555,9 @@ int dev_page_out(int owner, const PageOut& req, PageResult* out) {
     /* A batch that fails before its swaps leaves nothing behind: the host memory it mapped at the
      * shadows and its staging buffers go back, and its chunks stay on the card as they were. */
     auto undo = [&](int rc) {
+        /* Earlier ranks may still write these destinations after a later failure. */
+        if (st.sync_all() < 0)
+            fatal("parking: copy streams did not drain; refusing to release their destinations");
         for (Job& j : batch) {
             if (j.committed) {
                 rad_dev_set(j.p.pg->device);
@@ -908,6 +916,10 @@ int read_back(const std::vector<InPick>& disk, Streams& st) {
     }
     for (auto& t : th) t.join();
     const int sync_rc = st.sync_all();
+    /* Neither a reader error nor a failed event proves that submitted copies stopped. Their
+     * pinned sources and the caller's mapped destinations must survive an unproven fence. */
+    if (sync_rc < 0)
+        fatal("parking: readback streams did not drain; refusing to recycle staging or unmap destinations");
     for (Slot& x : slots) {
         for (auto& [dv, e] : x.ev) if (e) { rad_dev_set(dv); rad_event_destroy(e); }
         stage_give(x.buf);

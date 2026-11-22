@@ -122,6 +122,8 @@
 #include <cstring>
 #include <type_traits>
 
+int halo_moe_w4nl_gemv(const RadArgs* a, RadStream stream, bool chain);   /* halo_moe_gemv.hip */
+
 namespace {
 
 constexpr uint32_t kWave  = 32;
@@ -1425,6 +1427,13 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         /* The decode band's launches have chained forms (halo_chain.h); the prefill forms have
          * none, as libr4d's. */
         const bool chain = halo_geti_or(a, "chain", 0) != 0;
+        /* At most four rows an expert under w4nl64a8i8h, the GEMV (halo_moe_gemv.hip), which
+         * stages no 16-row tile for each row. */
+        if constexpr (W4 == 2)
+            if (form == 0 && g_moe_down_dec_pin == 0 && ncls == 2) {
+                const int grc = halo_moe_w4nl_gemv(a, stream, chain);
+                if (grc != RAD_E_UNSUPPORTED) return grc;
+            }
         /* The sorted operand's decode kernel: one block a run tile, G column tiles of output. */
         const bool dn_dec = a_sorted && parts == 1 && n_expert <= (long long)kMaxExpert;
         const long long g2 = moeq_down_dec_g(T);

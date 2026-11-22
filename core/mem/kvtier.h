@@ -232,6 +232,8 @@ public:
          * clamp to it, so this is what the next turn skips; n_tokens minus it gets prefilled. */
         int64_t     resume_tokens = 0;
         bool        moving = false;                            /* a job is outstanding */
+        /* The runtime LoRA slot the newest turn ran under, -1 for the base. */
+        int32_t     last_lora_slot = -1;
     };
     /* Host memory held for the cache, each block counted once (including clean entries' copies),
      * and the configured cap. */
@@ -243,7 +245,8 @@ public:
      * off, since a VRAM-only server still stores conversations. A session is a leaf, so a chain a
      * later turn extends is absorbed into it: one row per conversation, not per turn. */
     void note_session(uint64_t id, const std::vector<BlockHash>& chain, int64_t n_tokens,
-                      uint64_t now_ns, const std::string& label = std::string());
+                      uint64_t now_ns, const std::string& label = std::string(),
+                      int32_t lora_slot = -1);
     void set_model(const std::string& m) { model_ = m; }
     /* Newest activity first, tier histograms recomputed from the records. The walk takes the lock
      * in slices and yields between them (YieldingMutex), so rows may describe moments a few
@@ -350,6 +353,8 @@ private:
         uint64_t last_used_ns = 0;
         std::vector<BlockHash> chain;
         std::string label;
+        /* The runtime LoRA slot the newest turn ran under, -1 for the base. */
+        int32_t  last_lora_slot = -1;
     };
 
     /* Erase one row and its root index entry together. */

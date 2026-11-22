@@ -7,9 +7,9 @@
  * gemm_nt_q at w4a8 / w8a8; asymmetric int4/int5 affine per
  * [1 x 128] (`codes=u4/u5 zero=u8 group=128 scale=f16`) rides quant_act_i8g + gemm_nt_q at
  * w4a8i8_asym / w5a8i8, with the a16 low-latency decode form w4a16_asym / w5a16 under 64 rows;
- * int8 a 128 (i8g) rides gemm_nt_q at i8a8. Anything else is refused by name. The tower and its
- * adapter stay bf16 whatever the trunk does: the recipes never touch them, and a container that
- * quantised tower weights is refused naming the weight.
+ * int8 a 128 (i8g) rides gemm_nt_q at i8a8. Anything else is refused by name. A vision linear is
+ * BF16, or int8 with a bf16 scale per (row, 128 of K) read by gemm_i8a8_row; block FP8 is retired.
+ * The stem, position table, norms and biases stay BF16 and are refused by name if quantised.
  *
  * Rotated i8a8h trunks are whole-trunk forms, detected from layer 0's q projection before any
  * activation is declared. IQ8R uses a 256-column scale group; computed-trellis IQR (including
@@ -1042,9 +1042,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* ---- media: the vision tower, declared last so its activations share the arena with every
-     * buffer above (the trunk's weights were mapped and declared first). The tower stays bf16
-     * whatever the trunk does -- the recipes never touch it -- so a container that quantised a
-     * tower weight is refused naming the weight. */
+     * buffer above (the trunk's weights were mapped and declared first). A tower linear is BF16
+     * or int8 with a bf16 scale per (row, 128 of K); block FP8 is retired. The stem, norms and
+     * biases stay BF16, which the tower refuses by name if a recipe quantised them. */
     if (m.media) {
         const char* tower_srcs[] = {
             nm.ckpt("model.vision_tower.patch_embedder.patch_embedding.weight"),
@@ -1055,14 +1055,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         };
         for (const char* src : tower_srcs) {
             RadEncoding te{};
-            if (weight_enc(b, src, &te) &&
-                !(rad_enc_is(&te, "plain") && te.n_planes == 1 && te.plane[0].dtype == RAD_BF16)) {
-                char ten[256];
-                rad_enc_format(&te, ten, sizeof ten);
-                fprintf(stderr, "radiance: '%s' is %s; museglimmer_ct serves the vision tower in "
-                                "bf16 only, like every recipe for this family\n", src, ten);
-                return RAD_E_DTYPE;
-            }
+            if (!weight_enc(b, src, &te)) continue;
+            const bool plain = rad_enc_is(&te, "plain") && te.n_planes == 1 &&
+                               te.plane[0].dtype == RAD_BF16;
+            if (plain || linear_is_w8(te)) continue;
+            if (const char* gone = linear_retired(te))
+                return linear_refuse_retired(src, gone);
+            char ten[256];
+            rad_enc_format(&te, ten, sizeof ten);
+            fprintf(stderr, "radiance: '%s' is %s; a vision linear is BF16 or int8 with a bf16 "
+                            "scale per (row, 128 of K)\n", src, ten);
+            return RAD_E_DTYPE;
         }
         RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer));
     }

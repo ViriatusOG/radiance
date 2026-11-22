@@ -3,9 +3,10 @@
  * Hybrid models are the normal case (spec §7.2): Qwen3.5-27B has 48 GDN layers to 16
  * full-attention ones. This block composes with AttnGatedBF16 and MlpBF16 in one plugin.
  *
- *   rmsnorm -> in gemm ([q|k|v|a|b]) -> z gemm
- *     prefill: gdn_conv_prep -> gdn_kkt_solve -> gdn_chunk_scan -> gdn_gated_rmsnorm
- *     decode:  gdn_conv_update -> gdn_recurrent_update       (which folds the gated norm)
+ *   rmsnorm -> in gemm ([q|k|v|a|b])
+ *     prefill: z gemm -> gdn_conv_prep -> gdn_kkt_solve -> gdn_chunk_scan -> gdn_gated_rmsnorm
+ *     decode:  gdn_conv_update -> z gemm -> gdn_recurrent_update   (which folds the gated norm)
+ *   (z after the convolution in a pure decode step; a mixed step issues it first, as prefill)
  *   -> out gemm -> [all_reduce] -> residual add
  *
  * The two paths branch on phase, which spec §10 allows: both sequences are declared, resolved
@@ -42,6 +43,7 @@
 #define RAD_BLOCK_GDN_H
 
 #include "rad_arch.h"
+#include "rad_norm_bf16.h"
 
 #include <cmath>
 
@@ -105,14 +107,34 @@ struct GdnBF16 {
     rad_op op_conv_prep = 0, op_kkt = 0, op_scan = 0, op_gnorm = 0;   /* prefill */
     rad_op op_conv_update = 0, op_recur = 0;                          /* decode */
     rad_op op_out = 0, op_ar = 0, op_add = 0;
+    /* The fold (rad_norm_bf16.h): the norm may take the previous block's delta and all-reduce,
+     * and this block may leave its own to the next block's norm (`ar_out`, NormBF16::takes_ar). */
+    NormBF16 nq{};
+    bool ar_out = false;
+    /* Set by the architecture after declare, `prefetch`es (decl_prefetch, rad_arch.h); 0 where
+     * none is declared:
+     *   op_pf / pf_w  of the next GEMM's leading weight bytes, issued after out and before this
+     *                 block's own all-reduce where it issues one, so it is beside the reduction
+     *                 whether this block or the next norm runs it (prefetch_beside);
+     *   op_pf_out     of the out-projection's leading bytes beside the decode recurrent update (as
+     *                 GdnFP8::op_pf_out), issued right before it in a pure decode step of at most
+     *                 pf_out_seqs sequences. */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
+    rad_op     op_pf_out = 0;
+    int64_t    pf_out_seqs = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
-                 rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s);
+                 rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s,
+                 bool fold = false, bool add_out = true,
+                 bool ar_in = false, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
-                            rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s) {
+                            rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s,
+                            bool fold, bool add_out, bool ar_in, bool ar_out_) {
+    ar_out = ar_out_;
     g = geom; cfg = c; w = wire; src = s; layer = l; kv_state = state; kv_conv = conv;
     if (cfg.n_head_k <= 0 || cfg.head_k <= 0 || cfg.n_head_v <= 0 || cfg.head_v <= 0 ||
         cfg.conv_width <= 0 || cfg.chunk <= 0)
@@ -155,11 +177,13 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
 
     w_norm     = decl_w(b, nm.f("blk.%d.attn_norm.weight", l),      RAD_F32,  {g.n_embd},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_in       = decl_w(b, nm.f("blk.%d.ssm_in.weight", l),         RAD_BF16, {in_dim, g.n_embd},
-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l), 0,
-                        {cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.n_head_v, cfg.n_head_v});
-    w_z        = decl_w(b, nm.f("blk.%d.ssm_z.weight", l),          RAD_BF16, {v_dim, g.n_embd},
-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
+    const LinearBF16 in = decl_linear_bf16(b, g, nm.f("blk.%d.ssm_in.weight", l),
+                                           {in_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l),
+                                           {cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.n_head_v,
+                                            cfg.n_head_v});
+    const LinearBF16 z  = decl_linear_bf16(b, g, nm.f("blk.%d.ssm_z.weight", l),
+                                           {v_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    w_in = in.w; w_z = z.w;
     /* The depthwise convolution shards with its channels. The checkpoint ships [conv_dim, 1, 4];
      * the depthwise group extent is squeezed at convert. Qwen3.5's conv1d has bias=False, so the
      * bias operand is passed absent. */
@@ -174,20 +198,19 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     /* One gain vector over head_v shared by every head, so replicated. */
     w_out_norm = decl_w(b, nm.f("blk.%d.ssm_norm.weight", l),       RAD_F32,  {cfg.head_v},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_out      = decl_w(b, nm.f("blk.%d.ssm_out.weight", l),        RAD_BF16, {g.n_embd, v_dim},
-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
+    const LinearBF16 out = decl_linear_bf16(b, g, nm.f("blk.%d.ssm_out.weight", l),
+                                            {g.n_embd, v_dim}, RAD_SHARD_COL, grp_layer(l));
+    w_out = out.w;
 
-    op_norm = rw(b, RAD_OP(b, "rmsnorm",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
-                     RAD_WEIGHTS(w_norm)), {w.x}, {w.h});
+    RAD_ARCH_TRY(nq.declare(b, g, w_norm, w.x, w.h, fold, ar_in));
+    op_norm = nq.op_norm;
     op_in = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", in_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", in.dtype)),
                    RAD_WEIGHTS(w_in)), {w.h}, {w.in});
     op_z  = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", v_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", z.dtype)),
                    RAD_WEIGHTS(w_z)), {w.h}, {w.z});
 
     /* ---- the chunked path (prefill). `chunk` is RAD_DERIVED on gdn_kkt_solve and gdn_chunk_scan
@@ -245,7 +268,7 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
 
     op_out = rw(b, RAD_OP(b, "gemm_nt",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
-                               RAD_INT("K", v_dim), RAD_STR("dtype", g.dtype)),
+                               RAD_INT("K", v_dim), RAD_STR("dtype", out.dtype)),
                     RAD_WEIGHTS(w_out)),
                 {w.o}, {w.h});
     if (g.world > 1)
@@ -256,11 +279,12 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                   RAD_INT("min_bytes", g.wire_min_bytes)),
                        RAD_NOWEIGHTS),
                    {w.h}, {w.h});
-    op_add = rw(b, RAD_OP(b, "add",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.x, w.h}, {w.x});
+    if (add_out)
+        op_add = rw(b, RAD_OP(b, "add",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS),
+                    {w.x, w.h}, {w.x});
     return RAD_OK;
 }
 
@@ -278,10 +302,6 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t conv_dim = cfg.conv_dim();
     const int64_t H        = cfg.n_head_v;
 
-    RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
-    RAD_ISSUE(c, op_in,   brows(w.h, T), RAD_W(w_in),   brows(w.in, T));
-    RAD_ISSUE(c, op_z,    brows(w.h, T), RAD_W(w_z),    brows(w.z, T));
-
     /* Each path runs over its own run of sequences (details in rad_block_gdn_fp8.h's step()). The
      * step is sorted decode-first and every kernel derives grid and rows from cu_seqlens, which
      * holds absolute offsets: the prefill half gets `cu + D` with token operands at their base,
@@ -289,6 +309,21 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
      * slice. */
     int64_t D = 0, DT = 0;
     batch_split(batch, &D, &DT);
+
+    /* In a pure decode step z goes after the convolution. in and z read only the normed input, so
+     * the engine runs z beside in when it follows in, and at decode heights the two then share
+     * the memory and both stretch: on two R9700s at Qwen3.8-27B's verify shape, ~145 us each
+     * against ~72 and ~43 apart. The convolution reads only in's output, so z behind it runs
+     * beside that small kernel instead, and the recurrent update, which reads z, waits for it.
+     * Only the order of two independent launches changes, so the bytes do not: measured
+     * 166 -> 142 us from in to the recurrent update, and 1.6 ms off a 47 ms step, with the same
+     * greedy text. A prefill or mixed step keeps z beside in: there it is a large GEMM, and the
+     * order was measured at decode only. */
+    const bool z_late = D > 0 && D == S;
+
+    nq.step(c, T);
+    RAD_ISSUE(c, op_in,   brows(w.h, T), RAD_W(w_in),   brows(w.in, T));
+    if (!z_late) RAD_ISSUE(c, op_z, brows(w.h, T), RAD_W(w_z), brows(w.z, T));
     /* The decode half's band. In a mixed step max_q_len is the prefill chunk's; in a pure decode
      * step it is already right, so a batch leaving max_q_len_decode zero still works there. */
     const int32_t qd = batch->phase == RAD_PHASE_MIXED ? batch->max_q_len_decode : batch->max_q_len;
@@ -302,6 +337,12 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     praw(cv_idx, RAD_I32, D), praw(batch->num_accepted, RAD_I32, D),
                     praw(batch->cu_seqlens, RAD_I32, D + 1),
                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT));
+        if (z_late) RAD_ISSUE(c, op_z, brows(w.h, T), RAD_W(w_z), brows(w.z, T));
+        /* The recurrent update runs one workgroup per (sequence, head) and leaves the card's
+         * memory mostly idle, so the out-projection's leading bytes are read beside it
+         * (prefetch_beside: on the second lane, behind a join from lane 0). The join follows z,
+         * which the update reads, so it orders nothing the update did not wait for. */
+        if (op_pf_out && z_late && D <= pf_out_seqs) prefetch_beside(c, op_pf_out, w_out, T);
         /* a and b are the last 2*n_head_v columns of the projection row, read in place. The
          * recurrent kernel folds the gated norm, so it takes z and the gain. */
         RAD_ISSUE_N(c, op_recur, qd,
@@ -349,8 +390,11 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_out_norm), brow_slice(w.o, DT, PT, v_dim));
     }
     RAD_ISSUE(c, op_out, brows(w.o, T), RAD_W(w_out), brows(w.h, T));
-    if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
-    RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));
+    /* Decode steps only: a prompt's rows never take the reads (rad_arch.h, kPrefetchRows). */
+    prefetch_beside(c, op_pf, pf_w, batch->phase == RAD_PHASE_DECODE ? T : INT64_MAX);
+    if (op_ar && !(ar_out && ar_wire_is_exact(g, T)))
+        RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));
 }
 
 }  /* namespace arch */

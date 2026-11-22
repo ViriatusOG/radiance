@@ -1,0 +1,37 @@
+# q38-27b-bf16x12-df2.recipe -- Qwen3.8-27B at the checkpoint's own bf16 with the DFlash2 drafter,
+# the trunk's linears packed losslessly in 12 bits (bf16x12), served by qwen35_bf16.
+#
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-bf16x12-df2.recipe -o q38-27b-bf16x12-df2.rad
+#
+# The same numbers as q38-27b-bf16-df2.recipe's, bit for bit. bf16x12 keeps each value's sign and
+# mantissa, and its exponent as a 4-bit offset below the largest of its 32-value block; a block
+# whose exponents span more than 15 goes whole to an escape table. The table holds esc=0.004 of a
+# weight's blocks (the default): 0.133% of this trunk's blocks are raw, and at most 0.184% of one
+# weight's (blk.59.attn_k). The trunk is 34.9 GiB instead of 45.4, and 17.5 GiB a card at TP2
+# instead of 22.7, since each card holds every escape table whole.
+#
+# No --set: the container states no quantisation, so qwen35_bf16 serves it. The head, the
+# embedding, the norms, the convolution, the delta net's other parameters and the vision tower stay
+# as the checkpoint holds them. The drafter's rules are q38-27b-bf16-df2.recipe's, so its weights
+# are that container's and --reuse can copy them from it.
+
+blk.*.attn_qg.weight                 bf16x12
+blk.*.attn_k.weight                  bf16x12
+blk.*.attn_v.weight                  bf16x12
+blk.*.attn_output.weight             bf16x12
+blk.*.ssm_in.weight                  bf16x12
+blk.*.ssm_z.weight                   bf16x12
+blk.*.ssm_out.weight                 bf16x12
+blk.*.ffn_gate_up.weight             bf16x12
+blk.*.ffn_down.weight                bf16x12
+
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0

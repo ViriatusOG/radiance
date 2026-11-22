@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import type { FinishedRequest, Stats } from "@/lib/api"
+import { splitModel } from "@/lib/api"
 import { DASH, fAgo, fDur, fNum, fSig, fin } from "@/lib/format"
 import type { Scope } from "@/lib/store"
 import { Download } from "lucide-react"
@@ -13,15 +14,19 @@ import { Download } from "lucide-react"
 const median = (a: number[]) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1] }
 const STATE: Record<string, string> = { prefill: "Processing prompt", decode: "Generating", waiting: "Waiting", preempted: "Paused", done: "Done" }
 
-export function Requests({ scope }: { scope: Scope<Stats> }) {
+export function Requests({ scope, model }: { scope: Scope<Stats>; model: string }) {
   const s = scope.live
-  const done = scope.finished
+  /* A LoRA child page shows only its adapter's rows; the base model's page keeps every request,
+   * adapter included -- the model is the unit that did the work. */
+  const { adapter } = splitModel(model)
+  const lora = adapter ? s?.loras?.find((l) => l.name === adapter) : undefined
+  const done = adapter ? scope.finished.filter((r) => r.lora === adapter) : scope.finished
   const [shown, setShown] = useState(50)
   const now = scope.series.end * 1000
   const speeds = done.map((r) => r.tps).filter((v): v is number => fin(v) && v > 0)
   const ttfts = done.map((r) => r.ttft).filter((v): v is number => fin(v))
   const mean = speeds.length ? speeds.reduce((a, b) => a + b, 0) / speeds.length : null
-  const running = (s?.requests ?? []).filter((r) => r.state !== "done")
+  const running = (s?.requests ?? []).filter((r) => r.state !== "done" && (!adapter || r.lora === adapter))
   const latest = useMemo(() => done.slice().reverse(), [done, scope.version]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function save() {
@@ -36,13 +41,13 @@ export function Requests({ scope }: { scope: Scope<Stats> }) {
   return (
     <div className="flex flex-col gap-4">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi label="Served" value={fNum(s?.total_requests)} detail="since the model started" />
-        <Kpi label="Preempted" value={fNum(s?.preemptions)} detail="requests paused for another and resumed" />
+        <Kpi label="Served" value={adapter ? fNum(lora?.requests) : fNum(s?.total_requests)} detail={adapter ? `requests completed under ${adapter}` : "since the model started"} />
+        <Kpi label="Preempted" value={fNum(s?.preemptions)} detail={adapter ? "model-wide: pauses are the scheduler's, not the adapter's" : "requests paused for another and resumed"} />
         <Kpi label="Mean speed" value={fin(mean) ? fSig(mean) : DASH} unit="tok/s" detail={`over ${fNum(speeds.length)} finished`} />
         <Kpi label="Median time to first token" value={ttfts.length ? fDur(median(ttfts)) : DASH} detail={`over ${fNum(ttfts.length)} finished`} />
       </div>
 
-      <Panel title="Running" description={running.length ? undefined : "No active requests"} flush={running.length > 0}>
+      <Panel title="Running" description={running.length ? undefined : adapter ? `No active requests under ${adapter}` : "No active requests"} flush={running.length > 0}>
         {running.length > 0 && (
           <Table>
             <TableHeader>
@@ -91,7 +96,7 @@ export function Requests({ scope }: { scope: Scope<Stats> }) {
         </Panel>
       </div>
 
-      <Panel title="Finished" description={done.length ? `${fNum(done.length)} in the last hour, latest first` : "No requests in the last hour"} flush={done.length > 0}
+      <Panel title="Finished" description={done.length ? `${fNum(done.length)} in the last hour${adapter ? ` under ${adapter}` : ""}, latest first` : `No requests in the last hour${adapter ? ` under ${adapter}` : ""}`} flush={done.length > 0}
         action={done.length > 0 && <Button variant="outline" size="sm" onClick={save}><Download />Export</Button>}>
         {done.length > 0 && (
           <>

@@ -307,6 +307,9 @@ public:
         int64_t  kv_tokens = 0;
         int32_t  n_draft = 0;          /* the proposal standing for the next step */
         int32_t  slot = -1;
+        /* The runtime LoRA slot this row runs with, -1 for the base. The name is the caller's:
+         * rad::Engine::lora_names() indexes by slot. */
+        int32_t  lora_slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
         double   prefill_s = -1;       /* first token minus admission; negative until both */
@@ -327,6 +330,9 @@ public:
      * (take_encodes) and encodes them between steps, which keeps the encoder off the step path. */
     bool     encodes_pending() const;
     void     take_encodes(std::vector<std::shared_ptr<mm::Item>>* out);
+    /* The end of the run take_encodes began: its items and patches are added to the counters
+     * with the time since it began (SchedMetrics::encode_items). */
+    void     encodes_done(int64_t items, int64_t patches);
     /* An encoder pass over whole segments; see BatchBuilder::build_encoder. */
     const RadBatch* build_encoder(const std::vector<BatchBuilder::EncoderPart>& parts, int step,
                                   const RadEncoderDecl& enc) {
@@ -583,6 +589,9 @@ private:
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
+    enum class AdmissionFailure { None, Capacity, ExternalCapacity, Allocator };
+    AdmissionFailure admission_failure_ = AdmissionFailure::None;
+    bool          admission_reclaim_pending_ = false; /* eviction hit its per-step work bound */
     bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
     bool          room_wait_ = false;         /* the refusal is the fresh prefill's room gate */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
@@ -709,6 +718,7 @@ private:
 
     SchedMetrics metrics_locked() const;
     int          requests_locked(ReqStat* out, int max) const;
+    void         publish_held();
     /* The published copy and its lock (publish()). The scratch pair is the engine thread's, filled
      * under mu_ and then swapped with the published pair, so a publication allocates nothing once
      * the vectors have grown to the request count. */
@@ -718,6 +728,9 @@ private:
     SchedMetrics         scratch_m_;
     std::vector<ReqStat> scratch_reqs_;
     int64_t              pub_at_us_ = 0;
+    /* The encoder run under way, under mu_: its items and its start, 0 when none (take_encodes). */
+    int64_t              enc_active_ = 0;
+    int64_t              enc_started_ns_ = 0;
 
     std::vector<std::unique_ptr<SchedReq>> reqs_;   /* by slot */
     std::vector<int32_t> free_slots_;

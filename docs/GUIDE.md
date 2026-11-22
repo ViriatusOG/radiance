@@ -4258,15 +4258,16 @@ curl -s http://localhost:8000/v1/videos -F 'prompt=the fox turns and runs into t
 
 - **`prompt`** is read as written (no template), at most 1024 tokens; **`negative_prompt`** is
   what guidance steers away from, empty by default.
-- **`seconds`** is rounded up to steps of 8 frames at 24 a second, from 17 frames (0.71 s) to 161
-  (6.7 s). Left out (or `"auto"`), the release's duration head chooses the length the prompt
+- **`seconds`** is rounded up to steps of 8 frames at 24 a second, from 17 frames (0.71 s) to 321
+  (13.4 s). Left out (or `"auto"`), the release's duration head chooses the length the prompt
   implies, as diffusers does when `num_frames` is omitted: its prediction held to 1 to 20 seconds,
-  rounded to frames and down to the 8-frame steps, then to the 161 frames this server makes. The
+  rounded to frames and down to the 8-frame steps, then to the 321 frames this server makes. The
   video object says `"seconds": "auto"` until the prompt is read, then the length chosen. A
   container without the head makes 121 frames (5.04 s). **`size`**: both sides multiples of 32 from 256, at most
   1920 x 1088 pixels of area, at most 3:1; 960x544 by default, the release's own. A step carries at
-  most 121 frames at 1920x1088 (a longer video at that size is refused). Up to 960 x 544 of area
-  the VAE decodes each frame whole, as the pipeline does by default; a larger frame is decoded in
+  most 121 frames at 1920x1088 and 249 at 1344x768 (a longer video at those sizes is refused).
+  Up to 960 x 544 of area the VAE decodes each frame whole, as the pipeline does by default; a
+  larger frame is decoded in
   diffusers' tiles (`vae.enable_tiling()`: 512 pixels every 448) and blended where they overlap,
   as the release's two-stage README does at 1920x1088.
 - **`input_reference`** is the first frame, resized and cropped to `size` and put through H.264

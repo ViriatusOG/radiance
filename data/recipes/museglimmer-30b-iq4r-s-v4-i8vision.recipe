@@ -1,0 +1,45 @@
+# Muse Glimmer IQ4R-S-V4 with int8 vision and a quantised DFlash2 drafter.
+#
+# The text and DFlash2 rules are the S-V4 point (U4 attention, U3 MLP and drafter, U2 draft head).
+# The large vision-tower, adapter and projection linears are int8 with a bf16 scale per (row, 128
+# of K), the form that replaced block FP8. The patch stem (K=1176), position table, norms and
+# biases remain BF16.
+#
+# To keep an earlier BF16-vision candidate's text and drafter bytes rather than refitting them,
+# pass --reuse <muse-glimmer-30b-iq4r-s-v4-df2-bf16vision.rad>. The earlier container must have
+# been converted from the same checkpoint and with the same options as these rules. Use a separate
+# -o; never use --in-place on the kept model. CALIB must name the same MLP RADGRAM2 directory.
+#
+#   CALIB=/path/to/grams rad-convert <Muse-Glimmer-30B> \
+#       --draft-model <Muse-Glimmer-30B-DFlash2> \
+#       --tokenizer <Muse-Glimmer-30B>/tokenizer.json \
+#       --chat-template <Muse-Glimmer-30B>/chat_template.jinja \
+#       --recipe data/recipes/museglimmer-30b-iq4r-s-v4-i8vision.recipe \
+#       --set quantization_config.quant_method=compressed-tensors \
+#       --gpus 0,1,2 \
+#       -o muse-glimmer-30b-iq4r-s-v4-df2-i8vision.rad
+
+blk.*.attn_q.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=1024 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_gate.weight    gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=1024 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_k.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128  block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_v.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128  block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 tcq_order=1
+blk.*.attn_output.weight  gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 group=128 scale=bf16 dyn=1 transform=fwht128 tcq_gain=1.12 damp=0.01
+blk.*.ffn_gate_up.weight  gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=512  block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01 calib=$CALIB tcq_order=1
+blk.*.ffn_down.weight     gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256  block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01 calib=$CALIB tcq_order=1
+
+dflash.draft_head.weight                    rtn  codes=u2 zero=u8 group=128 scale=f16
+dflash.fc.weight                            gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.attn_q.weight                  gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.attn_k.weight                  gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.attn_v.weight                  gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.attn_output.weight             gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.ffn_gate_up.weight             gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+dflash.blk.*.ffn_down.weight                gptq codes=u3 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.08 damp=0.01
+
+v.blk.*.qkv.weight       rtn codes=i8 group=128 scale=bf16
+v.blk.*.proj.weight      rtn codes=i8 group=128 scale=bf16
+v.blk.*.fc1.weight       rtn codes=i8 group=128 scale=bf16
+v.blk.*.fc2.weight       rtn codes=i8 group=128 scale=bf16
+v.mlp.fc1.weight         rtn codes=i8 group=128 scale=bf16
+v.mlp.fc2.weight         rtn codes=i8 group=128 scale=bf16
+v.proj.weight            rtn codes=i8 group=128 scale=bf16

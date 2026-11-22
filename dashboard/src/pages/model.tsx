@@ -6,7 +6,7 @@ import { fBytes, fDur } from "@/lib/format"
 import { modelScope, useScope } from "@/lib/store"
 import { hrefOf, type Tab } from "@/lib/ui"
 import { Details } from "./details"
-import { Performance, type Kind } from "./performance"
+import { HardwareSwitch, Performance, type Kind } from "./performance"
 import { Requests } from "./requests"
 import { SessionsView } from "./sessions"
 
@@ -46,6 +46,7 @@ export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: Fle
           </Tabs>
           <div className="flex flex-wrap gap-1.5">
             {DOES.filter(([k]) => model?.capabilities?.[k]).map(([k, label]) => <span key={k} className="rounded-md border px-1.5 py-0.5 text-xs text-muted-foreground">{label}</span>)}
+            {model && shown === "performance" && <HardwareSwitch />}
           </div>
         </div>
       </div>
@@ -54,9 +55,9 @@ export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: Fle
           <>
             {!serving && scope.series.t.length > 0 && <div className="text-sm text-muted-foreground">This model is not loaded right now. The charts show its earlier activity.</div>}
             {scope.series.t.length === 0 && !serving ? <Empty>{model.state === "failed" ? "The model failed to start, so there is no data" : model.state === "cold" ? "This model has not been loaded yet. It loads when a request asks for it." : "No data yet. Charts appear once the model has been loaded."}</Empty>
-              : <Performance scope={scope} kind={kind} slots={slots} noun={noun} />}
+              : <Performance scope={scope} kind={kind} slots={slots} noun={noun} model={id} cards={model.cards} />}
           </>
-        ) : shown === "requests" ? <Requests scope={scope} />
+        )        : shown === "requests" ? <Requests scope={scope} model={id} />
         : shown === "sessions" ? (serving ? <SessionsView model={id} /> : <Empty>Conversations are listed while the model is loaded</Empty>)
         : <Details model={id} stats={s} />}
     </div>

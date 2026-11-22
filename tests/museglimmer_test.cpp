@@ -1044,9 +1044,8 @@ TEST(museglimmer_ct_refuses_block_fp8_and_mxfp4_by_name) {
     }
 }
 
-/* What the encodings cannot serve is refused naming the weight: a grid outside the forms the
- * plugin takes, and a container that quantised a tower weight the recipes never touch -- the
- * tower stays bf16 whatever the trunk does. */
+/* What the encodings cannot serve is refused naming the weight: a trunk grid outside the forms
+ * the plugin takes, or a vision linear that is neither BF16 nor int8 per (row, 128). */
 TEST(museglimmer_ct_refuses_encodings_it_does_not_serve_by_name) {
     {
         RadBuilder b;
@@ -1065,6 +1064,93 @@ TEST(museglimmer_ct_refuses_encodings_it_does_not_serve_by_name) {
             return museglimmer_ct::declare(&b, with_vision(muse_meta_quant()).meta(), &ctx);
         });
         CHECK_EQ(rc, RAD_E_DTYPE);
+    }
+}
+
+/* Int8 vision: codes with a bf16 scale per (row, 128), gemm_nt_q at i8a8 with w_rb 1 so the
+ * container-form kernel is selected. Both plugins share the tower. */
+TEST(museglimmer_vision_serves_int8_linears_and_issues_the_encoder) {
+    const RadEncoding i8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    for (bool ct : { false, true }) {
+        MetaKV mk = with_vision(ct ? muse_meta_quant() : muse_meta());
+        mk.set("vision_config.hidden_size", "128").set("out_hidden_size", "512")
+          .set("vision_config.num_attention_heads", "8");
+        RadBuilder b;
+        for (int l = 0; l < 4; ++l)
+            for (const char* name : { "qkv", "proj", "fc1", "fc2" })
+                b.encs.push_back({ "v.blk." + std::to_string(l) + "." + name + ".weight", i8 });
+        for (const char* name : { "v.mlp.fc1.weight", "v.mlp.fc2.weight", "v.proj.weight" })
+            b.encs.push_back({ name, i8 });
+        RadBuildCtx ctx = muse_ctx(0, 1, 128);
+        REQUIRE_EQ(ct ? museglimmer_ct::declare(&b, mk.meta(), &ctx)
+                      : museglimmer::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const RecWeight* qkv = find_w(b, "v.blk.0.qkv.weight");
+        const RecWeight* scale = find_w(b, "v.blk.0.qkv.scale");
+        REQUIRE(qkv && scale);
+        CHECK_EQ(qkv->d.dtype, (uint32_t)RAD_I8);
+        CHECK_EQ(qkv->d.shape[0], 384);
+        CHECK_EQ(qkv->d.shape[1], 128);
+        CHECK_EQ(scale->d.dtype, (uint32_t)RAD_BF16);
+        CHECK_EQ(scale->d.shape[0], 384);
+        CHECK_EQ(scale->d.shape[1], 1);
+        REQUIRE_EQ(scale->d.n_row_parts, 3);
+        CHECK_EQ(scale->d.row_parts[0], 128);
+        CHECK_EQ(scale->d.row_parts[1], 128);
+        CHECK_EQ(scale->d.row_parts[2], 128);
+        CHECK(find_b(b, "v.i8_width.q") != nullptr);
+        CHECK(find_b(b, "v.i8_ff.q") != nullptr);
+        CHECK(find_b(b, "v.i8_merged.q") != nullptr);
+        CHECK(find_b(b, "v.i8_projector.q") != nullptr);
+        CHECK_EQ(count_op(b, "quant_act_i8g"), 19);
+        CHECK_EQ(count_op(b, "table_add"), 16);
+        int wrb = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op != "gemm_nt_q") continue;
+            CHECK_EQ(pstr(&o, "dtype"), std::string("i8a8"));
+            for (const RecParam& p : o.p)
+                if (p.key == "w_rb") { CHECK_EQ(p.ival, 1); ++wrb; }
+        }
+        CHECK_EQ(wrb, 19);
+
+        static uint16_t pix[128 * 1176];
+        static int32_t coord[4 * 128];
+        static const int32_t cu[] = { 0, 128 }, sh[] = { 16 }, sw[] = { 8 };
+        RadBatch batch{};
+        batch.enc = 1; batch.enc_n_patch = 128; batch.enc_pixels = pix; batch.enc_coord = coord;
+        batch.enc_n_seg = 1; batch.enc_cu = cu; batch.enc_seg_h = sh; batch.enc_seg_w = sw;
+        batch.enc_max_seg = 128;
+        RadCtx c{ .b = &b, .batch = &batch };
+        c.rank = 0; c.world = 1;
+        if (ct) museglimmer_ct::step(&c, &batch); else museglimmer::step(&c, &batch);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        const RecIssue* first = issue_of(b, c, "gemm_nt_q");
+        REQUIRE(first != nullptr);
+        CHECK_EQ(first->n, 128);
+        CHECK_EQ(first->opd[0].handle, b_h(b, "v.i8_width.q"));
+        CHECK_EQ(first->opd[1].handle, b_h(b, "v.i8_width.s"));
+    }
+}
+
+TEST(museglimmer_vision_refuses_retired_and_ragged_int8_grids) {
+    MetaKV mk = with_vision(muse_meta());
+    mk.set("vision_config.hidden_size", "128").set("out_hidden_size", "512");
+    RadBuildCtx ctx = muse_ctx(0, 1, 128);
+    {
+        RadBuilder b;
+        b.encs = { { "v.blk.0.qkv.weight", rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128) } };
+        CHECK_EQ(stderr_of_rc([&] { return museglimmer::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+    {
+        /* hidden 96 is not a whole 128, so an int8 qkv is refused rather than relaid out. */
+        MetaKV narrow = with_vision(muse_meta());
+        RadBuilder b;
+        b.encs = { { "v.blk.0.qkv.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) } };
+        CHECK_EQ(stderr_of_rc([&] {
+                     return museglimmer::declare(&b, narrow.meta(), &ctx);
+                 }),
+                 RAD_E_SHAPE);
     }
 }
 

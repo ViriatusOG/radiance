@@ -333,6 +333,19 @@ static const RadOperandSpec oPleConv[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
 };
+/* causal_conv1d: libref's schema, ple_conv's without `dilation` and `resid`. */
+static const RadParamSpec pCausalConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oCausalConv[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
 
 static const RadParamSpec pExpertScale[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
                                              P_STR("dtype") };
@@ -385,7 +398,7 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 
 /* moe_gemm_q dtype w4a8: the grouped int4 GEMM (r3d_moe_gemm_w4a8.hip) is a row of the moe_gemm_q
  * op above (two's-complement int4 experts, a bf16 scale per (row, 128 of K), bf16 out; the int8 or
- * E4M3 activation arm is picked by `a`'s dtype). It reuses moe_gemm_q's nine-operand parity schema. */
+ * E4M3 activation arm is picked by `a`'s dtype). It reuses moe_gemm_q's ten-operand parity schema. */
 
  /* moe_gemm: the grouped GEMM with unquantised experts, libref's schema; one weight table. */
 static const RadOperandSpec oMoeGemm[] = { { "a", RAD_OPD_IN, 0 },
@@ -656,6 +669,10 @@ static const RadOpSchema kSchemas[] = {
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is GemmaRMSNorm's `1 +`, "
            "added to the gain in f32; `mult` scales the normed row before its one rounding. No "
            "gain operand at all means a gain of 1 and a `wadd` of 0."),
+    SCHEMA("rmsnorm_rows", pRmsNorm, oRmsNorm,
+           "the same norm under its row-form name: a plugin written for libr4d's short-row launch "
+           "(LFM2's and LFM3's q/k head norms) resolves here, and libr3d launches it as `rmsnorm` "
+           "(byte-identical)."),
     SCHEMA("layernorm", pLayernorm, oLayernorm,
            "y = (x - mean) / sqrt(var + eps) * w + b, the mean and the variance taken in two "
            "passes over the row."),
@@ -683,6 +700,9 @@ static const RadOpSchema kSchemas[] = {
            "Rotary positions applied in place to a fused qkv row: q heads, then the key heads, the "
            "value heads untouched. `mode` is neox, gptj, mrope, imrope or axial; the yarn, llama3 "
            "and ladder parameters adjust the frequency ladder."),
+    SCHEMA("rope_rows", pRope, oRope,
+           "the same rotation under its row-form name: a plugin written for libr4d's one-angle-a-"
+           "(token, pair) launch resolves here, and libr3d launches it as `rope` (byte-identical)."),
     SCHEMA("kv_store", pKvStore, oKvStore,
            "K and V into a paged cache at slot_mapping's slots, converting to the cache's dtype. A "
            "negative slot is skipped; the cache is [blocks, kv_heads, block_size, 2*head_dim]."),
@@ -794,6 +814,10 @@ static const RadOpSchema kSchemas[] = {
            "Absent, every token commits: the read is at offset zero and the last "
            "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
            "`resid` absent drops the add and leaves the plain convolution."),
+    SCHEMA("causal_conv1d", pCausalConv, oCausalConv,
+           "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
+           "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
+           "The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's."),
     SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
            "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
            "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
@@ -1205,16 +1229,16 @@ extern "C" void r3d_cfg_topk(const RadArgs* a, R3dTopkCfg* out) {
  * from, capped at 16 MiB. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
  * `scratch == nullptr`), which is the cost of the split. */
 static int64_t attn_scratch(const RadArgs* a) {
-    /* Sized from the shape: a scratch hook runs at declare, when the operands' shapes are bound
-     * but every tensor's `data` is still null. A hook that required data would answer 0 and the
-     * split pass would find no buffer. gemm_scratch sizes from RadParam dims for the same reason. */
-    if (!a || a->n_t < 1 || a->t[0].rank == 0) return 0;
-    long long n_head = 0, head_dim = 0;
-    const int64_t nh = rad_args_geti(a, "n_head", &n_head) ? n_head : 0;
-    if (!rad_args_geti(a, "head_dim", &head_dim) || !head_dim || !nh) return 0;
-    const long long rows = rad_tensor_numel(&a->t[0]) / (nh * head_dim);
-    if (rows <= 0) return 0;
-    const long long want = rows * nh * 8 * 132 * (long long)sizeof(float);
+    /* Sized from the geometry alone: the builder calls a scratch hook at declare with the band's
+     * params and no tensors (rad_builder.cpp), so a hook that read an operand's shape would answer
+     * 0, the shim would halve the slice count to 1 and one wave a KV head would walk the whole
+     * context. The decode band is q_len <= 16 (cAttnBf16Decode), so the query rows are at most
+     * 16 * max_seqs; 8 is pick_splits' widest count. gemm_scratch sizes from RadParam dims for
+     * the same reason. */
+    long long n_head = 0, max_seqs = 0;
+    if (!a || !rad_args_geti(a, "n_head", &n_head) || n_head <= 0) return 0;
+    if (!rad_args_geti(a, "max_seqs", &max_seqs) || max_seqs < 1) max_seqs = 1;
+    const long long want = 16 * max_seqs * n_head * 8 * 132 * (long long)sizeof(float);
     const long long cap = 16LL << 20;
     return want < cap ? want : cap;
 }
@@ -1350,7 +1374,8 @@ static const RadConstraint cHadQuantFp8[] = { C_IN("dtype", "bf16"), C_EQ("group
 static const RadConstraint cGatedHadQuantFp8[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                                    C_EQ("n", 128) };
 static const RadConstraint cQuantCols[] = { C_IN("dtype", "bf16"), C_DIV("n", 8) };
-static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128), C_EQ("n", 128) };
+static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
+                                              C_DIV("n", 128) };
 static const RadConstraint cGatedHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                                    C_EQ("n", 128) };
 static const RadConstraint cRmsQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("n", 16) };
@@ -1407,6 +1432,10 @@ static const RadConstraint cGdnConvUpdW4[] = { C_GE("q_len", 1), C_EQ("head_k", 
 static const RadConstraint cPleConv[]   = { C_IN("dtype", "bf16"), C_GE("width", 1),
                                             C_LE("width", 5), C_GE("dilation", 1),
                                             C_LE("dilation", 4) };
+/* Undilated, so the history is width-1 <= 7: inside both the kernel's 8 taps (kPcMaxW) and its
+ * 16-slot write-back window (kPcMaxHist). Width 1 has no history and no model declares it. */
+static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
+                                             C_LE("width", 8) };
 static const RadConstraint cGdnRecurrent[] = { C_GE("q_len", 1), C_EQ("head_k", 128),
                                               C_EQ("head_v", 128) };
 static const RadConstraint cKdaUpdate[] = {
@@ -1514,11 +1543,11 @@ static const RadConstraint cGemmQFp8a16[] = { C_IN("dtype", "fp8a16"),
 static const RadConstraint cGemmQFp8a8[]  = { C_IN("dtype", "fp8a8"),
                                               C_EQ("group", R3D_FP8_BLOCK), C_GE("M", 1),
                                               C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
-/* The int8 GEMM's constraints. No row uses them: a row must name an entry point the library
- * defines, or the plugin fails to load. */
-static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8"),
+/* The int8 trunk GEMM: i8a8 and its rotated twin i8a8h are one launch (the rotation is in the
+ * stored weight and in the activation's quantiser). Every M: the kernel tiles M itself. */
+static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8 i8a8h"),
                                               C_EQ("group", R3D_W8_GROUP), C_GE("M", 1),
-                                              C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
+                                              C_DIV("K", 128), C_GE("N", 1) };
 
 /* ================================================================== the rows
  *
@@ -1624,6 +1653,18 @@ static const RadKernelInfo kKernels[] = {
   "f32 x, y and gain, fp32 reduction",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cNormF32), NOTUNE,
+  nullptr, nullptr, r3d_rad_rmsnorm, nullptr, nullptr, nullptr,
+  r3d_shape_rmsnorm },
+
+/* rmsnorm under its row-form name (libr4d's rmsnorm_rows): the same launch, so a per-head q/k
+ * norm declared for the rows form has a device row on this part too. */
+{ "rmsnorm_rows_bf16", "rmsnorm_rows", "norm",
+  "root-mean-square norm with a gain, two passes over the row, under its row-form name",
+  "any n; a workgroup a row (a wave for a head-wide row); the sum of squares accumulates in f32 "
+  "and only the store narrows; byte-identical to rmsnorm",
+  "bf16 x and y, bf16 or f32 gain, fp32 reduction",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormBf16), NOTUNE,
   nullptr, nullptr, r3d_rad_rmsnorm, nullptr, nullptr, nullptr,
   r3d_shape_rmsnorm },
 
@@ -1809,8 +1850,19 @@ static const RadKernelInfo kKernels[] = {
 
 { "rope_bf16", "rope", "attn",
   "rotary positions applied in place to a fused qkv row, neox and gptj pair layouts",
-  "head_dim even; rotary_dim optional and even, defaulting to head_dim; a wave a head; the "
-  "angles from accurate powf and sincosf, the position divided by `scale`",
+  "head_dim even; rotary_dim optional and even, defaulting to head_dim; the `rotary` and the "
+  "proportional `head` ladder; a wave a head; the angles from accurate powf and sincosf, the "
+  "position divided by `scale`",
+  "bf16 qkv in place, i32 positions, fp32 angles",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRope), NOTUNE,
+  nullptr, nullptr, r3d_rad_rope, nullptr, nullptr, nullptr, r3d_shape_rope },
+
+/* rope under its row-form name (libr4d's rope_rows): the same launch. */
+{ "rope_rows_bf16", "rope_rows", "attn",
+  "rotary positions applied in place, one thread a rotated pair, under its row-form name",
+  "head_dim even; rotary_dim optional and even; the `rotary` and the proportional `head` ladder "
+  "(LFM3's partial rotary on its full layers); neox and gptj pairings; byte-identical to rope",
   "bf16 qkv in place, i32 positions, fp32 angles",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cRope), NOTUNE,
@@ -1990,8 +2042,9 @@ static const RadKernelInfo kKernels[] = {
 
 { "had_quant_act_i8g_bf16", "had_quant_act_i8g", "quant",
   "a 128-wide block Hadamard, then per-group int8: the rotated form for the int8 trunk GEMMs",
-  "n == group == 128 (single-group form, the FWHT runs once per wave so its DPP stages stay out of "
-  "a loop); the codes row-major for the i8a8 dot2 GEMM, the scale carrying the 1/sqrt(128)",
+  "group 128, n a multiple of it: a workgroup is one wave and one (row, group), so the FWHT runs "
+  "once per wave and its DPP stages stay out of a loop; the codes row-major for the i8a8 GEMMs, "
+  "the scale libref's amax / 127 (1 for an all-zero group)",
   "bf16 in, int8 codes (row-major), f32 scale per group",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cHadQuantI8g), NOTUNE,
@@ -2262,6 +2315,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cPleConv), NOTUNE,
   nullptr, nullptr, r3d_rad_ple_conv, nullptr, nullptr, nullptr, nullptr },
+
+/* LFM2's and LFM3's short convolution on the same kernel: its SILU=false arm, no residual, the
+ * family of ple_conv beside which it sits. */
+{ "causal_conv1d_bf16", "causal_conv1d", "norm",
+  "depthwise causal conv with no activation (ple_conv's kernel); one thread a channel",
+  "width 2 to 8, undilated",
+  "bf16 activations, weights and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cCausalConv), NOTUNE,
+  nullptr, nullptr, r3d_rad_causal_conv1d, nullptr, nullptr, nullptr, nullptr },
 
 { "expert_scale_bf16", "expert_scale", "moe",
   "Each routing weight times its expert's own per-expert scale, in place",
@@ -2644,6 +2707,24 @@ static const RadKernelInfo kKernels[] = {
    ROW(cGemmQW8A8M64), NOTUNE,
    nullptr, nullptr, r3d_rad_gemm_nt_q_w8a8_m64,
    nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_w8a8 },
+
+{ "gemm_nt_q_i8a8", "gemm_nt_q", "gemm",
+  "the int8 trunk grid (i8a8, and i8a8h, its rotated twin): signed int8 codes against row-major "
+  "int8 activations, the group's integer sub-sum scaled by the activation's (row, group) scale "
+  "and the weight's (row, group) scale",
+  "group 128, K a multiple of it, every M; below M = 128 a wave is a 16-column tile over one "
+  "16-row tile (M <= 16) or two, the weight read from global at each step; from M = 128 a block "
+  "is a 128x128 output tile with a group of both operands staged in LDS, so a prefill chunk "
+  "reads the weight once per 128 rows",
+  "I8 a row-major with an f32 scale per (row, 128 of K) -- quant_act_i8g's output, or "
+  "had_quant_act_i8g's at i8a8h; I8 codes b with a bf16 scale per (row, 128 of K), bf16 y, fp32 "
+  "accumulation in ascending group order; the sub-sums are exact integers under 2^24, and the "
+  "store is the only narrowing; each group term rounds as quant_dot's (two multiplies, an add, "
+  "none fused), so the row is bit-identical to the reference; no zero point, so no a_sum",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
+  ROW(cGemmQI8), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_i8a8,
+  nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_i8a8 },
 
     { "silu_mul_bf16", "silu_mul", "elem",
       "silu(gate) * up over one fused gate_up plane, the gate the first half",

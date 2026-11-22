@@ -903,6 +903,19 @@ void gemm_8a8_prefill_kernel(const uint8_t* __restrict__ A, const float* __restr
                                                           sw_ld, PrefillPlain{});
 }
 
+/* The same int8 prefill tile over a row-major weight and row-major per-row scales: the container's
+ * bytes, so a vision tower on the mapped tier needs no relayout. `w_ld` is the weight's row pitch
+ * in bytes (one byte a code). */
+template <bool I8>
+__global__ __launch_bounds__(kPWaves * kWave) R4D_WAVES(6)
+void gemm_8a8_prefill_row_kernel(const uint8_t* __restrict__ A, const float* __restrict__ Sa,
+                                 const uint8_t* __restrict__ W, const uint16_t* __restrict__ Sw,
+                                 uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
+                                 uint32_t a_ld, uint32_t sa_ld, uint32_t w_ld, uint32_t sw_ld) {
+    gemm_8a8_prefill_body<I8, 0, PrefillPlain, false, kBlock, true>(
+        A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, PrefillPlain{}, nullptr, nullptr, w_ld);
+}
+
 // The narrow tile's K width is kFKNarrow (256 B); 128 B loses at every wave count (see `kTPR`), and
 // is used only via narrow_fk for a K that 256 does not divide.
 
@@ -1394,6 +1407,28 @@ extern "C" int r4d_rad_gemm_i8a8_tiled(const RadArgs* a, RadStream s) {
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
         (long)(uintptr_t)s);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* Vision's int8 linear: the prefill tile over container-form weights. `w_rb` 1 is how the
+ * architecture names it; the fragment rows do not read the parameter, so they stay the text path. */
+extern "C" int r4d_rad_gemm_i8a8_row(const RadArgs* a, RadStream s) {
+    Fp8Ops g;
+    int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
+    if (rc != RAD_OK) return rc;
+    if (g.a->dtype != RAD_I8 || g.b->dtype != RAD_I8 || g.bscale->dtype != RAD_BF16 ||
+        g.ascale->dtype != RAD_F32 || g.y->dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    if (r4d_geti_or(a, "w_rb", 0) != 1 || g.group != R4D_FP8_BLOCK) return R4D_NO(RAD_E_SHAPE);
+    if (g.K % (int)kBlock || g.N % (int)kPBN) return R4D_NO(RAD_E_SHAPE);
+    if (((uintptr_t)g.y->data) & 15u) return R4D_NO(RAD_E_ALIGN);
+    const int e = R4D_EMIT(s, (gemm_8a8_prefill_row_kernel<true>),
+                           dim3(((uint32_t)g.M + kPBM - 1) / kPBM, (uint32_t)g.N / kPBN, 1),
+                           dim3(kPWaves * kWave), 0, (const uint8_t*)r4d_addr(g.a),
+                           (const float*)r4d_addr(g.ascale), (const uint8_t*)r4d_addr(g.b),
+                           (const uint16_t*)r4d_addr(g.bscale), (uint16_t*)r4d_addr(g.y),
+                           (uint32_t)g.M, (uint32_t)g.K, (uint32_t)g.N, (uint32_t)g.a_ld,
+                           (uint32_t)g.sa_ld, (uint32_t)g.w_ld, (uint32_t)g.sw_ld);
+    return e == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_SHAPE;
 }
 
 extern "C" int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs* a, RadStream s) {

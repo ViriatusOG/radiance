@@ -50,6 +50,8 @@
 #include <cstdarg>
 #include <cerrno>
 #include <cmath>
+#include <csetjmp>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -394,6 +396,16 @@ static void check_shapes() {
         { "fill", { PI("M", 8), PI("n", 4096), PS("dtype", "bf16"), PF("value", 0.0) } },
         { "rope", { PI("M", 8), PI("head_dim", 128), PI("n_head", 32), PI("n_head_kv", 8),
                     PF("theta", 500000.0), PF("scale", 1.0), PS("mode", "neox") } },
+        /* The row forms as LFM2 and LFM3 declare them: the q/k head norms over rows of head_dim
+         * (64 and 128), and q rotated as a q-only row (n_head_kv 0); LFM3's full layers turn 64 of
+         * 128 channels on the proportional ladder. */
+        { "rmsnorm_rows", { PI("M", 8 * 32), PI("n", 64), PF("eps", 1e-5), PS("dtype", "bf16") } },
+        { "rmsnorm_rows", { PI("M", 8 * 16), PI("n", 128), PF("eps", 1e-5), PS("dtype", "bf16") } },
+        { "rope_rows", { PI("M", 8), PI("head_dim", 64), PI("n_head", 32), PI("n_head_kv", 0),
+                         PF("theta", 1000000.0), PF("scale", 1.0), PS("mode", "neox") } },
+        { "rope_rows", { PI("M", 8), PI("head_dim", 128), PI("n_head", 16), PI("n_head_kv", 0),
+                         PF("theta", 1000000.0), PF("scale", 1.0), PS("mode", "neox"),
+                         PI("rotary_dim", 64), PS("ladder", "head") } },
         { "kv_store", { PI("M", 8), PI("head_dim", 128), PI("n_head_kv", 8), PI("block_size", 32),
                         PS("kv_dtype", "bf16") } },
         { "embed_lookup", { PI("M", 8), PI("n_embd", 4096), PI("n_vocab", 128256),
@@ -413,6 +425,7 @@ static void check_shapes() {
         { "gated_had_quant_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "quant_cols_fp8", { PI("M", 32), PI("n", 128), PS("dtype", "bf16") } },
         { "had_quant_act_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "had_quant_act_i8g", { PI("M", 8), PI("n", 7680), PI("group", 128), PS("dtype", "bf16") } },
         { "gated_had_quant_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "rmsnorm_quant_i8", { PI("M", 8), PI("n", 128), PF("eps", 1e-6), PS("dtype", "bf16") } },
         { "gated_quant_fp8", { PI("M", 8), PI("n", 11008), PI("group", 128), PS("dtype", "bf16"),
@@ -1653,6 +1666,66 @@ static int build_gdn_conv_update(Case& c, const RadOpSchema* s) {
     return 0;
 }
 
+/* causal_conv1d at LFM2's band: two sequences in one prefill chunk (cu 0, 11, 19), width 3 over
+ * 2048 channels, each sequence on its own state slot with a history to read (has_init 1), and no
+ * num_accepted, so every token commits and the window is rewritten. `cu` and the slots are
+ * offsets the kernel follows, so they are built here rather than drawn. */
+static int build_causal_conv1d(Case& c, const RadOpSchema* s) {
+    const long long T = 19, N = 2, n = 2048, W = 3, SL = W - 1, SLOTS = 2;
+    if (s->n_operands != 8) { fail("causal_conv1d: the schema has %d operands, not 8",
+                                   s->n_operands); return 1; }
+    c.n_p = 0;
+    const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
+                            { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                            { "width", RAD_P_INT, W, 0, nullptr, 0.0 },
+                            { "dtype", RAD_P_STR, 0, 0, "bf16", 0.0 } };
+    for (const RadParam& q : pp) c.p[c.n_p++] = q;
+
+    uint32_t st = 0x2C0F1D35u;
+    auto rndf = [&]() { st = st * 1664525u + 1013904223u;
+                        return (float)((st >> 8) & 0xffffu) / 65536.0f; };
+    std::vector<uint16_t> hx(T * n), hw(n * W), hcs(SLOTS * n * SL), hy(T * n, 0x7fc0u);
+    for (auto& x : hx) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    for (auto& x : hw) x = f32_to_bf16((rndf() - 0.5f) * 0.5f);
+    for (auto& x : hcs) x = f32_to_bf16((rndf() - 0.5f) * 2.0f);
+    const int cuv[N + 1] = { 0, 11, (int)T };
+    const int sidxv[N] = { 1, 0 }, hiv[N] = { 1, 1 };
+
+    struct { uint32_t dt; long long nel; const void* src; } qd[8] = {
+        { RAD_BF16, T * n, hx.data() },              // x
+        { RAD_BF16, n * W, hw.data() },              // w
+        { RAD_BF16, SLOTS * n * SL, hcs.data() },    // conv_state [SLOTS, n, SL]
+        { RAD_I32,  N + 1, cuv },                    // cu
+        { RAD_I32,  N, sidxv },                      // cache_idx
+        { RAD_I32,  N, hiv },                        // has_init
+        { RAD_I32,  0, nullptr },                    // num_accepted, absent: a prefill
+        { RAD_BF16, T * n, hy.data() }               // y, NaN until written
+    };
+    for (int o = 0; o < 8; ++o) {
+        RadTensor& t = c.t[o];
+        t = RadTensor{};
+        if (!qd[o].nel) continue;
+        const size_t bytes = (size_t)qd[o].nel * dt_bytes(qd[o].dt);
+        void* d = nullptr;
+        if (hipMalloc(&d, bytes) != hipSuccess) { fail("causal_conv1d: hipMalloc(%zu) failed", bytes);
+                                                  return 1; }
+        c.dev.push_back(d);
+        if (hipMemcpy(d, qd[o].src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+            fail("causal_conv1d: hipMemcpy in failed"); return 1;
+        }
+        t.data = d; t.dtype = qd[o].dt;
+        switch (o) {
+            case 0: case 7: t.rank = 2; t.shape[0] = T; t.shape[1] = n;
+                            t.stride[1] = 1; t.stride[0] = n; break;
+            case 1: t.rank = 2; t.shape[0] = n; t.shape[1] = W; t.stride[1] = 1; t.stride[0] = W; break;
+            case 2: t.rank = 3; t.shape[0] = SLOTS; t.shape[1] = n; t.shape[2] = SL;
+                    t.stride[2] = 1; t.stride[1] = SL; t.stride[0] = n * SL; break;
+            default: t.rank = 1; t.shape[0] = qd[o].nel; t.stride[0] = 1; break;
+        }
+    }
+    return 0;
+}
+
 static int build_expert_scale(Case& c, const RadOpSchema* s) {
     const long long M = 3, K = 4, NE = 8;
     if (s->n_operands != 3) { fail("expert_scale: the schema has %d operands, not 3",
@@ -1780,8 +1853,8 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
     constexpr int NOPD = 9;
     const long long M = 8, N = 128, K = 128, NE = 8, TK = 2;   // T = 16; N % 128
     const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2, NB = (N + 127) / 128;
-    if (s->n_operands != NOPD) { fail("moe_gemm_q: the schema has %d operands, not 9",
-                                      s->n_operands); return 1; }
+    if (s->n_operands != NOPD + 1) { fail("moe_gemm_q: the schema has %d operands, not 10",
+                                          s->n_operands); return 1; }
     c.n_p = 0;
     const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
                             { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
@@ -1839,6 +1912,7 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
         rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
+    c.t[NOPD] = RadTensor{};   // split absent
     return 0;
 }
 
@@ -1900,8 +1974,8 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
     constexpr int NOPD = 9;
     const long long M = 8, N = 128, K = 128, NE = 8, TK = 2;   // T = 16; N % 128
     const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2;
-    if (s->n_operands != NOPD) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 9",
-                                      s->n_operands); return 1; }
+    if (s->n_operands != NOPD + 1) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 10",
+                                          s->n_operands); return 1; }
     c.n_p = 0;
     const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
                             { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
@@ -1960,6 +2034,7 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
         rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
+    c.t[NOPD] = RadTensor{};   // split absent
     return 0;
 }
 
@@ -1973,8 +2048,8 @@ static int build_moe_gemm_w4a8(Case& c, const RadOpSchema* s) {
     const long long M = 6, N = 96, K = 256, NE = 4, TK = 4;   // T = 24, six rows per expert
     const long long T = M * TK;
     const long long ne0 = (NE + 1) / 2, ne1 = NE / 2;
-    if (s->n_operands != NOPD) { fail("moe_gemm_w4a8: the schema has %d operands, not 9",
-                                       s->n_operands); return 1; }
+    if (s->n_operands != NOPD + 1) { fail("moe_gemm_w4a8: the schema has %d operands, not 10",
+                                           s->n_operands); return 1; }
     c.n_p = 0;
     const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
                             { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
@@ -2046,6 +2121,7 @@ static int build_moe_gemm_w4a8(Case& c, const RadOpSchema* s) {
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
         rad_tensor_pack(&t);
     }
+    c.t[NOPD] = RadTensor{};   // split absent
     return 0;
 }
 
@@ -2432,6 +2508,7 @@ static int run_row(int i) {
         : (0 == std::strcmp(k->name, "gdn_gated_norm_had_quant_i8")) ? 8
         : (0 == std::strcmp(k->name, "gdn_conv_prep_w4_h128")) ? 9
         : (0 == std::strcmp(k->name, "gdn_conv_update_w4_h128")) ? 10
+        : (0 == std::strcmp(k->name, "causal_conv1d_bf16")) ? 24
         : (0 == std::strcmp(k->name, "gdn_recurrent_update_k128_v128")) ? 11
         : (0 == std::strcmp(k->name, "gdn_conv_recurrent_update_k128_v128")) ? 23
         : (0 == std::strcmp(k->name, "expert_scale_bf16")) ? 12
@@ -2463,6 +2540,7 @@ static int run_row(int i) {
                         : hand == 8 ? build_gdn_gated_norm_hq(c, s)
                         : hand == 9 ? build_gdn_conv_prep(c, s)
                         : hand == 10 ? build_gdn_conv_update(c, s)
+                        : hand == 24 ? build_causal_conv1d(c, s)
                         : hand == 11 ? build_gdn_recurrent(c, s)
                         : hand == 23 ? build_gdn_conv_recurrent(c, s)
                         : hand == 12 ? build_expert_scale(c, s)
@@ -2981,6 +3059,729 @@ static void check_moe_numerics() {
 #endif
 }
 
+/* ================================================================== causal_conv1d, by value
+ *
+ * LFM2's and LFM3's short convolution against a host mirror of libref/ref_ple.cpp's depthwise
+ * causal convolution (ported from libhalo's causal_conv1d_cases): the taps summed in f64 in ref's
+ * order over the same bf16 bytes, the store narrowed to bf16, and the window rewritten by ref's
+ * rule -- `num_accepted` present shifts the read down by one and puts the step's inputs behind it,
+ * absent keeps the last width-1 inputs at offset zero. y is compared to a relative L2 (the kernel
+ * accumulates in f32); the window, a copy of input bytes, byte for byte; and the rows of a
+ * sequence that writes nothing (empty, or on slot -1) must keep their NaN fill.
+ */
+namespace convnum {
+using namespace moenum;
+
+struct ConvCase {
+    long long n = 0, wid = 0, slots = 1, state_len = 0;
+    std::vector<int32_t> cu, sidx, hini, nacc;           /* sidx/hini/nacc empty: absent */
+    std::vector<uint16_t> x, w, st;                       /* x [T, n], w [n, wid], st [slots, n, state_len] */
+    std::vector<double> y;                                /* the answer, [T, n] */
+    std::vector<char> live;
+    long long T() const { return cu.empty() ? 0 : cu.back(); }
+};
+
+void model(ConvCase& c) {
+    const long long hist = c.wid - 1, N = (long long)c.cu.size() - 1, T = c.T();
+    c.y.assign((size_t)(T * c.n), 0.0);
+    c.live.assign((size_t)T, 0);
+    for (long long s = 0; s < N; ++s) {
+        const long long bos = c.cu[s], slen = c.cu[s + 1] - bos;
+        if (slen <= 0) continue;
+        const long long slot = c.sidx.empty() ? s : c.sidx[s];
+        if (slot < 0) continue;
+        const bool warm = c.hini.empty() || c.hini[s] != 0;
+        const long long off = c.nacc.empty() ? 0 : (long long)c.nacc[s] - 1;
+        for (long long ch = 0; ch < c.n; ++ch) {
+            const long long base = (slot * c.n + ch) * c.state_len;
+            float h[8] = {};
+            for (long long i = 0; i < hist; ++i) h[i] = warm ? bf16_to_f32(c.st[base + off + i]) : 0.0f;
+            for (long long t = 0; t < slen; ++t) {
+                c.live[bos + t] = 1;
+                double acc = 0.0;
+                for (long long j = 0; j < c.wid; ++j) {
+                    const long long src = t - hist + j;
+                    const double v = src >= 0 ? (double)bf16_to_f32(c.x[(bos + src) * c.n + ch])
+                                              : (double)h[src + hist];
+                    acc += v * (double)bf16_to_f32(c.w[ch * c.wid + j]);
+                }
+                c.y[(bos + t) * c.n + ch] = acc;
+            }
+            if (!c.nacc.empty()) {
+                uint16_t keep[8] = {};
+                for (long long i = 0; i + 1 < hist; ++i) keep[i] = warm ? c.st[base + off + i + 1] : 0;
+                for (long long i = 0; i + 1 < hist; ++i) c.st[base + i] = keep[i];
+                for (long long t = 0; t < slen && hist - 1 + t < c.state_len; ++t)
+                    c.st[base + hist - 1 + t] = c.x[(bos + t) * c.n + ch];
+            } else {
+                uint16_t keep[8] = {};
+                for (long long i = 0; i < hist; ++i) {
+                    const long long src = slen - hist + i;
+                    keep[i] = src >= 0 ? c.x[(bos + src) * c.n + ch]
+                                       : (warm ? c.st[base + off + src + hist] : (uint16_t)0);
+                }
+                for (long long i = 0; i < hist; ++i) c.st[base + i] = keep[i];
+            }
+        }
+    }
+}
+
+/* Upload, launch, model, compare. `dil` > 0 adds a `dilation` parameter (a refusal case). */
+int run(Launch fn, ConvCase& c, const char* what, long long dil = 0, bool report = true) {
+    const long long T = c.T();
+    Dev dv;
+    std::vector<uint16_t> ynan((size_t)(T * c.n), 0x7fc0u);
+    RadTensor cs{};
+    cs.data = dv.put(c.st.data(), c.st.size() * 2); cs.dtype = RAD_BF16; cs.rank = 3;
+    cs.shape[0] = c.slots; cs.shape[1] = c.n; cs.shape[2] = c.state_len;
+    cs.stride[2] = 1; cs.stride[1] = c.state_len; cs.stride[0] = c.n * c.state_len;
+    auto opt = [&](const std::vector<int32_t>& v) {
+        return v.empty() ? RadTensor{} : vec(dv.put(v.data(), v.size() * 4), RAD_I32, (long long)v.size());
+    };
+    RadTensor t[8] = { dense(dv.put(c.x.data(), c.x.size() * 2), RAD_BF16, T, c.n),
+                       dense(dv.put(c.w.data(), c.w.size() * 2), RAD_BF16, c.n, c.wid),
+                       cs,
+                       vec(dv.put(c.cu.data(), c.cu.size() * 4), RAD_I32, (long long)c.cu.size()),
+                       opt(c.sidx), opt(c.hini), opt(c.nacc),
+                       dense(dv.put(ynan.data(), ynan.size() * 2), RAD_BF16, T, c.n) };
+    std::vector<RadParam> p = { pi("M", T), pi("n", c.n), pi("width", c.wid), ps("dtype", "bf16") };
+    if (dil) p.push_back(pi("dilation", dil));
+    RadArgs a{ t, 8, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+    const int rc = fn(&a, nullptr);
+    hipDeviceSynchronize();
+    if (!report) return rc;
+    if (rc != 0) { fail("%s: the launch returned %d", what, rc); return rc; }
+    std::vector<uint16_t> y((size_t)(T * c.n)), st(c.st.size());
+    hipMemcpy(y.data(), t[7].data, y.size() * 2, hipMemcpyDeviceToHost);
+    hipMemcpy(st.data(), cs.data, st.size() * 2, hipMemcpyDeviceToHost);
+    model(c);
+    std::vector<double> ref;
+    std::vector<uint16_t> got;
+    long long dead_moved = 0;
+    for (long long r = 0; r < T; ++r)
+        for (long long ch = 0; ch < c.n; ++ch) {
+            const uint16_t g = y[r * c.n + ch];
+            if (c.live[r]) { ref.push_back(c.y[r * c.n + ch]); got.push_back(g); }
+            else dead_moved += g != 0x7fc0u;
+        }
+    compare(what, ref, got, 2e-3);
+    long long sdiff = 0;
+    for (size_t i = 0; i < st.size(); ++i) sdiff += st[i] != c.st[i];
+    if (sdiff) fail("%s: the window after the step: %lld of %zu values differ", what, sdiff, st.size());
+    else ok("%s: the window after the step, byte for byte", what);
+    if (dead_moved) fail("%s: %lld values written in rows no sequence commits", what, dead_moved);
+    return 0;
+}
+
+}  // namespace convnum
+
+static void check_conv_numerics() {
+    std::printf("== causal_conv1d, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: causal_conv1d is not run");
+#else
+    using namespace convnum;
+    auto fn = (Launch)dlsym(g_h, "r3d_rad_causal_conv1d");
+    if (!fn) { fail("r3d_rad_causal_conv1d is missing"); return; }
+    /* No device is a skip, as in run_row: a build machine runs the static phase alone. */
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    uint32_t st = 0xC0417D1u;
+    auto rnd = [&](float sc) { st = st * 1664525u + 1013904223u;
+                               return f32_to_bf16((((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * sc); };
+    auto fill = [&](ConvCase& c, int with_state) {
+        const long long T = c.T();
+        c.x.resize((size_t)(T * c.n)); c.w.resize((size_t)(c.n * c.wid));
+        c.st.resize((size_t)(c.slots * c.n * c.state_len));
+        for (auto& v : c.x) v = rnd(2.0f);
+        for (auto& v : c.w) v = rnd(1.0f);
+        for (auto& v : c.st) v = with_state ? rnd(2.0f) : 0;
+    };
+    {   /* LFM2's band at prefill: an empty sequence, a cold window over stale bytes, a slot of -1. */
+        ConvCase c; c.n = 2048; c.wid = 3; c.slots = 3; c.state_len = 2;
+        c.cu = { 0, 0, 3, 12, 15 }; c.sidx = { 0, 2, 0, -1 }; c.hini = { 1, 0, 1, 1 };
+        fill(c, 1);
+        run(fn, c, "causal_conv1d prefill, width 3: empty, cold, warm and slot -1 sequences");
+    }
+    {   /* A decode step with drafts (num_accepted) over a window of width - 1 + 3. */
+        ConvCase c; c.n = 1024; c.wid = 3; c.slots = 2; c.state_len = 2 + 3;
+        c.cu = { 0, 4, 8 }; c.sidx = { 1, 0 }; c.hini = { 1, 1 }; c.nacc = { 2, 4 };
+        fill(c, 1);
+        run(fn, c, "causal_conv1d decode, width 3, num_accepted 2 and 4, a window of 5");
+    }
+    {   /* The widest and narrowest the row takes. */
+        ConvCase c; c.n = 512; c.wid = 8; c.slots = 1; c.state_len = 7; c.cu = { 0, 10 };
+        fill(c, 1);
+        run(fn, c, "causal_conv1d prefill, width 8, 7 values of history");
+        ConvCase d; d.n = 512; d.wid = 2; d.slots = 1; d.state_len = 1; d.cu = { 0, 5 };
+        fill(d, 1);
+        run(fn, d, "causal_conv1d prefill, width 2, one value of history");
+    }
+    {   /* The refusals: a dilation is not this op's; a window shallower than width - 1. */
+        ConvCase c; c.n = 256; c.wid = 3; c.slots = 1; c.state_len = 2; c.cu = { 0, 4 };
+        fill(c, 1);
+        const int r1 = run(fn, c, "", 2, false);
+        if (r1 == RAD_E_INVAL) ok("causal_conv1d refuses a dilation of 2");
+        else fail("causal_conv1d: a dilation of 2 returned %d, not RAD_E_INVAL", r1);
+        ConvCase d = c; d.state_len = 1; fill(d, 1);
+        const int r2 = run(fn, d, "", 0, false);
+        if (r2 == RAD_E_SHAPE) ok("causal_conv1d refuses a window shallower than width - 1");
+        else fail("causal_conv1d: a window of 1 at width 3 returned %d, not RAD_E_SHAPE", r2);
+    }
+#endif
+}
+
+/* ---- rope, by value -----------------------------------------------------------------------------
+ * run_row launches the rope rows with their required params only and checks that the output is
+ * finite, so neither `ladder` nor a partial `rotary_dim` is exercised there. This case is libhalo's
+ * (rope_ladder_case): an f32 mirror of libref's rotation at the three ladders. `head` is the
+ * proportional ladder: pair i is (i, i + head_dim/2), the exponent's divisor is head_dim, and the
+ * pairs from rotary_dim/2 on do not turn. Q and K heads rotate; the V head must come back byte
+ * for byte. */
+static void check_rope_numerics() {
+    std::printf("== rope, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: rope is not run");
+#else
+    using namespace moenum;
+    auto fn = (Launch)dlsym(g_h, "r3d_rad_rope");
+    if (!fn) { fail("r3d_rad_rope is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long M = 5, hd = 64, rot = 32, n_head = 2, nkv = 1, n_rope = n_head + nkv;
+    const long long row = (n_head + 2 * nkv) * hd;
+    const float theta = 10000.0f;
+    const std::vector<int32_t> pos = { 0, 1, 7, 128, 4096 };
+    for (const char* lad : { (const char*)nullptr, "rotary", "head" }) {
+        const bool head = lad && !std::strcmp(lad, "head");
+        const long long den = head ? hd : rot, off = head ? hd / 2 : rot / 2;
+        char what[96];
+        std::snprintf(what, sizeof(what), "rope neox, head_dim 64, rotary_dim 32, ladder %s",
+                      lad ? lad : "absent");
+        std::vector<uint16_t> x((size_t)(M * row));
+        for (long long i = 0; i < M * row; ++i) {
+            float v = (float)(((i * 5) % 17) - 8) / 9.0f;
+            if (i % 13 == 0) v *= 4.0f;                        /* a few big channels */
+            x[(size_t)i] = f32_to_bf16(v);
+        }
+        Dev dv;
+        RadTensor t[2] = { dense(dv.put(x.data(), x.size() * 2), RAD_BF16, M, row),
+                           vec(dv.put(pos.data(), pos.size() * 4), RAD_I32, M) };
+        std::vector<RadParam> p = { pi("M", M), pi("head_dim", hd), pi("n_head", n_head),
+                                    pi("n_head_kv", nkv),
+                                    RadParam{ "theta", RAD_P_F64, 0, 0, nullptr, (double)theta },
+                                    RadParam{ "scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
+                                    ps("mode", "neox"), pi("rotary_dim", rot) };
+        if (lad) p.push_back(ps("ladder", lad));
+        RadArgs a{ t, 2, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = fn(&a, nullptr);
+        hipDeviceSynchronize();
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<uint16_t> got(x.size());
+        hipMemcpy(got.data(), t[0].data, got.size() * 2, hipMemcpyDeviceToHost);
+        std::vector<double> ref;
+        std::vector<uint16_t> y;
+        long long v_moved = 0;
+        for (long long m = 0; m < M; ++m) {
+            const size_t base = (size_t)(m * row);
+            for (long long h = 0; h < n_rope; ++h) {
+                std::vector<double> w((size_t)hd);
+                for (long long e = 0; e < hd; ++e) w[(size_t)e] = bf16_to_f32(x[base + h * hd + e]);
+                for (long long i = 0; i < rot / 2; ++i) {
+                    const float x0 = bf16_to_f32(x[base + h * hd + i]);
+                    const float x1 = bf16_to_f32(x[base + h * hd + i + off]);
+                    const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
+                    const float sn = sinf((float)pos[(size_t)m] * inv);
+                    const float cs = cosf((float)pos[(size_t)m] * inv);
+                    w[(size_t)i] = x0 * cs - x1 * sn;
+                    w[(size_t)(i + off)] = x0 * sn + x1 * cs;
+                }
+                for (long long e = 0; e < hd; ++e) {
+                    ref.push_back(w[(size_t)e]); y.push_back(got[base + h * hd + e]);
+                }
+            }
+            for (long long e = 0; e < hd; ++e)
+                v_moved += got[base + n_rope * hd + e] != x[base + n_rope * hd + e];
+        }
+        compare(what, ref, y, 2e-3);
+        if (v_moved) fail("%s: %lld values of the V head moved", what, v_moved);
+        else ok("%s: the V head byte for byte", what);
+    }
+#endif
+}
+
+/* ---- attn_paged decode at depth, by value --------------------------------------------------------
+ * One query row over a 4,096-key context, the shape a decode step has and rad-kbench's attention
+ * shape (context = q_len) does not. The row's scratch hook is called the way the builder calls it,
+ * with the params and no tensors, and must size the split-KV partials: a hook that returns 0 makes
+ * the shim fall back to one slice, which is correct and several times slower, so nothing else
+ * notices. The launch is then checked against a host mirror of the reference (scores and sums in
+ * double), with the partials and without (one slice), full causal and under a window.
+ * The window is chosen so that its first three keys are the last three of a slice, at any slice
+ * count from 2 to 32: the real row sees three keys of that slice and the idle row slots, which sit
+ * at later positions, see none, the case in which every lane must still stage the tile. */
+static void check_attn_depth() {
+    std::printf("== attn_paged decode at depth, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: attention is not run");
+#else
+    using namespace moenum;
+    const RadKernelInfo* k = nullptr;
+    for (int i = 0; i < rows(); ++i)
+        if (row_at(i) && !std::strcmp(row_at(i)->name, "attn_paged_bf16_decode")) k = row_at(i);
+    if (!k || !k->launch) { fail("attn_paged_bf16_decode is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long hd = 128, nh = 16, gqa = 4, kvh = nh / gqa, bs = 16, ctx = 4096 - 9;
+    const long long nb = (ctx + bs - 1) / bs;
+    const float scale = 1.0f / std::sqrt((float)hd);
+    std::vector<uint16_t> q((size_t)(nh * hd)), kv((size_t)(nb * kvh * bs * 2 * hd));
+    uint32_t seed = 0x1234567u;
+    auto draw = [&](float amp) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        return amp * ((float)(seed & 0xffff) / 32768.0f - 1.0f);
+    };
+    for (auto& v : q) v = f32_to_bf16(draw(1.5f));
+    std::vector<int32_t> bt((size_t)nb), su = { (int32_t)ctx };
+    for (long long b = 0; b < nb; ++b) bt[(size_t)b] = (int32_t)((b * 37 + 5) % nb);   /* a permutation */
+    for (long long i = 0; i < (long long)kv.size(); ++i)
+        kv[(size_t)i] = f32_to_bf16(draw((i / hd) % 2 ? 2.0f : 1.5f));                 /* K then V a slot */
+    const long long edge = (nb / 2) * bs - 3;          /* three keys under a slice boundary */
+    for (long long window : { 0LL, ctx - edge }) {
+        std::vector<RadParam> p = { pi("q_len", 1), pi("head_dim", hd), pi("gqa", gqa),
+                                    pi("block_size", bs), pi("causal", 1), pi("window", window),
+                                    pi("n_head", nh), pi("max_seqs", 1), pi("max_ctx", nb * bs),
+                                    ps("q_dtype", "bf16"), ps("kv_dtype", "bf16"),
+                                    RadParam{ "scale", RAD_P_F64, 0, 0, nullptr, (double)scale } };
+        /* The builder's call: params, no tensors. */
+        RadArgs pa{ nullptr, 0, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const long long bytes = k->scratch ? (long long)k->scratch(&pa) : 0;
+        const long long need = nh * 8 * 132 * 4;     /* eight slices of one row's partials */
+        if (bytes < need)
+            fail("attn_paged decode, window %lld: the scratch hook gives %lld bytes from the params "
+                 "alone, eight slices need %lld", window, bytes, need);
+        else ok("attn_paged decode, window %lld: the scratch hook gives %lld bytes from the params "
+                "alone", window, bytes);
+        /* The host mirror. */
+        std::vector<double> ref((size_t)(nh * hd));
+        const long long pos = ctx - 1, j0 = window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0;
+        for (long long h = 0; h < nh; ++h) {
+            const long long kh = h / gqa;
+            std::vector<double> sc((size_t)ctx, 0.0);
+            double mx = -1e300;
+            for (long long j = j0; j < ctx; ++j) {
+                const uint16_t* slot = kv.data() + ((bt[(size_t)(j / bs)] * kvh + kh) * bs + j % bs) * 2 * hd;
+                double d = 0;
+                for (long long e = 0; e < hd; ++e)
+                    d += (double)bf16_to_f32(q[(size_t)(h * hd + e)]) * (double)bf16_to_f32(slot[e]);
+                sc[(size_t)j] = d * (double)scale;
+                mx = std::max(mx, sc[(size_t)j]);
+            }
+            double sum = 0;
+            std::vector<double> acc((size_t)hd, 0.0);
+            for (long long j = j0; j < ctx; ++j) {
+                const uint16_t* slot = kv.data() + ((bt[(size_t)(j / bs)] * kvh + kh) * bs + j % bs) * 2 * hd;
+                const double w = std::exp(sc[(size_t)j] - mx);
+                sum += w;
+                for (long long e = 0; e < hd; ++e) acc[(size_t)e] += w * (double)bf16_to_f32(slot[hd + e]);
+            }
+            for (long long e = 0; e < hd; ++e) ref[(size_t)(h * hd + e)] = acc[(size_t)e] / sum;
+        }
+        std::vector<uint16_t> first;
+        for (int split : { 1, 0 }) {
+            Dev dv;
+            RadTensor t[8] = {};
+            t[0].data = dv.put(q.data(), q.size() * 2); t[0].dtype = RAD_BF16; t[0].rank = 3;
+            t[0].shape[0] = 1; t[0].shape[1] = nh; t[0].shape[2] = hd;
+            t[0].stride[0] = nh * hd; t[0].stride[1] = hd; t[0].stride[2] = 1;
+            t[7] = t[0]; t[7].data = dv.put(nullptr, q.size() * 2);
+            t[1].data = dv.put(kv.data(), kv.size() * 2); t[1].dtype = RAD_BF16; t[1].rank = 4;
+            t[1].shape[0] = nb; t[1].shape[1] = kvh; t[1].shape[2] = bs; t[1].shape[3] = 2 * hd;
+            t[1].stride[0] = kvh * bs * 2 * hd; t[1].stride[1] = bs * 2 * hd; t[1].stride[2] = 2 * hd;
+            t[1].stride[3] = 1;
+            t[2] = dense(dv.put(bt.data(), bt.size() * 4), RAD_I32, 1, nb);
+            t[3] = vec(dv.put(su.data(), 4), RAD_I32, 1);
+            RadArgs a{ t, 8, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+            if (split && bytes > 0) {
+                a.scratch = dv.put(nullptr, (size_t)bytes);
+                a.scratch_bytes = bytes;
+            }
+            char what[112];
+            std::snprintf(what, sizeof(what), "attn_paged decode, context %lld, window %lld, %s", ctx,
+                          window, split ? "with the partials" : "one slice (no scratch)");
+            const int rc = k->launch(&a, nullptr);
+            hipDeviceSynchronize();
+            if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+            std::vector<uint16_t> got(q.size());
+            hipMemcpy(got.data(), t[7].data, got.size() * 2, hipMemcpyDeviceToHost);
+            compare(what, ref, got, 2e-3);
+            if (split) first = got;
+            else if (!first.empty()) {
+                long long far = 0;
+                for (size_t i = 0; i < got.size(); ++i) {
+                    const double a0 = bf16_to_f32(first[i]), a1 = bf16_to_f32(got[i]);
+                    if (!(std::fabs(a0 - a1) <= 0.02 * std::fabs(a1) + 1e-4)) ++far;
+                }
+                if (far) fail("attn_paged decode, window %lld: %lld values far apart between the split "
+                              "launch and one slice", window, far);
+                else ok("attn_paged decode, window %lld: the split launch and one slice agree", window);
+            }
+        }
+    }
+#endif
+}
+
+/* ---- the int8 trunk, by value -------------------------------------------------------------------
+ * had_quant_act_i8g and gemm_nt_q at i8a8 against host mirrors of libref's arithmetic
+ * (had_quant_act_q8 / q8_group, quant_dot). The quantiser's scale must be amax / 127 of the
+ * unnormalised transform and 1 for an all-zero group; a code may sit one step from the mirror's
+ * where the device's reciprocal differs in its last place. The GEMM's group term is
+ * (sub * a_scale[m, g]) * b_scale[n, g], each product rounded, groups ascending, one bf16 store,
+ * and the device's output is compared bit for bit. */
+static void check_i8a8_numerics() {
+    std::printf("== the int8 trunk (had_quant_act_i8g, gemm_nt_q i8a8), by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: not run");
+#else
+    using namespace moenum;
+    auto qfn = (Launch)dlsym(g_h, "r3d_rad_had_quant_act_i8g");
+    auto gfn = (Launch)dlsym(g_h, "r3d_rad_gemm_nt_q_i8a8");
+    if (!qfn || !gfn) { fail("an int8 trunk entry point is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    uint32_t st = 0x18A8u;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return ((st >> 8) & 0xffffu) / 65536.0f - 0.5f; };
+
+    for (long long n : { 128LL, 2048LL, 7680LL }) {
+        const long long M = 3, G = n / 128;
+        char what[96];
+        std::snprintf(what, sizeof(what), "had_quant_act_i8g, n %lld, group 128, 3 rows", n);
+        std::vector<uint16_t> x((size_t)(M * n));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = f32_to_bf16(rnd() * ((i % 97) == 0 ? 40.0f : 3.0f));
+        if (G > 1) for (long long i = 0; i < 128; ++i) x[(size_t)(n + 128 + i)] = 0;   /* row 1, group 1: all zero */
+        std::vector<int8_t> q0((size_t)(M * n), (int8_t)0x55);
+        std::vector<float> s0((size_t)(M * G), -1.0f);
+        Dev dv;
+        RadTensor t[3] = { dense(dv.put(x.data(), x.size() * 2), RAD_BF16, M, n),
+                           dense(dv.put(q0.data(), q0.size()), RAD_I8, M, n),
+                           dense(dv.put(s0.data(), s0.size() * 4), RAD_F32, M, G) };
+        std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("group", 128), ps("dtype", "bf16") };
+        RadArgs a{ t, 3, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = qfn(&a, nullptr);
+        hipDeviceSynchronize();
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<int8_t> q(q0.size());
+        std::vector<float> sc(s0.size());
+        hipMemcpy(q.data(), t[1].data, q.size(), hipMemcpyDeviceToHost);
+        hipMemcpy(sc.data(), t[2].data, sc.size() * 4, hipMemcpyDeviceToHost);
+        long long off1 = 0, worse = 0, sbad = 0;
+        for (long long r = 0; r < M; ++r)
+            for (long long g = 0; g < G; ++g) {
+                float v[128];
+                for (int i = 0; i < 128; ++i) v[i] = bf16_to_f32(x[(size_t)(r * n + g * 128 + i)]);
+                for (int h = 1; h < 128; h <<= 1)
+                    for (int i = 0; i < 128; i += 2 * h)
+                        for (int j = i; j < i + h; ++j) {
+                            const float u = v[j], w = v[j + h];
+                            v[j] = u + w; v[j + h] = u - w;
+                        }
+                float amax = 0.0f;
+                for (int i = 0; i < 128; ++i) amax = std::max(amax, std::fabs(v[i]));
+                const float want = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f, inv = 1.0f / want;
+                if (sc[(size_t)(r * G + g)] != want) ++sbad;
+                for (int i = 0; i < 128; ++i) {
+                    float c = v[i] * inv;
+                    c = c > 127.0f ? 127.0f : (c < -127.0f ? -127.0f : c);
+                    const long long d = std::llabs((long long)std::nearbyint(c) -
+                                                   (long long)q[(size_t)(r * n + g * 128 + i)]);
+                    if (d == 1) ++off1; else if (d > 1) ++worse;
+                }
+            }
+        if (sbad == 0 && worse == 0 && off1 * 1000 <= M * n)
+            ok("%s: every scale exact, %lld of %lld codes one step off", what, off1, M * n);
+        else
+            fail("%s: %lld scales differ, %lld codes one step off, %lld further", what, sbad, off1, worse);
+    }
+
+    /* gemm_nt_q i8a8, bit for bit. Four host mirrors of an output: the reference's (two rounded
+     * multiplies, then the add, groups ascending: quant_dot), a fused one (the add takes the
+     * unrounded product, what a v_fmac does), the other scale order ((sub * b_scale) * a_scale)
+     * and the reference's terms summed from the last group down. The device must equal the first
+     * on every output. Each case counts the outputs the other three would move. Random codes
+     * seldom land on a rounding boundary (a handful of outputs in a few hundred thousand), so the
+     * rounding and the order are carried by three constructed cells, each run on every kernel
+     * (M <= 16, 17 to 127, the tile from 128) and each required to be moved on every output by
+     * the mirror it is for: a pass of a cell says the case could have failed. The volatile
+     * temporaries keep the host's own compiler from fusing the mirror. */
+    auto term = [](float acc, int32_t sub, float sa, float sb, int mode) -> float {
+        if (mode == 2) { volatile float u = (float)sub * sb; volatile float q = u * sa; return acc + q; }
+        volatile float u = (float)sub * sa;
+        if (mode == 1) return std::fma((float)u, sb, acc);
+        volatile float q = u * sb;
+        return acc + q;
+    };
+    /* The order cell's scales: group 0 leaves exactly -16129, group 1 adds about +16129, so the
+     * sum is the last places of group 1's product. Searched, not typed: a pair is kept only when
+     * the fused mirror and the swapped mirror both store a bf16 other than the reference's. */
+    float o_sa = 0.0f; uint16_t o_sb = 0; bool o_found = false;
+    for (int i = 0; i < 200000 && !o_found; ++i) {
+        const uint16_t sbw = f32_to_bf16(0.75f + (rnd() + 0.5f) * 0.75f);
+        const float sb = bf16_to_f32(sbw);
+        float sa = 1.0f / sb;
+        const int steps = (int)std::lrint(rnd() * 16.0f);
+        for (int j = 0; j < std::abs(steps); ++j) sa = std::nextafter(sa, steps > 0 ? 4.0f : 0.0f);
+        uint16_t r[3];
+        for (int mode = 0; mode < 3; ++mode)
+            r[mode] = f32_to_bf16(term(term(0.0f, -16129, 1.0f, 1.0f, mode), 16129, sa, sb, mode));
+        if (r[0] != r[1] && r[0] != r[2]) { o_sa = sa; o_sb = sbw; o_found = true; }
+    }
+    if (!o_found) fail("gemm_nt_q i8a8: no scale pair separates the three mirrors (the order cell cannot be built)");
+
+    /* cell: 0 random, 1 fused-add, 2 scale order, 3 group order. nt 0 launches the kernels'
+     * plain-load instantiation (the row has no tune axis, so an engine launch is always nt 1). */
+    struct G8 { long long M, N, K; int pad; int cell; int nt = 1; };
+    for (const G8& c : { G8{ 1, 1, 128, 0, 0 },     G8{ 1, 143, 256, 1, 0 },   G8{ 5, 512, 2048, 0, 0 },
+                         G8{ 16, 17, 384, 1, 0, 0 }, G8{ 16, 128, 7680, 0, 0 }, G8{ 17, 127, 256, 0, 0, 0 },
+                         G8{ 33, 129, 2048, 1, 0 }, G8{ 127, 257, 128, 0, 0 }, G8{ 128, 143, 384, 1, 0 },
+                         G8{ 129, 17, 2048, 0, 0 }, G8{ 257, 129, 256, 1, 0 }, G8{ 300, 144, 384, 0, 0 },
+                         G8{ 128, 1, 128, 0, 0 },   G8{ 255, 130, 256, 1, 0, 0 }, G8{ 256, 128, 7680, 0, 0 },
+                         G8{ 130, 131, 7680, 1, 0 }, G8{ 513, 255, 384, 0, 0 },
+                         G8{ 1, 17, 256, 0, 1 },    G8{ 33, 143, 256, 1, 1 },  G8{ 257, 143, 256, 0, 1 },
+                         G8{ 16, 17, 256, 1, 2 },   G8{ 33, 17, 256, 1, 2 },   G8{ 129, 17, 256, 1, 2 },
+                         G8{ 5, 17, 384, 0, 3 },    G8{ 33, 17, 384, 1, 3 },   G8{ 129, 143, 384, 1, 3 } }) {
+        if (c.cell == 2 && !o_found) continue;
+        const long long G = c.K / 128;
+        /* a's padded pitch is 12 mod 16: the rows start at every 4-byte phase of a 16-byte load. */
+        const long long a_ld = c.K + (c.pad ? 12 : 0), as_ld = G + (c.pad ? 3 : 0);
+        const long long bs_ld = G + (c.pad ? 5 : 0), y_ld = c.N + (c.pad ? 7 : 0);
+        char what[144];
+        std::snprintf(what, sizeof(what), "gemm_nt_q i8a8, M %lld N %lld K %lld%s%s%s", c.M, c.N, c.K,
+                      c.pad ? ", padded pitches" : "", c.nt ? "" : ", nt 0",
+                      c.cell == 1 ? ", the fused-add cell" : c.cell == 2 ? ", the order cell"
+                      : c.cell == 3 ? ", the group-order cell" : "");
+        std::vector<int8_t> a8((size_t)(c.M * a_ld), (int8_t)0x55), b8((size_t)(c.N * c.K));
+        std::vector<float> as((size_t)(c.M * as_ld), std::nanf(""));
+        /* y has a guard row before its first row and one after its last: a store guard off by a
+         * row writes there, where the pitch canaries of the M rows do not look. y's canary is a
+         * finite word, not the NaN the scale padding holds: a stray store of a value computed from
+         * that padding would be the same NaN word and go unseen. */
+        const uint16_t kYCanary = 0x5a5au;
+        std::vector<uint16_t> bs((size_t)(c.N * bs_ld), 0x7fc0u), y0((size_t)((c.M + 2) * y_ld), kYCanary);
+        auto A = [&](long long m, long long k) -> int8_t& { return a8[(size_t)(m * a_ld + k)]; };
+        auto B = [&](long long n, long long k) -> int8_t& { return b8[(size_t)(n * c.K + k)]; };
+        auto AS = [&](long long m, long long g) -> float& { return as[(size_t)(m * as_ld + g)]; };
+        auto BS = [&](long long n, long long g) -> uint16_t& { return bs[(size_t)(n * bs_ld + g)]; };
+        if (c.cell == 0) {
+            /* Random codes over the whole int8 range, a saturated group on one row and one
+             * column (sub = 127 * -128 * 128), an all-zero group, and scales that step 2^6
+             * between neighbouring groups, so a scale read from the group beside is far off. */
+            auto code = [&]() { const float u = rnd(); return (st & 0x3f00u) == 0 ? (int8_t)-128 : (int8_t)std::lrint(u * 254.0f); };
+            for (long long m = 0; m < c.M; ++m) for (long long k = 0; k < c.K; ++k) A(m, k) = code();
+            for (long long n = 0; n < c.N; ++n) for (long long k = 0; k < c.K; ++k) B(n, k) = code();
+            if (G > 1) for (long long k = 128; k < 256; ++k) { A(0, k) = 127; B(0, k) = -128; }
+            if (c.M > 2) for (long long k = 0; k < 128; ++k) A(2, k) = 0;
+            for (long long m = 0; m < c.M; ++m) for (long long g = 0; g < G; ++g)
+                AS(m, g) = (0.002f + (rnd() + 0.5f) * 0.02f) * ((g & 1) ? 64.0f : 1.0f);
+            for (long long n = 0; n < c.N; ++n) for (long long g = 0; g < G; ++g)
+                BS(n, g) = f32_to_bf16((0.0005f + (rnd() + 0.5f) * 0.004f) * ((g & 1) ? 1.0f / 64.0f : 1.0f));
+        } else if (c.cell == 3) {
+            /* Three groups: 2^25, then -2^25, then 1 (64 * 64 = 2^12 with an activation scale of
+             * 2^13; the weight's scale 1). Ascending, the first two cancel and 1 is stored (0x3f80);
+             * from the last group down, 1 - 2^25 rounds to -2^25 and 0 is stored. */
+            for (long long m = 0; m < c.M; ++m) for (long long k = 0; k < c.K; ++k) A(m, k) = 0;
+            for (long long m = 0; m < c.M; ++m) {
+                A(m, 0) = 64; A(m, 128) = 64; A(m, 256) = 1;
+                AS(m, 0) = 8192.0f; AS(m, 1) = 8192.0f; AS(m, 2) = 1.0f;
+            }
+            for (long long n = 0; n < c.N; ++n) {
+                B(n, 0) = 64; B(n, 128) = -64; B(n, 256) = 1;
+                for (long long g = 0; g < G; ++g) BS(n, g) = 0x3f80u;
+            }
+        } else {
+            /* One code pair a group. The fused-add cell: 1 from group 0, then 6710989 * 2^-31 * 1.25,
+             * whose rounded product is 2^-8 + 2^-24: the sum ties to 1 + 2^-8 and stores 0x3f80, while
+             * the unrounded product sits above the tie and stores 0x3f81. The order cell: see o_sa. */
+            for (long long m = 0; m < c.M; ++m) for (long long k = 0; k < c.K; ++k) A(m, k) = 0;
+            const int8_t a0 = c.cell == 1 ? 1 : 127, b0 = c.cell == 1 ? 1 : -127, b1 = c.cell == 1 ? 1 : 127;
+            for (long long m = 0; m < c.M; ++m) {
+                A(m, 0) = a0; A(m, 128) = a0;
+                AS(m, 0) = 1.0f; AS(m, 1) = c.cell == 1 ? std::ldexp(6710989.0f, -31) : o_sa;
+            }
+            for (long long n = 0; n < c.N; ++n) {
+                B(n, 0) = b0; B(n, 128) = b1;
+                BS(n, 0) = 0x3f80u; BS(n, 1) = c.cell == 1 ? (uint16_t)0x3fa0u : o_sb;
+            }
+        }
+        Dev dv;
+        auto pitched = [](void* d, uint32_t dt, long long r, long long cols, long long ld) {
+            RadTensor t = dense(d, dt, r, cols); t.stride[0] = ld; return t; };
+        void* yd = dv.put(y0.data(), y0.size() * 2);
+        RadTensor t[7] = { pitched(dv.put(a8.data(), a8.size()), RAD_I8, c.M, c.K, a_ld),
+                           pitched(dv.put(as.data(), as.size() * 4), RAD_F32, c.M, G, as_ld),
+                           dense(dv.put(b8.data(), b8.size()), RAD_I8, c.N, c.K),
+                           pitched(dv.put(bs.data(), bs.size() * 2), RAD_BF16, c.N, G, bs_ld),
+                           pitched(yd ? (char*)yd + y_ld * 2 : nullptr, RAD_BF16, c.M, c.N, y_ld),
+                           RadTensor{}, RadTensor{} };
+        if (!yd) { fail("%s: no device memory for y", what); continue; }
+        std::vector<RadParam> p = { pi("M", c.M), pi("N", c.N), pi("K", c.K), pi("group", 128),
+                                    ps("dtype", "i8a8") };
+        if (!c.nt) p.push_back(pi("nt", 0));
+        RadArgs a{ t, 7, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = gfn(&a, nullptr);
+        hipDeviceSynchronize();
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<uint16_t> yg(y0.size());
+        hipMemcpy(yg.data(), (char*)t[4].data - y_ld * 2, yg.size() * 2, hipMemcpyDeviceToHost);
+        const uint16_t* y = yg.data() + y_ld;
+        long long bad = 0, fused = 0, swapped = 0, reversed = 0, canary = 0, guard = 0, bm = -1, bn = -1;
+        for (long long i = 0; i < y_ld; ++i) guard += (yg[(size_t)i] != kYCanary) + (y[(size_t)(c.M * y_ld + i)] != kYCanary);
+        std::vector<int32_t> subs((size_t)G);
+        uint16_t bgot = 0, bwant = 0;
+        for (long long m = 0; m < c.M; ++m) {
+            for (long long n = 0; n < c.N; ++n) {
+                float acc[3] = { 0.0f, 0.0f, 0.0f };
+                for (long long g = 0; g < G; ++g) {
+                    int32_t sub = 0;
+                    for (long long k = g * 128; k < (g + 1) * 128; ++k) sub += (int32_t)A(m, k) * (int32_t)B(n, k);
+                    subs[(size_t)g] = sub;
+                    for (int mode = 0; mode < 3; ++mode)
+                        acc[mode] = term(acc[mode], sub, AS(m, g), bf16_to_f32(BS(n, g)), mode);
+                }
+                float rev = 0.0f;
+                for (long long g = G - 1; g >= 0; --g) rev = term(rev, subs[(size_t)g], AS(m, g), bf16_to_f32(BS(n, g)), 0);
+                const uint16_t want = f32_to_bf16(acc[0]), got = y[(size_t)(m * y_ld + n)];
+                if (f32_to_bf16(acc[1]) != want) ++fused;
+                if (f32_to_bf16(acc[2]) != want) ++swapped;
+                if (f32_to_bf16(rev) != want) ++reversed;
+                if (got != want) { if (!bad) { bm = m; bn = n; bgot = got; bwant = want; } ++bad; }
+            }
+            for (long long n = c.N; n < y_ld; ++n) if (y[(size_t)(m * y_ld + n)] != kYCanary) ++canary;
+        }
+        const long long nout = c.M * c.N;
+        if ((c.cell == 1 && fused != nout) || (c.cell == 2 && (fused != nout || swapped != nout)) ||
+            (c.cell == 3 && reversed != nout))
+            fail("%s: the cell does not discriminate (a fused add moves %lld of %lld outputs, the other "
+                 "scale order %lld, the other group order %lld)", what, fused, nout, swapped, reversed);
+        else if (bad || canary || guard)
+            fail("%s: %lld of %lld outputs differ from the reference (first at m %lld n %lld: 0x%04x, "
+                 "want 0x%04x), %lld written past a row's end, %lld in the guard rows", what, bad, nout, bm, bn,
+                 bgot, bwant, canary, guard);
+        else
+            ok("%s: %lld outputs bit-identical to the reference; a fused add would move %lld, the other "
+               "scale order %lld, the other group order %lld", what, nout, fused, swapped, reversed);
+    }
+#endif
+}
+
+/* ---- a plain weight the host cannot read -------------------------------------------------------
+ * The engine maps weights through its own pool (core/device/aql.cpp), and on an integrated GPU (a
+ * Radeon 860M) the host cannot read those pages, where hipMalloc's can be. Until 2026-11-18
+ * rad_gemm_run looked for a joined-planes header through every weight's address on the host, so
+ * the first prefill GEMM of a bf16 model faulted there, while this selftest, whose weights come
+ * from hipMalloc, passed. This case maps the weight with HIP's virtual memory calls and grants
+ * access to the device only; the host's read is caught (SIGSEGV) and reported as a FAIL. */
+#ifdef RAD_HAVE_HIP
+namespace devw {
+
+sigjmp_buf g_jb;
+volatile sig_atomic_t g_armed = 0;
+void on_segv(int) { if (g_armed) siglongjmp(g_jb, 1); signal(SIGSEGV, SIG_DFL); raise(SIGSEGV); }
+
+/* fn() with SIGSEGV caught: 1 when it faulted, else 0 and *rc its return. */
+template <class F> int guarded(F fn, int* rc) {
+    struct sigaction sa{}, old{};
+    sa.sa_handler = on_segv; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old);
+    int faulted = 0;
+    if (sigsetjmp(g_jb, 1) == 0) { g_armed = 1; *rc = fn(); }
+    else faulted = 1;
+    g_armed = 0;
+    sigaction(SIGSEGV, &old, nullptr);
+    return faulted;
+}
+
+struct DeviceOnly {
+    void* p = nullptr; size_t size = 0; hipMemGenericAllocationHandle_t h{}; int stage = 0;
+    ~DeviceOnly() {
+        if (stage >= 3) (void)hipMemUnmap(p, size);
+        if (stage >= 2) (void)hipMemAddressFree(p, size);
+        if (stage >= 1) (void)hipMemRelease(h);
+    }
+    /* 0, or the failing call's status */
+    int map(size_t bytes) {
+        hipMemAllocationProp prop{};
+        prop.type = hipMemAllocationTypePinned;
+        prop.location.type = hipMemLocationTypeDevice; prop.location.id = 0;
+        size_t g = 0;
+        if (int e = hipMemGetAllocationGranularity(&g, &prop, hipMemAllocationGranularityMinimum)) return e;
+        if (!g) return -1;
+        size = (bytes + g - 1) / g * g;
+        if (int e = hipMemCreate(&h, size, &prop, 0)) return e;
+        stage = 1;
+        if (int e = hipMemAddressReserve(&p, size, 0, nullptr, 0)) return e;
+        stage = 2;
+        if (int e = hipMemMap(p, size, 0, h, 0)) return e;
+        stage = 3;
+        hipMemAccessDesc ad{};
+        ad.location.type = hipMemLocationTypeDevice; ad.location.id = 0;
+        ad.flags = hipMemAccessFlagsProtReadWrite;
+        if (int e = hipMemSetAccess(p, size, &ad, 1)) return e;
+        return 0;
+    }
+};
+
+}  // namespace devw
+#endif
+
+static void check_gemm_device_weight() {
+    std::printf("== gemm_nt_bf16_tiled, a plain weight the host cannot read\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: not run");
+#else
+    using namespace moenum;
+    using namespace devw;
+    auto fn = (int (*)(const RadArgs*, RadStream))dlsym(g_h, "r3d_rad_gemm_nt_bf16_tiled");
+    if (!fn) { fail("r3d_rad_gemm_nt_bf16_tiled is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long M = 32, N = 64, K = 128;   /* M >= 17: the tiled row's band */
+    uint32_t st = 0x6E3D17u;
+    auto rnd = [&](float sc) { st = st * 1664525u + 1013904223u;
+                               return f32_to_bf16((((st >> 8) & 0xffffu) / 65536.0f - 0.5f) * sc); };
+    std::vector<uint16_t> x((size_t)(M * K)), w((size_t)(N * K)), ynan((size_t)(M * N), 0x7fc0u);
+    for (auto& v : x) v = rnd(2.0f);
+    for (auto& v : w) v = rnd(1.0f);
+    DeviceOnly dw;
+    if (int e = dw.map(w.size() * 2)) { skip("HIP's virtual memory calls are not available here (status %d)", e); return; }
+    if (hipMemcpy(dw.p, w.data(), w.size() * 2, hipMemcpyHostToDevice) != hipSuccess) {
+        fail("copying the weight into device-only memory failed"); return; }
+    int probe = 0;
+    if (!guarded([&] { return (int)*(volatile const uint8_t*)dw.p; }, &probe)) {
+        skip("the host can read device-only memory on this machine, so the case proves nothing here"); return; }
+    Dev dv;
+    RadTensor t[3] = { dense(dv.put(x.data(), x.size() * 2), RAD_BF16, M, K),
+                       dense(dw.p, RAD_BF16, N, K),
+                       dense(dv.put(ynan.data(), ynan.size() * 2), RAD_BF16, M, N) };
+    std::vector<RadParam> p = { pi("M", M), pi("N", N), pi("K", K), ps("dtype", "bf16") };
+    RadArgs a{ t, 3, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+    int rc = 0;
+    if (guarded([&] { return fn(&a, nullptr); }, &rc)) {
+        fail("the shim read the weight's bytes on the host (SIGSEGV)"); return; }
+    (void)hipDeviceSynchronize();
+    if (rc != 0) { fail("the launch returned %d", rc); return; }
+    std::vector<uint16_t> y((size_t)(M * N));
+    if (hipMemcpy(y.data(), t[2].data, y.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) { fail("copying y back failed"); return; }
+    std::vector<double> ref((size_t)(M * N));
+    for (long long m = 0; m < M; ++m)
+        for (long long n = 0; n < N; ++n) {
+            double s = 0;
+            for (long long k = 0; k < K; ++k) s += (double)bf16_to_f32(x[m * K + k]) * bf16_to_f32(w[n * K + k]);
+            ref[m * N + n] = s;
+        }
+    compare("gemm_nt_bf16_tiled, M 32 N 64 K 128, the weight device-only", ref, y, 2e-3);
+#endif
+}
+
 int main(int argc, char** argv) {
     /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
      * even when output goes to a file or pipe. */
@@ -3017,6 +3818,11 @@ int main(int argc, char** argv) {
         check_band_reach();
         check_shapes();
         check_moe_numerics();
+        check_conv_numerics();
+        check_rope_numerics();
+    check_attn_depth();
+        check_i8a8_numerics();
+        check_gemm_device_weight();
 
         const int n = rows();
         int passed = 0, failed = 0;

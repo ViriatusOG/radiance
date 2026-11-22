@@ -23,12 +23,19 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.8-Flash-Next: IQR-V4 experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | `tp1.yaml`, `tp2.yaml` |
 | GLM-5.3-Flash: IQR-V4 experts, IQ8R trunk, int8 latent cache, four cards with the experts tiered to host memory | `glm53-flash-iqr-v4.rad` (159 GiB) | [download](https://huggingface.co/animusnull/glm-5.3-flash-iqr-v4) | `tp4.yaml` |
 | Qwen3.8-Flash-Next abliterated (refusals removed): IQR-V4 trunk (GPTQ), codebook experts (round to nearest), MTP, vision | `qwen3.8-flash-next-uncensored-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/davetha/qwen3.8-flash-next-uncensored-iqr-v4) | — |
+| Qwen3.8-Flash-Next: calibrated Q5 expert down (w5nl, group 64), BF16 PLE, vision | `qwen4exp-w5dn64-bf16ple-gptq.rad` (166 GiB) | [download](https://huggingface.co/gostar77/qwen3.8-flash-next-radiance-q5-w5dn64-bf16ple) | — |
+| Qwen3.8-Flash-Next IQ5R-V4: U5 trunk, W5NL expert down, BF16 PLE and vision | `qwen3.8-flash-next-iq5r.rad` (175 GiB) | [download](https://huggingface.co/gostar77/qwen3.8-flash-next-iq5r-v4-u5-w5-bf16ple) | — |
+| Qwen3.8-Flash-Next: U4 expert gate/up, W6NL expert down, BF16 PLE and vision | `qwen3.8-flash-next-u4-w6-bf16ple.rad` (170 GiB) | [download](https://huggingface.co/gostar77/qwen3.8-flash-next-u4-w6-bf16ple) | — |
 | Qwen3.8-27B IQ8R (rotated int8), DFlash2 drafter, vision | `qwen3.8-27b-iq8r-dflash.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iq8r-dflash) | `tp2.yaml` |
 | Qwen3.8-27B IQR-V4, 2.5 to 8 bits a weight ([docs/IQR.md](docs/IQR.md)), DFlash2 drafter, vision | `qwen3.8-27b-iq2r-v4.rad` .. `qwen3.8-27b-iq8r-v4.rad` (10 to 28 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4) | `tp1.yaml` (IQ4R-L) |
+| Hemmingway-1.5 (Qwen3.8-27B fine-tune) IQ4R-S, tool-tail GPTQ; this version serves the trunk, not the MTP block | `hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad` (14 GiB) | [download](https://huggingface.co/gostar77/hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq) | — |
 | Qwen3.6-35B-A3B IQ8R, MTP | `qwen3.6-35b-a3b-iq8r.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r) | — |
 | MiniCPM5-2B IQ8R, DSpark drafter | `minicpm5-2b-iq8r.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r) | `tp1.yaml`, `tp2.yaml` |
 | MiniCPM5-2B bf16 (served without its drafter) | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | — |
-| Spark X2.6 4B bf16: thinking and tool calls, one to four cards | `spark-x2.6-4b-bf16.rad` (8.3 GiB) | [convert](#convert-a-checkpoint) | — |
+| Spark X2.6 4B bf16: thinking and tool calls, one to four cards | `spark-x2.6-4b-radiance-bf16.rad` (8.3 GiB), with DSpark `spark-x2.6-4b-radiance-bf16-dspark.rad` (10 GiB) | [download](https://huggingface.co/gostar77/spark-x2.6-4b-radiance) | — |
+| Spark X2.6 4B IQ8R: rotated int8 trunk, optional bf16 head, layers 0-11 kept bf16, optional DSpark | `spark-x2.6-4b-radiance-iq8r-diverse.rad` .. `spark-x2.6-4b-radiance-iq8r-bf16-head-dspark.rad` (4.5 to 6.6 GiB) | [download](https://huggingface.co/gostar77/spark-x2.6-4b-radiance) | — |
+| Hy-Memory-30B-A3B bf16 | `hy-memory-30b-a3b-bf16.rad` (56 GiB) | [download](https://huggingface.co/gostar77/hy-memory-30b-a3b-radiance) | — |
+| Hy-Memory-30B-A3B W4 GPTQ: attention, dense MLP and routed experts | `hy-memory-30b-a3b-w4-gptq-full-1m.rad` (15 GiB) | [download](https://huggingface.co/gostar77/hy-memory-30b-a3b-radiance) | — |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | — |
 | Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | — |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | — |
@@ -61,6 +68,9 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Meta Muse Glimmer 30B bf16: text, images and video; sliding-window rotary layers between NoPE full ones, a windowed ViT | `muse-glimmer-30b-bf16.rad` (56 GiB) | [convert](#convert-a-checkpoint) | — |
 | Meta Muse Glimmer 30B w4a8: int4 trunk, images and video, one card | `muse-glimmer-30b-w4a8.rad` (16 GiB) | [convert](#convert-a-checkpoint) | — |
 | Meta Muse Glimmer 30B IQ8R: rotated int8 trunk, int8 head, DFlash drafter, images and video | `muse-glimmer-30b-iq8r-dflash.rad` (36 GiB) | [download](https://huggingface.co/StillDeadcode/muse-glimmer-30b-iq8r-dflash) | — |
+| Meta Muse Glimmer 30B IQ4R-V4: trellis trunk, DFlash2, BF16 vision | `muse-glimmer-30b-iq4r-v4-df2.rad` (24 GiB) | [download](https://huggingface.co/gostar77/muse-glimmer-30b-iq4r-v4-radiance) | — |
+| Meta Muse Glimmer 30B IQ4R-S-V4: smaller trellis trunk, DFlash2, BF16 vision | `muse-glimmer-30b-iq4r-s-v4-df2-bf16vision.rad` (19.6 GiB) | [download](https://huggingface.co/gostar77/muse-glimmer-30b-iq4r-s-v4-radiance) | — |
+| Meta Muse Glimmer 30B IQ4R-S-V4, int8 vision (needs [#564](https://codeberg.org/StillDeadcode/radiance/pulls/564)) | `muse-glimmer-30b-iq4r-s-v4-df2-i8vision.rad` (17.8 GiB) | [download](https://huggingface.co/gostar77/muse-glimmer-30b-iq4r-s-v4-radiance) | — |
 | Recursive Flint (39.8B, about 2.5B active) IQ8R: rotated int8 trunk and experts, two cards | `flint-iq8r.rad` (38 GiB) | [download](https://huggingface.co/StillDeadcode/flint-iq8r) | — |
 | Ling-3.0-tiny IQ8R: rotated int8 trunk and experts, one card | `ling-3.0-tiny-iq8r.rad` (7.9 GiB) | [download](https://huggingface.co/StillDeadcode/ling-3.0-tiny-iq8r) | — |
 | Nemotron 3.5 Embed 1B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | — |
@@ -169,8 +179,13 @@ in the clone (it needs `docker buildx` and tests the build as it goes). Then set
 ## Build from source
 
 You need Linux, git, a C++20 compiler, CMake 3.21+ and Ninja. For the device kernels you also need
-ROCm 10.1 or 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`). Clone the repository and
-build in it:
+ROCm 10.1 or 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`).
+
+The C++20 compiler is tested with the clang included in the ROCm 10.1 distribution; other
+compilers may produce compile errors in the C++ architecture plugins. Pull requests for
+cross-compiler build issues are not accepted.
+
+Clone the repository and build in it:
 
 ```sh
 git clone https://codeberg.org/StillDeadcode/radiance.git && cd radiance

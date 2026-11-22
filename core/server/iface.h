@@ -152,6 +152,15 @@ struct SchedMetrics {
     int64_t mixed_step_target_misses = 0;      /* those whose completed wall time exceeded the target */
     int64_t mixed_step_target_prefill_cap = 0; /* current learned mixed-prefill row cap */
     int64_t decode_rows_unspeculated = 0;
+    /* Runtime LoRA, by slot index (rad::SchedMetrics::loras): what completed under each slot
+     * and what runs there now. The dashboard's adapter rows read these; the names come from
+     * IScheduler::lora_names(), which indexes the same slots. */
+    static const int MAX_LORA_SLOTS = 16;
+    struct LoraCount {
+        int64_t requests = 0, prompt_tokens = 0, output_tokens = 0, running = 0;
+    };
+    int        n_loras = 0;
+    LoraCount  loras[MAX_LORA_SLOTS] = {};
     /* Cumulative nanoseconds inside steps, all shapes and decode-only. Wall clock over a step
      * count is not a step time: the engine idles between turns, and a prefill chunk costs an
      * order of magnitude more than a decode step. `step_ns_decode / steps_decode` is the cost of
@@ -161,6 +170,12 @@ struct SchedMetrics {
     /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+    /* The encoder: cumulative items, patches and nanoseconds, and the items waiting or being
+     * encoded now (rad::SchedMetrics::encode_items). */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
 };
 
 
@@ -187,6 +202,9 @@ struct SessionStat {
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
     bool        moving = false;   /* a transfer is outstanding */
+    /* The runtime LoRA the conversation's last turn ran under; "" for the base. A session's
+     * turns may name different adapters -- this is the newest one, not a constraint. */
+    std::string lora;
 };
 
 /* What stored conversations occupy off the card, blocks and snapshots each counted once (the
@@ -223,6 +241,8 @@ struct RequestStat {
     int64_t     kv_tokens = 0;
     int32_t     n_draft = 0;
     int32_t     slot = -1;
+    /* The runtime LoRA this row runs under; "" for the base. */
+    std::string lora;
     double      age_s = 0;
     double      ttft_s = -1;       /* negative until the first token */
     double      prefill_s = -1;    /* first token minus admission; negative until both */
@@ -276,6 +296,10 @@ public:
 
     /* The live request table, oldest first; returns the count. Default: none kept. */
     virtual int requests(std::vector<RequestStat>* /*out*/) const { return 0; }
+
+    /* The runtime LoRA names by slot index (the scheduler's ReqStat::lora_slot and the metrics'
+     * loras array index the same slots). Default: none. */
+    virtual std::vector<std::string> lora_names() const { return {}; }
 
     /* The stored conversations and where they are held. Default: no idle tiers, so an empty
      * table (everything the cache holds is in VRAM). */

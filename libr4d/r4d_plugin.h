@@ -525,6 +525,7 @@ int  r4d_rad_ar_twoshot_4rank_ti8  (const RadArgs*, RadStream);
 int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_ln_had_quant_i8(const RadArgs*, RadStream);
 int  r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs*, RadStream);
+int  r4d_rad_ar_rmsnorm(const RadArgs*, RadStream);
 int  r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs*, RadStream);
 int  r4d_rad_ar_hc_write(const RadArgs*, RadStream);
 /* ar_hc_write at four ranks, exact wire only, on an instance of the wide family keyed by its own
@@ -540,6 +541,12 @@ int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
+/* The same GEMM over a bf16x12 weight (r4d_gemm_bf16x12_nt_m64.hip); m16 forwards to m64, and
+ * tiled unpacks the weight into its scratch for gemm_bf16_nt_tiled. */
+int r4d_rad_gemm_bf16x12_m16(const RadArgs*, RadStream);
+int r4d_rad_gemm_bf16x12_m64(const RadArgs*, RadStream);
+int r4d_rad_gemm_bf16x12_tiled(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_bf16x12_tiled_scratch(const RadArgs*);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);
@@ -565,6 +572,7 @@ int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
 int r4d_rad_rowtopk_merge   (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);
+int r4d_rad_logit_rerank_bf16(const RadArgs*, RadStream);
 
 /* -- the routed mixture of experts (r4d_moe.hip) --
  *
@@ -646,6 +654,8 @@ int r4d_rad_logits_gemm_vocab(const RadArgs*, RadStream);
 int64_t r4d_rad_logits_gemm_vocab_scratch(const RadArgs*);
 int r4d_rad_logit_rerank_iqr(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
+/* Container-form int8 GEMM (row-major codes and per-row scales), selected by w_rb 1. */
+int r4d_rad_gemm_i8a8_row(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_rb32_tiled(const RadArgs*, RadStream);
 /* The IQR weights, decoded from their codes where they are read (r4d_gemm_iqr.hip). */
@@ -689,8 +699,8 @@ int r4d_rad_sample_chain    (const RadArgs*, RadStream);
  *
  * RadLayoutFn / RadRelayoutFn / RadUnrelayoutFn (rad_abi.h, spec §4.3). r4d_fp8_layout.cpp holds
  * the fp8 families (block-fp8 codes in fragment order; the lm_head, hyper-connection and MTP rows
- * with scales in each row's tail), r4d_layout.cpp the packed integer ones. Each refuses an
- * encoding its kernel does not read. A family whose kernel reads the canonical plane unchanged
+ * with scales in each row's tail), r4d_layout.cpp the packed integer ones and bf16x12. Each refuses
+ * an encoding its kernel does not read. A family whose kernel reads the canonical plane unchanged
  * (the row-major fp8 matvec, the fp8 experts) has only the layout hook, to check its input. */
 #define R4D_HOOKS(name)                                                                         \
     int r4d_rad_layout_##name(const RadParam*, int, int, const RadEncoding*, const int*,       \
@@ -714,6 +724,7 @@ R4D_HOOKS(w4)
 R4D_HOOKS(w2a8)
 R4D_HOOKS(moe_w4)
 R4D_HOOKS(moe_w4_mod4)
+R4D_HOOKS(bf16x12)
 #undef R4D_HOOKS
 /* embed_lookup_bf16's check that its table is plain bf16 (r4d_fp8_layout.cpp), and the IQR
  * table's hooks and gather (r4d_iqr_layout.cpp, r4d_iqr_embed.hip). */
@@ -1004,6 +1015,7 @@ int r4d_shape_all_reduce           (const RadParam*, int, int operand, RadOpdDes
 int r4d_shape_all_gather           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_ln_had_quant_i8   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_rmsnorm_quant_fp8 (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_ar_rmsnorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_rmsnorm_had_quant_i8g (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_hc_write          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_gather_hc_write   (const RadParam*, int, int operand, RadOpdDesc*);
@@ -1085,6 +1097,7 @@ int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t, int,
                                                  RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_ar_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_had_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);

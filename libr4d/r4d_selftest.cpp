@@ -425,6 +425,7 @@ static void cross_check(const Plugin& pl) {
 
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;
+    int p_x16 = -1, p_x64 = -1, p_xt = -1;
     int p_g2dec = -1, p_g2pre = -1, p_g2win = -1;
     int p_lsc = -1, p_lsw = -1, p_lsq = -1, p_lec = -1, p_let = -1;
     for (int k = 0; k < nk; ++k) {
@@ -436,6 +437,9 @@ static void cross_check(const Plugin& pl) {
         if (!std::strcmp(r->name, "gemm_bf16_nt_m16")) p_m16 = r->priority;
         if (!std::strcmp(r->name, "gemm_bf16_nt_m64")) p_m64 = r->priority;
         if (!std::strcmp(r->name, "gemm_bf16_nt_tiled")) p_bt = r->priority;
+        if (!std::strcmp(r->name, "gemm_bf16x12_nt_m16")) p_x16 = r->priority;
+        if (!std::strcmp(r->name, "gemm_bf16x12_nt_m64")) p_x64 = r->priority;
+        if (!std::strcmp(r->name, "gemm_bf16x12_nt_tiled")) p_xt = r->priority;
         if (!std::strcmp(r->name, "attn_decode_h256_gqa2_i8"))  p_g2dec = r->priority;
         if (!std::strcmp(r->name, "attn_prefill_h256_gqa2_i8")) p_g2pre = r->priority;
         if (!std::strcmp(r->name, "attn_window_h256_gqa2_i8kv"))  p_g2win = r->priority;
@@ -450,6 +454,9 @@ static void cross_check(const Plugin& pl) {
     ok("gemm_bf16_nt_m16 outranks _m64 (libr4d row order, see the ladder)", p_m16 > p_m64);
     ok("gemm_bf16_nt_tiled outranks _m64 and not _m16 (M > 64 is its band)",
        p_bt > p_m64 && p_bt < p_m16);
+    ok("gemm_bf16x12_nt_m16 outranks _m64, as the bf16 pair", p_x16 > p_x64 && p_x64 > 0);
+    ok("gemm_bf16x12_nt_tiled outranks _m64 and not _m16, as gemm_bf16_nt_tiled",
+       p_xt > p_x64 && p_xt < p_x16);
     ok("the h256/gqa2 legs outrank the windowed kernel in both their bands",
        p_g2win > 0 && p_g2dec > p_g2win && p_g2pre > p_g2win);
     ok("the tiled LoRA rows outrank the scalar rows they shadow (at every M)",
@@ -7228,6 +7235,127 @@ static void i8a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N
     char d[64];
     std::snprintf(d, sizeof d, "rel_l2 %.3e", rel);
     ok(nm, rel < 5e-3, d);
+}
+
+/* gemm_i8a8_row reads the container's row-major planes. Against a host product, and byte-identical
+ * to gemm_i8a8_tiled once that row's hooks have moved the same planes into fragment order: the
+ * MMA and the fold are that tile's, so a differing byte is a gather that missed frag_src. */
+static void i8a8_row_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K) {
+    if (!sel("gemm_i8a8_row") && !sel("gemm_i8a8_tiled")) return;
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "gemm_i8a8_row numeric M=%lld N=%lld K=%lld", (long long)M,
+                  (long long)N, (long long)K);
+    const RadKernelInfo* row = find(pl, "gemm_i8a8_row");
+    const RadKernelInfo* tiled = find(pl, "gemm_i8a8_tiled");
+    const RadKernelInfo* qz = find(pl, "quant_act_i8g");
+    if (!row || !tiled || !qz || !row->layout || !tiled->relayout) {
+        ok(nm, false, "rows or hooks absent");
+        return;
+    }
+    const int64_t nkb = K / 128;
+    Planes p;
+    p.enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    p.size(N, K);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t g = 0; g < nkb; ++g) {
+            const float sc = 0.02f * (float)(1 + (n + 3 * g) % 7);
+            rad_store_f32(p.data[1].data(), RAD_BF16, n * nkb + g, sc);
+            for (int64_t j = 0; j < 128; ++j)
+                p.data[0][(size_t)(n * K + g * 128 + j)] =
+                    (uint8_t)(int8_t)((int)((n * 13 + g * 5 + j * 3) % 251) - 125);
+        }
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PI("w_rb", 1) };
+    std::vector<uint8_t> wrow, srow, wfrag, sfrag;
+    const int idw = stored(row, lp, 2, p, { "codes" }, &wrow);
+    const int ids = stored(row, lp, 3, p, { "scale" }, &srow);
+    if (idw != RAD_E_UNSUPPORTED || ids != RAD_E_UNSUPPORTED) {
+        ok(nm, false, "identity layout rc " + std::to_string(idw) + "/" + std::to_string(ids));
+        return;
+    }
+    std::vector<RadParam> tp = { PI("N", N), PI("K", K), PI("group", 128) };
+    const int rw = stored(tiled, tp, 2, p, { "codes" }, &wfrag);
+    const int rs = stored(tiled, tp, 3, p, { "scale" }, &sfrag);
+    if (rw != RAD_OK || rs != RAD_OK) {
+        ok(nm, false, "tiled relayout rc " + std::to_string(rw) + "/" + std::to_string(rs));
+        return;
+    }
+    std::vector<uint16_t> ha((size_t)(M * K));
+    for (int64_t i = 0; i < M * K; ++i)
+        ha[(size_t)i] = h_to_bf16((float)(((i * 17) % 401) - 200) * 0.04f);
+    void* d_a = dalloc(ha.size() * 2);
+    void* d_q = dalloc((size_t)(M * K));
+    void* d_qs = dalloc((size_t)(M * nkb) * 4);
+    void* d_w = dalloc((size_t)(N * K));
+    void* d_s = dalloc((size_t)(N * nkb) * 2);
+    void* d_wf = dalloc(wfrag.size());
+    void* d_sf = dalloc(sfrag.size());
+    void* d_y = dalloc((size_t)(M * N) * 2);
+    void* d_yt = dalloc((size_t)(M * N) * 2);
+    if (!d_a || !d_q || !d_qs || !d_w || !d_s || !d_wf || !d_sf || !d_y || !d_yt) {
+        ok(nm, false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wrow.data(), wrow.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, srow.data(), srow.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_wf, wfrag.data(), wfrag.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_sf, sfrag.data(), sfrag.size(), hipMemcpyHostToDevice);
+    auto launch = [&](const RadKernelInfo* k, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        return k->launch(&a, (RadStream) nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess
+                   ? RAD_OK : -1;
+    };
+    int rc = launch(qz, { T(d_a, RAD_BF16, { M, K }), T(d_q, RAD_I8, { M, K }),
+                          T(d_qs, RAD_F32, { M, nkb }) },
+                    { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok(nm, false, "quant rc " + std::to_string(rc)); return; }
+    std::vector<RadTensor> absent_tail = { T(nullptr, RAD_F32, { 1 }), T(nullptr, RAD_U8, { 1 }) };
+    std::vector<RadTensor> ts = {
+        T(d_q, RAD_I8, { M, K }), T(d_qs, RAD_F32, { M, nkb }), T(d_w, RAD_I8, { N, K }),
+        T(d_s, RAD_BF16, { N, nkb }), T(d_y, RAD_BF16, { M, N }), absent_tail[0], absent_tail[1],
+    };
+    absent(ts[5]); absent(ts[6]);
+    rc = launch(row, ts, { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                           PS("dtype", "i8a8"), PI("w_rb", 1) });
+    if (rc != RAD_OK) { ok(nm, false, "row rc " + std::to_string(rc)); return; }
+    ts[2] = T(d_wf, RAD_I8, { N, K });
+    ts[3] = T(d_sf, RAD_BF16, { N, nkb });
+    ts[4] = T(d_yt, RAD_BF16, { M, N });
+    rc = launch(tiled, ts, { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                             PS("dtype", "i8a8") });
+    if (rc != RAD_OK) { ok(nm, false, "tiled rc " + std::to_string(rc)); return; }
+    std::vector<uint16_t> hy((size_t)(M * N)), ht((size_t)(M * N)), hq_b;
+    std::vector<int8_t> hq((size_t)(M * K));
+    std::vector<float> hqs((size_t)(M * nkb));
+    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(ht.data(), d_yt, ht.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(hq.data(), d_q, hq.size(), hipMemcpyDeviceToHost);
+    st_memcpy(hqs.data(), d_qs, hqs.size() * 4, hipMemcpyDeviceToHost);
+    int64_t differ = 0;
+    for (size_t i = 0; i < hy.size(); ++i) differ += hy[i] != ht[i];
+    ok((std::string(nm) + " matches gemm_i8a8_tiled").c_str(), differ == 0,
+       std::to_string(differ) + " bf16 words differ");
+    double num = 0, den = 0;
+    const int64_t nstep = N > 64 ? N / 64 : 1;
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t n = 0; n < N; n += (n + nstep < N ? nstep : 1)) {
+            double acc = 0;
+            for (int64_t k = 0; k < K; ++k)
+                acc += (double)hq[(size_t)(i * K + k)] * hqs[(size_t)(i * nkb + k / 128)] *
+                       (double)(int8_t)p.data[0][(size_t)(n * K + k)] *
+                       rad_load_f32(p.data[1].data(), RAD_BF16, n * nkb + k / 128);
+            const double dlt = (double)h_bf16(hy[(size_t)(i * N + n)]) - acc;
+            num += dlt * dlt;
+            den += acc * acc;
+        }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    char detail[64];
+    std::snprintf(detail, sizeof detail, "rel_l2 %.3e", rel);
+    ok(nm, rel < 5e-3, detail);
 }
 
 /* gemm_iqr_nt_m64 and gemm_iqr_tiled against the int8 rows over the same weight decoded on the
@@ -17570,6 +17698,94 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     ok(rn.c_str(), bad == 0, std::to_string(bad) + " wrong ids, values or orderings");
 }
 
+/* logit_rerank over a plain bf16 head (logit_rerank_bf16, for qwen35_bf16's drafter): the head as
+ * logits_gemm_bf16 stores it, [N][K] bf16 with no layout hook, against a host dot product of the
+ * same bf16 values. Each row has R candidates, the last an id past this rank's rows, which must
+ * come back a pad (-1, sorted last). With `voff` the ids are global, as row_topk reports them under
+ * vocab-parallel drafting, and the pair plane the merge reads must carry the same (id, value). */
+static void bf16_rerank_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M, int64_t voff) {
+    const std::string tag = " [N=" + std::to_string(N) + " K=" + std::to_string(K) + " M=" +
+                            std::to_string(M) + " vocab_off=" + std::to_string(voff) + "]";
+    const std::string rn = "logit_rerank_bf16 vs host ref over the bf16 head" + tag;
+    const RadKernelInfo* rr = find(pl, "logit_rerank_bf16");
+    if (!rr) { ok(rn.c_str(), false, "row absent"); return; }
+    ok("logit_rerank_bf16 has no layout hook (a single-plane head only)",
+       !rr->layout && !rr->relayout);
+
+    std::vector<uint16_t> wb((size_t)N * K), xb((size_t)M * K);
+    std::vector<float> wf((size_t)N * K), xf((size_t)M * K);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c) {
+            const float v = std::ldexp(1.0f, (int)((r % 5) - 2)) *
+                            (0.031f * (float)((r * 37 + c * 11) % 61) - 0.9f);
+            wb[(size_t)(r * K + c)] = h_to_bf16(v);
+            wf[(size_t)(r * K + c)] = h_bf16(wb[(size_t)(r * K + c)]);
+        }
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t c = 0; c < K; ++c) {
+            xb[(size_t)(m * K + c)] = h_to_bf16(0.017f * (float)((m * 53 + c * 7) % 83) - 0.7f);
+            xf[(size_t)(m * K + c)] = h_bf16(xb[(size_t)(m * K + c)]);
+        }
+    std::vector<double> ref((size_t)(M * N));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0;
+            for (int64_t c = 0; c < K; ++c)
+                acc += (double)wf[(size_t)(n * K + c)] * xf[(size_t)(m * K + c)];
+            ref[(size_t)(m * N + n)] = acc;
+        }
+
+    const int64_t R = std::min<int64_t>(8, N);
+    std::vector<int32_t> cand((size_t)(M * R));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t r = 0; r < R; ++r)
+            cand[(size_t)(m * R + r)] =
+                (int32_t)(voff + (r == R - 1 ? N : (m * 131 + r * 977) % N));
+    void* d_w  = dalloc(wb.size() * 2);
+    void* d_x  = dalloc(xb.size() * 2);
+    void* d_in = dalloc(cand.size() * 4);
+    void* d_oi = dalloc(cand.size() * 4);
+    void* d_ov = dalloc(cand.size() * 4);
+    void* d_pr = dalloc(cand.size() * 8);
+    if (!d_w || !d_x || !d_in || !d_oi || !d_ov || !d_pr) { ok(rn.c_str(), false, "hipMalloc failed"); return; }
+    st_memcpy(d_w, wb.data(), wb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_x, xb.data(), xb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_in, cand.data(), cand.size() * 4, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { N, K }),
+                                  T(d_in, RAD_I32, { M, R }), T(d_oi, RAD_I32, { M, R }),
+                                  T(d_ov, RAD_F32, { M, R }) };
+    if (voff) ts.push_back(T(d_pr, RAD_F32, { M, R, 2 }));
+    const int rc = launch_row(rr, ts, { PI("M", M), PI("R", R), PI("n_vocab", N), PI("n_embd", K),
+                                        PI("vocab_off", voff), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok(rn.c_str(), false, "rc=" + std::to_string(rc)); return; }
+    std::vector<int32_t> oi(cand.size());
+    std::vector<float> ov(cand.size()), pr(cand.size() * 2);
+    st_memcpy(oi.data(), d_oi, oi.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(ov.data(), d_ov, ov.size() * 4, hipMemcpyDeviceToHost);
+    if (voff) st_memcpy(pr.data(), d_pr, pr.size() * 4, hipMemcpyDeviceToHost);
+    int64_t bad = 0;
+    for (int64_t m = 0; m < M; ++m) {
+        double amax = 0;
+        for (int64_t n = 0; n < N; ++n) amax = std::max(amax, std::fabs(ref[(size_t)(m * N + n)]));
+        for (int64_t r = 0; r < R; ++r) {
+            const int32_t id = oi[(size_t)(m * R + r)];
+            const float v = ov[(size_t)(m * R + r)];
+            if (voff) {
+                int32_t pid;
+                std::memcpy(&pid, &pr[(size_t)(m * R + r) * 2], sizeof pid);
+                bad += pid != id || pr[(size_t)(m * R + r) * 2 + 1] != v;
+            }
+            if (r == R - 1) { bad += id != -1; continue; }      /* the pad sorts last */
+            const bool known = std::find(cand.begin() + m * R, cand.begin() + m * R + R - 1, id) !=
+                               cand.begin() + m * R + R - 1;
+            bad += !known ||
+                   std::fabs((double)v - ref[(size_t)(m * N + (id - voff))]) > 1e-3 * amax + 1e-4;
+            if (r > 0) bad += v > ov[(size_t)(m * R + r - 1)];
+        }
+    }
+    ok(rn.c_str(), bad == 0, std::to_string(bad) + " wrong ids, values, orderings or pairs");
+}
+
 /* ---- the decode GEMM, timed ------------------------------------------------------------------
  *
  * Timing per shape for rows rad-tune cannot reach (the fp8a8 rows declare no axes).
@@ -21027,17 +21243,25 @@ static void project_perf(const Plugin& pl, int64_t M, int iters) {
 /* logits_gemm_bf16_cols against logits_gemm_bf16 on the same operands: the column form must give
  * the block-per-column row's bytes. M from one row to past the 8-row chunk, a vocabulary not a
  * multiple of the four columns a wave takes, an activation row pitch past n_embd, and a NaN and
- * signed zeros in the activation, which the per-thread sums must carry the same way. With `iters`
- * both rows are also timed at GLM-5.3's TP8 slice, where the weight is past the last-level cache
- * and every launch reads it from memory. */
-static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters = 0) {
+ * signed zeros in the activation, which the per-thread sums must carry the same way. K is one of
+ * the row's two widths: 4096, two chunks a thread, and 5120, where half the block kernel's threads
+ * hold three. With `iters` both rows are also timed at the slice the caller names (GLM-5.3's TP8
+ * head is 19360 x 4096, Qwen3.8-27B's TP2 head 124160 x 5120), where the weight is past the
+ * last-level cache and every launch reads it from memory. */
+static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters = 0,
+                              int64_t K = 4096) {
     const RadKernelInfo* ref = find(pl, "logits_gemm_bf16");
     const RadKernelInfo* cols = find(pl, "logits_gemm_bf16_cols");
     if (!ref || !cols) {
         ok("logits_gemm_bf16_cols", false, "row absent");
         return;
     }
-    const int64_t K = 4096, xp = K + 8;
+    if (K != 4096 && K != 5120) {
+        ok(fmt("logits_gemm_bf16_cols n_embd=%lld", (long long)K).c_str(), false,
+           "the row serves n_embd 4096 and 5120");
+        return;
+    }
+    const int64_t xp = K + 8;
     std::vector<uint16_t> hx((size_t)(M * xp), 0), hw((size_t)(N * K));
     for (int64_t r = 0; r < M; ++r)
         for (int64_t k = 0; k < K; ++k)
@@ -21067,10 +21291,13 @@ static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters 
     st_memset(dy, 0x5a, got.size());
     run_case(cols, ts, ps);
     st_memcpy(got.data(), dy, got.size(), hipMemcpyDeviceToHost);
-    ok(fmt("logits_gemm_bf16_cols M=%lld N=%lld: the bytes of logits_gemm_bf16", (long long)M,
-           (long long)N)
+    size_t bad = 0;
+    for (size_t i = 0; i < got.size(); i += 4)
+        if (std::memcmp(&got[i], &want[i], 4)) ++bad;
+    ok(fmt("logits_gemm_bf16_cols n_embd=%lld M=%lld N=%lld: the bytes of logits_gemm_bf16",
+           (long long)K, (long long)M, (long long)N)
            .c_str(),
-       got == want);
+       bad == 0, fmt("%zu of %lld logits differ", bad, (long long)(M * N)));
     if (iters > 0) {
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
@@ -21083,8 +21310,8 @@ static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters 
         for (const RadKernelInfo* r : { ref, cols }) {
             for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
             const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-            std::printf("  %-22s M=%-3lld %9.1f us  %6.1f GB/s of weight\n", r->name, (long long)M,
-                        us, bytes / (us * 1e3));
+            std::printf("  %-22s M=%-3lld K=%lld N=%lld %9.1f us  %6.1f GB/s of weight\n", r->name,
+                        (long long)M, (long long)K, (long long)N, us, bytes / (us * 1e3));
         }
     }
     dfree_all();
@@ -22759,6 +22986,1128 @@ static void bf16_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int ite
                      tp.label.c_str());
         }
     }
+}
+/* ---- the bf16 GEMM over bf16x12 weights (gemm_bf16x12_nt_m16, _m64, _tiled) ---------------------
+ *
+ * libquant's bf16x12 keeps a bf16 weight losslessly in four planes (lq_bf16x12.cpp), and the rows'
+ * layout hook arranges them for the kernel (r4d_layout.cpp). The planes here are written from the
+ * format as libquant states it and the stored form comes from the row's own hooks, so a wrong idea
+ * of the format on any side shows as a failed round trip or unequal bytes.
+ *
+ * The decode rows' case, on synthetic weights at small shapes and at the trunk's TP2 shapes:
+ *   - on the host: the planes decode to the weight; the stored form, read in the order the
+ *     kernel's header states, is the weight; the row's inverse gives the planes back
+ *   - C byte for byte against gemm_bf16_nt_m64 at every point of the row's tuning space, M 1 to 64
+ *     (1 to 16 for _m16). Only sk sets the bits, and the bf16 row runs at each point's wv, sk and
+ *     mb; at sk 0 at the split the packed row's law gives (x12_law_sk)
+ *   - both rows untuned at the trunk shapes: there the two laws agree, so an untuned install gives
+ *     the bf16 bytes
+ *   - _m64: rank 1's share of rows and of columns, whose raw blocks index the whole weight's
+ *     table; the launch's refusals; M past the decode band
+ *
+ * The prefill row's (x12_tiled) unpacks the weight into its scratch for gemm_bf16_nt_tiled:
+ *   - its hooks are the decode rows', so every band of an op reads one stored form; its scratch is
+ *     the bf16 weight at any M
+ *   - C byte for byte against gemm_bf16_nt_tiled at the same tile and split, at every tile and
+ *     M 65 to 2048: a small weight with an infinity, rank 1's shares, the trunk's TP2 shapes
+ *   - untuned against gemm_bf16x12_nt_m64 untuned at a K where the laws at 16 and 32 split
+ *     differently, and against gemm_bf16_nt_tiled untuned at the trunk's K, where they agree
+ *   - the launch's refusals; then each trunk shape timed at M = 2048, the unpack included
+ *
+ * --perfx12 <file> <woff> N K M [iters] [wv,sk,mb ...] runs the small check, then the real N x K
+ * bf16 weight at byte `woff` of a safetensors file (as for --real), packed with libquant's default
+ * table: the host checks, then at each point C byte for byte and both rows timed, the weights
+ * rotated over copies past the last-level cache as in bf16_perf. The points: the untuned default,
+ * each wv,sk,mb given (0 = the law's), then the splits at wv 1 and 2, mb 1; the packed row in its
+ * plain form and PRE. --tunex12 <file> <woff> N K [iters] times both decode bands at every distinct
+ * point on such a weight, for the tune homes (x12_tune). */
+
+/* The k inside a block of lane half h, k step t and fragment element e, and that element's nibble
+ * in its D dword: the kernel's order, which reading a stored form back follows. */
+static int x12_k(int h, int t, int e) { return 16 * t + 8 * (e >> 2) + 4 * h + (e & 3); }
+static int x12_dbit(int e) { return (e & 1) ? 16 + 4 * (e >> 1) : 4 * (e >> 1); }
+static unsigned x12_exp(uint16_t v) { return (v >> 7) & 0xFFu; }
+
+/* libquant's planes of an N x K bf16 weight: codes, d, e and an escape table of `cap` rows (0: one
+ * a raw block, at least one). `raw` gets how many blocks are raw; with more than `cap` the planes
+ * are empty (no encoding). */
+static Planes x12_canon(const std::vector<uint16_t>& w, int64_t N, int64_t K, int64_t cap,
+                        int64_t* raw) {
+    const int64_t nb = K / 32;
+    std::vector<uint8_t> top((size_t)(N * nb));      /* E, or 0xFF for a raw block */
+    int64_t n = 0;
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t b = 0; b < nb; ++b) {
+            unsigned hi = 0, lo = 255;
+            for (int i = 0; i < 32; ++i) {
+                const unsigned ex = x12_exp(w[(size_t)(r * K + b * 32 + i)]);
+                hi = std::max(hi, ex);
+                lo = std::min(lo, ex);
+            }
+            const bool is_raw = hi == 0xFFu || hi - lo > 15;
+            top[(size_t)(r * nb + b)] = (uint8_t)(is_raw ? 0xFFu : hi);
+            n += is_raw;
+        }
+    *raw = n;
+    Planes p;
+    if (cap <= 0) cap = std::max<int64_t>(n, 1);
+    if (n > cap) return p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "bf16x12");
+    rad_enc_add_plane(&p.enc, "codes", RAD_U8, 1, 1);
+    rad_enc_add_plane(&p.enc, "d", RAD_U4, 1, 1);
+    rad_enc_add_plane(&p.enc, "e", RAD_U8, 1, 32);
+    rad_enc_add_table(&p.enc, "esc", RAD_BF16, cap, 32);
+    p.size(N, K);
+    uint32_t idx = 0;
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint16_t* x = &w[(size_t)(r * K + b * 32)];
+            uint8_t* c = &p.data[0][(size_t)(r * K + b * 32)];
+            uint8_t* d = &p.data[1][(size_t)(r * (K / 2) + b * 16)];
+            const unsigned E = top[(size_t)(r * nb + b)];
+            p.data[2][(size_t)(r * nb + b)] = (uint8_t)E;
+            if (E == 0xFFu) {
+                std::memcpy(d, &idx, 4);
+                std::memcpy(&p.data[3][(size_t)idx * 64], x, 64);
+                ++idx;
+                continue;
+            }
+            for (int i = 0; i < 32; ++i) {
+                c[i] = (uint8_t)((x[i] >> 15) << 7 | (x[i] & 0x7Fu));
+                d[i / 2] = (uint8_t)(d[i / 2] | (E - x12_exp(x[i])) << (4 * (i & 1)));
+            }
+        }
+    return p;
+}
+
+/* The planes back to bf16, as libquant's decode hook reads them. */
+static std::vector<uint16_t> x12_decode(const Planes& p, int64_t N, int64_t K) {
+    const int64_t nb = K / 32;
+    std::vector<uint16_t> out((size_t)(N * K), 0);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t b = 0; b < nb; ++b) {
+            const unsigned E = p.data[2][(size_t)(r * nb + b)];
+            const uint8_t* c = &p.data[0][(size_t)(r * K + b * 32)];
+            const uint8_t* d = &p.data[1][(size_t)(r * (K / 2) + b * 16)];
+            uint16_t* o = &out[(size_t)(r * K + b * 32)];
+            if (E == 0xFFu) {
+                uint32_t idx;
+                std::memcpy(&idx, d, 4);
+                if ((int64_t)idx < p.rows[3]) std::memcpy(o, &p.data[3][(size_t)idx * 64], 64);
+                continue;
+            }
+            for (int i = 0; i < 32; ++i) {
+                const unsigned off = (d[i / 2] >> (4 * (i & 1))) & 0xFu;
+                o[i] = (uint16_t)((c[i] >> 7) << 15 | ((E - off) & 0xFFu) << 7 | (c[i] & 0x7Fu));
+            }
+        }
+    return out;
+}
+
+/* A stored form read back as the kernel reads it: SM, D and E in the fragment order its header
+ * states, and a raw block's table row by the index in each of its D dwords. */
+static std::vector<uint16_t> x12_read_stored(const std::vector<uint8_t>& s, int64_t N, int64_t K) {
+    const int64_t nb = K / 32;
+    const R4dX12Regions g = r4d_x12_regions(N, K, 0);
+    std::vector<uint16_t> out((size_t)(N * K), 0);
+    if ((int64_t)s.size() < g.esc) return out;
+    const int64_t rows = ((int64_t)s.size() - g.esc) / 64;
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t b = 0; b < nb; ++b) {
+            const unsigned E = s[(size_t)(g.e + r * nb + b)];
+            const uint8_t* sm = &s[(size_t)(g.sm + r * K + b * 32)];
+            const uint8_t* d = &s[(size_t)(g.d + r * (K / 2) + b * 16)];
+            uint16_t* o = &out[(size_t)(r * K + b * 32)];
+            for (int h = 0; h < 2; ++h)
+                for (int t = 0; t < 2; ++t) {
+                    uint32_t dw;
+                    std::memcpy(&dw, d + 8 * h + 4 * t, 4);
+                    for (int e = 0; e < 8; ++e) {
+                        const int at = 16 * h + 8 * t + e, k = x12_k(h, t, e);
+                        if (E == 0xFFu) {
+                            if ((int64_t)dw < rows)
+                                std::memcpy(&o[k], &s[(size_t)(g.esc + (int64_t)dw * 64 + at * 2)], 2);
+                            continue;
+                        }
+                        const unsigned off = (dw >> x12_dbit(e)) & 0xFu;
+                        o[k] = (uint16_t)((sm[at] >> 7) << 15 | ((E - off) & 0xFFu) << 7 |
+                                          (sm[at] & 0x7Fu));
+                    }
+                }
+        }
+    return out;
+}
+
+/* Weights like the checkpoint's: exponent fields 118 to 127, both signs. Then about a third of the
+ * blocks made raw by one element, a zero, a negative zero or an exponent 16 below the block's
+ * largest, and some spanning exactly 15 (packed); an all-zero and an all-negative-zero block
+ * (packed, E 0); with `inf`, an infinity (raw, E 0xFF). N >= 8 and K >= 320. */
+static std::vector<uint16_t> x12_weight(int64_t N, int64_t K, uint32_t seed, bool inf) {
+    const int64_t nb = K / 32;
+    std::vector<uint16_t> w((size_t)(N * K));
+    for (size_t i = 0; i < w.size(); ++i) {
+        const uint32_t x = st_mix32((uint32_t)i * 2654435761u + seed);
+        const unsigned ex = 118u + (x >> 8) % 10u;
+        w[i] = (uint16_t)(((x >> 31) << 15) | (ex << 7) | (x & 0x7Fu));
+    }
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t b = 0; b < nb; ++b) {
+            uint16_t* x = &w[(size_t)(r * K + b * 32)];
+            const int64_t q = r * nb + b;
+            const int i = (int)(st_mix32((uint32_t)q + 99u + seed) % 32u);
+            unsigned hi = 0;
+            for (int j = 0; j < 32; ++j) hi = std::max(hi, x12_exp(x[j]));
+            if (q % 5 == 0)      x[i] = (q % 10 == 0) ? 0x0000 : 0x8000;
+            else if (q % 7 == 1) x[i] = (uint16_t)((x[i] & 0x807Fu) | ((hi - 16) << 7));
+            else if (q % 7 == 3) x[i] = (uint16_t)((x[i] & 0x807Fu) | ((hi - 15) << 7));
+        }
+    for (int j = 0; j < 32; ++j) {
+        w[(size_t)(3 * K + 4 * 32 + j)] = 0x0000;
+        w[(size_t)(5 * K + 9 * 32 + j)] = 0x8000;
+    }
+    if (inf) w[(size_t)(7 * K + 2 * 32 + 5)] = 0x7F80;
+    return w;
+}
+
+/* One weight of a case: the bf16 matrix, its planes, the stored form the row's hooks make of them,
+ * and both forms on the card. */
+struct X12W {
+    int64_t N = 0, K = 0, raw = 0;
+    std::vector<uint16_t> w;
+    Planes p;
+    std::vector<uint8_t> s;
+    void* d_w = nullptr;        /* the bf16 matrix */
+    void* d_s = nullptr;        /* the stored form */
+};
+
+/* The planes, packed from `w` with a table of `cap` rows (0: one a raw block) unless `have` says
+ * they are given, stored through `r`'s hooks; the host checks; both forms uploaded. False when a
+ * step failed, which is reported. */
+static bool x12_ready(const RadKernelInfo* r, const std::string& tag, X12W& x, int64_t cap = 0,
+                      bool have = false) {
+    if (!have) {
+        x.p = x12_canon(x.w, x.N, x.K, cap, &x.raw);
+        if (x.p.enc.n_planes == 0) {
+            ok((tag + ": packed").c_str(), false,
+               fmt("%lld raw blocks and a table of %lld", (long long)x.raw, (long long)cap));
+            return false;
+        }
+    }
+    ok((tag + ": the planes decode to the weight").c_str(), x12_decode(x.p, x.N, x.K) == x.w);
+    const std::vector<RadParam> lp = { PI("N", x.N), PI("K", x.K), PS("dtype", "bf16x12") };
+    RadLayout L;
+    const int rc = stored(r, lp, 1, x.p, { "codes", "d", "e", "esc" }, &x.s, &L);
+    if (rc != RAD_OK) {
+        ok((tag + ": the row's relayout").c_str(), false, "rc=" + std::to_string(rc));
+        return false;
+    }
+    ok((tag + ": the stored form, read as the kernel reads it, is the weight").c_str(),
+       L.dtype == R4D_DT_BF16X12 &&
+           L.bytes == r4d_x12_regions(x.N, x.K, x.p.rows[3]).bytes &&
+           x12_read_stored(x.s, x.N, x.K) == x.w,
+       fmt("dtype %u, %lld bytes", L.dtype, (long long)L.bytes));
+    std::string why;
+    ok((tag + ": the row's inverse gives the planes back").c_str(),
+       restores(r, lp, 1, x.p, { "codes", "d", "e", "esc" }, x.s, &why), why);
+    x.d_w = dalloc(x.w.size() * 2);
+    x.d_s = dalloc(x.s.size());
+    if (!x.d_w || !x.d_s) {
+        ok((tag + ": the weights on the card").c_str(), false, "hipMalloc failed");
+        return false;
+    }
+    st_memcpy(x.d_w, x.w.data(), x.w.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(x.d_s, x.s.data(), x.s.size(), hipMemcpyHostToDevice);
+    return true;
+}
+
+/* rank `rank` of two's share of a weight, cut as the loader cuts one: rows (`cols` false) or
+ * columns of every tiled plane, the table whole. Its raw blocks keep the whole weight's indices. */
+static X12W x12_share(const X12W& x, bool cols, int rank) {
+    X12W s;
+    const int64_t r0 = cols ? 0 : rank * x.N / 2, r1 = cols ? x.N : (rank + 1) * x.N / 2;
+    const int64_t c0 = cols ? rank * x.K / 2 : 0, c1 = cols ? (rank + 1) * x.K / 2 : x.K;
+    s.N = r1 - r0;
+    s.K = c1 - c0;
+    s.w.resize((size_t)(s.N * s.K));
+    s.p.enc = x.p.enc;
+    s.p.size(s.N, s.K);
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i = r - r0;
+        std::memcpy(&s.w[(size_t)(i * s.K)], &x.w[(size_t)(r * x.K + c0)], (size_t)s.K * 2);
+        std::memcpy(&s.p.data[0][(size_t)(i * s.K)], &x.p.data[0][(size_t)(r * x.K + c0)],
+                    (size_t)s.K);
+        std::memcpy(&s.p.data[1][(size_t)(i * s.K / 2)],
+                    &x.p.data[1][(size_t)(r * x.K / 2 + c0 / 2)], (size_t)s.K / 2);
+        std::memcpy(&s.p.data[2][(size_t)(i * s.K / 32)],
+                    &x.p.data[2][(size_t)(r * x.K / 32 + c0 / 32)], (size_t)s.K / 32);
+    }
+    s.p.data[3] = x.p.data[3];
+    return s;
+}
+
+/* The split the packed row's law gives at sk 0: r4d_gemm_args.h's pick_sk at the unit of a
+ * 32-block under the flat bound, mirrored so the bf16 row can run at the same split. A drift from
+ * the law shows as unequal bytes, not as a pass. `unit` 16 is the bf16 rows' law. */
+static int x12_law_sk(int64_t N, int64_t K, int wv, int64_t unit = 32) {
+    static const int ladder[] = { 1, 2, 4, 5, 8, 10, 16, 20 };
+    const int64_t n_tiles = (N + 15) / 16;
+    const int cap = 1024 / ((wv > 0 ? wv : 1) * 32);
+    int best = 1;
+    for (int s : ladder) {
+        if (s > cap || K % ((int64_t)s * unit)) continue;
+        best = s;
+        if (n_tiles * s >= 128) return s;
+    }
+    return best;
+}
+
+/* A point of the packed row's space; a negative value is left out, so the row takes its axis
+ * default. `tile` is the tiled rows' axis. */
+/* `chain` 1 sets the row's chained form (the decode rows' `chain` parameter, which the core sets where
+ * launches chain); outside the engine no record reaches it, so it must give the plain form's C. */
+struct X12Pt { int wv, sk, mb, form; int tile = -1; int chain = 0; };
+
+/* The scratch a row asks for (the tiled row's: the weight unpacked), from one buffer kept outside
+ * dalloc, as st_time_us's flush buffers are, since dfree_all runs between shapes. `poison` fills it
+ * first, so a value the unpack leaves unwritten shows in C. Null when the card has no room. */
+static void* x12_scratch(int64_t bytes, bool poison) {
+    static void* buf = nullptr;
+    static int64_t have = 0;
+    if (bytes > have) {
+        if (buf) st_free(buf);
+        buf = nullptr;
+        have = 0;
+        if (hipMalloc(&buf, (size_t)bytes) != hipSuccess) { buf = nullptr; return nullptr; }
+        have = bytes;
+    }
+    if (poison) st_memset(buf, 0x5A, (size_t)bytes);
+    return buf;
+}
+
+/* One launch of `r` as the engine issues one: the bf16 row over the matrix, the packed row over the
+ * stored form, or over `w` given as `wdt`, with the scratch its hook asks for. The launch's
+ * status. */
+static int x12_issue(const RadKernelInfo* r, const X12W& x, void* a, void* y, int64_t M,
+                     const X12Pt& pt, const void* w = nullptr, uint32_t wdt = 0,
+                     bool poison = false) {
+    const bool packed = std::strncmp(r->name, "gemm_bf16x12", 12) == 0;
+    std::vector<RadTensor> ts = {
+        T(a, RAD_BF16, { M, x.K }),
+        T(const_cast<void*>(w ? w : packed ? x.d_s : x.d_w),
+          wdt ? wdt : packed ? (uint32_t)R4D_DT_BF16X12 : (uint32_t)RAD_BF16, { x.N, x.K }),
+        T(y, RAD_BF16, { M, x.N }),
+    };
+    std::vector<RadParam> ps = { PI("M", M), PI("N", x.N), PI("K", x.K),
+                                 PS("dtype", packed ? "bf16x12" : "bf16") };
+    if (pt.wv >= 0) ps.push_back(PI("wv", pt.wv));
+    if (pt.sk >= 0) ps.push_back(PI("sk", pt.sk));
+    if (pt.mb >= 0) ps.push_back(PI("mb", pt.mb));
+    if (packed && pt.form >= 0) ps.push_back(PI("form", pt.form));
+    if (pt.tile >= 0) ps.push_back(PI("tile", pt.tile));
+    if (pt.chain > 0) ps.push_back(PI("chain", pt.chain));
+    RadArgs args;
+    std::memset(&args, 0, sizeof(args));
+    args.t = ts.data(); args.n_t = (int)ts.size();
+    args.p = ps.data(); args.n_p = (int)ps.size();
+    args.world_size = 1;
+    if (r->scratch) {
+        const int64_t need = r->scratch(&args);
+        if (need < 0) return (int)need;
+        if (need > 0) {
+            args.scratch = x12_scratch(need, poison);
+            args.scratch_bytes = need;
+            if (!args.scratch) return RAD_E_NOMEM;
+        }
+    }
+    return r->launch(&args, (RadStream) nullptr);
+}
+
+/* C of one launch, written over a fill so an element left unwritten shows. False when the launch
+ * is refused or the card fails. */
+static bool x12_out(const RadKernelInfo* r, const X12W& x, void* a, void* y, int64_t M,
+                    const X12Pt& pt, int fill, std::vector<uint16_t>* out) {
+    st_memset(y, fill, (size_t)(M * x.N) * 2);
+    if (x12_issue(r, x, a, y, M, pt, nullptr, 0, true) != RAD_OK ||
+        st_stream_sync(nullptr) != hipSuccess)
+        return false;
+    out->resize((size_t)(M * x.N));
+    st_memcpy(out->data(), y, out->size() * 2, hipMemcpyDeviceToHost);
+    return true;
+}
+
+/* The bf16 row's C, kept between comparisons at the same M, wv, split, mb and tile. */
+struct X12Ref {
+    std::vector<uint16_t> c;
+    int64_t M = -1;
+    int wv = 0, sk = 0, mb = 0, tile = 0;
+    bool ok = false;
+};
+
+/* C of the packed row at `pt` against the bf16 row `rb`'s at the same wv, sk, mb and tile (at sk 0,
+ * the packed row's law), byte for byte: the count that differ, or -1 when a launch is refused. */
+static int64_t x12_diff(const RadKernelInfo* rx, const RadKernelInfo* rb, const X12W& x, void* a,
+                        void* y0, void* y1, int64_t M, const X12Pt& pt, X12Ref* ref) {
+    const int wv = pt.wv > 0 ? pt.wv : 1;
+    const int sk = pt.sk > 0 ? pt.sk : x12_law_sk(x.N, x.K, wv);
+    if (ref->M != M || ref->wv != wv || ref->sk != sk || ref->mb != pt.mb ||
+        ref->tile != pt.tile) {
+        ref->ok = x12_out(rb, x, a, y0, M, X12Pt{ wv, sk, pt.mb, -1, pt.tile }, 0x11, &ref->c);
+        ref->M = M;
+        ref->wv = wv;
+        ref->sk = sk;
+        ref->mb = pt.mb;
+        ref->tile = pt.tile;
+    }
+    std::vector<uint16_t> got;
+    if (!ref->ok || !x12_out(rx, x, a, y1, M, pt, 0x22, &got)) return -1;
+    int64_t n = 0;
+    for (size_t i = 0; i < got.size(); ++i) n += got[i] != ref->c[i];
+    return n;
+}
+
+/* Every point of `r`'s tuning space at this geometry, as the core enumerates it. */
+static std::vector<X12Pt> x12_space(const RadKernelInfo* r, const X12W& x, int64_t M) {
+    const std::vector<RadParam> geom = { PI("M", M), PI("N", x.N), PI("K", x.K),
+                                         PS("dtype", "bf16x12") };
+    std::vector<X12Pt> out;
+    for (const TunePoint& tp : tune_points(r, geom)) {
+        X12Pt pt{ -1, -1, -1, -1 };
+        for (const RadParam& c : tp.choice) {
+            if (!std::strcmp(c.key, "wv"))        pt.wv = (int)c.ival;
+            else if (!std::strcmp(c.key, "sk"))   pt.sk = (int)c.ival;
+            else if (!std::strcmp(c.key, "mb"))   pt.mb = (int)c.ival;
+            else if (!std::strcmp(c.key, "form")) pt.form = (int)c.ival;
+            else if (!std::strcmp(c.key, "tile")) pt.tile = (int)c.ival;
+        }
+        out.push_back(pt);
+    }
+    return out;
+}
+
+/* An activation of Mmax rows and C buffers for both rows. */
+struct X12Io { void* a = nullptr; void* y0 = nullptr; void* y1 = nullptr; };
+static bool x12_io(const X12W& x, int64_t Mmax, X12Io* io) {
+    io->a = dalloc((size_t)(Mmax * x.K) * 2);
+    io->y0 = dalloc((size_t)(Mmax * x.N) * 2);
+    io->y1 = dalloc((size_t)(Mmax * x.N) * 2);
+    if (!io->a || !io->y0 || !io->y1) return false;
+    std::vector<uint16_t> a((size_t)(Mmax * x.K));
+    for (size_t i = 0; i < a.size(); ++i) a[i] = st_rand_bf16((uint32_t)i * 3u + 1u);
+    st_memcpy(io->a, a.data(), a.size() * 2, hipMemcpyHostToDevice);
+    return true;
+}
+
+/* C byte-identical to the bf16 row's at every point of `pts` (each M's tuning space when empty)
+ * and each M: one line. */
+static void x12_every_point(const RadKernelInfo* rx, const RadKernelInfo* rb, const X12W& x,
+                            const X12Io& io, const std::string& tag, const std::vector<int64_t>& Ms,
+                            const std::vector<X12Pt>& extra = {}) {
+    /* The decode rows have a chained form (kChained); each point runs in it too, at the M it is
+     * taken at (M <= 64), against the same bf16 C. */
+    const bool chained = std::strcmp(rx->name, "gemm_bf16x12_nt_tiled") != 0;
+    int runs = 0, cruns = 0;
+    std::string bad, cbad;
+    X12Ref ref;
+    for (int64_t M : Ms) {
+        std::vector<X12Pt> pts = x12_space(rx, x, M);
+        pts.insert(pts.end(), extra.begin(), extra.end());
+        for (const X12Pt& pt : pts) {
+            const int64_t n = x12_diff(rx, rb, x, io.a, io.y0, io.y1, M, pt, &ref);
+            ++runs;
+            if (n != 0 && bad.size() < 600)
+                bad += fmt(" M=%lld wv%d,sk%d,mb%d,form%d,tile%d: %s;", (long long)M, pt.wv, pt.sk,
+                           pt.mb, pt.form, pt.tile,
+                           n < 0 ? "refused" : fmt("%lld differ", (long long)n).c_str());
+            if (!chained || M > 64) continue;
+            X12Pt pc = pt;
+            pc.chain = 1;
+            const int64_t nc = x12_diff(rx, rb, x, io.a, io.y0, io.y1, M, pc, &ref);
+            ++cruns;
+            if (nc != 0 && cbad.size() < 600)
+                cbad += fmt(" M=%lld wv%d,sk%d,mb%d,form%d: %s;", (long long)M, pt.wv, pt.sk,
+                            pt.mb, pt.form,
+                            nc < 0 ? "refused" : fmt("%lld differ", (long long)nc).c_str());
+        }
+    }
+    ok(fmt("%s: C byte-identical to %s at every point (%d runs, M %lld to %lld)", tag.c_str(),
+           rb->name, runs, (long long)Ms.front(), (long long)Ms.back()).c_str(),
+       bad.empty(), bad);
+    if (cruns > 0)
+        ok(fmt("%s: the chained form, C byte-identical to %s at every point (%d runs)",
+               tag.c_str(), rb->name, cruns).c_str(),
+           cbad.empty(), cbad);
+}
+
+/* Both rows untuned, each at its own law: byte-identical where the laws give one split. */
+static void x12_untuned(const RadKernelInfo* rx, const RadKernelInfo* rb, const X12W& x,
+                        const X12Io& io, const std::string& tag, const std::vector<int64_t>& Ms) {
+    std::string bad;
+    for (int64_t M : Ms) {
+        std::vector<uint16_t> c0, c1;
+        const X12Pt none{ -1, -1, -1, -1 };
+        const bool ran = x12_out(rb, x, io.a, io.y0, M, none, 0x11, &c0) &&
+                         x12_out(rx, x, io.a, io.y1, M, none, 0x22, &c1);
+        if (!ran || c0 != c1) bad += fmt(" M=%lld %s;", (long long)M, ran ? "differs" : "refused");
+    }
+    ok(fmt("%s: untuned, C byte-identical to the untuned %s", tag.c_str(), rb->name).c_str(),
+       bad.empty(), bad);
+}
+
+/* The trunk's shapes at TP2 (Qwen3.8-27B): the delta net's in (q|k|v|a|b) and z, gate|up, down,
+ * attention's q|gate, the delta net's out and attention's o, k and v. */
+static const int64_t kX12Trunk[][2] = { { 5168, 5120 }, { 3072, 5120 }, { 17408, 5120 },
+                                        { 5120, 8704 }, { 6144, 5120 }, { 5120, 3072 },
+                                        { 512, 5120 } };
+
+static void x12_rows(const Plugin& pl, const char* row) {
+    const RadKernelInfo* rx = find(pl, row);
+    const RadKernelInfo* rb = find(pl, "gemm_bf16_nt_m64");
+    if (!rx || !rb || !rx->layout || !rx->relayout || !rx->unrelayout) {
+        ok(row, false, "row or hooks absent");
+        return;
+    }
+    const bool m16 = std::strcmp(row, "gemm_bf16x12_nt_m16") == 0;
+    const std::vector<int64_t> Ms = m16 ? std::vector<int64_t>{ 1, 8, 16 }
+                                        : std::vector<int64_t>{ 1, 8, 16, 40, 64 };
+
+    /* 72 x 1120: N leaves a part tile, and K is 35 blocks, so splits of 1, 5 and 7 all leave an
+     * unroll tail. Past the tuning space: three waves (a part block of tiles) and a split of 7. */
+    {
+        X12W x;
+        x.N = 72;
+        x.K = 1120;
+        x.w = x12_weight(x.N, x.K, 7u, true);
+        X12Io io;
+        if (!x12_ready(rx, "72 x 1120", x) || !x12_io(x, 64, &io)) { dfree_all(); return; }
+        std::printf("  72 x 1120: %lld of %lld blocks raw, an infinity among them\n",
+                    (long long)x.raw, (long long)(x.N * x.K / 32));
+        const std::vector<X12Pt> extra = { { 3, 7, 1, 1 }, { 3, 7, 1, 2 }, { 1, 7, 3, 1 },
+                                           { 2, 5, 2, 2 }, { 4, 1, 4, 1 }, { 3, 1, 2, 0 } };
+        x12_every_point(rx, rb, x, io, "72 x 1120", Ms, extra);
+
+        if (!m16) {
+            /* The launch refuses a weight of another dtype, a split that leaves part of a block
+             * (sk 3 does not divide 35 blocks), PRE above two row tiles and a form it lacks. */
+            const int e_dt = x12_issue(rx, x, io.a, io.y0, 8, { 1, 1, 1, 1 }, x.d_s, RAD_BF16);
+            const int e_sk = x12_issue(rx, x, io.a, io.y0, 8, { 1, 3, 1, 1 });
+            const int e_pre = x12_issue(rx, x, io.a, io.y0, 40, { 1, 1, 3, 2 });
+            const int e_form = x12_issue(rx, x, io.a, io.y0, 8, { 1, 1, 1, 3 });
+            st_stream_sync(nullptr);
+            ok("the launch refuses another dtype, a part block, PRE at three row tiles, form 3",
+               e_dt == RAD_E_DTYPE && e_sk == RAD_E_SHAPE && e_pre == RAD_E_UNSUPPORTED &&
+                   e_form == RAD_E_INVAL,
+               fmt("rc %d %d %d %d", e_dt, e_sk, e_pre, e_form));
+        }
+        dfree_all();
+    }
+
+    /* Rank 1's shares of a 96 x 4096 weight: its rows and its columns, as the loader cuts gate|up
+     * and the delta net's in (rows) and down, out and o (columns). Its raw blocks index the whole
+     * weight's table, which has rows to spare. */
+    if (!m16) {
+        X12W x;
+        x.N = 96;
+        x.K = 4096;
+        x.w = x12_weight(x.N, x.K, 11u, false);
+        x.p = x12_canon(x.w, x.N, x.K, x.N * x.K / 32, &x.raw);
+        for (const bool cols : { false, true }) {
+            X12W s = x12_share(x, cols, 1);
+            const std::string tag = std::string("rank 1's ") + (cols ? "columns" : "rows") +
+                                    " of 96 x 4096";
+            X12Io io;
+            if (!x12_ready(rx, tag, s, 0, true) || !x12_io(s, 64, &io)) { dfree_all(); continue; }
+            x12_every_point(rx, rb, s, io, tag, Ms);
+            dfree_all();
+        }
+    }
+
+    /* The trunk's shapes at TP2. */
+    for (const auto& sh : kX12Trunk) {
+        X12W x;
+        x.N = sh[0];
+        x.K = sh[1];
+        x.w = x12_weight(x.N, x.K, (uint32_t)(x.N * 31 + x.K), false);
+        const std::string tag = fmt("%lld x %lld", (long long)x.N, (long long)x.K);
+        X12Io io;
+        if (!x12_ready(rx, tag, x) || !x12_io(x, m16 ? 16 : 200, &io)) { dfree_all(); continue; }
+        x12_every_point(rx, rb, x, io, tag, Ms);
+        x12_untuned(rx, rb, x, io, tag, Ms);
+        if (!m16) {
+            /* Past the decode band: this row serves it where the prefill row does not (N under
+             * 128, or K not a multiple of 64). */
+            std::string bad;
+            X12Ref ref;
+            for (int64_t M : { 65, 200 })
+                for (const X12Pt& pt : { X12Pt{ -1, -1, -1, -1 }, X12Pt{ 1, 1, 0, -1 },
+                                         X12Pt{ 2, 4, 0, -1 } }) {
+                    const int64_t n = x12_diff(rx, rb, x, io.a, io.y0, io.y1, M, pt, &ref);
+                    if (n != 0)
+                        bad += fmt(" M=%lld wv%d,sk%d: %lld;", (long long)M, pt.wv, pt.sk,
+                                   (long long)n);
+                }
+            ok((tag + ": C byte-identical at M 65 and 200").c_str(), bad.empty(), bad);
+        }
+        dfree_all();
+    }
+}
+
+/* Checkpoint-like weights, for timing: exponent fields 118 to 127, so no block is raw, then one
+ * block in 750 made raw by an exponent field of 100, about the 0.133% of blocks Qwen3.8-27B's trunk
+ * has. */
+static std::vector<uint16_t> x12_weight_ckpt(int64_t N, int64_t K, uint32_t seed) {
+    std::vector<uint16_t> w((size_t)(N * K));
+    for (size_t i = 0; i < w.size(); ++i) {
+        const uint32_t x = st_mix32((uint32_t)i * 2654435761u + seed);
+        w[i] = (uint16_t)(((x >> 31) << 15) | ((118u + (x >> 8) % 10u) << 7) | (x & 0x7Fu));
+    }
+    for (int64_t q = 0; q < N * (K / 32); q += 750) {
+        uint16_t& v = w[(size_t)(q * 32 + q % 32)];
+        v = (uint16_t)((v & 0x807Fu) | (100u << 7));
+    }
+    return w;
+}
+
+/* Each trunk shape at M = 2048, a prefill chunk: gemm_bf16x12_nt_tiled (the unpack, then the GEMM)
+ * against gemm_bf16_nt_tiled, both untuned, over checkpoint-like weights packed with libquant's
+ * default table. The weights rotate over copies past the last-level cache, as in --perfx12; two
+ * interleaved rounds, the faster of each. The unpack's cost is the difference, and its GB/s the
+ * bytes it moves over that difference (est.); summed over a step's calls of each shape (64 layers:
+ * 48 delta-net, 16 attention), the cost a chunk (est.). */
+static void x12_tiled_time(const RadKernelInfo* rx, const RadKernelInfo* rb) {
+    static const int kCalls[] = { 48, 48, 64, 64, 16, 64, 32 };   /* kX12Trunk's order */
+    const int64_t M = 2048;
+    const int iters = 10;
+    double extra = 0.0;
+    int calls = 0;
+    bool all_equal = true, all_timed = true;
+    std::printf("  timing at M = %lld, both rows untuned; weights checkpoint-like (one block in "
+                "750 raw), rotated past the last-level cache\n", (long long)M);
+    for (size_t s = 0; s < sizeof kX12Trunk / sizeof kX12Trunk[0]; ++s) {
+        X12W x;
+        x.N = kX12Trunk[s][0];
+        x.K = kX12Trunk[s][1];
+        const std::string tag = fmt("%lld x %lld", (long long)x.N, (long long)x.K);
+        x.w = x12_weight_ckpt(x.N, x.K, (uint32_t)(x.N * 7 + x.K));
+        /* libquant's default table: max(64, ceil(blocks x 0.004)) rows, at most one a block. */
+        const int64_t blocks = x.N * (x.K / 32);
+        const int64_t cap =
+            std::min(blocks, std::max<int64_t>(64, (int64_t)std::ceil((double)blocks * 0.004)));
+        x.p = x12_canon(x.w, x.N, x.K, cap, &x.raw);
+        const std::vector<RadParam> lp = { PI("N", x.N), PI("K", x.K), PS("dtype", "bf16x12") };
+        if (x.p.enc.n_planes == 0 ||
+            stored(rx, lp, 1, x.p, { "codes", "d", "e", "esc" }, &x.s) != RAD_OK) {
+            ok(("x12 tiled timing " + tag + ": packed").c_str(), false);
+            all_timed = false;
+            continue;
+        }
+        /* Up to 32 copies, so k and v's 4 MiB packed rotate over twice the 64 MiB cache. */
+        const size_t wb = (size_t)(x.N * x.K) * 2, sb = x.s.size(), span = (size_t)768 << 20;
+        const int cb = (int)std::min<size_t>(32, span / wb + 1);
+        const int cx = (int)std::min<size_t>(32, span / sb + 1);
+        uint8_t* d_w = (uint8_t*)dalloc(wb * (size_t)cb);
+        uint8_t* d_s = (uint8_t*)dalloc(sb * (size_t)cx);
+        X12Io io;
+        if (!d_w || !d_s || !x12_io(x, M, &io)) {
+            ok(("x12 tiled timing " + tag + ": the weights on the card").c_str(), false,
+               "hipMalloc failed");
+            all_timed = false;
+            dfree_all();
+            continue;
+        }
+        for (int i = 0; i < cb; ++i)
+            st_memcpy(d_w + (size_t)i * wb, x.w.data(), wb, hipMemcpyHostToDevice);
+        for (int i = 0; i < cx; ++i)
+            st_memcpy(d_s + (size_t)i * sb, x.s.data(), sb, hipMemcpyHostToDevice);
+        x.d_w = d_w;
+        x.d_s = d_s;
+        /* The bytes first: untuned at the trunk's K the two laws give one split. */
+        const X12Pt none{ -1, -1, -1, -1 };
+        std::vector<uint16_t> c0, c1;
+        const bool same = x12_out(rb, x, io.a, io.y0, M, none, 0x11, &c0) &&
+                          x12_out(rx, x, io.a, io.y1, M, none, 0x22, &c1) && c0 == c1;
+        all_equal &= same;
+        auto timed = [&](int k) {
+            const RadKernelInfo* r = k ? rx : rb;
+            uint8_t* base = k ? d_s : d_w;
+            const size_t stride = k ? sb : wb;
+            const int copies = k ? cx : cb;
+            return st_time_us([&](int i) {
+                x12_issue(r, x, io.a, io.y0, M, none, base + (size_t)(i % copies) * stride);
+            }, iters, nullptr);
+        };
+        double t[2] = { 1e30, 1e30 };
+        for (int round = 0; round < 2; ++round)
+            for (int k = 0; k < 2; ++k) t[k] = std::min(t[k], timed(k));
+        const double d = t[1] - t[0];
+        /* The unpack reads SM, D, E and the raw blocks' rows, and writes the bf16 weight. */
+        const double moved =
+            (double)(x.N * x.K) * (1.0 + 0.5 + 1.0 / 32 + 2.0) + (double)x.raw * 64;
+        const double tf = 2.0 * (double)M * (double)x.N * (double)x.K / (t[0] * 1e6);
+        extra += kCalls[s] * d;
+        calls += kCalls[s];
+        std::printf("        x12 tiled %s M=%lld: bf16 %8.1f us (%5.1f TF/s), x12 %8.1f us, "
+                    "%5.3fx; unpack %+7.1f us, %s; %lld raw blocks (%.3f%%), C %s "
+                    "(component timing)\n",
+                    tag.c_str(), (long long)M, t[0], tf, t[1], t[1] / t[0], d,
+                    d > 0 ? fmt("%.0f GB/s est.", moved / (d * 1e3)).c_str() : "-",
+                    (long long)x.raw, 100.0 * (double)x.raw / (double)blocks,
+                    same ? "=" : "DIFFERS");
+        dfree_all();
+    }
+    if (all_timed)
+        std::printf("        x12 tiled: a %lld-token chunk's %d calls a card, est. %+.1f ms "
+                    "(each call as timed here) (component timing)\n", (long long)M, calls,
+                    extra / 1000.0);
+    ok("x12 tiled timing: C byte-identical to gemm_bf16_nt_tiled untuned at every trunk shape",
+       all_equal && all_timed);
+}
+
+static void x12_tiled(const Plugin& pl) {
+    const RadKernelInfo* rx = find(pl, "gemm_bf16x12_nt_tiled");
+    const RadKernelInfo* rb = find(pl, "gemm_bf16_nt_tiled");
+    const RadKernelInfo* rm = find(pl, "gemm_bf16x12_nt_m64");
+    if (!rx || !rb || !rm || !rx->layout || !rx->relayout || !rx->unrelayout || !rx->scratch) {
+        ok("gemm_bf16x12_nt_tiled", false, "row, its hooks or its scratch hook absent");
+        return;
+    }
+    ok("gemm_bf16x12_nt_tiled stores the weight with gemm_bf16x12_nt_m64's hooks",
+       rx->layout == rm->layout && rx->relayout == rm->relayout &&
+           rx->unrelayout == rm->unrelayout);
+    {
+        /* Asked at declare with the band's widest M, so M must not enter it. */
+        static const int64_t kAsk[][3] = { { 65, 136, 2240 }, { 2048, 17408, 5120 },
+                                           { 65536, 17408, 5120 }, { 65536, 5120, 8704 } };
+        std::string bad;
+        for (const auto& g : kAsk) {
+            std::vector<RadParam> ps = { PI("M", g[0]), PI("N", g[1]), PI("K", g[2]),
+                                         PS("dtype", "bf16x12") };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            const int64_t got = rx->scratch(&a);
+            if (got != 2 * g[1] * g[2])
+                bad += fmt(" M=%lld N=%lld K=%lld: %lld;", (long long)g[0], (long long)g[1],
+                           (long long)g[2], (long long)got);
+        }
+        ok("its scratch is the weight in bf16, N x K x 2 bytes, at any M", bad.empty(), bad);
+    }
+
+    /* 136 x 2240: N leaves part tiles of 64 and 128 rows, K is 35 tiles of 64, and the laws split
+     * it differently, 20 at the bf16 rows' unit of 16 and 10 at the packed rows' 32. Untuned, the
+     * row has to give gemm_bf16x12_nt_m64's bytes, not gemm_bf16_nt_tiled's. */
+    {
+        X12W x;
+        x.N = 136;
+        x.K = 2240;
+        x.w = x12_weight(x.N, x.K, 13u, true);
+        X12Io io;
+        if (!x12_ready(rx, "136 x 2240", x) || !x12_io(x, 2048, &io)) { dfree_all(); return; }
+        std::printf("  136 x 2240: %lld of %lld blocks raw, an infinity among them\n",
+                    (long long)x.raw, (long long)(x.N * x.K / 32));
+        const std::vector<int64_t> Ms = { 65, 333, 512, 2048 };
+        x12_every_point(rx, rb, x, io, "136 x 2240", Ms);
+        ok("136 x 2240: the laws at 16 and 32 split it differently (20, 10)",
+           x12_law_sk(x.N, x.K, 1, 16) == 20 && x12_law_sk(x.N, x.K, 1) == 10);
+        x12_untuned(rx, rm, x, io, "136 x 2240", Ms);
+
+        /* The launch refuses another dtype, a tile it lacks, and scratch short of the weight,
+         * absent or misaligned, before it unpacks. */
+        const int e_dt = x12_issue(rx, x, io.a, io.y0, 65, { -1, -1, -1, -1 }, x.d_s, RAD_BF16);
+        const int e_tile = x12_issue(rx, x, io.a, io.y0, 65, { -1, -1, -1, -1, 3 });
+        const int64_t need = 2 * x.N * x.K;
+        char* buf = (char*)x12_scratch(need + 16, false);
+        auto with = [&](void* scr, int64_t bytes) {
+            std::vector<RadTensor> ts = { T(io.a, RAD_BF16, { 65, x.K }),
+                                          T(x.d_s, R4D_DT_BF16X12, { x.N, x.K }),
+                                          T(io.y0, RAD_BF16, { 65, x.N }) };
+            std::vector<RadParam> ps = { PI("M", 65), PI("N", x.N), PI("K", x.K),
+                                         PS("dtype", "bf16x12") };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size();
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            a.scratch = scr;
+            a.scratch_bytes = bytes;
+            return rx->launch(&a, (RadStream) nullptr);
+        };
+        const int e_short = buf ? with(buf, need - 2) : 0;
+        const int e_none = with(nullptr, need);
+        const int e_align = buf ? with(buf + 8, need) : 0;
+        st_stream_sync(nullptr);
+        ok("the launch refuses another dtype, tile 3, and scratch short, absent or misaligned",
+           e_dt == RAD_E_DTYPE && e_tile == RAD_E_SHAPE && e_short == RAD_E_SCRATCH &&
+               e_none == RAD_E_SCRATCH && e_align == RAD_E_ALIGN,
+           fmt("rc %d %d %d %d %d", e_dt, e_tile, e_short, e_none, e_align));
+        dfree_all();
+    }
+
+    /* Rank 1's shares of a 256 x 4096 weight, its rows and its columns, each still in the tiled
+     * band. Their raw blocks index the whole weight's table, which has rows to spare. */
+    {
+        X12W x;
+        x.N = 256;
+        x.K = 4096;
+        x.w = x12_weight(x.N, x.K, 17u, false);
+        x.p = x12_canon(x.w, x.N, x.K, x.N * x.K / 32, &x.raw);
+        for (const bool cols : { false, true }) {
+            X12W s = x12_share(x, cols, 1);
+            const std::string tag = std::string("rank 1's ") + (cols ? "columns" : "rows") +
+                                    " of 256 x 4096";
+            X12Io io;
+            if (!x12_ready(rx, tag, s, 0, true) || !x12_io(s, 512, &io)) { dfree_all(); continue; }
+            x12_every_point(rx, rb, s, io, tag, { 65, 512 });
+            dfree_all();
+        }
+    }
+
+    /* The trunk's shapes at TP2, at a prefill chunk's row counts. */
+    const std::vector<int64_t> Ms = { 65, 512, 2048 };
+    for (const auto& sh : kX12Trunk) {
+        X12W x;
+        x.N = sh[0];
+        x.K = sh[1];
+        x.w = x12_weight(x.N, x.K, (uint32_t)(x.N * 31 + x.K), false);
+        const std::string tag = fmt("%lld x %lld", (long long)x.N, (long long)x.K);
+        X12Io io;
+        if (!x12_ready(rx, tag, x) || !x12_io(x, 2048, &io)) { dfree_all(); continue; }
+        x12_every_point(rx, rb, x, io, tag, Ms);
+        x12_untuned(rx, rb, x, io, tag, Ms);
+        dfree_all();
+    }
+    x12_tiled_time(rx, rb);
+}
+
+/* The real N x K bf16 weight at byte `woff` of `file` into `x`, packed with libquant's default
+ * table (its rows in `cap`) and stored through `r`'s hooks, with x12_ready's checks. False when a
+ * step failed, which is reported. */
+static bool x12_real(const RadKernelInfo* r, const char* file, long long woff, int64_t N, int64_t K,
+                     X12W& x, int64_t* cap) {
+    x.N = N;
+    x.K = K;
+    x.w.resize((size_t)(N * K));
+    std::FILE* f = std::fopen(file, "rb");
+    if (!f) { ok("x12 real weight", false, std::string("cannot open ") + file); return false; }
+    const bool okread = std::fseek(f, (long)woff, SEEK_SET) == 0 &&
+                        std::fread(x.w.data(), 2, x.w.size(), f) == x.w.size();
+    std::fclose(f);
+    if (!okread) { ok("x12 real weight", false, "short read"); return false; }
+    /* A weight read at the wrong offset shows here: a real one has no zero, inf or NaN exponent
+     * field, and its largest magnitude is a few units at most. */
+    int64_t zsub = 0, infnan = 0;
+    float amax = 0.f;
+    for (uint16_t v : x.w) {
+        const unsigned ex = x12_exp(v);
+        zsub += ex == 0;
+        infnan += ex == 0xFF;
+        if (ex != 0xFF) amax = std::max(amax, std::fabs(h_bf16(v)));
+    }
+    std::printf("  %s @ %lld: %lld x %lld bf16, max |w| %.4g, zero/subnormal %lld, inf/nan %lld\n",
+                file, woff, (long long)N, (long long)K, amax, (long long)zsub, (long long)infnan);
+
+    /* libquant's default table: max(64, ceil(blocks x 0.004)) rows, at most one a block. */
+    const int64_t blocks = N * (K / 32);
+    *cap = std::min(blocks, std::max<int64_t>(64, (int64_t)std::ceil(blocks * 0.004)));
+    return x12_ready(r, "x12 real", x, *cap);
+}
+
+static void x12_perf(const Plugin& pl, const char* file, long long woff, int64_t N, int64_t K,
+                     int64_t M, int iters, const std::vector<int>& given) {
+    const RadKernelInfo* rx = find(pl, M <= 16 ? "gemm_bf16x12_nt_m16" : "gemm_bf16x12_nt_m64");
+    const RadKernelInfo* rb = find(pl, "gemm_bf16_nt_m64");
+    if (!rx || !rb || !rx->layout || !rx->relayout || !rx->unrelayout) {
+        ok("--perfx12 rows", false, "row or hooks absent");
+        return;
+    }
+    if (N < 1 || K < 32 || K % 32 || M < 1 || M > 64) {
+        ok("--perfx12 shape", false, "N >= 1, K a multiple of 32, 1 <= M <= 64");
+        return;
+    }
+    if (iters <= 0) iters = 100;
+    std::printf("x12: %s against gemm_bf16_nt_m64\n", rx->name);
+    {
+        X12W x;
+        x.N = 72;
+        x.K = 1120;
+        x.w = x12_weight(x.N, x.K, 7u, true);
+        X12Io io;
+        if (x12_ready(rx, "x12 72 x 1120", x) && x12_io(x, M, &io))
+            x12_every_point(rx, rb, x, io, "x12 72 x 1120", { M });
+        dfree_all();
+    }
+
+    X12W x;
+    int64_t cap = 0;
+    if (!x12_real(rx, file, woff, N, K, x, &cap)) return;
+    const int64_t blocks = N * (K / 32);
+    const size_t wb = (size_t)(N * K) * 2, sb = x.s.size();
+    const double traffic = (double)(N * K + N * K / 2 + N * K / 32 + x.raw * 64);
+    std::printf("  raw blocks %lld of %lld (%.3f%%), table %lld rows; read %.1f MiB = %.2f%% of "
+                "bf16's %.1f MiB (%.2f bits a weight); stored %.1f MiB\n", (long long)x.raw,
+                (long long)blocks, 100.0 * (double)x.raw / (double)blocks, (long long)cap,
+                traffic / (1 << 20), 100.0 * traffic / (double)wb, (double)wb / (1 << 20),
+                8.0 * traffic / (double)(N * K), (double)sb / (1 << 20));
+
+    const size_t span = (size_t)768 << 20;
+    const int cb = (int)std::min<size_t>(16, span / wb + 1), cx = (int)std::min<size_t>(16, span / sb + 1);
+    uint8_t* d_w = (uint8_t*)dalloc(wb * (size_t)cb);
+    uint8_t* d_s = (uint8_t*)dalloc(sb * (size_t)cx);
+    X12Io io;
+    if (!d_w || !d_s || !x12_io(x, M, &io)) {
+        ok("x12 real alloc", false, fmt("hipMalloc failed (%zu MiB wanted)",
+                                        (wb * (size_t)cb + sb * (size_t)cx) >> 20));
+        return;
+    }
+    for (int i = 0; i < cb; ++i) st_memcpy(d_w + (size_t)i * wb, x.w.data(), wb, hipMemcpyHostToDevice);
+    for (int i = 0; i < cx; ++i) st_memcpy(d_s + (size_t)i * sb, x.s.data(), sb, hipMemcpyHostToDevice);
+
+    /* The points, resolved as the law resolves a 0 (mb 1 at M <= 64) and deduplicated; the first
+     * tag a point gets is the one shown. */
+    struct Pt { int wv, sk, mb; const char* tag; };
+    std::vector<Pt> pts;
+    auto add = [&](int wv, int sk, int mb, const char* tag) {
+        wv = wv > 0 ? wv : 1;
+        if (sk <= 0) sk = x12_law_sk(N, K, wv);
+        if (mb <= 0) mb = 1;
+        if (K % ((int64_t)sk * 32) || wv * sk * 32 > 1024 || mb > 4) {
+            if (std::strcmp(tag, "sweep"))
+                std::printf("  point %d,%d,%d (%s): not legal at K=%lld\n", wv, sk, mb, tag, (long long)K);
+            return;
+        }
+        for (const Pt& q : pts) if (q.wv == wv && q.sk == sk && q.mb == mb) return;
+        pts.push_back({ wv, sk, mb, tag });
+    };
+    add(0, 0, 0, "default");
+    for (size_t i = 0; i + 2 < given.size(); i += 3) add(given[i], given[i + 1], given[i + 2], "given");
+    for (int wv : { 1, 2 })
+        for (int sk : { 1, 2, 4, 5, 8, 10, 16, 20 }) add(wv, sk, 1, "sweep");
+
+    std::printf("  M=%lld, %d iters; bf16 %d copies, packed %d copies (%.0f / %.0f MiB)\n"
+                "  C: = when byte-identical to gemm_bf16_nt_m64. GB/s: bf16 and pre/x12 on the bytes "
+                "each reads; eq = bf16 bytes over the packed kernel's time\n",
+                (long long)M, iters, cb, cx, (double)(wb * (size_t)cb) / (1 << 20),
+                (double)(sb * (size_t)cx) / (1 << 20));
+    /* bf16 at the packed row's split, x12 plain, x12 PRE. */
+    auto timed = [&](int k, const X12Pt& pt) {
+        const RadKernelInfo* r = k ? rx : rb;
+        uint8_t* base = k ? d_s : d_w;
+        const size_t stride = k ? sb : wb;
+        const int copies = k ? cx : cb;
+        if (x12_issue(r, x, io.a, io.y0, M, pt, base) != RAD_OK || st_stream_sync(nullptr) != hipSuccess)
+            return -1.0;
+        return st_time_us([&](int i) {
+            x12_issue(r, x, io.a, io.y0, M, pt, base + (size_t)(i % copies) * stride);
+        }, iters, nullptr);
+    };
+    bool all_equal = true;
+    double best_b = 1e30, best_x = 1e30;
+    std::string best_bl, best_xl;
+    X12Ref ref;
+    for (const Pt& q : pts) {
+        const std::string lbl = fmt("wv%d,sk%d,mb%d", q.wv, q.sk, q.mb);
+        const X12Pt p1{ q.wv, q.sk, q.mb, 1 }, p2{ q.wv, q.sk, q.mb, 2 }, pb{ q.wv, q.sk, q.mb, -1 };
+        const bool pre = q.mb <= 2;
+        const int64_t n1 = x12_diff(rx, rb, x, io.a, io.y0, io.y1, M, p1, &ref);
+        const int64_t n2 = pre ? x12_diff(rx, rb, x, io.a, io.y0, io.y1, M, p2, &ref) : 0;
+        all_equal &= n1 == 0 && n2 == 0;
+        /* Two rounds, interleaved, and the faster of each. */
+        double t[3] = { 1e30, 1e30, 1e30 };
+        for (int round = 0; round < 2; ++round)
+            for (int k = 0; k < 3; ++k) {
+                if (k == 2 && !pre) continue;
+                const double us = timed(k, k == 0 ? pb : k == 1 ? p1 : p2);
+                if (us > 0) t[k] = std::min(t[k], us);
+            }
+        auto cell = [&](double us, double bytes) {
+            return us < 1e29 ? fmt("%7.1f us %5.1f GB/s", us, bytes / (us * 1e3)) : std::string("      -");
+        };
+        auto rel = [&](int k, int64_t n) {
+            if (t[k] >= 1e29) return std::string("     -");
+            return fmt("%s (%5.1f eq) %5.3fx %s", cell(t[k], traffic).c_str(), (double)wb / (t[k] * 1e3),
+                       t[k] / t[0], n == 0 ? "=" : n < 0 ? "refused" : fmt("DIFF %lld", (long long)n).c_str());
+        };
+        std::printf("  %-16s %-7s bf16 %s | x12 %s | pre %s\n", lbl.c_str(), q.tag,
+                    cell(t[0], (double)wb).c_str(), rel(1, n1).c_str(), pre ? rel(2, n2).c_str() : "-");
+        if (t[0] < best_b) { best_b = t[0]; best_bl = lbl; }
+        for (int k = 1; k <= 2; ++k)
+            if (t[k] < best_x) { best_x = t[k]; best_xl = lbl + (k == 2 ? " pre" : " x12"); }
+    }
+    if (best_b < 1e29 && best_x < 1e29)
+        std::printf("  fastest bf16 %s %.1f us; fastest packed %s %.1f us; packed/bf16 %.3f\n",
+                    best_bl.c_str(), best_b, best_xl.c_str(), best_x, best_x / best_b);
+    ok("x12 real: C byte-identical to gemm_bf16_nt_m64 at every point, both forms", all_equal);
+}
+
+/* --tunex12 <file> <woff> N K [iters]: the decode rows tuned from DRAM on one real trunk weight,
+ * for bench-src/x12homes.py, which writes tune homes from its lines. rad-tune cannot tune these
+ * rows: its fixture draws a fill, which is no valid packed weight, and it times warm, where the
+ * server streams the trunk from DRAM every step.
+ *
+ * The weight is read and packed as for --perfx12. Each band runs at a row count decode gives it:
+ * M = 8 with gemm_bf16x12_nt_m16 (the M <= 16 band), M = 64 with gemm_bf16x12_nt_m64 (17 to 64).
+ * The points are every distinct launch of gemm_bf16_nt_m64's space: wv 1, 2 and 4, each sk the
+ * bound and K at the bf16 unit allow, mb 1 to 4. sk 0 and mb 0 resolve to one of them (the law's
+ * split; mb 1 in the decode band), and neither kernel reads npw or nt (BR_FLAT), so the set covers
+ * both rows' spaces, which a check confirms against the core's enumeration. An mb above the row
+ * tiles is still its own launch (the kernel's MT), so mb 2 to 4 are timed at M = 8 too.
+ *
+ * At each point: C byte for byte against gemm_bf16_nt_m64 in both forms, then the bf16 row and
+ * the packed row plain and PRE timed in two interleaved rounds, the faster of each, the weights
+ * rotated over copies past the last-level cache. One line a point:
+ *   x12pt N= K= M= wv= sk= mb= law= bf16=<us> x12=<us> pre=<us> eq=
+ * law is 1 where sk is the split both laws give at this wv. x12 and pre are '-' where the packed
+ * row cannot run (sk slices of whole 32-blocks that do not divide K; PRE above mb 2), and eq is
+ * '-' where neither runs. Then the fastest of each a band, and one check for every point equal. */
+static void x12_tune(const Plugin& pl, const char* file, long long woff, int64_t N, int64_t K,
+                     int iters) {
+    const RadKernelInfo* r16 = find(pl, "gemm_bf16x12_nt_m16");
+    const RadKernelInfo* r64 = find(pl, "gemm_bf16x12_nt_m64");
+    const RadKernelInfo* rb = find(pl, "gemm_bf16_nt_m64");
+    if (!r16 || !r64 || !rb || !r64->layout || !r64->relayout || !r64->unrelayout ||
+        r16->layout != r64->layout || r16->relayout != r64->relayout) {
+        ok("--tunex12 rows", false, "a row absent, or the two rows' hooks differ");
+        return;
+    }
+    if (N < 1 || K < 32 || K % 32) {
+        ok("--tunex12 shape", false, "N >= 1, K a multiple of 32");
+        return;
+    }
+    if (iters <= 0) iters = 200;
+    struct Band { const RadKernelInfo* r; int64_t M; };
+    const Band bands[] = { { r16, 8 }, { r64, 64 } };
+    std::printf("x12 tune: %s (M = 8) and %s (M = 64) against gemm_bf16_nt_m64, from DRAM\n",
+                r16->name, r64->name);
+    for (const Band& b : bands) {
+        X12W x;
+        x.N = 72;
+        x.K = 1120;
+        x.w = x12_weight(x.N, x.K, 7u, true);
+        const std::string tag = fmt("x12 72 x 1120, %s", b.r->name);
+        X12Io io;
+        if (x12_ready(b.r, tag, x) && x12_io(x, b.M, &io))
+            x12_every_point(b.r, rb, x, io, tag, { b.M });
+        dfree_all();
+    }
+
+    X12W x;
+    int64_t cap = 0;
+    if (!x12_real(r64, file, woff, N, K, x, &cap)) return;
+    const int64_t blocks = N * (K / 32);
+    /* Up to 32 copies, so k and v's 4 MiB packed rotate over twice the 64 MiB cache. */
+    const size_t wb = (size_t)(N * K) * 2, sb = x.s.size(), span = (size_t)768 << 20;
+    const int cb = (int)std::min<size_t>(32, span / wb + 1);
+    const int cx = (int)std::min<size_t>(32, span / sb + 1);
+    uint8_t* d_w = (uint8_t*)dalloc(wb * (size_t)cb);
+    uint8_t* d_s = (uint8_t*)dalloc(sb * (size_t)cx);
+    X12Io io;
+    if (!d_w || !d_s || !x12_io(x, 64, &io)) {
+        ok("x12 tune alloc", false, fmt("hipMalloc failed (%zu MiB wanted)",
+                                        (wb * (size_t)cb + sb * (size_t)cx) >> 20));
+        return;
+    }
+    for (int i = 0; i < cb; ++i) st_memcpy(d_w + (size_t)i * wb, x.w.data(), wb, hipMemcpyHostToDevice);
+    for (int i = 0; i < cx; ++i) st_memcpy(d_s + (size_t)i * sb, x.s.data(), sb, hipMemcpyHostToDevice);
+    std::printf("  raw blocks %lld of %lld (%.3f%%), table %lld rows; %d iters; bf16 %d copies, "
+                "packed %d copies (%.0f / %.0f MiB)\n", (long long)x.raw, (long long)blocks,
+                100.0 * (double)x.raw / (double)blocks, (long long)cap, iters, cb, cx,
+                (double)(wb * (size_t)cb) / (1 << 20), (double)(sb * (size_t)cx) / (1 << 20));
+
+    /* Every distinct launch: the bf16 row's bound and unit; the packed row where its unit allows. */
+    struct Pt { int wv, sk, mb; };
+    std::vector<Pt> pts;
+    for (int wv : { 1, 2, 4 })
+        for (int sk : { 1, 2, 4, 5, 8, 10, 16, 20, 32 })
+            for (int mb = 1; mb <= 4; ++mb)
+                if (wv * sk * 32 <= 1024 && K % ((int64_t)sk * 16) == 0) pts.push_back({ wv, sk, mb });
+    auto packs = [&](const Pt& q) { return K % ((int64_t)q.sk * 32) == 0; };
+
+    bool all_equal = true, all_timed = true, all_covered = true;
+    for (const Band& b : bands) {
+        const int64_t M = b.M;
+        /* The core's enumeration of each row's space, each point resolved as the launch resolves
+         * it, must fall among the points timed. */
+        std::string missing;
+        for (const RadKernelInfo* r : { rb, b.r }) {
+            const bool px = r != rb;
+            const std::vector<RadParam> geom = { PI("M", M), PI("N", N), PI("K", K),
+                                                 PS("dtype", px ? "bf16x12" : "bf16") };
+            for (const TunePoint& tp : tune_points(r, geom)) {
+                int wv = 1, sk = 0, mb = 0, form = 0;
+                for (const RadParam& c : tp.choice) {
+                    if (!std::strcmp(c.key, "wv"))        wv = (int)c.ival;
+                    else if (!std::strcmp(c.key, "sk"))   sk = (int)c.ival;
+                    else if (!std::strcmp(c.key, "mb"))   mb = (int)c.ival;
+                    else if (!std::strcmp(c.key, "form")) form = (int)c.ival;
+                }
+                if (wv <= 0) wv = 1;
+                if (sk <= 0) sk = x12_law_sk(N, K, wv, px ? 32 : 16);
+                if (mb <= 0) mb = 1;
+                const bool pre = form == 2 || (form == 0 && mb <= 2);
+                bool found = false;
+                for (const Pt& q : pts)
+                    found |= q.wv == wv && q.sk == sk && q.mb == mb && (!px || packs(q)) &&
+                             (!pre || mb <= 2);
+                if (!found && missing.size() < 300)
+                    missing += fmt(" %s wv%d,sk%d,mb%d,form%d;", r->name, wv, sk, mb, form);
+                all_covered &= found;
+            }
+        }
+        ok(fmt("x12 tune M=%lld: the points cover both rows' tuning spaces", (long long)M).c_str(),
+           missing.empty(), missing);
+
+        /* bf16 at the point, x12 plain, x12 PRE. */
+        auto timed = [&](int k, const X12Pt& pt) {
+            const RadKernelInfo* r = k ? b.r : rb;
+            uint8_t* base = k ? d_s : d_w;
+            const size_t stride = k ? sb : wb;
+            const int copies = k ? cx : cb;
+            if (x12_issue(r, x, io.a, io.y0, M, pt, base) != RAD_OK ||
+                st_stream_sync(nullptr) != hipSuccess)
+                return -1.0;
+            return st_time_us([&](int i) {
+                x12_issue(r, x, io.a, io.y0, M, pt, base + (size_t)(i % copies) * stride);
+            }, iters, nullptr);
+        };
+        auto us = [](double t) { return t < 1e29 ? fmt("%.3f", t) : std::string("-"); };
+        double best_b = 1e30, best_x = 1e30;
+        std::string best_bl, best_xl;
+        X12Ref ref;
+        for (const Pt& q : pts) {
+            const bool px = packs(q), pre = px && q.mb <= 2;
+            const X12Pt pb{ q.wv, q.sk, q.mb, -1 }, p1{ q.wv, q.sk, q.mb, 1 },
+                        p2{ q.wv, q.sk, q.mb, 2 };
+            const int64_t n1 = px ? x12_diff(b.r, rb, x, io.a, io.y0, io.y1, M, p1, &ref) : 0;
+            const int64_t n2 = pre ? x12_diff(b.r, rb, x, io.a, io.y0, io.y1, M, p2, &ref) : 0;
+            const bool eq = n1 == 0 && n2 == 0;
+            all_equal &= eq;
+            /* Two rounds, interleaved, and the faster of each. */
+            double t[3] = { 1e30, 1e30, 1e30 };
+            for (int round = 0; round < 2; ++round)
+                for (int k = 0; k < 3; ++k) {
+                    if ((k == 1 && !px) || (k == 2 && !pre)) continue;
+                    const double v = timed(k, k == 0 ? pb : k == 1 ? p1 : p2);
+                    if (v > 0) t[k] = std::min(t[k], v);
+                }
+            all_timed &= t[0] < 1e29 && (!px || t[1] < 1e29) && (!pre || t[2] < 1e29);
+            const int law = q.sk == x12_law_sk(N, K, q.wv) && q.sk == x12_law_sk(N, K, q.wv, 16);
+            std::printf("x12pt N=%lld K=%lld M=%lld wv=%d sk=%d mb=%d law=%d bf16=%s x12=%s pre=%s "
+                        "eq=%s\n", (long long)N, (long long)K, (long long)M, q.wv, q.sk, q.mb, law,
+                        us(t[0]).c_str(), us(t[1]).c_str(), us(t[2]).c_str(),
+                        px ? (eq ? "1" : "0") : "-");
+            const std::string lbl = fmt("wv%d,sk%d,mb%d", q.wv, q.sk, q.mb);
+            if (t[0] < best_b) { best_b = t[0]; best_bl = lbl; }
+            for (int k = 1; k <= 2; ++k)
+                if (t[k] < best_x) { best_x = t[k]; best_xl = lbl + (k == 2 ? ",pre" : ",plain"); }
+        }
+        if (best_b < 1e29 && best_x < 1e29)
+            std::printf("  M=%lld: fastest bf16 %s %.1f us; fastest packed %s %.1f us; "
+                        "packed/bf16 %.3f\n", (long long)M, best_bl.c_str(), best_b,
+                        best_xl.c_str(), best_x, best_x / best_b);
+    }
+    ok(fmt("x12 tune %lld x %lld: C byte-identical to gemm_bf16_nt_m64 at every point, both forms, "
+           "both bands; every point timed", (long long)N, (long long)K).c_str(),
+       all_equal && all_timed && all_covered);
 }
 /* The int2 draft head at every variant. rad-tune never reaches this row (on the DFlash2
  * container its requests are `gemm_nt` and `all_reduce`), and it runs well under the part's
@@ -33933,6 +35282,9 @@ static void device_phase(const Plugin& pl) {
         i8a8_numeric(pl, "gemm_i8a8_nt_m16", 64, 512, 640);
         i8a8_numeric(pl, "gemm_i8a8_tiled", 200, 256, 640);
         i8a8_numeric(pl, "gemm_i8a8_tiled", 2048, 512, 2560);
+        i8a8_row_numeric(pl, 3, 128, 256);
+        i8a8_row_numeric(pl, 200, 256, 384);
+        i8a8_row_numeric(pl, 196, 1536, 256);
         i8a8_numeric(pl, "gemm_i8a8_rb8_tiled", 200, 256, 640, 8);
         i8a8_numeric(pl, "gemm_i8a8_rb8_tiled", 2048, 512, 2560, 8);
         i8a8_numeric(pl, "gemm_i8a8_rb8_tiled", 300, 256, 5120, 8);
@@ -35253,6 +36605,10 @@ static void device_phase(const Plugin& pl) {
                                  (int64_t)17 })
             logits_cols_check(pl, M, 2051);
         logits_cols_check(pl, 6, 19360);
+        for (const int64_t M : { (int64_t)1, (int64_t)2, (int64_t)6, (int64_t)8, (int64_t)9,
+                                 (int64_t)17 })
+            logits_cols_check(pl, M, 2051, 0, 5120);
+        logits_cols_check(pl, 8, 19360, 0, 5120);
     }
     /* The IQR head and embedding table, at their codes' width. */
     if (sel("logits_gemm_iqr") || sel("logit_rerank_iqr")) {
@@ -35289,6 +36645,13 @@ static void device_phase(const Plugin& pl) {
             fp8_logits_numeric(pl, 5120, 5120, M, true);
         for (const int64_t M : { (int64_t)1, (int64_t)8 })
             fp8_logits_numeric(pl, 2560, 2560, M, true);
+    }
+    /* The plain bf16 head's rescoring: one rank, the second of two (global ids, the pair plane),
+     * and a K that is not a whole number of 128-column blocks. */
+    if (sel("logit_rerank_bf16")) {
+        bf16_rerank_numeric(pl, 1024, 5120, 7, 0);
+        bf16_rerank_numeric(pl, 1024, 5120, 7, 1024);
+        bf16_rerank_numeric(pl, 640, 2504, 3, 0);
     }
 
     gate_had_case(pl, 37, 256);
@@ -35362,6 +36725,17 @@ static void device_phase(const Plugin& pl) {
                                           { 17408, 5120 }, { 5120, 8704 }, { 6144, 5120 },
                                           { 512, 5120 } };
         for (const auto& nk : kNK) bf16_band_edge(pl, nk[0], nk[1]);
+    }
+    for (const char* row : { "gemm_bf16x12_nt_m16", "gemm_bf16x12_nt_m64" })
+        if (sel(row)) {
+            if (!g_case) std::printf("\n%s, against the bf16 GEMM over the same weights\n", row);
+            x12_rows(pl, row);
+        }
+    if (sel("gemm_bf16x12_nt_tiled")) {
+        if (!g_case)
+            std::printf("\ngemm_bf16x12_nt_tiled, against the tiled bf16 GEMM over the same "
+                        "weights\n");
+        x12_tiled(pl);
     }
 
     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
@@ -35461,6 +36835,8 @@ static void device_phase(const Plugin& pl) {
     /* The same for its rotated int8 twin, whose norm half is rmsnorm_had_quant_i8g's. */
     skip_pair("ar_rmsnorm_had_quant_i8g", "two-rank fusion: needs a peer rank");
     skip_pair("ar_rmsnorm_had_quant_iq8r", "two-rank fusion: needs a peer rank");
+    /* And its bf16 form (ar_rmsnorm), whose norm half is the same device function unquantised. */
+    skip_pair("ar_rmsnorm_bf16", "two-rank fusion: needs a peer rank");
 
     dfree_all();
 }
@@ -35715,6 +37091,16 @@ static void usage(void) {
                 "  --perfmxd N K M [iters]:  the dense MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
                 "             one shape, with the weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
+                "  --perfx12 <file> <woff> N K M [iters] [wv,sk,mb ...]:  the bf16x12 GEMM rows\n"
+                "             (gemm_bf16x12_nt_m16 at M <= 16, else _m64): a synthetic check, then\n"
+                "             the real N x K bf16 weight at byte woff of a safetensors file, packed\n"
+                "             with libquant's default table, byte for byte against gemm_bf16_nt_m64\n"
+                "             and timed beside it at the default, the given points (0 = the law's\n"
+                "             choice) and a split sweep.\n"
+                "  --tunex12 <file> <woff> N K [iters]:  the bf16x12 decode rows tuned from DRAM on\n"
+                "             that real weight: M = 8 (gemm_bf16x12_nt_m16) and M = 64 (_m64), every\n"
+                "             distinct (wv, sk, mb), byte for byte against gemm_bf16_nt_m64 and timed\n"
+                "             beside it, plain and PRE; an x12pt line a point (bench-src/x12homes.py).\n"
                 "  --perff32 N K M [iters]:  gemm_nt_f32 at the tile form its rule picks, compared\n"
                 "             byte for byte with the host arithmetic, with GB/s and TFLOP/s.\n"
                 "  --perfvocab B:rows,.. K M [iters]:  the vocabulary-weighted head against the int8\n"
@@ -35813,8 +37199,9 @@ static void usage(void) {
                 "  --perfkda M [iters]:  kda_update at GLM's TP8 shape: prefill of M tokens (one\n"
                 "             sequence, and three anchored) and the 8x6 verify step, timed.\n"
                 "  --perfproject M [iters]:  mla_project at GLM's TP8 shape, both modes, timed.\n"
-                "  --perflogits M [iters]:  logits_gemm_bf16 and logits_gemm_bf16_cols at\n"
-                "             GLM-5.3's TP8 head slice (19360 x 4096), M rows, bytes compared.\n"
+                "  --perflogits M [iters] [n_embd] [n_vocab]:  logits_gemm_bf16 and\n"
+                "             logits_gemm_bf16_cols over M rows, bytes compared, at GLM-5.3's TP8\n"
+                "             head slice (4096 19360) or another (5120 124160 is Qwen3.8-27B's TP2).\n"
                 "  --perfmla M blocks heads [iters] [fill]:  MLA attention without the oracle, so\n"
                 "             a 2048-row prefill chunk at 2k/8k context fits (blocks 513/2049).\n"
                 "             The wave row and the matrix row at both key loads (paired tiles at\n"
@@ -35884,7 +37271,7 @@ int main(int argc, char** argv) {
     long long ar8_n = -1;
     int ar8_it = 200;
     const char* ar8_dt = "bf16";
-    long long lg_m = 0;
+    long long lg_m = 0, lg_k = 4096, lg_n = 19360;
     int lg_it = 200;
     const char* ar8_forms = "lockstep";
     const char* ar8_w = nullptr;
@@ -35899,6 +37286,11 @@ int main(int argc, char** argv) {
     /* Six children a card: at eight, the cards' 16 SDMA queues run out (the driver logs "No more
      * SDMA queue to allocate") and a run is barely shorter. */
     int jobs = 6;
+    const char* x12_file = nullptr;
+    long long x12_woff = 0, x12_n = 0, x12_k = 0, x12_m = 0;
+    int x12_it = 100;
+    bool x12_tune_mode = false;
+    std::vector<int> x12_pts;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--perfwpa")) {
             if (i + 3 >= argc) { usage(); return 2; }
@@ -36108,10 +37500,12 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d)
                 (kda ? kda_it : proj_it) = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perflogits")) {
-            /* Both bf16 head rows at GLM-5.3's TP8 slice over M rows. */
+            /* Both bf16 head rows over M rows, at GLM-5.3's TP8 slice or the one named. */
             if (i + 1 >= argc) { usage(); return 2; }
             lg_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_k = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_n = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfmtp")) {
             /* The draft head's entry at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -36155,6 +37549,35 @@ int main(int argc, char** argv) {
             sop_m = std::strtoll(argv[++i], nullptr, 0);
             sop_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') sop_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfx12")) {
+            /* The bf16x12 GEMM rows on a real weight (see x12_perf). */
+            if (i + 5 >= argc) { usage(); return 2; }
+            x12_file = argv[++i];
+            x12_woff = std::strtoll(argv[++i], nullptr, 0);
+            x12_n = std::strtoll(argv[++i], nullptr, 0);
+            x12_k = std::strtoll(argv[++i], nullptr, 0);
+            x12_m = std::strtoll(argv[++i], nullptr, 0);
+            x12_tune_mode = false;
+            if (i + 1 < argc && *argv[i + 1] &&
+                std::strspn(argv[i + 1], "0123456789") == std::strlen(argv[i + 1]))
+                x12_it = (int)std::strtol(argv[++i], nullptr, 0);
+            while (i + 1 < argc && argv[i + 1][0] != '-' && std::strchr(argv[i + 1], ',')) {
+                int w = 0, sk = 0, mb = 0;
+                if (std::sscanf(argv[++i], "%d,%d,%d", &w, &sk, &mb) != 3) { usage(); return 2; }
+                x12_pts.insert(x12_pts.end(), { w, sk, mb });
+            }
+        } else if (!std::strcmp(argv[i], "--tunex12")) {
+            /* The bf16x12 decode rows tuned from DRAM (see x12_tune). */
+            if (i + 4 >= argc) { usage(); return 2; }
+            x12_file = argv[++i];
+            x12_woff = std::strtoll(argv[++i], nullptr, 0);
+            x12_n = std::strtoll(argv[++i], nullptr, 0);
+            x12_k = std::strtoll(argv[++i], nullptr, 0);
+            x12_it = 200;
+            x12_tune_mode = true;
+            if (i + 1 < argc && *argv[i + 1] &&
+                std::strspn(argv[i + 1], "0123456789") == std::strlen(argv[i + 1]))
+                x12_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--jobs")) {
             if (i + 1 >= argc) { usage(); return 2; }
             jobs = std::atoi(argv[++i]);
@@ -36194,6 +37617,18 @@ int main(int argc, char** argv) {
         skip("paged attention timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (x12_file) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (x12_tune_mode) x12_tune(pl, x12_file, x12_woff, x12_n, x12_k, x12_it);
+        else               x12_perf(pl, x12_file, x12_woff, x12_n, x12_k, x12_m, x12_it, x12_pts);
+        dfree_all();
+#else
+        skip("x12 GEMM check and timing", "built without HIP");
+#endif
+        std::printf("\n%d failure(s), %d skipped\n", g_fail, g_skip);
+        return g_fail;
     }
     if (attn_m > 0 && attn_h > 0) {
         if (!load(&pl, path)) return 1;
@@ -36359,7 +37794,7 @@ int main(int argc, char** argv) {
     if (lg_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        logits_cols_check(pl, lg_m, 19360, lg_it);
+        logits_cols_check(pl, lg_m, lg_n, lg_it, lg_k);
 #else
         skip("bf16 head timing", "built without HIP");
 #endif

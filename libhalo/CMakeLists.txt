@@ -126,6 +126,7 @@ set(HALO_UNITS
   "halo_moe|"
   "halo_moe_gemm_bf16|"
   "halo_moe_gemm_q|"
+  "halo_moe_gemv|"
   "halo_moe_iqr|"
   "halo_moe_mxfp4|"
   "halo_mtp_enter|"
