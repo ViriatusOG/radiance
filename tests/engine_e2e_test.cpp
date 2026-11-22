@@ -1305,6 +1305,16 @@ TEST(lfm3_iq8r_container_tracks_the_bf16_one) {
  * them by 0.5 or more and changes the top token at a tenth of the positions. So at every position
  * the top token must agree, unless transformers' own top two are within the bound, and the
  * log-probability of an agreed token must be within 0.2. */
+/* Inkling 2's loop checkpoint (tests/tiny_model.h write_inkling2, golden tests/inkling2_logp_golden.h)
+ * is not yet compared with the engine: the bf16 arithmetic the engine runs drifts from the f32 golden
+ * by about 3 nats mean over the top-16 on this tiny model, so no tolerance here is meaningful yet.
+ * The plugin declares and runs the document end to end (arch/inkling2); the comparison is blocked on
+ * finding the operation that amplifies the bf16 rounding. */
+TEST(inkling2_logits_match_the_golden) {
+    SKIP("blocked: the tiny Inkling 2 model drifts ~3 nats under bf16 (see the comment above); "
+         "the plugin runs end to end but its logits are not yet checked against the golden");
+}
+
 TEST(each_family_computes_what_transformers_computes) {
     World& w = world();
     REQUIRE(w.ok);

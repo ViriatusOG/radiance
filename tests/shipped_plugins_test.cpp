@@ -99,7 +99,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" },
         { "hunyuan3d2", "" }, { "hyv3", "" }, { "hyv3", "fp8" }, { "hyv3", "gguf_ftype_15" },
-        { "laya", "" }, { "lfm2", "" }, { "lfm3", "" }, { "llama", "" }, { "mistral3", "" },
+        { "inkling2", "" }, { "laya", "" }, { "lfm2", "" }, { "lfm3", "" }, { "llama", "" }, { "mistral3", "" },
         { "llama", "fp8_e4m3" }, { "nemotronh", "" }, { "nomicbert", "" }, { "qwen35", "" },
         { "museglimmer", "" },
         { "museglimmer", "compressed-tensors" },

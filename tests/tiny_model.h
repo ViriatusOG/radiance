@@ -481,6 +481,150 @@ inline bool write_lfm3(const std::string& dir, const Lfm3& s) {
     return write_checkpoint(dir, c, ts);
 }
 
+/* ------------------------------------------------------------------ inkling2: the loop */
+
+/* Inkling 2 Mini's text backbone (`inkling2_loop`, served by arch/inkling2), at a size the host
+ * backend runs in a blink: the release's 24 physical layers, with the loop core 6..18 run three
+ * times, so 48 layer applications, and the release's attention-residual blocks of 6 layers. Full
+ * attention on layers 5, 11, 17 and 23, local elsewhere. The window is shorter than the golden
+ * prompt and the relative table's extent shorter still, so the window and the distance clip both
+ * bite; the clip thresholds are below the release's, and the position tau turns on at 32 tokens,
+ * so each of those paths runs. The names are the raw checkpoint's, which mkinkling2golden.py reads
+ * under the `model.` prefix. */
+struct Inkling2 {
+    int64_t layers = 24, hidden = 64, heads = 6, kv_heads = 2, head_dim = 16, d_rel = 8;
+    int64_t ffn = 32, experts = 8, top_k = 2, rank = 8;
+    int64_t vocab = 300, vocab_real = 300, extent = 32, window = 32, conv = 4;
+    int64_t core_start = 6, core_end = 18, passes = 3, block = 6;
+    int64_t tau_floor = 32;
+    float    qk_clip = 3.0f, rel_clip = 2.0f, tau_alpha = 0.1f, route_scale = 2.5f;
+    float    gate_cap = 4.0f, up_cap = 25.0f, final_cap = 30.0f;
+    float    branch = 0.5f, head = 3.0f;        /* the residual gain; the head amplitude: logits about 3 apart */
+    uint64_t seed = 71;
+    bool is_full(int64_t l) const { return l == 5 || l == 11 || l == 17 || l == 23; }
+};
+
+inline bool write_inkling2(const std::string& dir, const Inkling2& s) {
+    Rng r(s.seed);
+    const int64_t H = s.hidden, hd = s.head_dim, nh = s.heads, kv = s.kv_heads;
+    const int64_t Q = nh * hd, KV = kv * hd;
+    Json local = Json::array();
+    for (int64_t l = 0; l < s.layers; ++l)
+        if (!s.is_full(l)) local.push_back(l);
+    Json c;
+    c["architectures"] = { "Inkling2LoopForConditionalGeneration" };
+    c["model_type"] = "inkling2_loop";
+    c["hidden_size"] = H;
+    c["num_hidden_layers"] = s.layers;
+    c["num_attention_heads"] = nh;
+    c["num_key_value_heads"] = kv;
+    c["head_dim"] = hd;
+    c["local_layer_ids"] = local;
+    c["n_layers_per_attn_res_block"] = s.block;
+    c["sconv_kernel_size"] = s.conv;
+    c["sliding_window_size"] = s.window;
+    c["rel_extent"] = s.extent;
+    c["d_rel"] = s.d_rel;
+    c["qk_l2_clip_threshold"] = s.qk_clip;
+    c["rel_l2_clip_threshold"] = s.rel_clip;
+    c["log_scaling_n_floor"] = s.tau_floor;
+    c["log_scaling_alpha"] = s.tau_alpha;
+    c["n_routed_experts"] = s.experts;
+    c["num_experts_per_tok"] = s.top_k;
+    c["moe_intermediate_size"] = s.ffn;
+    c["intermediate_size"] = s.ffn;
+    c["route_scale"] = s.route_scale;
+    c["scoring_func"] = "sigmoid";
+    c["mlp_gate_softcap"] = s.gate_cap;
+    c["mlp_up_softcap"] = s.up_cap;
+    c["final_logit_softcapping"] = s.final_cap;
+    c["n_shared_experts"] = 0;
+    c["use_value_norm_no_gamma"] = true;
+    c["attn_res_normalize_values"] = true;
+    c["q_bias"] = false;
+    c["o_bias"] = false;
+    c["vocab_size"] = s.vocab;
+    c["unpadded_vocab_size"] = s.vocab_real;
+    c["max_position_embeddings"] = 4096;
+    c["tie_word_embeddings"] = false;
+    c["eos_token_id"] = (int)kEndOfText;
+    c["loop_config"] = { { "core_start", s.core_start }, { "core_end", s.core_end },
+                         { "num_passes", s.passes }, { "gate_rank", s.rank },
+                         { "is_varloop", false } };
+
+    const std::string m = "model.";
+    std::vector<Tensor> ts;
+    const int64_t n_cross = 2 * (s.core_end - s.core_start);
+    ts.push_back(noise(m + "embed.weight", { s.vocab, H }, r, s.head));
+    ts.push_back(noise(m + "embed_norm.weight", { H }, r, 0.1f, 1.0f));
+    ts.push_back(linear(m + "unembed.weight", s.vocab, H, r, s.head));
+    ts.push_back(noise(m + "norm.weight", { H }, r, 0.1f, 1.0f));
+    /* attn_queries[i] feeds layer i + 1: 3 queries on a full layer, 1 on a local one */
+    for (int64_t ip = 1; ip < s.layers; ++ip) {
+        const int64_t q = s.is_full(ip) ? 3 : 1;
+        ts.push_back(noise(m + "attn_res.attn_queries." + std::to_string(ip - 1), { q, H }, r, 0.3f));
+    }
+    for (int64_t ip = 0; ip < s.layers; ++ip)
+        ts.push_back(noise(m + "attn_res.mlp_queries." + std::to_string(ip), { H }, r, 0.3f));
+    ts.push_back(noise(m + "attn_res.output_query", { H }, r, 0.3f));
+    /* the cross-pass queries of the core: two rows per core layer, [q, kv] */
+    ts.push_back(noise(m + "middle_cycle_cross_pass_queries", { n_cross, H }, r, 0.3f));
+    ts.push_back(noise(m + "middle_cycle_cross_pass_kv_queries", { n_cross, H }, r, 0.3f));
+
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = m + "layers." + std::to_string(l) + ".";
+        const std::string a = p + "attn.";
+        const bool full = s.is_full(l);
+        ts.push_back(linear(a + "wq_du.weight", Q, H, r));
+        ts.push_back(linear(a + "wk_dv.weight", KV, H, r));
+        ts.push_back(linear(a + "wv_dv.weight", KV, H, r));
+        ts.push_back(linear(a + "wr_du.weight", nh * s.d_rel, H, r));
+        ts.push_back(linear(a + "wo_ud.weight", H, Q, r, s.branch));
+        ts.push_back(linear(a + "gate_attn.weight", Q, H, r));
+        ts.push_back(linear(a + "attn_sink_proj.weight", nh, H, r));
+        ts.push_back(noise(a + "rel_logits_proj.proj", { s.d_rel, s.extent }, r, 0.5f));
+        ts.push_back(noise(a + "q_l2_clip.scale", { nh, hd }, r, 0.1f, 1.0f));
+        ts.push_back(noise(a + "rel_l2_clip.scale", { nh, s.d_rel }, r, 0.1f, 1.0f));
+        if (full) {
+            /* a full layer's K and V convolutions take input-dependent taps too */
+            ts.push_back(noise(a + "k_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(noise(a + "v_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(linear(a + "k_sconv.weight_proj", kv * s.conv, H, r));
+            ts.push_back(linear(a + "v_sconv.weight_proj", kv * s.conv, H, r));
+            ts.push_back(noise(p + "q_input_norm.weight", { H }, r, 0.1f, 1.0f));
+            ts.push_back(noise(p + "k_input_norm.weight", { H }, r, 0.1f, 1.0f));
+            ts.push_back(noise(p + "v_input_norm.weight", { H }, r, 0.1f, 1.0f));
+        } else {
+            /* the convolutions are [channels, width] weights, the conv1d layout with the current tap last */
+            ts.push_back(noise(a + "k_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(noise(a + "v_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(noise(p + "attn_norm.weight", { H }, r, 0.1f, 1.0f));
+        }
+        ts.push_back(noise(p + "attn_sconv.weight", { H, s.conv }, r, 0.5f));
+
+        const std::string f = p + "mlp.";
+        ts.push_back(linear(f + "gate.weight", s.experts, H, r));
+        ts.push_back(noise(f + "gate.bias", { s.experts }, r, 0.1f));
+        ts.push_back(noise(f + "experts.w13_weight", { s.experts, 2 * s.ffn, H }, r,
+                           std::sqrt(3.0f / (float)H)));
+        ts.push_back(noise(f + "experts.w2_weight", { s.experts, H, s.ffn }, r,
+                           s.branch * std::sqrt(3.0f / (float)s.ffn)));
+        ts.push_back(noise(p + "mlp_norm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "mlp_sconv.weight", { H, s.conv }, r, 0.5f));
+
+        if (l >= s.core_start && l < s.core_end) {
+            /* the loop core's controllers: down [rank, 2H], gain and forget [H, rank] */
+            for (const char* w : { "attn", "k", "v", "mlp" }) {
+                const std::string q = p + "controllers." + w + ".";
+                ts.push_back(linear(q + "down_weight", s.rank, 2 * H, r));
+                ts.push_back(linear(q + "gain_weight", H, s.rank, r));
+                ts.push_back(linear(q + "forget_weight", H, s.rank, r));
+            }
+        }
+    }
+    return write_checkpoint(dir, c, ts);
+}
+
 /* ------------------------------------------------------------------ gemma4: sliding + global */
 
 /* Gemma 4 dense (`gemma4`, served by the gemma4 plugin as written), shaped like the 31B: sliding
