@@ -81,7 +81,7 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 | `had_quant_act_i8`, `had_quant_act_i8g`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
 | `gdn_conv_prep`, `gdn_conv_update` | a convolution history over 16 | the same |
 | `gdn_recurrent_update` | a `state_form` other than `per_candidate` or `anchor` | the same |
-| `ple_conv`, `causal_conv1d` | a history over 64 | the same |
+| `ple_conv`, `causal_conv1d`, `sconv_res` | a history over 64 | the same |
 | `ngram_ids` | `ngram` over 8 | the same |
 | `moe_gemm`, `moe_gemm_q`, `moe_gemm_q_mod4` | an `a_order` other than `token` or `sorted` | the same |
 | `gemm_nt_q` | parts (`pb1`/`pb2`) over a weight other than MXFP4 and the ParoQuant grids, or on the bias form | the same |

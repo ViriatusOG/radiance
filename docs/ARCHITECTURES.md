@@ -29,6 +29,7 @@ plugin claims.
 | `arch/bailing_hybrid_gguf_q5km` | `bailinghybrid` | `gguf_ftype_17` | the same tiny family, Q5_K_M GGUF release, served whole |
 | `arch/bailing_hybrid_gguf_q6k` | `bailinghybrid` | `gguf_ftype_18` | the same tiny family, Q6_K GGUF release, served whole |
 | `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them; pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
+| `arch/inkling2` | `inkling2` | `nvfp4` experts, `mxfp8` experts | Inkling 2 Mini (`inkling2_loop`), NVFP4 and MXFP8 experts, text only: a 24-layer loop (prelude, core run three times, coda) over 48 applications with their own KV and convolution states, sliding (1024) and full attention, block attention residuals, loop controllers, 128 sigmoid-routed SiTU experts at top-8. Not yet written: this row is the contract ([geometry](#inkling2-inkling-2-mini)) |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16 or IQ8R, one rank |
 | `arch/lfm3_bf16` | `lfm3` | *(empty)* | LiquidAI's LFM3 (LFM3-1.7B), bf16 or IQ8R, one rank: LFM2's short convolutions with full and sliding-window (256) GQA attention, sandwich norms, a partial rotary on the full layers and a sigmoid gate per query head. Text only |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
@@ -2642,6 +2643,98 @@ greedy text, as `ident.sh` allows ([TOOLS](TOOLS.md)).
 **Vision.** `arch/nemotronh/radio.h` serves the C-RADIO (v4-H) tower and its `mlp1` projector when
 the container holds them (`vision_config.model_type` `radio`): pictures, and video in tubelets of
 two frames, through `core/mm`'s `Radio` family.
+
+---
+
+# `inkling2`: Inkling 2 Mini
+
+`arch/inkling2` serves Inkling 2 Mini (`Inkling2LoopForConditionalGeneration`, `model_type:
+inkling2_loop`) from its bf16 release with NVFP4 and MXFP8 experts, text only, at one rank. The
+reference is `tests/mkinkling2golden.py`, a
+float32 torch forward that follows llama.cpp's graph (`src/models/inkling2-loop.cpp`) op for op.
+transformers has no class for the model, and vLLM has no loop.
+
+```
+Inkling 2 Mini (text_config inkling2_loop_text; eos 200006)
+  24 physical layers, hidden 2304; a loop: prelude 0..5, core 6..17 run three passes with one set
+    of weights, coda 18..23. 48 layer applications, each with its own KV and convolution state
+  kinds: full attention at physical layers 5, 11, 17 and 23 (8 applications); sliding window of
+    1024 on the other 20 physical layers (40 applications)
+  embed -> rms(embed_norm); final: the AttnRes mix with output_query, rms with `norm`, then the
+    unembed (untied, 201024 rows, 200058 real); logits softcap 30
+attention: 24 query heads, 8 KV heads, head_dim 128 on both kinds (swa_head_dim 128)
+  q = wq_du x ; k, v = conv(wk_dv x), conv(wv_dv x) ; r = wr_du x, d_rel 16 a head
+  q = clip(q * q_l2_clip, 22.627) ; k = clip(k, 22.627) ; v = rms(v), no gain
+  r = clip(r * rel_l2_clip, 8.0)
+  full layers: q and r times tau = 1 + 0.1 ln(max(1, (pos + 1) / 8192))
+  relative bias: r . rel_logits_proj[16, extent] at distance d = i - j, extent 1024 on full layers,
+    the window (1024) on sliding ones
+  sink: one logit per (query, head) from attn_sink_proj; it joins the denominator and has no value
+  out = softmax-weighted v, times sigmoid(gate_attn x), then wo_ud and attn_sconv
+short convolutions: kernel 4, four streams a layer (attn_sconv, k_sconv, v_sconv, mlp_sconv);
+  each is (x + sum of taps) / sqrt(5). K and V of full layers add input-dependent taps
+  (weight_proj of their input), with the divisor sqrt(9)
+attention residuals: a new block starts at every 6th layer (ip % 6 == 0). A layer's attention inputs are
+  a softmax over depth of the block states and the current one: three queries on full layers
+  (q, k, v), one on sliding layers; the MLP input has its own query (mlp_queries[ip])
+loop controllers, core layers 6..17 on passes after the first:
+  control(x, msg) = (1 - tanh(F g)) x + tanh(G g) msg, g = D [rms x | rms msg], gate rank 64
+MoE: 128 experts, top-8, intermediate 1152, router sigmoid over f32 logits; selection adds
+  gate.bias, the weights do not; weights normalised over the eight, times route_scale 8.0
+  SiTU on the expert: a = 4 tanh(g / 4) sigmoid(g) (sigmoid of the raw gate), u = 25 tanh(u / 25),
+    y = (a u) w2; w13 holds gate and up interleaved by row
+  no shared expert; mlp_sconv, then the residual add
+vision: not served yet; the checkpoint's vision tower is a follow-up (text only here)
+quantisation: NVFP4 experts on physical layers 0..19 (w13, w2: u8 codes, e4m3 scale per 16 of K,
+  per-expert amax over outer_scale_denominator); MXFP8 experts on 20..23 (e4m3 codes, ue8m0 scale
+  per 32 of K); everything else bf16, except 74 tensors kept f32 (the AttnRes queries among them)
+```
+
+Traps:
+
+- **The relative bias is read at the clipped distance, and it is zero past the extent.** The table
+  has `extent` columns: distance d reads column `clamp(d, 0, extent - 1)`, and the bias is zero
+  where d >= extent (llama.cpp's zero padded column; vLLM's `masked_fill`). Reading the last column
+  past the extent, or not clipping d, still produces fluent text.
+- **There is no RoPE in the text model.** Position enters through the relative bias and tau; a
+  rotary on either kind of layer is a different model.
+- **A controller's message comes from the previous pass's bank, not the current pass.** Pass p > 0
+  takes its messages from the bank of pass p - 1 (that pass's blocks after its first core block,
+  and its output), and restarts from the prelude's output and the prelude's blocks.
+- **Each application has its own KV and convolution state.** The same weights run at three
+  applications of each core layer, so the cache has 48 slots over two KV groups, and a convolution
+  history shared across passes reads the wrong inputs from the second pass on.
+- **Log-scaled tau multiplies q and r, on full layers only.** Sliding layers get neither; scaling q
+  alone, or both on every layer, is fluent and wrong.
+- **The convolution's divisor counts the residual.** It is sqrt(k + 1) for a static convolution and
+  sqrt(2k + 1) for K and V on full layers, where the input-dependent taps add a second term per tap.
+- **The clips come after the gains.** q is multiplied by `q_l2_clip` and r by `rel_l2_clip`
+  before their L2 clips (22.627 and 8.0); the k clip has no gain.
+- **The AttnRes softmax reads the normed states for both scores and values**, and the caller's
+  norm applies its gain afterwards. Mixing the raw states into the values is a different model.
+- **SiTU's sigmoid reads the raw gate.** The cap acts on the gate's tanh and on the up projection
+  only, so `4 tanh(g / 4) sigmoid(g)` is not `sigmoid(4 tanh(g / 4))`.
+
+Kernels (`docs/OPS.md`): `attn_paged_rel` (the bias and the per-row sink, on window and full
+layers), `sconv_res` for the four streams and K and V's dynamic taps, `attn_res_mix` for the AttnRes
+blocks, an f32 router (`gemm_nt_f32`, `router_sigmoid_topk`), and the experts as
+`data/recipes/inkling2-mini.recipe` stores them: the 20 NVFP4 layers kept as stored, `moe_gemm_q` at
+`nvfp4a8i8` with the SiTU product through `gated_quant_i8`; the 4 MXFP8 layers (20 to 23) as rotated
+int8, `moe_gemm_q` at `i8a8h` with the product through `situ_mul` and `had_quant_act_i8g`.
+
+Checked against llama.cpp origin/master at 29b52d398 (the Inkling 2 Mini commit, #32694) on a
+12-token prompt (ids 371, 151451, 149879, 151194, 149884, 152717, 13, 149917, 151451, 149879,
+153067, 149884): the top-5 sets and their order are identical at all 12 positions, and the largest
+|Δlogp| over the common top-5 entries is 7.5e-4. The same prompt through the float32 torch reference
+(`tests/mkinkling2golden.py real`) gives the same top-5 at every position, with the same bound.
+
+The converted release (17.6 GiB) against that reference on the same prompt, `--kld-record`'s
+top-16 at each of the 12 positions: on one R9700 the top-1 agrees at 12 of 12, the ordered top-4 at
+10, the mean |Δlogp| over the reference's top-16 is 0.036 and the largest 0.23; on the host backend
+12, 10, 0.045 and 0.24. The stream after each of the 48 layer applications stays within 1 to 6% of
+the reference's (relative L2), the bf16 activations and the experts' int8 inputs.
+
+---
 
 # `minimaxmusic3`: MiniMax-Music3, songs
 

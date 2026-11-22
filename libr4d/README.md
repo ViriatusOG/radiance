@@ -67,7 +67,8 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `had_quant_act_i8` | the same with a block Walsh-Hadamard rotation first, which is what makes one scale per row viable |
 | `rmsnorm_had_quant_i8` | residual add, RMS norm, rotate and quantise in one kernel |
 | `ar_ln_had_quant_i8` | the all-reduce fused with the norm that follows it: the peer's contribution is a second operand on the norm's load, so the all-reduce's bf16 output never exists. Exact bf16 or rotated 6-bit wire (`wire`) |
-| `gated_had_quant_i8` | `silu(a)*b` or `sigmoid(a)*b`, then the same rotation and quantiser |
+| `gated_had_quant_i8` | `silu(a)*b`, `sigmoid(a)*b`, or SiTU (`act` situ, with optional caps), then the same rotation and quantiser |
+| `gated_quant_i8` | `act(a)*b` (silu, sigmoid or SiTU), then per-group int8 codes with one f32 scale a group, row-major: the unrotated `gated_had_quant_i8` |
 | `gdn_gated_norm_had_quant_i8` | the GDN gated norm with the rotation and quantiser fused onto it |
 | `qk_norm_rope_gate` | q/k RMS norm, rope and the attention gate in one kernel |
 | `ar_oneshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4}rank_ti8`, `ar_gather_3rank` | the wider-world collectives (TP3/TP4/TP8), exact and int8-wire |

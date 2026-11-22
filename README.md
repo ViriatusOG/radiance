@@ -77,6 +77,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Nemotron 3.5 Embed 8B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | — |
 | Nemotron 3.5 Rerank 8B BF16: text/image document relevance, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16) | `tp1.yaml`, `tp2.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | `tp1.yaml`, `tp2.yaml` |
+| Inkling 2 Mini: NVFP4 experts as stored, MXFP8 experts as rotated int8; text, one card ([geometry](docs/ARCHITECTURES.md#inkling2-inkling-2-mini)) | `inkling2-mini.rad` (17.6 GiB) | [convert](#convert-a-checkpoint) with `data/recipes/inkling2-mini.recipe` | — |
 
 **Not served by this version.** A container whose weights are block FP8, MXFP4, M2XFP4 or
 ParoQuant, or whose experts read E4M3 activations, is refused at startup by the name of the first
