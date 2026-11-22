@@ -153,6 +153,29 @@ static const RadOperandSpec oAttnPagedSink[] = {
     { "out",         RAD_OPD_OUT,    0 },
 };
 
+/* attn_paged_rel (Inkling 2): attn_paged's parameters and the two widths of its bias. */
+static const RadParamSpec pAttnPagedRel[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8"),
+    P_INT("d_rel"), P_INT("extent"),
+};
+/* attn_paged_rel's operands: r [q_len, n_head, d_rel] and the sinks [q_len, n_head] are per-row
+ * activations, rel_proj [d_rel, extent] is a weight. */
+static const RadOperandSpec oAttnPagedRel[] = {
+    { "q",           RAD_OPD_IN,     0 },
+    { "kv_cache",    RAD_OPD_IN,     0 },
+    { "block_table", RAD_OPD_IN,     0 },
+    { "seqused",     RAD_OPD_IN,     0 },
+    { "k_descale",   RAD_OPD_IN,     1 },
+    { "v_descale",   RAD_OPD_IN,     1 },
+    { "cu_seqlens",  RAD_OPD_IN,     1 },
+    { "r",           RAD_OPD_IN,     0 },
+    { "rel_proj",    RAD_OPD_WEIGHT, 0 },
+    { "sink",        RAD_OPD_IN,     0 },
+    { "out",         RAD_OPD_OUT,    0 },
+};
+
 /* attn_paged with gate_quant_fp8 folded into its merge: attn_paged's parameters plus the two of
  * gate_quant_fp8's that are not implied (its `n` is `head_dim`, its rows attn_paged's (token,
  * head) pairs), then attn_paged's operands, the gate, the codes and the scales. `out` holds the
@@ -1842,7 +1865,7 @@ static const RadOperandSpec oRmsNormHadQuant[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },   /* layers with a bf16 consumer of the post-norm tensor */
 };
 
-/* `act` names the gate: "silu" for down_proj's input, "sigmoid" for a gated-attention o_proj's.
+/* `act` names the gate: "silu" for down_proj's input, "sigmoid" for a gated-attention o_proj's, "situ" for SiTU. The
  * `mode` is libr4d's optional integer spelling of the same choice; `act` wins if both are given. */
 static const RadParamSpec pGatedHadQuant[] = {
     P_INT("M"),
@@ -1850,13 +1873,27 @@ static const RadParamSpec pGatedHadQuant[] = {
     P_INT("group"),
     P_STR("dtype"),
     P_STRO("act"),
-    P_INTO("mode"),                         /* 0 = silu(a)*b, 1 = sigmoid(a)*b */
+    P_INTO("mode"),                         /* 0 = silu(a)*b, 1 = sigmoid(a)*b, 2 = SiTU */
+    P_F64O("gate_cap"),                     /* SiTU only: a cap with silu or sigmoid is refused */
+    P_F64O("up_cap"),
 };
 static const RadOperandSpec oGatedHadQuant[] = {
     { "a",     RAD_OPD_IN,  0 },
     { "b",     RAD_OPD_IN,  1 },   /* absent = vLLM's packed gate_up layout, b = a + n */
     { "q",     RAD_OPD_OUT, 0 },
     { "scale", RAD_OPD_OUT, 0 },
+};
+
+/* gated_quant_i8 is gated_had_quant_i8's table with `group` optional (default 128), as libref's is. */
+static const RadParamSpec pGatedQuantI8[] = {
+    P_INT("M"),
+    P_INT("n"),
+    P_INTO("group"),
+    P_STR("dtype"),
+    P_STRO("act"),
+    P_INTO("mode"),                         /* 0 silu, 1 sigmoid, 2 situ */
+    P_F64O("gate_cap"),
+    P_F64O("up_cap"),
 };
 
 /* Not in docs/OPS.md. Like `rmsnorm_had_quant_i8`, a fusion with no unfused equivalent: the GDN
@@ -2389,6 +2426,41 @@ static const RadOperandSpec oCausalConv[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
 };
+/* sconv_res: causal_conv1d's operands with the input-dependent taps `dyn` before the optionals. */
+/* l2_clip's specs, before the schema table that names them. */
+static const RadParamSpec pL2Clip[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "n",         RAD_P_INT, RAD_REQUIRED },
+    { "group",     RAD_P_INT, RAD_REQUIRED },
+    { "threshold", RAD_P_F64, RAD_REQUIRED },
+    { "dtype",     RAD_P_STR, RAD_REQUIRED },
+    { "floor",     RAD_P_F64, RAD_OPTIONAL },
+    { "alpha",     RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oL2Clip[] = {
+    { "x",         RAD_OPD_IN,     0 },
+    { "w",         RAD_OPD_WEIGHT, 1 },
+    { "positions", RAD_OPD_IN,     1 },
+    { "y",         RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pSconvRes[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "width", RAD_P_INT, RAD_REQUIRED },
+    { "heads", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oSconvRes[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "dyn",          RAD_OPD_IN,     1 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
 
 /* PLE's hashed n-gram ids. `state` is a rolling window of committed ids (RAD_KV_CONV's shape,
  * ple_conv's contract), except that a cold window holds EOS, not zero, since zero is a real token
@@ -2608,6 +2680,18 @@ static const RadOperandSpec oLiliCand[] = {
     { "up_w", RAD_OPD_WEIGHT, 0 },  { "up_b", RAD_OPD_WEIGHT, 0 },
     { "slot", RAD_OPD_WEIGHT, 0 },  { "rank", RAD_OPD_WEIGHT, 0 },
     { "cand", RAD_OPD_OUT, 0 },     { "feat", RAD_OPD_OUT, 0 },     { "base", RAD_OPD_OUT, 0 },
+};
+/* SiTU over a fused gate_up (r4d_situ.hip). A cap of 0 is no softcap on that side. */
+static const RadParamSpec pSituMul[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("gate_cap"), P_F64O("up_cap"),
+};
+/* Block attention residuals (r4d_attn_res.hip). states is absent at n_state 0. */
+static const RadParamSpec pAttnResMix[] = {
+    P_INT("M"), P_INT("n"), P_INT("n_state"), P_INT("n_query"), P_STR("dtype"), P_F64("eps"),
+};
+static const RadOperandSpec oAttnResMix[] = {
+    { "states", RAD_OPD_IN, 1 },  { "cur", RAD_OPD_IN, 0 },   { "addend", RAD_OPD_IN, 1 },
+    { "query", RAD_OPD_WEIGHT, 0 }, { "w", RAD_OPD_WEIGHT, 1 }, { "y", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pLiliAttn[] = {
     P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n_head"), P_INT("head_dim"), P_STR("dtype"),
@@ -3331,6 +3415,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("silu_mul", pMnDtype, oGateUp,
            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
             "which is the order rad-convert fuses gate_proj and up_proj in."),
+    SCHEMA("situ_mul", pSituMul, oGateUp,
+           "SiTU over a fused gate_up, the gate first: gcap * tanh(g / gcap) * sigmoid(g) * ucap * "
+           "tanh(u / ucap), the sigmoid on the raw gate. A cap of 0 leaves that side uncapped."),
     SCHEMA("gelu_mul", pMnDtype, oGateUp,
            "y[.., i] = gelu_tanh(gate_up[.., i]) * gate_up[.., n + i], the tanh approximation "
            "(gemma's gelu_pytorch_tanh), and the GATE IS THE FIRST HALF as in silu_mul. Its own "
@@ -3520,6 +3607,15 @@ static const RadOpSchema kSchemas[] = {
            "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
            "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
            "The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's."),
+    SCHEMA("sconv_res", pSconvRes, oSconvRes,
+           "y[t][c] = (x[t][c] + sum_lag (w[c][k-1-lag] + dyn[t][c/(n/heads)][lag]) * "
+           "x[t-lag][c]) / sqrt(m*k + 1), causal_conv1d's window with the input as the residual; "
+           "m = 2 with dyn, 1 without (heads 0). The state, `has_init`, `cache_idx` and "
+           "`num_accepted` are causal_conv1d's."),
+    SCHEMA("l2_clip", pL2Clip, oL2Clip,
+           "y[r][i] = x[r][i] * w[i] * min(1, threshold / (||x*w over i's group|| + 1e-6)) * tau[r], "
+           "tau = 1 + alpha * ln(max(1, (positions[r] + 1) / floor)) with positions, else 1. "
+           "floor 1 and alpha 0 by default."),
     SCHEMA("ngram_hint", pNgramHint, oNgramHint,
            "ids[s][h] = ngram_ids' hash of the n-gram ending at sequence s's NEWEST token on a "
            "draft head's pass: with `hist` the history pass's last row (the token the verify "
@@ -3607,6 +3703,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("attn_paged_sink", pAttnPaged, oAttnPagedSink,
            "attn_paged with `sinks` [n_head] f32: one logit a query head in the scaled-score "
            "domain, in the softmax's maximum and denominator, with no value."),
+    SCHEMA("attn_paged_rel", pAttnPagedRel, oAttnPagedRel,
+           "attn_paged with a relative-position bias r . rel_proj[:, d] on each score at distance "
+           "d < extent, and one sink logit per query row and head, in the maximum and the "
+           "denominator, with no value."),
     SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
@@ -4031,7 +4131,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_had_quant_i8", pRmsNormHadQuant, oRmsNormHadQuant,
            "residual add, RMS norm, rotation and int8 quantisation in one pass over the row."),
     SCHEMA("gated_had_quant_i8", pGatedHadQuant, oGatedHadQuant,
-           "silu(a)*b or sigmoid(a)*b, then the rotation and the quantiser."),
+           "silu(a)*b, sigmoid(a)*b or SiTU(a, b), then the rotation and the quantiser."),
+    SCHEMA("gated_quant_i8", pGatedQuantI8, oGatedHadQuant,
+           "gated_had_quant_i8 without the rotation: act(a) * b, then per-group int8 codes with one "
+           "f32 scale each, row-major (quant_act_i8g's layout). act silu, sigmoid or situ."),
     SCHEMA("gdn_gated_norm_had_quant_i8", pGdnGatedNormHadQuant, oGdnGatedNormHadQuant,
            "the GDN gated RMS norm over 128-wide heads, then a rotation and int8 quantisation "
            "over the flattened row."),
@@ -4056,6 +4159,9 @@ static const RadOpSchema kSchemas[] = {
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
            "and the gated residual's write follows the reduction. Both wires at two ranks, the "
            "exact one at four."),
+    SCHEMA("attn_res_mix", pAttnResMix, oAttnResMix,
+           "block attention residuals: a softmax over depth of the rms-normed states, cur + addend, "
+           "per query; the mix is rms-normed and gained by w when present."),
     SCHEMA("lili_cand", pLiliCand, oLiliCand,
            "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
            "layernorm, the up projection and silu, and the lattice rows' additive part."),
@@ -4540,6 +4646,17 @@ R4D_WIN_C(cAnchorH512G4Bf16, 512, 4, "bf16", 1) R4D_WIN_C(cAnchorH512G4I8, 512, 
 R4D_WIN_C(cAnchorH512G8Bf16, 512, 8, "bf16", 1) R4D_WIN_C(cAnchorH512G8I8, 512, 8, "i8", 1)
 R4D_WIN_C(cWinH512G16Bf16, 512, 16, "bf16", 0) R4D_WIN_C(cWinH512G16I8, 512, 16, "i8", 0)
 #undef R4D_WIN_C
+#define R4D_REL_C(NAME, G, KV)                                                                     \
+    static const RadConstraint NAME[] = {                                                          \
+        C_EQ("head_dim", 128), C_EQ("gqa", G), C_EQ("block_size", 16), C_GE("causal", 0),          \
+        C_GE("window", 0), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                          \
+    };
+R4D_REL_C(cRelG1Bf16, 1, "bf16") R4D_REL_C(cRelG1I8, 1, "i8")
+R4D_REL_C(cRelG2Bf16, 2, "bf16") R4D_REL_C(cRelG2I8, 2, "i8")
+R4D_REL_C(cRelG3Bf16, 3, "bf16") R4D_REL_C(cRelG3I8, 3, "i8")
+R4D_REL_C(cRelG4Bf16, 4, "bf16") R4D_REL_C(cRelG4I8, 4, "i8")
+R4D_REL_C(cRelG8Bf16, 8, "bf16") R4D_REL_C(cRelG8I8, 8, "i8")
+#undef R4D_REL_C
 /* The open-ended window (attn_paged_ahead): non-causal, a window of at least one. */
 #define R4D_WIN_AHEAD_C(NAME, HD, G, KV)                                                          \
     static const RadConstraint NAME[] = {                                                          \
@@ -5003,6 +5120,11 @@ static const RadConstraint cLiliAttn[] = {
 };
 static const RadConstraint cLiliFactor[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cLiliWalk[] = { C_GE("k", 1), C_LE("k", 64), C_IN("dtype", "bf16") };
+/* The depth is states plus cur, at most 16 values in the kernel's LDS (r4d_attn_res.hip). */
+static const RadConstraint cAttnResMix[] = {
+    C_GE("n_state", 0), C_LE("n_state", 15), C_GE("n_query", 1), C_LE("n_query", 4),
+    C_IN("dtype", "bf16"),
+};
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
@@ -5270,6 +5392,12 @@ static const RadConstraint cMoeGemmW4I8[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128),
     C_IN("dtype", "w4a8i8 w4a8i8h w4nl64a8i8h w4nl32a8i8h"), C_IN("a_group", "128 256"),
+};
+/* NVFP4 experts: K in whole 64s (the scale blob's rows are whole words), the activation's scale
+ * per a whole number of 16-wide groups. Any N: the kernel is a column per thread. */
+static const RadConstraint cMoeGemmNvfp4[] = {
+    C_GE("M", 1), C_GE("N", 1), C_DIV("K", 64), C_GE("n_expert", 1), C_LE("n_expert", 65536),
+    C_GE("top_k", 1), C_DIV("group", 16), C_IN("dtype", "nvfp4a8i8"),
 };
 /* The bf16 expert GEMM: 64-wide column tiles and 64-deep K passes, one table, no group. */
 static const RadConstraint cMoeGemmBf16[] = {
@@ -5724,6 +5852,9 @@ static const RadConstraint cRopeTable[] = {
 static const RadConstraint cGatedHadQuantI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("group", 512), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cGatedQuantI8[] = {
+    C_GE("n", 1), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cGdnGatedNormHadQuantI8[] = {
     C_DIV("n", 128), C_LE("group", 512), C_EQ("head_dim", 128), C_IN("dtype", "bf16"),
 };
@@ -6108,6 +6239,11 @@ static const RadConstraint cPleConv[]   = { C_IN("dtype", "bf16"), C_GE("width",
 /* The same kernel undilated: the window is width-1 deep, and the taps are held in registers. */
 static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
                                              C_LE("width", 8) };
+/* sconv_res's window is causal_conv1d's; heads (0, or one that divides n) is checked at launch. */
+static const RadConstraint cSconvRes[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
+                                           C_LE("width", 8), C_GE("heads", 0) };
+/* l2_clip: bf16 activations and scale, i32 positions, groups of at least one column. */
+static const RadConstraint cL2Clip[] = { C_IN("dtype", "bf16"), C_GE("group", 1) };
 static const RadConstraint cKvStore[]   = { C_GE("block_size", 1), C_IN("kv_dtype", "bf16") };
 /* The E4M3 store, which GLM-5.3's latent attention cache takes (four columns a thread). */
 static const RadConstraint cKvStoreFp8[] = { C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3") };
@@ -6462,6 +6598,22 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cCausalConv), NOTUNE,
   nullptr, nullptr, r4d_rad_causal_conv1d },
+
+{ "sconv_res_bf16", "sconv_res", "conv",
+  "Inkling 2's short convolution with its residual and dynamic taps; one thread a channel",
+  "width up to 8, undilated; heads 0 or a count dividing n",
+  "bf16 activations, weights, dyn and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSconvRes), NOTUNE,
+  nullptr, nullptr, r4d_rad_sconv_res },
+
+{ "l2_clip_bf16", "l2_clip", "elem",
+  "Inkling 2's per-group L2 clip with an optional scale and a position tau; one thread a group",
+  "any group size dividing n",
+  "bf16 activations and scale, i32 positions; pitched x and y, y may alias x",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cL2Clip), NOTUNE,
+  nullptr, nullptr, r4d_rad_l2_clip },
 
 { "ngram_ids_i32", "ngram_ids", "vocab",
   "PLE's hashed n-gram row ids, one thread a token",
@@ -7053,6 +7205,14 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_silu_mul, nullptr, nullptr, nullptr,
+  r4d_shape_silu_mul },
+{ "situ_mul_bf16", "situ_mul", "elem",
+  "SiTU gated product over a fused [M, 2n] gate_up, Inkling 2's expert activation",
+  "any n; the gate is the first half; a cap of 0 is no softcap",
+  "bf16 in and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_situ_mul, nullptr, nullptr, nullptr,
   r4d_shape_silu_mul },
 
 { "gelu_mul_bf16", "gelu_mul", "elem",
@@ -7759,6 +7919,31 @@ R4D_WINSINK_ROW(128, 8, i8kv, i8, cWinH128G8I8, "int8 (an f16 scale of K and of 
 R4D_WINSINK_ROW(128, 16, bf16kv, bf16, cWinH128G16Bf16, "bf16")
 R4D_WINSINK_ROW(128, 16, i8kv, i8, cWinH128G16I8, "int8 (an f16 scale of K and of V per token and head)")
 #undef R4D_WINSINK_ROW
+
+/* attn_paged_rel (Inkling 2's attention, r4d_attn_rel.hip): head_dim 128 at gqa 1, 2, 3, 4 and 8,
+ * bf16 or int8 cache, any window (0 is full) and causal or not. One plain kernel serves every
+ * q_len and gqa, so each geometry's row shares its launch and differs only in its constraints. */
+#define R4D_REL_ROW(G, KVN, KVS, C, KVDOC)                                                         \
+{ "attn_rel_h128_gqa" #G "_" #KVN, "attn_paged_rel", "attn",                                       \
+  "paged attention with a relative-position bias and a sink logit per row; a workgroup a (row, "  \
+  "head) pair, one thread a dimension",                                                            \
+  "head_dim 128, " #G " queries per kv head, paged block 16, any q_len, varlen, any window",       \
+  "bf16 query, bf16 r, rel_proj and sinks, " KVDOC " kv cache, bf16 out, f32 math",               \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_rel_h128_##KVS, nullptr, nullptr, nullptr,                       \
+  r4d_shape_attn_paged_rel },
+R4D_REL_ROW(1, bf16kv, bf16kv, cRelG1Bf16, "bf16")
+R4D_REL_ROW(1, i8kv, i8kv, cRelG1I8, "int8 (an f16 scale of K and of V per token and head)")
+R4D_REL_ROW(2, bf16kv, bf16kv, cRelG2Bf16, "bf16")
+R4D_REL_ROW(2, i8kv, i8kv, cRelG2I8, "int8 (an f16 scale of K and of V per token and head)")
+R4D_REL_ROW(3, bf16kv, bf16kv, cRelG3Bf16, "bf16")
+R4D_REL_ROW(3, i8kv, i8kv, cRelG3I8, "int8 (an f16 scale of K and of V per token and head)")
+R4D_REL_ROW(4, bf16kv, bf16kv, cRelG4Bf16, "bf16")
+R4D_REL_ROW(4, i8kv, i8kv, cRelG4I8, "int8 (an f16 scale of K and of V per token and head)")
+R4D_REL_ROW(8, bf16kv, bf16kv, cRelG8Bf16, "bf16")
+R4D_REL_ROW(8, i8kv, i8kv, cRelG8I8, "int8 (an f16 scale of K and of V per token and head)")
+#undef R4D_REL_ROW
 
 /* DSpark's shared-anchor mask is intentionally a distinct op/kernel family, not an accepted
  * `window` variation of attn_paged's per-query visibility. Its base/upper key bounds are tied to
@@ -9380,6 +9565,20 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4, nullptr,
   r4d_rad_unrelayout_moe_w4_mod4 },
 
+{ "moe_gemm_nvfp4a8i8", "moe_gemm_q", "moe",
+  "moe_gemm_q over NVFP4 experts against an INT8 activation: e2m1 codes times an E4M3 scale per "
+  "(row, 16 of K) times the expert's f32 level, each 16-wide group's int32 sum folded under its "
+  "scales; one thread a column, one block a sorted row, the same rows and routing as the others",
+  "any N; K a multiple of 64; group a multiple of 16",
+  "i8 activation with an f32 scale per (row, a_group of K), a_group a multiple of 16; nvfp4 "
+  "experts: the codes fp4_e2m1 [N, K] as stored and the joined scale,scale.1 (E4M3 per (row, 16 of "
+  "K) and an f32 level per expert); bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGemmNvfp4), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gemm_nvfp4a8i8, nullptr,
+  r4d_rad_layout_moe_nvfp4, r4d_rad_relayout_moe_nvfp4, nullptr,
+  r4d_rad_unrelayout_moe_nvfp4 },
+
 { "moe_gemm_bf16", "moe_gemm", "moe",
   "the grouped GEMM with unquantised experts: one run of expert-sorted rows a block, bf16 WMMA over "
   "an LDS-staged 64-deep K pass with the next one prefetched in registers",
@@ -10192,7 +10391,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "gated_had_quant_i8", "gated_had_quant_i8", "quant",
   "an elementwise gated product, block Hadamard and per-row int8 quantisation in one pass; mode 0 "
-  "is silu(a)*b for down_proj's input and mode 1 is sigmoid(a)*b for o_proj's",
+  "is silu(a)*b for down_proj's input, mode 1 is sigmoid(a)*b for o_proj's, and mode 2 (act situ) "
+  "is SiTU, with gate_cap and up_cap where 0 is no cap on that side",
   "K a multiple of 128; rotation width a power of two dividing the per-rank K; K*4 bytes must fit "
   "LDS; strides in elements, 0 means tight",
   "bf16 in, int8 out with an f32 per-row scale carrying 1/sqrt(had)",
@@ -10200,6 +10400,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cGatedHadQuantI8), NOTUNE,
   nullptr, nullptr, r4d_rad_gated_had_quant_i8, nullptr, nullptr, nullptr,
   r4d_shape_gated_had_quant_i8 },
+
+{ "gated_quant_i8", "gated_quant_i8", "quant",
+  "act(a) * b, then per-group int8 quantisation with one f32 scale per group, in one pass: "
+  "gated_had_quant_i8 without the rotation",
+  "any n; group defaults to 128, and a group wider than n is one scale per row",
+  "bf16 in, int8 codes out row-major with an f32 scale per (row, group); act silu, sigmoid or "
+  "situ; the caps are SiTU's and are refused with silu or sigmoid",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGatedQuantI8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_quant_i8, nullptr, nullptr, nullptr,
+  r4d_shape_gated_quant_i8 },
 
 { "gdn_gated_norm_had_quant_i8", "gdn_gated_norm_had_quant_i8", "quant",
   "the GDN gated RMS norm over 128-wide heads, then a block Hadamard and per-row int8 "
@@ -10276,6 +10487,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cLiliCand), NOTUNE,
   nullptr, nullptr, r4d_rad_lili_cand, nullptr, nullptr, nullptr,
   r4d_shape_lili_cand },
+{ "attn_res_mix_bf16", "attn_res_mix", "norm",
+  "block attention residuals over bf16 states, cur and addend, f32 query and gain",
+  "any M and n; one workgroup a row; depth at most 16, queries at most 4",
+  "bf16 states, cur, addend and y; f32 query and w",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnResMix), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_res_mix, nullptr, nullptr, nullptr,
+  r4d_shape_attn_res_mix },
 { "lili_attn_bf16", "lili_attn", "draft",
   "LiLiCorr lattice attention with learned slot biases, no mask",
   "steps * k <= 64, head_dim <= 128; one workgroup a (sequence, head)",

@@ -55,6 +55,8 @@ __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z))
 
 /* SILU is ple_conv's activation; causal_conv1d (LFM2's short convolution) is the same window with
  * no activation, no residual and dilation one. */
+/* sconv_res (SCONV) reads `dyn` [M, heads*k] at row pitch `dld`, a channel's head being c / hch,
+ * and takes its residual from x rather than `resid`, scaled by `sdiv` = sqrt(m*k + 1). */
 #define PLE_CONV_PARAMS                                                                         \
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,                             \
     uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,                                  \
@@ -62,8 +64,9 @@ __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z))
     const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,                         \
     uint16_t* __restrict__ y, const uint16_t* __restrict__ bias, uint32_t n, uint32_t wid,      \
     uint32_t dil, uint32_t hist, uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,        \
-    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len
-template <bool SILU>
+    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len,                  \
+    const uint16_t* __restrict__ dyn, uint32_t dld, uint32_t hch, float sdiv
+template <bool SILU, bool SCONV>
 __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 
     const uint32_t c = blockIdx.x * kPcThreads + threadIdx.x;
@@ -95,6 +98,8 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
     uint16_t* __restrict__ yc = y + (size_t)bos * yld + c;
 
     const float b0 = bias ? bf16_to_f32(bias[c]) : 0.0f;
+    /* sconv_res's taps: this channel's head's row of dyn, where column head*k + lag is lag's tap. */
+    const uint16_t* __restrict__ dc = SCONV && dyn ? dyn + (size_t)bos * dld + (c / hch) * wid : nullptr;
     for (int32_t t = t0; t < t1; ++t) {
         float acc = b0;
 #pragma unroll
@@ -103,8 +108,15 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
                 const int32_t src = t - (int32_t)hist + (int32_t)(j * dil);
                 const float v = src >= 0 ? bf16_to_f32(xc[(size_t)src * xld])
                                          : (hc ? bf16_to_f32(hc[(src + (int32_t)hist) * cs_tok]) : 0.0f);
-                acc += v * wt[j];
+                float tap = wt[j];
+                if (SCONV && dc) tap += bf16_to_f32(dc[(size_t)t * dld + (wid - 1 - j)]);
+                acc += v * tap;
             }
+        }
+        if (SCONV) {
+            const float xr = bf16_to_f32(xc[(size_t)t * xld]);
+            yc[(size_t)t * yld] = f32_to_bf16((xr + acc) / sdiv);
+            continue;
         }
         const float r = rc ? bf16_to_f32(rc[(size_t)t * rld]) : 0.0f;
         yc[(size_t)t * yld] = f32_to_bf16(r + (SILU ? pc_silu(acc) : acc));
@@ -154,12 +166,13 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
  * chained form (r4d_chain.h), taken at decode heights. */
-template <bool SILU, class CH>
+template <bool SILU, bool SCONV, class CH>
 __global__ __launch_bounds__(kPcThreads)
 void ple_conv_kernel(PLE_CONV_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    ple_conv_body<SILU>(x, w, cs, cu, resid, sidx, hini, nacc, y, bias, n, wid, dil, hist, xld, rld,
-                        yld, wld, cs_slot, cs_ch, cs_tok, state_len);
+    ple_conv_body<SILU, SCONV>(x, w, cs, cu, resid, sidx, hini, nacc, y, bias, n, wid, dil, hist,
+                               xld, rld, yld, wld, cs_slot, cs_ch, cs_tok, state_len, dyn, dld,
+                               hch, sdiv);
     if (CH::on) r4d_chain_done();
 }
 #undef PLE_CONV_PARAMS
@@ -170,11 +183,14 @@ enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y 
 enum { PB_B = PC_Y, PB_Y };
 /* causal_conv1d's operands: ple_conv's without `resid`. */
 enum { CC_X = 0, CC_W, CC_CS, CC_CU, CC_CIDX, CC_HINIT, CC_NACC, CC_Y };
+/* sconv_res's operands: causal_conv1d's with `dyn` before the optionals. */
+enum { SC_X = 0, SC_W, SC_CS, SC_CU, SC_DYN, SC_CIDX, SC_HINIT, SC_NACC, SC_Y };
 
 int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, const RadTensor* w,
                 const RadTensor* cs, const RadTensor* cu, const RadTensor* resid,
                 const RadTensor* cidx, const RadTensor* hini, const RadTensor* nacc,
-                const RadTensor* y, const RadTensor* b = nullptr) {
+                const RadTensor* y, const RadTensor* b = nullptr,
+                const RadTensor* dyn = nullptr, long long heads = 0, bool sconv = false) {
     if (!x || !w || !cu || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
@@ -209,6 +225,19 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     if (wrows < n) return R4D_NO(RAD_E_SHAPE);
     if (b && (r4d_numel(b) != n || !r4d_contig(b))) return R4D_NO(RAD_E_SHAPE);
 
+    /* sconv_res's dyn: rows of heads*k, the heads dividing the channels, bf16 like the rest. */
+    long long dld = 0;
+    if (sconv && dyn) {
+        if (dyn->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+        if (heads <= 0 || n % heads != 0) return R4D_NO(RAD_E_SHAPE);
+        long long tdy = 0;
+        dld = r4d_rows_pitch(dyn, heads * wid, &tdy);
+        if (dld < 0) return R4D_NO(RAD_E_STRIDE);
+        if (tdy != T) return R4D_NO(RAD_E_SHAPE);
+    }
+    const uint32_t hch = dyn ? (uint32_t)(n / heads) : 1;
+    const float sdiv = sqrtf((float)((dyn ? 2 : 1) * wid + 1));
+
     const long long N = r4d_numel(cu) - 1;
     if (N <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(cu)) return R4D_NO(RAD_E_STRIDE);
@@ -230,8 +259,8 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
     const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && T <= 64;
-#define R4D_PC(S_, CH_)                                                                         \
-    hipLaunchKernelGGL((ple_conv_kernel<S_, CH_>), dim3(cb, tb, (uint32_t)N),                   \
+#define R4D_PC(S_, SC_, CH_)                                                                    \
+    hipLaunchKernelGGL((ple_conv_kernel<S_, SC_, CH_>), dim3(cb, tb, (uint32_t)N),              \
                        dim3(kPcThreads), 0, (hipStream_t)s,                                      \
                        (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),               \
                        have_cs ? (uint16_t*)r4d_addr(cs) : nullptr,                              \
@@ -243,9 +272,11 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
                        (uint16_t*)r4d_addr(y), b ? (const uint16_t*)r4d_addr(b) : nullptr,       \
                        (uint32_t)n, (uint32_t)wid, (uint32_t)dil,                                \
                        (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld, \
-                       cs_slot, cs_ch, cs_tok, state_len)
-    if (silu) { if (chain) R4D_PC(true, r4dchain);  else R4D_PC(true, R4dUnchained); }
-    else      { if (chain) R4D_PC(false, r4dchain); else R4D_PC(false, R4dUnchained); }
+                       cs_slot, cs_ch, cs_tok, state_len,                                        \
+                       dyn ? (const uint16_t*)r4d_addr(dyn) : nullptr, (uint32_t)dld, hch, sdiv)
+    if (sconv) { if (chain) R4D_PC(false, true, r4dchain); else R4D_PC(false, true, R4dUnchained); }
+    else if (silu) { if (chain) R4D_PC(true, false, r4dchain); else R4D_PC(true, false, R4dUnchained); }
+    else           { if (chain) R4D_PC(false, false, r4dchain); else R4D_PC(false, false, R4dUnchained); }
 #undef R4D_PC
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
@@ -271,4 +302,16 @@ extern "C" int r4d_rad_causal_conv1d(const RadArgs* a, RadStream s) {
     return conv_launch(a, s, false, r4d_opt(a, CC_X), r4d_opt(a, CC_W), r4d_opt(a, CC_CS),
                        r4d_opt(a, CC_CU), nullptr, r4d_opt(a, CC_CIDX), r4d_opt(a, CC_HINIT),
                        r4d_opt(a, CC_NACC), r4d_opt(a, CC_Y));
+}
+
+/* Inkling 2's short convolution with its residual. Its dyn and heads must agree (libref refuses
+ * the rest too); the window is causal_conv1d's, and the dilation is one by construction. */
+extern "C" int r4d_rad_sconv_res(const RadArgs* a, RadStream s) {
+    const long long heads = r4d_geti_or(a, "heads", 0);
+    /* heads 0 means no dyn: the operand is ignored even when it is filled. */
+    const RadTensor* dyn = heads > 0 ? r4d_opt(a, SC_DYN) : nullptr;
+    if (heads > 0 && dyn == nullptr) return R4D_NO(RAD_E_INVAL);
+    return conv_launch(a, s, false, r4d_opt(a, SC_X), r4d_opt(a, SC_W), r4d_opt(a, SC_CS),
+                       r4d_opt(a, SC_CU), nullptr, r4d_opt(a, SC_CIDX), r4d_opt(a, SC_HINIT),
+                       r4d_opt(a, SC_NACC), r4d_opt(a, SC_Y), nullptr, dyn, heads, true);
 }

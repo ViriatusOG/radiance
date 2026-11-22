@@ -6,6 +6,8 @@
 //   mode 0, down_proj's input      silu(a) * b  =  a * sigmoid(a) * b     (vLLM's silu_and_mul)
 //   mode 1, o_proj's input         sigmoid(a) * b                        (Qwen3_5Attention does
 //                                                                         attn_output * sigmoid(gate))
+//   mode 2, SiTU (Inkling 2)       gcap*tanh(a/gcap)*sigmoid(a)*ucap*tanh(b/ucap), each cap optional
+//                                  (0 = none); the sigmoid reads the raw gate. Caps with modes 0/1 are refused.
 //
 // so one kernel serves the MLP of all 64 layers and the attention output of the 16 full-attention
 // ones. The 48 linear-attention layers reach out_proj through a gated RMSNorm instead.
@@ -29,13 +31,14 @@
 #include "r4d_fwht.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 
 template <int HAD, int MODE, int THR>
 __global__ __launch_bounds__(THR) void r4d_gated_had_quant_i8_kernel(
     const __hip_bfloat16* __restrict__ G, const __hip_bfloat16* __restrict__ U,
     signed char* __restrict__ Q, float* __restrict__ S,
-    int K, long gstride, long ustride, float rnorm) {
+    int K, long gstride, long ustride, float rnorm, float gcap, float ucap) {
   constexpr int VPL = HAD / 32, NW = THR / 32;
   extern __shared__ float lds[];
   float* red = lds + K;
@@ -51,8 +54,19 @@ __global__ __launch_bounds__(THR) void r4d_gated_had_quant_i8_kernel(
 #pragma unroll
     for (int j = 0; j < VPL; j++) {
       const float xg = __bfloat162float(g[base + j]);
-      const float sg = 1.f / (1.f + __expf(-xg));
-      v[j] = (MODE == 0 ? xg * sg : sg) * __bfloat162float(u[base + j]);
+      const float xu = __bfloat162float(u[base + j]);
+      if (MODE == 2) {
+        /* SiTU: the gate capped by tanh and multiplied by the sigmoid of the raw gate, the up capped
+         * by tanh; a cap of 0 leaves that side as it is. expf, not __expf: this is libref's oracle
+         * arithmetic, and a rounded sigmoid moves codes at the rounding boundary. */
+        const float sg = 1.f / (1.f + expf(-xg));
+        const float ga = gcap > 0.f ? gcap * tanhf(xg / gcap) : xg;
+        const float ua = ucap > 0.f ? ucap * tanhf(xu / ucap) : xu;
+        v[j] = ga * sg * ua;
+      } else {
+        const float sg = 1.f / (1.f + __expf(-xg));
+        v[j] = (MODE == 0 ? xg * sg : sg) * xu;
+      }
     }
     r4d_fwht_wave<HAD>(v, lane);
 #pragma unroll
@@ -86,6 +100,21 @@ __global__ __launch_bounds__(THR) void r4d_gated_had_quant_i8_kernel(
 // (vLLM's layout and what the MLP produces), so both row pitches are 2n. The row's dtype
 // constraint guarantees bf16.
 enum { GH_A = 0, GH_B, GH_Q, GH_S };
+
+// act as libref spells it: "silu" (or "swish"), "sigmoid" or "situ" by name, or the integer `mode`
+// (0, 1, 2) where the name is absent. Its own parser, not r4d_act_code: that one is shared with the
+// other int8 gated ops, and widening it would hand them a SiTU they cannot run.
+static int gh_act(const RadArgs* args) {
+  if (const char* s = r4d_gets(args, "act")) {
+    if (!std::strcmp(s, "silu") || !std::strcmp(s, "swish")) return 0;
+    if (!std::strcmp(s, "sigmoid")) return 1;
+    if (!std::strcmp(s, "situ")) return 2;
+    return -1;
+  }
+  long long v = 0;
+  if (r4d_geti(args, "mode", &v)) return (v >= 0 && v <= 2) ? (int)v : -1;
+  return 0;
+}
 
 extern "C" int r4d_rad_gated_had_quant_i8(const RadArgs* args, RadStream stream) {
   const RadTensor* ta = r4d_opt(args, GH_A);
@@ -127,9 +156,13 @@ extern "C" int r4d_rad_gated_had_quant_i8(const RadArgs* args, RadStream stream)
   if (K % had) return R4D_NO(RAD_E_SHAPE);
   if (K % 16) return R4D_NO(RAD_E_SHAPE);
 
-  // `act` names the activation ("silu" or "sigmoid"); `mode` is this kernel's integer for it.
-  const int mode = r4d_act_code(args, "act", "mode", 0);
-  if (mode != 0 && mode != 1) return R4D_NO(RAD_E_INVAL);
+  const int mode = gh_act(args);
+  if (mode < 0) return R4D_NO(RAD_E_INVAL);
+  const double gcap = r4d_getf(args, "gate_cap", 0.0), ucap = r4d_getf(args, "up_cap", 0.0);
+  if (!(gcap >= 0.0) || !(ucap >= 0.0) || !std::isfinite(gcap) || !std::isfinite(ucap))
+    return R4D_NO(RAD_E_INVAL);
+  /* The caps are SiTU's; with silu or sigmoid they would be silently ignored, so refuse them. */
+  if (mode != 2 && (gcap != 0.0 || ucap != 0.0)) return R4D_NO(RAD_E_UNSUPPORTED);
   if (r4d_numel(q) != M * K) return R4D_NO(RAD_E_SHAPE);
 
   const int thr = r4d_act_threads((int)M, (int)K);
@@ -139,7 +172,7 @@ extern "C" int r4d_rad_gated_had_quant_i8(const RadArgs* args, RadStream stream)
   const float rn = 1.f / sqrtf((float)had);
 #define R4D_GHQ_LAUNCH(H, MD, T) hipLaunchKernelGGL((r4d_gated_had_quant_i8_kernel<H, MD, T>), \
     dim3((int)M), dim3(T), shmem, (hipStream_t)stream, pa, pb, (signed char*)r4d_wp(q), \
-    (float*)r4d_wp(sc), (int)K, gs, us, rn)
+    (float*)r4d_wp(sc), (int)K, gs, us, rn, (float)gcap, (float)ucap)
 #define R4D_GHQ_T(H, MD) switch (thr) { \
     case 256: R4D_GHQ_LAUNCH(H, MD, 256); break; \
     case 512: R4D_GHQ_LAUNCH(H, MD, 512); break; \
@@ -149,7 +182,7 @@ extern "C" int r4d_rad_gated_had_quant_i8(const RadArgs* args, RadStream stream)
     case 128: R4D_GHQ_T(128, MD); break; \
     case 256: R4D_GHQ_T(256, MD); break; \
     default:  R4D_GHQ_T(512, MD); break; }
-  if (mode == 0) { R4D_GHQ_MODE(0); } else { R4D_GHQ_MODE(1); }
+  if (mode == 0) { R4D_GHQ_MODE(0); } else if (mode == 1) { R4D_GHQ_MODE(1); } else { R4D_GHQ_MODE(2); }
 #undef R4D_GHQ_MODE
 #undef R4D_GHQ_T
 #undef R4D_GHQ_LAUNCH

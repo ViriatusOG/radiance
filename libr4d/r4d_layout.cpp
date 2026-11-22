@@ -1496,6 +1496,90 @@ extern "C" int r4d_rad_layout_moe_i8_mod4(const RadParam* p, int n_p, int operan
                                                           out);
 }
 
+/* ---- moe_gemm_q at nvfp4a8i8: NVFP4 experts (r4d_moe_nvfp4.hip).
+ *
+ * The codes view, one plain e2m1 plane [N, K] (two codes a byte, element k in the low nibble of
+ * byte k / 2), is the kernel's own layout: it is served as stored, so the hook declines it. The
+ * scale view, `scale,scale.1` (E4M3 per (row, 16 of K) and the expert's f32 level), is one blob
+ * per expert: N rows of K / 16 scale bytes and then one more row of K / 16 bytes whose first four
+ * hold the level. K is a multiple of 64, so that row is whole words and the level is four-aligned.
+ * The blob is a rank-2 [N + 1, K / 16] U8 layout. */
+namespace {
+bool nv_codes_plane(const RadEncoding* enc, const int* sel) {
+    return enc->plane[sel[0]].dtype == RAD_FP4E2M1 && enc->plane[sel[0]].block[0] == 1 &&
+           enc->plane[sel[0]].block[1] == 1;
+}
+bool nv_scale_planes(const RadEncoding* enc, const int* sel) {
+    const RadEncPlane& s = enc->plane[sel[0]];
+    const RadEncPlane& l = enc->plane[sel[1]];
+    return s.dtype == RAD_F8E4M3 && s.block[0] == 1 && s.block[1] == 16 &&
+           l.dtype == RAD_F32 && l.block[0] == 0 && l.block[1] == 0;
+}
+/* The geometry of an nvfp4 operand: N and K of its class (the odd class's for operands 6 and 7). */
+int nv_geom(const RadParam* p, int n_p, int operand, MoeView* v, long long* N, long long* K) {
+    const int rc = moe_view(p, n_p, operand, v);
+    if (rc != RAD_OK) return rc;
+    *N = r4d_pgeti_or(v->p, v->n, "N", 0);
+    *K = r4d_pgeti_or(v->p, v->n, "K", 0);
+    if (*N <= 0 || *K <= 0 || *K % 64) return RAD_E_SHAPE;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_moe_nvfp4(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel,
+                                        const RadTensor* pl, int n, RadLayout* out) {
+    if (!out || !pl || !enc || !sel) return RAD_E_INVAL;
+    MoeView v;
+    long long N = 0, K = 0;
+    const int rc = nv_geom(p, n_p, operand, &v, &N, &K);
+    if (rc != RAD_OK) return rc;
+    if (v.operand == 2) {                            /* codes: as stored */
+        if (n != 1 || !nv_codes_plane(enc, sel)) return RAD_E_DTYPE;
+        if (!r4d_enc::dims(pl[0], N, K)) return RAD_E_SHAPE;
+        return RAD_E_UNSUPPORTED;
+    }
+    if (v.operand != 3) return RAD_E_UNSUPPORTED;
+    if (n != 2 || !nv_scale_planes(enc, sel)) return RAD_E_DTYPE;
+    if (!r4d_enc::dims(pl[0], N, K / 16) || !r4d_enc::dims(pl[1], 1, 1)) return RAD_E_SHAPE;
+    fill(out, "r4d.nvfp4.s", RAD_U8, N + 1, K / 16, (N + 1) * (K / 16));
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_relayout_moe_nvfp4(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, void* dst,
+                                          int64_t dst_bytes) {
+    RadLayout L;
+    const int rc = r4d_rad_layout_moe_nvfp4(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    MoeView v;
+    long long N = 0, K = 0;
+    if (nv_geom(p, n_p, operand, &v, &N, &K) != RAD_OK) return RAD_E_SHAPE;
+    uint8_t* d = (uint8_t*)dst;
+    std::memcpy(d, pdata(pl[0]), (size_t)(N * (K / 16)));
+    std::memcpy(d + N * (K / 16), pdata(pl[1]), sizeof(float));
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_moe_nvfp4(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const void* src, int64_t src_bytes,
+                                            const RadTensor* pl, int n) {
+    RadLayout L;
+    const int rc = r4d_rad_layout_moe_nvfp4(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes) return RAD_E_SHAPE;
+    MoeView v;
+    long long N = 0, K = 0;
+    if (nv_geom(p, n_p, operand, &v, &N, &K) != RAD_OK) return RAD_E_SHAPE;
+    const uint8_t* s = (const uint8_t*)src;
+    std::memcpy((void*)pdata(pl[0]), s, (size_t)(N * (K / 16)));
+    std::memcpy((void*)pdata(pl[1]), s + N * (K / 16), sizeof(float));
+    return RAD_OK;
+}
+
 /* ---- conv2d_nhwc: PyTorch's [cout][cin][k][k] stored tap-major, [cout][k][k][cin].
  *
  * The implicit-GEMM convolution (r4d_gen.hip) contracts over K = (tap, channel) with the channel

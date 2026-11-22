@@ -1112,6 +1112,27 @@ extern "C" int r4d_shape_attn_paged_sink(const RadParam* p, int n_p, int operand
     R4D_PICK(l);
 }
 
+/* attn_paged_rel -- attn_paged's operands, then r [q_len, n_head, d_rel] at q's dtype, rel_proj
+ * [d_rel, extent] f32 and sinks [q_len, n_head] f32, then out. */
+extern "C" int r4d_shape_attn_paged_rel(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    if (operand < 7) return r4d_shape_attn_paged(p, n_p, operand, out);
+    if (operand == 10) return r4d_shape_attn_paged(p, n_p, 7, out);
+    const int64_t q_len = pi(p, n_p, "q_len");
+    const int64_t nh    = pi(p, n_p, "n_head");
+    const int64_t dr    = pi(p, n_p, "d_rel");
+    const int64_t ext   = pi(p, n_p, "extent");
+    if (q_len <= 0 || nh <= 0 || dr <= 0 || ext <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t Q = dt_act(p, n_p, "q_dtype");
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd(Q, q_len, nh, dr),
+        opd((uint32_t)RAD_F32, dr, ext),
+        opd((uint32_t)RAD_F32, q_len, nh),
+    };
+    R4D_PICK(l);
+}
+
 /* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales,
  * flat as gate_quant_fp8 describes them: one row per (token, head) pair, `head_dim` columns. */
 extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int operand,
@@ -1790,6 +1811,23 @@ extern "C" int r4d_shape_pair_argmax(const RadParam* p, int n_p, int operand, Ra
     R4D_PICK(l);
 }
 
+/* attn_res_mix, as libref describes it. The states are dense here; a caller's pitched buffer is
+ * a view of the same operand. No states at depth 0. */
+extern "C" int r4d_shape_attn_res_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t nS = pi(p, n_p, "n_state"), nQ = pi(p, n_p, "n_query");
+    if (M <= 0 || n <= 0 || nS < 0 || nQ <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        nS > 0 ? opd((uint32_t)RAD_BF16, nS, M, n) : opd_none(),   /* states */
+        opd((uint32_t)RAD_BF16, M, n),                             /* cur */
+        opd((uint32_t)RAD_BF16, M, n),                             /* addend */
+        opd((uint32_t)RAD_F32, nQ, n),                             /* query */
+        opd((uint32_t)RAD_F32, nQ, n),                             /* w */
+        opd((uint32_t)RAD_BF16, nQ, M, n),                         /* y */
+    };
+    R4D_PICK(l);
+}
+
 /* LiLiCorr's ops, described as libref describes them; lili_cand declines (its stats rows are no
  * draw; avx_check_hand.cpp and tests/r4d_emu build them). */
 extern "C" int r4d_shape_lili_cand(const RadParam*, int, int, RadOpdDesc*) {
@@ -1904,6 +1942,25 @@ extern "C" int r4d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int oper
         opd_none(),
         opd((uint32_t)RAD_I8, M, n),
         opd((uint32_t)RAD_F32, M, 1),       /* one scale per row */
+    };
+    R4D_PICK(l);
+}
+
+/* gated_quant_i8: the same operands, the scale one per `group` of each row (default 128, and a group
+ * wider than the row is one scale per row, as libref clamps it). */
+extern "C" int r4d_shape_gated_quant_i8(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    if (n <= 0) return RAD_E_UNSUPPORTED;
+    int64_t g = pi(p, n_p, "group", 128);
+    if (g <= 0 || g > n) g = n;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, 2 * n),
+        opd_none(),
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
     };
     R4D_PICK(l);
 }

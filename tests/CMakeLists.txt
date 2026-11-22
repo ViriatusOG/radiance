@@ -175,8 +175,11 @@ set(RAD_TESTS_WHOLE_CORE shipped_plugins_test generator_lora_engine_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
-  list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/(dspark|attn_rel)_device_test\\.cpp$")
 endif()
+# A card test takes a plugin's path and is registered below, on the card only.
+list(FILTER RAD_TESTS EXCLUDE REGEX "/sconv_device_test\\.cpp$")
+list(FILTER RAD_TESTS EXCLUDE REGEX "/l2clip_device_test\\.cpp$")
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
@@ -303,6 +306,18 @@ foreach(t ${RAD_TESTS})
         TIMEOUT ${RAD_TEST_TIMEOUT}
         ENVIRONMENT "${RAD_TEST_CARD_ENV}")
     endif()
+  elseif(n STREQUAL "attn_rel_device_test")
+    # attn_paged_rel's libr4d rows against libref on the card (tests/attn_rel_device_test.cpp).
+    if(RAD_HIP_FOUND AND TARGET libr4d AND TARGET libref)
+      add_dependencies(${n} libr4d libref)
+      add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so
+                                 ${RAD_PLUGIN_OUT}/kernels/libref.so)
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
   else()
     if(DEFINED RAD_TEST_SHARDS_${n})
       math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
@@ -326,6 +341,34 @@ endforeach()
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/rad_perf_tests.cmake "${RAD_PERF_SCRIPT}")
 set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
              ${CMAKE_CURRENT_BINARY_DIR}/rad_perf_tests.cmake)
+
+# sconv_res on the card: libr4d's exported launcher against the formula, over the model's shapes.
+if(RAD_HIP_FOUND AND TARGET libr4d)
+  add_executable(sconv_device_test ${CMAKE_CURRENT_SOURCE_DIR}/sconv_device_test.cpp)
+  set_target_properties(sconv_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  target_link_libraries(sconv_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  add_dependencies(sconv_device_test libr4d)
+  add_test(NAME sconv_device_test_card COMMAND sconv_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+  set_tests_properties(sconv_device_test_card PROPERTIES
+    LABELS gpu
+    RUN_SERIAL TRUE
+    TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+endif()
+
+# l2_clip on the card: libr4d's exported launcher against the formula, at the model's shapes.
+if(RAD_HIP_FOUND AND TARGET libr4d)
+  add_executable(l2clip_device_test ${CMAKE_CURRENT_SOURCE_DIR}/l2clip_device_test.cpp)
+  set_target_properties(l2clip_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  target_link_libraries(l2clip_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  add_dependencies(l2clip_device_test libr4d)
+  add_test(NAME l2clip_device_test_card COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+  set_tests_properties(l2clip_device_test_card PROPERTIES
+    LABELS gpu
+    RUN_SERIAL TRUE
+    TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+endif()
 
 # ================================================================== the device tests on a card
 #
@@ -631,9 +674,11 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_keyed.hip ${R4D_DIR}/r4d_lili.hip
-                ${R4D_DIR}/r4d_vit_muse.hip)
-set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
-                  dsa lili vit)
+                ${R4D_DIR}/r4d_vit_muse.hip ${R4D_DIR}/r4d_ple_conv_bf16.hip
+                ${R4D_DIR}/r4d_l2_clip_bf16.hip ${R4D_DIR}/r4d_attn_rel.hip ${R4D_DIR}/r4d_moe_nvfp4.hip ${R4D_DIR}/r4d_attn_res.hip ${R4D_DIR}/r4d_situ.hip
+                ${R4D_DIR}/r4d_gated_quant_i8.hip)
+set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres gated_quant
+                  dsa lili vit sconv l2clip rel nvfp4 attnres)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -675,7 +720,9 @@ else()
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
-                ${R4D_EMU}/test_vit.cpp)
+                ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_sconv.cpp
+                ${R4D_EMU}/test_l2clip.cpp ${R4D_EMU}/test_rel.cpp ${R4D_EMU}/test_nvfp4.cpp ${R4D_EMU}/test_attnres.cpp
+                ${R4D_EMU}/test_gated_quant.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -712,7 +759,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit sconv l2clip rel nvfp4 attnres gated_quant)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -723,7 +770,8 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_lili
+                       r4d_emu_dsa r4d_emu_lili r4d_emu_sconv r4d_emu_l2clip r4d_emu_rel r4d_emu_nvfp4 r4d_emu_attnres
+                       r4d_emu_gated_quant
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

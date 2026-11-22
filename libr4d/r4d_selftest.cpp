@@ -26015,6 +26015,170 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
 }
 
+/* moe_gemm_q at nvfp4a8i8 (r4d_moe_nvfp4.hip) on the card: NVFP4 experts stored as the hooks leave
+ * them (codes as shipped, the E4M3 scales and each expert's f32 level in one blob), against an int8
+ * activation at one f32 scale per `ag` of K, held to an f64 host decode of the same planes: value
+ * e2m1 * e4m3 * level, times the activation. Two classes, a token-order gather, and a dropped tail. */
+static void moe_nvfp4_case(const Plugin& pl, int64_t Tr, int64_t N, int64_t K, int64_t ne,
+                           int64_t top_k, int64_t ag) {
+    const std::string what = "moe_gemm_nvfp4a8i8 vs a host decode (T=" + std::to_string(Tr) +
+                             ", N " + std::to_string(N) + ", K " + std::to_string(K) + ", " +
+                             std::to_string(ne) + " experts, top " + std::to_string(top_k) +
+                             ", a scale per " + std::to_string(ag) + ")";
+    const RadKernelInfo* r = find(pl, "moe_gemm_nvfp4a8i8");
+    if (!r || !r->layout || !r->relayout) {
+        ok(what.c_str(), false, "row or hooks absent");
+        return;
+    }
+    const int64_t M = (Tr + top_k - 1) / top_k, kb = K / ag, kg = K / 16;
+    const int64_t nec[2] = { (ne + 1) / 2, ne / 2 };
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("N_odd", N), PI("K_odd", K),
+                                 PI("group", ag), PS("dtype", "nvfp4a8i8") };
+
+    /* Each expert's planes: e2m1 codes, E4M3 scales per 16 of K, and its level (a binade apart). */
+    RadEncoding enc;
+    rad_enc_clear(&enc);
+    rad_enc_copy_str(enc.scheme, "affine");
+    rad_enc_add_plane(&enc, "codes", RAD_FP4E2M1, 1, 1);
+    rad_enc_add_plane(&enc, "scale", RAD_F8E4M3, 1, 16);
+    rad_enc_add_plane(&enc, "scale.1", RAD_F32, 0, 0);
+    std::vector<float> sv((size_t)(ne * N * kg)), lev((size_t)ne);
+    std::vector<uint8_t> wq[2], ws[2];
+    for (int c = 0; c < 2; ++c) {
+        wq[c].assign((size_t)(std::max<int64_t>(1, nec[c]) * N * K / 2), 0);
+        ws[c].assign((size_t)(std::max<int64_t>(1, nec[c]) * (N + 1) * kg), 0);
+    }
+    for (int64_t e = 0; e < ne; ++e) {
+        lev[(size_t)e] = 0.5f + 0.25f * (float)e;
+        Planes p;
+        p.enc = enc;
+        p.size(N, K);
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k)
+                rad_store_code(p.data[0].data() + n * p.row_bytes(0), RAD_FP4E2M1, k,
+                               (int)((e * 7 + n * 5 + k * 3) % 16));
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t g = 0; g < kg; ++g) {
+                const float v = std::ldexp(1.0f, (int)((e + n + g) % 4) - 2);
+                rad_store_f32(p.data[1].data(), RAD_F8E4M3, n * kg + g, v);
+                sv[(size_t)((e * N + n) * kg + g)] = v;
+            }
+        rad_store_f32(p.data[2].data(), RAD_F32, 0, lev[(size_t)e]);
+        const int c = (int)(e & 1), x = (int)(e / 2);
+        std::vector<uint8_t> w, sc;
+        if (stored(r, lp, 2 + 4 * c, p, { "codes" }, &w) != RAD_E_UNSUPPORTED ||
+            stored(r, lp, 3 + 4 * c, p, { "scale", "scale.1" }, &sc) != RAD_OK) {
+            ok(what.c_str(), false, "the stored planes do not relayout");
+            return;
+        }
+        std::memcpy(wq[c].data() + (size_t)x * N * K / 2, w.data(), w.size());
+        std::memcpy(ws[c].data() + (size_t)x * (N + 1) * kg, sc.data(), sc.size());
+    }
+
+    /* The activation: int8 codes both signs along a row, one scale per (row, ag) that varies. */
+    std::vector<int8_t> aq((size_t)(M * K));
+    std::vector<float>  as((size_t)(M * kb));
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t g = 0; g < kb; ++g)
+            as[(size_t)(m * kb + g)] = 0.011f + 0.003f * (float)g + 0.0007f * (float)(m % 11);
+        for (int64_t k = 0; k < K; ++k) aq[(size_t)(m * K + k)] = (int8_t)(((m * 13 + k * 29) % 255) - 127);
+    }
+
+    /* Uneven runs and a dropped tail, token order: sorted slot f names token f / top_k. */
+    std::vector<int32_t> off((size_t)(ne + 1), 0), sorted((size_t)Tr, -1);
+    const int64_t live = Tr - 3;
+    for (int64_t e = 0; e <= ne; ++e) off[(size_t)e] = (int32_t)((live * e) / ne);
+    off[(size_t)ne] = (int32_t)live;
+    for (int64_t i = 0; i < live; ++i) sorted[(size_t)i] = (int32_t)((i * 7 + 3) % (M * top_k));
+
+    /* The reference, in f64 over the same planes. */
+    std::vector<double> ref((size_t)(Tr * N), 0.0);
+    for (int64_t i = 0; i < live; ++i) {
+        const int32_t f = sorted[(size_t)i];
+        if (f < 0) continue;
+        int64_t e = 0;
+        while (e + 1 < ne && off[(size_t)(e + 1)] <= i) ++e;
+        const int64_t tok = f / top_k;
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int64_t k = 0; k < K; ++k) {
+                const int c = (int)(e & 1);
+                const int64_t x = e / 2;
+                const uint8_t byte = wq[c][(size_t)(x * N * K / 2 + n * K / 2 + k / 2)];
+                const uint8_t nib = (uint8_t)(k & 1 ? byte >> 4 : byte & 15);
+                const double sc = (double)sv[(size_t)((e * N + n) * kg + k / 16)];
+                acc += (double)rad_fp4e2m1_to_f32(nib) * sc * (double)lev[(size_t)e] *
+                       (double)aq[(size_t)(tok * K + k)] * (double)as[(size_t)(tok * kb + k / ag)];
+            }
+            ref[(size_t)(i * N + n)] = acc;
+        }
+    }
+
+    void* d_a  = dalloc(aq.size());
+    void* d_as = dalloc(as.size() * 4);
+    void* d_w[2]  = { dalloc(wq[0].size()), dalloc(wq[1].size()) };
+    void* d_ws[2] = { dalloc(ws[0].size()), dalloc(ws[1].size()) };
+    void* d_s  = dalloc(sorted.size() * 4);
+    void* d_o  = dalloc(off.size() * 4);
+    void* d_y  = dalloc((size_t)(Tr * N * 2));
+    st_memcpy(d_a,  aq.data(), aq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    for (int c = 0; c < 2; ++c) {
+        st_memcpy(d_w[c], wq[c].data(), wq[c].size(), hipMemcpyHostToDevice);
+        st_memcpy(d_ws[c], ws[c].data(), ws[c].size(), hipMemcpyHostToDevice);
+    }
+    st_memcpy(d_s, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_o, off.data(), off.size() * 4, hipMemcpyHostToDevice);
+    {
+        std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+    }
+    std::vector<RadTensor> ts = {
+        T(d_a,    RAD_I8,       { M, K }),
+        T(d_as,   RAD_F32,      { M, kb }),
+        T(d_w[0], RAD_FP4E2M1,  { std::max<int64_t>(1, nec[0]), N, K }),
+        T(d_ws[0], RAD_U8,      { std::max<int64_t>(1, nec[0]), N + 1, kg }),
+        T(d_s,    RAD_I32,      { Tr }),
+        T(d_o,    RAD_I32,      { ne + 1 }),
+        T(d_w[1], RAD_FP4E2M1,  { std::max<int64_t>(1, nec[1]), N, K }),
+        T(d_ws[1], RAD_U8,      { std::max<int64_t>(1, nec[1]), N + 1, kg }),
+        T(d_y,    RAD_BF16,     { Tr, N }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("N", N), PI("K", K), PI("N_odd", N), PI("K_odd", K), PI("parts", 1),
+        PI("n_expert", ne), PI("top_k", top_k), PI("group", ag), PS("a_order", "token"),
+        PS("dtype", "nvfp4a8i8"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data();
+    a.n_t = (int)ts.size();
+    a.p = ps.data();
+    a.n_p = (int)ps.size();
+    const int rc = r->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    if (rc != RAD_OK) {
+        ok(what.c_str(), false, "launch rc=" + std::to_string(rc));
+        return;
+    }
+    std::vector<uint16_t> got((size_t)(Tr * N));
+    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+    int64_t bad = 0;
+    double worst = 0.0;
+    for (int64_t i = 0; i < Tr; ++i)
+        for (int64_t n = 0; n < N; ++n) {
+            const double want = ref[(size_t)(i * N + n)];
+            const uint32_t u = (uint32_t)got[(size_t)(i * N + n)] << 16;
+            float gf;
+            std::memcpy(&gf, &u, 4);
+            const double err = std::fabs((double)gf - want);
+            if (!(err <= 0.004 * std::fabs(want) + 1e-3)) ++bad;
+            if (!(err <= worst)) worst = err;
+        }
+    ok(what.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
+                               " elements off, worst abs error " + std::to_string(worst));
+}
+
 static void moe_w6_cases(const Plugin& pl) {
     const MoeW4Shape sh[] = {
         { "w6 gate/up", 256, 256, 128, 256, 2, 5 },
@@ -35985,6 +36149,321 @@ static void device_phase(const Plugin& pl) {
                 run_case(r, ts, ps);
             }
         }
+        if (sel("gated_had_quant_i8_situ")) {
+            /* The rotated op with act situ on the card, against libref's formula in double: SiTU
+             * with both caps and with one cap at 0, the unnormalised butterflies over each group,
+             * and the scale amax * (1/127) / sqrt(group). Each dequantised code must be within half
+             * a step of its rotated value and each code within one of round(value / step).
+             *
+             * The device writes the codes in the int8 step order (the order quant_act_i8 stores
+             * and the int8 GEMMs read: byte i holds element step(i)), while libref's had_i8_row writes
+             * natural order. The check reads the device's bytes in step order; that difference from
+             * libref's storage is real and predates this op, and is reported rather than changed. */
+            const RadKernelInfo* r = find(pl, "gated_had_quant_i8");
+            if (!r) ok("gated_had_quant_i8_situ", false, "row absent");
+            else {
+                struct GH { const char* name; int64_t Mg, K, H; bool packed; double gcap, ucap; };
+                const GH cases[] = {
+                    { "gated_had_quant_i8 situ, both caps, packed", 3, 512, 128, true, 4.0, 25.0 },
+                    { "gated_had_quant_i8 situ, up cap 0, two operands", 17, 512, 256, false, 4.0, 0.0 },
+                };
+                for (const GH& c : cases) {
+                    const int64_t gw = c.packed ? 2 * c.K : c.K;
+                    std::vector<uint16_t> ga((size_t)(c.Mg * gw)), gb(c.packed ? 0 : (size_t)(c.Mg * c.K));
+                    for (size_t i = 0; i < ga.size(); ++i)
+                        ga[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 801) - 400) * 0.02f);
+                    for (size_t i = 0; i < gb.size(); ++i)
+                        gb[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i + 1000003u) % 801) - 400) * 0.02f);
+                    void* da = dalloc(ga.size() * 2);
+                    void* db = c.packed ? nullptr : dalloc(gb.size() * 2);
+                    void* dq = dalloc((size_t)(c.Mg * c.K));
+                    void* ds = dalloc((size_t)c.Mg * 4);
+                    if (!da || (!c.packed && !db) || !dq || !ds) { ok(c.name, false, "hipMalloc failed"); continue; }
+                    st_memcpy(da, ga.data(), ga.size() * 2, hipMemcpyHostToDevice);
+                    if (db) st_memcpy(db, gb.data(), gb.size() * 2, hipMemcpyHostToDevice);
+
+                    std::vector<RadTensor> ts = { T(da, RAD_BF16, { c.Mg, gw }), T(db, RAD_BF16, { c.Mg, c.K }),
+                                                  T(dq, RAD_I8, { c.Mg, c.K }), T(ds, RAD_F32, { c.Mg }) };
+                    if (c.packed) absent(ts[1]);
+                    std::vector<RadParam> ps = { PI("M", c.Mg), PI("n", c.K), PI("group", c.H),
+                                                 PS("dtype", "bf16"), PS("act", "situ") };
+                    if (c.gcap > 0) ps.push_back(PF("gate_cap", c.gcap));
+                    if (c.ucap > 0) ps.push_back(PF("up_cap", c.ucap));
+                    RadArgs a{};
+                    a.t = ts.data(); a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size();
+                    a.world_size = 1;
+                    const int rc = r->launch(&a, nullptr);
+                    const bool synced = st_stream_sync(nullptr) == hipSuccess;
+                    std::vector<int8_t> q((size_t)(c.Mg * c.K));
+                    std::vector<float> s((size_t)c.Mg);
+                    st_memcpy(q.data(), dq, q.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(s.data(), ds, s.size() * 4, hipMemcpyDeviceToHost);
+
+                    int64_t bad = 0, off = 0;
+                    double worst_s = 0, worst_d = 0;
+                    for (int64_t row = 0; row < c.Mg; ++row) {
+                        /* The gated product, then the unnormalised butterflies per group. */
+                        std::vector<double> rot((size_t)c.K);
+                        for (int64_t i = 0; i < c.K; ++i) {
+                            const double g = h_bf16(ga[(size_t)(row * gw + i)]);
+                            const double u = c.packed ? h_bf16(ga[(size_t)(row * gw + c.K + i)])
+                                                      : h_bf16(gb[(size_t)(row * c.K + i)]);
+                            const double sg = 1.0 / (1.0 + std::exp(-g));
+                            const double ga_ = c.gcap > 0 ? c.gcap * std::tanh(g / c.gcap) : g;
+                            const double ua = c.ucap > 0 ? c.ucap * std::tanh(u / c.ucap) : u;
+                            rot[(size_t)i] = ga_ * sg * ua;
+                        }
+                        for (int64_t b = 0; b < c.K; b += c.H)
+                            for (int64_t h = 1; h < c.H; h <<= 1)
+                                for (int64_t i = b; i < b + c.H; ++i)
+                                    if ((i & h) == 0) {
+                                        const double x = rot[(size_t)i], y = rot[(size_t)(i + h)];
+                                        rot[(size_t)i] = x + y;
+                                        rot[(size_t)(i + h)] = x - y;
+                                    }
+                        double m = 0;
+                        for (double x : rot) m = std::max(m, std::fabs(x));
+                        m = std::max(m, 1e-8);
+                        const double rn = 1.0 / std::sqrt((double)c.H);
+                        const double step = m * rn / 127.0;
+                        worst_s = std::max(worst_s, std::fabs(s[(size_t)row] - step) / step);
+                        for (int64_t i = 0; i < c.K; ++i) {
+                            const int64_t s0 = i >> 4, j = i & 15;
+                            const int64_t sr = (s0 << 4) + 8 * ((j & 7) >> 2) + 4 * (j >> 3) + (j & 3);
+                            const double want = rot[(size_t)sr];
+                            const double qref = std::max(-127.0, std::min(127.0, want * 127.0 / m));
+                            const int got = q[(size_t)(row * c.K + i)];
+                            const double d = std::fabs(got - std::nearbyint(qref));
+                            if (d > 1.0) ++bad;
+                            else if (d > 0.0) ++off;
+                            worst_d = std::max(worst_d, std::fabs(got * s[(size_t)row] - want * rn) / (m * rn));
+                        }
+                    }
+                    std::printf("    %s: %lld codes, %lld off by one, bad=%lld, scale rel %.2g, deq/max %.3g\n",
+                                c.name, (long long)(c.Mg * c.K), (long long)off, (long long)bad, worst_s, worst_d);
+                    ok(c.name, rc == RAD_OK && synced && bad == 0 && worst_s < 1e-5 && worst_d <= 0.51 / 127.0,
+                       "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) +
+                           " worst_scale=" + std::to_string(worst_s) + " worst_deq=" + std::to_string(worst_d));
+                }
+            }
+        }
+        if (sel("gated_quant_i8")) {
+            /* gated_quant_i8 on the card against libref's ref_gated_quant_i8 in double: each code
+             * within one of round(value / scale) (the device rounds its own quotient, so a value on
+             * a boundary can land either side), each scale within 1e-5 of amax / 127, and the
+             * dequantised value within half a step of the value. Three shapes: SiTU with both caps
+             * over a packed gate_up at prefill rows, silu over two operands at a partial last group,
+             * and silu on one decode row. */
+            const RadKernelInfo* r = find(pl, "gated_quant_i8");
+            if (!r) ok("gated_quant_i8", false, "row absent");
+            else {
+                struct GQ { const char* name; int64_t Mg, ng, group; bool packed, situ; };
+                const GQ cases[] = {
+                    { "gated_quant_i8 situ, packed, prefill rows", 37, 320, 128, true, true },
+                    { "gated_quant_i8 silu, two operands, partial group", 16, 200, 128, false, false },
+                    { "gated_quant_i8 silu, one decode row", 1, 512, 128, true, false },
+                };
+                for (const GQ& c : cases) {
+                    const int64_t ngrp = (c.ng + c.group - 1) / c.group;
+                    const int64_t gw = c.packed ? 2 * c.ng : c.ng;
+                    std::vector<uint16_t> ga((size_t)(c.Mg * gw)), gb(c.packed ? 0 : (size_t)(c.Mg * c.ng));
+                    for (size_t i = 0; i < ga.size(); ++i)
+                        ga[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 801) - 400) * 0.02f);
+                    for (size_t i = 0; i < gb.size(); ++i)
+                        gb[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i + 1000003u) % 801) - 400) * 0.02f);
+                    void* da = dalloc(ga.size() * 2);
+                    void* db = c.packed ? nullptr : dalloc(gb.size() * 2);
+                    void* dq = dalloc((size_t)(c.Mg * c.ng));
+                    void* ds = dalloc((size_t)(c.Mg * ngrp) * 4);
+                    if (!da || (!c.packed && !db) || !dq || !ds) { ok(c.name, false, "hipMalloc failed"); continue; }
+                    st_memcpy(da, ga.data(), ga.size() * 2, hipMemcpyHostToDevice);
+                    if (db) st_memcpy(db, gb.data(), gb.size() * 2, hipMemcpyHostToDevice);
+
+                    std::vector<RadTensor> ts = { T(da, RAD_BF16, { c.Mg, gw }), T(db, RAD_BF16, { c.Mg, c.ng }),
+                                                  T(dq, RAD_I8, { c.Mg, c.ng }), T(ds, RAD_F32, { c.Mg, ngrp }) };
+                    if (c.packed) absent(ts[1]);
+                    std::vector<RadParam> ps = { PI("M", c.Mg), PI("n", c.ng), PI("group", c.group),
+                                                 PS("dtype", "bf16"), PS("act", c.situ ? "situ" : "silu") };
+                    if (c.situ) { ps.push_back(PF("gate_cap", 4.0)); ps.push_back(PF("up_cap", 25.0)); }
+                    RadArgs a{};
+                    a.t = ts.data(); a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size();
+                    a.world_size = 1;
+                    const int rc = r->launch(&a, nullptr);
+                    const bool synced = st_stream_sync(nullptr) == hipSuccess;
+                    std::vector<int8_t> q((size_t)(c.Mg * c.ng));
+                    std::vector<float> s((size_t)(c.Mg * ngrp));
+                    st_memcpy(q.data(), dq, q.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(s.data(), ds, s.size() * 4, hipMemcpyDeviceToHost);
+
+                    const double cg = c.situ ? 4.0 : 0.0, cu = c.situ ? 25.0 : 0.0;
+                    int64_t bad = 0, off = 0;
+                    double worst_s = 0, worst_d = 0;
+                    for (int64_t row = 0; row < c.Mg; ++row)
+                        for (int64_t gi = 0; gi < ngrp; ++gi) {
+                            const int64_t k0 = gi * c.group, k1 = std::min(k0 + c.group, c.ng);
+                            std::vector<double> v;
+                            double amax = 0;
+                            for (int64_t i = k0; i < k1; ++i) {
+                                const double g = h_bf16(ga[(size_t)(row * gw + i)]);
+                                const double u = c.packed ? h_bf16(ga[(size_t)(row * gw + c.ng + i)])
+                                                          : h_bf16(gb[(size_t)(row * c.ng + i)]);
+                                const double sg = 1.0 / (1.0 + std::exp(-g));
+                                const double x = c.situ
+                                    ? (cg > 0 ? cg * std::tanh(g / cg) : g) * sg * (cu > 0 ? cu * std::tanh(u / cu) : u)
+                                    : g * sg * u;
+                                v.push_back(x);
+                                amax = std::max(amax, std::fabs(x));
+                            }
+                            const double sref = amax > 0 ? amax / 127.0 : 1.0;
+                            worst_s = std::max(worst_s, std::fabs(s[(size_t)(row * ngrp + gi)] - sref) / sref);
+                            for (int64_t i = k0; i < k1; ++i) {
+                                const double x = v[(size_t)(i - k0)];
+                                const double qref = std::max(-127.0, std::min(127.0, x / sref));
+                                const int got = q[(size_t)(row * c.ng + i)];
+                                const double d = std::fabs(got - std::nearbyint(qref));
+                                if (d > 1.0) ++bad;
+                                else if (d > 0.0) ++off;
+                                if (amax > 0)
+                                    worst_d = std::max(worst_d, std::fabs(got * s[(size_t)(row * ngrp + gi)] - x) / amax);
+                            }
+                        }
+                    std::printf("    %s: %lld codes, %lld off by one, bad=%lld, scale rel %.2g, deq/amax %.3g\n",
+                                c.name, (long long)(c.Mg * c.ng), (long long)off, (long long)bad, worst_s, worst_d);
+                    ok(c.name, rc == RAD_OK && synced && bad == 0 && worst_s < 1e-5 && worst_d <= 0.51 / 127.0,
+                       "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) +
+                           " worst_scale=" + std::to_string(worst_s) + " worst_deq=" + std::to_string(worst_d));
+                }
+            }
+        }
+        if (sel("situ_mul_bf16")) {
+            /* SiTU over a fused gate_up, both caps set, against the formula in double. */
+            const RadKernelInfo* r = find(pl, "situ_mul_bf16");
+            if (!r) ok("situ_mul_bf16", false, "row absent");
+            else {
+                const int64_t Ms = 4, ns = 128;
+                std::vector<uint16_t> gu((size_t)(Ms * 2 * ns)), y((size_t)(Ms * ns), 0);
+                for (size_t i = 0; i < gu.size(); ++i)
+                    gu[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 801) - 400) * 0.02f);
+                void* dg = dalloc(gu.size() * 2);
+                void* dy = dalloc(y.size() * 2);
+                if (!dg || !dy) ok("situ_mul_bf16", false, "hipMalloc failed");
+                else {
+                    st_memcpy(dg, gu.data(), gu.size() * 2, hipMemcpyHostToDevice);
+                    st_memcpy(dy, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+                    std::vector<RadTensor> ts = { T(dg, RAD_BF16, { Ms, 2 * ns }),
+                                                  T(dy, RAD_BF16, { Ms, ns }) };
+                    std::vector<RadParam> ps = { PI("M", Ms), PI("n", ns), PS("dtype", "bf16"),
+                                                 PF("gate_cap", 4.0), PF("up_cap", 25.0) };
+                    RadArgs a{};
+                    a.t = ts.data(); a.n_t = 2; a.p = ps.data(); a.n_p = (int)ps.size();
+                    a.world_size = 1;
+                    const int rc = r->launch(&a, nullptr);
+                    const bool synced = st_stream_sync(nullptr) == hipSuccess;
+                    st_memcpy(y.data(), dy, y.size() * 2, hipMemcpyDeviceToHost);
+                    int bad = 0; double worst = 0;
+                    for (int64_t t = 0; t < Ms; ++t)
+                        for (int64_t i = 0; i < ns; ++i) {
+                            const double g = h_bf16(gu[(size_t)(t * 2 * ns + i)]);
+                            const double u = h_bf16(gu[(size_t)(t * 2 * ns + ns + i)]);
+                            const double ref = 4.0 * std::tanh(g / 4.0) * (1.0 / (1.0 + std::exp(-g))) *
+                                               25.0 * std::tanh(u / 25.0);
+                            const double err = std::fabs((double)h_bf16(y[(size_t)(t * ns + i)]) - ref);
+                            if (err > 1e-2 * std::fabs(ref) + 1e-3) ++bad;
+                            worst = std::max(worst, err);
+                        }
+                    std::printf("    situ_mul_bf16: %lld values, bad=%d worst=%.3g\n", (long long)(Ms * ns), bad, worst);
+                    ok("situ_mul_bf16 against the formula", rc == RAD_OK && synced && bad == 0,
+                       "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) +
+                           " worst=" + std::to_string(worst));
+                }
+            }
+        }
+        if (sel("attn_res_mix_bf16")) {
+            /* Block attention residuals against the contract in double (OPS.md): two states and cur
+             * as the depth, two queries, no addend and no gain. */
+            const RadKernelInfo* r = find(pl, "attn_res_mix_bf16");
+            if (!r) ok("attn_res_mix_bf16", false, "row absent");
+            else {
+                const int64_t Mt = 3, nn = 64, nst = 2, nqr = 2;
+                const float eps = 1e-6f;
+                std::vector<uint16_t> hs((size_t)(nst * Mt * nn)), hc((size_t)(Mt * nn));
+                std::vector<float> hq((size_t)(nqr * nn));
+                std::vector<uint16_t> hy16((size_t)(nqr * Mt * nn), 0);
+                for (size_t i = 0; i < hs.size(); ++i)
+                    hs[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 401) - 200) * 0.01f);
+                for (size_t i = 0; i < hc.size(); ++i)
+                    hc[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i ^ 977u) % 401) - 200) * 0.02f);
+                for (size_t i = 0; i < hq.size(); ++i)
+                    hq[i] = (float)((int)(st_mix32((uint32_t)i ^ 31u) % 201) - 100) * 0.01f;
+                void* dS = dalloc(hs.size() * 2);
+                void* dC = dalloc(hc.size() * 2);
+                void* dQ = dalloc(hq.size() * 4);
+                void* dY = dalloc(hy16.size() * 2);
+                if (!dS || !dC || !dQ || !dY) ok("attn_res_mix_bf16", false, "hipMalloc failed");
+                else {
+                    st_memcpy(dS, hs.data(), hs.size() * 2, hipMemcpyHostToDevice);
+                    st_memcpy(dC, hc.data(), hc.size() * 2, hipMemcpyHostToDevice);
+                    st_memcpy(dQ, hq.data(), hq.size() * 4, hipMemcpyHostToDevice);
+                    st_memcpy(dY, hy16.data(), hy16.size() * 2, hipMemcpyHostToDevice);
+                    std::vector<RadTensor> ts = { T(dS, RAD_BF16, { nst, Mt, nn }),
+                                                  T(dC, RAD_BF16, { Mt, nn }),
+                                                  T(nullptr, RAD_BF16, { 0 }),
+                                                  T(dQ, RAD_F32, { nqr, nn }),
+                                                  T(nullptr, RAD_F32, { 0 }),
+                                                  T(dY, RAD_BF16, { nqr, Mt, nn }) };
+                    absent(ts[2]); absent(ts[4]);
+                    std::vector<RadParam> ps = { PI("M", Mt), PI("n", nn), PI("n_state", nst),
+                                                 PI("n_query", nqr), PS("dtype", "bf16"),
+                                                 PF("eps", eps) };
+                    RadArgs a{};
+                    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+                    a.world_size = 1;
+                    const int rc = r->launch(&a, nullptr);
+                    const bool synced = st_stream_sync(nullptr) == hipSuccess;
+                    st_memcpy(hy16.data(), dY, hy16.size() * 2, hipMemcpyDeviceToHost);
+                    int bad = 0; double worst = 0;
+                    for (int64_t t = 0; t < Mt; ++t) {
+                        std::vector<std::vector<double>> vh(nst + 1, std::vector<double>(nn));
+                        for (int64_t d = 0; d <= nst; ++d) {
+                            double ss = 0;
+                            for (int64_t i = 0; i < nn; ++i) {
+                                const double v = d < nst ? h_bf16(hs[(size_t)((d * Mt + t) * nn + i)])
+                                                         : h_bf16(hc[(size_t)(t * nn + i)]);
+                                ss += v * v;
+                            }
+                            const double inv = 1.0 / std::sqrt(ss / nn + eps);
+                            for (int64_t i = 0; i < nn; ++i)
+                                vh[(size_t)d][(size_t)i] = (d < nst ? h_bf16(hs[(size_t)((d * Mt + t) * nn + i)])
+                                                                    : h_bf16(hc[(size_t)(t * nn + i)])) * inv;
+                        }
+                        for (int64_t q = 0; q < nqr; ++q) {
+                            std::vector<double> sc((size_t)(nst + 1));
+                            double mx = -1e300;
+                            for (int64_t d = 0; d <= nst; ++d) {
+                                double dot = 0;
+                                for (int64_t i = 0; i < nn; ++i) dot += vh[(size_t)d][(size_t)i] * hq[(size_t)(q * nn + i)];
+                                sc[(size_t)d] = dot / std::sqrt((double)nn);
+                                mx = std::max(mx, sc[(size_t)d]);
+                            }
+                            double den = 0;
+                            for (double& s : sc) { s = std::exp(s - mx); den += s; }
+                            for (int64_t i = 0; i < nn; ++i) {
+                                double m = 0;
+                                for (int64_t d = 0; d <= nst; ++d) m += sc[(size_t)d] / den * vh[(size_t)d][(size_t)i];
+                                const double got = h_bf16(hy16[(size_t)((q * Mt + t) * nn + i)]);
+                                const double err = std::fabs(got - m);
+                                if (err > 1e-2 * std::fabs(m) + 2e-3) ++bad;
+                                worst = std::max(worst, err);
+                            }
+                        }
+                    }
+                    std::printf("    attn_res_mix_bf16: %lld values, bad=%d worst=%.3g\n", (long long)(Mt * nqr * nn), bad, worst);
+                    ok("attn_res_mix_bf16 against the contract", rc == RAD_OK && synced && bad == 0,
+                       "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) +
+                           " worst=" + std::to_string(worst));
+                }
+            }
+        }
         if (sel("gdn_gated_norm_had_quant_i8")) {
             const RadKernelInfo* r = find(pl, "gdn_gated_norm_had_quant_i8");
             if (!r) ok("gdn_gated_norm_had_quant_i8", false, "row absent");
@@ -36373,6 +36852,12 @@ static void device_phase(const Plugin& pl) {
             { "down, sorted rows, 512:256 x K 256:128", 512, 256, 256, 128, 1, 10, true },
             { "512 experts, down, sorted rows, 256 x K 128", 256, 128, 256, 128, 1, 512, true },
         };
+        if (sel("moe_gemm_nvfp4a8i8")) {
+            if (!g_case) std::printf("\nthe grouped MoE GEMM over NVFP4 experts, against a host decode\n");
+            moe_nvfp4_case(pl, 24, 64, 128, 4, 2, 64);
+            moe_nvfp4_case(pl, 200, 128, 256, 8, 2, 128);
+            moe_nvfp4_case(pl, 600, 256, 512, 16, 2, 256);
+        }
         if (sel("moe_gemm_iqr")) {
             if (!g_case) std::printf("\nthe grouped MoE GEMM over IQR experts, against the dense IQR GEMM\n");
             static const MoeIqrShape kIqr[] = {

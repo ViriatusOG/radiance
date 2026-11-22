@@ -128,6 +128,7 @@ set(R4D_UNITS
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"
+  "r4d_l2_clip_bf16|"
   # The all-reduce kernels share one instance (peer scratch, IPC-equivalent pointers, per-block
   # flags, device sequence counters) set up by one rendezvous across ranks, so all entry points
   # live in r4d_ar_entry. Spreading them across the kernel units would give each its own copy.
@@ -197,6 +198,8 @@ set(R4D_UNITS
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"
   "r4d_gated_had_quant_i8|"
+  # gated_quant_i8: the unrotated grouped int8 sibling, one workgroup a row for any row count.
+  "r4d_gated_quant_i8|"
   "r4d_qk_norm_rope_gate|"
   "r4d_gdn_gated_norm_had_quant_i8|"
   "r4d_dequant_w4_bf16|"
@@ -205,6 +208,13 @@ set(R4D_UNITS
   "r4d_pair_argmax_f32|"
   # LiLiCorr's correlator: candidates, lattice attention, factor input, walk.
   "r4d_lili|"
+  # Inkling 2's attention (attn_paged_rel): the relative-position bias and the row sinks at head_dim
+  # 128, any gqa, a plain kernel for every band.
+  "r4d_attn_rel|"
+  # Block attention residuals (Inkling 2): a softmax over depth, one workgroup a row.
+  "r4d_attn_res|"
+  # SiTU, Inkling 2's expert activation over a fused gate_up.
+  "r4d_situ|"
   # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
@@ -218,6 +228,8 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  # NVFP4 experts against an int8 activation: a plain per-column kernel (no WMMA).
+  "r4d_moe_nvfp4|"
   # Blocks a row keeps for an output buffer, freed with the memory they serve (r4d_keyed.h).
   "r4d_keyed|"
 )
