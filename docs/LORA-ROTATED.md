@@ -58,6 +58,10 @@ the architecture against patched copies of four SDK arch headers (a `radiance-ho
 engine source is touched). That step is arch-specific and is not in this change. If a plugin could
 override `declare()` for named module kinds, the whole path would live out of tree with no shadow.
 
+In tree, the shared fp8 blocks (`attn_output`, `ssm_out`, `ffn_down_shexp`) set that plain view
+only when a runtime adapter targets the checkpoint source (`rad_lora_source_targeted`). With no
+adapter those weights keep `gemm_nt_q` i8a8h, which is what a Flash-Next container starts on.
+
 ## 5. Cost and verification
 
 On a 2x R9700 gfx1201 rig against an unmodified `qwen3.8-next-flash-iqr-v4` container, 96 GEMMs

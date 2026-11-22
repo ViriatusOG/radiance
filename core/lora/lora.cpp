@@ -144,7 +144,7 @@ struct MapIndex {
 /* Is checkpoint tensor `src` an adapter target? A token model: its leaf is in the target list and
  * it is in the trunk. A generator: it is under a declared root, and its leaf is in the list or the
  * list is "*". */
-bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src) {
+bool source_hit(const Program& prog, const TargetSet& targets, const std::string& src) {
     std::string leaf;
     if (module_of(src, &leaf).empty()) return false;
     if (!gen_scope(prog)) return targets.count(leaf) && !excluded_source(src);
@@ -161,7 +161,7 @@ bool targeted_core(const Program& prog, const WeightInfo& w,
     if (excluded_weight(prog, w)) return false;
     for (const RadNameMap* m : maps)
         for (int k = 0; k < m->n_src && k < 8; ++k)
-            if (m->src[k] && source_targeted(prog, targets, m->src[k])) return true;
+            if (m->src[k] && source_hit(prog, targets, m->src[k])) return true;
     return false;
 }
 
@@ -505,7 +505,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
          * that is is not recorded. Usable only when exactly one alternative is targeted. */
         std::vector<std::string> hit;
         for (const std::string& x : srcs)
-            if (source_targeted(prog, targets, x)) hit.push_back(x);
+            if (source_hit(prog, targets, x)) hit.push_back(x);
         if (hit.size() != 1)
             return fail(err, RAD_E_UNSUPPORTED,
                         fmt("weight '%s' is one of %zu alternative checkpoint tensors and %zu of "
@@ -522,7 +522,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
         ss.module = module_of(x, &leaf);
         if (ss.module.empty()) ss.module = x;
         ss.module += piece[si];
-        ss.targeted = source_targeted(prog, targets, x);
+        ss.targeted = source_hit(prog, targets, x);
         if (ss.targeted) ss.slot = slot++;
         s.sources.push_back(ss);
     }
@@ -567,6 +567,10 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
 }  /* namespace */
 
 /* ================================================================== predicates */
+bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src) {
+    return source_hit(prog, targets, src);
+}
+
 bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets) {
     if (targets.empty() || w == 0 || w >= prog.weights.size()) return false;
     /* A generator's fused GEMMs are kept: its scope is the plain GEMMs (build_sites). */

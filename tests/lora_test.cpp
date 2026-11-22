@@ -873,12 +873,42 @@ TEST(weight_targeted_reads_only_what_exists_at_the_moment) {
     const rad_weight w = rad_decl_weight(&b, "blk.0.attn_q.weight", &d);
     REQUIRE(w != 0);
     CHECK(!lora::weight_targeted(b.program(), w, t));        /* no name map yet */
+    CHECK(lora::source_targeted(b.program(), t, "model.layers.0.self_attn.q_proj.weight"));
+    b.set_lora_targets(&t);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.q_proj.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.k_proj.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "mtp.layers.0.self_attn.q_proj.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.visual.q_proj.weight"), 0);
+    const lora::TargetSet head{ "embed_tokens", "lm_head" };
+    b.set_lora_targets(&head);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.embed_tokens.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "lm_head.weight"), 0);
+    b.set_lora_targets(&t);
+    CHECK_EQ(rad_lora_source_targeted(&b, nullptr), 0);
+    b.set_lora_targets(nullptr);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.q_proj.weight"), 0);
     REQUIRE_EQ(AR::map_copy(&b, "blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"), RAD_OK);
     CHECK(lora::weight_targeted(b.program(), w, t));
     CHECK(!lora::weight_targeted(b.program(), w, { "k_proj" }));
     CHECK(!lora::weight_targeted(b.program(), w, {}));
     CHECK(!lora::weight_targeted(b.program(), 0, t));
     CHECK(!lora::weight_targeted(b.program(), 999, t));
+}
+
+TEST(lora_source_targeted_on_a_generator_is_the_declared_root) {
+    const RadModelMeta meta = llama_meta();
+    const RadBuildCtx ctx = ctx_for(0, 1);
+    Builder b(empty_registry(), meta, ctx);
+    const lora::TargetSet star{ "*" };
+    b.set_lora_targets(&star);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 0);
+    REQUIRE_EQ(rad_lora_root(&b, "diffusion_model", "-"), RAD_OK);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "text_encoder.blocks.0.attn.q.weight"), 0);
+    const lora::TargetSet q{ "q" };
+    b.set_lora_targets(&q);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.k.weight"), 0);
 }
 
 TEST(scopes_that_are_never_targets) {

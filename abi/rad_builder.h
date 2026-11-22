@@ -1148,6 +1148,14 @@ int rad_lora_root(RadBuilder* b, const char* native, const char* spellings);
 int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
                    int64_t from_lo, int64_t from_hi, int64_t to_lo);
 
+/* Is checkpoint tensor `src` a runtime-LoRA target of this build? 1 when an adapter configured
+ * for this startup targets it, 0 otherwise (no adapter, a different module, a tower, the drafter,
+ * or a generator source outside a declared root). The same predicate as lora::source_targeted:
+ * the leaf of a `.weight` name. A plugin asks before the weight exists, and sets a LoRA-only
+ * declaration (the plain bf16 view of a rotated int8 trunk weight) only on 1. Null or an empty
+ * name is 0. Additive export; RAD_ABI_VERSION does not move. */
+int rad_lora_source_targeted(RadBuilder* b, const char* src);
+
 /* ================================================================== the audio generator */
 /* A program that makes audio from text: an autoregressive language model writes the piece frame by
  * frame, with classifier-free guidance (each request runs a conditional and an unconditional

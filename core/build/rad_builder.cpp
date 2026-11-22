@@ -2235,6 +2235,11 @@ int Builder::lora_root(const char* native, const char* spellings) {
     return RAD_OK;
 }
 
+int Builder::lora_source_targeted(const char* src) const {
+    if (!lora_targets_ || !src || !*src) return 0;
+    return lora::source_targeted(prog_, *lora_targets_, src) ? 1 : 0;
+}
+
 int Builder::lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
                         int64_t from_hi, int64_t to_lo) {
     if (finished_) {
@@ -2916,6 +2921,11 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
                    int64_t from_lo, int64_t from_hi, int64_t to_lo) {
     if (!b) return RAD_E_INVAL;
     return B(b)->lora_alias(native, from, to, from_lo, from_hi, to_lo);
+}
+
+int rad_lora_source_targeted(RadBuilder* b, const char* src) {
+    if (!b || !src) return 0;
+    return B(b)->lora_source_targeted(src);
 }
 
 int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
