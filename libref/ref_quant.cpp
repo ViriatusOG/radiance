@@ -104,9 +104,14 @@ int ref_quant_act_i8g(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ had_quant_act_i8 */
 /* The rotated int8 row of the had_*_i8 ops: `v(i)` for i < n rotated in blocks of `g`, its codes
- * stored at q[qb + i * qs] against one scale for the whole row (the amax is over the whole rotated
- * row). The rotation is computed twice, for the amax and then for the codes, rather than held.
- * Returns the row's scale, amax / 127 / sqrt(g). */
+ * against one scale for the whole row (the amax is over the whole rotated row). The rotation is
+ * computed twice, for the amax and then for the codes, rather than held. Returns the row's scale,
+ * amax / 127 / sqrt(g).
+ *
+ * The codes are stored in the step order (i8_step_pos), not column order: the card's rotated
+ * quantisers (r4d_gated_had_quant_i8, r4d_rmsnorm_had_quant_i8, r4d_had_quant_act_i8) write
+ * byte i = code of column i8_step_pos(i), and the int8 WMMA reads them so. Needs n a multiple of
+ * 16 (a whole step), which the callers check. */
 template <class V>
 static float had_i8_row(const V& v, int64_t n, int64_t g, const RadTensor* q, int64_t qb,
                         int64_t qs) {
@@ -121,7 +126,8 @@ static float had_i8_row(const V& v, int64_t n, int64_t g, const RadTensor* q, in
     for (int64_t b = 0; b < n; b += g) {
         for (int64_t i = 0; i < g; ++i) buf[i] = v(b + i);
         fwht(buf, g);
-        for (int64_t i = 0; i < g; ++i) st_dt(q->dtype, q->data, qb + (b + i) * qs, buf[i] * inv);
+        for (int64_t i = 0; i < g; ++i)
+            st_dt(q->dtype, q->data, qb + i8_step_pos(b + i) * qs, buf[i] * inv);
     }
     return amax / 127.0f * (1.0f / std::sqrt((float)g));
 }
@@ -133,6 +139,7 @@ int ref_had_quant_act_i8(const RadArgs* a, RadStream) {
     const int64_t g = p_int(a, "group", 0);
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (n % 16) return RAD_E_SHAPE;                 /* whole steps, as quant_act_i8 */
     const int64_t rows = numel(x) / n;
     if (rows <= 0 || numel(q) < rows * n || numel(s) < rows) return RAD_E_SHAPE;
 
@@ -168,6 +175,7 @@ int ref_rmsnorm_had_quant_i8(const RadArgs* a, RadStream) {
     const float wadd = p_f32(a, "wadd", 0.0f);
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (n % 16) return RAD_E_SHAPE;                 /* whole steps, as quant_act_i8 */
     const int64_t rows = numel(x) / n;
     if (rows <= 0 || numel(q) < rows * n || numel(s) < rows || numel(w) < n) return RAD_E_SHAPE;
     if (res && numel(res) < rows * n) return RAD_E_SHAPE;
@@ -220,11 +228,15 @@ int ref_gated_had_quant_i8(const RadArgs* a, RadStream) {
     if (!ga->data || !q->data || !s->data) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0);
     const int64_t g = p_int(a, "group", 0);
-    static const char* kActs[] = { "silu", "sigmoid" };
-    const int act = p_enum(a, "act", kActs, 2, (int)p_int(a, "mode", 0));
+    static const char* kActs[] = { "silu", "sigmoid", "situ" };
+    const int act = p_enum(a, "act", kActs, 3, (int)p_int(a, "mode", 0));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
-    if (act != 0 && act != 1) return RAD_E_INVAL;
+    if (act < 0 || act > 2) return RAD_E_INVAL;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (n % 16) return RAD_E_SHAPE;                 /* whole steps, as quant_act_i8 */
     const int64_t rows = numel(q) / n;
     if (rows <= 0 || numel(s) < rows) return RAD_E_SHAPE;
     if (numel(ga) < rows * (up ? n : 2 * n)) return RAD_E_SHAPE;
@@ -238,9 +250,56 @@ int ref_gated_had_quant_i8(const RadArgs* a, RadStream) {
         auto gated = [&](int64_t i) {
             const float gate = ldt(ga, gb + i * gs);
             const float x    = up ? ldt(up, ub + i * us) : ldt(ga, gb + (n + i) * gs);
+            if (act == 2) return act_situ_gate(gate, gcap) * act_situ_up(x, ucap);
             return (act == 1 ? act_sigmoid(gate) : act_silu(gate)) * x;
         };
         stt(s, r * laststride(s), had_i8_row(gated, n, g, q, rowoff(q, r, n), laststride(q)));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ gated_quant_i8 */
+/* gated_had_quant_i8 without the rotation: the same gated product (the same `act`, SiTU included),
+ * quantised per `group` contiguous elements, default 128, against one f32 scale each as
+ * quant_act_i8g writes them. The NVFP4 experts' down projection reads this form. */
+int ref_gated_quant_i8(const RadArgs* a, RadStream) {
+    if (a->n_t < 4) return RAD_E_INVAL;
+    const RadTensor *ga = &a->t[0], *q = &a->t[2], *s = &a->t[3];
+    const RadTensor* up = t_in(a, 1);
+    if (!ga->data || !q->data || !s->data) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0);
+    int64_t g = p_int(a, "group", 128);
+    static const char* kActs[] = { "silu", "sigmoid", "situ" };
+    const int act = p_enum(a, "act", kActs, 3, (int)p_int(a, "mode", 0));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (act < 0 || act > 2) return RAD_E_INVAL;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
+    if (g <= 0 || g > n) g = n;
+    const int64_t ngrp = (n + g - 1) / g;
+    const int64_t rows = numel(q) / n;
+    if (rows <= 0 || numel(s) < rows * ngrp) return RAD_E_SHAPE;
+    if (numel(ga) < rows * (up ? n : 2 * n)) return RAD_E_SHAPE;
+    if (up && numel(up) < rows * n) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(rows * n * 8)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gb = rowoff(ga, r, up ? n : 2 * n), gs = laststride(ga);
+        const int64_t ub = up ? rowoff(up, r, n) : 0, us = up ? laststride(up) : 0;
+        auto gated = [&](int64_t i) {
+            const float gate = ldt(ga, gb + i * gs);
+            const float x    = up ? ldt(up, ub + i * us) : ldt(ga, gb + (n + i) * gs);
+            if (act == 2) return act_situ_gate(gate, gcap) * act_situ_up(x, ucap);
+            return (act == 1 ? act_sigmoid(gate) : act_silu(gate)) * x;
+        };
+        const int64_t qb = rowoff(q, r, n), qs = laststride(q);
+        for (int64_t gi = 0; gi < ngrp; ++gi) {
+            const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
+            const float sc = q8_group([&](int64_t i) { return gated(k0 + i); }, k1 - k0, 127.0f, q,
+                                      qb + k0 * qs, qs);
+            stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
+        }
     }
     return RAD_OK;
 }

@@ -379,6 +379,29 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("window", 0).ps("q_dtype", "f32").ps("kv_dtype", "f32");
         hs.push_back(std::move(h));
     }
+    /* ---- attn_paged_rel (Inkling 2): a ragged prefill with cu_seqlens, the keys past the
+     * extent (contexts of 40 against an extent of 24), GQA 3 over 2 KV heads at head_dim 16. The
+     * window variant takes the local layers' sliding window over the same batch. ------------- */
+    for (int window : { 0, 16 }) {
+        const int64_t S = 2, T = 8, KVH = 2, G = 3, NH = KVH * G, HD = 16, BS = 16, NB = 6;
+        const int64_t DR = 4, EXT = 24, MB = 3;
+        Hand h(window ? "attn_paged_rel ragged, window 16" : "attn_paged_rel ragged, window 0",
+               "attn_paged_rel", 1e-4);
+        h.dense(RAD_F32, { T, NH, HD }, hfill(31))
+         .dense(RAD_F32, { NB, KVH, BS, 2 * HD }, hfill(32))
+         .dense(RAD_I32, { S, MB }, [](int64_t i) { return (float)((i * 5) % 6); })
+         .idx({ 40, 20 })
+         .none().none()
+         .dense(RAD_I32, { S + 1 }, [](int64_t i) { return i == 0 ? 0.0f : i == 1 ? 3.0f : 8.0f; })
+         .dense(RAD_F32, { T, NH, DR }, hfill(33))
+         .dense(RAD_F32, { DR, EXT }, hfill(34))
+         .dense(RAD_F32, { T, NH }, hfill(35))
+         .dense(RAD_F32, { T, NH, HD }, hfill(36), true)
+         .pi("q_len", 5).pi("head_dim", HD).pi("gqa", G).pi("block_size", BS).pi("causal", 1)
+         .pi("window", window).pi("d_rel", DR).pi("extent", EXT)
+         .ps("q_dtype", "f32").ps("kv_dtype", "f32");
+        hs.push_back(std::move(h));
+    }
     /* ---- attention and the KV write over column slices of a fused [q|k|v] projection ------- */
     {
         const int64_t T = 5, NH = 2, KVH = 1, HD = 16, W = (NH + 2 * KVH) * HD, BS = 4, NB = 4;
@@ -532,6 +555,22 @@ void shape_cases(std::vector<Hand>& hs) {
          .dense(RAD_F32, { T, N }, hfill(58), true)
          .pi("M", BAND).pi("n", N).pi("width", CW).ps("dtype", "f32");
         hs.push_back(std::move(k));
+
+        /* Inkling 2's short convolution with its residual and dynamic taps: the same window as
+         * the causal case, with 4 heads of 8 channels each (dyn is [T, heads * k]). */
+        const int64_t SH = 4, SK = 4, SSL = SK - 1 + 2;
+        Hand sc("M = 64 over 5 rows, verifies of 3 and 2, dynamic taps", "sconv_res", 1e-5);
+        sc.dense(RAD_F32, { T, N }, hfill(64))
+          .dense(RAD_F32, { N, SK }, hfill(65, 0.5f))
+          .dense(RAD_F32, { 2, N, SSL }, hfill(66), true)
+          .idx({ 0, 3, 5 })
+          .dense(RAD_F32, { T, SH * SK }, hfill(67, 0.5f))
+          .idx({ 1, 0 })
+          .idx({ 7, 9 })
+          .idx({ 2, 3 })
+          .dense(RAD_F32, { T, N }, hfill(68), true)
+          .pi("M", BAND).pi("n", N).pi("width", SK).pi("heads", SH).ps("dtype", "f32");
+        hs.push_back(std::move(sc));
 
         /* The antialiased resample upscaling a 4 x 4 table (drawn grids never exceed the table),
          * one row downscaling it, and a 1 x 1 grid. */
@@ -1297,6 +1336,27 @@ void format_cases(std::vector<Hand>& hs) {
              .ps("dtype", form == 0 ? "w4a8" : "fp8a8");
             hs.push_back(std::move(h));
         }
+        /* NVFP4 experts: every e2m1 code in turn, an E4M3-shaped scale per 16 of K (here as the
+         * product with the expert's level, the logical form), against an int8 activation at one
+         * scale per 64. The codes are one plane, two a byte, element k in the low nibble. */
+        const int64_t NV = NE / 2;
+        std::vector<uint8_t> codes((size_t)(NV * N * K / 2), 0);
+        for (int64_t i = 0; i < NV * N * K; ++i)
+            rad_store_code(codes.data(), RAD_FP4E2M1, i, (int)((i * 7 + 3) % 16));
+        Hand h("nvfp4 experts, every code, scales per 16 of K, against an int8 activation",
+               "moe_gemm_q", 8e-3);
+        h.dense(RAD_I8, { M, K }, [](int64_t i) { return (float)((i * 37) % 255) - 127.0f; })
+         .dense(RAD_F32, { M, K / 64 }, [](int64_t i) { return 0.01f + 0.003f * (float)i; })
+         .raw(RAD_FP4E2M1, { NV, N, K }, codes.data())
+         .dense(RAD_F32, { NV, N, K / 16 }, [](int64_t i) { return 0.25f + 0.25f * (float)(i % 5); })
+         .idx(sorted)
+         .idx(off)
+         .raw(RAD_FP4E2M1, { NV, N, K }, codes.data())
+         .dense(RAD_F32, { NV, N, K / 16 }, [](int64_t i) { return 0.5f + 0.125f * (float)(i % 3); })
+         .dense(RAD_BF16, { T, N }, zero, true)
+         .pi("M", M).pi("N", N).pi("K", K).pi("n_expert", NE).pi("top_k", TOPK)
+         .pi("group", 64).ps("a_order", "token").ps("dtype", "nvfp4a8i8");
+        hs.push_back(std::move(h));
     }
 }
 
@@ -5051,6 +5111,126 @@ void audio_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* attn_res_mix's contract in double over the inputs as the buffers hold them (rounded to their
+ * dtype), so the oracle and both libraries start from the same values. */
+std::vector<float> attn_res_oracle(const std::vector<float>& st, int64_t MT, int64_t nS,
+                                   const std::vector<float>& cur, const std::vector<float>* add,
+                                   const std::vector<float>& q, const std::vector<float>* w,
+                                   int64_t M, int64_t n, int64_t nQ, double eps) {
+    std::vector<float> y((size_t)(nQ * M * n));
+    for (int64_t t = 0; t < M; ++t) {
+        std::vector<std::vector<double>> v;
+        for (int64_t i = 0; i <= nS; ++i) {
+            std::vector<double> x((size_t)n);
+            for (int64_t c = 0; c < n; ++c)
+                x[(size_t)c] = i < nS ? st[(size_t)(i * MT * n + t * n + c)]
+                                      : (double)cur[(size_t)(t * n + c)] +
+                                            (add ? (double)(*add)[(size_t)(t * n + c)] : 0.0);
+            double ms = 0;
+            for (double e : x) ms += e * e;
+            const double r = 1.0 / std::sqrt(ms / n + eps);
+            for (double& e : x) e *= r;
+            v.push_back(x);
+        }
+        for (int64_t qq = 0; qq < nQ; ++qq) {
+            std::vector<double> sc;
+            double mx = -1e300;
+            for (auto& x : v) {
+                double d = 0;
+                for (int64_t c = 0; c < n; ++c) d += x[(size_t)c] * q[(size_t)(qq * n + c)];
+                sc.push_back(d / std::sqrt((double)n));
+                mx = std::max(mx, sc.back());
+            }
+            double den = 0;
+            for (double& s : sc) { s = std::exp(s - mx); den += s; }
+            std::vector<double> m((size_t)n, 0.0);
+            for (size_t i = 0; i < v.size(); ++i)
+                for (int64_t c = 0; c < n; ++c) m[(size_t)c] += sc[i] / den * v[i][(size_t)c];
+            if (w) {
+                double ms = 0;
+                for (double e : m) ms += e * e;
+                const double r = 1.0 / std::sqrt(ms / n + eps);
+                for (int64_t c = 0; c < n; ++c)
+                    m[(size_t)c] = m[(size_t)c] * r * (*w)[(size_t)(qq * n + c)];
+            }
+            for (int64_t c = 0; c < n; ++c)
+                y[(size_t)((qq * M + t) * n + c)] = (float)m[(size_t)c];
+        }
+    }
+    return y;
+}
+
+/* attn_res_mix over pitched state planes (a [max_blocks, max_tok, n] buffer of which the first
+ * n_state planes and M rows are read), with and without the addend, the gain, and at depth 0. The
+ * oracle is the double-precision contract above; both libraries are held to it. */
+void attnres_cases(std::vector<Hand>& hs) {
+    struct Geo { int64_t M, n, nS, nQ, MB, MT; const char* dt; };
+    const Geo geos[] = {
+        { 3, 8, 2, 2, 4, 5, "f32" },
+        { 3, 8, 2, 2, 4, 5, "bf16" },
+        { 5, 16, 1, 1, 2, 9, "bf16" },
+        { 4, 8, 8, 3, 9, 6, "bf16" },
+        { 2, 8, 0, 4, 1, 2, "f32" },
+    };
+    for (const Geo& g : geos) {
+        const bool bf = std::string(g.dt) == "bf16";
+        const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+        const double tol = bf ? 8e-3 : 2e-5;
+        const double eps = 1e-6;
+        /* Values as the buffers hold them. */
+        auto fit = [&](std::vector<float> v) {
+            if (bf) for (float& e : v) e = rad_bf16_to_f32(rad_f32_to_bf16(e));
+            return v;
+        };
+        std::vector<float> st((size_t)(g.MB * g.MT * g.n)), cur((size_t)(g.M * g.n)),
+                           add((size_t)(g.M * g.n)), q((size_t)(g.nQ * g.n)), w((size_t)(g.nQ * g.n));
+        for (size_t i = 0; i < st.size(); ++i) st[i] = std::sin(0.37f * (float)i) * (1.0f + (float)(i % 4));
+        for (size_t i = 0; i < cur.size(); ++i) { cur[i] = std::cos(0.91f * (float)i); add[i] = 0.1f * (float)i - 0.4f; }
+        for (size_t i = 0; i < q.size(); ++i) { q[i] = std::sin(1.3f * (float)i + 0.2f); w[i] = 1.0f + 0.05f * (float)i; }
+        st = fit(st); cur = fit(cur); add = fit(add);
+        /* The query and gain are f32 whatever the activations are. */
+        for (int with : { 0, 1 }) {
+            const std::vector<float>* ad = with ? &add : nullptr;
+            const std::vector<float>* wp = with ? &w : nullptr;
+            const std::string nm = std::string("pitched states, n_state ") + std::to_string(g.nS) +
+                                   (with ? ", addend and gain" : ", no addend or gain") + ", " + g.dt;
+            Hand h(nm.c_str(), "attn_res_mix", tol);
+            if (g.nS > 0)
+                h.view(dt, { g.MB, g.MT, g.n }, { g.MT * g.n, g.n, 1 }, g.MB * g.MT * g.n,
+                       [&st](int64_t i) { return st[(size_t)i]; });
+            else
+                h.none();
+            h.dense(dt, { g.M, g.n }, [&cur](int64_t i) { return cur[(size_t)i]; });
+            if (with) h.dense(dt, { g.M, g.n }, [&add](int64_t i) { return add[(size_t)i]; });
+            else      h.none();
+            h.dense(RAD_F32, { g.nQ, g.n }, [&q](int64_t i) { return q[(size_t)i]; });
+            if (with) h.dense(RAD_F32, { g.nQ, g.n }, [&w](int64_t i) { return w[(size_t)i]; });
+            else      h.none();
+            h.dense(dt, { g.nQ, g.M, g.n }, [](int64_t) { return 0.0f; }, true)
+             .pi("M", g.M).pi("n", g.n).pi("n_state", g.nS).pi("n_query", g.nQ)
+             .ps("dtype", g.dt).pf("eps", eps);
+            /* The query and gain are f32, unrounded, as the oracle reads them. */
+            h.oracle_opd = 5;
+            h.oracle = attn_res_oracle(st, g.MT, g.nS, cur, ad, q, wp, g.M, g.n, g.nQ, eps);
+            h.oracle_tol = bf ? 6e-3 : 1e-5;
+            hs.push_back(std::move(h));
+        }
+    }
+
+    /* SiTU with gates and ups far past both caps (sigma 60 against caps of 4 and 25), and at the
+     * caps themselves: the softcaps saturate, the sigmoid does not, and both libraries must agree
+     * on where the saturation starts. */
+    for (const char* dt : { "f32", "bf16" }) {
+        const uint32_t d = std::string(dt) == "bf16" ? RAD_BF16 : RAD_F32;
+        Hand h(std::string(dt) == "bf16" ? "situ far past both caps, bf16" : "situ far past both caps, f32",
+               "situ_mul", 6e-3);
+        h.dense(d, { 4, 2 * 64 }, hfill(401, 60.0f))
+         .dense(d, { 4, 64 }, [](int64_t) { return 0.0f; }, true)
+         .pi("M", 4).pi("n", 64).ps("dtype", dt).pf("gate_cap", 4.0).pf("up_cap", 25.0);
+        hs.push_back(std::move(h));
+    }
+}
+
 }  // namespace
 
 bool hand_cases(const Check& ck) {
@@ -5069,6 +5249,7 @@ bool hand_cases(const Check& ck) {
     kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);
+    attnres_cases(hs);
     Broken broken;
     planes_cases(ck, hs, broken);
 

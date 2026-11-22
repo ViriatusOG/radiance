@@ -196,11 +196,17 @@ struct ConvArgs {
     const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
     bool silu;
     const RadTensor* b;   /* per-channel bias inside the activation (Mamba-2's conv1d), or null */
+    /* sconv_res only (the fields below are ignored otherwise): the input-dependent taps `dyn`
+     * [M, heads*width], the head count, and the residual, which is x itself. */
+    bool sconv = false;
+    const RadTensor* dyn = nullptr;
+    int64_t heads = 0;
 };
 
 static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
     const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y, *b = o.b;
+    const RadTensor *dyn = o.sconv ? o.dyn : nullptr;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n    = p_int(a, "n", 0);
@@ -219,6 +225,11 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     if (numel(x) < M * n || numel(y) < M * n || numel(w) < n * wid) return RAD_E_SHAPE;
     if (resid && numel(resid) < M * n) return RAD_E_SHAPE;
     if (b && numel(b) != n) return RAD_E_SHAPE;
+    /* Channel c's taps come from head c / (n / heads): the heads must divide the channels. */
+    if (dyn) {
+        if (o.heads <= 0 || n % o.heads != 0) return RAD_E_SHAPE;
+        if (numel(dyn) < M * o.heads * wid) return RAD_E_SHAPE;
+    }
 
     const int64_t state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : hist_len;
     if (cs->data && state_len < hist_len) return RAD_E_SHAPE;
@@ -239,6 +250,11 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     const int64_t rrow = resid ? rowoff(resid, 1, n) : 0;
     const int64_t rcol = resid ? laststride(resid) : 0;
     const int64_t wrow = rowoff(w, 1, wid), wcol = laststride(w);
+    const int64_t drow = dyn ? rowoff(dyn, 1, o.heads * wid) : 0;
+    const int64_t dcol = dyn ? laststride(dyn) : 0;
+    const int64_t hch = dyn ? n / o.heads : 1;   /* channels a head's taps cover */
+    /* sconv_res's scale: 1 + k taps per input, and twice that with input-dependent taps. */
+    const float sdiv = std::sqrt((float)((dyn ? 2 : 1) * wid + 1));
     /* [n_slots, n, state_len], as gdn's conv state; a flattened one is read as the tight layout. */
     const bool cs3 = cs->rank >= 3;
     const int64_t cs_slot = cs3 ? cs->stride[cs->rank - 3] : n * state_len;
@@ -266,13 +282,23 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
             hist[i] = (warm && cs->data) ? ldt(cs, base + (off + i) * cs_t) : 0.0f;
 
         const float bias = b ? ldt(b, c * laststride(b)) : 0.0f;
+        const int64_t head = dyn ? c / hch : 0;
         for (int64_t t = 0; t < slen; ++t) {
             float acc = bias;
             for (int64_t j = 0; j < wid; ++j) {
                 const int64_t src = t - hist_len + j * dil;
                 const float v = src >= 0 ? ldt(x, (bos + src) * xrow + c * xcol)
                                          : hist[src + hist_len];
-                acc += v * ldt(w, c * wrow + j * wcol);
+                float tap = ldt(w, c * wrow + j * wcol);
+                /* Tap j is lag wid-1-j, and dyn's column head*k + lag is that lag's tap. */
+                if (dyn) tap += ldt(dyn, (bos + t) * drow + (head * wid + (wid - 1 - j)) * dcol);
+                acc += v * tap;
+            }
+            if (o.sconv) {
+                /* The residual is the input itself, and the sum is scaled by 1/sqrt(m k + 1). */
+                const float r = ldt(x, (bos + t) * xrow + c * xcol);
+                stt(y, (bos + t) * yrow + c * ycol, (r + acc) / sdiv);
+                continue;
             }
             const float r = resid ? ldt(resid, (bos + t) * rrow + c * rcol) : 0.0f;
             stt(y, (bos + t) * yrow + c * ycol, r + (o.silu ? act_silu(acc) : acc));
@@ -318,4 +344,22 @@ int ref_causal_conv1d(const RadArgs* a, RadStream) {
     if (p_int(a, "dilation", 1) != 1) return RAD_E_INVAL;
     return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), nullptr,
                                       t_in(a, 4), t_in(a, 5), t_in(a, 6), t_in(a, 7), false });
+}
+
+/* Inkling 2's short convolution with its residual, on the window above:
+ *
+ *   y[t][c] = ( x[t][c] + sum_lag (w[c][k-1-lag] + dyn[t][c/(n/heads)][lag]) * x[t-lag][c] )
+ *             / sqrt(m*k + 1),       m = 2 with dyn, else 1
+ *
+ * `dyn` is the optional input-dependent part, [M, heads*k]; `heads` a parameter, 0 meaning no dyn
+ * operand, so the two must agree. Operands as causal_conv1d's, with `dyn` where `resid` sits. */
+int ref_sconv_res(const RadArgs* a, RadStream) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    const int64_t heads = p_int(a, "heads", 0);
+    /* heads 0 means no dyn: the operand is ignored even when a harness fills it. */
+    const RadTensor* dyn = heads > 0 ? t_in(a, 4) : nullptr;
+    if (heads > 0 && dyn == nullptr) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), nullptr,
+                                      t_in(a, 5), t_in(a, 6), t_in(a, 7), t_in(a, 8), false,
+                                      nullptr, true, dyn, heads });
 }

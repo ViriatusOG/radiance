@@ -530,6 +530,156 @@ AVX_KERNEL(attn_paged_sink) {
     return attn_paged_rows(a, stream, &a->t[7], 8);
 }
 
+/* ------------------------------------------------------------------ attn_paged_rel */
+/* Inkling 2's attention, the contract of libref's ref_attn_paged_rel: attn_paged's mask with a bias
+ * on each score, r[i,h] . rel_proj[:, d] at distance d = pos_i - pos_j for 0 <= d < extent, and one
+ * sink logit per query row and head. One work unit a (token, head): the keys in ascending order
+ * under this file's online softmax, the sink folded in last (sink_fold), so the denominator takes
+ * it and the value does not. The bias comes from r and rel_proj per key (d_rel MACs), never from a
+ * table of extent entries. */
+AVX_KERNEL(attn_paged_rel) {
+    if (a->n_t < 11) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[10];
+    const RadTensor *rr = &a->t[7], *rp = &a->t[8], *sk = &a->t[9];
+    const RadTensor* kdes = rad_arg_in(a, 4);
+    const RadTensor* vdes = rad_arg_in(a, 5);
+    const RadTensor* cus  = rad_arg_in(a, 6);
+    if (!q->data || !kv->data || !bt->data || !su->data || !rr->data || !rp->data || !sk->data ||
+        !o->data) return RAD_E_INVAL;
+
+    const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
+    const int64_t gqa        = p_int(a, "gqa", 1);
+    const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
+    const int     causal     = (int)p_int(a, "causal", 1);
+    const int64_t window     = p_int(a, "window", 0);
+    const int64_t d_rel      = p_int(a, "d_rel", 0);
+    const int64_t extent     = p_int(a, "extent", 0);
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0 || window < 0 || d_rel <= 0 || extent <= 0)
+        return RAD_E_SHAPE;
+    if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
+
+    const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
+    if (kv_heads <= 0) return RAD_E_SHAPE;
+    const int64_t q_heads = gqa * kv_heads;
+    if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    const int64_t n_seq = numel(su);
+    const int64_t rows  = numel(q) / (q_heads * head_dim);
+    if (n_seq <= 0 || rows <= 0) return RAD_E_SHAPE;
+    if (!cus && rows % n_seq != 0) return RAD_E_SHAPE;
+    if (cus && numel(cus) != n_seq + 1) return RAD_E_SHAPE;
+    const int64_t q_len = cus ? 0 : rows / n_seq;
+    if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
+    if (numel(rr) < rows * q_heads * d_rel || rr->rank < 2) return RAD_E_SHAPE;
+    if (rp->rank != 2 || rp->shape[0] != d_rel || rp->shape[1] != extent) return RAD_E_SHAPE;
+    if (sk->rank < 2 || numel(sk) < rows * q_heads) return RAD_E_SHAPE;
+    if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
+    if (kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+    const bool i8 = kv->dtype == RAD_I8;
+    if (i8 && !kv_i8_shape(kv, head_dim)) return RAD_E_SHAPE;
+
+    const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
+    const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
+    const int64_t bt_cs = bt->rank >= 2 ? bt->stride[bt->rank - 1] : 1;
+    const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
+
+    const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
+    const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1;
+    const int64_t o_hs = o->rank >= 3 ? o->stride[o->rank - 2] : head_dim * o_ds;
+    const int64_t o_rs = row_stride(o, q_heads * head_dim);
+    const int64_t r_ds = rr->stride[rr->rank - 1];
+    const int64_t r_hs = rr->rank >= 3 ? rr->stride[rr->rank - 2] : d_rel * r_ds;
+    const int64_t r_rs = row_stride(rr, q_heads * d_rel);
+    const int64_t s_hs = sk->stride[sk->rank - 1];
+    const int64_t s_rs = row_stride(sk, q_heads);
+    const int64_t rp_c = rp->stride[0], rp_d = rp->stride[1];
+
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+    const int64_t total = rows * q_heads;
+    const int64_t jcap  = max_blocks * block_size;
+
+    AVX_PARALLEL_FOR_IF(total >= 2)
+    for (int64_t idx = 0; idx < total; ++idx) {
+        const int64_t h   = idx % q_heads;
+        const int64_t tok = idx / q_heads;
+        int64_t s = 0, qlen = q_len, i = 0;
+        if (cus) {
+            while (s + 1 < n_seq && ldi(cus, offlin(cus, s + 1)) <= tok) ++s;
+            const int64_t beg = ldi(cus, offlin(cus, s));
+            qlen = ldi(cus, offlin(cus, s + 1)) - beg;
+            i = tok - beg;
+        } else {
+            s = tok / q_len;
+            i = tok - s * q_len;
+        }
+        if (qlen <= 0) continue;
+        const int64_t kh  = h / gqa;
+        const int64_t ctx = ldi(su, offlin(su, s));
+        const int64_t pos = ctx - qlen + i;
+        const int64_t qb  = tok * q_rs + h * q_hs;
+        const int64_t ob  = tok * o_rs + h * o_hs;
+        const int64_t rb  = tok * r_rs + h * r_hs;
+        const float kds = i8 ? 1.0f : kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
+        const float vds = i8 ? 1.0f : vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
+
+        /* One scratch call for the unit's query, accumulator and r row. */
+        float* frame = scratch_f32((size_t)(2 * head_dim + d_rel) + 16);
+        float* qf  = frame;
+        float* acc = qf + head_dim;
+        float* rv  = acc + head_dim;
+        for (int64_t d = 0; d < head_dim; ++d) { qf[d] = ldt(q, qb + d * q_ds); acc[d] = 0.0f; }
+        for (int64_t c = 0; c < d_rel; ++c) rv[c] = ldt(rr, rb + c * r_ds);
+
+        float m = -INFINITY, l = 0.0f;
+        for (int64_t j = 0; j < jcap && j < ctx; ++j) {
+            /* Key j's slot, or none when the mask hides it or its block is unmapped. */
+            if (causal ? j > pos : j >= ctx) continue;
+            if (window > 0) {
+                const int64_t dd = pos - j;
+                if (causal ? dd >= window : (dd >= window || dd <= -window)) continue;
+            }
+            const int64_t blk = ldi(bt, s * bt_rs + (j / block_size) * bt_cs);
+            if (blk < 0) continue;
+            const int64_t kb = blk * kvv.sb + kh * kvv.sh + (j % block_size) * kvv.so;
+
+            const float km = i8 ? kv_i8_scale(kv->data, kb, head_dim, 0) : kds;
+            float dot = 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d)
+                dot += qf[d] * (ldt(kv, kb + d * kvv.sd) * km);
+            float bias = 0.0f;
+            const int64_t dist = pos - j;
+            if (dist >= 0 && dist < extent)
+                for (int64_t c = 0; c < d_rel; ++c) bias += rv[c] * ldt(rp, c * rp_c + dist * rp_d);
+            const float sc = dot * scale + bias;
+
+            /* Online: the running maximum moves to a larger score and the sum and accumulator
+             * are rescaled by exp(old max - new max). */
+            if (sc > m) {
+                const float r = sc_exp(m - sc);
+                for (int64_t d = 0; d < head_dim; ++d) acc[d] *= r;
+                l *= r;
+                m = sc;
+            }
+            const float w = sc_exp(sc - m);
+            l += w;
+            const float vm = i8 ? kv_i8_scale(kv->data, kb, head_dim, 1) : vds;
+            const int64_t vb = kb + head_dim * kvv.sd;
+            for (int64_t d = 0; d < head_dim; ++d)
+                acc[d] += w * (ldt(kv, vb + d * kvv.sd) * vm);
+        }
+        /* No visible key: a zero row, the sink or not. */
+        if (m == -INFINITY) {
+            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+            continue;
+        }
+        sink_fold(ldt(sk, tok * s_rs + h * s_hs), acc, head_dim, &m, &l);
+        const float inv = 1.0f / l;
+        for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ attn_dense, bf16 blocks */
 /* Encoder attention is all prefill. The per-query loop in attn_dense parallelises over
  * (segment, head) only and re-widens every key row for every query (four million row conversions

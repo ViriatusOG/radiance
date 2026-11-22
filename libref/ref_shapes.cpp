@@ -544,6 +544,24 @@ int ref_grid_embed_cpe_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return o.finish("grid_embed_cpe", operand, out);
 }
 
+/* attn_res_mix: the planes of `states` are the first n_state of a [max_blocks, max_tok, n] buffer,
+ * drawn dense here; a hand case builds the pitched form. */
+int ref_attn_res_mix_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t nS = gi(p, n_p, "n_state", 0), nQ = gi(p, n_p, "n_query", 0);
+    if (M <= 0 || n <= 0 || nS < 0 || nQ <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    if (nS > 0) o.t(D, { nS, M, n });              /* states */
+    else        o.skip();
+    o.t(D, { M, n });                              /* cur */
+    o.t(D, { M, n });                              /* addend */
+    o.t((uint32_t)RAD_F32, { nQ, n });             /* query */
+    o.t((uint32_t)RAD_F32, { nQ, n });             /* w */
+    o.t(D, { nQ, M, n });                          /* y */
+    return o.finish("attn_res_mix", operand, out);
+}
+
 /* LiLiCorr's ops. lili_cand declines: its stats rows (sample_logprobs' sorted pairs and positive
  * sums) are no draw; avx_check_hand.cpp builds them. The others draw freely. */
 int ref_lili_cand_shape(const RadParam*, int, int, RadOpdDesc*) { return RAD_E_UNSUPPORTED; }
@@ -993,6 +1011,15 @@ int ref_silu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("silu_mul", operand, out);
 }
 
+int ref_situ_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, 2 * n });      /* gate_up -- the gate is the FIRST half */
+    o.t(D, { M, n });          /* y */
+    return o.finish("situ_mul", operand, out);
+}
+
 int ref_gelu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -1152,6 +1179,27 @@ int ref_causal_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
     o.t(D, { M, n });                                /* y */
     return o.finish("causal_conv1d", operand, out);
+}
+
+/* causal_conv1d's description with `dyn` [M, heads*width] where `resid` would sit (sconv_res).
+ * Without dyn (heads 0) the operand is described at one head's width, which nothing reads. */
+int ref_sconv_res_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D  = act_dt(p, n_p);
+    const int64_t M   = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), wid = gi(p, n_p, "width", 0);
+    const int64_t heads = gi(p, n_p, "heads", 0);
+    if (M <= 0 || n <= 0 || wid <= 0 || heads < 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = 1, depth = wid - 2 + M;
+    Opd o;
+    o.t(D, { M, n });                                /* x */
+    o.t(D, { n, wid });                              /* w */
+    o.t(D, { S, n, depth });                         /* conv_state, INOUT */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);           /* cu */
+    o.t(D, { M, (heads > 0 ? heads : 1) * wid });   /* dyn */
+    o.t_idx({ S }, S, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);           /* cache_idx */
+    o.t_idx({ S }, 0, 1, 0);                         /* has_init: warm */
+    o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
+    o.t(D, { M, n });                                /* y */
+    return o.finish("sconv_res", operand, out);
 }
 
 /* PLE's n-gram ids. The three i64 weights are not index-like: `mult` is ~10^13, `vocab_sizes` a
@@ -1324,6 +1372,18 @@ int ref_gated_had_quant_i8_shape(const RadParam* p, int n_p, int operand, RadOpd
     o.t((uint32_t)RAD_I8, { M, n });        /* q */
     o.t((uint32_t)RAD_F32, { M, 1 });       /* scale -- one per row */
     return o.finish("gated_had_quant_i8", operand, out);
+}
+
+int ref_gated_quant_i8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 128));
+    Opd o;
+    o.t(D, { M, 2 * n });                   /* a -- the packed gate_up, gate first */
+    o.skip();                               /* b */
+    o.t((uint32_t)RAD_I8, { M, n });        /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });      /* scale -- one per `group` of each row */
+    return o.finish("gated_quant_i8", operand, out);
 }
 
 int ref_dequant_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1596,6 +1656,40 @@ int ref_attn_paged_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     out->dtype = (uint32_t)RAD_F32;
     out->rank = 1;
     out->shape[0] = nh;
+    return RAD_OK;
+}
+
+/* attn_paged's operands, then r [M, n_head, d_rel] at q's dtype, rel_proj [d_rel, extent] f32 and
+ * sinks [M, n_head] f32 (one per query row and head), then out. A single sequence, as attn_paged. */
+int ref_attn_paged_rel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 7) return ref_attn_paged_shape(p, n_p, operand, out);
+    if (operand == 10) return ref_attn_paged_shape(p, n_p, 7, out);
+    if (operand > 9 || !out) return RAD_E_SHAPE;
+    const int64_t M   = gi(p, n_p, "q_len", 0);
+    const int64_t gqa = gi(p, n_p, "gqa", 1);
+    const int64_t nh  = gi(p, n_p, "n_head", gqa);
+    const int64_t dr  = gi(p, n_p, "d_rel", 0);
+    const int64_t ext = gi(p, n_p, "extent", 0);
+    if (M <= 0 || nh <= 0 || dr <= 0 || ext <= 0) return RAD_E_UNSUPPORTED;
+    RadOpdDesc qd;
+    const int rc = ref_attn_paged_shape(p, n_p, 0, &qd);
+    if (rc != RAD_OK) return rc;
+    std::memset(out, 0, sizeof *out);
+    out->fill = (uint32_t)RAD_FILL_NORMAL;
+    out->idx_const = -1;
+    if (operand == 7) {
+        out->dtype = qd.dtype;
+        out->rank = 3;
+        out->shape[0] = M; out->shape[1] = nh; out->shape[2] = dr;
+    } else if (operand == 8) {
+        out->dtype = (uint32_t)RAD_F32;
+        out->rank = 2;
+        out->shape[0] = dr; out->shape[1] = ext;
+    } else {
+        out->dtype = (uint32_t)RAD_F32;
+        out->rank = 2;
+        out->shape[0] = M; out->shape[1] = nh;
+    }
     return RAD_OK;
 }
 
@@ -2000,6 +2094,18 @@ int ref_scale_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("scale_rows", operand, out);
 }
 
+int ref_l2_clip_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                /* x */
+    o.t(D, { n });                                   /* w -- the optional scale, one per column */
+    o.t(RAD_I32, { M });                             /* positions -- optional, one per row */
+    o.t(D, { M, n });                                /* y */
+    return o.finish("l2_clip", operand, out);
+}
+
 int ref_router_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = gi(p, n_p, "M", 0);
     const int64_t ne = gi(p, n_p, "n_expert", 0);
@@ -2127,6 +2233,8 @@ static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     if (is("i8a8") || is("i8a8h") || is("w4a8i8") || is("w4a8i8h")) return { 1, g };
     if (is("w4nl64a8i8h")) return { 1, g / 2 };
     if (is("w4nl32a8i8h")) return { 1, g / 4 };
+    /* NVFP4: one E4M3 scale per 16 of K, whatever the group. */
+    if (is("nvfp4a8i8")) return { 1, 16 };
     return { 0, 0 };
 }
 /* The operands' code dtypes `dtype` names: an int8 activation for the `a8i8` and `i8a8` names and
@@ -2137,7 +2245,8 @@ static MoeCodes moe_codes(const RadParam* p, int n_p) {
     const char* d = gs(p, n_p, "dtype");
     auto is = [&](const char* s) { return d && std::strcmp(d, s) == 0; };
     const bool w8 = is("i8a8") || is("i8a8h");
-    const bool a8 = w8 || is("w4a8i8") || is("w4a8i8h") || is("w4nl64a8i8h") || is("w4nl32a8i8h");
+    const bool a8 = w8 || is("w4a8i8") || is("w4a8i8h") || is("w4nl64a8i8h") || is("w4nl32a8i8h") ||
+                    is("nvfp4a8i8");
     return { a8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3,
              w8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3 };
 }
@@ -2171,6 +2280,8 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
+    /* nvfp4a8i8's scale is the logical product of the E4M3 scale and the expert's f32 level. */
+    const bool nv = kind && !std::strcmp(kind, "nvfp4a8i8");
     const auto SD = kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : D;
     const MoeCodes cd = moe_codes(p, n_p);
     /* The K one activation scale covers: `a_group` where stated, else `group`. */
@@ -2178,14 +2289,16 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t(cd.a, { AR, K });                             /* a -- E4M3 or int8 codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + ag - 1) / ag }); /* a_scale */
     /* w -- the even experts; mxfp4a8 carries e2m1 codes with an E8M0 byte per (row, 32 of K) */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : cd.w, { ne0, N0, K0 });
+    o.t(mx || nv ? (uint32_t)RAD_FP4E2M1 : cd.w, { ne0, N0, K0 });
     if (mx) o.t_idx_dt(RAD_U8, { ne0, N0, (K0 + 31) / 32 }, 0, 127, 0);    /* w_scale */
+    else if (nv) o.t((uint32_t)RAD_F32, { ne0, N0, (K0 + 15) / 16 });
     else    o.t(SD, { ne0, (N0 + sg.rows - 1) / sg.rows, (K0 + sg.k - 1) / sg.k });
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
     /* w_odd -- the odd experts */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : cd.w, { ne1, N1, K1 });
+    o.t(mx || nv ? (uint32_t)RAD_FP4E2M1 : cd.w, { ne1, N1, K1 });
     if (mx) o.t_idx_dt(RAD_U8, { ne1, N1, (K1 + 31) / 32 }, 0, 127, 0);    /* w_odd_scale */
+    else if (nv) o.t((uint32_t)RAD_F32, { ne1, N1, (K1 + 15) / 16 });
     else    o.t(SD, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });
     o.t(D, { M * k, N });                             /* y -- in sorted order */
     o.skip();                                         /* split -- optional */

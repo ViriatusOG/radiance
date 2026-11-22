@@ -512,6 +512,17 @@ static inline float ref_abs(float x)   { return std::fabs(x); }
 static inline float act_sigmoid(float x) { return 1.0f / (1.0f + ref_exp(-x)); }
 static inline float act_silu(float x) { return x * act_sigmoid(x); }
 
+/* SiTU, Inkling 2's expert activation: situ(g, u) = gcap * tanh(g / gcap) * sigmoid(g) * ucap *
+ * tanh(u / ucap). The sigmoid reads the raw gate, so the cap bounds the gate's linear part only;
+ * a cap of 0 leaves that side uncapped. Split in two so each caller multiplies in f32 once. */
+static inline float act_situ_gate(float g, float gcap) {
+    const float a = gcap > 0 ? gcap * ref_tanh(g / gcap) : g;
+    return a * act_sigmoid(g);
+}
+static inline float act_situ_up(float u, float ucap) {
+    return ucap > 0 ? ucap * ref_tanh(u / ucap) : u;
+}
+
 /* The exact erf-based GELU. "gelu" means this; the tanh approximation must be requested by name. */
 static inline float act_gelu(float x) {
     return 0.5f * x * (1.0f + ref_erf(x * 0.70710678118654752f));

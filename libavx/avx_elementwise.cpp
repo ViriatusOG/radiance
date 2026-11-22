@@ -107,6 +107,36 @@ AVX_KERNEL(mul_weight) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ situ_mul */
+/* SiTU over a fused gate_up, the contract of libref's ref_situ_mul. The tanh is libm's, not a
+ * vector approximation: near zero a polynomial or sigmoid-based tanh loses the relative precision
+ * the gate's small values need once they are scaled by the cap. */
+AVX_KERNEL(situ_mul) {
+    if (a->n_t < 2 || !a->t[0].data || !a->t[1].data) return RAD_E_INVAL;
+    const RadTensor *gu = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(y));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gb = rowoff(gu, r, 2 * n), yb = rowoff(y, r, n);
+        const int64_t gs = laststride(gu), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float g = ldt(gu, gb + i * gs), u = ldt(gu, gb + (n + i) * gs);
+            const float sg = 1.0f / (1.0f + std::exp(-g));
+            const float ga = gcap > 0 ? gcap * std::tanh(g / gcap) : g;
+            const float ua = ucap > 0 ? ucap * std::tanh(u / ucap) : u;
+            stt(y, yb + i * ys, ga * sg * ua);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ act_mul */
 /* y = act(a) * b. As in libref, the activation is rounded to y's dtype before the product,
  * because the unfused pair stores it.

@@ -208,6 +208,17 @@ std::vector<Case> build_cases() {
         add("ple_conv",  { HI("M", 9), HI("n", 128), HI("width", 4), HI("dilation", 2),
                            HS("dtype", dt) });
         add("causal_conv1d", { HI("M", 9), HI("n", 128), HI("width", 3), HS("dtype", dt) });
+        /* Inkling 2's QK clip: per-head norms of 16 over 8 heads, with positions. */
+        add("l2_clip", { HI("M", 9), HI("n", 128), HI("group", 16), HF("threshold", 1.5),
+                          HS("dtype", dt), HF("floor", 2.0), HF("alpha", 0.3) });
+        add("l2_clip", { HI("M", 9), HI("n", 128), HI("group", 128), HF("threshold", 0.5),
+                          HS("dtype", dt) });
+        /* Inkling 2's short convolution: the dynamic form at 8 heads (head width 16 here), and the
+         * plain form at the stream's own width. */
+        add("sconv_res", { HI("M", 9), HI("n", 128), HI("width", 4), HI("heads", 8),
+                           HS("dtype", dt) });
+        add("sconv_res", { HI("M", 9), HI("n", 128), HI("width", 4), HI("heads", 0),
+                           HS("dtype", dt) });
     }
     add("ngram_ids", { HI("M", 9), HI("heads", 3), HI("ngram", 4), HI("eos", 2) });
 
@@ -215,6 +226,15 @@ std::vector<Case> build_cases() {
         add("moe_gemm_q",
             { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
               HI("group", 128), HS("a_order", order), HS("dtype", "mxfp4a8") });
+    /* NVFP4 experts: e2m1 codes, an E4M3 scale per 16 of K and a level, against an int8
+     * activation at one scale per 64 of K (the scale grid is libref's logical description). */
+    for (const char* order : { "token", "sorted" })
+        add("moe_gemm_q",
+            { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
+              HI("group", 64), HS("a_order", order), HS("dtype", "nvfp4a8i8") });
+    add("moe_gemm_q",
+        { HI("M", 9), HI("N", 128), HI("K", 256), HI("N_odd", 64), HI("n_expert", 8),
+          HI("top_k", 2), HI("group", 64), HS("a_order", "token"), HS("dtype", "nvfp4a8i8") });
     /* One scale per column over the rows: no group. */
     add("quant_cols_fp8", { HI("M", 5), HI("n", 256), HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
     add("quant_cols_fp8", { HI("M", 7), HI("n", 96), HS("dtype", "f32") }, EB(7, 96, 4, 1.25));
@@ -247,7 +267,11 @@ std::vector<Case> build_cases() {
                                     HS("dtype", "bf16") });
         add("dequant",            { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
-        add("gated_had_quant_i8", { HI("M", 5), HI("n", 256), HI("group", group),
+        /* The unrotated sibling, grouped at 128 and at a width of two groups, plain and SiTU. */
+    add("gated_quant_i8", { HI("M", 3), HI("n", 256), HI("group", 128), HS("dtype", "f32") });
+    add("gated_quant_i8", { HI("M", 4), HI("n", 192), HI("group", 64), HS("dtype", "f32"),
+                            HS("act", "situ"), HF("gate_cap", 4.0), HF("up_cap", 25.0) });
+    add("gated_had_quant_i8", { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16"), HS("act", "silu"), HI("mode", 0) });
         add("rmsnorm_had_quant_i8", { HI("M", 5), HI("n", 256), HF("eps", 1e-6),
                                       HI("group", group), HS("dtype", "bf16"), HF("wadd", 0) });
@@ -414,6 +438,24 @@ std::vector<Case> build_cases() {
                                          HI("window", window), HS("q_dtype", dt),
                                          HS("kv_dtype", dt), HF("scale", 0.125),
                                          HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* attn_paged_rel (Inkling 2): a decode row, a verify block and a prefill panel over GQA 3 and
+     * 1, window 0 and 16, causal and a two-sided window. The extent of 40 is below the contexts of
+     * 128, so keys past it take no bias. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 4, 40 })
+            for (int gqa : { 1, 3 })
+                for (int window : { 0, 16 }) {
+                    add("attn_paged_rel", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", gqa),
+                                            HI("block_size", 16), HI("causal", 1),
+                                            HI("window", window), HS("q_dtype", dt),
+                                            HS("kv_dtype", dt), HF("scale", 0.125),
+                                            HI("max_ctx", 128), HI("n_head", 2 * gqa),
+                                            HI("max_seqs", 2), HI("d_rel", 4), HI("extent", 40) });
+                }
+    add("attn_paged_rel", { HI("q_len", 8), HI("head_dim", 64), HI("gqa", 3), HI("block_size", 16),
+                            HI("causal", 0), HI("window", 16), HS("q_dtype", "f32"),
+                            HS("kv_dtype", "f32"), HF("scale", 0.125), HI("max_ctx", 128),
+                            HI("n_head", 6), HI("max_seqs", 2), HI("d_rel", 4), HI("extent", 40) });
     for (const char* dt : { "f32", "bf16" })
         for (int causal : { 0, 1 })
             add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 2),
@@ -671,6 +713,33 @@ std::vector<Case> build_cases() {
         add("grid_embed_cpe", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
         add("grid_embed_cpe", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 3),
                                 HS("dtype", dt) });
+    }
+
+    /* SiTU at the model's caps, uncapped on one side, and at a width past the vector body. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("situ_mul", { HI("M", 6), HI("n", 645), HS("dtype", dt), HF("gate_cap", 4.0),
+                          HF("up_cap", 25.0) });
+        add("situ_mul", { HI("M", 5), HI("n", 96), HS("dtype", dt), HF("gate_cap", 0.0),
+                          HF("up_cap", 25.0) });
+        add("situ_mul", { HI("M", 3), HI("n", 33), HS("dtype", dt), HF("gate_cap", 4.0),
+                          HF("up_cap", 0.0) });
+    }
+
+    /* The rotated gated op with act "situ" at the caps; libavx's SiTU runs scalar, so the rotation
+     * and the quantiser see the same values the reference does. */
+    add("gated_had_quant_i8", { HI("M", 3), HI("n", 64), HI("group", 32), HS("dtype", "f32"),
+                                HS("act", "situ"), HF("gate_cap", 4.0), HF("up_cap", 25.0) });
+
+    /* Block attention residuals at the model's depths (0 to 8 states) and query counts. */
+    for (const char* dt : { "f32", "bf16" }) {
+        for (long long ns : { 0, 1, 8 }) {
+            add("attn_res_mix", { HI("M", 37), HI("n", 96), HI("n_state", ns), HI("n_query", 3),
+                                  HS("dtype", dt), HF("eps", 1e-6) });
+        }
+        add("attn_res_mix", { HI("M", 5), HI("n", 64), HI("n_state", 2), HI("n_query", 1),
+                              HS("dtype", dt), HF("eps", 1e-6) });
+        add("attn_res_mix", { HI("M", 9), HI("n", 48), HI("n_state", 3), HI("n_query", 4),
+                              HS("dtype", dt), HF("eps", 1e-6) });
     }
 
     /* LiLiCorr's lattice ops, at its geometry (7 positions of 8 candidates, 8 heads) narrowed in

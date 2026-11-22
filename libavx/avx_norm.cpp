@@ -574,3 +574,45 @@ AVX_KERNEL(grid_embed_cpe) {
     }
     return RAD_OK;
 }
+
+/* l2_clip: libref's ref_l2_clip. The group norm is taken in double, as libref takes it, before any
+ * element of the group is stored, and each element is read before it is written, so y may alias x. */
+AVX_KERNEL(l2_clip) {
+    if (!a || a->n_t < 4 || !a->t[0].data || !a->t[3].data) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[3];
+    const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
+    const RadTensor* pos = a->t[2].data ? &a->t[2] : nullptr;
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", n);
+    if (n <= 0 || g <= 0 || n % g != 0) return RAD_E_SHAPE;
+    const float thr = p_f32(a, "threshold", 0.0f);
+    const float flr = p_f32(a, "floor", 1.0f), alpha = p_f32(a, "alpha", 0.0f);
+    if (!(thr > 0.0f) || !(flr > 0.0f)) return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(x) < rows * n || numel(y) < rows * n) return RAD_E_SHAPE;
+    if (w && numel(w) < n) return RAD_E_SHAPE;
+    if (pos && numel(pos) < rows) return RAD_E_SHAPE;
+
+    const int64_t xs = laststride(x), ys = laststride(y), ws = w ? laststride(w) : 0;
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float tau = 1.0f;
+        if (pos) {
+            const double p = (double)ldi(pos, offlin(pos, r));
+            tau = 1.0f + alpha * (float)std::log(std::fmax(1.0, (p + 1.0) / (double)flr));
+        }
+        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
+        for (int64_t g0 = 0; g0 < n; g0 += g) {
+            double ss = 0.0;
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const double v = (double)ldt(x, xb + i * xs) * (w ? (double)ldt(w, i * ws) : 1.0);
+                ss += v * v;
+            }
+            const double f = std::fmin(1.0, (double)thr / (std::sqrt(ss) + 1e-6));
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const float v = ldt(x, xb + i * xs) * (w ? ldt(w, i * ws) : 1.0f);
+                stt(y, yb + i * ys, (float)(v * f) * tau);
+            }
+        }
+    }
+    return RAD_OK;
+}

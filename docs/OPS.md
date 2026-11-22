@@ -621,7 +621,8 @@ second of a clip apart and attends in windows of eight seconds:
 | `quant_act_i8g` | `M`(range) `n` `group` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_i8` | `M`(range) `n` `group` `dtype` | `x` → `q`, `scale` |
 | `rmsnorm_had_quant_i8` | `M`(range) `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
-| `gated_had_quant_i8` | `M`(range) `n` `group` `dtype` `act`:str/opt `mode`/opt | `a`, `b`? → `q`, `scale` |
+| `gated_had_quant_i8` | `M`(range) `n` `group` `dtype` `act`:str/opt `mode`/opt `gate_cap`:f64/opt `up_cap`:f64/opt | `a`, `b`? → `q`, `scale` |
+| `gated_quant_i8` | `M`(range) `n` `group`(default 128) `dtype` `act`:str/opt `mode`/opt `gate_cap`:f64/opt `up_cap`:f64/opt | `a`, `b`? → `q`, `scale` (one per group) |
 | `dequant` | `M`(range) `n` `group` `dtype` | `q`, `scale` → `y` |
 | `gram_accum` | `M`(range) `n` `group` `dtype` `upper`/opt | `a`, `a_scale`?, `h`:inout |
 
@@ -658,9 +659,13 @@ not slow. `libref/ref_quant.cpp` is the definition.
   swapped), so `n` is a multiple of 16. `group` sizes `asum`, each row's code sums per `group`
   columns, group-major `[n/group][ceil(M/16)*16]`, which an asymmetric weight grid needs to remove
   its zero point. Rows past `M` are not written.
-- **The `had_*` int8 forms**: `group` is the Walsh–Hadamard rotation width (libr4d's `had`), and
-  the int8 scale is per row, carrying the `1/sqrt(group)` normalisation. The rotation is what makes
-  one scale per row viable, so its width and the scale granularity cannot be the same number.
+- **The `had_*` int8 forms** (`had_quant_act_i8`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`):
+  `group` is the Walsh–Hadamard rotation width (libr4d's `had`), and the int8 scale is per row,
+  carrying the `1/sqrt(group)` normalisation. The rotation is what makes one scale per row viable,
+  so its width and the scale granularity cannot be the same number. The codes are stored in the
+  step order `quant_act_i8` uses (column `c` at byte `i8_step_pos(c)`, bits 2 and 3 of `c`
+  swapped), which is the order every card kernel of these ops writes; `n` is a multiple of 16.
+  The `_i8g` forms are row-major and are not affected.
 - **The rotated E4M3 form** (`hc_read`'s `rq`, `rscale`): `group` is both. It
   serves a four-bit MoE expert whose scale grid is already one bf16 per (row, 128 of K); a rotation
   of the same 128 lines the two up, so the scale is per group, `[M, n/group]` as for
@@ -688,6 +693,21 @@ per-rank `n`.
 `gated_had_quant_i8` takes the gate and up as two operands (libr4d's form), or one fused `gate_up`
 `[M, 2n]` with the gate first as `a` and `b` absent. `mode` is libr4d's integer spelling of `act`
 and is optional.
+
+`act` is `silu`, `sigmoid`, or `situ`. `situ` is Inkling 2's expert activation:
+`gcap * tanh(g / gcap) * sigmoid(g) * ucap * tanh(u / ucap)`, the sigmoid on the raw gate, with
+`gate_cap` and `up_cap` optional and 0 (or absent) meaning no softcap on that side.
+
+`gated_quant_i8` is `gated_had_quant_i8` without the rotation: the same gated product (SiTU
+included), quantised per `group` contiguous elements (default 128) against one f32 scale each,
+written as `quant_act_i8g` writes them. It exists for the NVFP4 experts' down projection, which
+reads int8 activation codes with an f32 scale per (row, 128). The rotated op and this one share
+the gate, up, and cap conventions; only the rotation and the scale granularity differ.
+
+libr4d serves `gated_quant_i8` in one kernel (`r4d_gated_quant_i8.hip`), one workgroup a row at any
+row count, each group evaluated twice (once for its absmax, once for its codes) rather than staged,
+so it has no limit on `n`. Its codes are row-major, as above. The caps are refused with `silu` or
+`sigmoid`, as the rotated device op refuses them: a cap the caller asked for is never dropped.
 
 ### The fp8 fusions
 
@@ -979,6 +999,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
 | `attn_paged_anchor_window` | same parameters as `attn_paged` | same operands as `attn_paged` → `out` |
 | `attn_paged_sink` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`?, `sinks`w → `out` |
+| `attn_paged_rel` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt `d_rel` `extent` | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`?, `r`, `rel_proj`w, `sink` → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
@@ -1002,6 +1023,27 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 carries no value, so `out = Σ_j p_j v_j` with `p_j = exp(s_j) / (Σ_k exp(s_k) + exp(sink))`. A row
 with no visible key stays zero. It has its own name so that no `attn_paged` kernel which does not
 know the operand can be chosen for it (LiLiCorr's drafter, and gpt-oss's sinks have the same form).
+
+**`attn_paged_rel`** is Inkling 2's attention: `attn_paged` with a relative-position bias on each
+score, and a sink logit that belongs to each query row and head rather than to the head. Its
+operands are `r` `[M, n_head, d_rel]` (bf16 or f32, read at q's row layout, so a column slice of a
+wider row is read at its own pitch) and `rel_proj` `[d_rel, extent]` (a weight, bf16 or f32), then
+`sink` `[M, n_head]` (f32 or bf16). With p_i the position of query row i and p_j the position of
+key j, as attn_paged numbers them (`seqused[s] - q_len + i`), and d = p_i - p_j:
+
+    bias      = Σ_c r[i,h,c] · rel_proj[c, d]      for 0 <= d < extent, else 0
+    logit_j   = scale · (q_i,h · k_j) + bias       the bias is not scaled
+    out_i,h   = Σ_j exp(logit_j) v_j / (exp(sink_i,h) + Σ_j exp(logit_j))
+
+Visibility is attn_paged's (causal, and `window`, measured as there); a non-causal key with d < 0
+takes no bias. The maximum is taken over the logits and the sink, the arithmetic is f32, and the
+output rounds once to its dtype. A row with no visible key is zero, sink or not. The bias is a
+function of the distance alone and is computed from `r` and `rel_proj` per key (`d_rel` multiply-
+adds), so no `[M, n_head, extent]` table exists. The model's shape is `d_rel` 16, `extent` 1024,
+head_dim 128, gqa 3 over 8 KV heads, with `window` 1024 on the local layers and 0 on the full ones.
+Kernels: libref (the oracle), libavx (online softmax over each row's keys) and libr4d's
+`attn_rel_h128_gqa{1,2,3,4,8}_{bf16kv,i8kv}`, each one plain kernel for every q_len; the int8 cache
+is the attn_paged layout with its per-slot f16 scales.
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
 verify, thousands in a prefill chunk, and libr4d has a different kernel for each band.
@@ -2365,6 +2407,35 @@ E8M0 exponent per (row, 32 of K), typed `e8m0` or raw `u8`; either way a byte is
 an integer multiplier. `a` and `a_scale` are `quant_act_fp8`'s pair, and `group` is that
 activation's scale group, independent of the weight's 32-wide grid.
 
+**`moe_gemm_q` at `dtype=nvfp4a8i8`** is the NVFP4 expert (the ModelOpt and Inkling 2 form) against an
+int8 activation. `a` and `a_scale` are the int8 pair above, one f32 scale per (row, `a_group` of K)
+with `a_group` a multiple of 16 (`group` is its default). Each expert is three things, held in the
+planes the encoding `fp4_e2m1*fp8_e4m3[1x16]*f32[*x*]` names (abi/rad_encoding.h, `affine`):
+`codes` (`fp4_e2m1`, [N, K]: e2m1 nibbles, two a byte, element k in the low nibble of byte k / 2),
+`scale` (`fp8_e4m3`, one per (row, 16 of K)) and `scale.1` (`f32`, one per expert). `w` and `w_odd`
+take the codes as their plane alone (one plane is stored as it is); `w_scale` and `w_odd_scale` take
+the joined `scale,scale.1` form (abi/rad_planes.h). Element (n, k) of an expert is
+`e2m1(code) * e4m3(scale[n, k / 16]) * level`, where the level is the checkpoint's amax over its
+divisor (for Inkling 2, `amax[e] / denominator`). The e2m1 magnitudes are {0, 0.5, 1, 1.5, 2, 3, 4, 6},
+so twice them are the integers {0, 1, 2, 3, 4, 6, 8, 12}, exact in int8, and the output is
+
+    y[i, n] = bf16( sum over 16-wide groups g of
+                    (sum over k in g of L(code[n, k]) * a[k]) * sa[k / a_group] * (e4m3[n, g] * level) / 2 )
+
+with L the doubled e2m1 level (sign from bit 3; code 8 is negative zero). The 16-wide sums are exact
+integers; libref folds them in the order `(sub * sa) * sb` with `sb` the scale times its level, and
+libr4d folds the same products in f32 per group (no WMMA: the kernel is a column per thread, one
+block a sorted row, and takes no run map, so it serves every band). No rotation: the checkpoints are
+unrotated, and the `h` forms' fwht128 lives in the stored weight and the activation's producer, neither
+of which this dtype uses, so the GEMM applies none.
+
+libref and libavx read the codes through the codebook path (u4 codes into the sixteen e2m1 levels,
+`kE2m1Table`, `kCbE2m1`) and the scale view as any codebook scale view, so one tile serves the
+codebook forms and this one. libr4d stores the codes as they are and the scale view as a blob per
+expert: N rows of K / 16 E4M3 bytes, then one row whose first four bytes are the level (rank-2
+`[N + 1, K / 16]` U8; `r4d_layout.cpp`, `nvfp4`). K is a multiple of 64 so the level is four-aligned.
+A scale or level that is NaN is refused at import (`import_expert`), not read.
+
 **`moe_gemm_q_mod4`** is the same GEMM over four classes by the expert's number mod 4. `w`/`w_scale`
 hold class 0 at `[N, K]` and `w_q`/`w_q_scale` class `q` at `[N_q, K_q]` (defaulting to `N`, `K`);
 expert `e` is entry `e / 4` of class `e % 4`, so class `q` holds `ceil((n_expert - q) / 4)` of them.
@@ -2716,6 +2787,8 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
 | `ple_conv_bias` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`?, `b`w → `y` |
 | `causal_conv1d` | `M`(range) `n` `width` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+| `sconv_res` | `M`(range) `n` `width` `heads` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `dyn`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+| `l2_clip` | `M` `n` `group` `threshold` `dtype` `floor`? `alpha`? | `x`, `w`w?, `positions`?, → `y` |
 
 `logits_gemm` is separate from `gemm_nt` because `lm_head` is its own access class
 (`RAD_ACCESS_VOCAB`) and because the sampler fuses against it: under the distributed top-k a rank
@@ -3001,6 +3074,36 @@ gates around it are separate `mul`s in the architecture). The window and its thr
 are `ple_conv`'s at dilation one, so an architecture issues it the same way, once over its decode
 rows with `num_accepted` and once over its prefill rows without. libr4d, libref and libavx each
 serve both ops from one implementation.
+
+### `sconv_res`
+
+    y[t][c] = ( x[t][c] + sum_{lag=0}^{k-1} (w[c][k-1-lag] + dyn[t][c / (n/heads)][lag]) * x[t-lag][c] )
+              / sqrt(m*k + 1),        k = width, m = 2 with dyn, else 1
+
+Inkling 2's short convolution with its residual. It is `causal_conv1d`'s depthwise causal window with
+two changes: the input is the residual, so there is no `resid` operand, and the sum is scaled. `w`
+is causal_conv1d's layout, `[n, k]`, with `w[c][k-1]` multiplying the current input. A sequence
+starts on zeros, as `causal_conv1d`'s does, and the window, `has_init`, `cache_idx` and
+`num_accepted` are its contract unchanged: one issue over a sequence's decode rows with
+`num_accepted`, one over its prefill rows without.
+
+- `dyn` is the optional input-dependent part, `[M, heads*k]`, row `t` holding `heads` blocks of `k`
+  taps (column `head*k + lag`). Channel `c` takes head `c / (n/heads)`, so `n` must be a multiple of
+  `heads`. `heads` is a parameter and 0 means there is no `dyn` operand; the two must agree, and the
+  op refuses a mismatch (`RAD_E_INVAL`). Inkling 2 issues the dynamic form at `n` 1024 with 8 heads
+  of 128 (the K and V streams of a full-attention layer) and the plain form at `n` 2304 and 1024.
+- `m` counts the tap sources: 2 with `dyn`, 1 without, so the scale is `sqrt(2k+1)` with `dyn`
+  (3 at k = 4) and `sqrt(k+1)` without (`sqrt(5)` at k = 4).
+- Rounding: f32 inside, one rounding to the output dtype, the sum divided by the scale in f32.
+
+**One state per stream.** A layer keeps four of these convolutions (K, V, the attention output and
+the MLP output), each with its own history, and their channel counts differ. The state is
+`[n_slots, n, state_len]` with the stream's own `n`, so an architecture gives each stream its own
+state tensor and issues the op once per stream over the same `cu`, `cache_idx`, `has_init` and
+`num_accepted`. A channel offset into a shared tensor is also valid: libref and libr4d read the
+state's strides, so a view `[n_slots, n_stream, state_len]` whose slot and channel strides are the
+parent's serves it. libavx reads the state dense, as `ple_conv` does, so it takes one tensor per
+stream and no view.
 
 ## Sampling
 
@@ -3693,6 +3796,33 @@ the anchor's outgoing one (`aout`) as `v / max(|v|, eps)`, scores `start[j] = sc
 and `pair[s][i][j] = scale * out[s][i] · in[s + 1][j]`, and walks greedily from the start, the first
 index winning a tie: `tokens[m][s] = cand[m * steps + s][p_s]`. `scores` `[M, steps, k, k]` is the
 score tensor vLLM builds (row 0 the start for every `i`), for checking.
+
+### Block attention residuals (Inkling 2)
+
+| op | params | operands |
+|---|---|---|
+| `attn_res_mix` | `M`(range) `n` `n_state` `n_query` `dtype` `eps`:f64 | `states`?, `cur`, `addend`?, `query`w, `w`w? → `y` |
+
+Inkling 2's AttnRes is a softmax over depth: a token's residual stream is not the last block's
+output but a learned mixture of every block's, so each layer reads its input through a query.
+`states` `[n_state, M, n]` holds the earlier blocks' outputs, `cur` `[M, n]` the current stream,
+and `addend`, when present, is added to `cur` before anything else. `n_state` may be 0, in which
+case `states` is absent and the depth is `cur` alone.
+
+The values of row `t` are `V = [states[0][t], .., states[n_state-1][t], cur[t] + addend[t]]`, each
+rms-normalised without a gain: `v_hat = v * rsqrt(mean(v^2) + eps)`. For each query `q` (`query` is
+`[n_query, n]`), with `p = softmax_i((v_hat_i . query[q]) / sqrt(n))` over the depth,
+`m = sum_i p_i v_hat_i`, and `y[q][t] = m` when `w` is absent, or `rms(m) * w[q]` when it is present
+(`w` is `[n_query, n]` as well, the caller's post-norm gain). `y` is `[n_query, M, n]`, or `[M, n]`
+when `n_query` is 1, which a caller trims to the step's rows. Rows are `cur`'s, `M` a ceiling. Everything is
+f32 and `y` is rounded once to its dtype. The scores and the mixed values both read the normalised
+form, as the Inkling 2 reference does; the unnormalised states are never mixed.
+
+`states` is the first `n_state` planes of a caller's `[max_blocks, max_tok, n]` buffer, so a plane is
+`states.stride[0]` from the next, and a row `states.stride[1]` from the next row in a plane; only the
+last axis must be dense. `cur`, `addend` and `y` take their row pitch from their own strides in the
+same way. `query` and `w` are f32 whatever the activations are. The model's shapes are `n` 2304,
+`n_state` 0 to 8, `n_query` 1, 3 or 4, `eps` 1e-6, bf16 states.
 
 ### `mtp_enter`
 

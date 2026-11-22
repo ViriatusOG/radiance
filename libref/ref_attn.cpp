@@ -348,6 +348,182 @@ int ref_attn_paged_sink(const RadArgs* a, RadStream) {
     return attn_paged_impl(a, &a->t[7], 8, false);
 }
 
+/* ------------------------------------------------------------------ attn_paged_rel */
+/* Inkling 2's attention: attn_paged with a relative-position bias on the scores and one sink logit
+ * per query row and head. Operands: attn_paged's (q, kv_cache, block_table, seqused, the optional
+ * descales and cu_seqlens), then r [M, n_head, d_rel], rel_proj [d_rel, extent] and sinks
+ * [M, n_head], then out.
+ *
+ *   d      = pos_i - pos_j, the distance of key j from query row i (pos as attn_paged numbers them)
+ *   bias   = sum_c r[i,h,c] * rel_proj[c, d]   for 0 <= d < extent, else 0
+ *   logit  = scale * (q . k) + bias            the bias is not scaled
+ *   out    = sum_j exp(logit_j) v_j / (exp(sink) + sum_j exp(logit_j))
+ *
+ * Visibility is attn_paged's; a row with no visible key is zero, sink or not. The bias is a
+ * function of the distance alone, so libr4d computes it in its kernel rather than from a
+ * [M, n_head, extent] table; a non-causal key ahead of its row (d < 0) takes no bias. */
+namespace {
+enum { REF_DREL_MAX = 256 };
+}
+
+int ref_attn_paged_rel(const RadArgs* a, RadStream) {
+    if (a->n_t < 11) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3];
+    const RadTensor *rr = &a->t[7], *rp = &a->t[8], *sk = &a->t[9], *o = &a->t[10];
+    const RadTensor* kdes = t_in(a, 4);
+    const RadTensor* vdes = t_in(a, 5);
+    const RadTensor* cus  = t_in(a, 6);
+    if (!q->data || !kv->data || !bt->data || !su->data || !rr->data || !rp->data || !sk->data ||
+        !o->data) return RAD_E_INVAL;
+
+    const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
+    const int64_t gqa        = p_int(a, "gqa", 1);
+    const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
+    const int     causal     = (int)p_int(a, "causal", 1);
+    const int64_t window     = p_int(a, "window", 0);
+    const int64_t d_rel      = p_int(a, "d_rel", 0);
+    const int64_t extent     = p_int(a, "extent", 0);
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0 || window < 0 || d_rel <= 0 || extent <= 0)
+        return RAD_E_SHAPE;
+    if (head_dim > REF_HD_MAX || d_rel > REF_DREL_MAX) return RAD_E_UNSUPPORTED;
+
+    const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
+    if (kv_heads <= 0) return RAD_E_SHAPE;
+    const int64_t q_heads = gqa * kv_heads;
+    if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    const int64_t n_seq = numel(su);
+    const int64_t rows  = numel(q) / (q_heads * head_dim);
+    if (n_seq <= 0 || rows <= 0) return RAD_E_SHAPE;
+    if (!cus && rows % n_seq != 0) return RAD_E_SHAPE;
+    if (cus && numel(cus) != n_seq + 1) return RAD_E_SHAPE;
+    const int64_t q_len = cus ? 0 : rows / n_seq;
+    if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
+    /* The bias operands: r at attn_paged's q pitch, rel_proj a [d_rel, extent] matrix, sinks one
+     * per row and head with a row pitch of their own. */
+    if (numel(rr) < rows * q_heads * d_rel || rr->rank < 2) return RAD_E_SHAPE;
+    if (rp->rank != 2 || rp->shape[0] != d_rel || rp->shape[1] != extent) return RAD_E_SHAPE;
+    if (sk->rank < 2 || numel(sk) < rows * q_heads) return RAD_E_SHAPE;
+    if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
+    if (kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+    const bool i8 = kv->dtype == RAD_I8;
+    if (i8 && (kv->rank != 4 || kv->shape[3] != 2 * head_dim + 4 || kv->stride[3] != 1))
+        return RAD_E_SHAPE;
+
+    const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
+    const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
+    const int64_t bt_cs = bt->rank >= 2 ? bt->stride[bt->rank - 1] : 1;
+    const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
+
+    const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
+    const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1;
+    const int64_t o_hs = o->rank >= 3 ? o->stride[o->rank - 2] : head_dim * o_ds;
+    const int64_t o_rs = row_stride(o, q_heads * head_dim);
+    /* r reads as [rows, q_heads, d_rel] at its own pitch: a column slice of a wider row is fine. */
+    const int64_t r_ds = rr->stride[rr->rank - 1];
+    const int64_t r_hs = rr->rank >= 3 ? rr->stride[rr->rank - 2] : d_rel * r_ds;
+    const int64_t r_rs = row_stride(rr, q_heads * d_rel);
+    const int64_t s_hs = sk->stride[sk->rank - 1];
+    const int64_t s_rs = row_stride(sk, q_heads);
+    const int64_t rp_c = rp->stride[0], rp_d = rp->stride[1];
+
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+    const int64_t total = rows * q_heads;
+    const int64_t jcap  = max_blocks * block_size;
+
+    REF_PAR_REGION(total * head_dim * 64)
+    {
+        float* const sc = ws_get((size_t)std::max<int64_t>(jcap, 1));
+        REF_FOR_DYN
+        for (int64_t idx = 0; idx < total; ++idx) {
+            const int64_t h   = idx % q_heads;
+            const int64_t tok = idx / q_heads;
+            int64_t s = 0, qlen = q_len, i = 0;
+            if (cus) {
+                s = seq_of(cus, n_seq, tok);
+                qlen = cu_at(cus, s + 1) - cu_at(cus, s);
+                i = tok - cu_at(cus, s);
+            } else {
+                s = tok / q_len;
+                i = tok - s * q_len;
+            }
+            if (qlen <= 0) continue;
+            const int64_t kh = h / gqa;
+            const int64_t ctx = ld_int(su->dtype, su->data, offlin(su, s));
+            const int64_t pos = ctx - qlen + i;
+            const int64_t qb = tok * q_rs + h * q_hs;
+            const int64_t ob = tok * o_rs + h * o_hs;
+            const int64_t rb = tok * r_rs + h * r_hs;
+
+            const float kds = i8 ? 1.0f : kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
+            const float vds = i8 ? 1.0f : vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
+            auto mul_of = [&](int64_t kb, int half) -> float {
+                return i8 ? kv_i8_scale(kv->data, kb, head_dim, half) : half ? vds : kds;
+            };
+            /* Key j's slot, or -1 when the mask hides it or its block is unmapped. */
+            auto key_at = [&](int64_t j) -> int64_t {
+                if (causal ? j > pos : j >= ctx) return -1;
+                if (window > 0) {
+                    const int64_t d = pos - j;
+                    if (causal ? d >= window : (d >= window || d <= -window)) return -1;
+                }
+                const int64_t blk = ld_int(bt->dtype, bt->data, s * bt_rs + (j / block_size) * bt_cs);
+                return blk < 0 ? -1 : blk * kvv.sb + kh * kvv.sh + (j % block_size) * kvv.so;
+            };
+
+            float qf[REF_HD_MAX];
+            for (int64_t d = 0; d < head_dim; ++d) qf[d] = ldt(q, qb + d * q_ds);
+            float rv[REF_DREL_MAX];
+            for (int64_t c = 0; c < d_rel; ++c) rv[c] = ldt(rr, rb + c * r_ds);
+
+            /* Pass one: each visible key's logit, and the maximum with the sink. */
+            float mx = -INFINITY;
+            for (int64_t j = 0; j < jcap && j < ctx; ++j) {
+                const int64_t kb = key_at(j);
+                if (kb < 0) continue;
+                float dot = 0.0f;
+                const float km = mul_of(kb, 0);
+                for (int64_t d = 0; d < head_dim; ++d)
+                    dot += qf[d] * (ld_dt(kv->dtype, kv->data, kb + d * kvv.sd) * km);
+                float bias = 0.0f;
+                const int64_t dist = pos - j;
+                if (dist >= 0 && dist < extent)
+                    for (int64_t c = 0; c < d_rel; ++c)
+                        bias += rv[c] * ldt(rp, c * rp_c + dist * rp_d);
+                sc[j] = dot * scale + bias;
+                if (sc[j] > mx) mx = sc[j];
+            }
+            /* No visible key: a zero row, the sink or not. */
+            if (mx == -INFINITY) {
+                for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+                continue;
+            }
+            const float sv = ldt(sk, tok * s_rs + h * s_hs);
+            if (sv > mx) mx = sv;
+
+            /* Pass two: the weights and the values, in ascending key order. */
+            float acc[REF_HD_MAX];
+            for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+            float sum = 0.0f;
+            for (int64_t j = 0; j < jcap && j < ctx; ++j) {
+                const int64_t kb = key_at(j);
+                if (kb < 0) continue;
+                const float w = ref_exp(sc[j] - mx);
+                sum += w;
+                const int64_t vb = kb + head_dim * kvv.sd;
+                const float vm = mul_of(kb, 1);
+                for (int64_t d = 0; d < head_dim; ++d)
+                    acc[d] += w * (ld_dt(kv->dtype, kv->data, vb + d * kvv.sd) * vm);
+            }
+            sum += ref_exp(sv - mx);
+            const float inv = 1.0f / sum;
+            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+        }
+    }
+    return RAD_OK;
+}
+
 /* attn_paged with its tree operand present: ref_attn_paged reads it (see there). Refused without
  * one, and for a non-causal layer, whose two-sided window has no tree reading here. */
 int ref_attn_paged_tree(const RadArgs* a, RadStream s) {

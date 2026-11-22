@@ -158,11 +158,17 @@ struct ConvOps {
     const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
     bool silu;
     const RadTensor* b;   /* per-channel bias inside the activation (Mamba-2's conv1d), or null */
+    /* sconv_res only: the input-dependent taps `dyn` [M, heads*width], the head count, and the
+     * residual that is x itself (libref/ref_ple.cpp). */
+    bool sconv = false;
+    const RadTensor* dyn = nullptr;
+    int64_t heads = 0;
 };
 
 static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
     const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
     const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y, *b = o.b;
+    const RadTensor *dyn = o.sconv ? o.dyn : nullptr;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n = p_int(a, "n", 0);
@@ -182,6 +188,10 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
     if (numel(x) < M * n || numel(y) < M * n || numel(w) < n * wid) return RAD_E_SHAPE;
     if (resid && numel(resid) < M * n) return RAD_E_SHAPE;
     if (b && numel(b) != n) return RAD_E_SHAPE;
+    if (dyn) {
+        if (o.heads <= 0 || n % o.heads != 0) return RAD_E_SHAPE;
+        if (numel(dyn) < M * o.heads * wid) return RAD_E_SHAPE;
+    }
 
     const int64_t state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : hist_len;
     if (cs->data && state_len < hist_len) return RAD_E_SHAPE;
@@ -202,6 +212,10 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
     const int64_t rrow = resid ? rowoff(resid, 1, n) : 0;
     const int64_t rcol = resid ? laststride(resid) : 0;
     const int64_t wrow = rowoff(w, 1, wid), wcol = laststride(w);
+    const int64_t drow = dyn ? rowoff(dyn, 1, o.heads * wid) : 0;
+    const int64_t dcol = dyn ? laststride(dyn) : 0;
+    const int64_t hch = dyn ? n / o.heads : 1;   /* channels a head's taps cover */
+    const float sdiv = std::sqrt((float)((dyn ? 2 : 1) * wid + 1));
     /* [n_slots, n, state_len], dense, the same layout as gdn's conv state. */
     const int64_t cs_slot = n * state_len, cs_ch = state_len;
 
@@ -225,6 +239,7 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
         float* tap = scratch_f32((size_t)wid);
         for (int64_t j = 0; j < wid; ++j) tap[j] = ldt(w, c * wrow + j * wcol);
         const float bias = b ? ldt(b, c * laststride(b)) : 0.0f;
+        const int64_t head = dyn ? c / hch : 0;
 
         for (int64_t t = 0; t < slen; ++t) {
             float acc = bias;
@@ -232,7 +247,15 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
                 const int64_t src = t - hist_len + j * dil;
                 const float vv = src >= 0 ? ldt(x, (bos + src) * xrow + c * xcol)
                                           : hist[src + hist_len];
-                acc += vv * tap[j];
+                float tp = tap[j];
+                /* Tap j is lag wid-1-j; dyn's column head*k + lag holds that lag's extra tap. */
+                if (dyn) tp += ldt(dyn, (bos + t) * drow + (head * wid + (wid - 1 - j)) * dcol);
+                acc += vv * tp;
+            }
+            if (o.sconv) {
+                const float r = ldt(x, (bos + t) * xrow + c * xcol);
+                stt(y, (bos + t) * yrow + c * ycol, (r + acc) / sdiv);
+                continue;
             }
             const float r = resid ? ldt(resid, (bos + t) * rrow + c * rcol) : 0.0f;
             stt(y, (bos + t) * yrow + c * ycol, r + (o.silu ? acc / (1.0f + sc_exp(-acc)) : acc));
@@ -297,6 +320,20 @@ AVX_KERNEL(causal_conv1d) {
     return depthwise_causal_conv(a, { rad_arg_in(a, 0), rad_arg_in(a, 1), rad_arg_in(a, 2),
                                       rad_arg_in(a, 3), nullptr, rad_arg_in(a, 4),
                                       rad_arg_in(a, 5), rad_arg_in(a, 6), rad_arg_in(a, 7), false });
+}
+
+/* Inkling 2's short convolution with its residual: causal_conv1d's operands with `dyn` before the
+ * state's optionals, where `heads` 0 means there is none (libref/ref_ple.cpp). */
+AVX_KERNEL(sconv_res) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    const int64_t heads = p_int(a, "heads", 0);
+    /* heads 0 means no dyn: the operand is ignored even when it is filled. */
+    const RadTensor* dyn = heads > 0 ? rad_arg_in(a, 4) : nullptr;
+    if (heads > 0 && dyn == nullptr) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { rad_arg_in(a, 0), rad_arg_in(a, 1), rad_arg_in(a, 2),
+                                      rad_arg_in(a, 3), nullptr, rad_arg_in(a, 5),
+                                      rad_arg_in(a, 6), rad_arg_in(a, 7), rad_arg_in(a, 8), false,
+                                      nullptr, true, dyn, heads });
 }
 
 /* ------------------------------------------------------------------ ngram_ids

@@ -592,6 +592,51 @@ int ref_scale_rows(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ l2_clip */
+/* y[r, i] = v[r, i] * f[r, g] * tau[r], with v = x * w (w [n], optional, read per column), g the
+ * group of column i (n / group groups of `group` columns), f = min(1, threshold / (||v_g|| + 1e-6))
+ * and tau = 1 + alpha * ln(max(1, (pos + 1) / floor)) from positions[r] (1 with no positions).
+ * This is the QK and relative-bias clip of Inkling 2 (tests/mkinkling2golden.py's l2clip after the
+ * per-channel scale). Each group's norm is taken before any of its outputs are written, and each
+ * element is read before it is stored, so y may alias x. */
+int ref_l2_clip(const RadArgs* a, RadStream) {
+    if (a->n_t < 4 || !t_in(a, 0) || !t_in(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *w = t_in(a, 1), *pos = t_in(a, 2), *y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", n);
+    if (n <= 0 || g <= 0 || n % g != 0) return RAD_E_SHAPE;
+    const float thr = p_f32(a, "threshold", 0.0f);
+    const float flr = p_f32(a, "floor", 1.0f), alpha = p_f32(a, "alpha", 0.0f);
+    if (!(thr > 0.0f) || !(flr > 0.0f)) return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(x) < rows * n || numel(y) < rows * n) return RAD_E_SHAPE;
+    if (w && numel(w) < n) return RAD_E_SHAPE;
+    if (pos && numel(pos) < rows) return RAD_E_SHAPE;
+
+    const int64_t xs = laststride(x), ys = laststride(y), ws = w ? laststride(w) : 0;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        float tau = 1.0f;
+        if (pos) {
+            const double p = (double)ld_int(pos->dtype, pos->data, offlin(pos, r));
+            tau = 1.0f + alpha * (float)std::log(std::fmax(1.0, (p + 1.0) / (double)flr));
+        }
+        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
+        for (int64_t g0 = 0; g0 < n; g0 += g) {
+            double ss = 0.0;
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const double v = (double)ldt(x, xb + i * xs) * (w ? (double)ldt(w, i * ws) : 1.0);
+                ss += v * v;
+            }
+            const double f = std::fmin(1.0, (double)thr / (std::sqrt(ss) + 1e-6));
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const float v = ldt(x, xb + i * xs) * (w ? ldt(w, i * ws) : 1.0f);
+                stt(y, yb + i * ys, (float)(v * f) * tau);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ silu_mul */
 /* y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate is the first half, the order in
  * which rad-convert fuses gate and up. */
@@ -609,6 +654,32 @@ int ref_silu_mul(const RadArgs* a, RadStream) {
         const int64_t gs = laststride(gu), ys = laststride(y);
         for (int64_t i = 0; i < n; ++i)
             stt(y, yb + i * ys, act_silu(ldt(gu, gb + i * gs)) * ldt(gu, gb + (n + i) * gs));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ situ_mul */
+/* y[.., i] = situ(gate_up[.., i], gate_up[.., n + i]) with the gate first, as silu_mul. The two
+ * caps are read as f64 and used in f32; a cap of 0 is no softcap on that side. */
+int ref_situ_mul(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *gu = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(y));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gb = rowoff(gu, r, 2 * n), yb = rowoff(y, r, n);
+        const int64_t gs = laststride(gu), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float g = ldt(gu, gb + i * gs), u = ldt(gu, gb + (n + i) * gs);
+            stt(y, yb + i * ys, act_situ_gate(g, gcap) * act_situ_up(u, ucap));
+        }
     }
     return RAD_OK;
 }
