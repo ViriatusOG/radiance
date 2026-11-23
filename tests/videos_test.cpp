@@ -630,6 +630,7 @@ TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
     CHECK_EQ(mm.n_ienc, 1);
     CHECK_EQ(mm.n_venc, 1);
     CHECK_EQ(mm.n_aenc, 2);
+    CHECK_EQ(mm.aenc_channels, 1);   /* reference soundtracks stay mono */
 
     const gen::VideoRequest& g = gen.last();
     REQUIRE_EQ(g.refs.size(), (size_t)4);   /* sorted (kind, index): image, video, video_audio, audio */
@@ -1029,6 +1030,141 @@ TEST(ref2va_requests_are_refused_naming_the_part) {
     CHECK_EQ(c["video_max_ref_videos"], 0);
     CHECK_EQ(c["video_max_ref_audios"], 0);
     CHECK_EQ(c["video_max_text"], 64);
+}
+
+namespace {
+
+/* A generator with both VAE encoders, behind a fake processor: 256x256 at the default 7 chunks
+ * is 124 frames. */
+struct GuideServer {
+    FakeMultimodal mm;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f;
+    GuideServer() {
+        mm.expand = { 900, 901 };
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 256;
+        gen.inf.max_enc_frames = 289;
+        gen.inf.max_enc_samples = 500000;
+        f.reset(new Fixture(Fixture::Tweak{ [this](ServerOptions& o, Deps& d) {
+            d.videos = &gen;
+            d.mm = &mm;
+            o.video_model = true;
+        } }));
+    }
+    HttpResponse post(const std::vector<FormPart>& extra) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/videos";
+        q.form = { FormPart{ "prompt", "", "", "fox" }, FormPart{ "size", "", "", "256x256" } };
+        q.form.insert(q.form.end(), extra.begin(), extra.end());
+        return f->srv->router().dispatch(q);
+    }
+    std::string refused(const std::vector<FormPart>& extra) {
+        HttpResponse r = post(extra);
+        CHECK_EQ(r.status, 400);
+        return str_at(json::parse(r.body, nullptr, false)["error"], "param");
+    }
+};
+
+const FormPart kSong{ "guide_audio", "song.wav", "audio/wav", "RIFF" };
+
+}  /* namespace */
+
+/* A song guide (ComfyUI's MiniMaxH3AddGuide) rides a ref2va request: the song is decoded in
+ * stereo, channel-major, at most the encoder's samples, and reaches the generator last, at its
+ * frame counted from the end (124 - 24). It is not named in the prompt. */
+TEST(a_song_guide_rides_reference_media) {
+    GuideServer s;
+    HttpResponse r = s.post({ FormPart{ "task", "", "", "ref2va" },
+                              FormPart{ "ref_image_1", "a.png", "image/png", "PA" }, kSong,
+                              FormPart{ "guide_frame", "", "", "-24" } });
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(s.mm.n_aenc, 1);
+    CHECK_EQ(s.mm.aenc_max, (int64_t)500000);
+    CHECK_EQ(s.mm.aenc_channels, 2);
+    const gen::VideoRequest& g = s.gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)2);
+    CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::IMAGE);
+    CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::GUIDE_AUDIO);
+    CHECK_EQ(g.refs[1].name, std::string("guide_audio"));
+    CHECK_EQ(g.refs[1].frame, 100);
+    CHECK_EQ(g.refs[1].enc_channels, 2);
+    CHECK_EQ(g.refs[1].enc_n, (int64_t)850);
+    CHECK_EQ(g.refs[1].enc_samples.size(), (size_t)2 * 850);
+    CHECK_EQ(g.refs[1].enc_samples[0], 0.5f);     /* the left channel */
+    CHECK_EQ(g.refs[1].enc_samples[850], 1.5f);   /* the right, its own samples */
+    std::vector<int32_t> want;
+    auto chars = [&](const std::string& t) { for (unsigned char c : t) want.push_back((int32_t)c); };
+    chars("<v>");
+    chars("<Picture 1>: ");
+    want.insert(want.end(), s.mm.expand.begin(), s.mm.expand.end());
+    chars("fox");
+    CHECK(g.tokens == want);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(str_at(o, "task"), std::string("ref2va"));
+    REQUIRE_EQ(o["refs"].size(), (size_t)2);
+    CHECK_EQ(o["refs"][1].get<std::string>(), std::string("guide_audio"));
+}
+
+/* A song guide goes with keyframes too, after them, and alone with a text prompt; guide_frame is
+ * 0 by default. */
+TEST(a_song_guide_rides_keyframes_and_text) {
+    GuideServer s;
+    HttpResponse r = s.post({ FormPart{ "task", "", "", "fl2va" },
+                              FormPart{ "first_frame", "f.png", "image/png", "PF" },
+                              FormPart{ "last_frame", "l.png", "image/png", "PL" }, kSong });
+    REQUIRE_EQ(r.status, 200);
+    {
+        const gen::VideoRequest& g = s.gen.last();
+        REQUIRE_EQ(g.refs.size(), (size_t)3);
+        CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::FIRST_FRAME);
+        CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::LAST_FRAME);
+        CHECK_EQ((int)g.refs[2].kind, (int)gen::VideoRefMedia::GUIDE_AUDIO);
+        CHECK_EQ(g.refs[2].frame, 0);
+        CHECK_EQ(g.refs[2].enc_n, (int64_t)850);
+        REQUIRE(g.media != nullptr);
+        CHECK_EQ(g.media->items.size(), (size_t)2);   /* the two frames; no song in the prompt */
+    }
+    r = s.post({ kSong, FormPart{ "guide_frame", "", "", "123" } });
+    REQUIRE_EQ(r.status, 200);
+    const gen::VideoRequest& g = s.gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)1);
+    CHECK_EQ(g.refs[0].frame, 123);
+    CHECK(g.media == nullptr);
+    std::vector<int32_t> want;
+    for (unsigned char c : std::string("<v>fox")) want.push_back((int32_t)c);
+    CHECK(g.tokens == want);
+    CHECK_EQ(str_at(json::parse(r.body, nullptr, false), "task"), std::string("t2va"));
+}
+
+/* Everything about a song guide that cannot be right is refused naming its field, before anything
+ * is queued; keyframes and reference media still exclude each other, guide or not. The capability
+ * says whether the model takes one. */
+TEST(a_song_guide_is_refused_naming_its_field) {
+    GuideServer s;
+    CHECK_EQ(s.refused({ kSong, FormPart{ "guide_frame", "", "", "124" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ kSong, FormPart{ "guide_frame", "", "", "-125" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ kSong, FormPart{ "guide_frame", "", "", "1.5" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ FormPart{ "guide_frame", "", "", "0" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ FormPart{ "guide_audio", "", "", "RIFF" } }), std::string("guide_audio"));
+    CHECK_EQ(s.refused({ kSong, kSong }), std::string("guide_audio"));
+    CHECK_EQ(s.refused({ FormPart{ "guide_audio", "s.wav", "audio/wav", "" } }),
+             std::string("guide_audio"));
+    CHECK_EQ(s.refused({ FormPart{ "task", "", "", "ref2va" },
+                         FormPart{ "ref_image_1", "a.png", "image/png", "PA" },
+                         FormPart{ "first_frame", "f.png", "image/png", "PF" }, kSong }),
+             std::string("first_frame"));
+    HttpRequest mq;
+    mq.method = "GET";
+    mq.path = "/v1/models";
+    CHECK_EQ(json::parse(s.f->srv->router().dispatch(mq).body, nullptr,
+                         false)["data"][0]["capabilities"]["video_guide_audio"], true);
+    s.gen.inf.max_enc_samples = 0;
+    CHECK_EQ(s.refused({ kSong }), std::string("guide_audio"));
+    CHECK_EQ(json::parse(s.f->srv->router().dispatch(mq).body, nullptr,
+                         false)["data"][0]["capabilities"]["video_guide_audio"], false);
+    CHECK_EQ(s.gen.got.size(), (size_t)0);
 }
 
 namespace {

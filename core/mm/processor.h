@@ -450,9 +450,10 @@ public:
     int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
                       int32_t max_frames, std::vector<Frame>* out, std::string* why) const;
 
-    /* A soundtrack: its first stream, mono at `rate` Hz, at most `max_samples`. */
-    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                      std::vector<float>* out, std::string* why) const;
+    /* A soundtrack: its first stream at `rate` Hz, at most `max_samples` a channel, as
+     * decode_audio lays `channels` (1: mono). */
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                      int64_t max_samples, std::vector<float>* out, std::string* why) const;
 
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
      * encoder's. */

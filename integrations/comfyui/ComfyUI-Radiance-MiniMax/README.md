@@ -55,6 +55,12 @@ A task ignores media it does not use, with a warning on the console. For `ref2va
 as a voice. Each kind is filled in order, since the input's number is the reference's number in
 the request. Pictures are sent as PNG, audio as WAV and clips as MP4.
 
+Every task also takes a song guide, as ComfyUI's Add Guide for MiniMax H3 does: `guide_audio`
+is a song pinned as the clip's soundtrack from frame `guide_frame` on (0 the first, a negative
+frame counted from the end), so the mouths follow its words. The server reads at most 15.6 s of
+it and cuts it where the clip ends. It goes with reference media and with keyframes, and needs a
+container with the audio VAE's encoder (`video_guide_audio` in `GET /v1/models`).
+
 ## Sizes
 
 The resolution tier is the short side and the aspect gives the long side (480p 16:9 is

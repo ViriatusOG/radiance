@@ -760,7 +760,8 @@ typedef struct RadVideoGenBatch {
      * height, latent width, latent frames, soundtrack latents} in presentation order and 3 a
      * keyframe {frame, latent frames, soundtrack latents}, then the prompt's vision pads: a count
      * and {first token, tokens} of each picture's run. A reference's kind is RAD_VREF_PICTURE,
-     * _AUDIO or _VIDEO; its slot is its encode pass's. */
+     * _AUDIO or _VIDEO; its slot is its encode pass's. A keyframe with soundtrack latents is the
+     * song guide (RAD_ENC_GUIDE), which has no picture: its latent frames are 0. */
     const int32_t*  ref_tab;
     /* VSTEP: i32, rad_arch_video_pack's `mod`: the boundaries of the modulation groups, then the
      * cell each reads; `seg_cu` then holds the segment boundaries. A request without references
@@ -810,13 +811,14 @@ typedef struct RadShapeGenBatch {
 } RadShapeGenBatch;
 
 /* RadVideoGenBatch::enc_kind: the media an encode pass carries, numbered from 1 within a kind. A
- * keyframe is 1 for the first frame and 2 for the last. */
+ * keyframe is 1 for the first frame and 2 for the last. Additive; RAD_ABI_VERSION does not move. */
 enum {
     RAD_ENC_IMAGE = 1,      /* a reference picture; Vencode */
     RAD_ENC_VIDEO = 2,      /* a reference video; Vencode */
     RAD_ENC_VAUDIO = 3,     /* the soundtrack of reference video `enc_slot`; Aencode */
     RAD_ENC_AUDIO = 4,      /* a standalone soundtrack; Aencode */
-    RAD_ENC_KEYFRAME = 5    /* a first or last frame; Vencode */
+    RAD_ENC_KEYFRAME = 5,   /* a first or last frame; Vencode */
+    RAD_ENC_GUIDE = 6       /* a song guide, the soundtrack of a keyframe without a picture; Aencode */
 };
 
 /* RadVideoGenBatch::ref_tab: a reference's kind. */

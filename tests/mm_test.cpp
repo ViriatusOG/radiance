@@ -1783,6 +1783,30 @@ TEST(mono_audio_at_the_rate_passes_through_and_truncates_exactly) {
     CHECK(std::equal(cut.begin(), cut.end(), m.begin()));
 }
 
+/* With two channels asked, a stereo source keeps its own, channel-major and resampled, and a mono
+ * one is copied to both: the song guide's form. max_samples caps each channel. */
+TEST(stereo_audio_keeps_its_channels_when_asked) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<int16_t> left = tone(44100, 1.0, 440.0, 0.5), silent(left.size(), 0);
+    const std::vector<uint8_t> b = wav(interleave(left, silent), 2, 44100);
+    std::vector<float> s;
+    std::string why;
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1 << 20, &s, &why, 2), RAD_OK);
+    REQUIRE(s.size() % 2 == 0);
+    const size_t m = s.size() / 2;
+    CHECK(m >= 15990 && m <= 16010);
+    REQUIRE(m >= 14000);
+    const std::vector<float> l(s.begin(), s.begin() + m), r(s.begin() + m, s.end());
+    CHECK_NEAR(amplitude(l, 2000, 14000), 0.5, 0.005);
+    CHECK_NEAR(amplitude(r, 2000, 14000), 0.0, 0.0005);
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1000, &s, &why, 2), RAD_OK);
+    CHECK_EQ(s.size(), (size_t)2000);
+    const std::vector<uint8_t> mono = wav(left, 1, 44100);
+    REQUIRE_EQ(decode_audio(mono.data(), mono.size(), 16000, 1 << 20, &s, &why, 2), RAD_OK);
+    REQUIRE(s.size() % 2 == 0);
+    CHECK(std::equal(s.begin(), s.begin() + s.size() / 2, s.begin() + s.size() / 2));
+}
+
 /* Qwen3-ASR's front end is the reference's, and its chunks are staged apart. Qwen3ASRFeatureExtractor
  * (transformers 5.18) on the same two-tone signal: 23456 samples are 146 real frames, one whole
  * chunk of 100 and one of 46, which the encoder keeps 13 and 6 rows of -- so 19 placeholders and

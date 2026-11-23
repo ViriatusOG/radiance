@@ -83,9 +83,11 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
 /* The first audio stream as mono float samples at `rate` Hz. Resampled with libswresample at the
  * source's channel layout, then averaged across channels: the plain mean reference loaders
  * (librosa, torchaudio's to-mono) take, where swresample's downmix weights a stereo pair by
- * 0.707. A clip longer than `max_samples` is truncated, as the reference feature extractor does. */
+ * 0.707. A clip longer than `max_samples` is truncated, as the reference feature extractor does.
+ * With `channels` above 1 the samples come channel-major, [channels][n]: a source with exactly that
+ * many channels keeps them, any other is its mono mean copied to every channel. */
 int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_samples,
-                 std::vector<float>* out, std::string* why);
+                 std::vector<float>* out, std::string* why, int32_t channels = 1);
 
 /* `in` encoded as a one-frame H.264 stream at constant quality `crf` (libx264, preset veryfast,
  * yuv420p) and decoded back, as a video model's reference pipeline does to a conditioning

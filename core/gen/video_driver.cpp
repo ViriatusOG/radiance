@@ -409,9 +409,13 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
     if (!pack_ || !enc_geom_)
         return no("this model conditions on no reference media");
     int32_t eg[kEncGeomCap];
+    auto is_audio = [](const VideoRefMedia& m) {
+        return m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO ||
+               m.kind == VideoRefMedia::GUIDE_AUDIO;
+    };
     /* A picture's or video's latent frames or a soundtrack's latents, -1 for media refused. */
     auto latents = [&](const VideoRefMedia& m) -> int64_t {
-        const bool audio = m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO;
+        const bool audio = is_audio(m);
         if (audio ? d.max_enc_samples <= 0 : d.max_enc_side <= 0) return -1;
         if (audio ? m.enc_samples.empty() : m.enc_pixels.empty()) return -1;
         const int64_t in[4] = { audio ? m.enc_n : m.enc_frames, audio ? 0 : m.enc_h,
@@ -422,7 +426,7 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
     };
     auto refused = [&](const VideoRefMedia& m) {
         return no("'" + m.name + "' is not media this model's encoders take (" +
-                  (m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO
+                  (is_audio(m)
                        ? std::to_string(m.enc_n) + " samples"
                        : std::to_string(m.enc_w) + "x" + std::to_string(m.enc_h) + ", " +
                              std::to_string(m.enc_frames) + " frames") + ")");
@@ -433,14 +437,28 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
         *lw = m.enc_w / d.enc_ratio;
         return true;
     };
-    std::vector<int32_t> keys;
+    std::vector<int32_t> keys, guide;
     j.ref_tab.assign(2, 0);
     for (size_t i = 0; i < r.refs.size(); ++i) {
         const VideoRefMedia& m = r.refs[i];
         if (m.kind == VideoRefMedia::VIDEO_AUDIO) continue;
         const int64_t t = latents(m);
         int32_t lh = 0, lw = 0;
-        if (t < 1 || (m.kind != VideoRefMedia::AUDIO && !grid(m, &lh, &lw))) return refused(m);
+        if (t < 1 || (!is_audio(m) && !grid(m, &lh, &lw))) return refused(m);
+        if (m.kind == VideoRefMedia::GUIDE_AUDIO) {
+            /* ComfyUI's MiniMaxH3AddGuide: the song's latents from its frame on, cut where the
+             * video's soundtrack ends. The streams share one clock, audio_rate / fps soundtrack
+             * latents a frame, in ComfyUI's double arithmetic. */
+            const double per_frame = (double)d.audio_rate * (double)d.fps_den / (double)d.fps_num;
+            const double room = std::floor((double)j.geom.n_audio - per_frame * m.frame);
+            if (m.frame < 0 || m.frame >= frames || room < 1.0)
+                return no("'" + m.name + "' starts at frame " + std::to_string(m.frame) +
+                          ", outside the video's " + std::to_string(frames) + " frames");
+            if (!guide.empty()) return no("a request carries one song guide");
+            j.enc_q.push_back({ RAD_ENC_GUIDE, 1, (int32_t)i });
+            guide = { m.frame, 0, (int32_t)std::min<double>((double)t, room) };
+            continue;
+        }
         if (m.kind == VideoRefMedia::FIRST_FRAME || m.kind == VideoRefMedia::LAST_FRAME) {
             if (lh != j.geom.lat_h || lw != j.geom.lat_w)
                 return no("'" + m.name + "' is not the video's size");
@@ -478,6 +496,8 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
                          { kind, m.index, lh, lw, kind == RAD_VREF_AUDIO ? 0 : (int32_t)t,
                            kind == RAD_VREF_AUDIO ? (int32_t)t : sound });
     }
+    /* The guide is the last keyframe, as ComfyUI appends it after the first and last frames. */
+    keys.insert(keys.end(), guide.begin(), guide.end());
     j.ref_tab[1] = (int32_t)keys.size() / 3;
     j.ref_tab.insert(j.ref_tab.end(), keys.begin(), keys.end());
     j.enc_pre = j.enc_q.size();
@@ -546,8 +566,12 @@ int VideoDriver::plan_small_keys(Job& j, const VideoRequest& r, std::string* why
         }
         q.push_back({ it.kind, it.slot, it.ref, true });
     }
+    /* The references and the song guide do not depend on the size: once, before the prompt. */
+    for (const Job::EncItem& it : j.enc_q)
+        if (it.kind != RAD_ENC_KEYFRAME) q.push_back(it);
     j.enc_pre = q.size();
-    q.insert(q.end(), j.enc_q.begin(), j.enc_q.end());
+    for (const Job::EncItem& it : j.enc_q)
+        if (it.kind == RAD_ENC_KEYFRAME) q.push_back(it);
     j.enc_q = std::move(q);
     return RAD_OK;
 }
@@ -1259,7 +1283,8 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const Job::EncItem& it = j.enc_q[j.enc_next];
     const VideoRefMedia& m = j.req->refs[(size_t)it.ref];
-    const bool audio = it.kind == RAD_ENC_VAUDIO || it.kind == RAD_ENC_AUDIO;
+    const bool audio = it.kind == RAD_ENC_VAUDIO || it.kind == RAD_ENC_AUDIO ||
+                       it.kind == RAD_ENC_GUIDE;
     /* A keyframe at an upscale's small size is the media's second picture. */
     const std::vector<float>& pix = it.small ? m.small_pixels : m.enc_pixels;
     const int32_t eh = it.small ? m.small_h : m.enc_h, ew = it.small ? m.small_w : m.enc_w;

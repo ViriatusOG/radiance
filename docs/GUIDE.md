@@ -4195,9 +4195,17 @@ workflow, and is otherwise read off the parts:
   and a video keeps at most 289 frames, soundtracks at most 15.6 s. The pictures are shown to the
   text encoder as well, as `<Picture N>` in front of the prompt, so the container needs its vision
   tower for them.
+- **Song guide**: `guide_audio`, a soundtrack pinned from frame **`guide_frame`** of the video on
+  (0 by default; a negative frame counts from the end, -1 the last), as ComfyUI's
+  `MiniMaxH3AddGuide` pins one: the model takes it as the clip's own sound, so mouths follow its
+  words. It is read in stereo, as ComfyUI's guide reads it (a mono song is copied to both
+  channels), at most 15.6 s, and cut where the video ends. It is not named in the prompt, and it goes with any task: with text alone, with
+  keyframes or with reference media. A frame outside the video is refused naming `guide_frame`.
 
-A request carries keyframes or reference media, not both. `capabilities` reports the counts a
-model takes (`video_max_ref_images` and the rest). Every reference adds rows to each step, so
+A request carries keyframes or reference media, not both: each is shown to the text encoder as a
+`<Picture N>` counted from 1. A song guide goes with either. `capabilities` reports the counts a
+model takes (`video_max_ref_images` and the rest) and whether it takes a song guide
+(`video_guide_audio`). Every reference adds rows to each step, so
 many large ones may need a larger `max-model-len`; a request that does not fit, or whose
 references alternate kinds too often for the model's modulation table (group them by kind), is
 refused naming why.
@@ -4205,6 +4213,8 @@ refused naming why.
 ```sh
 curl -s http://localhost:8000/v1/videos -F task=fl2va -F first_frame=@start.png \
   -F last_frame=@end.png -F size=1344x768 -F 'prompt=...'
+curl -s http://localhost:8000/v1/videos -F task=ref2va -F ref_image_1=@singer.png \
+  -F guide_audio=@verse.wav -F guide_frame=0 -F size=1344x768 -F 'prompt=...'
 ```
 
 **FastH3.** FastVideo's FastH3 8-Step V2 (`FastVideo/FastVideo-FastH3-8-Step-V2`) is the same model
@@ -4223,7 +4233,7 @@ full-size step's, so most of the time goes to the refinement. The video object o
 video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
 size. Reference media ride it unchanged. Keyframes ride it too: each is encoded at the small size
 before the prompt and again at the full size after the upscale, into the same slot, so every step
-pins it on its own grid.
+pins it on its own grid. A song guide does not depend on the size and is encoded once.
 
 ```sh
 curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{

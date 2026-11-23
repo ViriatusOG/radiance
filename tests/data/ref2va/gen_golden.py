@@ -83,6 +83,13 @@ CASES = {
                   refs=[dict(kind="image", latent_h=8, latent_w=12, latent_t=0, ref_audio_t=0),
                         dict(kind="video_audio", latent_h=4, latent_w=6, latent_t=5,
                              ref_audio_t=20)]),
+    # a song guide (MiniMaxH3AddGuide's audio alone) mid-video after a first frame, with
+    # references: its rows sit on the video's clock, 5/3 a frame after every reference's span
+    "guide": dict(text_len=12, target=(7, 4, 6, 20),
+                  keyframes=[dict(frame=0, video_t=1, audio_t=0), dict(frame=7, video_t=0, audio_t=8)],
+                  refs=[dict(kind="image", latent_h=4, latent_w=4, latent_t=0, ref_audio_t=0),
+                        dict(kind="video_audio", latent_h=4, latent_w=6, latent_t=2, ref_audio_t=3),
+                        dict(kind="audio", latent_h=0, latent_w=0, latent_t=0, ref_audio_t=2)]),
     # degenerate prompt: text_len 0, nothing but targets
     "no_text": dict(text_len=0, target=(2, 4, 6, 1), keyframes=[], refs=[]),
 }

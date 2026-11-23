@@ -657,9 +657,9 @@ public:
         return RAD_E_UNSUPPORTED;
     }
 
-    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                              std::vector<float>* out, std::string* why) {
-        (void)bytes; (void)n; (void)rate; (void)max_samples; (void)out;
+    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                              int64_t max_samples, std::vector<float>* out, std::string* why) {
+        (void)bytes; (void)n; (void)rate; (void)channels; (void)max_samples; (void)out;
         if (why) *why = "this server prepares no reference media for an audio encoder";
         return RAD_E_UNSUPPORTED;
     }
