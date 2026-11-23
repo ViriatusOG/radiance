@@ -153,6 +153,8 @@ enum { kC = 24, kPatchVals = kC * kPatch * kPatch };
 /* Video sparse attention's tiles, in patches (time, row, column), for a checkpoint distilled with
  * it: 64 rows a tile, the dense segments cut into 64-row chunks of their own. */
 enum { kVsaT = 4, kVsaH = 4, kVsaW = 4, kVsaRows = kVsaT * kVsaH * kVsaW };
+/* The device selector's tile limit and the video driver's segment boundary capacity. */
+enum { kVsaTileLimit = 3072, kVsaPrefixSegments = 64 };
 
 /* ImageNet's normalisation, which the video decoder's pixels are in. */
 static const char* kPixMean = "0.485 0.456 0.406";
@@ -228,19 +230,29 @@ static int64_t vsa_keep(double sparsity, int64_t V) {
     const double keep = std::ceil((1.0 - sparsity) * (double)V);
     return std::max<int64_t>(1, std::min<int64_t>((int64_t)keep, V));
 }
-/* The most tiles a step has (the prompt's and the soundtrack's chunks, then the video's boxes) and
- * the most a video query keeps, over every size at the longest length. */
-static void vsa_bounds(double sparsity, int64_t* tiles, int64_t* keep) {
-    int64_t best = 0;
-    for (int64_t w = kMinSide; w <= (int64_t)kMaxArea / kMinSide; w += kMult)
-        for (int64_t h = kMinSide; h * w <= kMaxArea; h += kMult)
-            if (size_ok(w, h, kMaxArea))
-                best = std::max(best, vsa_video_tiles(max_lat_frames(), h / (kScale * kPatch),
-                                                      w / (kScale * kPatch)));
-    const int64_t prefix = ((int64_t)kMaxText + kVsaRows - 1) / kVsaRows +
-                           (kAudioCh * max_audio() + kVsaRows - 1) / kVsaRows;
-    *tiles = prefix + best;
-    *keep = vsa_keep(sparsity, best);
+static int64_t vsa_prefix_tiles(int64_t rows) { return rows / kVsaRows + (rows % kVsaRows != 0); }
+
+/* A packed step has at most max_rows. Each conditioning segment can add a padding tile, and
+ * the video can add more when a grid edge is not a multiple of four. */
+static void vsa_bounds(double sparsity, int64_t area, int64_t max_rows, int64_t* tiles,
+                       int64_t* keep) {
+    int64_t most_video_tiles = 0, most_video_padding = 0;
+    // An upscale pass can start below the output's minimum side or round its aspect ratio.
+    for (int64_t w = kMult; w * w <= kMaxAspect * area; w += kMult)
+        for (int64_t h = kMult; h * h <= kMaxAspect * area && h * w <= area; h += kMult) {
+            const int64_t ph = h / kMult, pw = w / kMult;
+            for (int64_t chunks = kMinChunks; chunks <= kMaxChunks; ++chunks) {
+                const int64_t frames = max_lat_frames(chunks);
+                const int64_t rows = frames * ph * pw;
+                if (rows >= max_rows) break;
+                const int64_t video_tiles = vsa_video_tiles(frames, ph, pw);
+                most_video_tiles = std::max(most_video_tiles, video_tiles);
+                most_video_padding = std::max(most_video_padding, video_tiles - rows / kVsaRows);
+            }
+        }
+    *tiles = std::min<int64_t>(kVsaTileLimit, vsa_prefix_tiles(max_rows) + kVsaPrefixSegments +
+                                           most_video_padding);
+    *keep = vsa_keep(sparsity, std::min(*tiles, most_video_tiles));
 }
 
 /* The packed sequence's rotary positions (diffusers' MiniMaxH3PrepareLayoutStep), the pack's
@@ -293,7 +305,7 @@ struct DitBlock {
     QuantFP8   q_attn{};
     GateQuantFP8 gq{};
     rad_op     op_mq1 = 0, op_mq2 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_ar2 = 0;
-    rad_op     op_sel = 0;         /* video sparse attention's tile selection */
+    rad_op     op_sel = 0, op_vsa = 0;
     rad_op     op_kq = 0;          /* the keys to int8 codes for the attention's scores */
     rad_op     op_vq = 0;          /* the values to E4M3 codes for the attention's P.V */
     /* The three modulation projections, one a modality, this rank's share of their rows; a
@@ -451,8 +463,10 @@ struct Model {
      * query's video tiles, the most tiles a step has and the most a query keeps, and the per-layer
      * selection and pooled-tile attention, [heads, tiles, k] i32 and [heads, tiles, head_dim]. */
     bool    vsa = false;
+    bool    vsa_gated = false;
     double  vsa_sparsity = 0.0;
     int64_t vsa_tiles = 0, vsa_k = 0;
+    int64_t vsa_min_rows = 0, vsa_dense_layers = 0;
     rad_buf b_sel = 0, b_coarse = 0;
     rad_buf b_k8 = 0, b_ks = 0;  /* the attention's keys at int8 codes and their scales */
     rad_buf b_v8 = 0, b_vs = 0;  /* its values at E4M3 codes and their column scales */
@@ -1293,11 +1307,14 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.a_hm.q8_fed = m.dit_i8;
     /* With video sparse attention a fourth projection beside q, k and v gates the pooled-tile
      * attention into each row's output. */
-    const int64_t nparts = m.vsa ? 4 : 3;
+    const int64_t nparts = m.vsa_gated ? 4 : 3;
     m.b_qkv = decl_b(b, nm.f("dit.qkv"), RAD_BF16, { T, nparts * qd });
     if (m.vsa) {
         m.b_sel = decl_b(b, nm.f("dit.vsa_sel"), RAD_I32, { g.n_head, m.vsa_tiles, m.vsa_k });
-        m.b_coarse = decl_b(b, nm.f("dit.vsa_coarse"), RAD_BF16, { g.n_head, m.vsa_tiles, hd });
+        if (m.vsa_gated)
+            m.b_coarse = decl_b(b, nm.f("dit.vsa_coarse"), RAD_BF16,
+                                { g.n_head, m.vsa_tiles, hd });
+        if (!m.b_sel || (m.vsa_gated && !m.b_coarse)) return RAD_E_INVAL;
     }
     m.b_k8 = decl_b(b, nm.f("dit.k8"), RAD_I8, { T, qd });
     m.b_ks = decl_b(b, nm.f("dit.ks"), RAD_F32, { T, qd / hd });
@@ -1349,7 +1366,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                        RAD_BF16, { hd }, acc, grp);
         if (!B.w_n1 || !B.w_n2 || !B.w_qn || !B.w_kn) return RAD_E_INVAL;
         B.op_mq1 = mod_q(B.w_n1, l > 0);
-        if (m.vsa)
+        if (m.vsa_gated)
             RAD_ARCH_TRY(B.qkv.declare(b, nm, g, nm.f("%s.attn_qkv", dn), 4 * qd, D, RAD_SHARD_ROW,
                                        grp_layer(grp),
                                        { nm.ckpt("%s.attn.to_q.weight", pre),
@@ -1385,31 +1402,39 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("dtype", "bf16")),
                                RAD_NOWEIGHTS),
                      { m.b_qkv }, { m.b_v8, m.b_vs });
-        if (m.vsa) {
+        if (m.vsa && l >= m.vsa_dense_layers) {
             /* Tiles of the packed sequence: each query tile's best video tiles by pooled score
              * and the softmax over every tile's pooled keys, then attention over the kept tiles
              * with that pooled term gated in. */
-            B.op_sel = rw(b, RAD_OP(b, "vsa_select",
+            B.op_sel = RAD_OP(b, "vsa_select",
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
                                                RAD_INT("tile_t", kVsaT), RAD_INT("tile_h", kVsaH),
                                                RAD_INT("tile_w", kVsaW), RAD_INT("patch", kPatch),
                                                RAD_F64("sparsity", m.vsa_sparsity),
                                                RAD_F64("scale", 1.0 / std::sqrt((double)hd))),
-                                    RAD_NOWEIGHTS),
-                          { m.b_qkv }, { m.b_sel, m.b_coarse });
+                                    RAD_NOWEIGHTS);
             /* The kept tiles' scores in int8, as the dense form below takes them. */
-            B.op_attn = rw(b, RAD_OP(b, "attn_vsa",
+            B.op_vsa = RAD_OP(b, "attn_vsa",
                                      RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
                                                 RAD_INT("tile_t", kVsaT), RAD_INT("tile_h", kVsaH),
                                                 RAD_INT("tile_w", kVsaW), RAD_INT("patch", kPatch),
                                                 RAD_F64("sparsity", m.vsa_sparsity),
                                                 RAD_F64("scale", 1.0 / std::sqrt((double)hd)),
                                                 RAD_STR("qk", "i8"), RAD_STR("pv", "fp8")),
-                                     RAD_NOWEIGHTS),
-                           { m.b_qkv, m.b_sel, m.b_coarse, m.b_k8, m.b_ks, m.b_v8, m.b_vs },
-                           { m.a_attn.x });
-            if (!B.op_sel) return RAD_E_INVAL;
-        } else {
+                                     RAD_NOWEIGHTS);
+            if (!B.op_sel || !B.op_vsa) return RAD_E_INVAL;
+            if (m.vsa_gated) {
+                rw(b, B.op_sel, { m.b_qkv }, { m.b_sel, m.b_coarse });
+                rw(b, B.op_vsa,
+                   { m.b_qkv, m.b_sel, m.b_coarse, m.b_k8, m.b_ks, m.b_v8, m.b_vs },
+                   { m.a_attn.x });
+            } else {
+                rw(b, B.op_sel, { m.b_qkv }, { m.b_sel });
+                rw(b, B.op_vsa, { m.b_qkv, m.b_sel, m.b_k8, m.b_ks, m.b_v8, m.b_vs },
+                   { m.a_attn.x });
+            }
+        }
+        if (!m.vsa_gated) {
             /* Dense attention with int8 scores: the keys quantised per (row, head) by
              * quant_act_i8g, the query inside the op, the score an exact integer product times
              * both scales, P.V in bf16. The prefix-free form of attn_prefix_self, the op that
@@ -1426,7 +1451,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                      RAD_NOWEIGHTS),
                            { m.b_qkv, m.b_k8, m.b_ks, m.b_v8, m.b_vs }, { m.a_attn.x });
         }
-        if (!B.op_kq || !B.op_vq) return RAD_E_INVAL;
+        if (!B.op_kq || !B.op_vq || (!m.vsa_gated && !B.op_attn)) return RAD_E_INVAL;
         RAD_ARCH_TRY(B.q_attn.declare(b, g, m.a_attn, qd));
         RAD_ARCH_TRY(B.o.declare(b, nm, g, nm.f("%s.attn_output", dn), D, qd, RAD_SHARD_COL,
                                  grp_layer(grp), { nm.ckpt("%s.attn.to_out.0.weight", pre) },
@@ -1451,7 +1476,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                     grp_layer(grp), { nm.ckpt("%s.ff.net.2.weight", pre) },
                                     m.a_ffn, m.b_ao));
         B.op_ar2 = all_reduce(b, g, m.b_ao, std::min<int64_t>(T, kArRows), D, "bf16", true);
-        if (!B.op_mq1 || !B.op_mq2 || !B.op_qkr || !B.op_attn) return RAD_E_INVAL;
+        if (!B.op_mq1 || !B.op_mq2 || !B.op_qkr) return RAD_E_INVAL;
     }
 
     /* ---- the output: norm_out's modulated norm (the last block's branch gated in), the heads in
@@ -2961,6 +2986,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const char* backend = rad_meta_gets(meta, "fastvideo_inference.attention_backend", "");
     if (!std::strcmp(backend, "VIDEO_SPARSE_ATTN_H3")) {
         m.vsa = true;
+        m.vsa_gated = rad_meta_geti(meta, "fastvideo_inference.vsa_gate_compress", 1) != 0;
+        m.vsa_min_rows = rad_meta_geti(meta, "fastvideo_inference.vsa_min_tokens", 0);
+        m.vsa_dense_layers = rad_meta_geti(meta, "fastvideo_inference.vsa_dense_prefix_layers", 0);
+        if (m.vsa_min_rows < 0 || m.vsa_dense_layers < 0 || m.vsa_dense_layers >= gd.n_layer ||
+            (m.vsa_gated && (m.vsa_min_rows || m.vsa_dense_layers))) {
+            fprintf(stderr, "radiance: minimaxh3: invalid video sparse attention cutoffs\n");
+            return RAD_E_UNSUPPORTED;
+        }
         m.vsa_sparsity = rad_meta_getf(meta, "fastvideo_inference.vsa_sparsity", -1.0);
         const long long tile = rad_meta_geti(meta, "fastvideo_inference.vsa_tile_size", 0);
         if (tile != kVsaRows || !(m.vsa_sparsity >= 0.0 && m.vsa_sparsity < 1.0)) {
@@ -2969,7 +3002,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "in [0, 1)\n", tile, m.vsa_sparsity, (int)kVsaRows);
             return RAD_E_UNSUPPORTED;
         }
-        vsa_bounds(m.vsa_sparsity, &m.vsa_tiles, &m.vsa_k);
+        vsa_bounds(m.vsa_sparsity, m.max_area, gd.max_tok, &m.vsa_tiles, &m.vsa_k);
     } else if (*backend && std::strcmp(backend, "FLASH_ATTN")) {
         fprintf(stderr, "radiance: minimaxh3: the checkpoint was made for the attention '%s'; this "
                         "plugin runs dense attention and VIDEO_SPARSE_ATTN_H3\n", backend);
@@ -3391,6 +3424,22 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         aseg = pk.segs[pk.segs.size() - 2].start;
         vseg = vid.start;
     }
+    const bool use_vsa = m.vsa && R >= m.vsa_min_rows;
+    if (use_vsa) {
+        int64_t prefix = 0;
+        if (V->ref_tab) {
+            for (const Ref2VASeg& s : pk.segs)
+                if (s.start < vseg) prefix += vsa_prefix_tiles(s.end - s.start);
+        } else {
+            prefix = vsa_prefix_tiles(nt) + vsa_prefix_tiles(arows);
+        }
+        const int64_t video = vsa_video_tiles(V->geom.lat_frames, V->geom.lat_h / kPatch,
+                                              V->geom.lat_w / kPatch);
+        if (prefix + video > m.vsa_tiles || vsa_keep(m.vsa_sparsity, video) > m.vsa_k) {
+            rad_step_fail(c, "minimaxh3: packed sequence exceeds sparse attention tile capacity");
+            return;
+        }
+    }
 
     if (V->step == 0) {
         RAD_ISSUE_N(c, m.op_rnd_v, vrows, praw(V->first_d, RAD_I32, 1), praw(V->seed, RAD_U32, 2),
@@ -3514,13 +3563,15 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                     RAD_W(B.w_kn));
         RAD_ISSUE_N(c, B.op_kq, R, bcol(m.b_qkv, qd, qd, R), brows(m.b_k8, R), brows(m.b_ks, R));
         RAD_ISSUE_N(c, B.op_vq, R, bcol(m.b_qkv, 2 * qd, qd, R), brows(m.b_v8, R), RAD_B(m.b_vs));
-        if (m.vsa) {
+        if (use_vsa && B.op_vsa) {
+            const RadOperand pooled_values = m.vsa_gated ? bcol(m.b_qkv, 2 * qd, qd, R) : RAD_NONE;
+            const RadOperand coarse = m.vsa_gated ? RAD_B(m.b_coarse) : RAD_NONE;
+            const RadOperand gate = m.vsa_gated ? bcol(m.b_qkv, 3 * qd, qd, R) : RAD_NONE;
             RAD_ISSUE_N(c, B.op_sel, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
-                        bcol(m.b_qkv, 2 * qd, qd, R), segs, geom, RAD_B(m.b_sel),
-                        RAD_B(m.b_coarse));
-            RAD_ISSUE_N(c, B.op_attn, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
-                        brows(m.b_v8, R), segs, geom, RAD_B(m.b_sel), RAD_B(m.b_coarse),
-                        bcol(m.b_qkv, 3 * qd, qd, R), brows(m.a_attn.x, R), brows(m.b_k8, R),
+                        pooled_values, segs, geom, RAD_B(m.b_sel), coarse);
+            RAD_ISSUE_N(c, B.op_vsa, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
+                        brows(m.b_v8, R), segs, geom, RAD_B(m.b_sel), coarse,
+                        gate, brows(m.a_attn.x, R), brows(m.b_k8, R),
                         brows(m.b_ks, R), RAD_B(m.b_vs));
         } else {
             RAD_ISSUE_N(c, B.op_attn, R, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
