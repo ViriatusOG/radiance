@@ -878,10 +878,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * layer's own LinearFP8 (which then maps it once): a recipe keeps it at a 128
                  * where a rank's share of its width is not whole 256s. */
                 LinearFP8& sd = m.layers[0].mlp.sh_down;
+                /* MoeFP8 takes the plain BF16 view of this projection only when a runtime
+                 * adapter targets it, and its own probe is skipped once this one has mapped
+                 * the weight. Make the same choice here, before the first probe: the probe's
+                 * result also decides whether the gate writes the BF16 activation the view
+                 * reads. */
+                const std::string sd_src =
+                    nm.ckpt("model.language_model.layers.0.mlp.shared_expert.down_proj.weight");
+                sd.plain_bf16_view = rad_lora_source_targeted(b, sd_src.c_str());
                 RAD_ARCH_TRY(sd.probe(b, nm, g, nm.f("blk.0.ffn_down_shexp"),
-                                      { nm.ckpt("model.language_model.layers.0.mlp."
-                                                "shared_expert.down_proj.weight") }));
-                const int64_t sg = sd.probed_i8 ? sd.probed_g8 : m.trunk_g8;
+                                      { sd_src.c_str() }));
+                /* The view still reserves a code pair. Keep the weight's own group so a
+                 * group-128 shared shard need not be divisible by the trunk's 256. */
+                const int64_t sg = sd.probed_i8 || sd.viewed ? sd.probed_g8 : m.trunk_g8;
                 RAD_ARCH_TRY(m.a_sff.declare_pair(b, nm, g, "shexp_ffn", mc.n_ff_shared, R, true,
                                                   sg, "gated_had_quant_i8g"));
             } else {

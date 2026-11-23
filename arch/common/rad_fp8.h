@@ -888,6 +888,8 @@ struct LinearFP8 {
      * at load. Set before probe()/declare(); a no-op for every other encoding and for source
      * names outside the trunk (lora_plain_view_src). See lora_plain_view_enc. */
     bool       plain_bf16_view = false;
+    /* probe() found the plain bf16 view applicable (set by it; false until probed). */
+    bool       viewed  = false;
     bool       mapped  = false;   /* probe() made the name map; declare() does not make it again */
     /* The stored weight this linear's views take when it is not `<base>.weight`: a second linear
      * over one container entry, e.g. a whole projection beside its tensor-parallel slice. Set
@@ -1295,6 +1297,7 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
      * tell the block its producer may skip the bf16 plane (GateQuantFP8's want_x). */
     const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
                       lora_plain_view_src(src);
+    viewed = view;
     probed_i8 = !view && known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
     probed_g8 = known ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or

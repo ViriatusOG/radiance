@@ -11925,6 +11925,51 @@ TEST(qwen35moe_w8a8_refuses_another_format_by_name) {
     }
 }
 
+/* The shared down projection is pre-probed while sizing its activation pair. When a runtime
+ * adapter targets it, the plain BF16 view (a gemm_nt over the activation's bf16 plane) must be
+ * taken at that first probe, or layer 0's consumer reads a plane the gate was told not to write.
+ * With no adapter the stock int8 form is kept. A 384-wide TP shard also needs its weight's
+ * group 128, rather than the IQ8R trunk's 256, in either case. */
+TEST(qwen35moe_w8a8_shared_view_preserves_its_producer_and_quant_group) {
+    for (bool targeted : { false, true }) for (int shared_width : {512, 768}) for (int world : {1, 2})
+        for (int rank = 0; rank < world; ++rank) {
+            MetaKV mk = q35moe_w8a8_meta();
+            mk.set("shared_expert_intermediate_size", shared_width == 512 ? "512" : "768");
+            RadBuilder b;
+            moe_iq8r_encs(&b);
+            if (targeted) b.lora_targets = { "down_proj" };
+            auto ctx = spec_ctx(rank, world, 3);
+            REQUIRE_EQ(qwen35moe_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+            const auto& model = qwen35moe_w8a8::g_model[rad_build_slot(&ctx)];
+            CHECK(model.layers[0].mlp.sh_down.reads_x);
+            CHECK_EQ(model.layers[0].mlp.sh_down.probed_i8, !targeted);
+            CHECK_EQ(model.layers[0].mlp.sh_down.viewed, targeted);
+            /* The gate's code pair keeps the shared weight's group 128, not the trunk's 256. */
+            CHECK_EQ(model.a_sff.g8, (int64_t)128);
+            /* The trunk's shared downs take the plain view only when targeted; the MTP head's
+             * (past n_main) is never a LoRA target and stays the int8 GEMM either way. */
+            int trunk_views = 0, trunk_i8 = 0, mtp_i8 = 0;
+            for (const RecOp& o : b.ops) {
+                if (o.w.empty() || !o.w[0]) continue;
+                const std::string& wn = b.weights[o.w[0] - 1].name;
+                if (wn.find("ffn_down_shexp.weight") == std::string::npos) continue;
+                const long layer = std::strtol(wn.c_str() + wn.find("blk.") + 4, nullptr, 10);
+                const bool i8op = o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
+                if (layer < model.n_main) { trunk_views += o.op == "gemm_nt"; trunk_i8 += i8op; }
+                else mtp_i8 += i8op;
+            }
+            CHECK_EQ(trunk_views > 0, targeted);
+            CHECK_EQ(trunk_i8 > 0, !targeted);
+            CHECK(mtp_i8 > 0);
+            const auto decode = kit(b, {1, 1}, {});
+            const auto prefill = kit(b, {}, {32});
+            const auto mixed = kit(b, {1}, {6});
+            const auto passes = run_passes(b, qwen35moe_w8a8::step,
+                                          {decode.get(), prefill.get(), mixed.get()}, rank, world);
+            CHECK_PASSES(b, passes);
+        }
+}
+
 /* The routed int8 model's engine steps, its routed MTP head included, lint clean at one and two
  * ranks. */
 TEST(qwen35moe_w8a8_steps_lint_clean_with_its_routed_mtp_head) {
