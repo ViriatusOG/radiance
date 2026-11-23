@@ -80,8 +80,10 @@ std::vector<float> schedule(const RadGeneratorDecl& d, const std::vector<double>
         }
     } else {
         const int32_t n = steps > 0 ? steps : (int32_t)d.default_steps;
-        /* np.linspace(1.0, 1 / n, n) in f64, then astype(f32). */
-        const double lo = 1.0 / (double)n;
+        /* np.linspace(1.0, 1 / n, n) in f64, then astype(f32) -- or, with `sigma_lower` > 0, the
+         * schedule's own lower bound (MOSSImageScheduler: shift / (train_steps + shift - 1),
+         * so the last sigma is the same for every step count). */
+        const double lo = d.sigma_lower > 0.0 ? d.sigma_lower : 1.0 / (double)n;
         for (int32_t i = 0; i < n; ++i) {
             const double v = n == 1 ? 1.0 : 1.0 + (lo - 1.0) * (double)i / (double)(n - 1);
             s.push_back((float)v);

@@ -88,6 +88,45 @@ TEST(the_schedule_is_diffusers_flow_match_euler) {
     CHECK_EQ(gen::schedule(d, {}, 0, 64).size(), (size_t)d.default_steps + 1);
 }
 
+/* A declared lower bound replaces 1/n as the end of the unshifted linspace. MOSSImageScheduler's
+ * table is linspace(1, shift / (train_steps + shift - 1), n) through the static shift, so its last
+ * sigma before the closing 0 is the same at every step count (25/1024 at shift 5 over 1000
+ * training steps), where the default's is shift / (n + shift - 1): 5/12 at 8 steps, which leaves
+ * 42% of the noise in the picture. 0 is the default, and one step is sigma 1 either way. */
+TEST(a_declared_lower_bound_ends_the_schedule_at_every_step_count) {
+    RadGeneratorDecl d = decl_base();
+    d.dyn_shift = 0; d.shift_terminal = 0; d.shift = 5.0;
+    d.sigma_lower = 5.0 / 1004.0;
+    for (int n : { 2, 8, 20, 50 }) {
+        std::vector<double> want;
+        for (int i = 0; i < n; ++i) {
+            const double v = 1.0 + (d.sigma_lower - 1.0) * i / (n - 1);
+            want.push_back(d.shift * v / (1.0 + (d.shift - 1.0) * v));
+        }
+        want.push_back(0.0);
+        const std::vector<float> s = gen::schedule(d, {}, n, 1024);
+        REQUIRE_EQ(s.size(), (size_t)n + 1);
+        CHECK(close_to(s, want, 2e-6));
+        CHECK_EQ(s[0], 1.0f);
+        CHECK_NEAR(s[(size_t)n - 1], 25.0 / 1024.0, 2e-6);
+        CHECK_EQ(s.back(), 0.0f);
+        for (size_t i = 1; i < s.size(); ++i) CHECK(s[i] < s[i - 1]);
+    }
+    const std::vector<float> one = gen::schedule(d, {}, 1, 1024);
+    REQUIRE_EQ(one.size(), (size_t)2);
+    CHECK_EQ(one[0], 1.0f);
+    /* The bound is applied before the shift, whichever shift that is. */
+    d.dyn_shift = 1; d.shift_exp = 1;
+    d.base_shift = 0.5; d.max_shift = 0.9; d.base_seq = 256; d.max_seq = 8192;
+    const double m = (0.9 - 0.5) / (8192 - 256), e = std::exp(1024 * m + 0.5 - 256 * m);
+    CHECK_NEAR(gen::schedule(d, {}, 8, 1024)[7], e / (e + (1004.0 / 5.0 - 1.0)), 2e-6);
+    /* Unset, the bound is diffusers' 1/n. */
+    d.dyn_shift = 0; d.sigma_lower = 0;
+    const std::vector<float> stock = gen::schedule(d, {}, 8, 1024);
+    CHECK(close_to(stock, diffusers_sigmas(d, 8, 1024), 2e-6));
+    CHECK_NEAR(stock[7], 5.0 / 12.0, 2e-6);
+}
+
 /* A schedule off a table of timesteps is ComfyUI's `simple` scheduler over its discrete flow
  * sampling (1000 timesteps, shift 3, multiplier 1): the sigmas below are what ComfyUI hands its
  * sampler, as f32. */
