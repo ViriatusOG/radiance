@@ -188,7 +188,8 @@ int64_t TierExec::device_bytes(int64_t entry_bytes, int n_groups, const Sizes& s
 
 void TierExec::close() {
     /* Drain before freeing buffers the stream may still read. */
-    if (stream_) (void)rad_stream_sync(stream_);
+    if (stream_ && rad_stream_sync(stream_) < 0)
+        fatal("refusing to free KV transfer buffers after an unsuccessful device fence");
     if (stream_ && own_stream_) rad_stream_destroy(stream_);
     stream_ = nullptr; shared_ = nullptr; own_stream_ = false;
     release_device();
@@ -528,10 +529,10 @@ int TierExec::wait_copy() {
 
 /* ------------------------------------------------------------------ restore */
 
-void TierExec::quiesce() {
-    if (!enabled_ || !stream_) return;
-    if (rad_dev_set(device_) < 0) return;
-    (void)rad_stream_sync(stream_);
+int TierExec::quiesce() {
+    if (!enabled_ || !stream_) return RAD_OK;
+    RAD_TRY(rad_dev_set(device_));
+    return rad_stream_sync(stream_);
 }
 
 int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
@@ -627,7 +628,11 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
      * wait. */
     if (rad_event_record(ev_restore_, stream_) != RAD_OK ||
         rad_event_wait(compute, ev_restore_) != RAD_OK) {
-        (void)rad_stream_sync(stream_);
+        const int fence = rad_stream_sync(stream_);
+        if (fence < 0) {
+            std::fill(ok->begin(), ok->end(), 0);
+            return fence;
+        }
     }
     ++st_.passes;
     st_.jobs += (int64_t)m;
@@ -636,9 +641,9 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
 
 /* ------------------------------------------------------------------ the report */
 
-void TierExec::report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok,
-                           uint64_t now_ns) {
-    if (!enabled_ || !leader_) return;
+int TierExec::report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok,
+                          uint64_t now_ns) {
+    if (!enabled_ || !leader_) return RAD_OK;
     bool quiet = false;
     for (size_t i = 0; i < jobs.size(); ++i) {
         TierJob& j = jobs[i];
@@ -646,13 +651,14 @@ void TierExec::report_pass(std::vector<TierJob>& jobs, const std::vector<char>& 
         /* A failed promotion releases the leader's blocks once nothing queued against them can
          * still land; after report() nothing names them again. */
         if (j.kind == TierJob::Kind::ToDevice && !good) {
-            if (!quiet) { quiesce(); quiet = true; }
+            if (!quiet) { RAD_TRY(quiesce()); quiet = true; }
             for (size_t k = 0; k < gi_.size() && k < j.blocks.size(); ++k)
                 if (j.blocks[k] >= 0) kv_->release_block(gi_[k].g, j.blocks[k]);
             j.blocks.clear();
         }
         tiers_->report(j, good, now_ns);
     }
+    return RAD_OK;
 }
 
 bool TierExec::plan_promote(const BlockHash& key, TierJob* out) {

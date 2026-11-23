@@ -712,3 +712,14 @@ headings name the removed patch files, whose diffs are in git history.
       connection closes with the unread bytes still on it. Tests: transport_test
       (a_stalled_drain_dies_on_its_deadline, a_refusal_closes_the_connection,
       the_inflight_body_budget).
+
+  patches/0023-jinja-tojson-sort-keys.patch
+
+      llama.cpp's e1925b36 ("jinja: support json sort_keys=true (#32366)"), after the lifted
+      commit; drop it on the next refresh. tojson threw "tojson sort_keys=true not implemented".
+      Inkling 2 Mini's template writes its tool list with tojson(sort_keys=true), so the probe
+      failed, as 0006 describes, and every request with `tools` was refused. value_to_json takes
+      sort_keys and orders each object's keys by their UTF-8 bytes, nested objects and objects in
+      arrays too. tests/chat_test.cpp (tojson_sorts_object_keys_when_sort_keys_is_true,
+      a_template_that_sorts_its_tools_reports_tool_support,
+      inklings_tool_declaration_renders_its_tools_with_sorted_keys).

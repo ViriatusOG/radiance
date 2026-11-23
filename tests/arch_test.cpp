@@ -11254,6 +11254,52 @@ TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_
     }
 }
 
+/* The plain bf16 view (#552) is a runtime-LoRA declaration, not the container's. With no adapter
+ * the 36 trunk linears stay gemm_nt_q i8a8h. An adapter on o_proj switches only the two attention
+ * outputs; one on out_proj switches only the six delta-net outputs. q_proj is a target the blocks
+ * do not detour, and a drafter source of the same leaf is not a trunk target. */
+TEST(qwen35_w8a8_plain_bf16_view_follows_the_runtime_lora_target) {
+    MetaKV mk = q35w8a8_meta();
+    RadBuildCtx ctx = build_ctx();
+    auto count = [&](const std::set<std::string>& targets) {
+        struct C { int rc = 0, rot = 0, view_o = 0, view_ssm = 0; };
+        C c;
+        RadBuilder b;
+        w8a8_encs(&b);
+        b.lora_targets = targets;
+        c.rc = qwen35_w8a8::declare(&b, mk.meta(), &ctx);
+        if (c.rc != RAD_OK) return c;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h") ++c.rot;
+            if (o.op != "gemm_nt" || o.w.empty() || !o.w[0]) continue;
+            const std::string& n = b.weights[o.w[0] - 1].name;
+            c.view_o += n.find("attn_output.weight") != std::string::npos;
+            c.view_ssm += n.find("ssm_out.weight") != std::string::npos;
+        }
+        return c;
+    };
+    const int trunk = 2 * 4 + 6 * 2 + 8 * 2;
+    const auto none = count({});
+    REQUIRE_EQ(none.rc, RAD_OK);
+    CHECK_EQ(none.rot, trunk);
+    CHECK_EQ(none.view_o, 0);
+    CHECK_EQ(none.view_ssm, 0);
+    const auto q = count({ "q_proj" });
+    REQUIRE_EQ(q.rc, RAD_OK);
+    CHECK_EQ(q.rot, trunk);
+    CHECK_EQ(q.view_o, 0);
+    const auto o = count({ "o_proj" });
+    REQUIRE_EQ(o.rc, RAD_OK);
+    CHECK_EQ(o.view_o, 2);
+    CHECK_EQ(o.view_ssm, 0);
+    CHECK_EQ(o.rot, trunk - 2);
+    const auto ssm = count({ "out_proj" });
+    REQUIRE_EQ(ssm.rc, RAD_OK);
+    CHECK_EQ(ssm.view_o, 0);
+    CHECK_EQ(ssm.view_ssm, 6);
+    CHECK_EQ(ssm.rot, trunk - 6);
+}
+
 /* What the int8 build refuses: a trunk that is not int8 (no stated encoding, which a block-fp8
  * plugin reads as fp8), a plain int8 trunk (the descriptor names the rotation, and a plain weight
  * served behind the rotated quantiser would be wrong), and a container stated for another format
@@ -14620,6 +14666,33 @@ TEST(the_control_vector_projection_is_issued_only_when_a_row_takes_it) {
     CHECK(!q.steered());
 }
 
+TEST(a_scoped_vae_preserves_checkpoint_names_and_spatial_attention_weights) {
+    for (bool spatial : {false, true}) {
+        RadBuilder builder;
+        rad::arch::Names names("engine");
+        rad::arch::Vae vae;
+        vae.b = &builder;
+        vae.nm = &names;
+        vae.scope = "venc";
+        vae.base_px = 16;
+        vae.form = rad::arch::VAE_CONV_CAUSAL;
+        const auto input = vae.img(8, 0);
+        REQUIRE(vae.resblock(input, 8, "vae.encoder.block").buf > 0);
+        REQUIRE(vae.attention(input, "vae.encoder.attn", spatial).buf > 0);
+        int projections = 0;
+        for (const RecMap& mapping : builder.maps) {
+            for (const std::string& source : mapping.src) {
+                CHECK(source.starts_with("vae."));
+                if (source.ends_with(".to_qkv.weight") || source.ends_with(".proj.weight")) {
+                    ++projections;
+                    CHECK_EQ(mapping.mode, spatial ? RAD_MAP_COPY : RAD_MAP_TAP);
+                }
+            }
+        }
+        CHECK_EQ(projections, 2);
+    }
+}
+
 RAD_TEST_MAIN()
 
 /* Without --prefill-span a 4096 budget declares and steps the pinned graph and launches: for
@@ -15375,4 +15448,23 @@ TEST(krea_pixel_limits_preserve_the_default_canvas_and_reject_unusable_declarati
     ctx.max_seqs = 0;
     RadBuilder no_entries;
     CHECK_EQ(krea2::declare(&no_entries, meta.meta(), &ctx), RAD_E_INVAL);
+}
+
+TEST(a_scoped_krea_declaration_keeps_dynamic_vae_sources_unscoped) {
+    MetaKV mk = krea2_meta();
+    RadBuilder builder;
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.scope = "engine";
+    REQUIRE_EQ(krea2::declare(&builder, mk.meta(), &ctx), RAD_OK);
+    bool found_dynamic_block = false;
+    for (const RecMap& mapping : builder.maps) {
+        for (const std::string& source : mapping.src) {
+            CHECK(!source.starts_with("engine.vae."));
+            if (source.starts_with("vae.")) CHECK_EQ(mapping.declared, "engine." + source);
+            if (source.find("vae.decoder.up_blocks.") == 0 &&
+                source.find(".resnets.") != std::string::npos)
+                found_dynamic_block = true;
+        }
+    }
+    CHECK(found_dynamic_block);
 }

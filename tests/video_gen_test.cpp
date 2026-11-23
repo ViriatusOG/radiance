@@ -353,6 +353,46 @@ TEST(a_request_runs_prompt_steps_soundtrack_and_chunks_in_order) {
     CHECK_EQ(t->status(), (int)RAD_OK);
 }
 
+TEST(a_video_only_request_finishes_without_an_audio_pass) {
+    VideoFixture f;
+    f.build();
+    auto& d = f.prog.video_gen;
+    d.sample_rate = d.audio_rate = d.audio_channels = d.audio_latent_channels = 0;
+    d.audio_out = RAD_NULL_HANDLE;
+    d.shift_audio = 0;
+    d.guidance = 1;
+    d.guidance_default[0] = 1.0;
+    REQUIRE_EQ(f.start(), RAD_OK);
+
+    auto r = f.req();
+    auto ticket = r->ticket;
+    std::string why;
+    REQUIRE_EQ(f.drv.submit(std::move(r), &why), RAD_OK);
+    CHECK_EQ(ticket->channels, 0);
+    CHECK_EQ(ticket->sample_rate, 0);
+
+    std::string passes;
+    for (int i = 0; i < 10; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        passes += kind_of(b->gen);
+        CHECK_EQ(b->vgen_b->geom.n_audio, 0);
+        f.answer(i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(passes, std::string("CSSDD"));
+    CHECK_EQ(ticket->status(), RAD_OK);
+
+    gen::VideoEvent e;
+    bool timeout = false;
+    int frames = 0;
+    while (ticket->next(&e, 0, &timeout)) {
+        CHECK(e.kind != gen::VideoEvent::AUDIO);
+        if (e.kind == gen::VideoEvent::FRAMES) frames += e.n;
+    }
+    CHECK_EQ(frames, 5);
+}
+
 /* A second request is conditioned while the first waits for its first step, and denoised once the
  * first has finished: requests are denoised one after another. */
 TEST(a_second_request_is_conditioned_early_and_denoised_after_the_first) {
@@ -1316,4 +1356,93 @@ TEST(references_the_model_cannot_take_are_refused) {
     refused(h, std::move(r), "at most 4");
 }
 
+TEST(unipc_stages_wan_timesteps_and_coefficients_for_each_video_step) {
+    VideoFixture f;
+    f.build();
+    auto& d = f.prog.video_gen;
+    d.sample_rate = d.audio_rate = d.audio_channels = d.audio_latent_channels = 0;
+    d.audio_out = RAD_NULL_HANDLE;
+    d.shift_audio = 0;
+    d.shift_video = 5;
+    d.default_steps = 4;
+    d.sched_kind = RAD_VIDEO_SCHEDULE_UNIPC;
+    REQUIRE_EQ(f.start(), RAD_OK);
+
+    std::string why;
+    auto euler = f.req();
+    euler->sampler = RAD_SAMPLER_EULER;
+    CHECK_EQ(f.drv.submit(std::move(euler), &why), RAD_E_INVAL);
+    CHECK(why.find("sampler") != std::string::npos);
+    auto request = f.req();
+    REQUIRE_EQ(f.drv.submit(std::move(request), &why), RAD_OK);
+    const int32_t expected_times[] = { 999, 937, 833, 624 };
+    const auto sched = gen::video_schedule(d, 4);
+    REQUIRE_EQ(sched.steps, 4);
+    REQUIRE_EQ(sched.unipc.size(), 4u);
+    const RadBatch* pass = f.drv.next(0);
+    REQUIRE(pass && pass->gen == RAD_GEN_PASS_VCOND);
+    for (int i = 0; i < 4; ++i) {
+        CHECK_EQ(pass->vgen_b->t_video[i], static_cast<float>(expected_times[i]));
+        CHECK_EQ(pass->vgen_b->t_audio[i], 0.0f);
+    }
+    CHECK_OK(f.drv.done());
+    for (int i = 0; i < 4; ++i) {
+        pass = f.drv.next(i + 1);
+        REQUIRE(pass && pass->gen == RAD_GEN_PASS_VSTEP);
+        const RadVideoGenBatch& batch = *pass->vgen_b;
+        CHECK_EQ(batch.sampler, RAD_SAMPLER_UNIPC);
+        CHECK_EQ(batch.sched[0], static_cast<float>(expected_times[i]));
+        CHECK_EQ(batch.sched[1], sched.sig_v[i]);
+        CHECK_EQ(batch.sched[2], sched.sig_v[i + 1]);
+        float coefficients[rad_unipc::COUNT];
+        sched.unipc[i].coefficients(coefficients);
+        for (int k = 0; k < rad_unipc::COUNT; ++k)
+            CHECK_EQ(batch.sched[RAD_VIDEO_UNIPC_COEFF_OFFSET + k], coefficients[k]);
+        CHECK_OK(f.drv.done());
+    }
+}
+
 RAD_TEST_MAIN()
+
+
+TEST(a_causal_video_decoder_can_trim_only_the_first_chunk) {
+    VideoFixture f;
+    f.build();
+    auto& d = f.prog.video_gen;
+    d.frames_per_chunk = 4;
+    d.frames_tail = -3;
+    d.latents_tail = 0;
+    d.dec_latents = 1;
+    REQUIRE_EQ(f.start(), RAD_OK);
+
+    for (const int chunks : {1, 3}) {
+        auto r = f.req(chunks);
+        auto ticket = r->ticket;
+        std::string why;
+        REQUIRE_EQ(f.drv.submit(std::move(r), &why), RAD_OK);
+        const int frames = 4 * chunks - 3;
+        CHECK_EQ(ticket->frames, frames);
+        for (int i = 0; i < 12; ++i) {
+            const RadBatch* b = f.drv.next(i);
+            if (!b) break;
+            if (b->gen == RAD_GEN_PASS_VDECODE) {
+                const auto& v = *b->vgen_b;
+                CHECK_EQ(v.n_frames_out, v.chunk == 0 ? 1 : 4);
+                CHECK_EQ(v.geom_d[RAD_VGEOM_CHUNK_LAT0], v.chunk);
+                CHECK_EQ(f.drv.readbacks().front().bytes, v.n_frames_out * 64 * 32 * 3);
+            }
+            f.answer(i);
+            CHECK_OK(f.drv.done());
+        }
+        CHECK_EQ(ticket->status(), RAD_OK);
+        gen::VideoEvent e;
+        bool timeout = false;
+        int n = 0;
+        while (ticket->next(&e, 0, &timeout)) {
+            if (e.kind != gen::VideoEvent::FRAMES) continue;
+            CHECK_EQ(e.first, n);
+            n += e.n;
+        }
+        CHECK_EQ(n, frames);
+    }
+}

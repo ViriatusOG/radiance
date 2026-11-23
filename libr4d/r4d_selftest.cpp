@@ -1,3 +1,7 @@
+#include "rad_unipc_math.h"
+#include "rad_wan_dit.h"
+#include <numeric>
+#include "rad_wan_vae.h"
 /* r4d_selftest -- dump the libr4d row table, cross-check it, and prove every row links and runs.
  *
  * A transcription error in a constraint table stays invisible until a model silently picks the
@@ -12393,6 +12397,42 @@ void timestep_round_cases(const Plugin& pl) {
             }
         }
         check(nm, down_bf16(dy, want.size()), want, 2e-2);
+    }
+}
+
+void attn_wide_cases(const Plugin& pl, std::initializer_list<int> widths) {
+    for (const int64_t hd : widths) {
+        const std::string row = fmt("attn_dense_h%lld_bf16", (long long)hd);
+        const RadKernelInfo* r = find(pl, row.c_str());
+        if (!r) { ok(row.c_str(), false, "row absent"); continue; }
+        const int64_t N = 300;
+        const std::vector<int32_t> cu = { 0, 139, (int32_t)N };
+        std::vector<float> qkv = randv((size_t)(N * 3 * hd), 1.0f);
+        for (float& x : qkv) x = bfr(x);
+        void* d = up_bf16(qkv);
+        auto col = [&](int c) {
+            RadTensor t = T((char*)d + c * hd * 2, RAD_BF16, { N, hd });
+            t.stride[0] = 3 * hd;
+            return t;
+        };
+        void* dout = dalloc((size_t)(N * hd) * 2);
+        const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 3 }),
+                                   T(dout, RAD_BF16, { N, hd }) },
+                              { PI("M", N), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
+                                PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ok(row.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> q((size_t)(N * hd)), k((size_t)(N * hd)), v((size_t)(N * hd));
+        for (int64_t i = 0; i < N; ++i)
+            for (int64_t t = 0; t < hd; ++t) {
+                q[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + t)];
+                k[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + hd + t)];
+                v[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + 2 * hd + t)];
+            }
+        std::vector<float> want((size_t)(N * hd));
+        for (size_t segment = 1; segment < cu.size(); ++segment)
+            host_attn(q, k, v, hd, hd, 1, 1, hd, cu[segment - 1], cu[segment],
+                      cu[segment - 1], cu[segment], false, &want);
+        check(row + " one head per spatial plane", down_bf16(dout, want.size()), want, 2e-2);
     }
 }
 
@@ -33662,6 +33702,284 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
     }
 }
 
+void umt5_attention_cases(const Plugin& pl) {
+    using namespace au;
+    const RadKernelInfo* r = find(pl, "attn_umt5_bf16");
+    if (!r) { ok("attn_umt5_bf16", false, "row absent"); return; }
+    constexpr int64_t heads = 2, width = 128, pitch = 131;
+    for (const int64_t rows : {3, 512}) {
+        std::vector<float> q(rows * pitch), k(q), v(q), bias(32 * heads);
+        std::vector<float> initial(q), want(q);
+        for (int64_t row = 0; row < rows; ++row) {
+            initial[row * pitch + width] = 21.0f;
+            want[row * pitch + width] = 21.0f;
+        }
+        // Move the non-zero dot products into the second half of each head.
+        for (int64_t head = 0; head < heads; ++head) {
+            const int64_t col = head * 64 + 37;
+            if (rows == 3) {
+                q[col] = 1.0f; q[pitch + col] = .5f;
+                k[col] = .75f; k[pitch + col] = .25f;
+                v[col] = head == 0 ? 1.0f : 3.0f;
+                v[pitch + col] = head == 0 ? 3.0f : 1.0f;
+                v[2 * pitch + col] = 16.0f;
+                bias[17 * heads + head] = head == 0 ? .75f : -.125f;
+                bias[heads + head] = head == 0 ? -.125f : .75f;
+                want[col] = head == 0 ? 2.125f : 2.3125f;
+                want[pitch + col] = head == 0 ? 1.9375f : 2.46875f;
+                want[2 * pitch + col] = 16.0f;
+            } else {
+                // A uniform 512-row softmax averages one nonzero value exactly.
+                v[(rows - 1) * pitch + col] = 2.0f;
+                for (int64_t row = 0; row < rows; ++row)
+                    want[row * pitch + col] = 1.0f / 256.0f;
+            }
+        }
+        const std::vector<int32_t> cu = rows == 3 ? std::vector<int32_t>{0, 2, 3}
+                                                 : std::vector<int32_t>{0, 512};
+        auto pitched = [&](void* p) {
+            RadTensor t = T(p, RAD_BF16, {rows, width});
+            t.stride[0] = pitch;
+            return t;
+        };
+        void* dst = up_bf16(initial);
+        const int rc = launch(r, {pitched(up_bf16(q)), pitched(up_bf16(k)), pitched(up_bf16(v)),
+                                  T(up_i32(cu), RAD_I32, {(int64_t)cu.size()}),
+                                  T(up_bf16(bias), RAD_BF16, {32, heads}), pitched(dst)},
+                              {PI("M", rows), PI("heads", heads), PS("dtype", "bf16")});
+        const std::string name = fmt("attn_umt5_bf16 %lld rows, including pitch gaps", (long long)rows);
+        if (rc != RAD_OK) { ok(name.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t bad = differ(down_bf16(dst, want.size()), want);
+        ok(name.c_str(), bad == 0, fmt("%lld values differ", (long long)bad));
+    }
+}
+
+void gelu_umt5_cases(const Plugin& pl) {
+    using namespace au;
+    const RadKernelInfo* r = find(pl, "gelu_umt5_bf16");
+    if (!r) { ok("gelu_umt5_bf16", false, "row absent"); return; }
+    // Pinned Wan GELU.forward evaluated on PyTorch with BF16 inputs.
+    std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                21, 21, 21, 21, 21, 21, 21, 21,
+                                .125f, .625f, 1.25f, 2.5f, 3.125f, 4, 0, 0};
+    auto want = input;
+    const float first[] = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                           -.16796875f, -.1328125f, 0};
+    const float second[] = {.06884765625f, .458984375f, 1.109375f, 2.484375f, 3.125f, 4, 0, 0};
+    std::copy_n(first, 8, want.begin());
+    std::copy_n(second, 8, want.begin() + 16);
+    void* dst = up_bf16(input);
+    RadTensor x = T(up_bf16(input), RAD_BF16, {2, 8});
+    RadTensor y = T(dst, RAD_BF16, {2, 8});
+    x.stride[0] = y.stride[0] = 16;
+    const int rc = launch(r, {x, y}, {PI("M", 2), PI("n", 8), PS("dtype", "bf16")});
+    const bool exact = rc == RAD_OK && differ(down_bf16(dst, want.size()), want) == 0;
+    ok("gelu_umt5_bf16 matches the pinned fixture and preserves row padding", exact,
+       fmt("rc=%d", rc));
+}
+
+void wan_rotary_cases(const Plugin& pl) {
+    using namespace au;
+    const auto* table = find(pl, "wan_rope_table_f32");
+    const auto* rotate = find(pl, "wan_rope_bf16");
+    if (!table || !rotate) { ok("Wan rotary", false, "row absent"); return; }
+    constexpr int64_t rows = 12, width = 128, pitch = 131;
+    auto pitched = [&](void* ptr, uint32_t dtype) {
+        RadTensor t = T(ptr, dtype, {rows, width});
+        t.stride[0] = pitch;
+        return t;
+    };
+    std::vector<float> pad(rows * pitch, 21.0f);
+    void* dc = up_f32(pad);
+    const auto coeff = pitched(dc, RAD_F32);
+    const int prep = launch(table, {T(up_i32({2, 4, 6}), RAD_I32, {3}), coeff},
+                            {PI("M", rows), PS("dtype", "f32")});
+    if (prep != RAD_OK) { ok("Wan rotary table", false, fmt("rc %d", prep)); return; }
+    const auto cs = down_f32(dc, pad.size());
+    constexpr int64_t row = 11 * pitch;
+    ok("Wan rotary table uses 22/21/21 pairs on time/height/width",
+       cs[row] == static_cast<float>(std::cos(1.0)) &&
+       cs[row + 44] == static_cast<float>(std::cos(1.0)) &&
+       cs[row + 86] == static_cast<float>(std::cos(2.0)) && cs[row + width] == 21.0f);
+
+    std::vector<float> q(pad), k(pad);
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < width; c += 2) {
+            q[r * pitch + c] = 1.0f; q[r * pitch + c + 1] = 0.0f;
+            k[r * pitch + c] = 0.0f; k[r * pitch + c + 1] = 1.0f;
+        }
+    void* dq = up_bf16(q);
+    void* dk = up_bf16(k);
+    const int used = launch(rotate, {pitched(dq, RAD_BF16), pitched(dk, RAD_BF16), coeff},
+                            {PI("M", rows), PI("heads", 1), PS("dtype", "bf16")});
+    if (used != RAD_OK) { ok("Wan apply rotary", false, fmt("rc %d", used)); return; }
+    q = down_bf16(dq, q.size());
+    k = down_bf16(dk, k.size());
+    ok("Wan rotary turns adjacent BF16 pairs and preserves pitched tails",
+       q[0] == 1.0f && q[1] == 0.0f && q[row + 44] == .5390625f && q[row + 45] == .83984375f &&
+       k[row + 86] == -.91015625f && k[row + 87] == -.416015625f &&
+       q[row + width] == 21.0f && k[row + width] == 21.0f);
+    const auto* rotate_f32 = find(pl, "wan_rope_f32");
+    if (!rotate_f32) { ok("Wan F32 rotary", false, "row absent"); return; }
+    std::vector<float> f32(rows * pitch, 0.0f);
+    f32[row + 86] = 1.0f;
+    void* fq = up_f32(f32);
+    void* fk = up_f32(f32);
+    const int full = launch(rotate_f32, {pitched(fq, RAD_F32), pitched(fk, RAD_F32), coeff},
+                            {PI("M", rows), PI("heads", 1), PS("dtype", "f32")});
+    f32 = down_f32(fq, f32.size());
+    ok("Wan rotary can keep the normalized query and key in FP32",
+       full == RAD_OK && f32[row + 86] == cs[row + 86] && f32[row + 87] == cs[row + 87]);
+}
+
+void wan_modulation_cases(const Plugin& pl) {
+    using namespace au;
+    const auto* norm = find(pl, "wan_mod_norm");
+    const auto* residual = find(pl, "wan_gated_add");
+    if (!norm || !residual) { ok("Wan modulation", false, "row absent"); return; }
+    void* x = up_f32({1, -1, 1, -1});
+    const auto state = T(x, RAD_F32, {2, 2});
+    const auto time = T(up_f32({1, 1, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0,
+                               2, 2, 1, 1, 3, 4, 0, 0, 0, 0, 0, 0}), RAD_F32, {2, 12});
+    const auto w = T(up_f32({0, 0, 0, 0, .5f, -.5f, 0, 0, 0, 0, 0, 0}), RAD_F32, {1, 6, 2});
+    const auto cut = T(up_i32({1}), RAD_I32, {1});
+    void* y = dalloc(4 * sizeof(uint16_t));
+    const int ns = launch(norm, {state, time, w, cut, T(y, RAD_BF16, {2, 2})},
+                          {PI("M", 2), PI("n", 2), PI("group", 0), PI("round_norm", 1),
+                           PS("dtype", "bf16")});
+    ok("Wan modulation selects timestep zero for the first-frame rows",
+       ns == RAD_OK && down_bf16(y, 4) == std::vector<float>{2, 0, 4, 0});
+    std::vector<float> u = {.25f, .5f, .25f, .5f};
+    const auto update = T(up_bf16(u), RAD_BF16, {2, 2});
+    const int rs = launch(residual, {state, update, time, w, cut},
+                          {PI("M", 2), PI("n", 2), PI("gate", 2), PS("dtype", "f32")});
+    ok("Wan gated residual updates keep FP32 state",
+       rs == RAD_OK && down_f32(x, 4) == std::vector<float>{1.375f, -.25f, 1.875f, .75f});
+}
+
+void wan_unpatch_cases(const Plugin& pl) {
+    using namespace au;
+    const auto* r = find(pl, "wan_unpatch");
+    if (!r) { ok("wan_unpatch", false, "row absent"); return; }
+    std::vector<float> x(4 * 8);
+    std::iota(x.begin(), x.end(), 0.0f);
+    const std::vector<float> wanted = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                                      16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    void* dst = dalloc(wanted.size() * sizeof(float));
+    const auto dims = T(up_i32({2, 2, 4}), RAD_I32, {3});
+    for (bool bf16 : {true, false}) {
+        auto src = bf16 ? T(up_bf16(x), RAD_BF16, {4, 8}) : T(up_f32(x), RAD_F32, {4, 8});
+        const int rc = launch(r, {src, dims, T(dst, RAD_F32, {16, 2})},
+                              {PI("M", 4), PI("n", 2), PS("dtype", bf16 ? "bf16" : "f32")});
+        const std::string name = fmt("wan_unpatch %s source, two frames", bf16 ? "bf16" : "f32");
+        ok(name.c_str(), rc == RAD_OK && differ(down_f32(dst, wanted.size()), wanted) == 0,
+           fmt("rc %d", rc));
+    }
+}
+
+void wan_vae_time_cases(const Plugin& pl) {
+    using namespace au;
+    const auto* h = find(pl, "wan_vae_history_bf16");
+    const auto* u = find(pl, "wan_vae_expand_bf16");
+    if (!h || !u) { ok("Wan VAE temporal ops", false, "row absent"); return; }
+    std::vector<float> x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    std::vector<float> filled(8, 33.0f);
+    void* input = up_bf16(x);
+    void* cache = up_bf16(filled);
+    void* out = dalloc(12 * sizeof(uint16_t));
+    auto history = T(cache, RAD_BF16, {4, 2});
+    int rc = launch(h, {T(input, RAD_BF16, {2, 2}), history, T(out, RAD_BF16, {2, 6})},
+                    {PI("M", 2), PI("temporal", 1), PI("reset", 1), PS("dtype", "bf16")});
+    ok("Wan VAE resets temporal history to two zero frames before its first convolution",
+       rc == RAD_OK && down_bf16(out, 12) == std::vector<float>{0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4});
+    void* volume = dalloc(16 * sizeof(uint16_t));
+    rc = launch(h, {T(static_cast<char*>(input) + 4 * sizeof(uint16_t), RAD_BF16, {4, 2}),
+                    history, T(volume, RAD_BF16, {8, 2})},
+                    {PI("M", 4), PI("temporal", 0), PI("reset", 0), PS("dtype", "bf16")});
+    ok("Wan VAE regular causal volume prepends the history in frame order",
+       rc == RAD_OK && down_bf16(volume, 16) ==
+       std::vector<float>{0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    std::vector<float> packed = {1, 2, 3, 4};
+    void* shortcut = up_bf16(packed);
+    const auto geom = T(up_i32({1, 1, 1}), RAD_I32, {3});
+    rc = launch(u, {T(shortcut, RAD_BF16, {1, 4}), geom, T(out, RAD_BF16, {4, 1})},
+                    {PI("M", 1), PI("cin", 4), PI("cout", 1), PI("st", 2), PI("s", 2),
+                     PI("drop", 1), PI("temporal", 0), PS("dtype", "bf16")});
+    ok("Wan VAE shortcut drops only the first expanded temporal plane",
+       rc == RAD_OK && down_bf16(out, 4) == std::vector<float>{3, 3, 4, 4});
+}
+
+void timestep_f64_case(const Plugin& pl) {
+    using namespace au;
+    const RadKernelInfo* r = find(pl, "timestep_embed_f64");
+    if (!r) { ok("timestep_embed_f64", false, "row absent"); return; }
+    constexpr int64_t rows = 2, n = 256, pitch = 263;
+    std::vector<float> t = {0.0f, 999.0f}, initial(rows * pitch, 21.0f);
+    void* dy = up_f32(initial);
+    RadTensor out = T(dy, RAD_F32, {rows, n});
+    out.stride[0] = pitch;
+    const int rc = launch(r, {T(up_f32(t), RAD_F32, {rows}), out},
+                          {PI("M", rows), PI("n", n), PF("max_period", 10000.0), PS("dtype", "f32")});
+    if (rc != RAD_OK) { ok("timestep_embed_f64", false, "rc " + std::to_string(rc)); return; }
+    const auto result = down_f32(dy, initial.size());
+    bool exact = result[pitch + 3] == 0x1.68de3cp-1f &&
+                 result[pitch + 63] == -0x1.077d74p-2f &&
+                 result[pitch + 131] == 0x1.6b349ap-1f &&
+                 result[pitch + 191] == -0x1.eec282p-1f;
+    for (int64_t i = 0; i < n / 2; ++i)
+        exact = exact && result[i] == 1.0f && result[n / 2 + i] == 0.0f;
+    for (int64_t row = 0; row < rows; ++row)
+        for (int64_t i = n; i < pitch; ++i) exact = exact && result[row * pitch + i] == 21.0f;
+    ok("timestep_embed_f64 matches pinned Wan values and preserves padding", exact);
+    out.stride[0] = n - 1;
+    const int rejected = launch(r, {T(up_f32(t), RAD_F32, {rows}), out},
+                                {PI("M", rows), PI("n", n), PF("max_period", 10000.0), PS("dtype", "f32")});
+    ok("timestep_embed_f64 rejects overlapping rows", rejected == RAD_E_STRIDE);
+}
+
+void flow_unipc_cases(const Plugin& pl) {
+    using namespace au;
+    const RadKernelInfo* r = find(pl, "flow_unipc_step_f32");
+    if (!r) { ok("flow_unipc_step_f32", false, "row absent"); return; }
+    const int64_t M = 19, n = 48, xld = n + 5, hld = 3 * n + 11;
+    // First prediction, a corrected prediction using all history, and terminal x0.
+    const std::vector<std::vector<float>> coefficients = {
+        { .9f, 0, 0, 0, 0, .8f, .2f, 0 },
+        { .72f, .8f, .2f, -.01f, .06f, .5f, .5f, -.1f },
+        { .36f, .5f, .5f, -.06f, .2f, 0, 1, 0 },
+    };
+    for (const bool bf : { false, true }) {
+        std::vector<float> x = randv(M * xld, 2.0f), history(M * hld, 15.0f);
+        std::vector<float> v = randv(M * n, 1.0f);
+        for (int64_t row = 0; row < M; ++row)
+            std::fill_n(history.begin() + row * hld, 3 * n, 0.0f);
+        void* dx = up_f32(x);
+        void* dh = up_f32(history);
+        void* dv = bf ? up_bf16(v) : up_f32(v);
+        RadTensor tx = T(dx, RAD_F32, { M, n }); tx.stride[0] = xld;
+        RadTensor th = T(dh, RAD_F32, { M, 3 * n }); th.stride[0] = hld;
+        const std::string name = fmt("flow_unipc_step_f32 %s velocity", bf ? "bf16" : "f32");
+        for (const auto& c : coefficients) {
+            const int rc = launch(r, { T(dv, bf ? RAD_BF16 : RAD_F32, { M, n }),
+                                       T(up_f32(c), RAD_F32, { rad_unipc::COUNT }), th, tx },
+                                  { PI("M", M), PI("n", n), PS("dtype", "f32") });
+            if (rc != RAD_OK) { ok(name.c_str(), false, "rc " + std::to_string(rc)); break; }
+            for (int64_t row = 0; row < M; ++row) {
+                for (int64_t col = 0; col < n; ++col) {
+                    float& sample = x[row * xld + col];
+                    float* h = history.data() + row * hld + col;
+                    sample = rad_unipc::advance(c.data(), sample, v[row * n + col],
+                                                h[0], h[n], h[2 * n]);
+                }
+            }
+            const int64_t bad = differ(down_f32(dx, x.size()), x) +
+                                differ(down_f32(dh, history.size()), history);
+            ok((name + ", sample and history including pitch gaps").c_str(), bad == 0,
+               fmt("%lld values differ", (long long)bad));
+        }
+    }
+}
+
 static void device_phase(const Plugin& pl) {
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess || n < 1) {
@@ -33681,6 +33999,16 @@ static void device_phase(const Plugin& pl) {
     }
     if (devs.empty()) { skip("device phase", "no gfx1200/gfx1201 device"); return; }
     st_set_device(devs[0]);
+    if (sel("flow_unipc_step")) flow_unipc_cases(pl);
+    if (sel("timestep_embed_f64")) timestep_f64_case(pl);
+    if (sel("wan_rotary")) wan_rotary_cases(pl);
+    if (sel("wan_modulation")) wan_modulation_cases(pl);
+    if (sel("wan_unpatch")) wan_unpatch_cases(pl);
+    if (sel("wan_vae_time")) wan_vae_time_cases(pl);
+    if (sel("umt5_attention")) umt5_attention_cases(pl);
+    if (sel("gelu_umt5")) gelu_umt5_cases(pl);
+    if (sel("attn_dense_h640_bf16") || sel("attn_dense_h1024_bf16")) g3::attn_wide_cases(pl, {640, 1024});
+
 
     if (!g_case) std::printf("\ndevice smoke tests (device %d)\n", devs[0]);
 

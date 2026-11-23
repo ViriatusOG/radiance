@@ -1571,10 +1571,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     ? src.shared_mlp_up
                                     : nm.ckpt("%s.up_proj.weight", src.shared);
         /* An architecture that sized the gate's code pair from this weight has probed it. */
-        /* qwen4exp_lora: mlp.shared_expert.down_proj is a LoRA-targeted module kind; see the
-         * gated attn block's o.declare (LinearFP8::plain_bf16_view). Probing it as the view
-         * (reads_x, not probed_i8) makes the SwiGLU producer write the bf16 plane below. */
-        sh_down.plain_bf16_view = true;
+        /* qwen4exp_lora: mlp.shared_expert.down_proj is a LoRA module kind. The plain bf16
+         * view is taken only when a runtime adapter targets this source (see the gated attn
+         * block). Probing it as the view (reads_x, not probed_i8) makes the SwiGLU producer write
+         * the bf16 plane below; with no adapter the probe stays the int8 one. */
+        sh_down.plain_bf16_view = shared_down && rad_lora_source_targeted(b, shared_down);
         if (!sh_down.mapped) RAD_ARCH_TRY(sh_down.probe(b, nm, g, down_base, { shared_down }));
         /* The code pair the gate writes, E4M3 or int8 (ActFP8::q8_fed); an int8 down projection
          * that quantises for itself also writes the int8 pair on this lane. */

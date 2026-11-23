@@ -139,6 +139,7 @@ rad-convert [options] <input> -o <model.rad>
                        states; a number given here is used as given). 0 leaves the draft
                        head out
       --reuse FILE     copy every weight an earlier container holds identically
+      --reuse-only     with --reuse, refuse any selected weight without a matching source
       --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from
                        the --reuse container's source; every weight that reads one is converted
       --lora FILE|DIR  a PEFT adapter merged into the checkpoint tensors it names before they
@@ -151,6 +152,8 @@ rad-convert [options] <input> -o <model.rad>
       --defer GLOB     leave the matching weights out, for a later --in-place run to add
       --gpus LIST      the cards (HIP device numbers, comma separated) quantisers may run on;
                        large weights then run two at a time. The bytes are the host's
+      --gpu-workers N  with --gpus, prefer N OpenMP workers for small trellis GPTQ jobs;
+                       N must leave at least one worker for other jobs and cannot exceed the cards in --gpus
       --plan-only      declare, plan every weight's encoding, print the plan, and stop
       --report N       the worst N quantisation errors to print (default 20)
   -v, --verbose
@@ -336,6 +339,17 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
 - `autoround` and `paroquant` are slow. AutoRound's 200 default steps each cost N·K² multiply-adds;
   on a 16-core Zen 5 at about 2.5 TFLOP/s that is minutes for a 17408-wide down projection and
   most of a working day for a 27B dense model. `iters=50` takes a quarter of the time.
+- `--gpu-workers N` separates small trellis GPTQ jobs from other converter jobs: N OpenMP
+  workers prefer the trellis queue and the rest prefer the host/copy queue; workers steal from the
+  other queue once their own is empty. It requires `--gpus`, at most one worker per listed card, and at least one remaining host worker,
+  e.g. `OMP_NUM_THREADS=8 rad-convert ... --gpus 0 --gpu-workers 4`. Large jobs retain their
+  existing scheduling. The option can reduce starvation but cannot guarantee card utilization:
+  Hessian preparation, storage, CPU work and the last few jobs may still leave cards idle.
+- `--reuse-only` requires `--reuse` without `--in-place` and refuses a selected, non-deferred
+  weight unless one of the supplied containers matches its encoding, quantiser, options, shape and
+  expert slot. It is useful for assembling verified partial containers without silently
+  quantising a missing weight. `--plan-only` stops before matching reusable weights; it is not a
+  reuse-only completeness check.
 - `--reuse` / `--in-place` match a weight on its encoding, quantiser, options and shape, not on its
   source bytes, and carry whatever calibration made the old planes. Use `--reuse` only when the
   source and the calibration are the same, or name the changed source tensors with `--changed`.

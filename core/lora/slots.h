@@ -52,8 +52,11 @@ public:
     uint64_t publish(int slot, const std::string& name, const std::string& dir);
 
     /* The slot, uid and a hold for a loaded adapter that is not draining; RAD_E_NOTFOUND
-     * otherwise. The adapter is not freed while the hold lives. */
-    int  acquire(const std::string& name, int32_t* slot, uint64_t* uid, std::shared_ptr<void>* hold);
+     * otherwise. The adapter is not freed while the hold lives. On a miss, optional `all_held`
+     * reports capacity under the same lock, so a newly published matching adapter is not
+     * mistaken for an unrelated combination occupying the last slot. */
+    int  acquire(const std::string& name, int32_t* slot, uint64_t* uid, std::shared_ptr<void>* hold,
+                 bool* all_held = nullptr);
 
     /* Unpublish `name`. RAD_OK with *in_flight 0: the slot is free (cooling). RAD_OK with
      * *in_flight > 0: those requests still use it, so it is draining and frees itself when the

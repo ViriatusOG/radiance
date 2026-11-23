@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE minimaxh3_limits_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE minimaxh3_limits_test wan_arch_test wan_vae_test wan_denoiser_test wan_conditioning_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -171,7 +171,7 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 
 # shipped_plugins_test loads the shipped architecture plugins, which bind the plugin-facing C ABI
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
-set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
+set(RAD_TESTS_WHOLE_CORE shipped_plugins_test generator_lora_engine_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
@@ -430,6 +430,14 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
     endif()
   endif()
 endforeach()
+# This test loads a tiny generator in process and holds real adapter slots through replacement
+# and unload. Export its core callbacks and build only the model/plugin it exercises.
+if(TARGET generator_lora_engine_test)
+  target_compile_definitions(generator_lora_engine_test PRIVATE
+    RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>" RAD_E2E_HOME="${RAD_PLUGIN_OUT}")
+  add_dependencies(generator_lora_engine_test rad-convert libref libquant qwenimage21)
+  set_tests_properties(generator_lora_engine_test PROPERTIES LABELS "e2e" TIMEOUT 90)
+endif()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)

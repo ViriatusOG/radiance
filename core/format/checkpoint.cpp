@@ -261,10 +261,12 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
     RadModelMeta& m = out->m;
+    // UMT5 is the text encoder in Wan's Diffusers package. Its dimensions use the T5 names.
+    const bool umt5 = out->arch == "umt5";
     /* Nomic BERT states its geometry with n_layer, n_embd, n_head, n_inner, n_positions and
      * moe_top_k. They are the last fallbacks in each chain, so a config carrying both spellings
      * reads the HuggingFace one. */
-    m.n_layers    = gi("num_hidden_layers", gi("n_layer", 0));
+    m.n_layers    = gi("num_hidden_layers", gi("n_layer", umt5 ? gi("num_layers", 0) : 0));
     /* Nemotron-H Puzzle states no count: HF derives it from the per-layer list. */
     if (m.n_layers == 0)
         if (const char* types = nested("layers_block_type"))
@@ -274,17 +276,19 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
                 ++m.n_layers;
                 while (*p && *p != ' ') ++p;
             }
-    m.n_embd      = gi("hidden_size", gi("n_embd", 0));
-    m.n_head      = gi("num_attention_heads", gi("n_head", 0));
+    m.n_embd      = gi("hidden_size", gi("n_embd", umt5 ? gi("d_model", 0) : 0));
+    m.n_head      = gi("num_attention_heads", gi("n_head", umt5 ? gi("num_heads", 0) : 0));
     m.n_head_kv   = gi("num_key_value_heads", m.n_head);
     /* Read head_dim; derive it only as a fallback. On qwen35 it is 256 while
      * hidden_size/num_attention_heads is 213. */
-    m.head_dim    = gi("head_dim", m.n_head ? m.n_embd / m.n_head : 0);
+    const int64_t inferred_head_dim = m.n_head ? m.n_embd / m.n_head : 0;
+    m.head_dim    = gi("head_dim", umt5 ? gi("d_kv", inferred_head_dim) : inferred_head_dim);
     /* A routed config has no `intermediate_size`, only `moe_intermediate_size` (one expert's
      * width, which is what a GEMM sees and what n_ff means) and
      * `shared_expert_intermediate_size` (read by the plugin from the free-form table). Nomic
      * spells the same width n_inner. */
-    m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", gi("n_inner", 0)));
+    m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size",
+                                              gi("n_inner", umt5 ? gi("d_ff", 0) : 0)));
     m.n_vocab     = gi("vocab_size", 0);
     m.n_ctx_train = gi("max_position_embeddings", gi("n_positions", 0));
     /* The DeepSeek spelling: Unlimited-OCR's decoder is a DeepSeek-V2 MoE and states its expert

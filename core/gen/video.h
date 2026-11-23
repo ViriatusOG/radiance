@@ -9,6 +9,7 @@
 #pragma once
 #include "rad_core.h"
 #include "mm/processor.h"
+#include "wan_unipc.h"
 
 #include <atomic>
 #include <cmath>
@@ -109,8 +110,8 @@ struct VideoRequest {
     int32_t  width = 0, height = 0;   /* pixels, within the declaration's limits */
     int32_t  chunks = 0;           /* the length in chunks (RadVideoGenDecl) */
     int32_t  steps = 0;            /* sigma grid points; 0: the model's default */
-    /* RAD_SAMPLER_* (abi/rad_runtime.h). */
-    int32_t  sampler = 0;
+    /* RAD_SAMPLER_* (abi/rad_runtime.h), or -1 for the model's default. */
+    int32_t  sampler = -1;
     /* Each stream's schedule shift; 0: the declaration's. */
     double   shift_video = 0.0;
     double   shift_audio = 0.0;
@@ -157,15 +158,17 @@ VideoShape video_shape(const RadVideoGenDecl& d, int32_t width, int32_t height, 
 void video_small_size(const RadVideoGenDecl& d, int32_t width, int32_t height, double factor,
                       int32_t* small_w, int32_t* small_h);
 
-/* The two schedules a request of `steps` runs (RadVideoGenDecl, "The sampler": grid points under
- * form 0, evaluations under form 1): each the f32 sigmas, last 0, and the model evaluations it
- * takes, the shorter of the two. With a trained schedule any other step count than the declared
- * one gives no steps. `video_tokens` are the video's latent tokens, which form 1's dynamic shift
+/* The schedules a request runs (RadVideoGenDecl, "The sampler"): f32 sigmas with a final zero
+ * and the evaluation count. Form 0 takes grid points and stops at the shorter of its two
+ * streams. Form 1 and UniPC take the number of model evaluations. UniPC adds timestep and
+ * history coefficients and has no audio stream. A trained schedule gives no steps for any
+ * count outside its declaration. `video_tokens` are the video's latent tokens, which form 1's dynamic shift
  * reads. With `refine` (form 1 and refinement rungs) the rungs are followed by the refinement
  * rungs instead of a 0, the evaluations their sum. `shift_video` and `shift_audio` replace the
- * declaration's shifts of form 0 when above 0. */
+ * declaration's shifts of form 0 or UniPC when above 0. */
 struct VideoSchedule {
     std::vector<float> sig_v, sig_a;
+    std::vector<wan::UniPCStep> unipc;
     int32_t            steps = 0;
 };
 VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t video_tokens = 0,

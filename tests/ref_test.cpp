@@ -19,6 +19,7 @@
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 #include "rad_planes.h"
+#include "rad_umt5_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1408,6 +1409,23 @@ TEST(plugin_surface) {
  * longer has a fallback or an oracle, which must be a decision, not an oversight (docs/OPS.md). */
 TEST(op_vocabulary) {
     static const char* kOps[] = {
+
+        "flow_unipc_step",
+
+        "timestep_embed_f64",
+
+        "wan_vae_frame_cu",
+        "wan_vae_history",
+        "wan_vae_expand",
+        "wan_unpatch",
+        "wan_mod_norm",
+        "wan_gated_add",
+        "wan_rope_table",
+        "wan_rope",
+
+        "attn_umt5",
+        "gelu_umt5",
+
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
@@ -6555,6 +6573,64 @@ TEST(errors_are_values) {
     CHECK_EQ(run("had_quant_act_i8", c), RAD_E_UNSUPPORTED);
 }
 
+TEST(op_attn_umt5_preserves_direction_and_packed_sequence_boundaries) {
+    constexpr int64_t width = 128, pitch = 131;
+    T q(RAD_BF16, {3, pitch}), k(RAD_BF16, {3, pitch}), v(RAD_BF16, {3, pitch});
+    T cu(RAD_I32, {3}), bias(RAD_BF16, {32, 2}), out(RAD_BF16, {3, pitch});
+    for (T* matrix : { &q, &k, &v, &out }) matrix->t.shape[1] = width;
+    auto put = [](T& t, int64_t off, float value) {
+        st_dt(t.t.dtype, t.t.data, off, value);
+    };
+    for (int h = 0; h < 2; ++h) {
+        const int64_t col = h * 64;
+        put(q, col, 1.0f); put(q, pitch + col, .5f);
+        put(k, col, .75f); put(k, pitch + col, .25f);
+        put(v, col, h == 0 ? 1.0f : 3.0f);
+        put(v, pitch + col, h == 0 ? 3.0f : 1.0f);
+        put(v, 2 * pitch + col, 16.0f);
+    }
+    put(bias, 17 * 2, .75f); put(bias, 1 * 2, -.125f);
+    put(bias, 17 * 2 + 1, -.125f); put(bias, 1 * 2 + 1, .75f);
+    put(out, pitch - 1, 21.0f);
+    cu.n({0, 2, 3});
+    A a; a.t(q).t(k).t(v).t(cu).t(bias).t(out).i("M", 3).i("heads", 2).s("dtype", "bf16");
+    CHECK_OK(run("attn_umt5", a));
+    // The pinned UMT5 attention expression in PyTorch BF16, no qk scaling.
+    CHECK_EQ(out.at(0), 2.125f);
+    CHECK_EQ(out.at(pitch), 1.9375f);
+    CHECK_EQ(out.at(64), 2.3125f);
+    CHECK_EQ(out.at(pitch + 64), 2.46875f);
+    CHECK_EQ(out.at(2 * pitch), 16.0f);
+    CHECK_EQ(out.at(pitch - 1), 21.0f);
+    cu.n({0, 0, 3});
+    CHECK_EQ(run("attn_umt5", a), RAD_E_SHAPE);
+}
+
+TEST(umt5_relative_buckets_match_the_reference_distance_thresholds) {
+    const int starts[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 23, 32, 46, 64, 91 };
+    for (int i = 1; i < 16; ++i) {
+        CHECK_EQ(rad_umt5::bucket(-starts[i]), i);
+        CHECK_EQ(rad_umt5::bucket(starts[i]), 16 + i);
+        CHECK_EQ(rad_umt5::bucket(1 - starts[i]), i - 1);
+    }
+    CHECK_EQ(rad_umt5::bucket(-511), 15);
+    CHECK_EQ(rad_umt5::bucket(511), 31);
+}
+
+TEST(gelu_umt5_preserves_wan_bf16_rounding) {
+    const std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                      .125f, .625f, 1.25f, 2.5f, 3.125f, 4};
+    // Official Wan GELU.forward on PyTorch 2.8.0 with BF16 input.
+    const std::vector<float> expected = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                                         -.16796875f, -.1328125f, 0, .06884765625f, .458984375f,
+                                         1.109375f, 2.484375f, 3.125f, 4};
+    T x(RAD_BF16, {2, 7}); x.f(input);
+    T y(RAD_BF16, {2, 7});
+    A a; a.t(x).t(y).i("M", 2).i("n", 7).s("dtype", "bf16");
+    CHECK_OK(run("gelu_umt5", a));
+    for (size_t i = 0; i < expected.size(); ++i) CHECK_EQ(y.at(i), expected[i]);
+}
+
 RAD_TEST_MAIN()
 
 /* scatter_rows: the three rules that distinguish it from the gather it mirrors, each because the
@@ -10579,6 +10655,31 @@ struct Geo {
 #define G(op, key, r, body) { op, key, r, [](A& a, int64_t R) { body; } }
 std::vector<Geo> geometries() {
     return {
+        G("flow_unipc_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+
+        G("timestep_embed_f64", "M", 3, a.i("M", R).i("n", 8).d("max_period", 10000.0)
+                                        .s("dtype", "f32")),
+
+        G("wan_rope", "M", 8, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
+
+        G("wan_rope_table", "M", 16, a.i("M", R).s("dtype", "f32")),
+
+        G("wan_gated_add", "M", 4, a.i("M", R).i("n", 8).i("gate", 5).s("dtype", "f32")),
+
+        G("wan_mod_norm", "M", 4, a.i("M", R).i("n", 8).i("group", 3).s("dtype", "bf16")),
+
+        G("wan_unpatch", "M", 16, a.i("M", R).i("n", 2).s("dtype", "bf16")),
+
+        G("wan_vae_expand", "M", 8, a.i("M", R).i("cin", 8).i("cout", 8).i("st", 2)
+                                       .i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16")),
+
+        G("wan_vae_history", "M", 4, a.i("M", R).i("temporal", 1).i("reset", 0).s("dtype", "bf16")),
+
+        G("wan_vae_frame_cu", "M", 3, a.i("M", R)),
+
+        G("attn_umt5", "M", 6, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
+        G("gelu_umt5", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
+
         G("position_scale", "M", 3, a.i("M", R).i("n", 8).i("original", 16384)
                                        .d("beta", 0.1).s("dtype", "f32")),
         G("embed_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("gqa", 2)
@@ -11762,4 +11863,218 @@ TEST(op_sam_attn_refuses_malformed_geometry) {
           .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
           .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
     CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
+}
+
+
+TEST(wan_rotary_resets_the_frequency_ladder_on_each_axis) {
+    T geom(RAD_I32, {3}); geom.n({2, 4, 6});
+    T table(RAD_F32, {12, 128});
+    A make; make.t(geom).t(table).i("M", 12).s("dtype", "f32");
+    CHECK_OK(run("wan_rope_table", make));
+    // Row 11 is patch (1, 1, 2). Pair zero of each axis has frequency 1.
+    CHECK_EQ(table.at(11 * 128), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 44), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 86), static_cast<float>(std::cos(2.0)));
+    CHECK_NEAR(table.at(11 * 128 + 2), std::cos(std::pow(10000.0, -1.0 / 22.0)), 1e-7);
+    CHECK_NEAR(table.at(11 * 128 + 46), std::cos(std::pow(10000.0, -1.0 / 21.0)), 1e-7);
+
+    std::vector<float> qv(12 * 128), kv(qv);
+    for (size_t i = 0; i < qv.size(); i += 2) { qv[i] = 1.0f; kv[i + 1] = 1.0f; }
+    T q(RAD_BF16, {12, 128}); q.f(qv);
+    T k(RAD_BF16, {12, 128}); k.f(kv);
+    A rotate; rotate.t(q).t(k).t(table).i("M", 12).i("heads", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_rope", rotate));
+    CHECK_EQ(q.at(0), 1.0f); CHECK_EQ(q.at(1), 0.0f);
+    CHECK_EQ(q.at(11 * 128 + 44), .5390625f);
+    CHECK_EQ(q.at(11 * 128 + 45), .83984375f);
+    CHECK_EQ(k.at(11 * 128 + 86), -.91015625f);
+    CHECK_EQ(k.at(11 * 128 + 87), -.416015625f);
+}
+
+
+TEST(wan_block_modulation_and_gates_select_the_first_frame_row) {
+    T x(RAD_F32, {2, 2}); x.f({1, -1, 1, -1});
+    T time(RAD_F32, {2, 12}); time.f({1, 1, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0,
+                                      2, 2, 1, 1, 3, 4, 0, 0, 0, 0, 0, 0});
+    T table(RAD_F32, {1, 6, 2}); table.f({0, 0, 0, 0, .5f, -.5f, 0, 0, 0, 0, 0, 0});
+    T split(RAD_I32, {1}); split.n({1});
+    T bf(RAD_BF16, {2, 2});
+    A norm; norm.t(x).t(time).t(table).t(split).t(bf).i("M", 2).i("n", 2)
+        .i("group", 0).d("eps", 1e-6).i("round_norm", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_mod_norm", norm));
+    CHECK_EQ(bf.at(0), 2.0f); CHECK_EQ(bf.at(1), 0.0f);
+    CHECK_EQ(bf.at(2), 4.0f); CHECK_EQ(bf.at(3), 0.0f);
+    T update(RAD_BF16, {2, 2}); update.f({.25f, .5f, .25f, .5f});
+    A gated; gated.t(x).t(update).t(time).t(table).t(split).i("M", 2).i("n", 2)
+        .i("gate", 2).s("dtype", "f32");
+    CHECK_OK(run("wan_gated_add", gated));
+    CHECK_EQ(x.at(0), 1.375f); CHECK_EQ(x.at(1), -.25f);
+    CHECK_EQ(x.at(2), 1.875f); CHECK_EQ(x.at(3), .75f);
+
+    T head_time(RAD_F32, {1, 2}); head_time.f({1, 2});
+    T head_table(RAD_F32, {1, 2, 2}); head_table.f({3, 4, 5, 6});
+    T state(RAD_F32, {1, 2}); state.f({3, 3});
+    T head(RAD_F32, {1, 2});
+    A out; out.t(state).t(head_time).t(head_table).tnull().t(head).i("M", 1).i("n", 2)
+        .i("group", -1).s("dtype", "f32");
+    CHECK_OK(run("wan_mod_norm", out));
+    CHECK_EQ(head.at(0), 4.0f); CHECK_EQ(head.at(1), 6.0f);
+}
+
+
+TEST(wan_unpatch_preserves_spatial_order_and_emits_float_velocity) {
+    T geom(RAD_I32, {3}); geom.n({2, 2, 4});
+    T x(RAD_BF16, {4, 8}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                               16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31});
+    T y(RAD_F32, {16, 2});
+    A a; a.t(x).t(geom).t(y).i("M", 4).i("n", 2).s("dtype", "bf16");
+    CHECK_OK(run("wan_unpatch", a));
+    const float expected[] = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                              16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    for (int i = 0; i < 32; ++i) CHECK_EQ(y.at(i), expected[i]);
+    geom.n({2, 3, 4});
+    CHECK_EQ(run("wan_unpatch", a), RAD_E_SHAPE);
+}
+
+
+TEST(wan_vae_frame_cu_separates_each_spatial_plane) {
+    T dims(RAD_I32, {3}); dims.n({2, 2, 3});
+    T offsets(RAD_I32, {3});
+    A a; a.t(dims).t(offsets).i("M", 3);
+    CHECK_OK(run("wan_vae_frame_cu", a));
+    const auto* cu = static_cast<const int32_t*>(offsets.t.data);
+    CHECK_EQ(cu[0], 0); CHECK_EQ(cu[1], 6); CHECK_EQ(cu[2], 12);
+}
+
+
+TEST(wan_vae_decoder_history_tracks_short_and_long_chunks) {
+    T x(RAD_BF16, {2, 2}); x.f({1, 2, 3, 4});
+    T history(RAD_BF16, {4, 2}); history.f({33, 33, 33, 33, 33, 33, 33, 33});
+    T windows(RAD_BF16, {2, 6});
+    A reset; reset.t(x).t(history).t(windows).i("M", 2).i("temporal", 1).i("reset", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_history", reset));
+    const float expected_windows[] = {0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4};
+    for (int i = 0; i < 12; ++i) CHECK_EQ(windows.at(i), expected_windows[i]);
+    CHECK_EQ(history.at(0), 0.0f); CHECK_EQ(history.at(4), 1.0f);
+
+    T next(RAD_BF16, {4, 2}); next.f({5, 6, 7, 8, 9, 10, 11, 12});
+    T volume(RAD_BF16, {8, 2});
+    A reuse; reuse.t(next).t(history).t(volume).i("M", 4).i("temporal", 0).i("reset", 0).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_history", reuse));
+    for (int i = 0; i < 4; ++i) CHECK_EQ(volume.at(i), 0.0f);
+    for (int i = 4; i < 16; ++i) CHECK_EQ(volume.at(i), static_cast<float>(i - 3));
+    for (int i = 0; i < 8; ++i) CHECK_EQ(history.at(i), static_cast<float>(i + 5));
+}
+
+
+TEST(wan_vae_temporal_shuffle_and_shortcut_keep_reference_order) {
+    T grid(RAD_I32, {3}); grid.n({2, 1, 2});
+    T x(RAD_BF16, {4, 4}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    T y(RAD_BF16, {8, 2});
+    A shuffle; shuffle.t(x).t(grid).t(y).i("M", 4).i("cin", 4).i("cout", 2)
+        .i("st", 2).i("s", 1).i("drop", 0).i("temporal", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_expand", shuffle));
+    const float expected[] = {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15};
+    for (int i = 0; i < 16; ++i) CHECK_EQ(y.at(i), expected[i]);
+
+    T shortcut_grid(RAD_I32, {3}); shortcut_grid.n({1, 1, 1});
+    T input(RAD_BF16, {1, 4}); input.f({1, 2, 3, 4});
+    T cropped(RAD_BF16, {4, 1});
+    A shortcut; shortcut.t(input).t(shortcut_grid).t(cropped).i("M", 1).i("cin", 4).i("cout", 1)
+        .i("st", 2).i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_expand", shortcut));
+    CHECK_EQ(cropped.at(0), 3.0f); CHECK_EQ(cropped.at(1), 3.0f);
+    CHECK_EQ(cropped.at(2), 4.0f); CHECK_EQ(cropped.at(3), 4.0f);
+}
+
+
+TEST(timestep_embed_f64_matches_pinned_wan_sinusoidal_embedding) {
+    T t(RAD_F32, {2}); t.f({0, 999});
+    T y(RAD_F32, {2, 256});
+    A a; a.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_OK(run("timestep_embed_f64", a));
+    for (int i = 0; i < 128; ++i) {
+        CHECK_EQ(y.at(i), 1.0f);
+        CHECK_EQ(y.at(128 + i), 0.0f);
+    }
+    // Wan's FP64 sinusoidal_embedding_1d, then narrowed to FP32 for the MLP.
+    CHECK_EQ(y.at(256 + 3), 0x1.68de3cp-1f);
+    CHECK_EQ(y.at(256 + 63), -0x1.077d74p-2f);
+    CHECK_EQ(y.at(256 + 131), 0x1.6b349ap-1f);
+    CHECK_EQ(y.at(256 + 191), -0x1.eec282p-1f);
+    y.t.stride[0] = 255;
+    A overlap; overlap.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", overlap), RAD_E_STRIDE);
+    T wrong_rank(RAD_F32, {1, 2, 256});
+    A rank; rank.t(t).t(wrong_rank).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", rank), RAD_E_SHAPE);
+}
+
+
+TEST(flow_unipc_step_updates_two_inout_views_and_refuses_overlapping_rows) {
+    T v(RAD_BF16, { 2, 1 }), coeff(RAD_F32, { 8 });
+    T history(RAD_F32, { 2, 5 }), x(RAD_F32, { 2, 2 });
+    history.t.shape[1] = 3;
+    x.t.shape[1] = 1;
+    x.f({ 1, 9, 1, 9 });
+    history.f({ 0, 0, 0, 8, 8, 0, 0, 0, 8, 8 });
+    auto step = [&] {
+        A a;
+        a.t(v).t(coeff).t(history).t(x).i("M", 2).i("n", 1).s("dtype", "f32");
+        return run("flow_unipc_step", a);
+    };
+    v.f({ .5f, .5f });
+    coeff.f({ .5f, 0, 0, 0, 0, .5f, .5f, 0 });
+    CHECK_OK(step());
+    CHECK_EQ(x.at(0), .875f);
+    CHECK_EQ(history.at(0), 1.0f);
+    CHECK_EQ(history.at(1), .75f);
+    v.f({ 1, 1 });
+    coeff.f({ .25f, .5f, .5f, 0, .25f, .25f, .75f, -.125f });
+    CHECK_OK(step());
+    for (int row = 0; row < 2; ++row) {
+        CHECK_EQ(x.at(2 * row), .6640625f);
+        CHECK_EQ(x.at(2 * row + 1), 9.0f);
+        CHECK_EQ(history.at(5 * row), .84375f);
+        CHECK_EQ(history.at(5 * row + 1), .625f);
+        CHECK_EQ(history.at(5 * row + 2), .75f);
+        CHECK_EQ(history.at(5 * row + 3), 8.0f);
+        CHECK_EQ(history.at(5 * row + 4), 8.0f);
+    }
+    history.t.stride[0] = 2;
+    CHECK_EQ(step(), RAD_E_STRIDE);
+    history.t.rank = 3;
+    CHECK_EQ(step(), RAD_E_SHAPE);
+}
+
+
+TEST(flow_unipc_step_blends_classifier_free_guidance_before_updating_history) {
+    T v(RAD_F32, {1, 1}), coeff(RAD_F32, {8}), history(RAD_F32, {1, 3});
+    T x(RAD_F32, {1, 1}), negative(RAD_F32, {1, 1}), guidance(RAD_F32, {1});
+    v.f({1.0f});
+    negative.f({.5f});
+    guidance.f({3.0f});
+    coeff.f({.5f, 0, 0, 0, 0, .5f, .5f, 0});
+    history.f({0, 0, 0});
+    x.f({3.0f});
+    A incomplete;
+    incomplete.t(v).t(coeff).t(history).t(x).t(negative).i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_EQ(run("flow_unipc_step", incomplete), RAD_E_INVAL);
+    A guided;
+    guided.t(v).t(coeff).t(history).t(x).t(negative).t(guidance)
+        .i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("flow_unipc_step", guided));
+    CHECK_EQ(x.at(0), 2.5f);
+    CHECK_EQ(history.at(1), 2.0f);
+}
+
+
+TEST(wan_vae_norm_rounds_length_before_division) {
+    T x(RAD_BF16, {1, 8}); x.f({6, 1, 0, 0, 0, 0, 0, 0});
+    T gain(RAD_BF16, {8, 1, 1, 1}); gain.f(std::vector<float>(8, 1.0f));
+    T y(RAD_BF16, {1, 8});
+    A a; a.t(x).t(gain).t(y).i("M", 1).i("n", 8).i("round_length", 1)
+        .s("act", "none").s("dtype", "bf16");
+    CHECK_OK(run("l2norm_chan", a));
+    CHECK_EQ(y.at(0), 2.78125f); CHECK_EQ(y.at(1), 0.46484375f);
 }

@@ -1107,6 +1107,8 @@ inline bool linear_is_w8h(const RadEncoding& e) { return linear_w8h_form(e) != W
  * encoding's `codes` and `scale` planes (read as plain bf16, which the reading kernel's
  * layout/relayout hook produces at load: FWHT_128(codes * scale), e.g. the lora_plain plugin)
  * and its product as a plain `gemm_nt` over the activation's bf16 plane, into the same output.
+ * The shared blocks set the flag only when rad_lora_source_targeted says a runtime adapter
+ * targets that checkpoint source. Unset, the linear keeps its stock declaration.
  *
  * Eligible encodings are exactly what such a hook accepts: affine, fwht128, i8 codes [x 1] with
  * a bf16 scale per [1 x 128], two planes and nothing else. IQ8R (u8 per 256 under a bf16 second

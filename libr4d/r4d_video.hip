@@ -1,3 +1,6 @@
+#include "rad_unipc_math.h"
+#include "rad_wan_vae.h"
+#include "rad_wan_dit.h"
 // R4D -- the video generator's ops (docs/OPS.md, "Video generation"): a diffusion transformer's
 // modulated RMS norm and its sampler step, the video decoder's patch unfold, the tiles it runs
 // over, their stitch back into frames and their rotary positions; the video encoder's plan, cut
@@ -628,6 +631,167 @@ int parse_f32_list(const char* s, float* out, int max) {
     return n;
 }
 
+__global__ void wan_rope_table(const int32_t* dims, float* table, int64_t rows, int64_t table_ld) {
+    using namespace rad_wan_dit;
+    int64_t height, width, actual_rows;
+    if (!latent_grid(dims, height, width, actual_rows) || actual_rows != rows) return;
+    const int64_t row = blockIdx.x;
+    const int pair = threadIdx.x;
+    const int axis = pair_axis(pair), count = axis == 0 ? time_pairs : spatial_pairs;
+    const double inverse = 1.0 / pow(10000.0, (double)pair_in_axis(pair, axis) / count);
+    const double angle = coordinate(row, axis, height, width) * inverse;
+    float* dst = table + row * table_ld + 2 * pair;
+    dst[0] = static_cast<float>(cos(angle));
+    dst[1] = static_cast<float>(sin(angle));
+}
+
+template<typename T>
+__device__ __forceinline__ void wan_turn(T* x, float co, float si) {
+    const float re = ldv(x, 0), im = ldv(x, 1);
+    stv(x, 0, re * co - im * si);
+    stv(x, 1, im * co + re * si);
+}
+
+template<typename T>
+__global__ __launch_bounds__(kT) void wan_rope(
+    T* q, T* k, const float* table, int64_t total, int row_width,
+    int64_t q_ld, int64_t k_ld, int64_t table_ld) {
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / (row_width / 2);
+        const int col = 2 * static_cast<int>(i % (row_width / 2));
+        const float* cs = table + row * table_ld + col % rad_wan_dit::head_width;
+        wan_turn(q + row * q_ld + col, cs[0], cs[1]);
+        wan_turn(k + row * k_ld + col, cs[0], cs[1]);
+    }
+}
+
+unsigned wan_blocks(int64_t total) {
+    const int64_t blocks = (total + kT - 1) / kT;
+    return static_cast<unsigned>(blocks > 65535 ? 65535 : blocks);
+}
+
+template<typename Out>
+__global__ __launch_bounds__(kT) void wan_mod_norm(
+    const float* x, const float* time, const float* table, const int32_t* split,
+    Out* y, int rows, int n, int group, bool round, float eps, int64_t xp, int64_t tp, int64_t yp) {
+    __shared__ float sums[kT / 32];
+    const int row = blockIdx.x;
+    const int first = split ? *split : rows;
+    if (first < 0 || first > rows) return;
+    x += row * xp;
+    y += row * yp;
+    time += row >= first ? tp : 0;
+    const bool head = group == -1;
+    const float* shift_time = time + (head ? 0 : group * n);
+    const float* scale_time = time + (head ? 0 : (group + 1) * n);
+    const float* shift_weight = table + (head ? 0 : group * n);
+    const float* scale_weight = shift_weight + n;
+    float mean = 0.0f;
+    for (int c = threadIdx.x; c < n; c += kT) mean += x[c];
+    mean = block_sum(mean, sums) / n;
+    // Finish consuming the first set of LDS partials before reusing it.
+    __syncthreads();
+    float variance = 0.0f;
+    for (int c = threadIdx.x; c < n; c += kT) {
+        const float centered = x[c] - mean;
+        variance += centered * centered;
+    }
+    const float inverse = rsqrtf(block_sum(variance, sums) / n + eps);
+    for (int c = threadIdx.x; c < n; c += kT) {
+        const float norm = (x[c] - mean) * inverse;
+        const float scale = scale_weight[c] + scale_time[c];
+        const float shift = shift_weight[c] + shift_time[c];
+        stv(y, c, (round ? bfr(norm) : norm) * (1.0f + scale) + shift);
+    }
+}
+
+__global__ __launch_bounds__(kT) void wan_gated_add(
+    float* x, const uint16_t* update, const float* time, const float* table, const int32_t* split,
+    int rows, int n, int gate, int64_t xp, int64_t up, int64_t tp) {
+    const int first = split ? *split : rows;
+    if (first < 0 || first > rows) return;
+    const int64_t total = (int64_t)rows * n;
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / n, c = i % n;
+        float v = bf2f(update[row * up + c]);
+        if (gate != -1) {
+            const int64_t off = gate * n + c;
+            v *= table[off] + time[(row >= first ? tp : 0) + off];
+        }
+        x[row * xp + c] += v;
+    }
+}
+
+
+template<typename Src>
+__global__ __launch_bounds__(kT) void wan_unpatch(
+    const Src* src, const int* geom, float* dst, int64_t patch_rows, int channels,
+    int64_t src_ld, int64_t dst_ld) {
+    int64_t height, width, rows;
+    if (!rad_wan_dit::latent_grid(geom, height, width, rows) || rows != patch_rows) return;
+    const int64_t total = 4 * rows * channels;
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / channels, channel = i % channels;
+        const int64_t at = rad_wan_dit::unpack_offset(row, channel, height, width, channels, src_ld);
+        dst[row * dst_ld + channel] = ldv(src, at);
+    }
+}
+
+
+__global__ void wan_vae_frame_cu(const int32_t* geom, int32_t* out, int n) {
+    const int i = threadIdx.x;
+    int64_t plane = 0;
+    if (i < n)
+        out[i] = rad_wan_vae::frame_plane(geom, n, plane) ? static_cast<int32_t>(i * plane) : 0;
+}
+
+template<bool Temporal>
+__global__ __launch_bounds__(kT) void wan_vae_history(
+    const uint16_t* x, uint16_t* cache, uint16_t* out, int64_t plane, int64_t frames, int64_t n,
+    int64_t x_ld, int64_t h_ld, int64_t y_ld, bool reset) {
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < plane * n;
+         i += (int64_t)gridDim.x * kT)
+        rad_wan_vae::history_cell<Temporal>(x, cache, out, i / n, i % n, plane, frames,
+                                            x_ld, h_ld, y_ld, reset);
+}
+
+__global__ __launch_bounds__(kT) void wan_vae_expand(
+    const uint16_t* x, const int32_t* geom, uint16_t* y, int64_t rows, int64_t expanded,
+    int cin, int cout, int st, int s, int drop, bool temporal, int64_t x_ld, int64_t y_ld) {
+    if (!rad_wan_vae::check_expand_grid(geom, rows, expanded, st, s, drop)) return;
+    const int64_t height = geom[1], width = geom[2], total = expanded * cout;
+    for (int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x; i < total;
+         i += (int64_t)gridDim.x * kT) {
+        const int64_t row = i / cout, c = i % cout;
+        const int64_t at = rad_wan_vae::expand_offset(row, c, height, width, cin, cout,
+                                                      st, s, drop, temporal, x_ld);
+        y[row * y_ld + c] = x[at];
+    }
+}
+
+
+template <typename TV>
+__global__ __launch_bounds__(kT) void flow_unipc_kernel(
+    const TV* __restrict__ v, const float* __restrict__ coeff, float* __restrict__ history,
+    float* __restrict__ x, const TV* __restrict__ negative, const float* __restrict__ guidance,
+    int64_t n, int64_t v_ld, int64_t h_ld, int64_t x_ld, int64_t negative_ld, int64_t total) {
+    const int64_t id = static_cast<int64_t>(blockIdx.x) * kT + threadIdx.x;
+    if (id >= total) return;
+    const int64_t row = id / n;
+    const int64_t col = id % n;
+    float& sample = x[row * x_ld + col];
+    float* hist = history + row * h_ld + col;
+    float velocity = ldv(v, row * v_ld + col);
+    if (negative) {
+        const float unconditioned = ldv(negative, row * negative_ld + col);
+        velocity = unconditioned + guidance[0] * (velocity - unconditioned);
+    }
+    sample = rad_unipc::advance(coeff, sample, velocity, hist[0], hist[n], hist[2 * n]);
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
@@ -991,5 +1155,249 @@ extern "C" int r4d_rad_snake_aa(const RadArgs* a, RadStream s) {
                        (const float*)fu->data, (const float*)fd->data, (const int*)cu->data,
                        (float*)y->data, (int)n, (int)R, (int)k, (int)lg, (int)n_seq, (int)xl,
                        (int)yl, cap);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_rope_table(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *geom = r4d_opt(a, 0), *out = r4d_opt(a, 1);
+    if (!geom || !out) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t rows = out->shape[0];
+    if (rows > INT32_MAX) return R4D_NO(RAD_E_SHAPE);
+    int rc = check_grid(geom);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(out, RAD_F32, rows, head_width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    hipLaunchKernelGGL(wan_rope_table, dim3(static_cast<unsigned>(rows)), dim3(pairs), 0,
+                       (hipStream_t)s, static_cast<const int32_t*>(geom->data),
+                       static_cast<float*>(out->data), rows, out->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_rope(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *q = r4d_opt(a, 0), *k = r4d_opt(a, 1), *table = r4d_opt(a, 2);
+    if (!q || !k || !table) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t rows = q->shape[0], heads = r4d_geti_or(a, "heads", 0);
+    if (heads < 1 || heads > 128 || rows > INT32_MAX) return R4D_NO(RAD_E_SHAPE);
+    const int width = static_cast<int>(heads * head_width);
+    if (q->dtype != RAD_F32 && q->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    int rc = check_matrix(q, q->dtype, rows, width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(k, q->dtype, rows, width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(table, RAD_F32, rows, head_width);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const int64_t total = rows * (width / 2);
+    const auto* cs = static_cast<const float*>(table->data);
+    const dim3 grid(wan_blocks(total));
+    if (q->dtype == RAD_F32)
+        hipLaunchKernelGGL(wan_rope<float>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<float*>(q->data), static_cast<float*>(k->data),
+                           cs, total, width, q->stride[0], k->stride[0], table->stride[0]);
+    else
+        hipLaunchKernelGGL(wan_rope<uint16_t>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<uint16_t*>(q->data), static_cast<uint16_t*>(k->data),
+                           cs, total, width, q->stride[0], k->stride[0], table->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_mod_norm(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *x = r4d_opt(a, 0), *time = r4d_opt(a, 1), *table = r4d_opt(a, 2),
+                    *split = r4d_opt(a, 3), *y = r4d_opt(a, 4);
+    if (!x || !time || !table || !y) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t n = r4d_geti_or(a, "n", 0), rows = x->shape[0], group = r4d_geti_or(a, "group", 0);
+    const bool head = group == -1, round = r4d_geti_or(a, "round_norm", 0) != 0;
+    const float eps = r4d_getf(a, "eps", 1e-6);
+    if (n < 1 || n > 4096 || rows > INT32_MAX || (group != -1 && group != 0 && group != 3) ||
+        !(eps > 0) || !std::isfinite(eps)) return R4D_NO(RAD_E_SHAPE);
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    int rc = check_matrix(x, RAD_F32, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    rc = check_matrix(y, y->dtype, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    rc = check_modulation(time, table, split, n, head);
+    if (rc < 0) return R4D_NO(rc);
+    const auto* input = static_cast<const float*>(x->data);
+    const auto* t = static_cast<const float*>(time->data);
+    const auto* w = static_cast<const float*>(table->data);
+    const auto* cut = split ? static_cast<const int32_t*>(split->data) : nullptr;
+    const dim3 grid(static_cast<unsigned>(rows));
+    if (y->dtype == RAD_F32)
+        hipLaunchKernelGGL(wan_mod_norm<float>, grid, dim3(kT), 0, (hipStream_t)s,
+                           input, t, w, cut, static_cast<float*>(y->data), (int)rows, (int)n,
+                           (int)group, round, eps, x->stride[0], time->stride[0], y->stride[0]);
+    else
+        hipLaunchKernelGGL(wan_mod_norm<uint16_t>, grid, dim3(kT), 0, (hipStream_t)s,
+                           input, t, w, cut, static_cast<uint16_t*>(y->data), (int)rows, (int)n,
+                           (int)group, round, eps, x->stride[0], time->stride[0], y->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_gated_add(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *x = r4d_opt(a, 0), *update = r4d_opt(a, 1), *time = r4d_opt(a, 2),
+                    *table = r4d_opt(a, 3), *split = r4d_opt(a, 4);
+    if (!x || !update) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t n = r4d_geti_or(a, "n", 0), rows = x->shape[0], gate = r4d_geti_or(a, "gate", -1);
+    const bool gated = gate != -1;
+    if (n < 1 || n > 4096 || rows > INT32_MAX || (gated && gate != 2 && gate != 5))
+        return R4D_NO(RAD_E_SHAPE);
+    if (gated ? (!time || !table) : (time || table || split)) return R4D_NO(RAD_E_INVAL);
+    int rc = check_matrix(x, RAD_F32, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    rc = check_matrix(update, RAD_BF16, rows, n);
+    if (rc < 0) return R4D_NO(rc);
+    if (gated) {
+        rc = check_modulation(time, table, split, n, false);
+        if (rc < 0) return R4D_NO(rc);
+    }
+    hipLaunchKernelGGL(wan_gated_add, dim3(wan_blocks(rows * n)), dim3(kT), 0, (hipStream_t)s,
+                       static_cast<float*>(x->data), static_cast<const uint16_t*>(update->data),
+                       time ? static_cast<const float*>(time->data) : nullptr,
+                       table ? static_cast<const float*>(table->data) : nullptr,
+                       split ? static_cast<const int32_t*>(split->data) : nullptr, (int)rows, (int)n,
+                       (int)gate, x->stride[0], update->stride[0], time ? time->stride[0] : 0);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_unpatch(const RadArgs* a, RadStream s) {
+    using namespace rad_wan_dit;
+    const RadTensor *src = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *out = r4d_opt(a, 2);
+    if (!src || !geom || !out) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t channels = r4d_geti_or(a, "n", 0), rows = src->shape[0];
+    if (src->dtype != RAD_F32 && src->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (channels < 1 || channels > 1024 ||
+        rows < 1 || rows > (int64_t)max_axis * max_axis * max_axis) return R4D_NO(RAD_E_SHAPE);
+    int rc = check_grid(geom);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(src, src->dtype, rows, 4 * channels);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    rc = check_matrix(out, RAD_F32, 4 * rows, channels);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const dim3 grid(wan_blocks(4 * rows * channels));
+    const auto* dims = static_cast<const int*>(geom->data);
+    auto* dst = static_cast<float*>(out->data);
+    if (src->dtype == RAD_F32)
+        hipLaunchKernelGGL(wan_unpatch<float>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<const float*>(src->data), dims, dst, rows,
+                           static_cast<int>(channels), src->stride[0], out->stride[0]);
+    else
+        hipLaunchKernelGGL(wan_unpatch<uint16_t>, grid, dim3(kT), 0, (hipStream_t)s,
+                           static_cast<const uint16_t*>(src->data), dims, dst, rows,
+                           static_cast<int>(channels), src->stride[0], out->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_vae_frame_cu(const RadArgs* a, RadStream s) {
+    const RadTensor *geom = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!geom || !y) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int rc = rad_wan_dit::check_grid(geom);
+    if (rc < 0) return R4D_NO(rc);
+    if (y->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (y->rank != 1 || y->shape[0] < 2 || y->shape[0] > rad_wan_vae::max_chunk_frames + 1)
+        return R4D_NO(RAD_E_SHAPE);
+    if (y->stride[0] != 1) return R4D_NO(RAD_E_STRIDE);
+    hipLaunchKernelGGL(wan_vae_frame_cu, dim3(1), dim3(32), 0, (hipStream_t)s,
+                       static_cast<const int32_t*>(geom->data), static_cast<int32_t*>(y->data),
+                       static_cast<int>(y->shape[0]));
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_vae_history(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *history = r4d_opt(a, 1), *out = r4d_opt(a, 2);
+    if (!x || !history || !out) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t mode = r4d_geti_or(a, "temporal", 0), reset = r4d_geti_or(a, "reset", 0);
+    if ((mode != 0 && mode != 1) || (reset != 0 && reset != 1)) return R4D_NO(RAD_E_INVAL);
+    int64_t plane, frames;
+    const int rc = rad_wan_vae::check_history(x, history, out, mode != 0, plane, frames);
+    if (rc < 0) return R4D_NO(rc);
+    const int64_t n = x->shape[1];
+    const auto* src = static_cast<const uint16_t*>(x->data);
+    auto* cache = static_cast<uint16_t*>(history->data);
+    auto* dest = static_cast<uint16_t*>(out->data);
+    const dim3 grid(wan_blocks(plane * n));
+    if (mode)
+        hipLaunchKernelGGL(wan_vae_history<true>, grid, dim3(kT), 0, (hipStream_t)s,
+                           src, cache, dest, plane, frames, n,
+                           x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    else
+        hipLaunchKernelGGL(wan_vae_history<false>, grid, dim3(kT), 0, (hipStream_t)s,
+                           src, cache, dest, plane, frames, n,
+                           x->stride[0], history->stride[0], out->stride[0], reset != 0);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_wan_vae_expand(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *geom = r4d_opt(a, 1), *out = r4d_opt(a, 2);
+    if (!x || !geom || !out) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "M", 0) <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int64_t cin = r4d_geti_or(a, "cin", 0), cout = r4d_geti_or(a, "cout", 0);
+    const int64_t st = r4d_geti_or(a, "st", 1), spatial = r4d_geti_or(a, "s", 1),
+                  drop = r4d_geti_or(a, "drop", 0), mode = r4d_geti_or(a, "temporal", 0);
+    if (mode != 0 && mode != 1) return R4D_NO(RAD_E_INVAL);
+    int rc = rad_wan_dit::check_grid(geom);
+    if (rc < 0) return R4D_NO(rc);
+    rc = rad_wan_vae::check_expand(x, out, cin, cout, st, spatial, drop, mode != 0);
+    if (rc < 0) return R4D_NO(rc);
+    const int64_t rows = x->shape[0], expanded = out->shape[0];
+    hipLaunchKernelGGL(wan_vae_expand, dim3(wan_blocks(expanded * cout)), dim3(kT), 0,
+                       (hipStream_t)s, static_cast<const uint16_t*>(x->data),
+                       static_cast<const int32_t*>(geom->data), static_cast<uint16_t*>(out->data),
+                       rows, expanded, (int)cin, (int)cout, (int)st, (int)spatial, (int)drop,
+                       mode != 0, x->stride[0], out->stride[0]);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_flow_unipc_step(const RadArgs* a, RadStream s) {
+    const RadTensor *v = r4d_opt(a, 0), *coeff = r4d_opt(a, 1);
+    const RadTensor *history = r4d_opt(a, 2), *x = r4d_opt(a, 3);
+    if (!v || !coeff || !history || !x) return R4D_NO(RAD_E_INVAL);
+    if ((!is_f32(v) && !is_bf16(v)) || !is_f32(coeff) || !is_f32(history) || !is_f32(x))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0 || n > INT32_MAX / 3 || coeff->rank != 1 ||
+        coeff->shape[0] != rad_unipc::COUNT) return R4D_NO(RAD_E_SHAPE);
+    if (v->rank != 2 || x->rank != 2 || history->rank != 2 ||
+        v->shape[1] != n || x->shape[1] != n || history->shape[1] != 3 * n)
+        return R4D_NO(RAD_E_SHAPE);
+    const int64_t xl = x->stride[0], vl = v->stride[0], hl = history->stride[0];
+    if (v->stride[1] != 1 || x->stride[1] != 1 || history->stride[1] != 1 ||
+        vl < n || xl < n || hl < 3 * n || coeff->stride[0] != 1)
+        return R4D_NO(RAD_E_STRIDE);
+    const int64_t rx = x->shape[0];
+    if (rx <= 0 || v->shape[0] < rx || history->shape[0] < rx ||
+        rx > static_cast<int64_t>(INT32_MAX) * kT / n ||
+        rx > (INT64_MAX - n) / xl || rx > (INT64_MAX - n) / vl ||
+        rx > (INT64_MAX - 3 * n) / hl)
+        return R4D_NO(RAD_E_SHAPE);
+    const RadTensor *negative = r4d_opt(a, 4), *guidance = r4d_opt(a, 5);
+    if (bool(negative) != bool(guidance)) return R4D_NO(RAD_E_INVAL);
+    int64_t negative_ld = 0;
+    if (negative) {
+        if (negative->dtype != v->dtype || !is_f32(guidance)) return R4D_NO(RAD_E_DTYPE);
+        if (negative->rank != 2 || negative->shape[0] < rx || negative->shape[1] != n ||
+            guidance->rank != 1 || guidance->shape[0] != 1) return R4D_NO(RAD_E_SHAPE);
+        negative_ld = negative->stride[0];
+        if (negative->stride[1] != 1 || negative_ld < n) return R4D_NO(RAD_E_STRIDE);
+        if (rx > (INT64_MAX - n) / negative_ld) return R4D_NO(RAD_E_SHAPE);
+    }
+    const int64_t total = rx * n;
+#define R4D_UNIPC(TV) \
+    hipLaunchKernelGGL(flow_unipc_kernel<TV>, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s, \
+                       (const TV*)v->data, (const float*)coeff->data, (float*)history->data, \
+                       (float*)x->data, negative ? (const TV*)negative->data : nullptr, \
+                       guidance ? (const float*)guidance->data : nullptr, n, vl, hl, xl, negative_ld, total)
+    if (is_f32(v)) R4D_UNIPC(float);
+    else           R4D_UNIPC(uint16_t);
+#undef R4D_UNIPC
     return st_of(hipGetLastError());
 }

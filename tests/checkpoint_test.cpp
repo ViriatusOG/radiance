@@ -2722,6 +2722,29 @@ TEST(a_diffusers_pipeline_reads_as_one_checkpoint) {
     }
 }
 
+TEST(a_wan_pipeline_normalizes_its_umt5_encoder_dimensions) {
+    const std::string dir = fresh_dir();
+    ::mkdir((dir + "/text_encoder").c_str(), 0755);
+    write_file(dir + "/model_index.json", R"({"_class_name":"WanPipeline"})");
+    write_file(dir + "/text_encoder/config.json",
+               R"({"model_type":"umt5","num_layers":24,"d_model":4096,"num_heads":64,
+                   "d_kv":32,"d_ff":10240,"vocab_size":256384})");
+    write_shard(dir + "/text_encoder/model.safetensors", {bf16("shared.weight", {4, 4}, 1.0f)});
+
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("wan"));
+    const auto& m = ck.meta().m;
+    CHECK_EQ(m.n_layers, 24);
+    CHECK_EQ(m.n_embd, 4096);
+    CHECK_EQ(m.n_head, 64);
+    CHECK_EQ(m.n_head_kv, 64);
+    CHECK_EQ(m.head_dim, 32);
+    CHECK_EQ(m.n_ff, 10240);
+    CHECK_EQ(m.n_vocab, 256384);
+    CHECK(ck.find("shared.weight") != nullptr);
+}
+
 /* ================================================================== a drafter of its own
  *
  * A drafter that ships as its own repository (DFlash2) merges under `draft.`: its tensors, and its

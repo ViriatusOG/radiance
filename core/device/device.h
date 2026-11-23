@@ -597,6 +597,10 @@ public:
     /* Whether every byte of [off, off+bytes) is backed; check before handing a range to a
      * kernel. */
     bool is_committed(int64_t off, int64_t bytes) const;
+    /* Actual backing inside a range, and the contiguous backed suffix. A sum alone cannot
+     * prove that every address a top-down expert loan exposes is mapped. */
+    int64_t committed_bytes(int64_t off, int64_t bytes) const;
+    int64_t committed_suffix() const;
 
     /* Parking (dev_page_out): every backed extent copied to pinned host memory on `s`, then
      * unbacked; the bytes held on the host, or an error. page_in backs the same extents again and

@@ -222,6 +222,8 @@ public:
 
     int  init(const CtxDesc& d);
     void shutdown();
+    /* Both compute lanes must finish before their operands may be reassigned. */
+    int quiesce();
 
     /* ---------------------------------------------------------- the hot path */
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
