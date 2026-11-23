@@ -14227,6 +14227,14 @@ void group_norm_cases(const Plugin& pl) {
              /* Groups of 2 channels (two-channel chunks): a 64-wide latent upsampler in 32 groups. */
              G{ "2 channels a group", 48 * 8 * 8, 64, 32, false, false, false, 0, true, false, 0.0f, 0 },
              G{ "2 channels a group, f32 rows", 777, 64, 32, true, true, true, 2, false, false, 5.0f, 8 },
+             /* Groups of 3 channels (one-channel chunks): MOSS-Image's VAE decoder, 96 channels
+              * in 32 groups. bf16 with SiLU; then f32 rows, f32 gain and bias and a bf16
+              * modulation under a pitch; then the same shape written in place. */
+             G{ "3 channels a group", 150, 96, 32, false, false, false, 0, true, false, 0.0f, 0 },
+             G{ "3 channels a group, f32 rows, modulated", 150, 96, 32, true, true, true, 1, false,
+                false, 2.0f, 8 },
+             G{ "3 channels a group, in place", 150, 96, 32, false, false, true, 0, true, true,
+                0.0f, 0 },
              G{ "4 channels a group, f32", 777, 128, 32, true, true, true, 2, false, false, 20.0f, 8 },
              /* SDXL's UNet: 10 to 80 channels a group, a row's chunks not a power of two (160),
               * or more than the block (480 and 320 chunks, three and two to a thread); a
@@ -14328,10 +14336,12 @@ void group_norm_cases(const Plugin& pl) {
     }
     RadTensor nomod = T(nullptr, RAD_BF16, { 1 });
     absent(nomod);
-    ok("group_norm refuses 3 channels a group",
+    /* An odd group width is served now (the 1-channel chunk above); what is refused is a width
+     * that does not divide n. */
+    ok("group_norm refuses a group width that does not divide n",
        launch(r, { TA(RAD_BF16, { 4, 96 }), TA(RAD_BF16, { 96 }), TA(RAD_BF16, { 96 }), nomod,
-                   TA(RAD_F32, { 32 * 3074 }), TA(RAD_BF16, { 4, 96 }) },
-              { PI("M", 4), PI("n", 96), PI("groups", 32), PF("eps", 1e-5), PS("act", "none"),
+                   TA(RAD_F32, { 30 * 3074 }), TA(RAD_BF16, { 4, 96 }) },
+              { PI("M", 4), PI("n", 96), PI("groups", 30), PF("eps", 1e-5), PS("act", "none"),
                 PS("dtype", "bf16") }) == RAD_E_SHAPE);
 }
 

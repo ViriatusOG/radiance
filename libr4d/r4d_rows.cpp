@@ -11685,9 +11685,9 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "group_norm", "group_norm", "norm",
   "GroupNorm over all rows in three launches: per-part (count, mean, M2), their merge to mean and "
-  "rstd, then the affine, modulation and SiLU a thread an 8-, 4- or 2-channel chunk",
-  "n % 8 == 0 up to 8192, an even n / groups, groups <= 256, M n / groups < 2^31; row pitches "
-  "honoured, y may alias x",
+  "rstd, then the affine, modulation and SiLU a thread an 8-, 4-, 2- or 1-channel chunk",
+  "n % 8 == 0 up to 8192, groups <= 256, M n / groups < 2^31; row pitches honoured, y may "
+  "alias x",
   "bf16 or f32 rows, bf16 or f32 gain, bias and modulation, f32 statistics",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGroupNorm), NOTUNE,
