@@ -655,6 +655,8 @@ REF_SHAPE_FN(ref_timestep_embed_f64);
 int ref_flow_unipc_step(const RadArgs*, RadStream);
 
 REF_SHAPE_FN(ref_flow_unipc_step);
+int ref_attn_dense_ref(const RadArgs*, RadStream);
+REF_SHAPE_FN(ref_attn_dense_ref);
 
 }  /* extern "C" */
 #endif /* RAD_REF_OPS_H */

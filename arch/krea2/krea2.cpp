@@ -50,6 +50,7 @@
  * by rows after its mid-block, as Qwen-Image 2.1's does (rad_vae2d.h).
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_vit.h>
 #include <arch/rad_fp8.h>
 #include <arch/rad_vae2d.h>
 
@@ -72,8 +73,30 @@ static int64_t image_tokens(int64_t pixels) {
     return pixels > 0 ? std::min<int64_t>(kMaxImageTokens, pixels / 256) : kMaxImageTokens;
 }
 /* The longest conditioning in rows: the pipeline's max_sequence_length. The prompt the language
- * model reads is that plus the template's system turn, at most kTeRows. */
-enum { kCondRows = 512, kTeRows = kCondRows + 64 };
+ * model reads is that plus the template's system turn. */
+enum { kCondRows = 512, kEditCondRows = 1024, kTemplateRows = 64 };
+static constexpr int64_t kGroundingPatches = 2304;  /* one 768×768 reference */
+static constexpr int64_t kMaxReferences = 2;
+
+static int64_t reference_count(int64_t requested) {
+    return requested > 0 ? requested : 1;
+}
+
+static int64_t edit_cond_rows(int64_t refs, int64_t merge) {
+    const int64_t group = merge * merge;
+    return kEditCondRows + (refs - 1) * ((kGroundingPatches + group - 1) / group);
+}
+
+static bool has_reference_encoder(const RadModelMeta* meta) {
+    return rad_meta_geti(meta, "pipeline.krea_reference_encoder", 0) != 0;
+}
+
+static int check_reference_encoder(const RadModelMeta* meta) {
+    if (!has_reference_encoder(meta) || VisionTower::present(meta)) return RAD_OK;
+    std::fprintf(stderr, "radiance: krea2: edit conversion was requested, but the Qwen3-VL "
+                         "vision tower metadata is missing; convert the complete pipeline\n");
+    return RAD_E_INVAL;
+}
 /* Images in flight, and so the lanes of latent state. */
 enum { kMaxLanes = 8 };
 /* The language model's hidden states the generator reads: hidden_states[i] for these i, the
@@ -153,15 +176,27 @@ enum : int {
     kGrpFuse  = 1000,   /* the text fusion's blocks, kGrpFuse + i */
     kGrpTxtIn = 1100,
     kGrpVaeDec = 1200,
+    kGrpVaeEnc = 1300,
+    kGrpVision = 1400,
     kGrpDit   = 2000,   /* the DiT's model-level weights; its blocks kGrpDit + 1.. */
 };
 
 struct Model {
     Names nm{""};
-    int64_t max_image_tokens = kMaxImageTokens;
     Geom  gt{}, gf{}, gd{};    /* the language model's, the text fusion's and the DiT's geometry */
+    int64_t max_image_tokens = kMaxImageTokens;
     bool  turbo = false;
     std::string te_pre;        /* the language model's tensor prefix */
+
+    int64_t cond_rows = kCondRows;
+    int64_t te_rows = kCondRows + kTemplateRows;
+    int64_t store_rows = kCondRows;
+    int64_t max_refs = 0;
+    /* Lanes of latent state and conditioning store: the configured sequences, at most kMaxLanes. */
+    int64_t lanes = kMaxLanes;
+    VisionTower vision{};
+    rad_op op_vision_embed = 0;
+    rad_op op_deepstack[VisionTower::MAX_DS] = {};
 
     /* ---- the language model */
     rad_weight w_tok = 0;
@@ -218,7 +253,12 @@ struct Model {
     rad_buf b_state = 0, b_prev = 0, b_store = 0;
 
     /* ---- the VAE */
-    Vae     dec{};
+    Vae     enc{}, dec{};
+    VImg    enc_out{};
+    rad_buf b_enc_cu = 0, b_enc_norm = 0, b_enc_pack = 0, b_enc_embed = 0;
+    rad_op  op_enc_cu = 0, op_enc_norm = 0, op_enc_zero = 0, op_enc_pack = 0;
+    rad_op  op_enc_project = 0, op_enc_store = 0;
+    std::string enc_mean, enc_std;
     VImg    dec_out{};
     rad_buf b_dl = 0, b_dl2 = 0, b_decin = 0, b_cu4 = 0, b_img = 0, b_rgbf = 0;
     rad_op  op_dinv = 0, op_dadd = 0, op_dzero = 0, op_unpack = 0, op_cu4 = 0, op_rgb = 0;
@@ -384,6 +424,7 @@ static int declare_lora_names(RadBuilder* b) {
     n.push_back({ "txtmlp.3", "txt_in.linear_2" });
     n.push_back({ "first", "img_in" });
     n.push_back({ "last_linear", "final_layer.linear" });
+    n.push_back({ "last.linear", "final_layer.linear" });
     n.push_back({ "tmlp.0", "time_embed.linear_1" });
     n.push_back({ "tmlp.2", "time_embed.linear_2" });
     n.push_back({ "tproj.1", "time_mod_proj" });
@@ -394,7 +435,7 @@ static int declare_lora_names(RadBuilder* b) {
 static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gt;
     Names& nm = m.nm;
-    const int64_t T = kTeRows;   /* the prompt with its system turn */
+    const int64_t T = m.te_rows;   /* the prompt with its system turn */
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
     const char* pre = m.te_pre.c_str();
 
@@ -414,7 +455,7 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.a_tffn.x = decl_b(b, nm.f("te.ffn"), RAD_BF16, { T, g.n_ff });
     RAD_ARCH_TRY(m.a_tffn.declare_pair(b, nm, g, "te.ffn", g.n_ff, T, m.i8, m.g8,
                                  "gated_had_quant_i8g"));
-    m.b_taps = decl_b(b, nm.f("te.taps"), RAD_BF16, { (int64_t)kTeRows * kNTaps, g.n_embd });
+    m.b_taps = decl_b(b, nm.f("te.taps"), RAD_BF16, { (int64_t)m.te_rows * kNTaps, g.n_embd });
     m.b_tidx = decl_b(b, nm.f("te.tap_idx"), RAD_I32, { T });
 
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
@@ -423,9 +464,25 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                          RAD_INT("vocab_offset", 0)),
                               RAD_WEIGHTS(m.w_tok)),
                     {}, { m.b_tx });
+    if (m.vision.on) {
+        m.op_vision_embed = rw(b, RAD_OP(b, "scatter_rows",
+                                         RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", g.n_embd),
+                                                    RAD_STR("dtype", "bf16")),
+                                         RAD_NOWEIGHTS),
+                               { m.vision.b_out, m.b_tx }, { m.b_tx });
+        if (!m.op_vision_embed) return RAD_E_INVAL;
+        for (int i = 0; i < m.vision.n_ds; ++i) {
+            m.op_deepstack[i] = rw(b, RAD_OP(b, "scatter_add_rows",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", g.n_embd),
+                                                       RAD_STR("dtype", "bf16")),
+                                            RAD_NOWEIGHTS),
+                                  { m.vision.b_ds[i], m.b_tx }, { m.b_tx });
+            if (!m.op_deepstack[i]) return RAD_E_INVAL;
+        }
+    }
     /* Row 12 t of the taps for token t; a tap i is scattered at row offset i. */
     m.op_iota = rw(b, RAD_OP(b, "iota",
-                             RAD_PARAMS(RAD_RANGE("M", 1, kTeRows), RAD_INT("start", 0),
+                             RAD_PARAMS(RAD_RANGE("M", 1, m.te_rows), RAD_INT("start", 0),
                                         RAD_INT("step", kNTaps)),
                              RAD_NOWEIGHTS),
                    {}, { m.b_tidx });
@@ -543,7 +600,7 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             /* f32 arithmetic, rounded once into bf16 (`round` 0) */
             for (int p = 0; p < kNPresets; ++p) {
                 L.op_gain[p] = rw(b, RAD_OP(b, "chan_affine",
-                                            RAD_PARAMS(RAD_RANGE("M", 1, kTeRows),
+                                            RAD_PARAMS(RAD_RANGE("M", 1, m.te_rows),
                                                        RAD_INT("n", kGainCh),
                                                        RAD_STR("mul", m.tap_mul[p][L.tap].c_str()),
                                                        RAD_STR("add", m.tap_add.c_str()),
@@ -554,17 +611,17 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                 if (!L.op_gain[p]) return RAD_E_INVAL;
             }
             L.op_tap_g = rw(b, RAD_OP(b, "scatter_rows",
-                                      RAD_PARAMS(RAD_RANGE("M", 1, kTeRows),
+                                      RAD_PARAMS(RAD_RANGE("M", 1, m.te_rows),
                                                  RAD_INT("n", g.n_embd), RAD_STR("dtype", "bf16")),
                                       RAD_NOWEIGHTS),
-                            { m.b_th2, m.b_tidx, m.b_taps }, { m.b_taps });
+                            { m.b_th2, m.b_tidx }, { m.b_taps });
         }
         if (L.tap >= 0)
             L.op_tap = rw(b, RAD_OP(b, "scatter_rows",
-                                    RAD_PARAMS(RAD_RANGE("M", 1, kTeRows), RAD_INT("n", g.n_embd),
+                                    RAD_PARAMS(RAD_RANGE("M", 1, m.te_rows), RAD_INT("n", g.n_embd),
                                                RAD_STR("dtype", "bf16")),
                                     RAD_NOWEIGHTS),
-                          { m.b_tx, m.b_tidx, m.b_taps }, { m.b_taps });
+                          { m.b_tx, m.b_tidx }, { m.b_taps });
         if (!L.op_n1 || !L.op_qkr || !L.op_attn || !L.op_add1 || !L.op_n2 || !L.op_add2 ||
             (L.tap >= 0 && (!L.op_tap || !L.op_tap_g)))
             return RAD_E_INVAL;
@@ -645,7 +702,7 @@ static int declare_fusion(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gf;
     Names& nm = m.nm;
     const int64_t D = g.n_embd, qd = g.q_dim();
-    const int64_t RL = (int64_t)kCondRows * kNTaps;   /* the layer-wise blocks' rows */
+    const int64_t RL = (int64_t)m.cond_rows * kNTaps;   /* the layer-wise blocks' rows */
     m.a_fh.x = decl_b(b, nm.f("fuse.h"), RAD_BF16, { RL, D });
     RAD_ARCH_TRY(m.a_fh.declare_pair(b, nm, g, "fuse.h", D, RL, m.i8, m.g8,
                                  "had_quant_act_i8g"));
@@ -676,12 +733,12 @@ static int declare_fusion(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     }
     RAD_ARCH_TRY(m.a_fffn.declare_pair(b, nm, g, "fuse.ffn", g.n_ff, RL, m.i8, ffn_g8,
                                  "gated_had_quant_i8g"));
-    m.b_fcu  = decl_b(b, nm.f("fuse.cu"), RAD_I32, { kCondRows + 1 });
-    m.b_ft   = decl_b(b, nm.f("fuse.out"), RAD_BF16, { kCondRows, D });
+    m.b_fcu  = decl_b(b, nm.f("fuse.cu"), RAD_I32, { m.cond_rows + 1 });
+    m.b_ft   = decl_b(b, nm.f("fuse.out"), RAD_BF16, { m.cond_rows, D });
 
     /* The layer-wise blocks attend within each token's twelve rows: cu 0, 12, 24, ... */
     m.op_fcu = rw(b, RAD_OP(b, "iota",
-                            RAD_PARAMS(RAD_RANGE("M", 1, kCondRows + 1), RAD_INT("start", 0),
+                            RAD_PARAMS(RAD_RANGE("M", 1, m.cond_rows + 1), RAD_INT("start", 0),
                                        RAD_INT("step", kNTaps)),
                             RAD_NOWEIGHTS),
                   {}, { m.b_fcu });
@@ -706,33 +763,33 @@ static int declare_fusion(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.w_mix = decl_w(b, nm.f("fuse.mix.weight"), RAD_BF16, { 1, kNTaps }, RAD_ACCESS_PER_REQUEST,
                      RAD_SHARD_NONE, grp_layer(kGrpFuse));
     m.op_mix = rw(b, RAD_OP(b, "mix_rows",
-                            RAD_PARAMS(RAD_RANGE("M", 1, kCondRows), RAD_INT("n", D),
+                            RAD_PARAMS(RAD_RANGE("M", 1, m.cond_rows), RAD_INT("n", D),
                                        RAD_INT("k", kNTaps), RAD_STR("dtype", "bf16")),
                             RAD_WEIGHTS(m.w_mix)),
                   { m.b_taps }, { m.b_ft });
     for (int i = 0; i < nrf; ++i)
         RAD_ARCH_TRY(declare_fuse_block(b, m, m.rf[(size_t)i],
                                         nm.f("transformer.text_fusion.refiner_blocks.%d", i),
-                                        kGrpFuse + nlw + i, kCondRows, m.b_ft));
+                                        kGrpFuse + nlw + i, m.cond_rows, m.b_ft));
     if (!m.op_fcu || !m.w_mix || !m.op_mix) return RAD_E_INVAL;
 
     /* ---- txt_in, into each lane's conditioning store */
     const int64_t Dd = m.gd.n_embd;
-    m.b_txa = decl_b(b, nm.f("txt.a"), RAD_BF16, { kCondRows, D });
-    m.b_txb = decl_b(b, nm.f("txt.b"), RAD_BF16, { kCondRows, Dd });
-    m.b_txt = decl_b(b, nm.f("txt.out"), RAD_BF16, { kCondRows, Dd });
+    m.b_txa = decl_b(b, nm.f("txt.a"), RAD_BF16, { m.cond_rows, D });
+    m.b_txb = decl_b(b, nm.f("txt.b"), RAD_BF16, { m.cond_rows, Dd });
+    m.b_txt = decl_b(b, nm.f("txt.out"), RAD_BF16, { m.cond_rows, Dd });
     m.w_txn = wcopy(b, nm.f("txt.norm.weight"), nm.ckpt("transformer.txt_in.norm.weight"), RAD_F32,
                     { D }, RAD_ACCESS_PER_REQUEST, kGrpTxtIn);
-    m.op_txn = zc_norm(b, kCondRows, D, g.eps, m.w_txn, m.b_ft, m.b_txa);
-    m.op_tx1 = dense_bias(b, nm, "txt.l1", "transformer.txt_in.linear_1", Dd, D, kCondRows, m.b_txa,
+    m.op_txn = zc_norm(b, m.cond_rows, D, g.eps, m.w_txn, m.b_ft, m.b_txa);
+    m.op_tx1 = dense_bias(b, nm, "txt.l1", "transformer.txt_in.linear_1", Dd, D, m.cond_rows, m.b_txa,
                           m.b_txb, &m.w_tx1, &m.b_tx1, RAD_ACCESS_PER_REQUEST, kGrpTxtIn);
-    m.op_txg = unary(b, "gelu_tanh", kCondRows, Dd, m.b_txb, m.b_txb);
-    m.op_tx2 = dense_bias(b, nm, "txt.l2", "transformer.txt_in.linear_2", Dd, Dd, kCondRows,
+    m.op_txg = unary(b, "gelu_tanh", m.cond_rows, Dd, m.b_txb, m.b_txb);
+    m.op_tx2 = dense_bias(b, nm, "txt.l2", "transformer.txt_in.linear_2", Dd, Dd, m.cond_rows,
                           m.b_txb, m.b_txt, &m.w_tx2, &m.b_tx2, RAD_ACCESS_PER_REQUEST, kGrpTxtIn);
-    /* Lane l's branch b at rows (2 l + b) kCondRows: the store's `stride` is two branches. */
+    /* Lane l's branch b at rows (2 l + b) m.cond_rows: the store's `stride` is two branches. */
     m.op_store = rw(b, RAD_OP(b, "lane_store",
-                              RAD_PARAMS(RAD_RANGE("M", 1, kCondRows), RAD_INT("n", Dd),
-                                         RAD_INT("stride", 2 * (int64_t)kCondRows),
+                              RAD_PARAMS(RAD_RANGE("M", 1, m.cond_rows), RAD_INT("n", Dd),
+                                         RAD_INT("stride", 2 * m.store_rows),
                                          RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
                     { m.b_txt, m.b_store }, { m.b_store });
@@ -923,7 +980,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                     RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", 6 * D),
                                                RAD_INT("L", 1), RAD_STR("dtype", "bf16")),
                                     RAD_WEIGHTS(B.w_tab)),
-                          { m.b_tmod, m.b_mods }, { m.b_mods });
+                          { m.b_tmod }, { m.b_mods });
             if (!B.w_tab || !B.op_tab) return RAD_E_INVAL;
         }
         B.op_n1 = mod_norm(B.w_n1, l > 0);
@@ -948,7 +1005,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                            RAD_F64("wadd", 1.0)),
                                 RAD_WEIGHTS(B.w_qn, B.w_kn)),
                       { m.b_qkv }, { m.b_qkv });
-        B.op_attn = rw(b, RAD_OP(b, "attn_dense",
+        B.op_attn = rw(b, RAD_OP(b, m.max_refs ? "attn_dense_ref" : "attn_dense",
                                  RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
                                             RAD_INT("gqa", g.gqa()), RAD_INT("causal", 0),
                                             RAD_STR("dtype", "bf16"),
@@ -1009,6 +1066,102 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                     { m.b_v, m.b_state, m.b_prev }, { m.b_state, m.b_prev });
     return m.op_g2 && m.op_gimg && m.w_fn && m.op_fn && m.op_pout && m.op_euler ? RAD_OK
                                                                                : RAD_E_INVAL;
+}
+
+/* The Qwen-Image VAE encoder for a single reference frame. The temporal downsample
+ * convolutions are bypassed on the first frame. Spatial downsamples still run. */
+static int declare_reference_encoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
+    Vae& v = m.enc;
+    Names& nm = m.nm;
+    v.nm = &nm;
+    v.b = b;
+    v.scope = "venc";
+    v.down = true;
+    v.first_group = kGrpVaeEnc;
+    v.base_px = m.max_image_tokens * 256;
+    v.form = VAE_CONV_CAUSAL;
+    const int64_t base = rad_meta_geti(meta, "vae.base_dim", 96);
+    const int64_t channels = rad_meta_geti(meta, "vae.z_dim", 16);
+    const int64_t blocks = rad_meta_geti(meta, "vae.num_res_blocks", 2);
+    const auto mult = meta_list(meta, "vae.dim_mult");
+    if (mult.size() != 4 || blocks != 2 || channels * 4 != m.C) {
+        fprintf(stderr, "radiance: krea2: reference encoding requires the Qwen-Image VAE\n");
+        return RAD_E_UNSUPPORTED;
+    }
+
+    m.b_enc_cu = decl_b(b, nm.f("venc.cu"), RAD_I32, {2});
+    if (!m.b_enc_cu) return RAD_E_INVAL;
+    m.op_enc_cu = rw(b, RAD_OP(b, "cu_repeat",
+                               RAD_PARAMS(RAD_RANGE("M", 1, 2), RAD_INT("mult", 4)),
+                               RAD_NOWEIGHTS), {}, {m.b_enc_cu});
+    if (!m.op_enc_cu) return RAD_E_INVAL;
+
+    const VImg input{0, rad_meta_geti(meta, "vae.input_channels", 3), 0};
+    VImg x = v.conv(input, base, 3, 1, 1, "same", "vae.encoder.conv_in");
+    int index = 0;
+    for (size_t level = 0; level < mult.size(); ++level) {
+        const int64_t width = base * (int64_t)mult[level];
+        for (int64_t block = 0; block < blocks; ++block)
+            x = v.resblock(x, width, nm.ckpt("vae.encoder.down_blocks.%d", index++));
+        if (level + 1 == mult.size()) break;
+        v.form = VAE_CONV_2D;
+        x = v.conv(x, width, 3, 2, 1, "down",
+                   nm.ckpt("vae.encoder.down_blocks.%d.resample.1", index++));
+        v.form = VAE_CONV_CAUSAL;
+    }
+    x = v.resblock(x, x.ch, "vae.encoder.mid_block.resnets.0");
+    v.form = VAE_CONV_2D;
+    x = v.attention(x, "vae.encoder.mid_block.attentions.0");
+    v.form = VAE_CONV_CAUSAL;
+    x = v.resblock(x, x.ch, "vae.encoder.mid_block.resnets.1");
+    x = v.norm(x, true, "vae.encoder.norm_out", 4);
+    x = v.conv(x, 2 * channels, 3, 1, 1, "same", "vae.encoder.conv_out");
+    m.enc_out = v.conv(x, 2 * channels, 1, 1, 1, "same", "vae.quant_conv");
+    if (!m.enc_out.buf) return RAD_E_INVAL;
+    return v.attn_reads(m.b_enc_cu);
+}
+
+static int declare_reference_tokens(RadBuilder* b, const RadModelMeta* meta, Model& m) {
+    Names& nm = m.nm;
+    const int64_t D = m.gd.n_embd, C = m.C, Z = C / 4, N = m.max_image_tokens;
+    const auto mean = meta_list(meta, "vae.latents_mean"), sd = meta_list(meta, "vae.latents_std");
+    if ((int64_t)mean.size() != Z || (int64_t)sd.size() != Z) return RAD_E_SHAPE;
+    for (int64_t i = 0; i < Z; ++i) {
+        if (!std::isfinite(mean[i]) || !(sd[i] > 0) || !std::isfinite(sd[i])) return RAD_E_INVAL;
+        m.enc_mean += (i ? " " : "") + std::to_string(mean[i]);
+        m.enc_std += (i ? " " : "") + std::to_string(sd[i]);
+    }
+    m.b_enc_norm = decl_b(b, nm.f("venc.mode"), RAD_BF16, {4 * N, Z});
+    m.b_enc_pack = decl_b(b, nm.f("venc.pack"), RAD_BF16, {N, C});
+    m.b_enc_embed = decl_b(b, nm.f("venc.embed"), RAD_BF16, {N, D});
+    m.op_enc_norm = rw(b, RAD_OP(b, "chan_affine",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, 4 * N), RAD_INT("n", Z),
+                                            RAD_STR("mul", m.enc_std.c_str()),
+                                            RAD_STR("add", m.enc_mean.c_str()),
+                                            RAD_STR("mode", "inv"), RAD_STR("dtype", "bf16")),
+                                 RAD_NOWEIGHTS), {m.enc_out.buf}, {m.b_enc_norm});
+    m.op_enc_zero = rw(b, RAD_OP(b, "fill",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, N), RAD_INT("n", C),
+                                            RAD_STR("dtype", "bf16"), RAD_F64("value", 0.0)),
+                                 RAD_NOWEIGHTS), {}, {m.b_enc_pack});
+    m.op_enc_pack = rw(b, RAD_OP(b, "s2d_avg_add",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, N), RAD_INT("cin", Z),
+                                            RAD_INT("cout", C), RAD_INT("ft", 1),
+                                            RAD_STR("dtype", "bf16")),
+                                 RAD_NOWEIGHTS), {m.b_enc_norm, m.b_enc_pack}, {m.b_enc_pack});
+    m.op_enc_project = rw(b, RAD_OP(b, "gemm_nt_bias",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, N), RAD_INT("N", D),
+                                               RAD_INT("K", C), RAD_STR("dtype", "bf16")),
+                                    RAD_WEIGHTS(m.w_imgin, m.b_imgin)),
+                            {m.b_enc_pack}, {m.b_enc_embed});
+    m.op_enc_store = rw(b, RAD_OP(b, "lane_store",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, N), RAD_INT("n", D),
+                                             RAD_INT("stride", 2 * m.store_rows),
+                                             RAD_STR("dtype", "bf16")),
+                                  RAD_NOWEIGHTS), {m.b_enc_embed, m.b_store}, {m.b_store});
+    return m.op_enc_cu && m.op_enc_norm && m.op_enc_zero && m.op_enc_pack &&
+           m.op_enc_project && m.op_enc_store
+               ? RAD_OK : RAD_E_INVAL;
 }
 
 /* The decoder: the latent denormalised, the 2 x 2 tokens unpacked to the VAE's 16 channels, then
@@ -1153,11 +1306,13 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->max_seqs <= 0) return RAD_E_INVAL;
+    RAD_ARCH_TRY(check_reference_encoder(meta));
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
+    m.lanes = std::clamp<int64_t>(ctx->max_seqs, 1, kMaxLanes);
     m.max_image_tokens = image_tokens(ctx->gen_max_pixels);
     if (m.max_image_tokens == 0) return RAD_E_INVAL;
     RAD_ARCH_TRY(check_format(meta));
@@ -1179,7 +1334,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     gf.head_dim = gf.n_embd / gf.n_head_all;
     gf.n_ff_all = rad_meta_geti(meta, "transformer.text_intermediate_size", 6912);
     gf.eps = (float)rad_meta_getf(meta, "transformer.norm_eps", 1e-5);
-    gf.max_tok = (int64_t)kCondRows * kNTaps;
+    gf.max_tok = (int64_t)m.cond_rows * kNTaps;
     RAD_ARCH_TRY(divide_or_fail(gf.n_head_all, gf.world, "the text fusion's heads", &gf.n_head));
     RAD_ARCH_TRY(divide_or_fail(gf.n_head_kv_all, gf.world, "the text fusion's KV heads",
                                 &gf.n_head_kv));
@@ -1225,22 +1380,39 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.i8) m.g8 = linear_w8h_group(e);
     }
 
+    const bool references = has_reference_encoder(meta);
+    if (references && VisionTower::present(meta) && ctx->max_enc_patches > 0) {
+        RAD_ARCH_TRY(m.vision.declare(b, meta, ctx, nm, m.gt.n_embd, kGrpVision, true, false,
+                                      m.te_pre == "language_model" ? "visual" : "model.visual"));
+        m.max_refs = reference_count(ctx->gen_max_refs);
+        if (m.max_refs > kMaxReferences) {
+            std::fprintf(stderr, "radiance: krea2: --image-gen-max-refs supports at most two references\n");
+            return RAD_E_INVAL;
+        }
+        m.cond_rows = edit_cond_rows(m.max_refs, m.vision.merge);
+        m.te_rows = m.cond_rows + kTemplateRows;
+        gf.max_tok = m.cond_rows * kNTaps;
+        m.store_rows = m.cond_rows + m.max_refs * m.max_image_tokens;
+    }
+
     /* ---- the per-image state, the conditioning store, and in issue order the language model,
      * the text fusion, the DiT and the decoder */
-    const int64_t lane_rows = (int64_t)kMaxLanes * m.max_image_tokens;
+    const int64_t lane_rows = m.lanes * m.max_image_tokens;
     m.b_state = decl_b(b, nm.f("lat_state"), RAD_BF16, { lane_rows, m.C }, RAD_BUF_PERSIST);
     m.b_prev  = decl_b(b, nm.f("lat_preview"), RAD_BF16, { lane_rows, m.C }, RAD_BUF_PERSIST);
     m.b_store = decl_b(b, nm.f("cond_store"), RAD_BF16,
-                       { 2 * (int64_t)kMaxLanes * kCondRows, gd.n_embd }, RAD_BUF_PERSIST);
+                       { 2 * m.lanes * m.store_rows, gd.n_embd }, RAD_BUF_PERSIST);
     RAD_ARCH_TRY(declare_lora_names(b));
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_fusion(b, meta, m));
     RAD_ARCH_TRY(declare_dit(b, meta, m));
+    if (references) RAD_ARCH_TRY(declare_reference_encoder(b, meta, m));
+    if (m.max_refs) RAD_ARCH_TRY(declare_reference_tokens(b, meta, m));
     RAD_ARCH_TRY(declare_decoder(b, meta, m));
 
     /* ---- what the core drives */
     if (!ctx->shape_probe) {
-        static thread_local std::string tmpl, drop;
+        static thread_local std::string tmpl, edit, drop;
         tmpl = std::string("<|im_start|>system\n") + kSysPrompt +
                "<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n";
         drop = std::string("<|im_start|>system\n") + kSysPrompt + "<|im_end|>\n<|im_start|>user\n";
@@ -1248,7 +1420,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.name = m.turbo ? "krea-2-turbo" : "krea-2";
         d.layout = RAD_GEN_LAYOUT_JOINT_STEP;
         d.tmpl_text = tmpl.c_str();
-        d.tmpl_edit = tmpl.c_str();
+        edit = drop + "{images}{prompt}<|im_end|>\n<|im_start|>assistant\n";
+        d.tmpl_edit = m.max_refs ? edit.c_str() : tmpl.c_str();
+        d.tmpl_image = m.max_refs ? "{image}" : nullptr;
         d.drop_prefix = drop.c_str();
         d.latent_channels = m.C;
         d.latent_scale = 16;
@@ -1256,8 +1430,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.pixel_channels = 3;
         d.slot_rows = 1;
         d.max_tokens = m.max_image_tokens;
-        d.max_refs = 0;
-        d.ref_area = 1;
+        d.max_refs = m.max_refs;
+        d.ref_area = m.max_refs ? m.max_image_tokens * 256 : 1;
         const int64_t side = (int64_t)std::sqrt(std::min<int64_t>(m.max_image_tokens, 4096)) * 16;
         d.default_width = side;
         d.default_height = side;
@@ -1278,9 +1452,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.cfg_original = 1;
         d.default_cfg = m.turbo ? 0.0 : 4.5;
         d.default_negative = "";
-        d.max_lanes = kMaxLanes;
+        d.max_lanes = m.lanes;
         d.image_out = m.b_img;
-        d.cond_rows = kCondRows;
+        d.cond_rows = m.store_rows;
         d.rope_hw_scale = 1.0;
         d.rope_text_l = 0;
         d.cond_opts = RAD_GEN_COND_REBALANCE | RAD_GEN_COND_REBALANCE_PRESET;
@@ -1307,10 +1481,15 @@ static void step_te(RadCtx* c, const RadBatch* batch, const Model& m) {
     const bool rebalance = (opts & RAD_GEN_COND_REBALANCE) && preset < kNPresets;
     RAD_ISSUE_N(c, m.op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok),
                 brows(m.b_tx, T));
+    const int64_t media_rows = m.vision.on ? batch->n_mm_rows : 0;
+    if (media_rows > 0)
+        RAD_ISSUE_N(c, m.op_vision_embed, media_rows, brows(m.vision.b_out, media_rows),
+                    praw(batch->mm_rows, RAD_I32, media_rows), brows(m.b_tx, T));
     RAD_ISSUE_N(c, m.op_iota, T, brows(m.b_tidx, T));
     const RadOperand pos = praw2(batch->rope_pos, RAD_I32, 3, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, 2);
-    for (const TeLayer& L : m.te) {
+    for (size_t layer = 0; layer < m.te.size(); ++layer) {
+        const TeLayer& L = m.te[layer];
         RAD_ISSUE_N(c, L.op_n1, T, brows(m.b_tx, T), RAD_W(L.w_n1), brows(m.a_th.x, T));
         L.q_h.step(c, T);
         L.qkv.step(c, m.a_th, m.b_tkv, T);
@@ -1328,12 +1507,15 @@ static void step_te(RadCtx* c, const RadBatch* batch, const Model& m) {
         L.down.step(c, m.a_tffn, m.b_th2, T);
         if (L.op_ar2) RAD_ISSUE_N(c, L.op_ar2, T * g.n_embd, brows(m.b_th2, T), RAD_NONE);
         RAD_ISSUE_N(c, L.op_add2, T, brows(m.b_tx, T), brows(m.b_th2, T), brows(m.b_tx, T));
+        if (media_rows > 0 && layer < (size_t)m.vision.n_ds)
+            RAD_ISSUE_N(c, m.op_deepstack[layer], media_rows, brows(m.vision.b_ds[layer], media_rows),
+                        praw(batch->mm_rows, RAD_I32, media_rows), brows(m.b_tx, T));
         if (L.tap >= 0 && rebalance)
             RAD_ISSUE_N(c, L.op_gain[preset], T, brows(m.b_tx, T), brows(m.b_th2, T));
         if (L.tap >= 0)
             RAD_ISSUE_N(c, rebalance ? L.op_tap_g : L.op_tap, T,
                         brows(rebalance ? m.b_th2 : m.b_tx, T), brows(m.b_tidx, T),
-                        brow_slice(m.b_taps, L.tap, (int64_t)kTeRows * kNTaps - L.tap,
+                        brow_slice(m.b_taps, L.tap, (int64_t)m.te_rows * kNTaps - L.tap,
                                    g.n_embd));
     }
 }
@@ -1383,8 +1565,13 @@ static void step_fuse(RadCtx* c, const Model& m, const FuseBlock& F, int64_t r0,
  * tokens), txt_in, and the rows into every lane's store at this branch. */
 static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadGenBatch* G = batch->gen_b;
-    const int64_t P = G->rows, drop = batch->n_tok - P;
+    const int64_t P = G->n_px ? G->seg_h[1] : G->rows, drop = batch->n_tok - P;
+    if (P > m.cond_rows || drop < 0 || batch->n_tok > m.te_rows) {
+        rad_step_fail(c, "krea2: the prompt exceeds the conditioning buffer");
+        return;
+    }
     const int64_t D = m.gf.n_embd, Dd = m.gd.n_embd, RL = P * kNTaps;
+    if (m.vision.on && batch->enc_n_patch > 0) m.vision.step(c, batch);
     step_te(c, batch, m);
     RAD_ISSUE_N(c, m.op_fcu, P + 1, brows(m.b_fcu, P + 1));
     for (const FuseBlock& F : m.lw) step_fuse(c, m, F, drop * kNTaps, RL, brows(m.b_fcu, P + 1));
@@ -1398,9 +1585,30 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     RAD_ISSUE_N(c, m.op_txg, P, brows(m.b_txb, P), brows(m.b_txb, P));
     RAD_ISSUE_N(c, m.op_tx2, P, brows(m.b_txb, P), RAD_W(m.w_tx2), RAD_W(m.b_tx2), RAD_NONE,
                 brows(m.b_txt, P));
-    RAD_ISSUE_N(c, m.op_store, P, brows(m.b_txt, P), praw(G->lane, RAD_I32, G->n_lane),
-                brow_slice(m.b_store, (int64_t)G->branch * kCondRows,
-                           2 * (int64_t)kMaxLanes * kCondRows - G->branch * kCondRows, Dd));
+    const int64_t base = (int64_t)G->branch * m.store_rows;
+    const int64_t rows = 2 * m.lanes * m.store_rows;
+    const RadOperand lanes = praw(G->lane, RAD_I32, G->n_lane);
+    RAD_ISSUE_N(c, m.op_store, P, brows(m.b_txt, P), lanes,
+                brow_slice(m.b_store, base, rows - base, Dd));
+    int64_t row = P;
+    for (int64_t i = 0; i < G->n_px; ++i) {
+        const int64_t h = G->px_h[3 * i + 1], w = G->px_h[3 * i + 2];
+        const int64_t H = h / 8, W = w / 8, Z = m.C / 4, n = H * W / 4;
+        const auto* px = (const uint16_t*)G->px + 3LL * G->px_h[3 * i];
+        RAD_ISSUE_N(c, m.op_enc_cu, 2, praw(G->px_cu + 2 * i + 1, RAD_I32, 1), brows(m.b_enc_cu, 2));
+        m.enc.issue(c, h, w, brows(m.b_enc_cu, 2), px);
+        RAD_ISSUE_N(c, m.op_enc_norm, H * W, bcol(m.enc_out.buf, 0, Z, H * W),
+                    brows(m.b_enc_norm, H * W));
+        RAD_ISSUE_N(c, m.op_enc_zero, n, brows(m.b_enc_pack, n));
+        RAD_ISSUE_N(c, m.op_enc_pack, n,
+                    RAD_P_T2(rad_buf_ptr(c, m.b_enc_norm), RAD_BF16, H, W * Z),
+                    RAD_P_T2(rad_buf_ptr(c, m.b_enc_pack), RAD_BF16, H / 2, (W / 2) * m.C));
+        RAD_ISSUE_N(c, m.op_enc_project, n, brows(m.b_enc_pack, n), RAD_W(m.w_imgin), RAD_W(m.b_imgin),
+                    RAD_NONE, brows(m.b_enc_embed, n));
+        RAD_ISSUE_N(c, m.op_enc_store, n, brows(m.b_enc_embed, n), lanes,
+                    brow_slice(m.b_store, base + row, rows - base - row, Dd));
+        row += n;
+    }
 }
 
 /* One denoising step: the entries' modulation, the joint rows, the blocks, and the image rows'
@@ -1414,7 +1622,7 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const RadOperand icu = praw(G->img_cu, RAD_I32, S + 1);
     const RadOperand lanes = praw(G->lane, RAD_I32, S);
-    const int64_t LR = (int64_t)kMaxLanes * m.max_image_tokens;
+    const int64_t LR = m.lanes * m.max_image_tokens;
 
     /* ---- modulation: the timestep MLP, the shared projection, each block's table, the final */
     RAD_ISSUE_N(c, m.op_temb, S, praw(G->sigma, RAD_F32, S), brows(m.b_tproj, S));
@@ -1434,7 +1642,7 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
     RAD_ISSUE_N(c, m.op_lgather, NI, brows(m.b_state, LR), lanes, icu, brows(m.b_lat, NI));
     RAD_ISSUE_N(c, m.op_imgin, NI, brows(m.b_lat, NI), RAD_W(m.w_imgin), RAD_W(m.b_imgin), RAD_NONE,
               brows(m.b_himg, NI));
-    RAD_ISSUE_N(c, m.op_join, N, brows(m.b_store, 2 * (int64_t)kMaxLanes * kCondRows),
+    RAD_ISSUE_N(c, m.op_join, N, brows(m.b_store, 2 * m.lanes * m.store_rows),
                 brows(m.b_himg, NI), praw(G->src, RAD_I32, N), brows(m.b_h, N));
 
     /* ---- the blocks; block l's modulation is columns [6 l D, 6 (l + 1) D) of `mods`:
@@ -1461,8 +1669,13 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
         B.qkv.step(c, m.a_hm, m.b_qkv, N);
         B.gate.step(c, m.a_hm, m.b_g, N);
         RAD_ISSUE_N(c, B.op_qkr, N, brows(m.b_qkv, N), pos, RAD_W(B.w_qn), RAD_W(B.w_kn));
-        RAD_ISSUE_N(c, B.op_attn, N, bcol(m.b_qkv, 0, qd, N), bcol(m.b_qkv, qd, kvd, N),
-                    bcol(m.b_qkv, qd + kvd, kvd, N), cu, brows(m.a_attn.x, N));
+        if (m.max_refs)
+            RAD_ISSUE_N(c, B.op_attn, N, bcol(m.b_qkv, 0, qd, N), bcol(m.b_qkv, qd, kvd, N),
+                        bcol(m.b_qkv, qd + kvd, kvd, N), cu, brows(m.a_attn.x, N),
+                        praw(G->mode_cu, RAD_I32, 3 * S + 1), praw(G->ref_log_bias, RAD_F32, S));
+        else
+            RAD_ISSUE_N(c, B.op_attn, N, bcol(m.b_qkv, 0, qd, N), bcol(m.b_qkv, qd, kvd, N),
+                        bcol(m.b_qkv, qd + kvd, kvd, N), cu, brows(m.a_attn.x, N));
         if (B.op_sig) {
             RAD_ISSUE_N(c, B.op_sig, N, brows(m.b_g, N), brows(m.b_g, N));
             RAD_ISSUE_N(c, B.op_gq, N, brows(m.a_attn.x, N), brows(m.b_g, N), brows(m.a_attn.x, N));
@@ -1565,10 +1778,21 @@ static void step(RadCtx* c, const RadBatch* batch) {
 /* The rows a pass carries: one image at the largest size with guidance, its text both ways. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    RAD_ARCH_TRY(check_reference_encoder(meta));
     const int64_t tokens = image_tokens(out->gen_max_pixels);
     if (tokens == 0) return RAD_E_INVAL;
-    out->gen_rows = 2 * (tokens + kCondRows);
-    out->gen_patches = 0;
+    const bool vision = has_reference_encoder(meta) && VisionTower::present(meta);
+    if (!vision) {
+        out->gen_rows = 2 * (tokens + kCondRows);
+        out->gen_patches = 0;
+        return RAD_OK;
+    }
+    const int64_t refs = reference_count(out->gen_max_refs);
+    const int64_t merge = rad_meta_geti(meta, "vision_config.spatial_merge_size", 0);
+    if (refs > kMaxReferences || merge < 1 || merge > 16) return RAD_E_INVAL;
+    out->gen_rows = 2 * (tokens + edit_cond_rows(refs, merge) + refs * tokens);
+    const int64_t group = merge * merge;
+    out->gen_patches = refs * ((kGroundingPatches + group - 1) / group * group);
     return RAD_OK;
 }
 

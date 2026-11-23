@@ -82,20 +82,20 @@ struct VisionTower {
      * and leaves `on` false, for a model whose config names a tower its weights may not have. */
     int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
                 int64_t model_embd, int first_group, bool deepstack = false,
-                bool gate_weights = false);
+                bool gate_weights = false, const char* prefix = "model.visual");
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx,
                                 Names& nm, int64_t model_embd, int first_group, bool deepstack,
-                                bool gate_weights) {
+                                bool gate_weights, const char* prefix) {
     on = false;
     if (!present(m) || ctx->max_enc_patches <= 0) return RAD_OK;
 
     /* Whether the stem is there: its map first, then its encoding, which convert answers from the
      * checkpoint and load from the container alike. A map left behind is inert. */
     if (gate_weights) {
-        if (map_copy(b, nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight")) < 0)
+        if (map_copy(b, nm.f("v.patch.weight"), nm.ckpt("%s.patch_embed.proj.weight", prefix)) < 0)
             return RAD_E_INVAL;
         RadEncoding enc;
         if (rad_weight_encoding(b, nm.f("v.patch.weight"), &enc, nullptr, nullptr) != RAD_OK) {
@@ -194,46 +194,45 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
     w_patch = gate_weights
         ? decl_w(b, nm.f("v.patch.weight"), RAD_BF16, { width, patch_dim },
                  RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, grp_model())
-        : bw(nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight"),
+        : bw(nm.f("v.patch.weight"), nm.ckpt("%s.patch_embed.proj.weight", prefix),
              RAD_BF16, { width, patch_dim }, grp_model());
-    b_patch = bw(nm.f("v.patch.bias"), nm.ckpt("model.visual.patch_embed.proj.bias"),
+    b_patch = bw(nm.f("v.patch.bias"), nm.ckpt("%s.patch_embed.proj.bias", prefix),
                  RAD_BF16, { width }, grp_model());
-    w_pos   = bw(nm.f("v.pos.weight"), nm.ckpt("model.visual.pos_embed.weight"),
+    w_pos   = bw(nm.f("v.pos.weight"), nm.ckpt("%s.pos_embed.weight", prefix),
                  RAD_BF16, { npos, width }, grp_model());
     L.assign((size_t)depth, Layer{});
     for (int64_t i = 0; i < depth; ++i) {
         Layer& l = L[(size_t)i];
         const RadWeightGroup g = grp_layer(first_group + (int)i);
         const int li = (int)i;
-        l.n1w    = bw(nm.f("v.blk.%d.norm1.weight", li), nm.ckpt("model.visual.blocks.%d.norm1.weight", li), RAD_BF16, { width }, g);
-        l.n1b    = bw(nm.f("v.blk.%d.norm1.bias", li),   nm.ckpt("model.visual.blocks.%d.norm1.bias", li),   RAD_BF16, { width }, g);
-        l.qkv_w  = bw(nm.f("v.blk.%d.qkv.weight", li),   nm.ckpt("model.visual.blocks.%d.attn.qkv.weight", li), RAD_BF16, { 3 * width, width }, g);
-        l.qkv_b  = bw(nm.f("v.blk.%d.qkv.bias", li),     nm.ckpt("model.visual.blocks.%d.attn.qkv.bias", li),   RAD_BF16, { 3 * width }, g);
-        l.out_w  = bw(nm.f("v.blk.%d.proj.weight", li),  nm.ckpt("model.visual.blocks.%d.attn.proj.weight", li), RAD_BF16, { width, width }, g);
-        l.out_b  = bw(nm.f("v.blk.%d.proj.bias", li),    nm.ckpt("model.visual.blocks.%d.attn.proj.bias", li),   RAD_BF16, { width }, g);
-        l.n2w    = bw(nm.f("v.blk.%d.norm2.weight", li), nm.ckpt("model.visual.blocks.%d.norm2.weight", li), RAD_BF16, { width }, g);
-        l.n2b    = bw(nm.f("v.blk.%d.norm2.bias", li),   nm.ckpt("model.visual.blocks.%d.norm2.bias", li),   RAD_BF16, { width }, g);
-        l.up_w   = bw(nm.f("v.blk.%d.fc1.weight", li),   nm.ckpt("model.visual.blocks.%d.mlp.linear_fc1.weight", li), RAD_BF16, { ff, width }, g);
-        l.up_b   = bw(nm.f("v.blk.%d.fc1.bias", li),     nm.ckpt("model.visual.blocks.%d.mlp.linear_fc1.bias", li),   RAD_BF16, { ff }, g);
-        l.down_w = bw(nm.f("v.blk.%d.fc2.weight", li),   nm.ckpt("model.visual.blocks.%d.mlp.linear_fc2.weight", li), RAD_BF16, { width, ff }, g);
-        l.down_b = bw(nm.f("v.blk.%d.fc2.bias", li),     nm.ckpt("model.visual.blocks.%d.mlp.linear_fc2.bias", li),   RAD_BF16, { width }, g);
+        l.n1w    = bw(nm.f("v.blk.%d.norm1.weight", li), nm.ckpt("%s.blocks.%d.norm1.weight", prefix, li), RAD_BF16, { width }, g);
+        l.n1b    = bw(nm.f("v.blk.%d.norm1.bias", li),   nm.ckpt("%s.blocks.%d.norm1.bias", prefix, li),   RAD_BF16, { width }, g);
+        l.qkv_w  = bw(nm.f("v.blk.%d.qkv.weight", li),   nm.ckpt("%s.blocks.%d.attn.qkv.weight", prefix, li), RAD_BF16, { 3 * width, width }, g);
+        l.qkv_b  = bw(nm.f("v.blk.%d.qkv.bias", li),     nm.ckpt("%s.blocks.%d.attn.qkv.bias", prefix, li),   RAD_BF16, { 3 * width }, g);
+        l.out_w  = bw(nm.f("v.blk.%d.proj.weight", li),  nm.ckpt("%s.blocks.%d.attn.proj.weight", prefix, li), RAD_BF16, { width, width }, g);
+        l.out_b  = bw(nm.f("v.blk.%d.proj.bias", li),    nm.ckpt("%s.blocks.%d.attn.proj.bias", prefix, li),   RAD_BF16, { width }, g);
+        l.n2w    = bw(nm.f("v.blk.%d.norm2.weight", li), nm.ckpt("%s.blocks.%d.norm2.weight", prefix, li), RAD_BF16, { width }, g);
+        l.n2b    = bw(nm.f("v.blk.%d.norm2.bias", li),   nm.ckpt("%s.blocks.%d.norm2.bias", prefix, li),   RAD_BF16, { width }, g);
+        l.up_w   = bw(nm.f("v.blk.%d.fc1.weight", li),   nm.ckpt("%s.blocks.%d.mlp.linear_fc1.weight", prefix, li), RAD_BF16, { ff, width }, g);
+        l.up_b   = bw(nm.f("v.blk.%d.fc1.bias", li),     nm.ckpt("%s.blocks.%d.mlp.linear_fc1.bias", prefix, li),   RAD_BF16, { ff }, g);
+        l.down_w = bw(nm.f("v.blk.%d.fc2.weight", li),   nm.ckpt("%s.blocks.%d.mlp.linear_fc2.weight", prefix, li), RAD_BF16, { width, ff }, g);
+        l.down_b = bw(nm.f("v.blk.%d.fc2.bias", li),     nm.ckpt("%s.blocks.%d.mlp.linear_fc2.bias", prefix, li),   RAD_BF16, { width }, g);
     }
-    mn_w = bw(nm.f("v.merger.norm.weight"), nm.ckpt("model.visual.merger.norm.weight"), RAD_BF16, { width }, grp_model());
-    mn_b = bw(nm.f("v.merger.norm.bias"),   nm.ckpt("model.visual.merger.norm.bias"),   RAD_BF16, { width }, grp_model());
-    m1_w = bw(nm.f("v.merger.fc1.weight"),  nm.ckpt("model.visual.merger.linear_fc1.weight"), RAD_BF16, { mm * width, mm * width }, grp_model());
-    m1_b = bw(nm.f("v.merger.fc1.bias"),    nm.ckpt("model.visual.merger.linear_fc1.bias"),   RAD_BF16, { mm * width }, grp_model());
-    m2_w = bw(nm.f("v.merger.fc2.weight"),  nm.ckpt("model.visual.merger.linear_fc2.weight"), RAD_BF16, { n_embd, mm * width }, grp_model());
-    m2_b = bw(nm.f("v.merger.fc2.bias"),    nm.ckpt("model.visual.merger.linear_fc2.bias"),   RAD_BF16, { n_embd }, grp_model());
+    mn_w = bw(nm.f("v.merger.norm.weight"), nm.ckpt("%s.merger.norm.weight", prefix), RAD_BF16, { width }, grp_model());
+    mn_b = bw(nm.f("v.merger.norm.bias"),   nm.ckpt("%s.merger.norm.bias", prefix),   RAD_BF16, { width }, grp_model());
+    m1_w = bw(nm.f("v.merger.fc1.weight"),  nm.ckpt("%s.merger.linear_fc1.weight", prefix), RAD_BF16, { mm * width, mm * width }, grp_model());
+    m1_b = bw(nm.f("v.merger.fc1.bias"),    nm.ckpt("%s.merger.linear_fc1.bias", prefix),   RAD_BF16, { mm * width }, grp_model());
+    m2_w = bw(nm.f("v.merger.fc2.weight"),  nm.ckpt("%s.merger.linear_fc2.weight", prefix), RAD_BF16, { n_embd, mm * width }, grp_model());
+    m2_b = bw(nm.f("v.merger.fc2.bias"),    nm.ckpt("%s.merger.linear_fc2.bias", prefix),   RAD_BF16, { n_embd }, grp_model());
     if (!w_patch || !b_patch || !w_pos || !mn_w || !mn_b || !m1_w || !m1_b || !m2_w || !m2_b)
         return RAD_E_INVAL;
     for (int t = 0; t < n_ds; ++t) {
-        const char* pre = "model.visual.deepstack_merger_list";
-        ds_nw[t] = bw(nm.f("v.ds.%d.norm.weight", t), nm.ckpt("%s.%d.norm.weight", pre, t), RAD_BF16, { mm * width }, grp_model());
-        ds_nb[t] = bw(nm.f("v.ds.%d.norm.bias", t),   nm.ckpt("%s.%d.norm.bias", pre, t),   RAD_BF16, { mm * width }, grp_model());
-        ds_1w[t] = bw(nm.f("v.ds.%d.fc1.weight", t),  nm.ckpt("%s.%d.linear_fc1.weight", pre, t), RAD_BF16, { mm * width, mm * width }, grp_model());
-        ds_1b[t] = bw(nm.f("v.ds.%d.fc1.bias", t),    nm.ckpt("%s.%d.linear_fc1.bias", pre, t),   RAD_BF16, { mm * width }, grp_model());
-        ds_2w[t] = bw(nm.f("v.ds.%d.fc2.weight", t),  nm.ckpt("%s.%d.linear_fc2.weight", pre, t), RAD_BF16, { n_embd, mm * width }, grp_model());
-        ds_2b[t] = bw(nm.f("v.ds.%d.fc2.bias", t),    nm.ckpt("%s.%d.linear_fc2.bias", pre, t),   RAD_BF16, { n_embd }, grp_model());
+        ds_nw[t] = bw(nm.f("v.ds.%d.norm.weight", t), nm.ckpt("%s.deepstack_merger_list.%d.norm.weight", prefix, t), RAD_BF16, { mm * width }, grp_model());
+        ds_nb[t] = bw(nm.f("v.ds.%d.norm.bias", t),   nm.ckpt("%s.deepstack_merger_list.%d.norm.bias", prefix, t),   RAD_BF16, { mm * width }, grp_model());
+        ds_1w[t] = bw(nm.f("v.ds.%d.fc1.weight", t),  nm.ckpt("%s.deepstack_merger_list.%d.linear_fc1.weight", prefix, t), RAD_BF16, { mm * width, mm * width }, grp_model());
+        ds_1b[t] = bw(nm.f("v.ds.%d.fc1.bias", t),    nm.ckpt("%s.deepstack_merger_list.%d.linear_fc1.bias", prefix, t),   RAD_BF16, { mm * width }, grp_model());
+        ds_2w[t] = bw(nm.f("v.ds.%d.fc2.weight", t),  nm.ckpt("%s.deepstack_merger_list.%d.linear_fc2.weight", prefix, t), RAD_BF16, { n_embd, mm * width }, grp_model());
+        ds_2b[t] = bw(nm.f("v.ds.%d.fc2.bias", t),    nm.ckpt("%s.deepstack_merger_list.%d.linear_fc2.bias", prefix, t),   RAD_BF16, { n_embd }, grp_model());
         if (!ds_nw[t] || !ds_nb[t] || !ds_1w[t] || !ds_1b[t] || !ds_2w[t] || !ds_2b[t])
             return RAD_E_INVAL;
     }

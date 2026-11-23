@@ -12225,6 +12225,132 @@ void attn_dense_gqa_cases(const Plugin& pl) {
 }
 
 /* attn_dense_h80_bf16: C-RADIO's tower, 16 heads of 80 over a fused [q|k|v] row, two images. */
+/* Reference boost crosses key tiles in two unequal sequences. The CPU oracle reads the same
+ * BF16 operands; the test also proves malformed later segments leave the whole GPU output alone. */
+void attn_dense_ref_cases(const Plugin& pl) {
+    const char* name = "attn_dense_ref_h128_bf16";
+    const RadKernelInfo* row = find(pl, name);
+    if (!row || !g_plugin) { ok(name, false, "row or plugin path absent"); return; }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    std::unique_ptr<void, decltype(&dlclose)> reference(dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL), dlclose);
+    if (!reference) { ok(name, false, "reference plugin unavailable"); return; }
+    auto count = (int (*)(void))dlsym(reference.get(), "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(reference.get(), "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (at(i) && !std::strcmp(at(i)->op, "attn_dense_ref")) { oracle = at(i); break; }
+    if (!oracle) { ok(name, false, "reference operation unavailable"); return; }
+
+    constexpr int64_t total = 333, hd = 128, guard = 32;
+    const std::vector<int32_t> valid_cu{0,197,333}, valid_modes{0,17,149,197,218,299,333};
+    for (int gqa : {1,2,4,8}) {
+        const int64_t width = gqa * hd, elements = total * width;
+        auto q = randv((size_t)elements, 0.7f);
+        auto k = randv((size_t)(total * hd), 0.7f);
+        auto v = randv((size_t)(total * hd), 1.0f);
+        // Distinguishable reference values make ignoring the boost fail the neutral control.
+        for (int64_t key = 218; key < 299; ++key)
+            for (int64_t dimension = 0; dimension < hd; ++dimension)
+                v[(size_t)(key * hd + dimension)] += 2.0f;
+        void* dq = up_bf16(q), *dk = up_bf16(k), *dv = up_bf16(v);
+        auto bf16 = [](const std::vector<float>& values) {
+            std::vector<uint16_t> result(values.size());
+            for (size_t i = 0; i < values.size(); ++i) result[i] = h_to_bf16(values[i]);
+            return result;
+        };
+        auto hq = bf16(q), hk = bf16(k), hv = bf16(v);
+        std::vector<int32_t> cu = valid_cu, modes = valid_modes;
+        std::vector<float> biases{0,std::log(4.0f)};
+        std::vector<float> initial((size_t)(elements + 2 * guard), 0.25f);
+        void* output_all = up_bf16(initial);
+        void* dcu = up_i32(cu), *dmodes = up_i32(modes), *dbiases = up_f32(biases);
+        if (!dq || !dk || !dv || !output_all || !dcu || !dmodes || !dbiases) {
+            ok(name, false, "allocation failed"); return;
+        }
+        auto* output = static_cast<uint16_t*>(output_all) + guard;
+        const auto initial_bytes = bf16(initial);
+        const std::vector<RadParam> params{PI("M", total), PI("head_dim", hd), PI("gqa", gqa),
+            PI("causal", 0), PS("dtype", "bf16")};
+        auto cpu = [&](std::vector<uint16_t>& result) {
+            std::vector<RadTensor> tensors{T(hq.data(), RAD_BF16, {total,gqa,hd}),
+                T(hk.data(), RAD_BF16, {total,1,hd}), T(hv.data(), RAD_BF16, {total,1,hd}),
+                T(cu.data(), RAD_I32, {3}), T(result.data(), RAD_BF16, {total,gqa,hd}),
+                T(modes.data(), RAD_I32, {7}), T(biases.data(), RAD_F32, {2})};
+            RadArgs args{};
+            args.t = tensors.data(); args.n_t = (int)tensors.size();
+            args.p = params.data(); args.n_p = (int)params.size(); args.world_size = 1;
+            return oracle->launch(&args, nullptr);
+        };
+        auto gpu = [&]() {
+            st_memcpy(dcu, cu.data(), cu.size() * sizeof(int32_t), hipMemcpyHostToDevice);
+            st_memcpy(dmodes, modes.data(), modes.size() * sizeof(int32_t), hipMemcpyHostToDevice);
+            st_memcpy(dbiases, biases.data(), biases.size() * sizeof(float), hipMemcpyHostToDevice);
+            st_memcpy(output_all, initial_bytes.data(), initial_bytes.size() * sizeof(uint16_t), hipMemcpyHostToDevice);
+            return launch(row, {T(dq, RAD_BF16, {total,gqa,hd}), T(dk, RAD_BF16, {total,1,hd}),
+                T(dv, RAD_BF16, {total,1,hd}), T(dcu, RAD_I32, {3}),
+                T(output, RAD_BF16, {total,gqa,hd}), T(dmodes, RAD_I32, {7}),
+                T(dbiases, RAD_F32, {2})}, params);
+        };
+        auto guards_intact = [&]() {
+            const auto all = down_bf16(output_all, initial.size());
+            return std::all_of(all.begin(), all.begin() + guard, [](float x) { return x == 0.25f; }) &&
+                   std::all_of(all.end() - guard, all.end(), [](float x) { return x == 0.25f; });
+        };
+        for (int profile = 0; profile < 2; ++profile) {
+            biases = profile == 0 ? std::vector<float>{0,std::log(4.0f)} : std::vector<float>{-16,16};
+            std::vector<uint16_t> wanted((size_t)elements);
+            const int reference_status = cpu(wanted), device_status = gpu();
+            ok(fmt("%s gqa%d profile%d launches", name, gqa, profile).c_str(),
+               reference_status == RAD_OK && device_status == RAD_OK);
+            if (reference_status != RAD_OK || device_status != RAD_OK) return;
+            std::vector<float> want(wanted.size());
+            for (size_t i = 0; i < wanted.size(); ++i) want[i] = h_bf16(wanted[i]);
+            const auto got = down_bf16(output, wanted.size());
+            check(fmt("%s gqa%d profile%d unequal/tile-crossing", name, gqa, profile),
+                  got, want, 2e-2);
+            for (size_t sequence = 0; sequence < 2; ++sequence) {
+                const int64_t begin = modes[3 * sequence + 2] * width;
+                const int64_t end = cu[sequence + 1] * width;
+                check(fmt("%s gqa%d profile%d target-sequence%zu", name, gqa, profile, sequence),
+                    std::vector<float>(got.begin() + begin, got.begin() + end),
+                    std::vector<float>(want.begin() + begin, want.begin() + end), 2e-2);
+            }
+            ok(fmt("%s gqa%d output guards", name, gqa).c_str(), guards_intact());
+            if (profile == 0) {
+                biases = {0,0};
+                std::vector<uint16_t> neutral((size_t)elements);
+                if (cpu(neutral) != RAD_OK) { ok(name, false, "neutral control refused"); return; }
+                std::vector<float> plain(neutral.size());
+                for (size_t i = 0; i < neutral.size(); ++i) plain[i] = h_bf16(neutral[i]);
+                ok(fmt("%s gqa%d boost differs from neutral", name, gqa).c_str(), rel(plain, want) > 0.05);
+            }
+        }
+        if (gqa != 2) continue; // The metadata preflight is shared; exercise malformed data once.
+        for (int invalid = 0; invalid < 10; ++invalid) {
+            cu = valid_cu; modes = valid_modes; biases = {0,0};
+            if (invalid == 0) cu[2] = (int32_t)total + 1;
+            if (invalid == 1) cu[2] = cu[1] - 1;
+            if (invalid == 2) cu[0] = -1;
+            if (invalid == 3) modes[4] = cu[1] - 1;
+            if (invalid == 4) modes[5] = (int32_t)total + 1;
+            if (invalid == 5) biases[1] = INFINITY;
+            if (invalid == 6) biases[1] = -INFINITY;
+            if (invalid == 7) biases[1] = NAN;
+            if (invalid == 8) biases[1] = 17.0f;
+            if (invalid == 9) biases[1] = 3.0e38f;
+            std::vector<uint16_t> wanted((size_t)elements, h_to_bf16(0.25f));
+            const int reference_status = cpu(wanted), device_status = gpu();
+            const auto all = down_bf16(output_all, initial.size());
+            ok(fmt("%s malformed second sequence case%d", name, invalid).c_str(),
+               reference_status == RAD_E_SHAPE && device_status == RAD_OK &&
+               std::all_of(wanted.begin(), wanted.end(), [](uint16_t x) { return x == h_to_bf16(0.25f); }) &&
+               std::all_of(all.begin(), all.end(), [](float x) { return x == 0.25f; }));
+        }
+    }
+}
+
 void attn_dense_h80_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "attn_dense_h80_bf16");
     if (!r) { ok("attn_dense_h80_bf16", false, "row absent"); return; }
@@ -36732,6 +36858,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("attn_cross_h128_bf16")) g3::attn_cross_cases(pl, 128);
     if (sel("attn_cross_h64_bf16")) g3::attn_cross_cases(pl, 64);
     if (sel("attn_dense_gqa")) g3::attn_dense_gqa_cases(pl);
+    if (sel("attn_dense_ref_h128_bf16")) g3::attn_dense_ref_cases(pl);
     if (sel("attn_dense_h80_bf16")) g3::attn_dense_h80_cases(pl);
     if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl);
     if (sel("rms_mod_bf16")) g3::rms_mod_forms(pl);

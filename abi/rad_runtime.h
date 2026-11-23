@@ -515,6 +515,10 @@ typedef struct RadGenBatch {
     /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
      * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
+    /* ---- appended Krea 2 reference attention (release assigns the ABI version) */
+    /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
+     * The natural-log bias is finite and in [-16, 16]; zero leaves dense attention unchanged. */
+    const float*   ref_log_bias;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */

@@ -235,4 +235,11 @@ TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(sizeof(RadBatch), (size_t)496);
 }
 
+/* Krea 2 reference attention: the generator batch's bias pointer sits past its old 408-byte end,
+ * at the offset a plugin built against these headers reads it from. */
+TEST(the_reference_bias_field_is_appended_past_the_generator_batchs_end) {
+    CHECK_EQ(offsetof(RadGenBatch, ref_log_bias), (size_t)408);
+    CHECK_EQ(sizeof(RadGenBatch), (size_t)416);
+}
+
 RAD_TEST_MAIN()

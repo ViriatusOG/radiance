@@ -724,6 +724,7 @@ struct ImageGenInfo {
     /* The pictures are not read by the conditioning network: they go to the generator's own
      * encoder only (RAD_GEN_LAYOUT_JOINT_STEP). */
     bool    refs_encoder_only = false;
+    bool    refs_fit_output = false;
     /* A reference picture is shrunk to `ref_area` only when larger, then centre-cropped to the
      * size multiple; otherwise resized to `ref_area` at its aspect. */
     bool    ref_shrink_only = false;

@@ -1232,6 +1232,16 @@ static const RadOperandSpec oTimestepF64[] = { OPD("t"), OUT("y") };
 static const RadOperandSpec oFlowUniPC[] = { OPD("v"), OPD("coefficients"),
                                              INOUT("history"), INOUT("x"), OPD_O("negative"), OPD_O("guidance") };
 
+static const RadParamSpec pAttnDenseRef[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oAttnDenseRef[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }, { "mode_cu", RAD_OPD_IN, 0 },
+    { "ref_log_bias", RAD_OPD_IN, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
 { "flow_unipc_step", ARR(pMnD), ARR(oFlowUniPC),
   "Flow-prediction UniPC BH2 corrector and predictor. F32 history per row is "
@@ -1251,6 +1261,9 @@ static const RadOpSchema kSchemas[] = {
 
 { "wan_rope_table", ARR(pWanTable), ARR(oWanTable), "Wan's three-axis rotary coefficients." },
 { "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to queries and keys." },
+{ "attn_dense_ref", ARR(pAttnDenseRef), ARR(oAttnDenseRef),
+  "Dense attention with a logit bias on target queries to reference keys. mode_cu gives "
+  "each sequence's text, reference and target starts and the last sequence's end. The natural-log bias must be finite and in [-16, 16]." },
 
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is not in docs/OPS.md's elementwise table: "
@@ -2505,6 +2518,8 @@ SIMPLE("ref_wan_gated_add", "wan_gated_add", "elem", "Wan's FP32 residual update
 
 SIMPLE("ref_wan_rope_table", "wan_rope_table", "elem", "Wan rotary coefficients", "f32", ref_wan_rope_table),
 SIMPLE("ref_wan_rope", "wan_rope", "elem", "Wan rotary on queries and keys", "bf16/f32", ref_wan_rope),
+SIMPLE("ref_attn_dense_ref", "attn_dense_ref", "attn", "dense attention with reference key bias",
+       DT_FLOAT, ref_attn_dense_ref),
 
 SIMPLE("ref_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT,
        ref_rmsnorm),

@@ -1425,6 +1425,7 @@ TEST(op_vocabulary) {
 
         "attn_umt5",
         "gelu_umt5",
+        "attn_dense_ref",
 
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
@@ -7145,6 +7146,70 @@ TEST(gelu_umt5_preserves_wan_bf16_rounding) {
     for (size_t i = 0; i < expected.size(); ++i) CHECK_EQ(y.at(i), expected[i]);
 }
 
+TEST(op_attn_dense_ref_boost_and_neutral_attention) {
+    T q(RAD_F32, {3, 1, 1}); q.f({0, 0, 0});
+    T k(RAD_F32, {3, 1, 1}); k.f({0, 0, 0});
+    T v(RAD_F32, {3, 1, 1}); v.f({0, 6, 0});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T modes(RAD_I32, {4}); modes.n({0, 1, 2, 3});
+    T bias(RAD_F32, {1});
+    T out(RAD_F32, {3, 1, 1});
+    A a; a.t(q).t(k).t(v).t(cu).t(out).t(modes).t(bias)
+          .i("M", 3).i("head_dim", 1).i("gqa", 1).i("causal", 0).s("dtype", "f32");
+    bias.f({std::log(4.0f)});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 4.0f, 1e-6);
+    bias.f({0});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 2.0f, 1e-6);
+}
+
+TEST(reference_attention_refuses_ranges_outside_the_sequence_before_writing) {
+    T q(RAD_F32, {3, 1, 1}); q.f({0, 0, 0});
+    T k(RAD_F32, {3, 1, 1}); k.f({0, 0, 0});
+    T v(RAD_F32, {3, 1, 1}); v.f({0, 6, 0});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T modes(RAD_I32, {4});
+    T bias(RAD_F32, {1}); bias.f({0});
+    T out(RAD_F32, {3, 1, 1});
+    A a; a.t(q).t(k).t(v).t(cu).t(out).t(modes).t(bias)
+          .i("M", 3).i("head_dim", 1).i("gqa", 1).i("causal", 0).s("dtype", "f32");
+    for (const auto& range : {std::pair{-1, 2}, std::pair{1, 4}, std::pair{2, 1}}) {
+        modes.n({0, range.first, range.second, 3});
+        out.f({17, 17, 17});
+        CHECK_EQ(run("attn_dense_ref", a), RAD_E_SHAPE);
+        for (int row = 0; row < 3; ++row) CHECK_EQ(out.at(row), 17.0f);
+    }
+}
+TEST(reference_attention_validates_all_outer_bounds_and_biases_before_writing) {
+    T q(RAD_F32, {6, 1, 1}); q.f({0,0,0,0,0,0});
+    T k(RAD_F32, {6, 1, 1}); k.f({0,0,0,0,0,0});
+    T v(RAD_F32, {6, 1, 1}); v.f({1,2,3,4,5,6});
+    T cu(RAD_I32, {3});
+    T modes(RAD_I32, {7}); modes.n({0,1,2,3,4,5,6});
+    T bias(RAD_F32, {2}); bias.f({0,0});
+    T out(RAD_F32, {6, 1, 1});
+    A args; args.t(q).t(k).t(v).t(cu).t(out).t(modes).t(bias)
+        .i("M", 6).i("head_dim", 1).i("gqa", 1).i("causal", 0).s("dtype", "f32");
+    for (const auto& bounds : {std::vector<int64_t>{0,3,7}, {0,3,2}, {-1,3,6}, {0,3,3}}) {
+        cu.n(bounds);
+        out.f({17,17,17,17,17,17});
+        CHECK_EQ(run("attn_dense_ref", args), RAD_E_SHAPE);
+        for (int row=0; row<6; ++row) CHECK_EQ(out.at(row), 17.0f);
+    }
+    cu.n({0,3,6});
+    for (float invalid : {INFINITY, -INFINITY, NAN, 17.0f, -17.0f, 3.0e38f}) {
+        bias.f({0,invalid});
+        out.f({17,17,17,17,17,17});
+        CHECK_EQ(run("attn_dense_ref", args), RAD_E_SHAPE);
+        for (int row=0; row<6; ++row) CHECK_EQ(out.at(row), 17.0f);
+    }
+}
+
 RAD_TEST_MAIN()
 
 /* scatter_rows: the three rules that distinguish it from the gather it mirrors, each because the
@@ -11193,6 +11258,8 @@ std::vector<Geo> geometries() {
 
         G("attn_umt5", "M", 6, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
         G("gelu_umt5", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
+        G("attn_dense_ref", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
+                                    .s("dtype", "f32")),
 
         G("position_scale", "M", 3, a.i("M", R).i("n", 8).i("original", 16384)
                                        .d("beta", 0.1).s("dtype", "f32")),

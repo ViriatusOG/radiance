@@ -82,7 +82,7 @@ json form_value(const std::string& key, const std::string& v) {
             if (e && *e == 0 && !v.empty()) return json(x);
             return json(v);
         }
-    if (key == "true_cfg_scale" || key == "guidance_scale") {
+    if (key == "true_cfg_scale" || key == "guidance_scale" || key == "ref_boost") {
         char* e = nullptr;
         const double x = std::strtod(v.c_str(), &e);
         if (e && *e == 0 && !v.empty()) return json(x);
@@ -247,7 +247,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         "style", "user", "input_fidelity", "seed", "negative_prompt", "true_cfg_scale",
         "guidance_scale",
         "num_inference_steps", "width", "height", "loras", "lora", "sampler", "scheduler",
-        "rebalance",
+        "rebalance", "ref_boost",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -477,6 +477,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             r.images.push_back(std::move(f));
         }
         if (have_mask) {
+            if (info.refs_fit_output)
+                return error_response(err_unsupported("mask", "masks are not supported for instruction edits"), req.peer);
             std::string why;
             if (mm::decode_image_rgba(mask_bytes.data(), mask_bytes.size(), kMaxSourcePixels,
                                       &r.mask, &why) < 0)
@@ -569,6 +571,15 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     g->seed = r.seed;
     g->previews = r.previews;
     g->cond_opts = r.rebalance;
+    if (body.contains("ref_boost")) {
+        if (!edit || !info.refs_fit_output)
+            return error_response(err_unsupported("ref_boost", "this model has no reference boost"),
+                                  req.peer);
+        const double boost = body["ref_boost"].is_number() ? body["ref_boost"].get<double>() : 0.0;
+        if (!(boost >= 0.0001 && boost <= 16.0))
+            return error_response(err_bad("ref_boost", "expected a number in 0.0001..16"), req.peer);
+        g->ref_log_bias = (float)std::log(boost);
+    }
     /* The driver guides as uncond + cfg (cond - uncond); a card's cond + s (cond - uncond) is
      * that at s + 1. */
     g->cfg = (float)(info.cfg_original ? r.cfg + 1.0 : r.cfg);
@@ -580,7 +591,20 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     for (const mm::FrameRGBA& f : r.images) {
         int32_t rw = 0, rh = 0;
         mm::FrameRGBA rs;
-        if (info.ref_shrink_only) {
+        if (info.refs_fit_output) {
+            const double sx = (double)r.w / f.w, sy = (double)r.h / f.h;
+            const double fit = std::min(sx, sy);
+            const bool near_match = f.w * fit >= r.w * 0.92 && f.h * fit >= r.h * 0.92;
+            const double scale = near_match ? std::max(sx, sy) : fit;
+            rw = near_match ? r.w : std::clamp((int32_t)(f.w * fit) / mult * mult, (int32_t)mult, r.w);
+            rh = near_match ? r.h : std::clamp((int32_t)(f.h * fit) / mult * mult, (int32_t)mult, r.h);
+            /* Crop the small remainder before resizing so snapping to the grid does not
+             * stretch reference content. Near-matched aspects fill the target grid. */
+            const int32_t cw = std::clamp((int32_t)std::lround(rw / scale), 1, f.w);
+            const int32_t ch = std::clamp((int32_t)std::lround(rh / scale), 1, f.h);
+            if (cw == f.w && ch == f.h) mm::resize_lanczos_rgba(f, rw, rh, &rs);
+            else mm::resize_lanczos_rgba(crop_centre(f, cw, ch), rw, rh, &rs);
+        } else if (info.ref_shrink_only) {
             /* Shrunk to the reference area only when larger, then cut to the size multiple. */
             const double area = (double)f.w * f.h;
             if (area > (double)info.ref_area) {
@@ -604,7 +628,15 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         g->refs.push_back(to_pixels(rs, pch));
         if (info.refs_encoder_only) continue;
         mm::Frame rgb;
-        mm::composite_white(rs, &rgb);
+        if (info.refs_fit_output && std::max(f.w, f.h) > 768) {
+            const double scale = 768.0 / std::max(f.w, f.h);
+            mm::FrameRGBA ground;
+            mm::resize_bilinear_rgba(f, std::max(1, (int32_t)std::lround(f.w * scale)),
+                                    std::max(1, (int32_t)std::lround(f.h * scale)), &ground);
+            mm::composite_white(ground, &rgb);
+        } else {
+            mm::composite_white(info.refs_fit_output ? f : rs, &rgb);
+        }
         std::shared_ptr<mm::Item> it;
         std::string why;
         if (deps_.images->picture(rgb, &it, &why) < 0 || !it)

@@ -1693,7 +1693,7 @@ int ref_attn_paged_rel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return RAD_OK;
 }
 
-int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+static int attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out, bool reference) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
     const int64_t gqa = gi(p, n_p, "gqa", 1);
@@ -1713,7 +1713,19 @@ int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     /* [0, ..., T], the batch's shape, not a draw. */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);   /* cu_seqlens */
     o.t(D, { M, nh, hd });                           /* out */
-    return o.finish("attn_dense", operand, out);
+    if (reference) {
+        o.t_idx({3 * S + 1}, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+        o.t(RAD_F32, {S});
+    }
+    return o.finish(reference ? "attn_dense_ref" : "attn_dense", operand, out);
+}
+
+int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return attn_dense_shape(p, n_p, operand, out, false);
+}
+
+int ref_attn_dense_ref_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return attn_dense_shape(p, n_p, operand, out, true);
 }
 
 int ref_attn_cross_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

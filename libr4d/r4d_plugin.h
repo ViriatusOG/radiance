@@ -1158,6 +1158,7 @@ int r4d_rad_wan_vae_expand(const RadArgs*, RadStream);
 int r4d_rad_timestep_embed_f64(const RadArgs*, RadStream);
 
 int r4d_rad_flow_unipc_step(const RadArgs*, RadStream);
+int r4d_rad_attn_dense_ref_h128(const RadArgs*, RadStream);
 
 }  /* extern "C" */
 

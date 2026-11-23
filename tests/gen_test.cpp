@@ -386,6 +386,14 @@ TEST(the_generator_refuses_a_request_that_can_never_run_by_field) {
         CHECK(named);
         if (!named) std::fprintf(stderr, "    refusal said: %s\n", why.c_str());
     };
+    for (float bias : {INFINITY, -INFINITY, NAN, 17.0f, -17.0f, 3.0e38f}) {
+        auto invalid_bias = f.req(64, 64);
+        invalid_bias->ref_log_bias = bias;
+        refused(std::move(invalid_bias), "reference log bias");
+    }
+    auto unsupported_boost = f.req(64, 64);
+    unsupported_boost->ref_log_bias = 1.0f;
+    refused(std::move(unsupported_boost), "grounded reference conditioning");
     refused(f.req(100, 64), "whole multiples of 32");
     refused(f.req(1024, 1024), "the largest this model makes is 1024 latent tokens");
     auto g = f.req(512, 512);
@@ -721,6 +729,100 @@ TEST(guidance_requires_enough_simultaneous_entries_at_submission) {
         CHECK_EQ(f.drv.submit(f.req(64, 64), &why), (int)RAD_OK);
         f.drv.shutdown("test finished", RAD_E_STATE);
     }
+}
+
+TEST(grounded_joint_edit_stages_two_distinct_references_in_both_branches) {
+    Program prog;
+    prog.generator = decl_base();
+    auto& d = prog.generator;
+    d.layout = RAD_GEN_LAYOUT_JOINT_STEP;
+    d.max_tokens = 16;
+    d.max_refs = 2;
+    d.cond_rows = 2 * d.max_tokens + 8;
+    d.ref_area = 64 * 64;
+    d.rope_hw_scale = 1.0;
+    d.pixel_channels = 3;
+    prog.gen_str.tmpl_image = "{image}";
+    prog.ctx.max_tok = 128;
+    prog.ctx.max_seqs = 2;
+    prog.ctx.max_enc_patches = 12;
+    prog.encoder.modalities = RAD_MM_IMAGE;
+    prog.encoder.patch_dim = 1;
+
+    auto picture = [](int h, int w, uint16_t fill) {
+        auto item = std::make_shared<mm::Item>();
+        item->n_seg = item->grid_t = 1;
+        item->rows_h = h;
+        item->rows_w = w;
+        item->grid_h = h * 2;
+        item->grid_w = w * 2;
+        item->seg_rows = h * w;
+        item->n_patch = item->grid_h * item->grid_w;
+        item->patch_dim = 1;
+        item->pixels.assign(item->n_patch, fill);
+        item->expand.assign(item->seg_rows, 5);
+        item->seg_at = {0};
+        return item;
+    };
+    auto req = std::make_unique<gen::Request>();
+    req->width = req->height = 64;
+    req->cfg = 2;
+    req->steps = 1;
+    req->has_neg = true;
+    req->ref_log_bias = std::log(2.0f);
+    req->pos.tokens = {1, 5, 5, 6, 5, 7, 8, 9};
+    req->pos.media = std::make_shared<mm::PromptMedia>();
+    req->pos.media->items = {{picture(2, 1, 21), 1}, {picture(1, 1, 42), 4}};
+    req->pos.media->layout();
+    req->neg = req->pos;
+    for (auto [w, h] : {std::pair{32, 64}, std::pair{64, 32}}) {
+        gen::Pixels ref;
+        ref.w = w; ref.h = h; ref.ch = 3;
+        ref.bf16.resize(w * h * 3);
+        req->refs.push_back(std::move(ref));
+    }
+    req->ticket = std::make_shared<gen::Ticket>();
+    gen::Driver drv;
+    REQUIRE_EQ(drv.init(prog, nullptr, {gen::Driver::RankIO{}}), RAD_OK);
+    std::string why;
+    req->pos.tokens.push_back(10);
+    auto too_long = std::make_unique<gen::Request>(*req);
+    CHECK_EQ(drv.submit(std::move(too_long), &why), RAD_E_INVAL);
+    CHECK(has(why, "conditioning token limit"));
+    req->pos.tokens.pop_back();
+    REQUIRE_EQ(drv.submit(std::move(req), &why), RAD_OK);
+    for (int branch = 0; branch < 2; ++branch) {
+        const RadBatch* b = drv.next(branch);
+        REQUIRE(b && b->gen == RAD_GEN_PASS_COND);
+        CHECK_EQ(b->enc_n_seg, 2);
+        CHECK_EQ(b->enc_n_patch, 12);
+        CHECK_EQ(b->enc_cu[1], 8);
+        CHECK_EQ(b->enc_cu[2], 12);
+        CHECK_EQ(static_cast<const uint16_t*>(b->enc_pixels)[0], 21);
+        CHECK_EQ(static_cast<const uint16_t*>(b->enc_pixels)[8], 42);
+        CHECK_EQ(b->gen_b->n_px, 2);
+        CHECK_EQ(b->gen_b->px_h[3], 32 * 64);
+        CHECK_EQ(b->gen_b->px_cu[1], 8);
+        CHECK_EQ(b->gen_b->px_cu[3], 8);
+        CHECK_OK(drv.done());
+    }
+    const RadBatch* b = drv.next(2);
+    REQUIRE(b && b->gen == RAD_GEN_PASS_DENOISE);
+    REQUIRE_EQ(b->n_seq, 2);
+    const auto& g = *b->gen_b;
+    for (int i = 0; i < 2; ++i) {
+        const int32_t first = g.mode_cu[3 * i + 1];
+        const int32_t second = first + 8;
+        CHECK_EQ(g.mode_cu[3 * i + 2], second + 8);
+        CHECK_EQ(g.rope_f[first], 1.0f);
+        CHECK_EQ(g.rope_f[second], 2.0f);
+        CHECK_EQ(g.rope_f[b->n_tok + first], 0.0f);
+        CHECK_EQ(g.rope_f[2 * b->n_tok + first], 1.0f);
+        CHECK_EQ(g.rope_f[b->n_tok + second], 1.0f);
+        CHECK_EQ(g.rope_f[2 * b->n_tok + second], 0.0f);
+        CHECK_EQ(g.ref_log_bias[i], std::log(2.0f));
+    }
+    CHECK_OK(drv.done());
 }
 
 RAD_TEST_MAIN()

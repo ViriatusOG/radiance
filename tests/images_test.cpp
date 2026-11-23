@@ -459,6 +459,101 @@ TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
 }
 
 
+/* A model whose references fit the output (Krea's instruction edit): `ref_boost` is a finite
+ * number in 0.0001..16 on an edit only, masks are refused, a reference is resized to the output's
+ * grid (near-matched aspects fill it, others fit inside it), and the grounding picture is cut
+ * to 768 px on its long side. */
+TEST(a_reference_fitting_edit_bounds_ref_boost_refuses_masks_and_resizes_references) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    const std::string pic = png(100, 100, 255, 255);
+    REQUIRE(!pic.empty());
+    auto edit = [&](const json& extra, int status) {
+        json b = { { "prompt", "x" }, { "image", data_url(pic) }, { "size", "256x128" } };
+        for (auto it = extra.begin(); it != extra.end(); ++it) b[it.key()] = it.value();
+        HttpResponse r = s.post("/v1/images/edits", b);
+        CHECK_EQ(r.status, status);
+        return json::parse(r.body, nullptr, false);
+    };
+    /* No boost leaves the bias at 0; in range it is the natural log. */
+    edit(json::object(), 200);
+    CHECK_EQ(s.last().ref_log_bias, 0.0f);
+    edit({ { "ref_boost", 1.0 } }, 200);
+    CHECK_EQ(s.last().ref_log_bias, 0.0f);
+    edit({ { "ref_boost", 2.0 } }, 200);
+    CHECK(std::fabs(s.last().ref_log_bias - std::log(2.0f)) < 1e-6f);
+    edit({ { "ref_boost", 16 } }, 200);
+    CHECK(std::fabs(s.last().ref_log_bias - std::log(16.0f)) < 1e-6f);
+    edit({ { "ref_boost", 0.0001 } }, 200);
+    CHECK(std::fabs(s.last().ref_log_bias - std::log(0.0001f)) < 1e-5f);
+    const size_t accepted = s.img.got.size();
+    /* Out of range, not a number, or not finite: refused under the field. */
+    const json bad[] = { 0.00009, 0.0, -1.0, 16.1, 1e300, "2", true, nullptr, json::array() };
+    for (const json& v : bad) {
+        const json e = edit({ { "ref_boost", v } }, 400);
+        CHECK_EQ(str_at(e["error"], "param"), std::string("ref_boost"));
+    }
+    /* A form field arrives as text: "nan" and "inf" parse as doubles and are still refused. */
+    for (const char* v : { "nan", "inf", "-inf", "16.5", "0" }) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/edits";
+        q.form = { FormPart{ "prompt", "", "", "x" }, FormPart{ "ref_boost", "", "", v },
+                   FormPart{ "image", "a.png", "image/png", pic } };
+        CHECK_EQ(s.f->srv->router().dispatch(q).status, 400);
+    }
+    {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/edits";
+        q.form = { FormPart{ "prompt", "", "", "x" }, FormPart{ "ref_boost", "", "", "3" },
+                   FormPart{ "image", "a.png", "image/png", pic } };
+        CHECK_EQ(s.f->srv->router().dispatch(q).status, 200);
+        CHECK(std::fabs(s.last().ref_log_bias - std::log(3.0f)) < 1e-6f);
+    }
+    CHECK_EQ(s.img.got.size(), accepted + 1);   /* nothing refused reached the generator */
+    /* Only an edit on a reference-fitting model takes it. */
+    CHECK_EQ(str_at(s.gen({ { "prompt", "x" }, { "ref_boost", 2.0 } }, 400)["error"], "param"),
+             std::string("ref_boost"));
+    s.img.inf.refs_fit_output = false;
+    CHECK_EQ(str_at(edit({ { "ref_boost", 2.0 } }, 400)["error"], "param"), std::string("ref_boost"));
+    s.img.inf.refs_fit_output = true;
+
+    /* A mask is refused (the first picture is not repainted under it). */
+    const json m = edit({ { "mask", data_url(png(100, 100, 0, 255)) } }, 400);
+    CHECK_EQ(str_at(m["error"], "param"), std::string("mask"));
+    CHECK(has(m["error"].value("message", ""), "instruction edits"));
+
+    /* The reference: a near-matched aspect fills the output grid, another fits inside it on the
+     * model's multiple, never above the output. Output is 256 x 128 here. */
+    edit(json::object(), 200);
+    REQUIRE(s.last().refs.size() == 1);
+    CHECK_EQ(s.last().refs[0].w, 128);
+    CHECK_EQ(s.last().refs[0].h, 128);
+    CHECK_EQ(s.last().refs[0].bf16.size(), (size_t)128 * 128 * s.last().refs[0].ch);
+    const std::string wide = png(512, 256, 255, 255);
+    edit({ { "image", data_url(wide) } }, 200);
+    CHECK_EQ(s.last().refs[0].w, 256);
+    CHECK_EQ(s.last().refs[0].h, 128);
+    const std::string tall = png(64, 256, 255, 255);
+    edit({ { "image", data_url(tall) } }, 200);
+    CHECK_EQ(s.last().refs[0].w, 32);
+    CHECK_EQ(s.last().refs[0].h, 128);
+    /* The grounding picture keeps the original aspect, cut to 768 on its long side. */
+    s.img.frames.clear();
+    edit({ { "image", data_url(png(1536, 768, 255, 255)) } }, 200);
+    REQUIRE(s.img.frames.size() == 1);
+    CHECK_EQ(s.img.frames[0].first, 768);
+    CHECK_EQ(s.img.frames[0].second, 384);
+    s.img.frames.clear();
+    edit({ { "image", data_url(wide) } }, 200);
+    REQUIRE(s.img.frames.size() == 1);
+    CHECK_EQ(s.img.frames[0].first, 512);
+    CHECK_EQ(s.img.frames[0].second, 256);
+}
+
+
 TEST(an_admitted_image_waits_for_the_previous_adapter_slot) {
     if (!mm::decoder_available()) SKIP("image codec unavailable");
     FakeImageGen image;

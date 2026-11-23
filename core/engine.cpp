@@ -4235,7 +4235,10 @@ int Engine::run_server() {
         in.max_tokens = gd.max_tokens;
         /* Edits need the conditioning network to read pictures, unless only the generator's
          * own encoder reads them. */
-        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP;
+        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP && in.tmpl_image.empty();
+        // A JOINT_STEP image template declares grounded vision plus latent references (Krea).
+        // Other JOINT_STEP generators keep their encoder-only reference preparation.
+        in.refs_fit_output = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP && !in.refs_encoder_only;
         in.max_refs = mm_proc || in.refs_encoder_only ? gd.max_refs : 0;
         in.ref_shrink_only = gd.ref_shrink_only != 0;
         in.ref_area = gd.ref_area;

@@ -3329,6 +3329,16 @@ static const RadOperandSpec oFlowUniPC[] = {
     { "negative", RAD_OPD_IN, 1 }, { "guidance", RAD_OPD_IN, 1 },
 };
 
+static const RadParamSpec pAttnDenseRef[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oAttnDenseRef[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }, { "mode_cu", RAD_OPD_IN, 0 },
+    { "ref_log_bias", RAD_OPD_IN, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     SCHEMA("flow_unipc_step", pGenMn, oFlowUniPC,
            "Flow-prediction UniPC BH2 corrector and predictor. F32 history per row is "
@@ -3358,6 +3368,9 @@ static const RadOpSchema kSchemas[] = {
            "bias. Each packed sequence uses its own key range and 32 signed distance buckets."),
 
     SCHEMA("gelu_umt5", pGenMn, oGenUnary, "Wan UMT5's tanh GELU with BF16 intermediates."),
+    SCHEMA("attn_dense_ref", pAttnDenseRef, oAttnDenseRef,
+           "Dense attention with a logit bias on target queries to reference keys. mode_cu "
+           "contains each sequence's text, reference and target starts and the last sequence's end. The natural-log bias must be finite and in [-16, 16]."),
 
 { "embed_attn", ROW(pEmbedAttn), ROW(oEmbedAttn),
   "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },
@@ -6496,6 +6509,13 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH1024), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense_wide },
+{ "attn_dense_ref_h128_bf16", "attn_dense_ref", "attn",
+  "dense attention with a logit bias on target queries to reference keys",
+  "head_dim 128, 1/2/4/8 query heads a KV head",
+  "bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH128), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_ref_h128 },
 
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",

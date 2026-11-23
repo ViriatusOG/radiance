@@ -536,7 +536,7 @@ int ref_attn_paged_tree(const RadArgs* a, RadStream s) {
 /* For the vision tower: unpaged, unquantised, `cu_seqlens` bounding one image (or attention window)
  * per entry so a whole batch is one launch. Causal is a parameter so a dense decoder-only prefill
  * can use the same kernel. */
-int ref_attn_dense(const RadArgs* a, RadStream) {
+static int attn_dense(const RadArgs* a, bool reference_bias) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[3], *o = &a->t[4];
 
@@ -568,11 +568,30 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
     if (kv_heads <= 0 || q_heads % gqa != 0) return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
+    const RadTensor* modes = reference_bias && have(a, 7) ? &a->t[5] : nullptr;
+    const RadTensor* biases = modes ? &a->t[6] : nullptr;
+    if (reference_bias && (!modes || modes->dtype != RAD_I32 || modes->rank != 1 ||
+                           numel(modes) != 3 * n_seq + 1 || !biases->data ||
+                           biases->dtype != RAD_F32 || biases->rank != 1 ||
+                           numel(biases) != n_seq || causal || cdiv != 1))
+        return RAD_E_SHAPE;
     const int64_t total_q = numel(q) / (q_heads * head_dim);
     if (total_q <= 0 || cu_at(cu, n_seq) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
     if (numel(o) < total_q * q_heads * head_dim) return RAD_E_SHAPE;
     if (numel(k) < total_q * kv_heads * head_dim) return RAD_E_SHAPE;
     if (numel(v) < total_q * kv_heads * head_dim) return RAD_E_SHAPE;
+
+    if (reference_bias) {
+        for (int64_t segment = 0; segment < n_seq; ++segment) {
+            const int64_t begin = cu_at(cu, segment), end = cu_at(cu, segment + 1);
+            const int64_t first = cu_at(modes, 3 * segment + 1);
+            const int64_t last = cu_at(modes, 3 * segment + 2);
+            const float bias = ldt(biases, segment * biases->stride[0]);
+            if (begin < 0 || begin >= end || end > total_q || first < begin ||
+                first > last || last > end || (!std::isfinite(bias) || std::fabs(bias) > 16.0f))
+                return RAD_E_SHAPE;
+        }
+    }
 
     const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
     const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
@@ -594,7 +613,13 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
         const int64_t s = sh / q_heads, h = sh % q_heads, kh = h / gqa;
         const int64_t b0 = cu_at(cu, s) / cdiv;
         const int64_t b1 = cu_at(cu, s + 1) / cdiv;
+        const float bias = biases ? ldt(biases, s * biases->stride[0]) : 0.0f;
+        const int64_t ref_begin = modes ? cu_at(modes, 3 * s + 1) : b1;
+        const int64_t ref_end = modes ? cu_at(modes, 3 * s + 2) : b1;
         for (int64_t i = b0; i < b1; ++i) {
+            const auto score_bias = [&](int64_t j) {
+                return i >= ref_end && j >= ref_begin && j < ref_end ? bias : 0.0f;
+            };
             const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
             int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
             if (window > 0) {
@@ -612,7 +637,7 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
                 float dot = 0.0f;
                 for (int64_t d = 0; d < head_dim; ++d)
                     dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
-                dot *= scale;
+                dot = dot * scale + score_bias(j);
                 if (dot > mx) mx = dot;
             }
             float acc[REF_HD_MAX];
@@ -627,7 +652,7 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
                 float dot = 0.0f;
                 for (int64_t d = 0; d < head_dim; ++d)
                     dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
-                const float w = ref_exp(dot * scale - mx);
+                const float w = ref_exp(dot * scale + score_bias(j) - mx);
                 sum += w;
                 for (int64_t d = 0; d < head_dim; ++d) acc[d] += w * ldt(v, vb + d * v_ds);
             }
@@ -644,6 +669,15 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
  * `causal` a query sees key j of its run when j <= its own index in its entry, both counted from
  * the start: a video's rows reading its prompt (cross attention), or a padded prompt's rows of which
  * the padding sees only the prompt. A query that sees no key is zero. */
+int ref_attn_dense(const RadArgs* a, RadStream) {
+    return attn_dense(a, false);
+}
+
+int ref_attn_dense_ref(const RadArgs* a, RadStream) {
+    return attn_dense(a, true);
+}
+
+
 int ref_attn_cross(const RadArgs* a, RadStream) {
     if (!have(a, 6)) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[3], *cuk = &a->t[4];
