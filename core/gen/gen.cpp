@@ -252,7 +252,8 @@ void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, 
 
 int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
                        const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
-                       std::string* why, bool grounded, int32_t target_h, int32_t target_w) {
+                       std::string* why, bool grounded, int32_t target_h, int32_t target_w,
+                       const Request::Outfill& outfill) {
     *out = Layout{};
     const int64_t T = (int64_t)b.tokens.size();
     if (b.n_drop < 0 || b.n_drop >= T) {
@@ -263,7 +264,7 @@ int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, b
         if (why) *why = "the joint layout reads no pictures in the prompt";
         return RAD_E_INVAL;
     }
-    if (grounded && (b.media ? b.media->rope.runs.size() : 0) != ref_hw.size()) {
+    if (grounded && !outfill.w && (b.media ? b.media->rope.runs.size() : 0) != ref_hw.size()) {
         if (why) *why = "the prompt must ground every reference picture";
         return RAD_E_INVAL;
     }
@@ -297,7 +298,12 @@ int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, b
                 pl[i] = (float)(1 + k);
                 pl[n + i] += dy;
                 pl[2 * n + i] += dx;
-
+                if (outfill.w) {
+                    pl[n + i] = (float)(hw_scale *
+                        ((outfill.y + (i / w + 0.5) * outfill.h / h) / 16.0 - 0.5));
+                    pl[2 * n + i] = (float)(hw_scale *
+                        ((outfill.x + (i % w + 0.5) * outfill.w / w) / 16.0 - 0.5));
+                }
             }
         }
         for (int cc = 0; cc < 4; ++cc)

@@ -726,4 +726,143 @@ TEST(stopping_the_server_releases_all_image_adapter_waiters) {
     CHECK_EQ(f.srv->in_flight(), 0);
 }
 
+TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    const json request = { {"prompt", "A portrait in a studio"}, {"size", "1024x1024"},
+                           {"image", data_url(png(48, 64, 255, 255))},
+                           {"outfill", { {"horizontal", "right"} }} };
+    const HttpResponse response = s.post("/v1/images/edits", request);
+    REQUIRE_EQ(response.status, 200);
+    CHECK_EQ(s.last().outfill.x, 256);
+    CHECK_EQ(s.last().outfill.y, 0);
+    CHECK_EQ(s.last().outfill.w, 768);
+    CHECK_EQ(s.last().outfill.h, 1024);
+    REQUIRE_EQ(s.last().refs.size(), (size_t)1);
+    CHECK_EQ(s.last().refs[0].w, 336);
+    CHECK_EQ(s.last().refs[0].h, 448);
+    CHECK(s.img.frames.empty());
+    const json answer = json::parse(response.body);
+    std::vector<uint8_t> png_bytes;
+    REQUIRE(base64_decode(answer["data"][0]["b64_json"].get<std::string>(), &png_bytes));
+    mm::FrameRGBA result;
+    std::string why;
+    REQUIRE_EQ(mm::decode_image_rgba(png_bytes.data(), png_bytes.size(), 1024 * 1024, &result, &why),
+               RAD_OK);
+    const auto red = [&](int x, int y) { return (int)result.rgba[((size_t)y * 1024 + x) * 4]; };
+    CHECK_EQ(red(10, 100), 0);
+    CHECK_EQ(red(256, 100), 0);
+    CHECK_EQ(red(272, 100), 100);
+    CHECK_EQ(red(288, 100), 200);
+    json other = request;
+    other["size"] = "768x768";
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+    other = request;
+    other["ref_boost"] = 4.0;
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+}
+
+/* Only sides that border generated area fade into the model's output; a source side on the canvas
+ * boundary keeps its pixels bit-identical to the scaled source. */
+TEST(krea_outfill_keeps_source_pixels_on_canvas_edge_sides) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    auto run = [&](const json& place, std::vector<uint8_t>* rgba) {
+        const HttpResponse r = s.post("/v1/images/edits",
+            { {"prompt", "x"}, {"size", "1024x1024"}, {"image", data_url(png(48, 64, 255, 255))},
+              {"outfill", place} });
+        REQUIRE_EQ(r.status, 200);
+        std::vector<uint8_t> file;
+        REQUIRE(base64_decode(json::parse(r.body)["data"][0]["b64_json"].get<std::string>(), &file));
+        mm::FrameRGBA out;
+        std::string why;
+        REQUIRE_EQ(mm::decode_image_rgba(file.data(), file.size(), 1024 * 1024, &out, &why), RAD_OK);
+        *rgba = out.rgba;
+    };
+    auto red = [](const std::vector<uint8_t>& p, int x, int y) { return (int)p[((size_t)y * 1024 + x) * 4]; };
+    std::vector<uint8_t> p;
+    /* Placed right (x = 256, 768 x 1024): left is the only generated side. The source's right,
+     * top and bottom borders are the source's 200 right up to the canvas edge. */
+    run({ {"horizontal", "right"} }, &p);
+    for (int y : { 0, 1, 31, 500, 1022, 1023 })
+        for (int x : { 1023, 1022, 1000, 992 }) CHECK_EQ(red(p, x, y), 200);
+    for (int x : { 288, 300, 600, 1000 })
+        for (int y : { 0, 1, 31, 1023 }) CHECK_EQ(red(p, x, y), 200);
+    CHECK_EQ(red(p, 256, 500), 0);    /* the left seam still fades from the generated side */
+    CHECK_EQ(red(p, 272, 500), 100);
+    CHECK_EQ(red(p, 288, 500), 200);
+    CHECK_EQ(red(p, 255, 500), 0);    /* outside the source: generated */
+    /* Centered: both side seams fade, the top and bottom (canvas edge) rows do not. */
+    run({ {"horizontal", "center"} }, &p);
+    CHECK_EQ(red(p, 512, 0), 200);
+    CHECK_EQ(red(p, 512, 1023), 200);
+    CHECK_EQ(red(p, 128, 500), 0);
+    CHECK_EQ(red(p, 128 + 767, 500), 0);
+    CHECK_EQ(red(p, 128 + 16, 500), 100);
+    CHECK_EQ(red(p, 128 + 767 - 16, 500), 100);
+    CHECK_EQ(red(p, 128 + 16, 0), 100);   /* the left ramp only: no top ramp on the canvas edge */
+}
+
+/* Malformed outfill input is a 400 under the field at fault, before anything is queued. */
+TEST(krea_outfill_refuses_malformed_input_before_the_generator) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    const std::string portrait = data_url(png(48, 64, 255, 255));
+    auto body = [&](const json& outfill) {
+        return json{ {"prompt", "x"}, {"size", "1024x1024"}, {"image", portrait}, {"outfill", outfill} };
+    };
+    auto refused = [&](json b, const char* param) {
+        const HttpResponse r = s.post("/v1/images/edits", b);
+        CHECK_EQ(r.status, 400);
+        CHECK_EQ(str_at(json::parse(r.body, nullptr, false)["error"], "param"), std::string(param));
+    };
+    refused(body("left"), "outfill");
+    refused(body(json::array({ "left" })), "outfill");
+    refused(body(5), "outfill");
+    refused(body(nullptr), "outfill");
+    refused(body({ {"horizontal", "left"}, {"diagonal", "up"} }), "outfill");
+    refused(body({ {"x", 10} }), "outfill");
+    refused(body({ {"horizontal", "middle"} }), "outfill");
+    refused(body({ {"horizontal", "top"} }), "outfill");
+    refused(body({ {"vertical", "left"} }), "outfill");
+    refused(body({ {"horizontal", 1} }), "outfill");
+    refused(body({ {"horizontal", "RIGHT"} }), "outfill");
+    json b = body(json::object());
+    b["size"] = "auto";
+    refused(b, "size");
+    b = body(json::object());
+    b["image"] = json::array({ portrait, portrait });
+    refused(b, "outfill");
+    b = body(json::object());
+    b["mask"] = data_url(png(48, 64, 0, 255));
+    refused(b, "mask");
+    b = body(json::object());
+    b["image"] = data_url(png(64, 64, 255, 255));   /* scales to fill the 1024 canvas */
+    refused(b, "image");
+    b = body(json::object());
+    b["ref_boost"] = 2.0;
+    refused(b, "outfill");
+    /* A plain edit endpoint model with no reference fitting has no outfill at all. */
+    s.img.inf.refs_fit_output = false;
+    refused(body(json::object()), "outfill");
+    /* Well-formed placements of every word are accepted (the generations endpoint takes none). */
+    s.img.inf.refs_fit_output = true;
+    CHECK(s.img.got.empty());
+    for (const char* h : { "left", "center", "right" })
+        for (const char* v : { "top", "center", "bottom" })
+            CHECK_EQ(s.post("/v1/images/edits", body({ {"horizontal", h}, {"vertical", v} })).status, 200);
+    CHECK_EQ(s.img.got.size(), (size_t)9);
+    CHECK_EQ(s.post("/v1/images/edits", body(json::object())).status, 200);
+    CHECK_EQ(s.last().outfill.x, 0);
+    CHECK_EQ(s.last().outfill.y, 0);
+    CHECK_EQ(str_at(s.gen({ {"prompt", "x"}, {"outfill", json::object()} }, 400)["error"], "param"),
+             std::string("outfill"));
+}
+
 RAD_TEST_MAIN()

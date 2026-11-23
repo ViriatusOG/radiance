@@ -31,3 +31,17 @@ Krea fits and centers each reference independently. Use references of the dimens
 The optional `ref_boost` multiplies the attention weight of reference tokens. Its default of 1 leaves reference attention unchanged. Masks are rejected for this instruction-edit path. LoRAs use the existing per-request `loras` field. Stacking adapters may require increasing `max-lora-rank` beyond its default.
 
 A seeded result is reproducible only with the same model, adapters, settings, and runtime profile. The same numeric seed in ComfyUI and Radiance can initialize different noise.
+
+## Registered outfill
+
+Use the Registered Outpaint adapter with one reference, an explicit `size: "1024x1024"`, and a scene description. Add `"outfill": {"horizontal": "center", "vertical": "center"}` to the edit request. The source's long edge scales to 1024. Horizontal placement accepts left, center, or right, and vertical placement accepts top, center, or bottom. Defaults are top left. After decoding, the source is blended back over a 32-pixel seam, but only on sides that border generated area: a side on the canvas boundary keeps the source pixels unchanged.
+
+The profile uses the simple Euler schedule with eight steps by default. `guidance_scale: 0` corresponds to ComfyUI CFG 1 for Krea. Masks, multiple references, and `ref_boost` are rejected for this path.
+
+```sh
+python3 scripts/krea2_outfill.py input.png output.png \
+  --url http://127.0.0.1:8000/v1 --model krea-edit \
+  --prompt "A person standing in a sunlit studio"
+```
+
+The script defaults to `http://127.0.0.1:8000/v1` and model `krea-edit` and applies no adapters. Name each adapter you want with `--lora NAME[:WEIGHT]` (repeatable); the Registered Outpaint adapter's name is whatever your deployment calls it.

@@ -825,4 +825,85 @@ TEST(grounded_joint_edit_stages_two_distinct_references_in_both_branches) {
     CHECK_OK(drv.done());
 }
 
+TEST(registered_outfill_uses_comfyui_flux_schedule_and_zero_reference_timestep) {
+    const std::vector<float> eight{1.0f, 0.95672369f, 0.90453076f, 0.84034878f, 0.75951093f,
+                                  0.65456682f, 0.51284409f, 0.31090108f, 0.0f};
+    const std::vector<float> seven{1.0f, 0.94989479f, 0.88759035f, 0.80814070f, 0.70316905f,
+                                  0.55826634f, 0.34492800f, 0.0f};
+    auto run = [](int requested_steps, int width, const std::vector<float>& want) {
+        Program prog;
+        prog.generator = decl_base();
+        auto& d = prog.generator;
+        d.layout = RAD_GEN_LAYOUT_JOINT_STEP;
+        d.max_refs = 1;
+        d.cond_rows = d.max_tokens + 64;
+        d.rope_hw_scale = 1.0;
+        d.ref_area = 64 * 64;
+        d.base_seq = d.max_seq = 256;
+        d.shift_terminal = 0.25;
+        prog.gen_str.tmpl_image = "{image}";
+        prog.ctx.max_tok = 2048;
+        prog.ctx.max_seqs = 2;
+        gen::Driver drv;
+        REQUIRE_EQ(drv.init(prog, nullptr, {gen::Driver::RankIO{}}), RAD_OK);
+        auto req = std::make_unique<gen::Request>();
+        req->width = width;
+        req->height = 64;
+        req->steps = requested_steps;
+        req->pos.tokens = {1, 2, 3};
+        req->pos.n_drop = 1;
+        req->outfill = {32, 0, 32, 64};
+        gen::Pixels ref;
+        ref.w = ref.h = 32;
+        ref.ch = 4;
+        ref.bf16.resize(32 * 32 * 4);
+        req->refs.push_back(std::move(ref));
+        req->ticket = std::make_shared<gen::Ticket>();
+        auto ticket = req->ticket;
+        std::string why;
+        for (int invalid_width : {-32, 0}) {
+            auto invalid = std::make_unique<gen::Request>(*req);
+            invalid->outfill.w = invalid_width;
+            CHECK_EQ(drv.submit(std::move(invalid), &why), RAD_E_INVAL);
+        }
+        /* A rectangle must lie inside the canvas, exactly: every other box is refused. */
+        const int32_t big = 0x7fffffff;
+        const int32_t boxes[][4] = { {-1, 0, 32, 64}, {32, -1, 32, 64}, {32, 0, 32, 0},
+                                     {32, 0, 32, -64}, {32, 1, 32, 64}, {width - 31, 0, 32, 64},
+                                     {big, 0, 32, 64}, {32, 0, big, 64}, {32, big, 32, 64},
+                                     {32, 0, 32, big}, {width, 0, 32, 64}, {32, 0, width, 64} };
+        for (const auto& box : boxes) {
+            auto invalid = std::make_unique<gen::Request>(*req);
+            invalid->outfill = {box[0], box[1], box[2], box[3]};
+            CHECK_EQ(drv.submit(std::move(invalid), &why), RAD_E_INVAL);
+        }
+        auto boosted = std::make_unique<gen::Request>(*req);
+        boosted->ref_log_bias = 1.0f;
+        CHECK_EQ(drv.submit(std::move(boosted), &why), RAD_E_INVAL);
+        REQUIRE_EQ(drv.submit(std::move(req), &why), RAD_OK);
+        const RadBatch* cond = drv.next(0);
+        REQUIRE(cond && cond->gen == RAD_GEN_PASS_COND);
+        const RadGenBatch& g = *cond->gen_b;
+        REQUIRE_EQ(g.rows, 6);
+        CHECK_EQ(g.rope_f[2], 1.0f);
+        CHECK_EQ(g.rope_f[6 + 2], 0.5f);
+        CHECK_EQ(g.rope_f[2 * 6 + 2], 2.0f);
+        CHECK_OK(drv.done());
+        CHECK_EQ(ticket->steps, (int32_t)want.size() - 1);
+        for (size_t i = 0; i + 1 < want.size(); ++i) {
+            const RadBatch* step = drv.next((int64_t)i + 1);
+            REQUIRE(step && step->gen == RAD_GEN_PASS_DENOISE);
+            CHECK_EQ(step->gen_b->ref_log_bias[0], -INFINITY);
+            CHECK_NEAR(step->gen_b->mode_sigma[0], want[i], 2e-7);
+            CHECK_EQ(step->gen_b->mode_sigma[1], 0.0f);
+            CHECK_NEAR(step->gen_b->mode_sigma[2], want[i], 2e-7);
+            CHECK_NEAR(step->gen_b->sigma_next[0], want[i + 1], 2e-7);
+            CHECK_OK(drv.done());
+        }
+    };
+    run(0, 64, eight);
+    run(0, 96, eight);
+    run(7, 64, seven);
+}
+
 RAD_TEST_MAIN()

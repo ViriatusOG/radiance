@@ -95,7 +95,7 @@ json form_value(const std::string& key, const std::string& v) {
     /* `loras` as JSON text, or one adapter's name. Bounded like a request body: a form field
      * under the body cap can be brackets alone, and the deep tree's teardown would take the
      * process with it. Over-deep or over-budget reads as plain text, as a discarded parse did. */
-    if ((key == "loras" || key == "lora") && !v.empty() && (v[0] == '[' || v[0] == '{')) {
+    if ((key == "loras" || key == "lora" || key == "outfill") && !v.empty() && (v[0] == '[' || v[0] == '{')) {
         bool over = false, deep = false;
         json j = parse_json_bounded(v, 0, &over, &deep);
         if (!j.is_discarded() && !over && !deep) return j;
@@ -247,7 +247,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         "style", "user", "input_fidelity", "seed", "negative_prompt", "true_cfg_scale",
         "guidance_scale",
         "num_inference_steps", "width", "height", "loras", "lora", "sampler", "scheduler",
-        "rebalance", "ref_boost",
+        "rebalance", "ref_boost", "outfill",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -588,10 +588,61 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
 
     std::vector<std::shared_ptr<mm::Item>> items;
     const int pch = (int)info.pixel_channels;
+    mm::Frame outfill_source;
+    if (body.contains("outfill")) {
+        if (!edit || !info.refs_fit_output)
+            return error_response(err_unsupported("outfill", "this model has no registered outfill"), req.peer);
+        if (r.images.size() != 1 || r.has_mask || body.contains("ref_boost"))
+            return error_response(err_bad("outfill", "expected one reference and no mask or ref_boost"),
+                                  req.peer);
+        if (r.w != 1024 || r.h != 1024 || (size == "auto" && !bw))
+            return error_response(err_bad("size", "registered outfill requires an explicit 1024x1024 canvas"),
+                                  req.peer);
+        const json& options = body["outfill"];
+        if (!options.is_object())
+            return error_response(err_bad("outfill", "expected an object"), req.peer);
+        for (auto it = options.begin(); it != options.end(); ++it)
+            if (it.key() != "horizontal" && it.key() != "vertical")
+                return error_response(err_bad("outfill", "expected horizontal and vertical placement"), req.peer);
+        const auto& f = r.images.front();
+        auto& box = g->outfill;
+        const double scale = 1024.0 / std::max(f.w, f.h);
+        box.w = std::max(1, (int32_t)std::lround(f.w * scale));
+        box.h = std::max(1, (int32_t)std::lround(f.h * scale));
+        if (box.w == r.w && box.h == r.h)
+            return error_response(err_bad("image", "the scaled source already fills the canvas"), req.peer);
+        auto place = [&](const char* key, const char* first, const char* last, int32_t free, int32_t& offset) {
+            if (!options.contains(key)) return true;
+            const json& mode = options[key];
+            if (mode == first) offset = 0;
+            else if (mode == "center") offset = free / 2;
+            else if (mode == last) offset = free;
+            else return false;
+            return true;
+        };
+        if (!place("horizontal", "left", "right", r.w - box.w, box.x) ||
+            !place("vertical", "top", "bottom", r.h - box.h, box.y))
+            return error_response(err_bad("outfill", "horizontal is left/center/right and vertical is top/center/bottom"),
+                                  req.peer);
+        mm::Frame source;
+        mm::composite_white(f, &source);
+        mm::resize_lanczos_rgb(source, box.w, box.h, &outfill_source);
+    }
+    const auto outfill = g->outfill;
     for (const mm::FrameRGBA& f : r.images) {
         int32_t rw = 0, rh = 0;
         mm::FrameRGBA rs;
-        if (info.refs_fit_output) {
+        if (outfill.w) {
+            constexpr double reference_area = 384.0 * 384.0;
+            const double scale = std::min(1.0, std::sqrt(reference_area / (outfill.w * outfill.h)));
+            rw = std::max(mult, (int32_t)std::lround(outfill.w * scale / mult) * mult);
+            rh = std::max(mult, (int32_t)std::lround(outfill.h * scale / mult) * mult);
+            mm::FrameRGBA placed{outfill.w, outfill.h,
+                                 std::vector<uint8_t>((size_t)outfill.w * outfill.h * 4, 255)};
+            for (size_t i = 0; i < (size_t)outfill.w * outfill.h; ++i)
+                std::memcpy(placed.rgba.data() + 4 * i, outfill_source.rgb.data() + 3 * i, 3);
+            mm::resize_bilinear_rgba(placed, rw, rh, &rs);
+        } else if (info.refs_fit_output) {
             const double sx = (double)r.w / f.w, sy = (double)r.h / f.h;
             const double fit = std::min(sx, sy);
             const bool near_match = f.w * fit >= r.w * 0.92 && f.h * fit >= r.h * 0.92;
@@ -626,7 +677,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             mm::resize_lanczos_rgba(f, rw, rh, &rs);
         }
         g->refs.push_back(to_pixels(rs, pch));
-        if (info.refs_encoder_only) continue;
+        if (info.refs_encoder_only || outfill.w) continue;
         mm::Frame rgb;
         if (info.refs_fit_output && std::max(f.w, f.h) > 768) {
             const double scale = 768.0 / std::max(f.w, f.h);
@@ -679,7 +730,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         std::string text = r.background == "transparent" && !info.tmpl_transparent.empty()
                                ? replace_all(info.tmpl_transparent, "{prompt}", prompt)
                                : prompt;
-        std::string tmpl = edit ? info.tmpl_edit : info.tmpl_text;
+        std::string tmpl = edit && !outfill.w ? info.tmpl_edit : info.tmpl_text;
         if (edit) {
             std::string imgs;
             for (size_t i = 0; i < items.size(); ++i) {
@@ -841,13 +892,32 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     const bool flatten = r.format == "jpeg" || r.background == "opaque";
     const std::string fmt = r.format;
     const int32_t comp = r.compression;
-    auto encode = [fmt, comp, keep_px, src_px, flatten](gen::Image& im, std::string* b64,
+    auto encode = [fmt, comp, keep_px, src_px, flatten, outfill,
+                   outfill_source = std::move(outfill_source)](gen::Image& im, std::string* b64,
                                                         std::string* why) -> int {
         std::vector<uint8_t>& px = im.px;
         const size_t ch = (size_t)im.ch;
         if (!keep_px.empty() && !im.preview)
             for (size_t i = 0; i < keep_px.size(); ++i)
                 if (keep_px[i]) std::memcpy(&px[i * ch], &src_px[i * 4], ch);
+        if (outfill.w && !im.preview) {
+            /* Fade only across sides that border generated area; a side on the canvas boundary
+             * keeps the source pixels as they are. */
+            const bool gl = outfill.x > 0, gt = outfill.y > 0;
+            const bool gr = outfill.x + outfill.w < im.w, gb = outfill.y + outfill.h < im.h;
+            for (int32_t y = 0; y < outfill.h; ++y)
+                for (int32_t x = 0; x < outfill.w; ++x) {
+                    int32_t edge = 32;
+                    if (gl) edge = std::min(edge, x);
+                    if (gt) edge = std::min(edge, y);
+                    if (gr) edge = std::min(edge, outfill.w - 1 - x);
+                    if (gb) edge = std::min(edge, outfill.h - 1 - y);
+                    uint8_t* dst = px.data() + ((size_t)(outfill.y + y) * im.w + outfill.x + x) * ch;
+                    const uint8_t* src = outfill_source.rgb.data() + ((size_t)y * outfill.w + x) * 3;
+                    for (int c = 0; c < 3; ++c)
+                        dst[c] = (uint8_t)((dst[c] * (32 - edge) + src[c] * edge + 16) / 32);
+                }
+        }
         std::vector<uint8_t> file;
         int s;
         if (ch == 3) {

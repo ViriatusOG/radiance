@@ -3370,7 +3370,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gelu_umt5", pGenMn, oGenUnary, "Wan UMT5's tanh GELU with BF16 intermediates."),
     SCHEMA("attn_dense_ref", pAttnDenseRef, oAttnDenseRef,
            "Dense attention with a logit bias on target queries to reference keys. mode_cu "
-           "contains each sequence's text, reference and target starts and the last sequence's end. The natural-log bias must be finite and in [-16, 16]."),
+           "contains each sequence's text, reference and target starts and the last sequence's end. The natural-log bias is finite in [-16, 16], or negative infinity for internal reference isolation."),
 
 { "embed_attn", ROW(pEmbedAttn), ROW(oEmbedAttn),
   "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },

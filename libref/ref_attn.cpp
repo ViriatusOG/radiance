@@ -588,7 +588,8 @@ static int attn_dense(const RadArgs* a, bool reference_bias) {
             const int64_t last = cu_at(modes, 3 * segment + 2);
             const float bias = ldt(biases, segment * biases->stride[0]);
             if (begin < 0 || begin >= end || end > total_q || first < begin ||
-                first > last || last > end || (!std::isfinite(bias) || std::fabs(bias) > 16.0f))
+                first > last || last > end ||
+                (bias != -INFINITY && (!std::isfinite(bias) || std::fabs(bias) > 16.0f)))
                 return RAD_E_SHAPE;
         }
     }
@@ -614,11 +615,12 @@ static int attn_dense(const RadArgs* a, bool reference_bias) {
         const int64_t b0 = cu_at(cu, s) / cdiv;
         const int64_t b1 = cu_at(cu, s + 1) / cdiv;
         const float bias = biases ? ldt(biases, s * biases->stride[0]) : 0.0f;
+        const bool isolate = bias == -INFINITY;
         const int64_t ref_begin = modes ? cu_at(modes, 3 * s + 1) : b1;
         const int64_t ref_end = modes ? cu_at(modes, 3 * s + 2) : b1;
         for (int64_t i = b0; i < b1; ++i) {
             const auto score_bias = [&](int64_t j) {
-                return i >= ref_end && j >= ref_begin && j < ref_end ? bias : 0.0f;
+                return !isolate && i >= ref_end && j >= ref_begin && j < ref_end ? bias : 0.0f;
             };
             const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
             int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
@@ -630,6 +632,10 @@ static int attn_dense(const RadArgs* a, bool reference_bias) {
                 const int64_t blk = b0 + (i - b0) / block * block;
                 jbeg = std::max<int64_t>(jbeg, blk);
                 jend = std::min<int64_t>(jend, blk + block);
+            }
+            if (isolate && i >= ref_begin && i < ref_end) {
+                jbeg = ref_begin;
+                jend = ref_end;
             }
             float mx = -INFINITY;
             for (int64_t j = jbeg; j < jend; ++j) {

@@ -7166,6 +7166,11 @@ TEST(op_attn_dense_ref_boost_and_neutral_attention) {
     CHECK_NEAR(out.at(0), 2.0f, 1e-6);
     CHECK_NEAR(out.at(1), 2.0f, 1e-6);
     CHECK_NEAR(out.at(2), 2.0f, 1e-6);
+    bias.f({-INFINITY});
+    CHECK_OK(run("attn_dense_ref", a));
+    CHECK_NEAR(out.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(out.at(1), 6.0f, 1e-6);
+    CHECK_NEAR(out.at(2), 2.0f, 1e-6);
 }
 
 TEST(reference_attention_refuses_ranges_outside_the_sequence_before_writing) {
@@ -7202,7 +7207,7 @@ TEST(reference_attention_validates_all_outer_bounds_and_biases_before_writing) {
         for (int row=0; row<6; ++row) CHECK_EQ(out.at(row), 17.0f);
     }
     cu.n({0,3,6});
-    for (float invalid : {INFINITY, -INFINITY, NAN, 17.0f, -17.0f, 3.0e38f}) {
+    for (float invalid : {INFINITY, NAN, 17.0f, -17.0f, 3.0e38f}) {
         bias.f({0,invalid});
         out.f({17,17,17,17,17,17});
         CHECK_EQ(run("attn_dense_ref", args), RAD_E_SHAPE);

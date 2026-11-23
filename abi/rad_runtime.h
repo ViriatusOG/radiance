@@ -517,8 +517,12 @@ typedef struct RadGenBatch {
     int32_t        cond_opts;
     /* ---- appended Krea 2 reference attention (release assigns the ABI version) */
     /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
-     * The natural-log bias is finite and in [-16, 16]; zero leaves dense attention unchanged. */
+     * Finite biases are in [-16, 16]; zero leaves dense attention unchanged.
+     * The driver uses negative infinity internally to isolate outfill reference queries. */
     const float*   ref_log_bias;
+    /* DENOISE: three timesteps a sequence, one per text/reference/target span.
+     * Registered outfill leaves the source reference at timestep zero. */
+    const float*   mode_sigma;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */

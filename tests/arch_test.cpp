@@ -15651,11 +15651,18 @@ TEST(krea2_reference_conditioning_declares_the_vision_tower_and_deepstack) {
     CHECK_EQ(count_issued(issued_ops(b, c), "s2d_avg_add"), 1);
     CHECK_EQ(count_issued(issued_ops(b, c), "lane_store"), 2);
 
+    for (const int64_t too_many : {INT64_MAX / 3 + 1, INT64_MAX}) {
+        RadBuilder oversized;
+        auto invalid = ctx;
+        invalid.max_seqs = too_many;
+        CHECK_EQ(krea2::declare(&oversized, mk.meta(), &invalid), RAD_E_INVAL);
+    }
+
     auto step = gen_pass(b, RAD_GEN_PASS_DENOISE, 20);
     int32_t mode_cu[] = {0, 12, 16, 20}, img_cu[] = {0, 4}, img_rows[] = {16, 17, 18, 19};
-    float positions[80]{}, bias[] = {std::log(2.0f)}, sigmas[] = {0.5f};
+    float positions[80]{}, bias[] = {-INFINITY}, sigmas[] = {0.5f, 0.0f, 0.5f};
     step->g.mode_cu = mode_cu;
-    step->g.sigma = sigmas;
+    step->g.mode_sigma = sigmas;
     step->g.ref_log_bias = bias;
     step->g.rope_f = positions;
     step->g.n_img = 4;
@@ -15668,14 +15675,14 @@ TEST(krea2_reference_conditioning_declares_the_vision_tower_and_deepstack) {
     CHECK_EQ(count_issued(issued_ops(b, denoise), "attn_dense_ref"), 1);
     int timestep_calls = 0, final_table_calls = 0;
     for (const auto& issue : denoise.issues) {
-        if (issue.op == model.op_temb) { ++timestep_calls; CHECK_EQ(issue.n, step->b.n_seq); }
+        if (issue.op == model.op_temb) { ++timestep_calls; CHECK_EQ(issue.n, 3 * step->b.n_seq); }
         if (issue.op == model.op_ftab) { ++final_table_calls; CHECK_EQ(issue.n, step->b.n_seq); }
     }
     CHECK_EQ(timestep_calls, 1);
     CHECK_EQ(final_table_calls, 1);
     const auto* timestep_rows = find_b(b, "dit.tproj");
     REQUIRE(timestep_rows);
-    CHECK_EQ(timestep_rows->d.shape[0], ctx.max_seqs);
+    CHECK_EQ(timestep_rows->d.shape[0], 3 * ctx.max_seqs);
 
     probe.gen_max_refs = 2;
     REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);

@@ -1263,7 +1263,7 @@ static const RadOpSchema kSchemas[] = {
 { "wan_rope", ARR(pWanRope), ARR(oWanRope), "Apply Wan rotary coefficients to queries and keys." },
 { "attn_dense_ref", ARR(pAttnDenseRef), ARR(oAttnDenseRef),
   "Dense attention with a logit bias on target queries to reference keys. mode_cu gives "
-  "each sequence's text, reference and target starts and the last sequence's end. The natural-log bias must be finite and in [-16, 16]." },
+  "each sequence's text, reference and target starts and the last sequence's end. The natural-log bias is finite in [-16, 16], or negative infinity for internal reference isolation." },
 
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is not in docs/OPS.md's elementwise table: "

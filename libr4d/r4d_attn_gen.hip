@@ -136,7 +136,9 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
             const int64_t begin = cu[sequence], end = cu[sequence + 1];
             const int64_t first = modes[3 * sequence + 1], last = modes[3 * sequence + 2];
             if (begin < 0 || begin >= end || end > total_q || first < begin ||
-                first > last || last > end || (!isfinite(biases[sequence]) || fabsf(biases[sequence]) > 16.0f)) return;
+                first > last || last > end ||
+                (biases[sequence] != -INFINITY &&
+                 (!isfinite(biases[sequence]) || fabsf(biases[sequence]) > 16.0f))) return;
         }
     }
     int seq = -1, q0 = 0;
@@ -163,7 +165,9 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     const int ref_begin = modes ? modes[3 * seq + 1] - s0 : 0;
     const int ref_end = modes ? modes[3 * seq + 2] - s0 : 0;
     const float bias = biases ? biases[seq] * 1.44269504089f : 0.0f;
-    const bool boost = bias != 0.0f && ref_begin < ref_end && qpos >= ref_end;
+    const bool isolate = bias == -INFINITY;
+    const bool ref_query = isolate && qpos >= ref_begin && qpos < ref_end;
+    const bool boost = !isolate && bias != 0.0f && ref_begin < ref_end && qpos >= ref_end;
 
     // The query: bf16 fragments pre-multiplied by the softmax scale, or int8 codes against the
     // row absmax (a lane holds half the head's dims, lane + 16 the other half) with the scale in
@@ -536,12 +540,13 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 }
             }
 
-            if (boost) {
+            if (boost || ref_query) {
                 const int first = k0 + mt * 16 + 8 * h;
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const bool ref_key = first + e >= ref_begin && first + e < ref_end;
-                    if (ref_key) sc[e] += bias;
+                    if (boost && ref_key) sc[e] += bias;
+                    if (ref_query && !ref_key) sc[e] = -INFINITY;
                 }
             }
 

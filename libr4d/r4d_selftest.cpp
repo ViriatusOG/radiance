@@ -12298,8 +12298,10 @@ void attn_dense_ref_cases(const Plugin& pl) {
             return std::all_of(all.begin(), all.begin() + guard, [](float x) { return x == 0.25f; }) &&
                    std::all_of(all.end() - guard, all.end(), [](float x) { return x == 0.25f; });
         };
-        for (int profile = 0; profile < 2; ++profile) {
-            biases = profile == 0 ? std::vector<float>{0,std::log(4.0f)} : std::vector<float>{-16,16};
+        for (int profile = 0; profile < 3; ++profile) {
+            biases = profile == 0 ? std::vector<float>{0,std::log(4.0f)} :
+                     profile == 1 ? std::vector<float>{-16,16} :
+                                    std::vector<float>{-INFINITY,-INFINITY};
             std::vector<uint16_t> wanted((size_t)elements);
             const int reference_status = cpu(wanted), device_status = gpu();
             ok(fmt("%s gqa%d profile%d launches", name, gqa, profile).c_str(),
@@ -12336,7 +12338,7 @@ void attn_dense_ref_cases(const Plugin& pl) {
             if (invalid == 3) modes[4] = cu[1] - 1;
             if (invalid == 4) modes[5] = (int32_t)total + 1;
             if (invalid == 5) biases[1] = INFINITY;
-            if (invalid == 6) biases[1] = -INFINITY;
+            if (invalid == 6) biases[1] = -17.0f;
             if (invalid == 7) biases[1] = NAN;
             if (invalid == 8) biases[1] = 17.0f;
             if (invalid == 9) biases[1] = 3.0e38f;

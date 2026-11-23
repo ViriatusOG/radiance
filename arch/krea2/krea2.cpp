@@ -808,7 +808,7 @@ static int map_mod_rows(RadBuilder* b, const char* declared, const char* src, in
 static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gd;
     Names& nm = m.nm;
-    const int64_t T = g.max_tok, S = g.max_seqs;
+    const int64_t T = g.max_tok, S = g.max_seqs * (m.max_refs ? 3 : 1);
     const int64_t D = g.n_embd, hd = g.head_dim, qd = g.q_dim(), kvd = g.kv_dim();
     const int64_t C = m.C, L = g.n_layer;
     const double eps = g.eps;
@@ -1307,6 +1307,8 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->max_seqs <= 0) return RAD_E_INVAL;
     RAD_ARCH_TRY(check_reference_encoder(meta));
+    /* Grounded edits reserve text/reference/target modulation rows per entry. */
+    if (has_reference_encoder(meta) && ctx->max_seqs > INT64_MAX / 3) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     Model& m = g_model[rad_build_slot(ctx)];
@@ -1620,21 +1622,30 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
     const int64_t D = g.n_embd, qd = g.q_dim(), kvd = g.kv_dim(), hd = g.head_dim;
     const int64_t L = g.n_layer, W = L * 6 * D, nD = D / RAD_FP8_BLOCK;
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
+    const int64_t MS = m.max_refs ? 3 * S : S;
+    const RadOperand mod_cu = m.max_refs ? praw(G->mode_cu, RAD_I32, MS + 1) : cu;
+    const RadOperand mod_sigma = praw(m.max_refs ? G->mode_sigma : G->sigma, RAD_F32, MS);
     const RadOperand icu = praw(G->img_cu, RAD_I32, S + 1);
     const RadOperand lanes = praw(G->lane, RAD_I32, S);
     const int64_t LR = m.lanes * m.max_image_tokens;
 
     /* ---- modulation: the timestep MLP, the shared projection, each block's table, the final */
-    RAD_ISSUE_N(c, m.op_temb, S, praw(G->sigma, RAD_F32, S), brows(m.b_tproj, S));
-    RAD_ISSUE_N(c, m.op_t1, S, brows(m.b_tproj, S), RAD_W(m.w_t1), RAD_W(m.b_t1), RAD_NONE,
-                brows(m.b_te1, S));
-    RAD_ISSUE_N(c, m.op_tg, S, brows(m.b_te1, S), brows(m.b_te1g, S));
-    RAD_ISSUE_N(c, m.op_t2, S, brows(m.b_te1g, S), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
-                brows(m.b_temb, S));
-    RAD_ISSUE_N(c, m.op_tg2, S, brows(m.b_temb, S), brows(m.b_tembg, S));
-    RAD_ISSUE_N(c, m.op_mod, S, brows(m.b_tembg, S), RAD_W(m.w_mod), RAD_W(m.b_mod), RAD_NONE,
-                brows(m.b_tmod, S));
-    RAD_ISSUE_N(c, m.op_ftab, S, brows(m.b_temb, S), RAD_W(m.w_ftab), brows(m.b_fmod, S));
+    RAD_ISSUE_N(c, m.op_temb, MS, mod_sigma, brows(m.b_tproj, MS));
+    RAD_ISSUE_N(c, m.op_t1, MS, brows(m.b_tproj, MS), RAD_W(m.w_t1), RAD_W(m.b_t1), RAD_NONE,
+                brows(m.b_te1, MS));
+    RAD_ISSUE_N(c, m.op_tg, MS, brows(m.b_te1, MS), brows(m.b_te1g, MS));
+    RAD_ISSUE_N(c, m.op_t2, MS, brows(m.b_te1g, MS), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
+                brows(m.b_temb, MS));
+    RAD_ISSUE_N(c, m.op_tg2, MS, brows(m.b_temb, MS), brows(m.b_tembg, MS));
+    RAD_ISSUE_N(c, m.op_mod, MS, brows(m.b_tembg, MS), RAD_W(m.w_mod), RAD_W(m.b_mod), RAD_NONE,
+                brows(m.b_tmod, MS));
+    if (m.max_refs) {
+        for (int64_t e = 0; e < S; ++e)
+            RAD_ISSUE_N(c, m.op_ftab, 1, brow_slice(m.b_temb, 3 * e + 2, 1, D), RAD_W(m.w_ftab),
+                        brow_slice(m.b_fmod, e, 1, 2 * D));
+    } else {
+        RAD_ISSUE_N(c, m.op_ftab, S, brows(m.b_temb, S), RAD_W(m.w_ftab), brows(m.b_fmod, S));
+    }
 
     /* ---- the rows: the images' latents (noise on a first step), img_in, joined with the text */
     RAD_ISSUE_N(c, m.op_randn, NI, praw(G->flags, RAD_I32, S), praw(G->seed, RAD_U32, 2 * S),
@@ -1649,21 +1660,21 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
      * (preshift, prescale), pregate, (postshift, postscale), postgate */
     const RadOperand pos = praw2(G->rope_f, RAD_F32, 4, N);
     auto mod = [&](int64_t l, int k, int width) { return bcol_at(m.b_mods, 0, W, (6 * l + k) * D,
-                                                                 width * D, S); };
+                                                                 width * D, MS); };
     const bool q8 = (!g.w_bf16 && !m.i8) || m.norm_i8;
     for (int64_t l = 0; l < L; ++l) {
         const DitLayer& B = m.dit[(size_t)l];
         /* The block's modulation: the shared projection plus its own table, into its columns. */
-        RAD_ISSUE_N(c, B.op_tab, S, brows(m.b_tmod, S), RAD_W(B.w_tab),
-                    bcol_at(m.b_mods, 0, W, l * 6 * D, 6 * D, S));
+        RAD_ISSUE_N(c, B.op_tab, MS, brows(m.b_tmod, MS), RAD_W(B.w_tab),
+                    bcol_at(m.b_mods, 0, W, l * 6 * D, 6 * D, MS));
         if (q8)
             RAD_ISSUE_N(c, B.op_n1, N, l > 0 ? brows(m.b_ao, N) : RAD_NONE,
-                        l > 0 ? mod(l - 1, 5, 1) : RAD_NONE, mod(l, 0, 2), RAD_W(B.w_n1), cu,
+                        l > 0 ? mod(l - 1, 5, 1) : RAD_NONE, mod(l, 0, 2), RAD_W(B.w_n1), mod_cu,
                         brows(m.b_h, N), brows(m.a_hm.cq(), N), brows(m.a_hm.cs(), N),
                         RAD_NONE);
         else
             RAD_ISSUE_N(c, B.op_n1, N, l > 0 ? brows(m.b_ao, N) : RAD_NONE,
-                        l > 0 ? mod(l - 1, 5, 1) : RAD_NONE, mod(l, 0, 2), RAD_W(B.w_n1), cu,
+                        l > 0 ? mod(l - 1, 5, 1) : RAD_NONE, mod(l, 0, 2), RAD_W(B.w_n1), mod_cu,
                         brows(m.b_h, N), brows(m.a_hm.x, N));
         B.q_n1.step(c, N);
         B.qkv.step(c, m.a_hm, m.b_qkv, N);
@@ -1695,11 +1706,11 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
         if (B.op_ar1) RAD_ISSUE_N(c, B.op_ar1, N * D, brows(m.b_ao, N), RAD_NONE);
         if (q8)
             RAD_ISSUE_N(c, B.op_n2, N, brows(m.b_ao, N), mod(l, 2, 1), mod(l, 3, 2), RAD_W(B.w_n2),
-                        cu, brows(m.b_h, N), brows(m.a_hm.cq(), N), brows(m.a_hm.cs(), N),
+                        mod_cu, brows(m.b_h, N), brows(m.a_hm.cq(), N), brows(m.a_hm.cs(), N),
                         RAD_NONE);
         else
             RAD_ISSUE_N(c, B.op_n2, N, brows(m.b_ao, N), mod(l, 2, 1), mod(l, 3, 2), RAD_W(B.w_n2),
-                        cu, brows(m.b_h, N), brows(m.a_hm.x, N));
+                        mod_cu, brows(m.b_h, N), brows(m.a_hm.x, N));
         B.q_n2.step(c, N);
         B.gate_up.step(c, m.a_hm, m.b_gu, N);
         B.gq.step(c, m.b_gu, N);
@@ -1708,7 +1719,7 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
     }
     (void)nD;
     /* ---- the last block's feed-forward gated in, the image rows out, the final layer */
-    RAD_ISSUE_N(c, m.op_g2, N, brows(m.b_ao, N), mod(L - 1, 5, 1), cu, brows(m.b_h, N));
+    RAD_ISSUE_N(c, m.op_g2, N, brows(m.b_ao, N), mod(L - 1, 5, 1), mod_cu, brows(m.b_h, N));
     RAD_ISSUE_N(c, m.op_gimg, NI, brows(m.b_h, N), praw(G->img_rows, RAD_I32, NI),
                 brows(m.b_hi, NI));
     RAD_ISSUE_N(c, m.op_fn, NI, RAD_NONE, RAD_NONE, brows(m.b_fmod, S), RAD_W(m.w_fn), icu,
