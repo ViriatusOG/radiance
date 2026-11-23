@@ -91,6 +91,15 @@ enum {
     /* The bf16 head's column form, above the block-per-column row whose bytes it gives, at the
      * n_embd it is built for. */
     R4D_PRIO_LOGITS_COLS    = 55,
+    /* The bf16 head's WMMA form at verify/draft row counts (17 <= M <= 64). Its summation order
+     * differs from the scalar/cols rows, so at the default it sits BELOW the scalar row (50) and is
+     * never selected: the choice must not depend on M, or a row's bytes would depend on its batch
+     * size. A build opts in with -DR4D_LOGITS_WMMA_PRIO=56. */
+#ifdef R4D_LOGITS_WMMA_PRIO
+    R4D_PRIO_LOGITS_WMMA    = R4D_LOGITS_WMMA_PRIO,
+#else
+    R4D_PRIO_LOGITS_WMMA    = 40,
+#endif
 
     /* Runtime LoRA: the tiled rows serve a subset of the scalar rows' dtypes at every M, so they
      * must outrank them to be reached; the scalar rows keep f16 / f32 activations (no exact WMMA)
@@ -548,6 +557,7 @@ int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 /* -- GEMM (r4d_gemm_*.hip) -- */
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
+int r4d_rad_logits_gemm_wmma(const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
 /* The same GEMM over a bf16x12 weight (r4d_gemm_bf16x12_nt_m64.hip); m16 forwards to m64, and
  * tiled unpacks the weight into its scratch for gemm_bf16_nt_tiled. */

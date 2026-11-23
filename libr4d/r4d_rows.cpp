@@ -6277,6 +6277,8 @@ static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4
 static const RadConstraint cSampleLogprobs[] = { C_GE("n_vocab", 1), C_GE("k", 1), C_LE("k", 64) };
 /* The activation width the column loop vectorises over; M is unbounded -- the kernel chunks rows. */
 static const RadConstraint cLogitsGemm[] = { C_DIV("n_embd", 8), C_IN("dtype", "bf16") };
+static const RadConstraint cLogitsGemmWmma[] = { C_GE("M", 17), C_LE("M", 64), C_DIV("n_embd", 16),
+                                                 C_IN("dtype", "bf16") };
 static const RadConstraint cLogitsGemmCols[] = { C_IN("n_embd", "4096 5120"),
                                                  C_IN("dtype", "bf16") };
 /* The fp8 head: n_embd on the 128 scale block, and no cap on M. The row relayouts the weight, so
@@ -7322,6 +7324,17 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cLogitsGemm), NOTUNE,
   nullptr, nullptr, r4d_rad_logits_gemm, nullptr, nullptr, nullptr,
+  r4d_shape_logits_gemm },
+
+{ "logits_gemm_bf16_wmma", "logits_gemm", "vocab",
+  "logits_gemm_bf16 on the wave-matrix for the verify/draft band: a wave a 16-column tile, the "
+  "weight fragment reused over the MT 16-row tiles, no split reduction",
+  "17 <= M <= 64, dense rows, n_embd a multiple of 16",
+  "bf16 x and lm_head, F32 LOGITS OUT, fp32 accumulate. NOT byte-identical to logits_gemm_bf16: the "
+  "WMMA summation order differs (opt-in row, off by default)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_WMMA,
+  ROW(cLogitsGemmWmma), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_wmma, nullptr, nullptr, nullptr,
   r4d_shape_logits_gemm },
 
 { "logits_gemm_bf16_cols", "logits_gemm", "vocab",

@@ -24,6 +24,7 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 #define WAVE32 32
 
@@ -51,10 +52,10 @@ __device__ __forceinline__ v8bf fragU(r4d_gu2 p, int u) {
 constexpr int KU = 8;
 // CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); no block returns
 // early. r4d_gemm_bf16_nt_m64_kernel and r4dchain_gemm_bf16_nt_m64 below wrap it.
-template <int MT, bool CHAIN>
+template <int MT, bool CHAIN, typename CT = __hip_bfloat16>
 __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+    CT* __restrict__ C, int M, int K, int N, int WV, int SK) {
   if (CHAIN) r4d_chain_wait_vec();
   extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
@@ -125,7 +126,10 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
       const int m = (mt0 + i) * 16 + 8 * (l >> 4) + (off >> 5);
       // The language's float-to-bf16 conversion on purpose; the header's f2bf rounds half away
       // from zero.
-      if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
+      if (n < N && m < M) {
+        if constexpr (std::is_same<CT, float>::value) C[(size_t)m * N + n] = v;   // f32 logits
+        else C[(size_t)m * N + n] = (__hip_bfloat16)v;
+      }
     }
   }
   if (CHAIN) r4d_chain_done();
@@ -201,6 +205,42 @@ static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, in
 #undef LAUNCH
 }
 
+
+// ---- f32-output form for the lm_head at verify/draft row counts (17 <= M <= 64) -----------------
+// logits_gemm_bf16 runs one workgroup a vocabulary column at any M (r4d_model_bf16.hip), which at
+// M = 56..64 reads the head once per row group and runs far from its bandwidth bound. This is the
+// same WMMA body with an f32 store: a wave owns a 16-column tile, the weight fragment is reused over
+// the MT row tiles, SK = 1 so there is no split reduction. The summation order differs from the
+// scalar kernel (not byte-identical), so the row is off by default (see R4D_PRIO_LOGITS_WMMA).
+template <int MT>
+__global__ __launch_bounds__(1024) void r4d_logits_wmma_kernel(
+    const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
+    float* __restrict__ C, int M, int K, int N, int WV, int SK) {
+  r4d_gemm_bf16_nt_m64_body<MT, false, float>(A, W, C, M, K, N, WV, SK);
+}
+extern "C" int r4d_logits_gemm_bf16_wmma(long a, long w, long c, int M, int K, int N, int a_ld,
+                                         int c_ld, long stream) {
+  if (!a || !w || !c) return -1;
+  if (M < 17 || M > 64 || K <= 0 || N <= 0) return -2;
+  if (K % 16) return -3;
+  if ((long)N * K > 0xFFFFFFFFL) return -3;      // the weight offset is 32-bit unsigned
+  if ((a_ld && a_ld != K) || (c_ld && c_ld != N)) return -3;   // dense rows only
+  const int WV = 8, SK = 1, MT = (M + 15) / 16;
+  const int ntiles = (N + 15) / 16;
+  dim3 grid((ntiles + WV - 1) / WV, 1), block(WV * SK * WAVE32);
+  const size_t smem = (size_t)WV * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a;
+  auto Wp = (const unsigned short*)w;
+  auto Cp = (float*)c;
+  hipStream_t st = (hipStream_t)stream;
+  switch (MT) {
+  case 2: hipLaunchKernelGGL(r4d_logits_wmma_kernel<2>, grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK); break;
+  case 3: hipLaunchKernelGGL(r4d_logits_wmma_kernel<3>, grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK); break;
+  default: hipLaunchKernelGGL(r4d_logits_wmma_kernel<4>, grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK); break;
+  }
+  return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 int r4d_gemm_bf16_nt_m64_max_m(void) {
   return INT_MAX;
 }
@@ -225,3 +265,31 @@ extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+
+// logits_gemm_bf16_wmma: the operand checks of r4d_rad_logits_gemm (r4d_model_bf16.hip), the band
+// 17..64 and dense rows, then the f32-output WMMA form.
+extern "C" int r4d_rad_logits_gemm_wmma(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* w = r4d_opt(a, 1);
+    const RadTensor* y = r4d_opt(a, 2);
+    if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
+    const long long n_vocab = r4d_geti_or(a, "n_vocab", r4d_dim(w, 0));
+    const long long n_embd  = r4d_geti_or(a, "n_embd", r4d_dim(w, 1));
+    if (n_vocab <= 0 || n_embd <= 0 || n_embd % 16) return R4D_NO(RAD_E_SHAPE);
+    if (w->rank != 2 || w->shape[0] != n_vocab || w->shape[1] != n_embd) return R4D_NO(RAD_E_SHAPE);
+    /* The launcher's weight offset is 32-bit unsigned: refuse here so the row falls through. */
+    if (n_vocab * n_embd > 0xFFFFFFFFLL) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n_embd, &M);
+    const long long y_ld = r4d_rows_pitch(y, n_vocab, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M < 17 || M > 64 || My < M) return R4D_NO(RAD_E_SHAPE);
+    if (x_ld != n_embd || y_ld != n_vocab) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16)) return R4D_NO(RAD_E_ALIGN);
+    return r4d_logits_gemm_bf16_wmma(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd,
+                                     (int)n_vocab, 0, 0, (long)(uintptr_t)s) == 0 ? RAD_OK
+                                                                                  : RAD_E_DEVICE;
+}
