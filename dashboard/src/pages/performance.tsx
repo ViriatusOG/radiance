@@ -35,7 +35,10 @@ const METRICS: Metric[] = [
     // stock dropped it, and a poll mean read against a window best reads as a lie whenever one
     // fast stretch beats the ruler (row b8070d47 — one burst sets the peak, a reload resets it).
     show: (s, h) => { const c = h.col("step") ?? []; const v = c.length ? c[c.length - 1] : null;
-                    return [fin(v) ? fMs(v) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
+                    // A bare number: `fMs` bakes " ms" into what it returns and the tile appends
+                    // its own unit suffix after the figure, so going through fMs printed the unit
+                    // twice. fMs stays for the detail line, which appends nothing after it.
+                    return [fin(v) ? (v >= 100 ? v.toFixed(0) : v.toFixed(2)) : DASH, (s.step_ns_decode_best ?? 0) > 0 ? "best " + fMs(s.step_ns_decode_best! / 1e6) : ""] },
     lines: [{ key: "step", label: "step", color: 1 }, { key: "stepBest", label: "best", dash: true }], fmt: fMs, tight: true },
   // Newest sample, and nothing prefilled is itself a figure. The engine left prefillRate out of a
   // sample that processed no prompt tokens (and now gates `prefill` the same way), so h.last() walked
