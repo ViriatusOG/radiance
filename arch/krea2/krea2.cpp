@@ -1102,11 +1102,11 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     for (const VOp& o : v.ops) v.whole.push_back(o.y.buf);
     for (int i = 0; i < 4; ++i) {
         for (int r = 0; r < nres + 1; ++r)
-            x = v.resblock(x, dims[(size_t)i + 1], nm.f("vae.decoder.up_blocks.%d.resnets.%d", i, r));
+            x = v.resblock(x, dims[(size_t)i + 1], nm.ckpt("vae.decoder.up_blocks.%d.resnets.%d", i, r));
         if (i != 3) {
             v.form = VAE_CONV_2D;
             x = v.conv(x, dims[(size_t)i + 1] / 2, 3, 1, 2, "same",
-                       nm.f("vae.decoder.up_blocks.%d.upsamplers.0.resample.1", i));
+                       nm.ckpt("vae.decoder.up_blocks.%d.upsamplers.0.resample.1", i));
             v.form = VAE_CONV_CAUSAL;
         }
     }

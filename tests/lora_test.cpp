@@ -873,12 +873,42 @@ TEST(weight_targeted_reads_only_what_exists_at_the_moment) {
     const rad_weight w = rad_decl_weight(&b, "blk.0.attn_q.weight", &d);
     REQUIRE(w != 0);
     CHECK(!lora::weight_targeted(b.program(), w, t));        /* no name map yet */
+    CHECK(lora::source_targeted(b.program(), t, "model.layers.0.self_attn.q_proj.weight"));
+    b.set_lora_targets(&t);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.q_proj.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.k_proj.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "mtp.layers.0.self_attn.q_proj.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.visual.q_proj.weight"), 0);
+    const lora::TargetSet head{ "embed_tokens", "lm_head" };
+    b.set_lora_targets(&head);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.embed_tokens.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "lm_head.weight"), 0);
+    b.set_lora_targets(&t);
+    CHECK_EQ(rad_lora_source_targeted(&b, nullptr), 0);
+    b.set_lora_targets(nullptr);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.q_proj.weight"), 0);
     REQUIRE_EQ(AR::map_copy(&b, "blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"), RAD_OK);
     CHECK(lora::weight_targeted(b.program(), w, t));
     CHECK(!lora::weight_targeted(b.program(), w, { "k_proj" }));
     CHECK(!lora::weight_targeted(b.program(), w, {}));
     CHECK(!lora::weight_targeted(b.program(), 0, t));
     CHECK(!lora::weight_targeted(b.program(), 999, t));
+}
+
+TEST(lora_source_targeted_on_a_generator_is_the_declared_root) {
+    const RadModelMeta meta = llama_meta();
+    const RadBuildCtx ctx = ctx_for(0, 1);
+    Builder b(empty_registry(), meta, ctx);
+    const lora::TargetSet star{ "*" };
+    b.set_lora_targets(&star);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 0);
+    REQUIRE_EQ(rad_lora_root(&b, "diffusion_model", "-"), RAD_OK);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "text_encoder.blocks.0.attn.q.weight"), 0);
+    const lora::TargetSet q{ "q" };
+    b.set_lora_targets(&q);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.k.weight"), 0);
 }
 
 TEST(scopes_that_are_never_targets) {
@@ -1461,6 +1491,35 @@ TEST(a_slot_is_never_reloaded_under_a_live_hold) {
 TEST(nothing_here_touches_a_device) {
     /* A guard on the guard: the Registry these programs were declared against has no plugin. */
     CHECK_EQ(empty_registry().plugins().size(), (size_t)0);
+}
+
+
+TEST(a_matching_published_combination_wins_over_a_full_slot_table) {
+    std::atomic<uint64_t> epoch{0};
+    lora::SlotTable table;
+    table.reset(1, &epoch);
+    int32_t slot = -1;
+    uint64_t uid = 0;
+    std::shared_ptr<void> request;
+    bool all_held = true;
+    CHECK_EQ(table.acquire("same", &slot, &uid, &request, &all_held), RAD_E_NOTFOUND);
+    CHECK(!all_held);
+    // Another request publishes after the first cache miss. A single atomic lookup must
+    // acquire that exact combination, even though it occupies the only slot and is held.
+    int reserved = -1;
+    bool cooling = false;
+    std::string why;
+    REQUIRE_EQ(table.reserve("same", &reserved, &cooling, &why), RAD_OK);
+    const uint64_t published = table.publish(reserved, "same", "");
+    std::shared_ptr<void> other;
+    REQUIRE_EQ(table.acquire("same", &slot, &uid, &other), RAD_OK);
+    REQUIRE_EQ(table.acquire("same", &slot, &uid, &request, &all_held), RAD_OK);
+    CHECK(!all_held);
+    CHECK_EQ(uid, published);
+    CHECK_EQ(slot, reserved);
+    std::shared_ptr<void> missing;
+    CHECK_EQ(table.acquire("different", &slot, &uid, &missing, &all_held), RAD_E_NOTFOUND);
+    CHECK(all_held);
 }
 
 RAD_TEST_MAIN()

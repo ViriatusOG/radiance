@@ -138,6 +138,13 @@ struct UnsupportedUse {
  * A routed expert IS targeted when its leaf is (so its moe op is reported, never skipped). */
 bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets);
 
+/* Is checkpoint tensor `src` an adapter target? The leaf of a `.weight` name, so a caller can ask
+ * before the weight exists. A token model: the leaf is in the list and the source is in the trunk
+ * (not mtp/draft, a vision or audio tower, embed_tokens or lm_head). A generator: the source is
+ * under a declared root, and the leaf is in the list or the list is "*". On a token model "*"
+ * matches nothing. */
+bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src);
+
 /* Is this op a LoRA-capable GEMM over weight handle `w` (as its `b` operand)? `why` says why not.
  * gemm_nt; gemm_nt_bias without `act`; gemm_nt_q without `pb1`/`pb2`, with K == the weight's K,
  * over a weight whose known encoding has no `transform`; gemm_nt_q_bias (same encoding rule). */

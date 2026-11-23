@@ -4,8 +4,9 @@
  * grid point, `gptq` feeds each column's rounding error into later columns, `awq` scales the input
  * channels the activations say matter, `autoround` descends on the rounding itself and `paroquant`
  * first learns a rotation of the input channels. They share the grid options, so anything added to
- * the grid is available to all. Two are not over a grid: `ggml` writes llama.cpp's formats by
- * llama.cpp's own searches (lq_ggml.h), and `cast` converts a weight to another float dtype.
+ * the grid is available to all. Three are not over a grid: `ggml` writes llama.cpp's formats by
+ * llama.cpp's own searches (lq_ggml.h), `cast` converts a weight to another float dtype, and
+ * `bf16x12` packs a bf16 weight losslessly in 12 bits and a quarter a value (lq_bf16x12.cpp).
  */
 #include "lq_ggml.h"
 #include "lq_gptq.h"
@@ -374,6 +375,7 @@ const std::vector<const RadQuantizerInfo*>& table() {
         v.push_back(&paroquant_info());
         v.push_back(&ggml_quantizer);
         v.push_back(&m2xfp_info());
+        v.push_back(&bf16x12_info());
         return v;
     }();
     return t;
@@ -386,7 +388,8 @@ const RadPluginInfo kInfo = {
     "the built-in quantisers: round-to-nearest, GPTQ, AWQ, AutoRound and ParoQuant over any "
     "integer, float or codebook grid, with grouped, blocked, two-level and shared-exponent scales "
     "and a Hadamard, permutation or Givens transform; llama.cpp's legacy, K- and I-quants by its "
-    "own searches; and a plain float cast (spec.md §4.5)",
+    "own searches; a plain float cast; and bf16x12, a lossless 12-bit packing of bf16 (spec.md "
+    "§4.5)",
     "host"
 };
 

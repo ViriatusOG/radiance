@@ -90,6 +90,10 @@ private:
     mutable std::mutex           mu_;
     std::map<std::string, Model> models_;
     Series                       fleet_;
+    /* The latest fleet sample's per-card figures and each model's cards, so a model's own rows can
+     * carry its cards' figures: /history?model= answers where the fleet's admin routes do not. */
+    json                         cards_;
+    std::map<std::string, std::vector<std::string>> model_cards_;
     std::string                  fleet_live_;
     /* steady_clock nanoseconds of the last body asked for; 0 before the first. */
     mutable std::atomic<int64_t> asked_ns_{ 0 };

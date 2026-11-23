@@ -2,8 +2,8 @@
  * grid off a rule, and the table each algorithm file exports its quantiser through.
  *
  * lq_registry.cpp holds the plugin's exports and the short quantisers (rtn, gptq, cast). An
- * algorithm with its own loop (AWQ, AutoRound, ParoQuant) has its own file and returns its
- * RadQuantizerInfo from the function named for it below.
+ * algorithm with its own loop (AWQ, AutoRound, ParoQuant) or a format of its own (bf16x12) has its
+ * own file and returns its RadQuantizerInfo from the function named for it below.
  */
 #pragma once
 #include "lq_grid.h"
@@ -102,5 +102,6 @@ const RadQuantizerInfo& awq_info();
 const RadQuantizerInfo& autoround_info();
 const RadQuantizerInfo& paroquant_info();
 const RadQuantizerInfo& m2xfp_info();
+const RadQuantizerInfo& bf16x12_info();
 
 }  /* namespace lq */

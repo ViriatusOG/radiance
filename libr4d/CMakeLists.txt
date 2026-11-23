@@ -141,6 +141,10 @@ set(R4D_UNITS
   "r4d_ar_twoshot_Nrank_ti8|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
+  # The same GEMM over bf16x12 weights (a bf16 weight in 12.25 bits a value, losslessly), all three
+  # of its rows: gemm_bf16x12_nt_m16 forwards to _m64, and _tiled unpacks the weight for
+  # r4d_gemm_bf16_nt_tiled.
+  "r4d_gemm_bf16x12_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"
   "r4d_gemm_w4a16_nt_m64|"
   "r4d_gemm_w5a16_nt_m64|"

@@ -399,6 +399,12 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["step_ns_decode_best"] = m.step_ns_decode_best;
         o["step_ns_decode_recent"] = m.step_ns_decode_recent;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
+        /* The encoder's time and work, which the step figures above do not show: it runs between
+         * steps. Emitted on every model, zero on one without an encoder. */
+        o["encode_items"]    = m.encode_items;
+        o["encode_patches"]  = m.encode_patches;
+        o["encode_ns"]       = m.encode_ns;
+        o["encode_pending"]  = m.encode_pending;
 
         /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
          * noise, over a reach of 40000 a broken draft round. */

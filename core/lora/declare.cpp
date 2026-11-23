@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <string_view>
 
 namespace rad {
 
@@ -70,6 +71,49 @@ rad_buf decl_persist(Builder& b, const std::string& name, uint32_t dtype, uint32
     d.kind = RAD_BUF_PERSIST;
     d.domain = RAD_DOMAIN_DEVICE;
     return b.decl_buffer(name.c_str(), &d);
+}
+
+int declare_replacement_slots(Builder& b, const OpInfo& op, int64_t slots) {
+    Program& prog = b.program();
+    const bool row_mixer = op.op == "mix_rows";
+    const int operand = opd_index(op, row_mixer ? "w" : "bias");
+    if (operand < 0) return RAD_OK;
+    for (size_t i = 0; i < op.weight_opd.size(); ++i) {
+        if (op.weight_opd[i] != operand) continue;
+        const auto weight = op.weights[i];
+        if (prog.lora_replacements.count(weight)) continue;
+        const auto& info = prog.weights[weight];
+        if (info.decl.dtype != RAD_BF16 || info.decl.shard != RAD_SHARD_NONE) continue;
+        if (row_mixer ? info.decl.rank != 2 || info.decl.shape[0] != 1 : info.decl.rank != 1)
+            continue;
+        Program::LoraReplacement bias;
+        bias.row_mixer = row_mixer;
+        bias.rows = info.decl.shape[row_mixer ? 1 : 0];
+        const RadNameMap* map = nullptr;
+        for (const auto& entry : prog.name_map)
+            if (entry.declared && info.name == entry.declared) map = &entry;
+        if (!map || !map->n_src || !map->src[0]) continue;
+        std::string source = map->src[0];
+        const std::string_view suffix = row_mixer ? ".weight" : ".bias";
+        if (!source.ends_with(suffix)) continue;
+        bias.module = source.substr(0, source.size() - suffix.size());
+        if (!row_mixer && map->mode == RAD_MAP_ROWS) {
+            for (int j = 0; j < map->n_src; ++j) {
+                if (!map->src[j] || source != map->src[j] || map->src_index[j] < 0) break;
+                for (int64_t row = 0; row < map->src_rows[j]; ++row)
+                    bias.source_rows.push_back(map->src_index[j] + row);
+            }
+            if ((int64_t)bias.source_rows.size() != bias.rows) continue;
+        } else if (map->mode != RAD_MAP_COPY || map->n_src != 1 || map->src_index[0] != -1) {
+            continue;
+        }
+        if (bias.rows <= 0) continue;
+        const int64_t shape[2] = {slots, bias.rows};
+        bias.slots = decl_persist(b, "lora." + info.name, RAD_BF16, 2, shape);
+        if (!bias.slots) return RAD_E_STATE;
+        prog.lora_replacements.emplace(weight, std::move(bias));
+    }
+    return RAD_OK;
 }
 
 }  /* namespace */
@@ -256,11 +300,13 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
                    "of its activation and output are not known at declare");
             continue;
         }
-        const uint32_t a_dt = P.buffers[reads[0]].decl.dtype;
+        const RadBufDecl& a = P.buffers[reads[0]].decl;
+        const uint32_t a_dt = a.dtype;
         const uint32_t y_dt = P.buffers[writes[0]].decl.dtype;
         const bool coded = is_coded(a_dt);
         if (coded && oas < 0) { refuse("a coded activation and no `a_scale` operand"); continue; }
         const int64_t a_grid = coded ? activation_grid(P, reads) : 0;
+
         if (coded && a_grid <= 0) {
             refuse("a coded activation whose read set holds no single f32 scale stream beside the "
                    "codes, so the grid lora_shrink reads it at is not known at declare");
@@ -324,11 +370,18 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         is.R = x.R; is.K = x.K_r; is.N = x.N_r;
         P.ops[hs].anchor = (int32_t)gh;
         P.ops[he].anchor = (int32_t)gh;
+        if (gen) RAD_TRY(declare_replacement_slots(b, P.ops[gh], S));
         P.ops[gh].lora_site = (int32_t)P.lora_sites.size();
         P.lora_sites.push_back(is);
     }
     if (n_refused) return RAD_E_UNSUPPORTED;
 
+    /* The generator's small row mixer reads a single output row with a different
+     * activation layout. Bind a merged copy of that weight for the selected slot. */
+    if (gen && d.targets.count("*"))
+        for (size_t i = 1; i < P.ops.size(); ++i)
+            if (P.ops[i].op == "mix_rows" && b.op_resolved((rad_op)i))
+                RAD_TRY(declare_replacement_slots(b, P.ops[i], S));
     if (gen) P.lora_rused.assign(P.lora_pools.size() * (size_t)S, 0);
     if (d.sites_out) {
         std::vector<lora::Site> kept;

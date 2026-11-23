@@ -1525,6 +1525,56 @@ extern "C" int r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
     return rad_ar_rmsnorm_quant(a, s, true);
 }
 
+/* ar_rmsnorm: ar_rmsnorm_quant_fp8 without the quantiser, for a block whose linears read the bf16
+ * norm output (arch/common's bf16 blocks). Its operands are that op's minus `q` and `scale`, with
+ * `y` required; the exact wire only. The checks, the block count and the norm's width are
+ * rad_ar_rmsnorm_quant's, for the same reasons. */
+enum { AN_X = 0, AN_RESID, AN_W, AN_Y };
+
+extern "C" int r4d_rad_ar_rmsnorm(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+
+    const RadTensor* x  = r4d_opt(a, AN_X);
+    const RadTensor* rs = r4d_opt(a, AN_RESID);
+    const RadTensor* w  = r4d_opt(a, AN_W);
+    const RadTensor* y  = r4d_opt(a, AN_Y);
+    if (!x || !w || !y) return RAD_E_INVAL;
+    if (!r4d_contig(w)) return RAD_E_STRIDE;
+    if (x->rank != 2 || y->rank != 2) return RAD_E_SHAPE;
+    const long long M = x->shape[0], K = x->shape[1];
+    if (M < 1 || K < 1) return RAD_E_SHAPE;
+    if (M * K > in->max_numel) return RAD_E_SHAPE;
+    if (K % 8) return RAD_E_SHAPE;
+    if (r4d_numel(w) != K) return RAD_E_SHAPE;
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (y->shape[0] != M || y->shape[1] != K) return RAD_E_SHAPE;
+    if (rs && (rs->rank != 2 || rs->shape[0] != M || rs->shape[1] != K)) return RAD_E_SHAPE;
+    const long long xp = r4d_row_pitch(x), yp = r4d_row_pitch(y);
+    const long long rp = rs ? r4d_row_pitch(rs) : 0;
+    if (xp < 0 || yp < 0 || rp < 0) return RAD_E_STRIDE;
+    if (xp != K) return RAD_E_STRIDE;
+    if (r4d_geti_or(a, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)M;
+    if (nblocks > (int)M) nblocks = (int)M;
+    constexpr int kNbCap = 256;
+    if (nblocks > kNbCap) nblocks = kNbCap;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    if (nblocks < 1) nblocks = 1;
+
+    const int e = r4d_ar_rmsnorm_bf16(
+        in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
+        in->slot16, r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w), r4d_addr(y), (int)M, (int)K,
+        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0), w->dtype == RAD_F32,
+        (int)rp, (int)yp, (long)(uintptr_t)s, nblocks, 0, cfgv.drain, cfgv.acq, in->my_stage,
+        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
 /* The all-reduce and the sandwich-norm junction after it, int8 out: exact `all_reduce` of `x`, then
  * `rmsnorm_quant_i8` (post-norm of the reduced x, residual add, scalar, norm and the per-row int8
  * quantiser the w4a8 skinny GEMM reads). Operands are rmsnorm_quant_i8's with `x` inout, since the

@@ -50,6 +50,12 @@
  *       [ceil(N/128)][ceil(K/128)] plane, and fragment order is a permutation of the same count
  *       (r4d_fp8_frag.h: `frag_bytes(N,K) == N*K`).
  *
+ *   gemm_nt at bf16x12
+ *       The weight is the stored form r4d_layout.cpp lays out from a bf16x12 weight's four planes
+ *       (R4D_DT_BF16X12), whose byte count is the layout hook's. Nor would a fill be a weight: an
+ *       exponent byte of 0xFF sends a lane to the escape table at whatever index its offsets
+ *       hold. r4d_selftest builds the weight from bf16 values through the rows' own hooks.
+ *
  *   logits_gemm at fp8
  *       The declared shape and the stored plane differ. The weight is declared [n_vocab][n_embd]
  *       E4M3 but the kernel strides it by r4d_fp8::lm_row_bytes(n_embd), since each row carries
@@ -1369,6 +1375,20 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
         opd((uint32_t)RAD_F32,  n),         /* f32 or bf16; the shim reads the operand's own */
         opd((uint32_t)RAD_F8E4M3, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+        opd((uint32_t)RAD_BF16, M, n),
+    };
+    R4D_PICK(l);
+}
+
+/* ar_rmsnorm: the same operands without the codes and their scales. */
+extern "C" int r4d_shape_ar_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),      /* inout: the message and the input */
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_F32,  n),         /* f32 or bf16; the shim reads the operand's own */
         opd((uint32_t)RAD_BF16, M, n),
     };
     R4D_PICK(l);

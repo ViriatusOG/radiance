@@ -803,3 +803,47 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
         return RAD_E_NOTFOUND;
     }
 }
+
+/* ==========================================================================================
+ * ar_rmsnorm -- ar_rmsnorm_quant_fp8 without the quantiser, for the bf16 blocks.
+ * (kernel: the same, at QZ false; shim: r4d_ar_entry.hip)
+ *
+ * Operands: [0] x (inout)  [1] residual?  [2] w  [3] y
+ *
+ * The exact wire's reduce as above, then rmsnorm_quant_fp8's chain without its last step: `add`
+ * (the sum rounded to bf16 and stored in the residual) and `rmsnorm` of the stored sum, at the
+ * same `r4d_act_threads` width, into `y`. The bf16 blocks issue exactly these three today.
+ */
+extern "C" int r4d_fuse_ar_rmsnorm(const RadParam* p, int n_p, uint64_t present, int step,
+                                   RadFuseStep* out) {
+
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t world = pi(p, n_p, "world_size");
+    if (M <= 0 || n <= 0 || world <= 0) return RAD_E_UNSUPPORTED;
+    const bool has_res = RAD_FUSE_HAS(present, 1) != 0;
+    /* Without a residual there is no `add`. */
+    const int s = (step >= 1 && !has_res) ? step + 1 : step;
+
+    switch (s) {
+    case 0: {
+        Step st(out, "all_reduce");
+        st.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+          .mirror(p, n_p, "dtype").pint("exact", 1);
+        return st.wire({ 0, RAD_FUSE_NONE });       /* x (inout), y */
+    }
+    case 1: {
+        Step st(out, "add");
+        st.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+        return st.wire({ 0, 1, 1 });                /* a, b, y */
+    }
+    case 2: {
+        Step st(out, "rmsnorm");
+        st.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps")
+          .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "wadd");
+        return st.wire({ has_res ? (int16_t)1 : (int16_t)0, 2, 3 });   /* x, w, y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}

@@ -131,6 +131,8 @@ public:
     int         lora_root(const char* native, const char* spellings);
     int         lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
                            int64_t from_hi, int64_t to_lo);
+    /* 1 when `src` is a runtime-LoRA target (lora::source_targeted); 0 when none is configured. */
+    int         lora_source_targeted(const char* src) const;
     int         drafter_short_block(int64_t block);
     int         drafter_tree(rad_buf parents);
     int         route_table(rad_buf table);

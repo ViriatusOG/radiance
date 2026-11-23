@@ -77,6 +77,19 @@ struct SchedMetrics {
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
 
+    /* The encoder (engine_mm.cpp): items and patches encoded and the nanoseconds the passes took,
+     * cumulative, and the items waiting for it or being encoded now. Encoding runs between
+     * steps, so a model that is encoding steps nothing and its step figures stay flat; these say
+     * where the time went. */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
+    /* When the pass under way began (steady clock, ns), 0 when none. metrics() and
+     * observed_metrics() add the time since to encode_ns, so a long pass reads as busy while
+     * it runs; the field is how the observers' copy carries that between publications. */
+    int64_t encode_started_ns = 0;
+
     /* Per KV group. `name` points into the Program, which outlives any scrape. */
     int n_kv_groups = 0;
     struct Group {

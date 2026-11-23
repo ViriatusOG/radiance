@@ -54,6 +54,7 @@ struct FakeVideoGen : IVideoGen {
         inf.max_ref_images = 9;
         inf.max_ref_videos = 3;
         inf.max_ref_audios = 3;
+        inf.max_enc_samples = 480000;
         inf.shift_video = 12.0;
         inf.shift_audio = 3.0;
     }
@@ -68,8 +69,8 @@ struct FakeVideoGen : IVideoGen {
         t.width = r->width;
         t.height = r->height;
         t.steps = 2;
-        t.sample_rate = 32000;
-        t.channels = 2;
+        t.sample_rate = inf.sample_rate;
+        t.channels = inf.channels;
         t.fps = 24.0;
         if (r->upscale > 1.0) {
             t.small_width = (int32_t)(r->width / r->upscale) / 32 * 32;
@@ -90,13 +91,15 @@ struct FakeVideoGen : IVideoGen {
                 e.steps_done = s;
                 t.push(std::move(e));
             }
-            gen::VideoEvent a;
-            a.kind = gen::VideoEvent::AUDIO;
-            for (int i = 0; i < 3200; ++i) {
-                a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
-                a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+            if (t.channels > 0) {
+                gen::VideoEvent a;
+                a.kind = gen::VideoEvent::AUDIO;
+                for (int i = 0; i < 3200; ++i) {
+                    a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
+                    a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+                }
+                t.push(std::move(a));
             }
-            t.push(std::move(a));
             gen::VideoEvent f;
             f.kind = gen::VideoEvent::FRAMES;
             f.first = 0;
@@ -238,6 +241,24 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
     CHECK_EQ(v.gen.last().height, 1344);
     CHECK_EQ(v.gen.last().chunks, 14);     /* 240 frames: 17 * 14 + 5 = 243 */
     v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+}
+
+TEST(a_short_first_chunk_is_counted_in_the_video_api_duration) {
+    Videos v;
+    auto& d = v.gen.inf;
+    d.fps_num = 16;
+    d.frames_per_chunk = 4;
+    d.frames_tail = -3;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+
+    for (const auto& [seconds, chunks] : std::vector<std::pair<double, int>>{
+             {0.0625, 1}, {0.20, 2}, {0.33, 3}}) {
+        const auto r = v.create(Videos::body({{"seconds", seconds}, {"size", "256x256"}}));
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().chunks, chunks);
+    }
+    CHECK_EQ(v.refused(Videos::body({{"seconds", 0.6}})), std::string("seconds"));
 }
 
 /* `shift`/`audio_shift` thread to the request and echo back; omitted, the request carries 0 (the
@@ -1409,6 +1430,60 @@ TEST(video_job_routes_skip_a_cold_default_and_survive_the_owner_draining) {
     CHECK_EQ(missing->status, 404);
     CHECK_EQ(demands.load(), 0);
     CHECK(front.activity("cold-text").state == Front::State::Cold);
+}
+
+TEST(a_video_only_model_refuses_soundtrack_options_and_finishes_an_mp4) {
+    Videos v;
+    auto& info = v.gen.inf;
+    info.channels = info.sample_rate = 0;
+    info.max_ref_audios = info.max_enc_samples = 0;
+    info.guidance = true;
+    info.guidance_default[0] = 1.0;
+    CHECK_EQ(v.refused(Videos::body({ { "audio_shift", 3 } })), std::string("audio_shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "audio_guidance_scale", 1 } })),
+             std::string("audio_guidance_scale"));
+
+    if (!mm::decoder_available()) SKIP("video codec unavailable");
+    const HttpResponse r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    const json video = json::parse(r.body, nullptr, false);
+    CHECK(!video.contains("audio_guidance_scale"));
+    CHECK(!video.contains("negative_prompt"));
+    const json done = v.wait(str_at(video, "id"));
+    if (str_at(done, "status") == "failed" && has(str_at(done["error"], "message"), "no libavcodec"))
+        SKIP("video encoder unavailable");
+    CHECK_EQ(str_at(done, "status"), std::string("completed"));
+}
+
+TEST(a_unipc_model_reports_its_sampler_and_refuses_other_samplers) {
+    Videos v;
+    v.gen.inf.channels = v.gen.inf.sample_rate = 0;
+    v.gen.inf.max_ref_audios = v.gen.inf.max_enc_samples = 0;
+    v.gen.inf.unipc_only = true;
+    v.gen.inf.guidance = true;
+    v.gen.inf.guidance_cfg_only = true;
+    CHECK_EQ(v.refused(Videos::body({{"stg_scale", 1}})), std::string("stg_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"modality_scale", 2}})), std::string("modality_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"guidance_rescale", .2}})), std::string("guidance_rescale"));
+    v.gen.inf.step_evals = true;
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "euler" } })), std::string("sampler"));
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "res_multistep" } })), std::string("sampler"));
+    for (const auto& body : { Videos::body(), Videos::body({ { "sampler", "unipc" },
+                                                          { "num_inference_steps", 1 } }) }) {
+        if (!mm::decoder_available()) SKIP("video codec unavailable");
+        const HttpResponse r = v.create(body);
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().sampler, RAD_SAMPLER_UNIPC);
+        const json video = json::parse(r.body, nullptr, false);
+        CHECK_EQ(str_at(video, "sampler"), std::string("unipc"));
+        CHECK(!video.contains("stg_scale"));
+        CHECK(!video.contains("modality_scale"));
+        CHECK(!video.contains("guidance_rescale"));
+        const json done = v.wait(str_at(video, "id"));
+        if (str_at(done, "status") == "failed" && has(str_at(done["error"], "message"), "no libavcodec"))
+            SKIP("video encoder unavailable");
+        CHECK_EQ(str_at(done, "status"), std::string("completed"));
+    }
 }
 
 RAD_TEST_MAIN()

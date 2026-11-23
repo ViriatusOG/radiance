@@ -15,6 +15,7 @@
  * are reported.
  */
 #include "iface.h"
+#include "convert_work_queue.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
 #include "format/imatrix.h"
@@ -367,6 +368,8 @@ void usage() {
         "                       Input is the vision safetensors with its source config. Copy all\n"
         "                       base weight planes, vocab and metadata to a new output.\n"
         "                       Supports --config, --home, --kernels and --plan-only.\n"
+        "      --reuse-only     with --reuse, refuse any weight not found with matching encoding,\n"
+        "                       quantiser, options, shape and expert slot; no fresh conversion\n"
         "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
         "                       the checkpoint the --reuse container was converted from. Every\n"
         "                       weight that reads one is converted; the rest are copied\n"
@@ -406,6 +409,9 @@ void usage() {
         "                       may run on, and large weights then run two at a time. A\n"
         "                       quantiser writes the same bytes on a card as on the host; with\n"
         "                       no quantiser plugin that has a device path, refused\n"
+        "      --gpu-workers N  with --gpus, reserve N OpenMP workers for trellis GPTQ jobs;\n"
+        "                       other workers process CPU jobs, either side can steal. N must\n"
+        "                       be less than OMP_NUM_THREADS and at most the cards in --gpus. Default: one shared queue\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
@@ -455,10 +461,11 @@ int main(int argc, char** argv) {
     std::vector<std::string> lora_paths;
     double      lora_strength = 1.0;
     std::string lora_map;
-    bool        in_place = false;
+    bool        in_place = false, reuse_only = false;
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
     std::vector<int> gpus;           /* --gpus: the cards the quantisers may run on */
+    int gpu_workers = 0;             /* 0: the original shared OpenMP job queue */
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -513,6 +520,7 @@ int main(int argc, char** argv) {
             if (reuse_path.empty()) reuse_path = r;
             else reuse_more.push_back(r);
         }
+        else if (a == "--reuse-only") reuse_only = true;
         else if (a == "--changed")   changed_path = next("--changed");
         else if (a == "--lora")      lora_paths.push_back(next("--lora"));
         else if (a == "--lora-strength") {
@@ -533,6 +541,7 @@ int main(int argc, char** argv) {
             for (const std::string& d : rad_split_list(next("--gpus")))
                 gpus.push_back((int)rad_flag_int("rad-convert", "--gpus", d.c_str(), 0, 1023));
         }
+        else if (a == "--gpu-workers") gpu_workers = (int)num("--gpu-workers", 1, 1023);
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
             if (v == "i8")        kv_dtype = RAD_I8;
@@ -551,7 +560,7 @@ int main(int argc, char** argv) {
     }
 
     if (!vision_base.empty()) {
-        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() ||
+        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() || reuse_only ||
             !recipe_files.empty() || !quant_flags.empty() || !set_kv.empty() ||
             !arch_override.empty() || !tokjson.empty() || !tokjson2.empty() || !chat_tmpl.empty() ||
             !add_files.empty() || !draft_dir.empty() || !imat_path.empty() || !lora_paths.empty() ||
@@ -602,6 +611,36 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    {
+        std::unordered_set<int> listed;
+        for (int g : gpus)
+            if (!listed.insert(g).second) {
+                std::fprintf(stderr, "rad-convert: --gpus lists card %d more than once\n", g);
+                return 2;
+            }
+    }
+    if (gpu_workers) {
+        if (gpus.empty()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers needs --gpus\n"); return 2;
+        }
+        if ((size_t)gpu_workers > gpus.size()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers %d exceeds the %zu card(s) in --gpus\n",
+                         gpu_workers, gpus.size());
+            return 2;
+        }
+#ifdef _OPENMP
+        if (gpu_workers >= omp_get_max_threads()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers must leave at least one of the %d "
+                                 "OpenMP workers for host jobs\n", omp_get_max_threads());
+            return 2;
+        }
+#else
+        std::fprintf(stderr, "rad-convert: --gpu-workers needs an OpenMP build\n"); return 2;
+#endif
+    }
+    if (reuse_only && (reuse_path.empty() || in_place)) {
+        std::fprintf(stderr, "rad-convert: --reuse-only needs --reuse without --in-place\n"); return 2;
+    }
     if (!changed_path.empty() && (reuse_path.empty() || in_place)) {
         std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
                              "container --reuse names, and needs --reuse without --in-place (a "
@@ -1347,6 +1386,12 @@ int main(int argc, char** argv) {
                 if (in_place) { ++n_from_other; other_bytes += (int64_t)e->bytes; }
             }
         }
+        if (reuse_only && !re) {
+            RAD_ERR("--reuse-only: no matching source for '%s'; refusing fresh conversion",
+                    ww.name.c_str());
+            w.abort();
+            return 1;
+        }
         const int64_t idx = w.add_weight(ww);
         if (idx < 0) { w.abort(); return 1; }
         jobs.push_back(Job{ Lp, idx, re, rf, plane_total });
@@ -1649,13 +1694,28 @@ int main(int argc, char** argv) {
     }
     std::atomic<int> failed{RAD_OK};
     const auto t0 = std::chrono::steady_clock::now();
+    std::vector<size_t> device_small, host_small;
+    if (gpu_workers) for (size_t i : small) {
+        const Job& j = jobs[i];
+        const bool device = !j.re && j.L->rule && j.L->rule->q &&
+                            std::strcmp(j.L->rule->q->name, "gptq") == 0 &&
+                            rad_enc_is(&j.L->enc, "trellis");
+        (device ? device_small : host_small).push_back(i);
+    }
+    if (gpu_workers && !device_small.empty()) {
+        RAD_INFO("gpu pipeline: %zu trellis job(s), %zu other job(s), %d preferred device worker(s)",
+                 device_small.size(), host_small.size(), gpu_workers);
+        failed.store(convert_run_queues(device_small, host_small, gpu_workers,
+                                        [&](size_t i) { return run_job(jobs[i]); }));
+    } else {
 #pragma omp parallel for schedule(dynamic, 1)
-    for (size_t i = 0; i < small.size(); ++i) {
-        if (failed.load(std::memory_order_relaxed) != RAD_OK) continue;
-        const int st = run_job(jobs[small[i]]);
-        if (st < 0) {
-            int ok = RAD_OK;
-            failed.compare_exchange_strong(ok, st);
+        for (size_t i = 0; i < small.size(); ++i) {
+            if (failed.load(std::memory_order_relaxed) != RAD_OK) continue;
+            const int st = run_job(jobs[small[i]]);
+            if (st < 0) {
+                int ok = RAD_OK;
+                failed.compare_exchange_strong(ok, st);
+            }
         }
     }
     {

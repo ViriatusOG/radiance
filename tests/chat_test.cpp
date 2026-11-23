@@ -1619,4 +1619,72 @@ TEST(a_schema_nested_past_the_limit_is_refused_before_it_is_rendered) {
     CHECK_EQ(t.apply(msgs, tools, ChatOptions{}, &q), RAD_E_INVAL);
 }
 
+/* Inkling 2 Mini's template writes its tool list with `tools | tojson(sort_keys=true, ...)`, which
+ * the vendored engine threw "tojson sort_keys=true not implemented" on: the probe swallowed the
+ * throw, reported the model without tool support, and tools were off for it. */
+TEST(tojson_sorts_object_keys_when_sort_keys_is_true) {
+    auto render = [](const char* filter) {
+        ChatTemplate t;
+        CHECK_OK(t.load(
+            std::string("{% set data = {'name':'f','args':{'z':1,'a':[{'y':2,'b':3}]}} %}"
+                        "{{ data|tojson(") + filter + ") }}", "", ""));
+        json msgs = json::array();
+        msgs.push_back({{"role", "user"}, {"content", "hi"}});
+        ChatPrompt p;
+        ChatOptions opt;
+        opt.add_generation_prompt = false;
+        CHECK_OK(t.apply(msgs, json(), opt, &p));
+        return p.prompt;
+    };
+    CHECK_EQ(render("sort_keys=true, separators=(',',':')"),
+             std::string(R"({"args":{"a":[{"b":3,"y":2}],"z":1},"name":"f"})"));
+    CHECK_EQ(render("separators=(',',':')"),
+             std::string(R"({"name":"f","args":{"z":1,"a":[{"y":2,"b":3}]}})"));
+}
+
+TEST(a_template_that_sorts_its_tools_reports_tool_support) {
+    ChatTemplate inkling;
+    CHECK_OK(inkling.load(
+        "{%- if tools -%}<tools>{{- tools | tojson(sort_keys=true, separators=(\",\", \":\")) -}}</tools>{%- endif -%}"
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(inkling.caps().tools);
+    CHECK(inkling.caps().probe_error.empty());
+}
+
+/* Inkling 2 Mini's own tool declaration: the tool list it writes has each object's keys in order. */
+TEST(inklings_tool_declaration_renders_its_tools_with_sorted_keys) {
+    ChatTemplate inkling;
+    CHECK_OK(inkling.load(
+        "{%- if tools -%}"
+        "{%- set tool_state = namespace(specs=[]) -%}"
+        "{%- for tool in tools -%}"
+        "{%- set fn = tool.function if tool.function is defined else tool -%}"
+        "{%- set spec = {"
+        "\"description\": (fn.description if fn.description is defined and fn.description else \"\"),"
+        "\"name\": fn.name,"
+        "\"parameters\": (fn.parameters if fn.parameters is defined and fn.parameters else {}),"
+        "\"type\": (tool.type if tool.type is defined and tool.type else \"function\"),"
+        "} -%}"
+        "{%- set tool_state.specs = tool_state.specs + [spec] -%}"
+        "{%- endfor -%}"
+        "{{- \"<|message_system|>tool_declare<|content_xml|>\" -}}"
+        "{{- tool_state.specs | tojson(sort_keys=true, separators=(\",\", \":\")) -}}"
+        "{{- \"<|end_message|>\" -}}"
+        "{%- endif -%}"
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(inkling.caps().tools);
+    CHECK(inkling.caps().probe_error.empty());
+    json tools = json::parse(R"([{"type":"function","function":{"name":"get_weather","description":"Weather",
+        "parameters":{"type":"object","required":["city"],"properties":{"unit":{"type":"string"},"city":{"type":"string"}}}}}])");
+    json msgs = json::array({ { { "role", "user" }, { "content", "hi" } } });
+    ChatPrompt p;
+    CHECK_OK(inkling.apply(msgs, tools, ChatOptions(), &p));
+    CHECK_EQ(p.prompt, std::string(
+        R"(<|message_system|>tool_declare<|content_xml|>[{"description":"Weather","name":"get_weather",)"
+        R"("parameters":{"properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city"],"type":"object"},)"
+        R"("type":"function"}]<|end_message|><user>hi</user><assistant>)"));
+}
+
 RAD_TEST_MAIN()

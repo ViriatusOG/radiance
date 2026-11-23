@@ -48,6 +48,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace rad {
@@ -65,12 +66,16 @@ struct TierJob;
 struct StepSlot;
 class ExpertStats;   /* place/xstats.h */
 class XsTally;
+class ExpertMemoryOps;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
 
+struct EngineMemoryTestAccess;
+
 class Engine {
 public:
+    friend struct EngineMemoryTestAccess;
     explicit Engine(Config cfg);
     ~Engine();
 
@@ -135,6 +140,12 @@ public:
      * Set at bring-up. */
     bool one_step() const { return embedding_; }
     bool parked() const { return parked_.load(std::memory_order_acquire); }
+    /* A failed fence forbids paging and fallback unload until a later complete drain succeeds. */
+    int memory_fence_status() const { return memory_fence_status_.load(std::memory_order_acquire); }
+    int prepare_unload(); // only after all producer threads have joined
+    int retry_memory_fence();
+    bool producers_stopped() const { return producers_stopped_.load(std::memory_order_acquire); }
+    bool stopping() const { return stopping_.load(std::memory_order_acquire); }
     /* While parked, the linear-state snapshot store's pinned host memory goes back to the host:
      * the park emptied the prefix cache, so the store holds no snapshot, and the next unpark pins
      * it again before paging in (4 GiB pins in about 0.3 s, far less than the host copies of
@@ -147,9 +158,9 @@ public:
      * container, whole weights at a time. The bytes filled, or a negative status. From the fleet's
      * thread, with the model idle. */
     int64_t fill_host(int64_t max_bytes);
-    /* Host memory a refill (a restore's or a host fill's) holds while it runs, at most: the
-     * relayout pool's staged inputs (kRefillStaging), its workers' output buffers and the sweep's
-     * pinned windows. The fleet keeps this much room for it. */
+    /* Host-room allowance for a refill's staged inputs, output scratch and read windows. CPU
+     * container warming preflights its aggregate inputs and partial output against this allowance;
+     * ordinary loading may still need a complete unusually large weight. */
     static constexpr int64_t kRefillStaging = (int64_t)2 << 30;
     static constexpr int64_t kRefillHost = (int64_t)4 << 30;
     /* What release_host_spare gave back and unpark will pin again. */
@@ -226,6 +237,7 @@ public:
 
 private:
     friend struct EngineBaseWeightsTestAccess;
+    friend struct EngineQuietTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -321,18 +333,35 @@ public:
     /* The adapter files a generator request may name: --lora's and those under --lora-dir. */
     std::vector<std::string> gen_lora_names() const;
 private:
-    /* A generator's adapter files by name (--lora, POST /v1/load_lora_adapter, --lora-dir), opened
-     * once and kept mapped; compositions read them when a combination is put in a slot. */
-    int gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
-                      std::string* err);
+    /* A generator keeps explicitly loaded files and snapshots discovered files on a cache miss. */
     int gen_lora_start();
+    struct LoraReplacement {
+        rad_buf buffer;
+        std::vector<uint16_t> values;
+    };
+    using LoraReplacements = std::vector<std::vector<LoraReplacement>>;
+    int gen_lora_prepare_replacements(const std::map<std::string, lora::Composite>& modules,
+                                      const std::map<std::string, std::vector<float>>& deltas,
+                                      LoraReplacements* replacements, std::string* err) const;
     /* Every rank's packed bytes into `slot` of its pools, each rank on a stream of its own. */
     int lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
-                  std::string* err);
+                  std::string* err, const LoraReplacements* replacements = nullptr);
     bool                        lora_gen_ = false;
     std::unique_ptr<lora::KeyMap> lora_keys_;
     mutable std::mutex          lora_lib_mu_;
-    std::map<std::string, std::pair<std::string, std::shared_ptr<const lora::AdapterFile>>> lora_lib_;
+    struct AdapterEntry {
+        std::string path;
+        std::optional<FileRevision> revision; // Empty for an explicitly loaded adapter.
+        std::shared_ptr<const lora::AdapterFile> file;
+        uint64_t version;
+    };
+    int resolve_gen_adapter(const std::string& name, AdapterEntry* entry, std::string* err);
+    int snapshot_gen_adapter(const std::string& path, std::shared_ptr<const lora::AdapterFile>* file,
+                             std::string* err, const FileRevision* expected = nullptr) const;
+    std::map<std::string, AdapterEntry> lora_lib_;
+    std::set<std::string> unloaded_gen_adapters_;
+    std::set<std::string> gen_bias_modules_; // Bias operands supported on every tensor-parallel rank.
+    uint64_t next_adapter_version_ = 1;
 private:
     std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
     lora::SlotTable            lora_table_;      /* reads lora_epoch_, so declared after it */
@@ -389,8 +418,10 @@ private:
      * dev_page_refilled) is read from the container and laid out again at its current address,
      * through the load's sweep and relayout pool. */
     /* `before_writes`, when set, runs once before the refill's first write into the spans. */
+    enum class RefillDestination { Device, Host };
     int refill_weights(const std::vector<PageSpan>& spans, const char* what = "restore",
-                       const std::function<int()>& before_writes = {});
+                       const std::function<int()>& before_writes = {},
+                       RefillDestination destination = RefillDestination::Device);
     /* dev_page_in (or the live form with `left`) and the refill of what it mapped back empty. */
     int page_back_in(int64_t* left);
     int configure_kv();
@@ -469,6 +500,10 @@ private:
      * once it is idle with nothing in flight and waits there until hold_req_ clears. */
     std::atomic<bool>             hold_req_{false};
     std::atomic<bool>             hold_ack_{false};
+    std::atomic<int>              hold_status_{RAD_OK};
+    std::atomic<int>              memory_fence_status_{RAD_OK};
+    std::atomic<bool>             producers_stopped_{true};
+    std::atomic<bool>             map_fence_pending_{false};
     /* hold_point's wait: woken when the hold clears (hold_release) or the engine stops
      * (wake_hold). */
     std::mutex                    hold_mu_;
@@ -477,7 +512,11 @@ private:
     void                          hold_release();
     void                          wake_hold();
     int                           unpark_with(std::string* why, int64_t* left);
-    void                          drain_streams();
+    int                           drain_streams();
+    int                           drain_tier_streams();
+    int                           report_tier_jobs(std::vector<TierJob>& jobs,
+                                                   const std::vector<char>& ok, uint64_t now);
+    int                           release_deferred_quietly();
     std::vector<int>              rank_devices() const;   /* each rank's card, in rank order */
     server::Server*               srv_ = nullptr;   /* run_server's, while it runs */
     std::atomic<int64_t>          background_jobs_{0};  /* server::Deps::background */
@@ -489,7 +528,9 @@ private:
     int64_t                       flex_want_ = 0;
     bool                          flex_preempt_ = false;
     bool                          flex_kv_ = true;          /* the cache's flex may go too */
-    int64_t                       flex_got_ = -1;
+    int64_t                       flex_got_ = 0;
+    bool                          flex_done_ = false;
+    int                           flex_status_ = RAD_OK;
     uint64_t                      flex_room_ns_ = 0;
     void                          flex_service();
     void                          flex_room_tick(uint64_t now_ns);
@@ -507,7 +548,9 @@ private:
     void                          xflex_tick(bool busy);
     int64_t                       xflex_give(int64_t bytes);
     int64_t                       xflex_settle();
+    int                           xflex_grow_to(int64_t bytes, ExpertMemoryOps& memory);
     /* run_quiet's handoff to the step loop (quiet_service). */
+    std::mutex quiet_call_mu_;  /* one caller owns the pending callback through completion */
     std::mutex                    quiet_mu_;
     std::condition_variable       quiet_cv_;
     std::atomic<bool>             quiet_pending_{false};

@@ -381,7 +381,8 @@ TEST(adapter_files_group_by_module_and_refuse_what_they_cannot_reproduce) {
     std::string err;
     REQUIRE_EQ(a.open(f.f1, &err), RAD_OK);
     CHECK_EQ(a.modules().size(), (size_t)6);
-    CHECK_EQ(a.skipped().size(), (size_t)1);
+    CHECK(a.skipped().empty());
+    CHECK_EQ(a.biases().size(), (size_t)1);
     CHECK_EQ(std::string(a.kind_name()), std::string("LoRA"));
     const std::string dir = new_dir("genlora_bad");
     write_st(dir + "/dora.safetensors", { tensor("m.lora_A.weight", "F32", { 2, 4 }, 1),
@@ -503,7 +504,7 @@ TEST(stacked_adapters_of_every_kind_pack_to_their_dense_delta_on_every_rank) {
             if (cs != RAD_OK) fprintf(stderr, "    world %d rank %d: %s\n", world, rank, err.c_str());
             REQUIRE_EQ(cs, RAD_OK);
             CHECK_EQ(rep.unplaced.size(), (size_t)1);
-            CHECK_EQ(rep.skipped.size(), (size_t)1);
+            CHECK(rep.skipped.empty());
             /* block 0's fc2 (a full delta, rank 128) is the one module past rank 24 */
             CHECK_EQ(rep.modules - rep.exact, (int64_t)1);
             CHECK_EQ(rep.worst_module, std::string("transformer.transformer_blocks.0.ff.net.2"));
@@ -654,6 +655,247 @@ TEST(scalar_truncation_deflates_dependent_columns_without_changing_scale) {
             REQUIRE(reference > 0);
             CHECK(error / reference < 1e-8);
         }
+}
+
+TEST(an_adapter_snapshot_keeps_factors_after_the_source_is_replaced) {
+    const std::string path = new_dir("genlora-snapshot") + "/one.safetensors";
+    const TW first = tensor("layer.lora_A.weight", "F32", {1, 8}, 1);
+    const TW second = tensor("layer.lora_A.weight", "F32", {1, 8}, 9);
+    const TW up = tensor("layer.lora_B.weight", "F32", {4, 1}, 2);
+    write_st(path, {first, up});
+    lora::AdapterFile snapshot;
+    std::string why;
+    REQUIRE_EQ(snapshot.open_snapshot(path, 1024 * 1024, &why), RAD_OK);
+    write_st(path, {second, up});
+    REQUIRE_EQ(snapshot.modules().size(), 1u);
+    lora::Delta old_delta;
+    REQUIRE_EQ(lora::module_delta(snapshot.modules()[0], 1.0, &old_delta, &why), RAD_OK);
+    CHECK(old_delta.A == first.v);
+    lora::AdapterFile current;
+    REQUIRE_EQ(current.open_snapshot(path, 1024 * 1024, &why), RAD_OK);
+    lora::Delta new_delta;
+    REQUIRE_EQ(lora::module_delta(current.modules()[0], 1.0, &new_delta, &why), RAD_OK);
+    CHECK(new_delta.A == second.v);
+    lora::AdapterFile bounded;
+    CHECK_EQ(bounded.open_snapshot(path, 8, &why), RAD_E_FULL);
+}
+
+
+TEST(a_snapshot_is_bound_to_the_expected_file_descriptor_revision) {
+    const std::string dir = new_dir("genlora-revision");
+    const std::string path = dir + "/one.safetensors", replacement = dir + "/replacement.safetensors";
+    const TW first = tensor("layer.lora_A.weight", "F32", {1, 8}, 1);
+    const TW second = tensor("layer.lora_A.weight", "F32", {1, 8}, 9);
+    const TW up = tensor("layer.lora_B.weight", "F32", {4, 1}, 2);
+    write_st(path, {first, up});
+    FileRevision expected;
+    REQUIRE_EQ(read_file_revision(path, &expected), RAD_OK);
+    lora::AdapterFile old;
+    std::string why;
+    REQUIRE_EQ(old.open_snapshot(path, 1024 * 1024, &why, &expected), RAD_OK);
+    CHECK(old.snapshot_revision() == expected);
+    write_st(replacement, {second, up});
+    FileRevision newer;
+    REQUIRE_EQ(read_file_revision(replacement, &newer), RAD_OK);
+    CHECK_EQ(expected.bytes, newer.bytes);
+    CHECK(expected != newer);
+    /* Deterministic descriptor mismatch: no rename timing is needed to exercise the ABA guard. */
+    lora::AdapterFile wrong;
+    CHECK_EQ(wrong.open_snapshot(replacement, 1024 * 1024, &why, &expected), RAD_E_STATE);
+    CHECK_EQ(wrong.size_bytes(), 0u);
+    CHECK(wrong.modules().empty());
+    REQUIRE_EQ(::rename(replacement.c_str(), path.c_str()), 0);
+    REQUIRE_EQ(read_file_revision(path, &newer), RAD_OK);
+    lora::AdapterFile current;
+    REQUIRE_EQ(current.open_snapshot(path, 1024 * 1024, &why, &newer), RAD_OK);
+    CHECK(current.snapshot_revision() == newer);
+    lora::Delta old_delta, new_delta;
+    REQUIRE_EQ(lora::module_delta(old.modules()[0], 1.0, &old_delta, &why), RAD_OK);
+    REQUIRE_EQ(lora::module_delta(current.modules()[0], 1.0, &new_delta, &why), RAD_OK);
+    CHECK(old_delta.A == first.v);
+    CHECK(new_delta.A == second.v);
+}
+
+TEST(adapter_snapshots_reject_non_regular_sources_without_blocking) {
+    const std::string pipe = new_dir("genlora-nonregular") + "/fifo";
+    REQUIRE_EQ(::mkfifo(pipe.c_str(), 0600), 0);
+    lora::AdapterFile file;
+    std::string why;
+    CHECK_EQ(file.open_snapshot(pipe, 1024 * 1024, &why), RAD_E_FORMAT);
+    CHECK_EQ(file.size_bytes(), 0u);
+}
+
+TEST(comfyui_bias_deltas_compose_at_the_requested_strengths) {
+    const std::string dir = new_dir("genlora_bias");
+    const std::string path = dir + "/bias.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 7)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(file->open(path, &err), RAD_OK);
+    REQUIRE_EQ(file->biases().size(), (size_t)1);
+    Program prog;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &prog, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(prog, {"*"}, 16, &sites, &err), RAD_OK);
+    lora::KeyMap keys(prog, sites);
+    std::map<std::string, std::vector<float>> biases;
+    std::vector<std::string> skipped;
+    REQUIRE_EQ(lora::compose_biases(keys, {{"one", file, 0.6}, {"two", file, 1.0}},
+                                    {module}, &skipped, &biases, &err), RAD_OK);
+    REQUIRE(biases.count(module));
+    REQUIRE_EQ(biases.at(module).size(), (size_t)kD);
+    for (int64_t i = 0; i < kD; ++i)
+        CHECK(std::abs(biases.at(module)[(size_t)i] - 1.6f * val(7, (size_t)i)) < 1e-6f);
+}
+
+TEST(a_missing_bias_operand_keeps_the_matrix_delta_and_reports_the_bias) {
+    const std::string path = new_dir("genlora_bias") + "/mixed.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    write_st(path, {tensor(module + ".lora_A.weight", "F32", {1, kQ}, 1),
+                    tensor(module + ".lora_B.weight", "F32", {kD, 1}, 2),
+                    tensor(module + ".diff_b", "F32", {kD}, 3)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(file->open(path, &err), RAD_OK);
+    Program program;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &program, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(program, {"*"}, 16, &sites, &err), RAD_OK);
+    lora::KeyMap keys(program, sites);
+    const std::vector<lora::Strength> adapters{{"mixed", file, 1.0}};
+    std::map<std::string, lora::Composite> matrices;
+    lora::ComposeReport report;
+    REQUIRE_EQ(lora::compose(keys, adapters, 16, &matrices, &report, &err), RAD_OK);
+    REQUIRE(matrices.count(module));
+    std::map<std::string, std::vector<float>> biases;
+    REQUIRE_EQ(lora::compose_biases(keys, adapters, {}, &report.skipped, &biases, &err), RAD_OK);
+    CHECK(biases.empty());
+    REQUIRE_EQ(report.skipped.size(), 1u);
+    CHECK(report.skipped.front().find(module) != std::string::npos);
+}
+
+TEST(snapshotted_adapter_composes_its_original_bias_after_replacement) {
+    const std::string dir = new_dir("genlora_bias");
+    const std::string path = dir + "/bias.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 7)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    CHECK_EQ(file->open_snapshot(path, 8, &err), RAD_E_FULL);
+    CHECK_EQ(file->size_bytes(), 0u);
+    REQUIRE_EQ(file->open_snapshot(path, 4096, &err), RAD_OK);
+    CHECK(file->size_bytes() > 0);
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 19)});
+    REQUIRE_EQ(file->biases().size(), (size_t)1);
+    Program prog;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &prog, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(prog, {"*"}, 16, &sites, &err), RAD_OK);
+    lora::KeyMap keys(prog, sites);
+    std::map<std::string, std::vector<float>> biases;
+    std::vector<std::string> skipped;
+    REQUIRE_EQ(lora::compose_biases(keys, {{"one", file, 0.6}, {"two", file, 1.0}},
+                                    {module}, &skipped, &biases, &err), RAD_OK);
+    REQUIRE(biases.count(module));
+    REQUIRE_EQ(biases.at(module).size(), (size_t)kD);
+    for (int64_t i = 0; i < kD; ++i)
+        CHECK(std::abs(biases.at(module)[(size_t)i] - 1.6f * val(7, (size_t)i)) < 1e-6f);
+
+    write_st(path, {tensor(module + ".lora_A.weight", "F32", {2, kD}, 1)});
+    CHECK_EQ(file->open_snapshot(path, 4096, &err), RAD_E_FORMAT);
+    CHECK_EQ(file->size_bytes(), 0u);
+    CHECK(file->modules().empty());
+    CHECK(file->biases().empty());
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD}, 19)});
+    REQUIRE_EQ(file->open_snapshot(path, 4096, &err), RAD_OK);
+    CHECK_EQ(file->biases().size(), 1u);
+}
+
+TEST(krea_projector_lora_resolves_and_composes_without_a_gemm_site) {
+    const std::string dir = new_dir("genlora_projector");
+    const std::string path = dir + "/projector.safetensors";
+    const std::string source = "diffusion_model.txtfusion.projector";
+    const std::string module = "transformer.text_fusion.projector";
+    write_st(path, {tensor(source + ".lora_down.weight", "F32", {1, 12}, 7),
+                    tensor(source + ".lora_up.weight", "F32", {1, 1}, 8)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(file->open(path, &err), RAD_OK);
+
+    Program prog;
+    prog.lora_roots.push_back({"transformer.", {"diffusion_model."}});
+    prog.lora_aliases.push_back({"transformer.", "txtfusion.projector", "text_fusion.projector"});
+    auto& projector = prog.lora_replacements[1];
+    projector.module = module;
+    projector.rows = 12;
+    projector.row_mixer = true;
+    lora::KeyMap keys(prog, {});
+    std::map<std::string, lora::Composite> deltas;
+    lora::ComposeReport report;
+    REQUIRE_EQ(lora::compose(keys, {{"turbo", file, 0.6}}, 128, &deltas, &report, &err), RAD_OK);
+    REQUIRE_EQ(report.modules, 1);
+    REQUIRE_EQ(report.exact, 1);
+    REQUIRE(deltas.count(module));
+    const auto& delta = deltas.at(module);
+    REQUIRE_EQ(delta.rows, 1);
+    REQUIRE_EQ(delta.K, 12);
+    REQUIRE_EQ(delta.r, 1);
+    for (size_t i = 0; i < 12; ++i)
+        CHECK(std::abs(delta.B[0] * delta.A[i] - 0.6f * val(8, 0) * val(7, i)) < 1e-6f);
+}
+
+
+TEST(mapped_bias_deltas_accept_subsets_and_preserve_source_order) {
+    const std::vector<float> delta = {1,2,3,4,5,6,7,8};
+    auto encode = [](std::initializer_list<float> values) {
+        std::vector<uint16_t> out;
+        for (float v : values) out.push_back(rad_f32_to_bf16(v));
+        return out;
+    };
+    std::string why;
+    auto subset = encode({10,20,30,40});
+    REQUIRE_EQ(lora::apply_bias_delta(delta, {0,1,2,3}, &subset, &why), RAD_OK);
+    CHECK(subset == encode({11,22,33,44}));
+    auto permuted = encode({10,20,30,40,50,60,70,80});
+    REQUIRE_EQ(lora::apply_bias_delta(delta, {4,5,0,1,6,7,2,3}, &permuted, &why), RAD_OK);
+    CHECK(permuted == encode({15,26,31,42,57,68,73,84}));
+    const auto base = encode({10,20,30,40});
+    for (const std::vector<int64_t>& rows : {std::vector<int64_t>{0,1,2,8},
+                                          std::vector<int64_t>{0,-1,2,3},
+                                          std::vector<int64_t>{0,1,2}}) {
+        auto invalid = base;
+        CHECK_EQ(lora::apply_bias_delta(delta, rows, &invalid, &why), RAD_E_SHAPE);
+        CHECK(invalid == base);
+    }
+    auto identity = base;
+    CHECK_EQ(lora::apply_bias_delta(delta, {}, &identity, &why), RAD_E_SHAPE);
+    CHECK(identity == base);
+    REQUIRE_EQ(lora::apply_bias_delta({1,2,3,4}, {}, &identity, &why), RAD_OK);
+    CHECK(identity == encode({11,22,33,44}));
+}
+
+TEST(composing_biases_still_rejects_a_known_full_source_size_mismatch) {
+    const std::string path = new_dir("genlora_wrong_bias_size") + "/bias.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    write_st(path, {tensor(module + ".diff_b", "F32", {kD + 1}, 7)});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string why;
+    REQUIRE_EQ(file->open(path, &why), RAD_OK);
+    Program program;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &program, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(program, {"*"}, 16, &sites, &why), RAD_OK);
+    const lora::KeyMap keys(program, sites);
+    REQUIRE_EQ(keys.rows(module), kD);
+    std::map<std::string, std::vector<float>> biases;
+    std::vector<std::string> skipped;
+    CHECK_EQ(lora::compose_biases(keys, {{"wrong", file, 1.0}}, {module},
+                                  &skipped, &biases, &why), RAD_E_SHAPE);
 }
 
 RAD_TEST_MAIN()

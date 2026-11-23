@@ -1681,6 +1681,128 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
     }
 }
 
+// The column form at an n_embd that is not a multiple of 2048, such as Qwen3.8-27B's 5120. There a
+// thread of logits_gemm_kernel holds KLO + 1 chunks while 32q + l < QB * 32, else KLO
+// (KLO = K / 2048, QB = (K % 2048) / 256): at 5120 waves 0-3 of its block sum three chunks and
+// waves 4-7 two.
+//
+// BYTE-IDENTICAL to logits_gemm_kernel, as logits_gemm_cols_kernel is: lane l runs thread 32q + l
+// in turn for q = 0..7, with that thread's own chunk count, so every (row, column) keeps the block
+// kernel's order -- each chunk an eight-term sum from 0, the thread's chunks added from 0 in k
+// order, the lane butterfly per q, the wave sums added from 0 in q order. Three chunks for four
+// columns and eight rows do not fit the registers (256 VGPRs, 160 spilled), so a q step works XH
+// columns by RH rows at a time; which (row, column) pair is visited first changes nothing in any
+// pair's sum.
+//
+// At 5120 the three-chunk steps take four columns by four rows and the two-chunk steps four by
+// eight (256 VGPRs, no spills). Of five such shapes that compile without spills it was the fastest
+// on an R9700 at Qwen3.8-27B's TP2 slice (124160 x 5120, r4d_selftest --perflogits), in us,
+// against logits_gemm_kernel: 8 rows 2157.0 / 4288.6, 16 rows 3888.7 / 7997.9, 1 row 2010.1 /
+// 2005.5.
+constexpr uint32_t kLgSpan = kThreads * kLgVec;   // 2048: the k stride of one thread's chunks
+
+template <uint32_t KI, uint32_t K, uint32_t C, uint32_t XH, uint32_t RH>
+__device__ __forceinline__ void logits_cols_q(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, uint32_t q, uint32_t lane,
+    uint32_t j0, uint32_t N, uint32_t r0, uint32_t nr, uint32_t a_ld, float (&v)[C][kLgRows]) {
+    constexpr uint32_t V = KI * kLgVec;
+    const uint32_t k0 = (q * kWave + lane) * kLgVec;
+#pragma unroll
+    for (uint32_t xb = 0; xb < C; xb += XH) {
+        uint4 wv[XH][KI];
+#pragma unroll
+        for (uint32_t x = 0; x < XH; ++x) {
+            const uint16_t* wr = w + (size_t)(j0 + xb + x < N ? j0 + xb + x : N - 1) * K + k0;
+#pragma unroll
+            for (uint32_t t = 0; t < KI; ++t) wv[x][t] = *(const uint4*)(wr + t * kLgSpan);
+        }
+        float wf[XH][V];
+#pragma unroll
+        for (uint32_t x = 0; x < XH; ++x)
+#pragma unroll
+            for (uint32_t t = 0; t < KI; ++t) {
+                const uint32_t ww[4] = { wv[x][t].x, wv[x][t].y, wv[x][t].z, wv[x][t].w };
+#pragma unroll
+                for (uint32_t p = 0; p < kLgVec; ++p)
+                    wf[x][t * kLgVec + p] = bf16_to_f32((uint16_t)(ww[p / 2] >> (16 * (p & 1))));
+            }
+#pragma unroll
+        for (uint32_t rb = 0; rb < kLgRows; rb += RH) {
+            if (rb >= nr) break;
+            uint4 av[RH][KI];
+#pragma unroll
+            for (uint32_t i = 0; i < RH; ++i) {
+                if (rb + i >= nr) break;
+                const uint16_t* ar = a + (size_t)(r0 + rb + i) * a_ld + k0;
+#pragma unroll
+                for (uint32_t t = 0; t < KI; ++t) av[i][t] = *(const uint4*)(ar + t * kLgSpan);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < RH; ++i) {
+                if (rb + i >= nr) break;
+                float af[V];
+#pragma unroll
+                for (uint32_t t = 0; t < KI; ++t) {
+                    const uint32_t aw[4] = { av[i][t].x, av[i][t].y, av[i][t].z, av[i][t].w };
+#pragma unroll
+                    for (uint32_t p = 0; p < kLgVec; ++p)
+                        af[t * kLgVec + p] = bf16_to_f32((uint16_t)(aw[p / 2] >> (16 * (p & 1))));
+                }
+#pragma unroll
+                for (uint32_t x = 0; x < XH; ++x) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (uint32_t t = 0; t < KI; ++t) {
+                        float s = 0.0f;
+#pragma unroll
+                        for (uint32_t p = 0; p < kLgVec; ++p)
+                            s += af[t * kLgVec + p] * wf[x][t * kLgVec + p];
+                        acc += s;
+                    }
+                    v[xb + x][rb + i] += r4d_wave_sum(acc);
+                }
+            }
+        }
+    }
+}
+
+// C columns a wave; the steps whose threads hold KLO + 1 chunks work XH_HI columns x RH_HI rows at
+// a time, the others XH_LO x RH_LO.
+template <uint32_t K, uint32_t C, uint32_t XH_HI, uint32_t RH_HI, uint32_t XH_LO, uint32_t RH_LO>
+__global__ __launch_bounds__(kThreads) void logits_gemm_cols_k_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    static_assert(K % (kWave * kLgVec) == 0, "a wave's 32 lanes must hold the same chunk count");
+    static_assert(C % XH_HI == 0 && C % XH_LO == 0 && kLgRows % RH_HI == 0 && kLgRows % RH_LO == 0,
+                  "a step's columns and rows must divide the wave's");
+    constexpr uint32_t KLO = K / kLgSpan, QB = (K % kLgSpan) / (kWave * kLgVec);
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const uint32_t j0 = (blockIdx.x * kWaves + wave) * C;
+    if (j0 >= N) return;
+    for (uint32_t r0 = 0; r0 < M; r0 += kLgRows) {
+        const uint32_t nr = (M - r0) < kLgRows ? (M - r0) : kLgRows;
+        float v[C][kLgRows];
+#pragma unroll
+        for (uint32_t x = 0; x < C; ++x)
+#pragma unroll
+            for (uint32_t i = 0; i < kLgRows; ++i) v[x][i] = 0.0f;
+#pragma unroll 1
+        for (uint32_t q = 0; q < QB; ++q)
+            logits_cols_q<KLO + 1, K, C, XH_HI, RH_HI>(a, w, q, lane, j0, N, r0, nr, a_ld, v);
+#pragma unroll 1
+        for (uint32_t q = QB; q < kWaves; ++q)
+            logits_cols_q<KLO, K, C, XH_LO, RH_LO>(a, w, q, lane, j0, N, r0, nr, a_ld, v);
+#pragma unroll
+        for (uint32_t x = 0; x < C; ++x) {
+            float out = 0.0f;
+#pragma unroll
+            for (uint32_t i = 0; i < kLgRows; ++i)
+                if (i == lane) out = v[x][i];
+            if (lane < nr && j0 + x < N) c[(size_t)(r0 + lane) * c_ld + j0 + x] = out;
+        }
+    }
+}
+
 }  // namespace
 
 //   a  [M][K]       bf16, `a_ld` elements a row (0 = K)
@@ -1699,18 +1821,29 @@ extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// The column form; n_embd must be 4096 and an activation row whole 16 bytes.
+// The column form; n_embd must be 4096 or 5120 and an activation row whole 16 bytes.
 extern "C" int r4d_logits_gemm_bf16_cols(long a, long w, long c, int M, int K, int N, int a_ld,
                                          int c_ld, long stream) {
     if (!a || !w || !c) return -1;
     if (M <= 0 || N <= 0) return -2;
     if (!a_ld) a_ld = K;
     if (!c_ld) c_ld = N;
-    if (K != (int)(kLgKi * kThreads * kLgVec) || a_ld % (int)kLgVec) return -3;
+    if (a_ld % (int)kLgVec) return -3;
     const uint32_t per = kWaves * kLgCols;
-    hipLaunchKernelGGL(logits_gemm_cols_kernel, dim3(((uint32_t)N + per - 1) / per), dim3(kThreads),
-                       0, (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
-                       (uint32_t)M, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    const dim3 grid(((uint32_t)N + per - 1) / per);
+    if (K == (int)(kLgKi * kThreads * kLgVec)) {
+        hipLaunchKernelGGL(logits_gemm_cols_kernel, grid, dim3(kThreads), 0, (hipStream_t)stream,
+                           (const uint16_t*)a, (const uint16_t*)w, (float*)c, (uint32_t)M,
+                           (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    } else if (K == 5120) {
+        hipLaunchKernelGGL((logits_gemm_cols_k_kernel<5120, kLgCols, kLgCols, kLgRows / 2, kLgCols,
+                                                       kLgRows>),
+                           grid, dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)a,
+                           (const uint16_t*)w, (float*)c, (uint32_t)M, (uint32_t)N,
+                           (uint32_t)a_ld, (uint32_t)c_ld);
+    } else {
+        return -3;
+    }
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -2733,7 +2866,7 @@ extern "C" int r4d_rad_logits_gemm_cols(const RadArgs* a, RadStream s) {
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
     const long long n_vocab = r4d_geti_or(a, "n_vocab", r4d_dim(w, 0));
     const long long n_embd  = r4d_geti_or(a, "n_embd", r4d_dim(w, 1));
-    if (n_vocab <= 0 || n_embd != 4096) return R4D_NO(RAD_E_SHAPE);
+    if (n_vocab <= 0 || (n_embd != 4096 && n_embd != 5120)) return R4D_NO(RAD_E_SHAPE);
     if (w->rank != 2 || w->shape[0] != n_vocab || w->shape[1] != n_embd)
         return R4D_NO(RAD_E_SHAPE);
     long long M = 0, My = 0;

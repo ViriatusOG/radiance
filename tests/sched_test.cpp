@@ -1964,6 +1964,51 @@ TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
     CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
+/* The encoder's counters move while a pass runs, not only when it ends: take_encodes publishes the
+ * pass's start, both copies add the time since it, the item being encoded still counts as
+ * pending, and the end publishes a total no smaller than what a reader saw during the pass. */
+TEST(an_encoder_pass_reads_busy_while_it_runs) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    std::shared_ptr<mm::Item> ia;
+    f.submit_unencoded(160, 8, &ia);
+    f.sch.step();                                 /* asks for the item */
+    CHECK_EQ(f.sch.metrics().encode_pending, 1);
+    CHECK(f.sch.encodes_pending());
+
+    std::vector<std::shared_ptr<mm::Item>> items;
+    f.sch.take_encodes(&items);
+    REQUIRE_EQ(items.size(), 1u);
+    CHECK(!f.sch.encodes_pending());
+    const SchedMetrics o1 = f.sch.observed_metrics();    /* published without a step */
+    CHECK(o1.encode_started_ns > 0);
+    CHECK_EQ(o1.encode_pending, 1);
+    CHECK_EQ(o1.encode_items, 0);
+    usleep(5000);
+    const SchedMetrics o2 = f.sch.observed_metrics();
+    CHECK(o2.encode_ns >= 5000000);               /* the 5 ms so far, with no publication since */
+    CHECK(f.sch.metrics().encode_ns >= o2.encode_ns);
+
+    ia->encoded = true;
+    f.sch.encodes_done(1, 400);
+    const SchedMetrics o3 = f.sch.observed_metrics();
+    CHECK_EQ(o3.encode_started_ns, 0);
+    CHECK_EQ(o3.encode_pending, 0);
+    CHECK_EQ(o3.encode_items, 1);
+    CHECK_EQ(o3.encode_patches, 400);
+    CHECK(o3.encode_ns >= o2.encode_ns);
+    usleep(2000);
+    CHECK_EQ(f.sch.observed_metrics().encode_ns, o3.encode_ns);   /* flat once it has ended */
+    CHECK_EQ(f.sch.metrics().encode_ns, o3.encode_ns);
+
+    /* An end without a start (take_encodes found nothing) adds nothing. */
+    f.sch.take_encodes(&items);
+    CHECK(items.empty());
+    f.sch.encodes_done(0, 0);
+    CHECK_EQ(f.sch.metrics().encode_ns, o3.encode_ns);
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */

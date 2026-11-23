@@ -598,7 +598,7 @@ __global__ __launch_bounds__(kT) void chan_affine_kernel(
 // A wave a pixel: the sum of squares over its channels, then the three roundings.
 __global__ __launch_bounds__(kT) void l2norm_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
-    int64_t rows, int n, float sq, int silu) {
+    int64_t rows, int n, float sq, bool silu, bool round_length) {
     const int64_t r = (int64_t)blockIdx.x * (kT / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (r >= rows) return;
@@ -610,7 +610,10 @@ __global__ __launch_bounds__(kT) void l2norm_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) ss += f[j] * f[j];
     }
-    const float nrm = fmaxf(sqrtf(halo_wave_sum(ss)), 1e-12f);
+    const float length = sqrtf(halo_wave_sum(ss));
+    const float clamped = round_length ? (length < 1e-12f ? 1e-12f : length)
+                                       : fmaxf(length, 1e-12f);
+    const float nrm = round_length ? bfr(clamped) : clamped;
     uint16_t* yr = y + (size_t)r * n;
     for (int c = lane * 8; c < n; c += 256) {
         float f[8], gg[8];
@@ -1415,10 +1418,11 @@ extern "C" int halo_rad_l2norm_chan(const RadArgs* a, RadStream s) {
         return HALO_NO(RAD_E_STRIDE);
     const long long rows = halo_numel(y) / n;
     if (rows <= 0 || halo_numel(x) < rows * n) return HALO_NO(RAD_E_SHAPE);
+    const bool round_length = halo_geti_or(a, "round_length", 0) != 0;
     hipLaunchKernelGGL(l2norm_kernel, dim3((unsigned)((rows + kT / 32 - 1) / (kT / 32))), dim3(kT),
                        0, (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)g->data,
                        (uint16_t*)y->data, (int64_t)rows, (int)n,
-                       (float)std::sqrt((double)n), silu);
+                       (float)std::sqrt((double)n), silu, round_length);
     return st_of(hipGetLastError());
 }
 

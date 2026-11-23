@@ -26,6 +26,7 @@
 #define RAD_BLOCK_ATTN_GATED_H
 
 #include "rad_arch.h"
+#include "rad_norm_bf16.h"
 
 namespace rad {
 namespace arch {
@@ -69,15 +70,28 @@ struct AttnGatedBF16 {
     rad_op op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op op_attn = 0, op_kv_store = 0, op_sigmoid = 0, op_gate = 0;
     rad_op op_o = 0, op_ar = 0, op_add = 0;
+    /* The fold (rad_norm_bf16.h): the norm may take the previous block's delta and all-reduce,
+     * and this block may leave its own to the next block's norm (`ar_out`, NormBF16::takes_ar). */
+    NormBF16 nq{};
+    bool ar_out = false;
+    /* Set by the architecture after declare: a `prefetch` of the next GEMM's leading weight bytes
+     * (decl_prefetch, rad_arch.h), issued after o and before this block's own all-reduce where it
+     * issues one, so it is beside the reduction whether this block or the next norm runs it
+     * (prefetch_beside). 0 where none is declared. */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
-                 int64_t rotary_dim, const Wire& wire, const Src& src);
+                 int64_t rotary_dim, const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
+                 bool ar_in = false, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                   rad_kvgroup group, int64_t rotary_dim, const Wire& wire,
-                                  const Src& src) {
+                                  const Src& src, bool fold, bool add_out, bool ar_in,
+                                  bool ar_out_) {
+    ar_out = ar_out_;
     g = geom; w = wire; layer = l; kv = group; n_rot = rotary_dim;
 
     const int64_t q_dim   = g.q_dim();
@@ -118,41 +132,40 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
 
     w_norm   = decl_w(b, nm.f("blk.%d.attn_norm.weight", l),   RAD_F32,  {g.n_embd},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_qg     = decl_w(b, nm.f("blk.%d.attn_qg.weight", l),     RAD_BF16, {qg_dim, g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
-    w_k      = decl_w(b, nm.f("blk.%d.attn_k.weight", l),      RAD_BF16, {kv_dim, g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
-    w_v      = decl_w(b, nm.f("blk.%d.attn_v.weight", l),      RAD_BF16, {kv_dim, g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
+    const LinearBF16 qg = decl_linear_bf16(b, g, nm.f("blk.%d.attn_qg.weight", l),
+                                           {qg_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    const LinearBF16 kp = decl_linear_bf16(b, g, nm.f("blk.%d.attn_k.weight", l),
+                                           {kv_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    const LinearBF16 vp = decl_linear_bf16(b, g, nm.f("blk.%d.attn_v.weight", l),
+                                           {kv_dim, g.n_embd}, RAD_SHARD_ROW, grp_layer(l));
+    w_qg = qg.w; w_k = kp.w; w_v = vp.w;
     /* One gain vector shared by every head, so replicated across ranks. */
     w_q_norm = decl_w(b, nm.f("blk.%d.attn_q_norm.weight", l), RAD_F32,  {g.head_dim},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     w_k_norm = decl_w(b, nm.f("blk.%d.attn_k_norm.weight", l), RAD_F32,  {g.head_dim},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_o      = decl_w(b, nm.f("blk.%d.attn_output.weight", l), RAD_BF16, {g.n_embd, q_dim},
-                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
+    const LinearBF16 out = decl_linear_bf16(b, g, nm.f("blk.%d.attn_output.weight", l),
+                                            {g.n_embd, q_dim}, RAD_SHARD_COL, grp_layer(l));
+    w_o = out.w;
 
     /* ---- ops, in run order except attn_paged (see there). Each states its read and write sets,
      * from which the buffer planner computes liveness. */
-    op_norm = rw(b, RAD_OP(b, "rmsnorm",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
-                     RAD_WEIGHTS(w_norm)),
-                 {w.x}, {w.h});
+    RAD_ARCH_TRY(nq.declare(b, g, w_norm, w.x, w.h, fold, ar_in));
+    op_norm = nq.op_norm;
 
     op_qg = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", qg_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", qg.dtype)),
                    RAD_WEIGHTS(w_qg)),
                {w.h}, {w.qg});
     op_kp = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", kv_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", kp.dtype)),
                    RAD_WEIGHTS(w_k)),
                {w.h}, {w.k});
     op_vp = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", kv_dim),
-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("K", g.n_embd), RAD_STR("dtype", vp.dtype)),
                    RAD_WEIGHTS(w_v)),
                {w.h}, {w.v});
 
@@ -234,7 +247,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
 
     op_o = rw(b, RAD_OP(b, "gemm_nt",
                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
-                             RAD_INT("K", q_dim), RAD_STR("dtype", g.dtype)),
+                             RAD_INT("K", q_dim), RAD_STR("dtype", out.dtype)),
                   RAD_WEIGHTS(w_o)),
               {w.attn}, {w.h});
 
@@ -251,11 +264,12 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
                        RAD_NOWEIGHTS),
                    {w.h}, {w.h});
 
-    op_add = rw(b, RAD_OP(b, "add",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.x, w.h}, {w.x});
+    if (add_out)
+        op_add = rw(b, RAD_OP(b, "add",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS),
+                    {w.x, w.h}, {w.x});
 
     return RAD_OK;
 }
@@ -270,7 +284,7 @@ inline void AttnGatedBF16::step(RadCtx* c, const RadBatch* batch) const {
 
     const int64_t T = batch->n_tok;
 
-    RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+    nq.step(c, T);
     RAD_ISSUE(c, op_qg,   brows(w.h, T), RAD_W(w_qg),   brows(w.qg, T));
     RAD_ISSUE(c, op_kp,   brows(w.h, T), RAD_W(w_k),    brows(w.k, T));
     RAD_ISSUE(c, op_vp,   brows(w.h, T), RAD_W(w_v),    brows(w.v, T));
@@ -303,8 +317,11 @@ inline void AttnGatedBF16::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_gate, brows(w.attn, T), brows(w.gate, T), brows(w.attn, T));
 
     RAD_ISSUE(c, op_o, brows(w.attn, T), RAD_W(w_o), brows(w.h, T));
-    if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
-    RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));
+    /* Decode steps only: a prompt's rows never take the reads (rad_arch.h, kPrefetchRows). */
+    prefetch_beside(c, op_pf, pf_w, batch->phase == RAD_PHASE_DECODE ? T : INT64_MAX);
+    if (op_ar && !(ar_out && ar_wire_is_exact(g, T)))
+        RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h, T), brows(w.x, T));
 }
 
 }  /* namespace arch */

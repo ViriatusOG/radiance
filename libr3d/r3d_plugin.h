@@ -186,8 +186,11 @@ int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s);
 int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s);
 
 /* --- r3d_ple_conv.hip: PLE's dilated depthwise convolution, its silu and the residual add that
- * finishes the layer: one thread a channel, the conv window rewritten in the same launch. */
+ * finishes the layer: one thread a channel, the conv window rewritten in the same launch.
+ * causal_conv1d is the same kernel with no activation, no residual and dilation one (LFM2's and
+ * LFM3's short convolution). */
 int r3d_rad_ple_conv(const RadArgs* a, RadStream s);
+int r3d_rad_causal_conv1d(const RadArgs* a, RadStream s);
 
 /* --- r3dh_gdn_recurrent_update.hip (libhalo's): the gated-delta-net recurrent state update at
  * decode against the paged state cache, in either state form (per_candidate or anchor). */
@@ -396,6 +399,7 @@ int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s);
 int r3d_shape_gemm_nt_q_w4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gemm_nt_q_i8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* The relayout writers for the three layout hooks, each delegating to rad_planes_relayout. The
  * loader converts a quantised weight into the joined operand the plan names, and only the row that
@@ -425,6 +429,7 @@ int r3d_rad_gemm_nt_bf16_tiled_alu(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_bf16_tiled_wmma(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_bf16_m64_wmma (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m64   (const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_i8a8       (const RadArgs* a, RadStream s);
 int r3d_shape_logits_gemm_bf16  (const RadParam*, int, int, RadOpdDesc*);
 
 /* --- r3d_model_bf16.hip: the fused MLP activation and the fused norm-quantiser --- */

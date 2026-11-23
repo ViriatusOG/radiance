@@ -28,6 +28,7 @@
  * shortcut; see kv_store for where the shortcut is wrong. */
 #include "ref_gemm.h"
 #include "ref_ops.h"
+#include "rad_umt5_attention.h"
 
 #include <algorithm>
 #include <cstring>
@@ -1354,6 +1355,59 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
             y[half + i] = x0 * s + x1 * c;
         }
         for (int64_t t = 0; t < n; ++t) stt(out, offlin(out, orow * n + t), y[t]);
+    }
+    return RAD_OK;
+}
+
+int ref_attn_umt5(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2];
+    const RadTensor *cu = &a->t[3], *bias = &a->t[4], *out = &a->t[5];
+    const RadTensor* matrices[] = { q, k, v, out };
+    if (cu->rank != 1 || cu->shape[0] < 2) return RAD_E_SHAPE;
+    const int64_t heads = p_int(a, "heads", 0), segments = cu->shape[0] - 1;
+    int64_t rows = 0;
+    const int status = rad_umt5::validate(matrices, cu, bias, heads, segments, rows);
+    if (status < 0) return status;
+    if (cu_at(cu, 0) != 0 || cu_at(cu, segments) != rows) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < segments; ++s) {
+        const int64_t length = static_cast<int64_t>(cu_at(cu, s + 1)) - cu_at(cu, s);
+        if (length < 1 || length > rad_umt5::max_tokens) return RAD_E_SHAPE;
+    }
+    auto bf_round = [](float x) { return bf16_to_f32(f32_to_bf16(x)); };
+    constexpr int64_t hd = rad_umt5::head_width;
+    REF_PAR_FOR(rows * heads * hd)
+    for (int64_t h = 0; h < heads; ++h) {
+        for (int64_t s = 0; s < segments; ++s) {
+            const int64_t begin = cu_at(cu, s), end = cu_at(cu, s + 1);
+            for (int64_t i = begin; i < end; ++i) {
+                float scores[rad_umt5::max_tokens];
+                float max_score = -INFINITY;
+                const int64_t qb = i * q->stride[0] + h * hd;
+                for (int64_t j = begin; j < end; ++j) {
+                    const int64_t kb = j * k->stride[0] + h * hd;
+                    float dot = 0.0f;
+                    for (int64_t c = 0; c < hd; ++c) dot += ldt(q, qb + c) * ldt(k, kb + c);
+                    const int r = rad_umt5::bucket(static_cast<int>(j - i));
+                    const float logit = bf_round(bf_round(dot) + ldt(bias, r * bias->stride[0] + h));
+                    scores[j - begin] = logit;
+                    max_score = std::max(max_score, logit);
+                }
+                float sum = 0.0f;
+                for (int64_t j = 0; j < end - begin; ++j) {
+                    scores[j] = std::exp(scores[j] - max_score);
+                    sum += scores[j];
+                }
+                float values[hd] = {};
+                for (int64_t j = begin; j < end; ++j) {
+                    const float prob = bf_round(scores[j - begin] / sum);
+                    const int64_t vb = j * v->stride[0] + h * hd;
+                    for (int64_t c = 0; c < hd; ++c) values[c] += prob * ldt(v, vb + c);
+                }
+                const int64_t ob = i * out->stride[0] + h * hd;
+                for (int64_t c = 0; c < hd; ++c) stt(out, ob + c, values[c]);
+            }
+        }
     }
     return RAD_OK;
 }

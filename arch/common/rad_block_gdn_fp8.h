@@ -372,9 +372,9 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     }
 
     RAD_ARCH_TRY(q_o.declare(b, g, w.o, v_dim));
-    /* qwen4exp_lora: linear_attn.out_proj is a LoRA-targeted module kind; see the gated attn
-     * block's o.declare (LinearFP8::plain_bf16_view). */
-    out.plain_bf16_view = true;
+    /* qwen4exp_lora: linear_attn.out_proj is a LoRA module kind. The plain bf16 view is
+     * taken only when a runtime adapter targets this source (see the gated attn block). */
+    out.plain_bf16_view = s.out && rad_lora_source_targeted(b, s.out);
     RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.ssm_out", l), g.n_embd, v_dim,
                              RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x, 0, {},
                              cfg.uneven() ? cfg.v_first * cfg.head_v : 0,

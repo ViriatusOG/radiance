@@ -44,6 +44,7 @@
 namespace rad {
 
 class TierExec {
+    friend struct EngineMemoryTestAccess;
 public:
     ~TierExec();
     /* `groups` is PrefixCache::entry_groups(): the group of each block an entry holds, in the
@@ -103,7 +104,7 @@ public:
     int  wait_copy();
     /* Waits until everything this rank enqueued has landed. Used before a block is given back on a
      * failure path, where a late in-flight copy would overwrite its next owner's writes. */
-    void quiesce();
+    int quiesce();
 
     /* ---------------- restore ----------------
      *
@@ -114,7 +115,7 @@ public:
     int  issue_restore(std::vector<TierJob>& jobs, RadStream compute, std::vector<char>* ok);
     /* Leader only. Gives back a failed restore's blocks and reports every job to the policy.
      * `now_ns` is the pass time; a promotion counts as a use. */
-    void report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok, uint64_t now_ns);
+    int report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok, uint64_t now_ns);
 
     /* A lookup hit off-device: the job that would bring it back, or false when the entry is not
      * off-device or already has work outstanding. */

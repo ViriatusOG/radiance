@@ -823,6 +823,30 @@ struct Geom {
     int64_t gqa()     const { return n_head_kv ? n_head / n_head_kv : 0; }
 };
 
+/* A linear of the bf16 blocks (rad_block_mlp.h, rad_block_attn_gated.h, rad_block_gdn.h): its
+ * weight, declared at what the model holds, and the `gemm_nt` dtype that reads it. A `bf16x12`
+ * weight, libquant's lossless packing of a bf16 one in 12.25 bits a value (docs/TOOLS.md), is
+ * declared over every plane at its codes' dtype and read at "bf16x12" (docs/OPS.md), whose rows
+ * give bf16's bytes. Any other weight is declared bf16 and read at `g.dtype`, so a container with
+ * no bf16x12 weight declares the graph it did before. */
+struct LinearBF16 {
+    rad_weight  w     = 0;
+    const char* dtype = nullptr;   /* gemm_nt's */
+};
+
+inline LinearBF16 decl_linear_bf16(RadBuilder* b, const Geom& g, const char* name,
+                                   std::initializer_list<int64_t> shape, int shard,
+                                   RadWeightGroup group,
+                                   std::initializer_list<int64_t> row_parts = {}) {
+    RadEncoding e{};
+    const bool x12 = weight_enc(b, name, &e) && rad_enc_is(&e, "bf16x12") && e.n_planes > 0;
+    LinearBF16 l;
+    l.w     = decl_w(b, name, x12 ? e.plane[0].dtype : (uint32_t)RAD_BF16, shape,
+                     RAD_ACCESS_PER_TOKEN, shard, group, 0, row_parts);
+    l.dtype = x12 ? "bf16x12" : g.dtype;
+    return l;
+}
+
 /* The KV cache dtype: RadBuildCtx::kv_dtype (--kv-cache-dtype), or `dflt` when it is
  * RAD_DT_INVALID (not given). Every architecture in this tree passes RAD_BF16 as the default. */
 static inline uint32_t rad_kv_cache_dtype(const RadBuildCtx* c, uint32_t dflt) {

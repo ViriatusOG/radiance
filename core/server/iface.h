@@ -170,6 +170,12 @@ struct SchedMetrics {
     /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+    /* The encoder: cumulative items, patches and nanoseconds, and the items waiting or being
+     * encoded now (rad::SchedMetrics::encode_items). */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
 };
 
 
@@ -825,9 +831,11 @@ struct VideoGenInfo {
     int64_t max_enc_frames = 0, max_enc_side = 0, max_enc_samples = 0, enc_ratio = 0;
     /* `steps` counts model evaluations rather than sigma grid points (RadVideoGenDecl form 1). */
     bool    step_evals = false;
+    bool    unipc_only = false;
     /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the
      * negative prompt a guided request gets when it names none. */
     bool    guidance = false;
+    bool    guidance_cfg_only = false;
     double  guidance_default[8] = {};
     std::string default_negative;
     /* Image to video: a first frame is taken, after an H.264 round trip at image_crf when > 0. */

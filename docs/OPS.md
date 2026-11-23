@@ -797,6 +797,12 @@ a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, 
 every quantised format and an architecture plugin that changes quantisation changes one string, not
 its op names.
 
+`gemm_nt` at `dtype` `bf16x12` takes as `b` every plane of a `bf16x12` weight, libquant's lossless
+packing of a bf16 weight in 12.25 bits a value (`docs/TOOLS.md`), and its `y` is `bf16`'s over the
+decoded weight. libr4d's rows rebuild each value bit for bit (the prefill row into its scratch, for
+`gemm_bf16_nt_tiled`) and run the bf16 rows' arithmetic, so at the same split their bytes are
+`gemm_bf16_nt_m64`'s. No host library serves it.
+
 `gemm_nt_q` takes the activation scales as an operand because the quantiser produced them; a kernel
 that folds dequantisation into its epilogue still receives them. Being a quantiser's amax over its
 range, an `a_scale` entry is never negative, and a kernel may treat a block whose scale is zero as
@@ -2620,6 +2626,7 @@ device code.
 | op | params | operands |
 |---|---|---|
 | `ar_rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `ar_rmsnorm` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `y` |
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
@@ -2635,6 +2642,9 @@ the message and the input, and the reduced sum lands in it.
 `x` and the residual are the same bytes, and the codes are int8 for a weight at `i8a8h`.
 `ar_rmsnorm_quant_i8g` is `ar_rmsnorm_quant_i8` with `rmsnorm_quant_i8g`'s quantiser, at two
 ranks, with no `sp`; `out_bf16` may be `x`'s buffer, which then ends holding the norm output.
+`ar_rmsnorm` is `ar_rmsnorm_quant_fp8` with no quantiser, for blocks whose linears read the bf16
+norm output: `x` and the residual are the same bytes, `y` is `out_bf16`, and the whole is
+`all_reduce` + `add` + `rmsnorm`. Exact wire only, so it has no `wire`.
 
 `sp` on `ar_rmsnorm_quant_i8` (0 when absent) lets a row split the all-reduce around the
 junction: reduce-scatter, the junction on the rows this rank owns (`M` split evenly over the

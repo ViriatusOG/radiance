@@ -642,7 +642,7 @@ __global__ __launch_bounds__(THR) void fill_kernel(void* __restrict__ y, uint32_
  * rope_freqs, rope_head, ref_rope -- in place on the fused qkv row, q heads
  * then k heads then v untouched:
  *
- *   inv[i] = 1 / pow(theta, (2i)/rot)                     the ladder, den == rot
+ *   inv[i] = 1 / pow(theta, (2i)/den)                     the ladder; 0 for i >= nfreq
  *   ang    = (pos[m] / scale) * inv[i]
  *   c, s   = cos(ang), sin(ang)
  *   i0, i1 = (i, i + rot/2) neox, (2i, 2i + 1) gptj
@@ -653,13 +653,19 @@ __global__ __launch_bounds__(THR) void fill_kernel(void* __restrict__ y, uint32_
  * because the shims refuse YaRN).
  *
  * The frequency is recomputed per pair rather than built in a plane: one pow per pair per head,
- * off the critical path, with no scratch. nfreq == rot/2 always, so no pair lies past the ladder
- * (ref zeroes inv[] past nfreq only for the proportional ladder, which libr3d refuses).
+ * off the critical path, with no scratch.
+ *
+ * The ladder (ref_rope's rope_ladder): `rotary` measures it in rot, so den == rot and
+ * nfreq == rot/2, and no pair lies past it. `head` is HF's proportional rotary (LFM3's full
+ * layers, rotary_dim 64 of 128): the launcher widens a NeoX rot to head_dim, so pair i is
+ * (i, i + head_dim/2), measures the ladder in head_dim, and keeps nfreq at rotary_dim/2; a pair
+ * past nfreq turns by 0 (cos 1, sin 0) and is stored back exactly, as ref zeroes inv[] there.
  */
 template <int THR, int GPTJ>
 __global__ __launch_bounds__(THR) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t head_dim,
-    uint32_t n_rope_heads, uint32_t rot, float theta, float scale, uint32_t row_pitch) {
+    uint32_t n_rope_heads, uint32_t rot, uint32_t den, uint32_t nfreq, float theta, float scale,
+    uint32_t row_pitch) {
     const uint32_t m = blockIdx.x;
     const float div = scale != 0.0f ? scale : 1.0f;
     const float p = (float)ldg_i32(pos + m) / div;
@@ -673,7 +679,8 @@ __global__ __launch_bounds__(THR) void rope_kernel(
          * narrowed once. powf would put the reciprocal a ULP off, and at position 262144 a ULP of a
          * frequency is about 0.01 rad of rotation, so the ladder is computed in double. The angle
          * stays f32, as in ref. */
-        const float inv = 1.0f / (float)std::pow((double)theta, (double)((float)(2 * i) / (float)rot));
+        const float inv = i >= nfreq ? 0.0f
+            : 1.0f / (float)std::pow((double)theta, (double)((float)(2 * i) / (float)den));
         float s, c;
         sincosf(p * inv, &s, &c);
         const uint32_t i0 = h * head_dim + (GPTJ ? 2u * i : i);
@@ -1247,7 +1254,7 @@ extern "C" int r3d_fill(long y, int M, int n, int y_ld, int dt, float v, long st
 }
 
 extern "C" int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head, int n_head_kv,
-                             float theta, float scale, int mode, int rot, int qkv_ld,
+                             float theta, float scale, int mode, int rot, int den, int qkv_ld,
                              long stream) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_head <= 0 || n_head_kv < 0) return -2;
@@ -1256,15 +1263,21 @@ extern "C" int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head
     if (mode != R3D_ROPE_NEOX && mode != R3D_ROPE_GPTJ) return -3;
     if (head_dim & 1) return -3;                       // the two halves of a head, evenly split
     if (!(theta > 0.0f) || !std::isfinite(theta)) return -2;
+    if (den <= 0) den = rot;
+    if (den != rot && den != head_dim) return -3;      // the two ladders ref_rope knows
     if (!qkv_ld) qkv_ld = (n_head + 2 * n_head_kv) * head_dim;
     if (qkv_ld < (n_head + 2 * n_head_kv) * head_dim) return -3;
+    /* The proportional ladder spans the whole head under NeoX pairing, exactly where ref_rope
+     * widens it; the frequencies past rotary_dim/2 stay zero. */
+    const int nfreq = rot / 2;
+    if (den == head_dim && rot < head_dim && mode == R3D_ROPE_NEOX) rot = head_dim;
     /* One wave covers a token's rope pairs when there are at most 256 of them; 256 threads take
      * more. */
     const int gptj = mode == R3D_ROPE_GPTJ;
     const int thr = (n_head + n_head_kv) * (rot / 2) <= 256u ? (int)kNarrow : (int)kThreads;
     R3D_ROPE2(thr, M, stream, (uint16_t*)(uintptr_t)qkv, (const int32_t*)(uintptr_t)pos,
-              (uint32_t)head_dim, (uint32_t)(n_head + n_head_kv), (uint32_t)rot, theta, scale,
-              (uint32_t)qkv_ld);
+              (uint32_t)head_dim, (uint32_t)(n_head + n_head_kv), (uint32_t)rot, (uint32_t)den,
+              (uint32_t)nfreq, theta, scale, (uint32_t)qkv_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1804,9 +1817,9 @@ extern "C" int r3d_rad_fill(const RadArgs* a, RadStream s) {
  * In place, so operand 0 is INOUT (a null data is RAD_E_INVAL); head_dim and rot must be even.
  *
  * Refused with RAD_E_UNSUPPORTED: the multi-component modes (mrope, imrope, axial), which need a
- * [C, M] position plane and per-section ladders; the proportional ladder (`ladder=head`), which
- * pairs across the whole head; and YaRN and Llama 3, which rescale the ladder. Each changes the
- * angles, not the arithmetic, and the kernel implements only the plain rotary.
+ * [C, M] position plane and per-section ladders; and YaRN and Llama 3, which rescale the ladder.
+ * Each changes the angles, not the arithmetic. Both of ref_rope's ladders are served: `rotary`
+ * (absent) and the proportional `head`, which pairs across the whole head (see rope_kernel).
  */
 extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     const RadTensor* qkv = r3d_opt(a, 0);
@@ -1837,9 +1850,12 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     if (r3d_gets(a, "sections")) return R3D_NO(RAD_E_UNSUPPORTED);
     if (r3d_getf(a, "yarn_factor", 0.0) != 0.0) return R3D_NO(RAD_E_UNSUPPORTED);
     if (r3d_getf(a, "llama3_factor", 0.0) != 0.0) return R3D_NO(RAD_E_UNSUPPORTED);
+    /* ref_rope's rope_ladder: absent and "rotary" measure the base ladder in rot, "head" in
+     * head_dim; any other value is refused, since a mistyped ladder would give wrong angles. */
+    long long den = rot;
     if (const char* lad = r3d_gets(a, "ladder")) {
-        /* Absent and "rotary" are the ladder the kernel has: the base frequency divides by rot. */
-        if (std::strcmp(lad, "rotary")) return R3D_NO(RAD_E_UNSUPPORTED);
+        if (!std::strcmp(lad, "head")) den = head_dim;
+        else if (std::strcmp(lad, "rotary")) return R3D_NO(RAD_E_UNSUPPORTED);
     }
 
     const float theta = (float)r3d_getf(a, "theta", 10000.0);
@@ -1855,7 +1871,7 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
 
     return r3d_launch_ok(r3d_rope_bf16(r3d_addr(qkv), r3d_addr(pos), (int)M, (int)head_dim,
                                         (int)n_head, (int)n_head_kv, theta, scale, mode, (int)rot,
-                                        (int)qkv_ld, (long)(uintptr_t)s));
+                                        (int)den, (int)qkv_ld, (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ kv_store

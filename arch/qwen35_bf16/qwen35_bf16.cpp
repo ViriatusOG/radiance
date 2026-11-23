@@ -12,7 +12,10 @@
  *
  * The unquantised release (quantisation descriptor ""), every projection a bf16 GEMM. The
  * block-scaled fp8 release is qwen35_fp8's. The lm_head is declared at whatever the model holds,
- * so a recipe-made block-fp8 head uses the fp8 logits kernel.
+ * so a recipe-made block-fp8 head uses the fp8 logits kernel. Likewise each trunk linear: one
+ * packed losslessly as `bf16x12` (data/recipes/q38-27b-bf16x12-df2.recipe) is read by gemm_nt at
+ * that dtype, which gives the bf16 GEMM's bytes from about three quarters of the weight's
+ * (decl_linear_bf16 in rad_arch.h).
  *
  * ============================== THE SHAPE, AT 27B ==============================
  *
@@ -35,19 +38,67 @@
  * The vision tower (27 blocks, hidden 1152, 16 heads of 72, patch 16, out 5120) is declared
  * through arch/common/rad_block_vit.h, only when the container carries one and the deployment
  * asked for media.
+ *
+ * ============================== THE DRAFTER ==============================
+ *
+ * A container converted with `rad-convert --draft-model` carries a DFlash2 drafter under `draft.`
+ * (data/recipes/q38-27b-bf16-df2.recipe), declared when the deployment speculates as qwen35_fp8
+ * declares it: a second model at absolute layers n_layer.., reading the residual stream after the
+ * layers `dflash_config.target_layer_ids` names (the taps). The drafter only proposes; the trunk
+ * verifies every token, so what is emitted is this graph's. The blocks below serve the verify
+ * steps (the delta net keeps an anchor state when speculating, rad_block_gdn.h).
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_attn_gated.h>
+#include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_gdn.h>
 #include <arch/rad_block_mlp.h>
 #include <arch/rad_block_vit.h>
 #include <arch/rad_calib_full.h>
 
+#include <cstring>
 #include <vector>
 
 namespace qwen35_bf16 {
 
 using namespace rad::arch;
+
+/* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h), at more than one
+ * rank. A decode-height all-reduce leaves the card's memory idle for its round trip, so the next
+ * GEMM's leading weight bytes are read into the on-die cache then, as qwen35_fp8 and gemma4_bf16
+ * do. Each read is issued inside its block, after the block's last GEMM and before its own
+ * all-reduce, so it is beside the reduction whether the block or the next norm (ar_rmsnorm) runs
+ * it:
+ *   kPfGateUpBytes  of gate_up, after the mixer's o or out
+ *   kPfNextBytes    of the next layer's first GEMM (q|gate, or the delta net's in; the lm_head
+ *                   after the last layer), after down
+ *   kPfOutBytes     of the delta net's out-projection, beside its decode recurrent update, which
+ *                   runs one workgroup per (sequence, head) and leaves the memory mostly idle; in a
+ *                   pure decode step of at most kPfOutSeqs sequences (qwen35_fp8's bound); only
+ *                   where launches do not chain (below)
+ *   kPfDraftBytes  of each GEMM the DFlash2 drafter's reads name (Dflash2::Config::prefetch),
+ *                   qwen35_fp8's size
+ * Decode steps only, up to kPrefetchRows rows: one or two sequences' verify. Qwen3.8-27B bf16x12 +
+ * DFlash2 at depth 7, TP2 on two R9700s, one stream, seven greedy prompts, two interleaved server
+ * starts each: 43.95 ms a step without the reads, 41.76 with these sizes (-5.0 %), the text
+ * byte-identical. A verify pass's packed GEMMs took 2.2 ms less and its all-reduces 0.66 ms more
+ * (ar_rmsnorm 17.4 -> 22.7 us beside a read); each read starts ~6 us after its GEMM and reads at
+ * ~330 GB/s beside the reduction; the drafter's pass took 2.51 -> 2.38 ms. Of the other (gate_up,
+ * next, out) sizes in MiB, (12, 12, 8) was within 0.1 ms at more bytes a pass and (12, 6, 15)
+ * 0.12 ms slower; in an earlier round (8, 16, 8) and (16, 20, 12) ran 0.44 and 0.34 ms slower than
+ * (12, 12, 8): a next read longer than the reduction runs on into the GEMM it feeds.
+ *
+ * Where launches chain (rad_chain_on) every read goes on lane 0 as the chained form right behind
+ * its GEMM (prefetch_beside). There the out read would sit in front of the recurrent update, a
+ * plain launch, which waits for it, so the read runs in series with the update instead of beside
+ * it; none is declared. The same bf16x12 + DFlash2 deployment, chained, three interleaved server
+ * starts each: 41.10 ms a step with the out read, 40.72 without it (-0.38 ms, faster in each of
+ * the three rounds), the text byte-identical. */
+constexpr int64_t kPfGateUpBytes = (int64_t)12 << 20;
+constexpr int64_t kPfNextBytes   = (int64_t)8 << 20;
+constexpr int64_t kPfOutBytes    = (int64_t)12 << 20;
+constexpr int64_t kPfOutSeqs     = 4;
+constexpr int64_t kPfDraftBytes  = (int64_t)12 << 20;
 
 /* One trunk layer, of one of two kinds; both small structs are held rather than a union. `full`
  * is the only branch in step(), and it is fixed per layer by the model. */
@@ -95,6 +146,19 @@ struct Model {
     VisionTower vit{};
     MediaRows   mrows{};
 
+    /* ---- the DFlash2 drafter (rad_block_dflash2.h), declared only when the container carries
+     * one and the deployment speculates, and the taps it reads: each tap layer's output copied
+     * into its column slice of `b_dfsrc` (`fc` is [n_embd, n_taps * n_embd]). */
+    bool          have_df = false;
+    Dflash2       df{};
+    Dflash2::Wire dfw{};
+    rad_kvgroup   kv_draft = 0;
+    enum { MAX_TAPS = 8 };
+    int      n_taps = 0;
+    int      tap_layer[MAX_TAPS] = {};
+    rad_buf  b_dfsrc = 0;                 /* [max_tok, n_taps * n_embd] */
+    rad_op   op_tap = 0;
+
     std::vector<Layer> layers;
 
     /* --calib-dir: the whole Hessian of every linear's input over a --calib-corpus run. */
@@ -106,6 +170,233 @@ struct Model {
  * model state is per instance: indexed by the instance's slot (unique across every engine in the
  * process, rad_build_slot) and read back in step() with rad_slot(). */
 static Model g_model[MAX_SLOTS];
+
+/* The DFlash2 drafter: its geometry, KV group, buffers and block, as qwen35_fp8.cpp declares it
+ * (each plugin keeps its own copy, as gemma3's does); only the rescoring test differs, for the
+ * heads a bf16 container can hold.
+ *
+ * A second model, not a head: it has its own layer count, head count, feed-forward width, rope
+ * base, norm convention and vocabulary claim. Its Geom starts as a copy of the trunk's (n_embd,
+ * deployment bounds, rank, wire) and takes everything else from the drafter's config.
+ *
+ * Nothing is defaulted quietly: a `draft.` config that does not describe a drafter this engine
+ * implements is refused by name, because a silently ignored scale factor would only lower
+ * acceptance (spec §17). */
+static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx,
+                           Model& m, int base_layer) {
+    Names& nm = m.nm;
+    Geom   dg{};
+    /* Plain RMS norm: the drafter uses the ordinary norm where the trunk uses GemmaRMSNorm
+     * (rad_block_dflash2.h). */
+    RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DFlash2"));
+
+    Dflash2::Config dc{};
+    /* The drafter's reads beside its all-reduces (kPfDraftBytes; the block declares them at more
+     * than one rank), none under --weight-prefetch off, as gemma4_bf16 declares them. */
+    dc.prefetch = ctx->weight_prefetch_off ? 0 : kPfDraftBytes;
+    dc.n_taps   = m.n_taps;
+    dc.block    = ctx->max_spec + 1;
+    dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
+    dc.group    = rad_meta_geti(meta, "draft.dflash_config.conv_group_size", 16);
+    dc.sel_rank = rad_meta_geti(meta, "draft.dflash_config.selector_rank", 0);
+    dc.sel_topk = rad_meta_geti(meta, "draft.dflash_config.selector_top_k", 0);
+    dc.causal   = rad_meta_geti(meta, "draft.is_causal", 0) ? 1 : 0;
+    if (rad_meta_geti(meta, "draft.use_sliding_window", 0))
+        dc.window = rad_meta_geti(meta, "draft.dflash_config.swa_window_size",
+                                  rad_meta_geti(meta, "draft.sliding_window", 0));
+    if (dc.sel_rank <= 0 || dc.sel_topk <= 0) {
+        fprintf(stderr, "radiance: the DFlash2 drafter states no selector geometry "
+                        "(rank %lld, top_k %lld). Without it the block of drafts has no path "
+                        "through it.\n", (long long)dc.sel_rank, (long long)dc.sel_topk);
+        return RAD_E_INVAL;
+    }
+
+    /* The query block must be a power of two: the convolution masks a row's position with
+     * `block_size - 1`, so any other value convolves one sequence's block into the next. The shim
+     * also rejects it, but only after the drafter's weights have loaded. */
+    const long long trained = rad_meta_geti(meta, "draft.dflash_config.block_size", 0);
+    if (dc.block < 2 || (dc.block & (dc.block - 1))) {
+        fprintf(stderr, "radiance: DFlash2's convolution masks the block position with "
+                        "block_size - 1, so the query block has to be a power of two. This serve "
+                        "asks for %d draft tokens, which makes it %lld; the checkpoint was trained "
+                        "at %lld (%lld draft tokens).\n",
+                ctx->max_spec, (long long)dc.block, trained, trained - 1);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (trained > 0 && trained != dc.block)
+        rad_note(b, "DFlash2 was trained at block_size %lld (%lld draft tokens) and runs at "
+                    "%lld; it accepts less away from its trained block length",
+                 trained, trained - 1, (long long)dc.block);
+
+    /* Three scalars this implementation does not apply. Each changes the proposals and would show
+     * up only as lower acceptance, so a non-default value is refused. */
+    const double escale = rad_meta_getf(meta, "draft.dflash_config.input_embedding_scale", 1.0);
+    const double omul   = rad_meta_getf(meta, "draft.dflash_config.output_multiplier", 1.0);
+    const double scap   = rad_meta_getf(meta, "draft.dflash_config.final_logit_softcapping", 0.0);
+    if (escale != 1.0 || omul != 1.0 || scap != 0.0) {
+        fprintf(stderr, "radiance: this DFlash2 checkpoint scales its input embedding by %g and "
+                        "its draft logits by %g, and soft-caps them at %g. None of the three is "
+                        "implemented, and a drafter that ignored them would just accept less.\n",
+                escale, omul, scap);
+        return RAD_E_UNSUPPORTED;
+    }
+
+    /* The window bounds the cache: the drafter's 2048-token window, not the context length. */
+    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, dc.window, base_layer, &m.kv_draft));
+
+    /* Activations. The context pass has one row per committed token over a whole prefill chunk;
+     * the query pass one row per draft position, `block` per sequence; the two are sized apart.
+     * All are small: the drafter's cost is its weights. */
+    const int64_t qd  = dg.n_head * dg.head_dim;
+    const int64_t kvd = dg.n_head_kv * dg.head_dim;
+    int64_t qr = dg.max_seqs * dc.block;
+    if (qr > dg.max_tok) qr = dg.max_tok;
+    const int64_t sr   = dg.max_seqs * dc.steps();
+    const int64_t spad = ((sr + 15) / 16) * 16;
+
+    Dflash2::Wire& dw = m.dfw;
+    dw.src     = m.b_dfsrc;
+    dw.c       = decl_b(b, nm.f("df_c"),    dg.act_dtype, {dg.max_tok, dg.n_embd});
+    dw.ck      = decl_b(b, nm.f("df_ck"),   dg.act_dtype, {dg.max_tok, kvd});
+    dw.cv      = decl_b(b, nm.f("df_cv"),   dg.act_dtype, {dg.max_tok, kvd});
+    dw.x       = decl_b(b, nm.f("df_x"),    dg.act_dtype, {qr, dg.n_embd});
+    dw.h       = decl_b(b, nm.f("df_h"),    dg.act_dtype, {qr, dg.n_embd});
+    dw.h2      = decl_b(b, nm.f("df_h2"),   dg.act_dtype, {qr, dg.n_embd});
+    dw.coef    = decl_b(b, nm.f("df_coef"), dg.act_dtype, {qr, dc.coef_dim(dg.n_embd)});
+    dw.q       = decl_b(b, nm.f("df_q"),    dg.act_dtype, {qr, qd});
+    dw.k       = decl_b(b, nm.f("df_k"),    dg.act_dtype, {qr, kvd});
+    dw.v       = decl_b(b, nm.f("df_v"),    dg.act_dtype, {qr, kvd});
+    dw.attn    = decl_b(b, nm.f("df_attn"), dg.act_dtype, {qr, qd});
+    dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
+    dw.ffn     = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
+    /* The codes the drafter's six linears read: every activation feeding one has an 8-bit copy
+     * and an f32 scale plane. E4M3 with a scale per 128 for block fp8 or MXFP4 linears (rad_fp8.h's
+     * DenseFP8), int8 with a scale per 128 or IQ8R's 256 for rotated int8 ones, which the drafter's
+     * `fc` tells apart.
+     * `srcq` is the largest (50 MiB at a 2048-token chunk and five taps) and halves the bytes of
+     * the context pass's dominant GEMM. */
+    RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (dc.act_i8 && ((dc.n_taps * dg.n_embd) % dqg || dg.n_embd % dqg || qd % dqg ||
+                      dg.n_ff % dqg)) {
+        fprintf(stderr, "radiance: a rotated int8 drafter takes widths in whole %lld-column scale groups; "
+                        "this one is n_embd %lld, q %lld, n_ff %lld\n", (long long)dqg,
+                (long long)dg.n_embd, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_INVAL;
+    }
+    auto dqs = [&](int64_t n) { return (n + dqg - 1) / dqg; };
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), dqt, {dg.max_tok, dc.n_taps * dg.n_embd});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, dqs(dc.n_taps * dg.n_embd)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   dqt,     {dg.max_tok, dg.n_embd});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32, {dg.max_tok, dqs(dg.n_embd)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  dqt,     {qr, dg.n_embd});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32, {qr, dqs(dg.n_embd)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  dqt,     {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32, {qr, dqs(qd)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  dqt,     {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32, {qr, dqs(dg.n_ff)});
+    dw.sel_h   = decl_b(b, nm.f("df_selh"), dg.act_dtype, {sr, dg.n_embd});
+    dw.hp      = decl_b(b, nm.f("df_hp"),   dg.act_dtype, {sr, dc.sel_rank});
+    dw.dq      = decl_b(b, nm.f("df_dq"),   RAD_I8,  {sr, dg.n_embd});
+    dw.ds      = decl_b(b, nm.f("df_ds"),   RAD_F32, {sr, 1});
+    /* Group-major, [n_embd/group][ceil(M/16)*16]: quant_act_i8's asum plane, whose first
+     * dimension is the K group, not the token. */
+    dw.dsum    = decl_b(b, nm.f("df_dsum"), RAD_F32, {dg.n_embd / 128, spad});
+    /* This rank's plane. `head_rows` is the block's own answer to whether the 2-bit head is
+     * vocab-sharded; asking it keeps the buffer consistent with the op declared over it. */
+    dw.dlog    = decl_b(b, nm.f("df_dlog"), dg.act_dtype, {sr, Dflash2::head_rows(dg)});
+    /* Candidates are rescored against the target's head when logit_rerank can read its plane
+     * (bf16 as the checkpoint holds it, logit_rerank_bf16; fp8 or int8 rows, as
+     * data/recipes/q38-27b-bf16.recipe's int8 head) and every candidate a rank proposes is one it
+     * owns; the planes are then kRerankR wide and the selector reads the first sel_topk. */
+    {
+        const uint32_t hd = weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16);
+        if ((hd == RAD_BF16 || hd == RAD_F8E4M3 || hd == RAD_I8) &&
+            (Dflash2::head_sharded(dg) || dg.world <= 1)) {
+            m.df.w_lm  = m.w_lm_head;
+            m.df.top_w = Dflash2::kRerankR;
+        }
+    }
+    const int64_t tw = m.df.w_lm ? m.df.top_w : dc.sel_topk;
+    dw.cand    = decl_b(b, nm.f("df_cand"), RAD_I32, {sr, tw});
+    dw.unary   = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, tw});
+    /* The vocab-parallel candidate exchange, and only when there is one: this rank's top-R as
+     * (int32 id, float value) pairs and the all-gathered world_size * R of them. */
+    if (Dflash2::head_sharded(dg)) {
+        dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, tw, 2});
+        dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * tw, 2});
+    }
+    /* The proposal buffer (RadDrafterDecl::proposal): a DFlash2 pass proposes through the
+     * selector, never through the sampler's token buffer. */
+    dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
+
+    /* --draft-coupling (RadBuildCtx::draft_coupling), as qwen35_fp8 declares it: the walk samples
+     * each draft from Q, its scores' softmax over the best eight candidates, and the sampler
+     * couples the target's own draw to it (abi/rad_spechub.h). The planes are named as the MTP
+     * head's, which is how the engine finds them. Q's temperature keeps the output exact at any
+     * value and moves only acceptance; 0.6 is qwen35_fp8's. With logit_rerank above, the walk's
+     * unary scores are the bf16 head's, as they are the fp8 head's there. */
+    if (ctx->draft_coupling) {
+        if (dc.steps() > RAD_MTP_COUPLE_MAX_ROUNDS || dc.sel_topk > RAD_DFLASH_COUPLE_MAX_K ||
+            dc.sel_rank % RAD_DFLASH_EDGE_PARTS || dc.sel_rank > RAD_DFLASH_COUPLE_MAX_R) {
+            rad_note(b, "--draft-coupling on: DFlash2's coupled walk takes at most %d drafts, %d "
+                        "candidates and a selector rank that is a multiple of %d up to %d",
+                     RAD_MTP_COUPLE_MAX_ROUNDS, RAD_DFLASH_COUPLE_MAX_K, RAD_DFLASH_EDGE_PARTS,
+                     RAD_DFLASH_COUPLE_MAX_R);
+            return RAD_E_UNSUPPORTED;
+        }
+        dc.q_temp = 0.6;
+        dw.couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                 {dg.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
+        dw.couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                 {dc.steps(), dg.max_seqs, RAD_MTP_COUPLE_STATE_WORDS},
+                                 RAD_BUF_PERSIST);
+        if (!dw.couple_draws || !dw.couple_state) return RAD_E_INVAL;
+        rad_note(b, "DFlash2 coupled: the walk samples x~Q (FP64 softmax of its edge scores / %g "
+                    "over the best eight candidates) at each of %lld positions, and the sampler "
+                    "couples the target's own draw to it; fixed-seed tokens are NOT preserved",
+                 dc.q_temp, (long long)dc.steps());
+    }
+
+    RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft",
+                              nm.ckpt("lm_head.weight"), dw));
+    m.have_df = true;
+
+    /* Block drafter: a context pass mirroring the trunk step, then one pass filling the whole
+     * block. `mask_token_id` is read only here and travels in the drafter declaration. `window`
+     * must be the one this plugin gated its own attention with, since the scheduler stages the
+     * block pass against it. */
+    RadDrafterDecl drf{};
+    drf.name           = "dflash2";
+    drf.kind           = RAD_DRAFT_BLOCK;
+    drf.depth          = ctx->max_spec;
+    /* The anchor row predicts nothing here, so the block is one row longer than the depth and the
+     * head runs over rows 1..depth (rad_builder.h, RadDrafterDecl::block). */
+    drf.block          = dc.block;
+    drf.proposal       = dw.tokens;
+    drf.proposal_pitch = dc.steps();
+    drf.window         = dc.window;
+    drf.mask_token     = (int32_t)rad_meta_geti(meta, "draft.dflash_config.mask_token_id", -1);
+    if (drf.mask_token < 0) {
+        fprintf(stderr, "radiance: this DFlash2 checkpoint declares no "
+                        "dflash_config.mask_token_id, and every drafted position embeds it -- "
+                        "there is nothing to run.\n");
+        return RAD_E_FORMAT;
+    }
+    RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+
+    rad_note(b, "DFlash2 drafter: %lld layers at absolute %d..%d, %lld heads / %lld kv x %lld, "
+                "ffn %lld, %s attention with a %lld-token window, %d trunk tap(s); one forward "
+                "proposes %lld tokens through the candidate selector",
+             (long long)dg.n_layer, base_layer, base_layer + (int)dg.n_layer - 1,
+             (long long)dg.n_head, (long long)dg.n_head_kv, (long long)dg.head_dim,
+             (long long)dg.n_ff, dc.causal ? "causal" : "non-causal", (long long)dc.window,
+             m.n_taps, (long long)dc.steps());
+    return RAD_OK;
+}
+
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
@@ -293,6 +584,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * gather_rows selects the hidden states into the narrow `b_hout` (n_embd wide) before the
      * GEMM. */
     m.b_hout    = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
+
+    /* The DFlash2 drafter's taps, only when the container carries the drafter and the deployment
+     * speculates: one residual stream per tap, 100 MiB at a 2048-token chunk and five taps. `cast`
+     * does the copy into a column slice (libr4d/r4d_rows.cpp). */
+    if (ctx->max_spec > 0) {
+        const char* da = rad_meta_gets(meta, "draft.architectures", "");
+        if (da && std::strstr(da, "DFlash")) {
+            m.n_taps = parse_layer_ids(
+                rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr),
+                m.n_main, m.tap_layer, Model::MAX_TAPS);
+            if (m.n_taps > 0) {
+                m.b_dfsrc = decl_b(b, nm.f("dflash_src"), g.act_dtype,
+                                   {g.max_tok, (int64_t)m.n_taps * g.n_embd});
+                m.op_tap = rw(b, RAD_OP(b, "cast",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                             RAD_INT("n", g.n_embd),
+                                             RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                                  RAD_NOWEIGHTS),
+                              {m.b_x}, {m.b_dfsrc});
+            }
+        }
+    }
     m.b_logits  = decl_b(b, nm.f("logits"),   RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
@@ -358,10 +671,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, g.n_ff * g.world,
                                std::max({ g.n_embd, q_dim * g.world, v_dim * g.world, g.n_ff * g.world })));
 
+    /* ---- where the residual adds happen. At two ranks with ar_rmsnorm, each block's norm takes
+     * the previous block's delta and all-reduce in one launch (rad_norm_bf16.h), placed by
+     * layer_fold() as in the fp8 trunk: a mixer folds the previous feed-forward's unless it is
+     * layer 0 or follows a drafter tap layer; a feed-forward always folds its mixer's, and keeps
+     * its own add on a tap layer and on the last layer, where the tap and the final norm read `x`.
+     * Otherwise (one rank, or a kernel library without the op) every block adds its own delta,
+     * as before. Byte-identical either way: ar_rmsnorm is all_reduce + add + rmsnorm.
+     *
+     * Not under calibration (--calib-dir): step() issues each block's input norm ahead of the
+     * block for the tap, which a folded norm would turn into a second all-reduce and add. */
+    const bool fold_ar = g.world == 2 && rad_op_declared(b, "ar_rmsnorm") && !m.calib.on;
+
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.full = is_full_attention(l, interval) ? 1 : 0;
+        const LayerFold f = fold_ar ? layer_fold(g, l, m.n_main, m.tap_layer, m.n_taps, false)
+                                    : LayerFold{};
+        const bool mix_fold = fold_ar && f.mix_fold;
 
         const char* pre = "model.language_model.layers";
         if (lay.full) {
@@ -374,7 +702,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             as.k_norm = nm.ckpt("%s.%lld.self_attn.k_norm.weight",    pre, (long long)l);
             as.o      = nm.ckpt("%s.%lld.self_attn.o_proj.weight",    pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
-            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as));
+            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
+                                          mix_fold, !fold_ar, mix_fold, fold_ar));
         } else {
             GdnBF16::Src gs{};
             gs.norm     = nm.ckpt("%s.%lld.input_layernorm.weight",           pre, (long long)l);
@@ -389,7 +718,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             gs.out      = nm.ckpt("%s.%lld.linear_attn.out_proj.weight",      pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_state));
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_conv));
-            RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs));
+            RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs,
+                                         mix_fold, !fold_ar, mix_fold, fold_ar));
         }
         if (m.calib.records(l)) {
             const std::string L = std::string(pre) + "." + std::to_string(l);
@@ -413,7 +743,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.gate = nm.ckpt("%s.%lld.mlp.gate_proj.weight",            pre, (long long)l);
         ms.up   = nm.ckpt("%s.%lld.mlp.up_proj.weight",              pre, (long long)l);
         ms.down = nm.ckpt("%s.%lld.mlp.down_proj.weight",            pre, (long long)l);
-        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms));
+        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, fold_ar, !fold_ar || f.mlp_add,
+                                     fold_ar, fold_ar && f.mlp_ar_out));
         if (m.calib.records(l)) {
             const std::string L = std::string(pre) + "." + std::to_string(l);
             lay.cs_mlp = (int)m.calib.sites.size();
@@ -422,6 +753,44 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             lay.cs_down = (int)m.calib.sites.size();
             RAD_ARCH_TRY(m.calib.site(b, g, l, L + ".mlp.down_proj.input", L + ".mlp.down_proj",
                                       m.b_ffn, g.n_ff, g.n_ff * g.world));
+        }
+    }
+
+    /* ---- the weight reads beside the decode all-reduces (kPfGateUpBytes and the rest), after
+     * every weight they read is declared. At more than one rank, where there are reductions to sit
+     * beside, and none under --weight-prefetch off. Each takes at most its weight's first N x K
+     * bytes (this rank's shape): r4d_rad_prefetch clamps a read to its tensor only where the stored
+     * dtype has a width, a packed weight's dtype is libr4d's own (rad_dtype_bits answers 0), and
+     * a bf16x12 weight's first region, a byte an element, is N x K long. */
+    int64_t n_pf = 0;
+    if (g.world > 1 && !ctx->weight_prefetch_off && rad_op_declared(b, "prefetch")) {
+        auto read = [&](rad_weight w, int64_t want, int64_t n, int64_t k) {
+            const rad_op op = decl_prefetch(b, w, std::min(want, n * k));
+            n_pf += op != 0;
+            return op;
+        };
+        for (int64_t l = 0; l < m.n_main; ++l) {
+            Layer& lay = m.layers[(size_t)l];
+            /* gate_up's, issued after the mixer's last GEMM */
+            const rad_op gu = read(lay.mlp.w_gate_up, kPfGateUpBytes, 2 * g.n_ff, g.n_embd);
+            if (lay.full) { lay.attn.op_pf = gu; lay.attn.pf_w = lay.mlp.w_gate_up; }
+            else          { lay.gdn.op_pf  = gu; lay.gdn.pf_w  = lay.mlp.w_gate_up; }
+            /* the next layer's first GEMM, issued after down; after the last layer the lm_head */
+            if (l + 1 < m.n_main) {
+                const Layer& nx = m.layers[(size_t)l + 1];
+                lay.mlp.pf_w  = nx.full ? nx.attn.w_qg : nx.gdn.w_in;
+                lay.mlp.op_pf = read(lay.mlp.pf_w, kPfNextBytes,
+                                     nx.full ? 2 * g.q_dim() : gc.in_dim(), g.n_embd);
+            } else {
+                lay.mlp.pf_w  = m.w_lm_head;
+                lay.mlp.op_pf = read(m.w_lm_head, kPfNextBytes, g.n_vocab, g.n_embd);
+            }
+            /* the delta net's out-projection, beside its recurrent update; none where launches
+             * chain, which would put the read in series with the plain update (above) */
+            if (!lay.full && !rad_chain_on()) {
+                lay.gdn.op_pf_out   = read(lay.gdn.w_out, kPfOutBytes, g.n_embd, gc.v_dim());
+                lay.gdn.pf_out_seqs = kPfOutSeqs;
+            }
         }
     }
 
@@ -449,6 +818,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_WEIGHTS(m.w_lm_head)),
                      {m.b_hout}, {m.b_logits});
 
+    /* ---- the DFlash2 drafter (rad_block_dflash2.h), at absolute layers n_main.. of its own KV
+     * group. `n_taps` is non-zero only when `draft.architectures` names a DFlash model and
+     * max_spec is positive. */
+    if (m.n_taps > 0) RAD_ARCH_TRY(declare_dflash2(b, meta, ctx, m, (int)m.n_main));
+
     /* ---- notes for --debug-graph. */
     rad_note(b, "rank %d/%d: %lld trunk layers, %lld full attention + %lld gated delta net, "
                 "n_head=%lld n_head_kv=%lld head_dim=%lld n_ff=%lld vocab=[%lld,%lld)",
@@ -471,9 +845,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     rad_note(b, "logits for at most %lld sampled rows a step (of %lld tokens): gather_rows "
                 "selects RadBatch::out_ids before the lm_head", (long long)g.max_logit_rows,
              (long long)g.max_tok);
+    if (n_pf > 0 && rad_chain_on())
+        rad_note(b, "%lld weight reads beside the decode all-reduces (the first %lld MiB of "
+                    "gate_up, %lld of the next layer's first GEMM; none of the delta net's out, "
+                    "since launches chain), on decode steps of up to %lld rows",
+                 (long long)n_pf, (long long)(kPfGateUpBytes >> 20),
+                 (long long)(kPfNextBytes >> 20), (long long)kPrefetchRows);
+    else if (n_pf > 0)
+        rad_note(b, "%lld weight reads beside the decode all-reduces and recurrent updates (the "
+                    "first %lld MiB of gate_up, %lld of the next layer's first GEMM, %lld of the "
+                    "delta net's out), on decode steps of up to %lld rows",
+                 (long long)n_pf, (long long)(kPfGateUpBytes >> 20),
+                 (long long)(kPfNextBytes >> 20), (long long)(kPfOutBytes >> 20),
+                 (long long)kPrefetchRows);
     if (nextn > 0)
-        rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not declared: this plugin "
-                    "serves the trunk only", (long long)nextn);
+        rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not declared: the only drafter "
+                    "this plugin runs is a DFlash2 one under `draft.`", (long long)nextn);
 
     /* The vision tower, last, so its activations share the arena with every buffer above. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
@@ -489,6 +876,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
 
+    /* A drafter pass runs only the drafter: positive is DFlash2's query pass, proposing the whole
+     * block at once, and negative its context pass, turning the tokens the trunk just committed
+     * into the drafter's own K and V. Zero is a trunk step. */
+    if (batch->draft_pass != 0) {
+        if (!m.have_df) {
+            rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
+                             "container has no `draft.` block, or declare ran at max_spec 0");
+            return;
+        }
+        if (batch->draft_pass > 0) m.df.step(c, batch);
+        else                      m.df.context(c, batch);
+        return;
+    }
+
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
@@ -499,7 +900,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     brows(m.b_x, batch->n_tok), RAD_NONE);
 
     const int64_t T = batch->n_tok;
-    for (const Layer& l : m.layers) {
+    for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
+        const Layer& l = m.layers[(size_t)li];
         /* Under calibration a block's input norm is issued once ahead of the block, so its output
          * is read before the block overwrites `h`; the block computes it again, the same op on
          * the same bytes. */
@@ -517,6 +919,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
         l.mlp.step(c, batch);
         if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, T);
+
+        /* The tap, after the layer: the drafter conditions on this layer's output, which the next
+         * layer overwrites, so the rows are copied into this tap's column slice now. */
+        for (int t = 0; t < m.n_taps; ++t) {
+            if (m.tap_layer[t] != (int)li) continue;
+            RAD_ISSUE(c, m.op_tap, brows(m.b_x, batch->n_tok),
+                      bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, batch->n_tok));
+        }
     }
 
     RAD_ISSUE(c, m.op_final_norm,
@@ -541,7 +951,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
-/* Chained launches pay on the plain-bf16 trunk with a drafter and without one: every kernel of
+/* ================================================================== the probe
+ *
+ * The speculation depth this container's drafter supports, answered before declare because
+ * `max_spec` sizes the drafter's buffers, bands kernels and sets the scheduler's window; rad-convert
+ * declares at it, which is how the container comes to carry the drafter's weights. DFlash2
+ * proposes the whole block in one pass, so its depth is the block length it was trained at
+ * (block_size 8: one anchor and 7 mask positions), and any other depth is refused. 0 when the
+ * container carries no drafter.
+ *
+ * Chained launches pay on the plain-bf16 trunk with a drafter and without one: every kernel of
  * its decode step but the gated delta net's two and the vocabulary GEMM has a chained form
  * (libr4d's rad_kernel_chain). Ms a decode step unchained / chained: Qwen3.5-0.8B on one R9700
  * 3.89 / 3.60 at one sequence and 4.72 / 4.46 at four; Qwen3.8-27B as bf16 on two, where the
@@ -549,6 +968,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->chain_pays = RAD_CHAIN_ALWAYS;
+    const char* da = rad_meta_gets(meta, "draft.architectures", "");
+    if (da && std::strstr(da, "DFlash2")) {
+        const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);
+        out->draft_depth = bs > 1 ? (int)(bs - 1) : 7;
+        out->draft_depth_fixed = 1;   /* trained at exactly this block; any other is a refusal */
+    }
     return RAD_OK;
 }
 

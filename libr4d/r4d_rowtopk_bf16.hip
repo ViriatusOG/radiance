@@ -395,16 +395,18 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_merge(
 // I8 reads the int8 head logits_gemm_i8 stores (r4d.i8lm.r128): the same row (K codes, then the
 // row's bf16 scale per 128 columns in its tail) with int8 codes instead of E4M3. The drafter
 // rescores against whichever head the trunk's logits GEMM reads, so an int8 head needs this form.
+// BF reads a plain bf16 head, logits_gemm_bf16's [n_vocab][n_embd] as stored: K values a row and
+// no scales, `w_ld` 2K bytes.
 #define R4D_RERANK_WPB 8       // waves a block: 256 threads, and R <= 32 so a wave takes <= 4
 #define R4D_RERANK_U   5       // 512-column steps a lane has in flight: all of K = 2560
 
 /* TB > 0: an IQR head (r4d_iqr.h's lm form), TB-bit codes then the row's scales, the table of 2^TB
- * int8 entries after the last row. */
+ * int8 entries after the last row. BF: a plain bf16 head (above). */
 #define R4D_LOGIT_RERANK_PARAMS                                                                 \
     const unsigned short* __restrict__ X, const int* __restrict__ IN,                           \
     const unsigned char* __restrict__ W, int* __restrict__ OI, float* __restrict__ OV,          \
     float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld
-template <bool I8, uint32_t TB = 0>
+template <bool I8, uint32_t TB = 0, bool BF = false>
 __device__ __forceinline__ void r4d_logit_rerank_body(R4D_LOGIT_RERANK_PARAMS) {
   __shared__ float s_sc[R4D_TOPK_PT2];
   __shared__ int   s_id[R4D_TOPK_PT2];
@@ -419,7 +421,16 @@ __device__ __forceinline__ void r4d_logit_rerank_body(R4D_LOGIT_RERANK_PARAMS) {
     const long loc = (long)gid - voff;
     const bool own = gid >= 0 && loc >= 0 && loc < nv;
     float acc = 0.0f;
-    if (own) {
+    if constexpr (BF) {
+      /* A plain bf16 row: a lane owns a strided subset of columns, with nothing to scale, so the
+       * fold is a plain sum whose order depends only on the lane count. */
+      if (own) {
+        const unsigned short* const wr = (const unsigned short*)(W + (size_t)loc * w_ld);
+        for (long k = lane; k < K; k += R4D_TOPK_WAVE)
+          acc = fmaf(bf16_to_f32(wr[k]), bf16_to_f32(xr[k]), acc);
+        acc = r4d_wave_sum(acc);
+      }
+    } else if (own) {
       /* The stored row, as logits_gemm_fp8 reads it (r4d_fp8_lm.h): K E4M3 codes then K/128 bf16
        * block scales in the row's tail. A lane owns a strided subset of columns and applies each
        * column's block scale locally, so the fold is a plain sum whose order depends only on the
@@ -539,32 +550,34 @@ __device__ __forceinline__ void r4d_logit_rerank_body(R4D_LOGIT_RERANK_PARAMS) {
 
 // The kernel around the body: CH `r4dchain` is the chained form (r4d_chain.h), taken at decode
 // heights.
-template <bool I8, uint32_t TB, class CH>
+template <bool I8, uint32_t TB, class CH, bool BF = false>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB)
 void r4d_logit_rerank_kernel(R4D_LOGIT_RERANK_PARAMS) {
   if (CH::on) r4d_chain_wait_vec();
-  r4d_logit_rerank_body<I8, TB>(X, IN, W, OI, OV, OP, R, K, voff, nv, w_ld);
+  r4d_logit_rerank_body<I8, TB, BF>(X, IN, W, OI, OV, OP, R, K, voff, nv, w_ld);
   if (CH::on) r4d_chain_done();
 }
 #undef R4D_LOGIT_RERANK_PARAMS
 
 static int logit_rerank_emit(long x, long idx_in, long head, long outi, long outv, long outp,
                              int M, int R, long K, long voff, long nv, RadStream stream,
-                             bool i8, uint32_t tb = 0, bool chain = false) {
+                             bool i8, uint32_t tb = 0, bool chain = false, bool bf = false) {
   r4d_iqr::Form tf;
   tf.bits = tb;
-  const long w_ld = tb ? (long)r4d_iqr::lm_row(tf, K) : r4d_fp8::lm_row_bytes(K);
+  const long w_ld = bf ? 2 * K : tb ? (long)r4d_iqr::lm_row(tf, K) : r4d_fp8::lm_row_bytes(K);
   // R <= PT2 makes the re-sort exact for any scores (one lane holds the whole answer), so it is
   // checked, not clamped.
   if (M < 1 || R < 1 || K < 1 || nv < 1 || R > R4D_TOPK_PT2) return R4D_NO(RAD_E_SHAPE);
-#define R4D_RERANK_CH(I8, TB, CH_)                                                              \
-  R4D_EMIT(stream, (r4d_logit_rerank_kernel<I8, TB, CH_>), dim3(M),                              \
+#define R4D_RERANK_CH(I8, TB, CH_, BF)                                                          \
+  R4D_EMIT(stream, (r4d_logit_rerank_kernel<I8, TB, CH_, BF>), dim3(M),                          \
            dim3(R4D_TOPK_WAVE * R4D_RERANK_WPB), 0, (const unsigned short*)x,                    \
            (const int*)idx_in, (const unsigned char*)head, (int*)outi, (float*)outv,             \
            (float*)outp, R, K, voff, nv, w_ld)
 #define R4D_RERANK_EMIT(I8, TB)                                                                 \
-  (chain ? R4D_RERANK_CH(I8, TB, r4dchain) : R4D_RERANK_CH(I8, TB, R4dUnchained))
-  const int rc = tb == 2u ? R4D_RERANK_EMIT(true, 2) : tb == 3u ? R4D_RERANK_EMIT(true, 3)
+  (chain ? R4D_RERANK_CH(I8, TB, r4dchain, false) : R4D_RERANK_CH(I8, TB, R4dUnchained, false))
+  /* The bf16 head's form is plain only: its row is not among the chained ones (rad_kernel_chain). */
+  const int rc = bf ? R4D_RERANK_CH(false, 0, R4dUnchained, true)
+               : tb == 2u ? R4D_RERANK_EMIT(true, 2) : tb == 3u ? R4D_RERANK_EMIT(true, 3)
                : tb == 4u ? R4D_RERANK_EMIT(true, 4) : tb == 5u ? R4D_RERANK_EMIT(true, 5)
                : tb == 6u ? R4D_RERANK_EMIT(true, 6)
                : i8 ? R4D_RERANK_EMIT(true, 0) : R4D_RERANK_EMIT(false, 0);
@@ -694,7 +707,8 @@ extern "C" int r4d_rad_rowtopk_merge(const RadArgs* a, RadStream s) {
 
 /* `M` and the candidate count come from the operands, as in rowtopk_merge: `M` is a band ceiling.
  * `n_vocab` is this rank's rows of the head, so the ownership guard is a shard test. */
-static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8, bool iqr = false) {
+static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8, bool iqr = false,
+                            bool bf = false) {
     const RadTensor* x   = r4d_opt(a, 0);
     const RadTensor* w   = r4d_opt(a, 1);
     const RadTensor* in  = r4d_opt(a, 2);
@@ -707,9 +721,12 @@ static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8, bool iq
      * plane is the stored form. Its stored width cannot be checked here and follows the layout
      * hook's rule; the engine's layout-tag check guarantees agreement by refusing a container laid
      * out for another row. So the head is accepted at either spelling and read as r4d.fp8lm.b128,
-     * or r4d.i8lm.r128 for the int8 form. */
+     * or r4d.i8lm.r128 for the int8 form. A plain bf16 head (`bf`) is stored as declared, so its
+     * dtype is the plane's. */
     uint32_t tb = 0;
-    if (iqr) {
+    if (bf) {
+        if (w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    } else if (iqr) {
         if (!r4d_iqr::is_weight_dtype(w->dtype) || !r4d_iqr::lm_built(w->dtype & r4d_iqr::kWordMask))
             return R4D_NO(RAD_E_DTYPE);
         tb = r4d_iqr::form(w->dtype & r4d_iqr::kWordMask).bits;
@@ -733,11 +750,16 @@ static int rad_logit_rerank(const RadArgs* a, RadStream stream, bool i8, bool iq
     if (r4d_numel(x) < M * K || r4d_numel(in) < M * R) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
     if (pr && r4d_numel(pr) < M * R * 2) return R4D_NO(RAD_E_SHAPE);
-    if (K % 128) return R4D_NO(RAD_E_SHAPE);   /* the scale block; lm_row_bytes assumes it */
+    if (bf) {
+        /* Its declared shape is the stored one, so the rows this rank holds can be checked. */
+        if (r4d_numel(w) < NV * K) return R4D_NO(RAD_E_SHAPE);
+    } else if (K % 128) {
+        return R4D_NO(RAD_E_SHAPE);   /* the scale block; lm_row_bytes assumes it */
+    }
 
     return logit_rerank_emit(r4d_addr(x), r4d_addr(in), r4d_addr(w), r4d_addr(idx), r4d_addr(val),
                              pr ? r4d_addr(pr) : 0, (int)M, (int)R, (long)K, (long)voff, (long)NV,
-                             stream, i8, tb, r4d_geti_or(a, "chain", 0) != 0 && M <= 64);
+                             stream, i8, tb, !bf && r4d_geti_or(a, "chain", 0) != 0 && M <= 64, bf);
 }
 extern "C" int r4d_rad_logit_rerank_i8(const RadArgs* a, RadStream stream) {
     return rad_logit_rerank(a, stream, true);
@@ -746,4 +768,6 @@ extern "C" int r4d_rad_logit_rerank_i8(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_logit_rerank_iqr(const RadArgs* a, RadStream stream) {
     return rad_logit_rerank(a, stream, true, true);
 }
-
+extern "C" int r4d_rad_logit_rerank_bf16(const RadArgs* a, RadStream stream) {
+    return rad_logit_rerank(a, stream, false, false, true);
+}
