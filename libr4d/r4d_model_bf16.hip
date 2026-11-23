@@ -1544,25 +1544,32 @@ namespace {
 constexpr uint32_t kLgRows = 8;    // rows held in registers at once
 constexpr uint32_t kLgVec  = 8;    // bf16 per 128-bit load
 
-__global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
+// LGR rows are held at once. Every row's sum is independent of the others (the same per-thread
+// 8-term chunks added in k order, the same lane butterfly, the same wave order), so LGR changes how
+// many times a column's weights are re-read -- once per LGR-row chunk -- and not one output byte.
+// The M > 8 head uses logits_gemm_body_wide below instead; this body stays the 8-row reference.
+template <uint32_t LGR>
+__device__ __forceinline__ void logits_gemm_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
     uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
-    __shared__ float lds[kWaves][kLgRows];
+    __shared__ float lds[kWaves][LGR];
     const uint32_t j = blockIdx.x;
     if (j >= N) return;
     const uint16_t* __restrict__ wj = w + (size_t)j * K;
 
-    for (uint32_t r0 = 0; r0 < M; r0 += kLgRows) {
-        const uint32_t nr = (M - r0) < kLgRows ? (M - r0) : kLgRows;
-        float acc[kLgRows];
+    for (uint32_t r0 = 0; r0 < M; r0 += LGR) {
+        const uint32_t nr = (M - r0) < LGR ? (M - r0) : LGR;
+        float acc[LGR];
 #pragma unroll
-        for (uint32_t i = 0; i < kLgRows; ++i) acc[i] = 0.0f;
+        for (uint32_t i = 0; i < LGR; ++i) acc[i] = 0.0f;
 
         for (uint32_t k = threadIdx.x * kLgVec; k < K; k += kThreads * kLgVec) {
             uint16_t wv[kLgVec];
 #pragma unroll
             for (uint32_t p = 0; p < kLgVec; ++p) wv[p] = wj[k + p];
-            for (uint32_t i = 0; i < nr; ++i) {
+#pragma unroll
+            for (uint32_t i = 0; i < LGR; ++i) {
+                if (i >= nr) break;
                 const uint16_t* __restrict__ ar = a + (size_t)(r0 + i) * a_ld + k;
                 float s = 0.0f;
 #pragma unroll
@@ -1588,6 +1595,109 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
     }
 }
 
+__global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    logits_gemm_body<kLgRows>(a, w, c, M, K, N, a_ld, c_ld);
+}
+
+// Wide form of the M > 8 head: a block takes LGC whole vocabulary columns and LGR rows a pass. Per
+// 8-wide k chunk each weight is one 16-byte load widened once, each activation row's chunk is one
+// 16-byte load widened once and shared by the LGC columns. Every (row, column) sum is formed exactly
+// as logits_gemm_body forms it -- s = 0; s += a[p] * w[p] for p = 0..7; acc += s per chunk in k
+// order; lane butterfly; then the eight wave partials in wave order -- so it is BYTE-IDENTICAL.
+// Needs a, w 16-byte aligned and a_ld a multiple of eight (the host checks).
+__device__ __forceinline__ void lg_widen8(const uint4 v, float* f) {
+    f[0] = __builtin_bit_cast(float, v.x << 16); f[1] = __builtin_bit_cast(float, v.x & 0xffff0000u);
+    f[2] = __builtin_bit_cast(float, v.y << 16); f[3] = __builtin_bit_cast(float, v.y & 0xffff0000u);
+    f[4] = __builtin_bit_cast(float, v.z << 16); f[5] = __builtin_bit_cast(float, v.z & 0xffff0000u);
+    f[6] = __builtin_bit_cast(float, v.w << 16); f[7] = __builtin_bit_cast(float, v.w & 0xffff0000u);
+}
+// Sixteen accumulators a lane, each wave-summed with r4d_wave_sum's exact tree (offsets 16, 8, 4, 2,
+// 1; every add is commutative, so a lane holding both operands' sums in either order is bit-equal):
+// after the offset-16 add both lanes of a pair hold the same sums, so one keeps the low eight values
+// and the other the high eight, and so down. Lane l ends with the wave sum of value (l >> 1) & 15.
+__device__ __forceinline__ float lg_wave_sum16(float (&a)[16], uint32_t lane) {
+    const bool l1 = lane & 2u, l2 = lane & 4u, l4 = lane & 8u, l8 = lane & 16u;
+    float b[8], c[4], d[2];
+#pragma unroll
+    for (uint32_t q = 0; q < 16; ++q) a[q] = a[q] + swap16(a[q]);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; ++j) b[j] = r4d_dpp_xor_add<0x168>(r4d_pick(l8, a[8 + j], a[j]));
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) c[j] = r4d_dpp_xor_add<0x164>(r4d_pick(l4, b[4 + j], b[j]));
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) d[j] = r4d_dpp_xor_add<0x162>(r4d_pick(l2, c[2 + j], c[j]));
+    return r4d_dpp_xor_add<0x161>(r4d_pick(l1, d[1], d[0]));
+}
+template <uint32_t LGR, uint32_t LGC>
+__device__ __forceinline__ void logits_gemm_body_wide(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    __shared__ float lds[kWaves][LGR * LGC];
+    const uint32_t j0 = blockIdx.x * LGC;
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+
+    for (uint32_t r0 = 0; r0 < M; r0 += LGR) {
+        const uint32_t nr = (M - r0) < LGR ? (M - r0) : LGR;
+        float acc[LGR][LGC];
+#pragma unroll
+        for (uint32_t i = 0; i < LGR; ++i)
+#pragma unroll
+            for (uint32_t x = 0; x < LGC; ++x) acc[i][x] = 0.0f;
+
+        for (uint32_t k = threadIdx.x * kLgVec; k < K; k += kThreads * kLgVec) {
+            float wf[LGC][8];
+#pragma unroll
+            for (uint32_t x = 0; x < LGC; ++x) {
+                uint4 wv = make_uint4(0, 0, 0, 0);
+                if (j0 + x < N) wv = *(const uint4*)(w + (size_t)(j0 + x) * K + k);
+                lg_widen8(wv, wf[x]);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < LGR; ++i) {
+                // rows past M re-read the last row (the sums are discarded): no dynamic row count
+                const uint32_t ri = (r0 + i) < M ? (r0 + i) : M - 1;
+                const uint4 av = *(const uint4*)(a + (size_t)ri * a_ld + k);
+                float af[8];
+                lg_widen8(av, af);
+#pragma unroll
+                for (uint32_t x = 0; x < LGC; ++x) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (uint32_t p = 0; p < kLgVec; ++p) s += af[p] * wf[x][p];
+                    acc[i][x] += s;
+                }
+            }
+        }
+
+        static_assert((LGR * LGC) % 16 == 0, "reduce in groups of sixteen");
+#pragma unroll
+        for (uint32_t g = 0; g < LGR * LGC / 16; ++g) {
+            float t[16];
+#pragma unroll
+            for (uint32_t q = 0; q < 16; ++q) t[q] = acc[(g * 16 + q) / LGC][(g * 16 + q) % LGC];
+            const float v = lg_wave_sum16(t, lane);
+            if (!(lane & 1u)) lds[wave][g * 16 + ((lane >> 1) & 15u)] = v;
+        }
+        __syncthreads();
+        for (uint32_t t = threadIdx.x; t < nr * LGC; t += kThreads) {
+            float v = 0.0f;
+#pragma unroll
+            for (uint32_t q = 0; q < kWaves; ++q) v += lds[q][t];
+            const uint32_t i = t / LGC, x = t % LGC;
+            if (j0 + x < N) c[(size_t)(r0 + i) * c_ld + j0 + x] = v;
+        }
+        __syncthreads();
+    }
+}
+#define LG_WIDE_KERNEL(R, C)                                                                       \
+    __global__ __launch_bounds__(kThreads) void logits_gemm_wide_##R##x##C(                        \
+        const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,     \
+        uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {                        \
+        logits_gemm_body_wide<R, C>(a, w, c, M, K, N, a_ld, c_ld);                                 \
+    }
+LG_WIDE_KERNEL(8, 8)
 
 // The same projection with each wave taking four whole vocabulary columns, for a head where the
 // 256-thread block per column is the cost: at n_embd 4096 a thread of that kernel makes two 16-byte
@@ -1815,9 +1925,17 @@ extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
     if (K % (int)kLgVec) return -3;      // a thread owns eight columns; see the kernel
     if (!a_ld) a_ld = K;
     if (!c_ld) c_ld = N;
-    hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
-                       (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
-                       (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    // M > 8: eight rows by eight columns a block (logits_gemm_body_wide), 16-byte loads of both
+    // operands. Byte-identical to the 8-row kernel, which stays the form for M <= 8 and for operands
+    // that are not 16-byte aligned.
+    if (M > (int)kLgRows && !(((uintptr_t)a | (uintptr_t)w | ((uintptr_t)a_ld * 2)) & 15))
+        hipLaunchKernelGGL(logits_gemm_wide_8x8, dim3((uint32_t)(((uint32_t)N + 7) / 8)), dim3(kThreads), 0,
+                           (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
+                           (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    else
+        hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
+                           (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
+                           (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
