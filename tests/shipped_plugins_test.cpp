@@ -107,7 +107,8 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "qwen35moe", "fp8_e4m3" },
         { "qwen35moe", "w8a8_fwht128" },
         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
-        { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" },
+        { "minimaxmusic3", "" }, { "mossimage", "" }, { "qwen4exp", "" },
+        { "qwenimage21", "" },
         { "spark25", "" }, { "spark25", "w8a8_fwht128" }, { "sdxl", "" },
         { "unlimitedocr", "" }, { "wan", "" } };
     std::set<std::pair<std::string, std::string>> got;
