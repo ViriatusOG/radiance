@@ -1,5 +1,5 @@
 #!/bin/sh
-# page_rules.sh — the three page rules that were each broken in production, stated where a build
+# page_rules.sh — the page rules that were each broken in production, stated where a build
 # can check them. Every rule here came from a report of a tile that read wrong on a live lane.
 #
 # These read dashboard/src, not the shipped bytes, because the two tests beside this one close the
@@ -42,6 +42,21 @@ echo "== a tile's detail line reads engine stats only =="
 grep -q 'of best' "$PAGE" \
   && bad "the page computes a percent-against-best drift figure" \
   || good "no page-side percent-against-best figure"
+
+echo "== a tile's figure is a bare number; its unit is the tile's suffix =="
+# A tile renders `<figure> <unit>`: the figure string, then the metric's `unit` as a separate span.
+# So a figure that goes through a formatter which bakes the unit into the number prints it twice --
+# the Step tile's fMs gave "25.34 ms" and the tile's suffix added a small ms after it. Formatters
+# that append a unit belong on detail lines, which append nothing after them.
+if grep -q 'id: "step"' "$PAGE"; then
+  if sed -n '/id: "step"/,/lines:/p' "$PAGE" | grep -qE 'return \[fin\(v\) \? fMs\('; then
+    bad "the Step tile's figure goes through a formatter that appends the unit the tile appends"
+  else
+    good "the Step tile's figure is a bare number, its unit suffix the only unit"
+  fi
+else
+  bad "the Step tile is gone from the page"
+fi
 
 echo "== a rate's graph never joins across its gaps, and matches its own tile =="
 # The prefill tile was on the other side of that bug: the graph drew prefillRate with uPlot's

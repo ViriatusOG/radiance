@@ -14,7 +14,11 @@ committed as core/server/dashboard_page.h and this keeps the two together:
 The digest lives inside the header and only proves sources and claim agree; the served bytes are
 hashed from outside by tests/ARTIFACTS (the ctest `artifact_sums`), so tampering with the header
 alone fails. After a real rebuild, re-record both in the same commit:
-  sha256sum $(awk '{print $2}' tests/ARTIFACTS) > tests/ARTIFACTS
+  tests/artifact_sums.sh . --record core/server/dashboard_page.h
+Name the artifacts. Reading the manifest into the command that overwrites it truncates it first, so
+the substitution reads an empty file, sha256sum hashes its own empty stdin, and the manifest ends up
+"e3b0c442…  -" -- the hash of nothing against a file named "-", which `sha256sum -c` answers with the
+same empty stdin. That line checks nothing and passes forever (artifact_sums.sh refuses it).
 """
 import hashlib, os, sys
 
