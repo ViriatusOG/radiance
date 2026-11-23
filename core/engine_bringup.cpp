@@ -5096,6 +5096,44 @@ int Engine::start() {
         decide("kernel selection", libs.empty() ? "none" : libs + " op bands",
                rows.empty() ? std::string() : "attention:\n" + rows);
     }
+    {
+        /* The vocab projection's row per M band (device domain), and the rows registered for it
+         * that no band selected, so an opt-in row that is registered but inactive (the WMMA row's
+         * priority sits below the scalar row's by default) is visible rather than implied. */
+        std::set<const KernelRow*> used;
+        std::string bands_s;
+        for (const OpInfo& op : ranks_[0]->program.ops) {
+            if (op.op != "logits_gemm") continue;
+            for (const Band& b : op.bands) {
+                /* Labelled by declared op index: a drafter head's logits_gemm is its own op. */
+                const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                bands_s += fmt("%s%s (op #%d) -> %s", bands_s.empty() ? "" : "\n", b.span.c_str(), (int)op.index,
+                               row && row->info ? fmt("%s (%s, prio %d)", row->info->name,
+                                                      row->plugin.c_str(), row->info->priority).c_str()
+                                                : "none");
+                if (row) used.insert(row);
+            }
+        }
+        std::string idle;
+        if (const auto* rows = reg_->rows_for("logits_gemm"))
+            for (const KernelRow* r : *rows)
+                if (r->info && !used.count(r) && !bands_s.empty() &&
+                    r->info->domain == RAD_DOMAIN_DEVICE) {
+                    /* Only flag the opt-in as inactive where it lost on priority to a scalar row. */
+                    bool wmma = false;
+                    if (std::strstr(r->info->name, "wmma"))
+                        for (const KernelRow* o : *rows)
+                            if (o && o->info && o != r && used.count(o) && o->info->domain == RAD_DOMAIN_DEVICE &&
+                                !std::strstr(o->info->name, "wmma") && r->info->priority < o->info->priority)
+                                wmma = true;
+                    idle += fmt("%s%s (prio %d)%s", idle.empty() ? "" : ", ", r->info->name,
+                                r->info->priority, wmma ? " [WMMA opt-in: INACTIVE]" : "");
+                }
+        if (!bands_s.empty()) {
+            RAD_INFO("logits_gemm rows by M band:\n%s%s%s", bands_s.c_str(),
+                     idle.empty() ? "" : "\n  registered but not selected: ", idle.c_str());
+        }
+    }
 
     RAD_TRY(plan());
     bringup.unlock();
