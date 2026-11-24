@@ -4626,6 +4626,12 @@ void* pin_pieces(int64_t bytes) {
         warn_if_no_huge_pages();
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
+    /* lock_to_pool mirrors the pages through HMM and does not pin them: a swapped or reclaimed
+     * page makes the driver evict every queue of the process until it restores them.
+     * pin_pieces_file does the same; a refusal (the memlock limit) costs only that. */
+    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
+        RAD_WARN("device: the pinned range %p (%s) could not be locked against swap (mlock2: %s)",
+                 (void*)p, humanb(len).c_str(), std::strerror(errno));
     prefault(p, len);
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
