@@ -205,6 +205,10 @@ endforeach()
 # reads a weight in the order it is stored (see r3d_rows.cpp). There is no fusion source because
 # no fused row exists.
 set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp)
+if(R3D_GPU_TARGETS STREQUAL "gfx1100")
+  list(APPEND R3D_SRC ${CMAKE_CURRENT_SOURCE_DIR}/r3d_gemm_iqr.hip)
+  list(APPEND R3D_DECLARATION r3d_iqr_layout.cpp)
+endif()
 
 rad_add_plugin(libr3d kernels
   SOURCES     ${R3D_DECLARATION}
@@ -217,6 +221,9 @@ rad_add_plugin(libr3d kernels
 # (core/plugin/loader.cpp, target_covers). A library built for two archs says two.
 string(REPLACE ";" " " R3D_BUILD_TARGET "${R3D_GPU_TARGETS}")
 target_compile_definitions(libr3d PRIVATE R3D_BUILD_TARGET="${R3D_BUILD_TARGET}")
+if(R3D_GPU_TARGETS STREQUAL "gfx1100")
+  target_compile_definitions(libr3d PRIVATE R3D_DENSE_IQR)
+endif()
 
 # Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
 # catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol

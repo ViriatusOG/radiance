@@ -44,6 +44,16 @@
 #include "r3d_plugin.h"
 #include "rad_abi_layout.h"
 
+#ifdef R3D_DENSE_IQR
+extern "C" int r3d_rad_gemm_iqr(const RadArgs*, RadStream);
+extern "C" int r3d_rad_layout_iqr(const RadParam*, int, int, const RadEncoding*,
+                                  const int*, const RadTensor*, int, RadLayout*);
+extern "C" int r3d_rad_relayout_iqr(const RadParam*, int, int, const RadEncoding*,
+                                    const int*, const RadTensor*, int, void*, int64_t);
+extern "C" int r3d_rad_unrelayout_iqr(const RadParam*, int, int, const RadEncoding*,
+                                      const int*, const void*, int64_t, const RadTensor*, int);
+#endif
+
 #ifndef R3D_BUILD_TARGET
 #define R3D_BUILD_TARGET "gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151"
 #endif
@@ -1632,7 +1642,20 @@ static const RadConstraint cDflashSelect[] = { C_IN("dtype", "bf16"), C_GE("M", 
                                                C_LE("top_k", 256), C_GE("rank", 1),
                                                C_GE("n_vocab", 1) };
 
+#ifdef R3D_DENSE_IQR
+static const RadConstraint cDenseIqr[] = { C_IN("dtype", "i8a8h"), C_EQ("group", 128),
+       C_GE("M", 1), C_LE("M", 2048), C_GE("N", 128), C_DIV("N", 128), C_GE("K", 128), C_DIV("K", 128) };
+#endif
+
 static const RadKernelInfo kKernels[] = {
+#ifdef R3D_DENSE_IQR
+{ "gemm_nt_q_iqr", "gemm_nt_q", "gemm", "Computed-trellis IQR with exact integer group sums",
+  "u3/u4/u5, L16, run 128 or 256, BF16 group scales or factored F32 scales",
+  "rotated int8 activations against packed weights, bf16 output",
+  RAD_DOMAIN_DEVICE, 1, ROW(cDenseIqr), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_iqr, nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  nullptr, r3d_rad_unrelayout_iqr },
+#endif
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
  *
  * One workgroup a row. The `shape` column states the geometry the grid is built for; the
