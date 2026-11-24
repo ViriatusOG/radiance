@@ -166,6 +166,7 @@ set(R3D_UNITS
   # The grouped E4M3 x E4M3 GEMM (moe_gemm_q): both operands fp8, staged compact and upcast to f16
   # in registers (the FeatherOps bit trick), the f16 wave-matrix, a per-(row, g-of-K) scale fold.
   "r3d_moe_gemm_q|"
+  "r3dh_moe_iqr|"
   # The grouped GEMM with unquantised bf16 experts: the same run-walk / gather as moe_gemm_q, the
   # bf16 operands loaded straight into the bf16 wave-matrix fragments (f32 accumulate), no decode.
   "r3d_moe_gemm_bf16|"
@@ -201,10 +202,9 @@ endforeach()
 
 # The host sources are declaration only: the row table and the operand descriptions. They are pure
 # host C++ that includes neither r3d.h nor hip_runtime.h, so the tables compile and can be inspected
-# without ROCm. libr3d has no layout source: nothing it serves is repacked, because a dot2 GEMM
-# reads a weight in the order it is stored (see r3d_rows.cpp). There is no fusion source because
-# no fused row exists.
-set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp)
+# without ROCm. The routed IQR rows own a reversible host weight layout; on gfx1100 so do the dense
+# IQR rows.
+set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp r3dh_moe_iqr_layout.cpp)
 if(R3D_GPU_TARGETS STREQUAL "gfx1100")
   list(APPEND R3D_SRC ${CMAKE_CURRENT_SOURCE_DIR}/r3d_gemm_iqr.hip)
   list(APPEND R3D_DECLARATION r3d_iqr_layout.cpp)

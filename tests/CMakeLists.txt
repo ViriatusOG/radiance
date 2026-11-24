@@ -50,6 +50,20 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
 set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+add_executable(r3d_moe_iqr_host r3d_moe_iqr_host.cpp ../libr3d/r3dh_moe_iqr_layout.cpp)
+target_link_libraries(r3d_moe_iqr_host PRIVATE radiance::abi)
+add_test(NAME r3d_moe_iqr_host COMMAND r3d_moe_iqr_host)
+set_tests_properties(r3d_moe_iqr_host PROPERTIES LABELS unit)
+if(TARGET libr3d)
+  add_executable(r3d_moe_iqr_gpu r3d_moe_iqr_gpu.cpp ../core/util/rad_util.cpp)
+  target_link_libraries(r3d_moe_iqr_gpu PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  target_compile_options(r3d_moe_iqr_gpu PRIVATE -ffp-contract=off)
+  add_dependencies(r3d_moe_iqr_gpu libr3d)
+  add_test(NAME r3d_moe_iqr_catalogue COMMAND r3d_moe_iqr_gpu $<TARGET_FILE:libr3d> --catalogue-only)
+  set_tests_properties(r3d_moe_iqr_catalogue PROPERTIES LABELS unit)
+  add_test(NAME r3d_moe_iqr_gpu COMMAND r3d_moe_iqr_gpu $<TARGET_FILE:libr3d>)
+  set_tests_properties(r3d_moe_iqr_gpu PROPERTIES LABELS gpu RESOURCE_LOCK card SKIP_RETURN_CODE 77)
+endif()
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)

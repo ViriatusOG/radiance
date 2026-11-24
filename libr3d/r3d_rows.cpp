@@ -43,6 +43,7 @@
 
 #include "r3d_plugin.h"
 #include "r3d_i8_gemm_rows.h"
+#include "r3dh_moe_iqr.h"
 #include "rad_abi_layout.h"
 
 #ifndef R3D_BUILD_TARGET
@@ -1449,6 +1450,14 @@ static const RadConstraint cMoeGemmQ[] = { C_IN("dtype", "fp8a8f32"), C_GE("n_ex
                                            C_GE("top_k", 1) };
 static const RadConstraint cMoeGemmMxfp4[] = { C_IN("dtype", "mxfp4a8"), C_GE("n_expert", 1),
                                                C_GE("top_k", 1) };
+#define IQR_GATE_CONSTRAINTS(even, odd) { C_IN("dtype", "i8a8h"), C_IN("a_order", "token"), \
+       C_GE("M", 1), C_LE("M", 2048), C_EQ("N", even), C_EQ("N_odd", odd), C_EQ("K", 2560), \
+       C_EQ("K_odd", 2560), C_EQ("n_expert", 512), C_EQ("top_k", 10), C_EQ("group", 128), \
+       C_EQ("a_group", 128), C_EQ("parts", 2) }
+static const RadConstraint cIqrGateEvenWide[] = IQR_GATE_CONSTRAINTS(768, 512);
+static const RadConstraint cIqrGateOddWide[] = IQR_GATE_CONSTRAINTS(512, 768);
+static const RadConstraint cIqrGateFull[] = IQR_GATE_CONSTRAINTS(1280, 1280);
+#undef IQR_GATE_CONSTRAINTS
 static const RadConstraint cMoeGemmQW4A8[] = { C_IN("dtype", "w4a8"), C_GE("n_expert", 1),
                                                C_GE("top_k", 1) };
 static const RadConstraint cMoeGemmW4A4[] = { C_IN("dtype", "w4a4"), C_GE("n_expert", 1),
@@ -1615,6 +1624,16 @@ static const RadConstraint cDflashSelect[] = { C_IN("dtype", "bf16"), C_GE("M", 
                                                C_GE("steps", 1), C_GE("top_k", 1),
                                                C_LE("top_k", 256), C_GE("rank", 1),
                                                C_GE("n_vocab", 1) };
+
+template<size_t Count>
+static constexpr RadKernelInfo iqr_gate(const char* name, const RadConstraint (&constraints)[Count]) {
+       return {name, "moe_gemm_q", "moe", "Routed IQR gate and up projections in sorted slot order",
+              "even/odd expert tables; each half padded to the wider class; dropped rows zeroed",
+              "token i8 and f32 group scales; trellis u4, MAD16 and row/column f32 scales; bf16 result",
+              RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY, constraints, Count, nullptr, 0, nullptr, nullptr, nullptr,
+              r3dh_moe_iqr_launch, nullptr, r3dh_moe_iqr_layout, r3dh_moe_iqr_relayout,
+              r3dh_moe_iqr_shape, r3dh_moe_iqr_unrelayout};
+}
 
 static const RadKernelInfo kKernels[] = {
 #ifdef R3D_DENSE_IQR
@@ -2401,6 +2420,9 @@ static const RadKernelInfo kKernels[] = {
   * registers (the 256-entry decode table), the f16 wave-matrix, the even experts in `w` and the
   * odd in `w_odd`.
   */
+ iqr_gate("model_moe_iqr_768_512_strict", cIqrGateEvenWide),
+ iqr_gate("model_moe_iqr_512_768_strict", cIqrGateOddWide),
+ iqr_gate("model_moe_iqr_1280_1280_strict", cIqrGateFull),
  { "moe_gemm_q_e4m3", "moe_gemm_q", "moe",
   "The grouped quantised GEMM over the model's fp8a8f32 experts: y[i] = a[sorted_tok[i]/top_k] @ "
   "w_e^T with a per-(row, grid-of-K) scale fold, e the expert of sorted row i",
