@@ -2734,6 +2734,14 @@ top-16 at each of the 12 positions: on one R9700 the top-1 agrees at 12 of 12, t
 12, 10, 0.045 and 0.24. The stream after each of the 48 layer applications stays within 1 to 6% of
 the reference's (relative L2), the bf16 activations and the experts' int8 inputs.
 
+`data/recipes/inkling2-mini-i8.recipe` re-quantises the NVFP4 experts of layers 0..19 to the same
+rotated int8 as layers 20..23, so every expert runs `moe_gemm_q` at `i8a8h`, which has a WMMA path
+where `nvfp4a8i8` does not. On one R9700: decode 35.9 t/s instead of 28.6, a 3220-token prompt
+prefilled at 1355 t/s (the NVFP4 container: 195 t/s at 2820), for 23.4 GiB of experts instead of
+about 15. Against the NVFP4 container in rad's KL mode (full vocabulary, 25218 positions of German,
+English and code): mean KL 0.0065, median 0.0015, p99 0.064, top-1 agreement 97.2 %, perplexity
+4.737 against 4.744. The DSpark drafter below pays only on this form (see its measurements).
+
 ## The DSpark drafter (`mtp.safetensors`)
 
 The release ships a drafter beside the target, configured by config.json's `mtp_config`, and the
@@ -2782,6 +2790,20 @@ Kernels: the drafter's attention is `attn_paged_anchor_window` (local layers, wi
 `kv_draft_local` (windowed) and `kv_draft_full`. Two roundings differ from the reference: each norm
 after a residual add reads the bf16 sum (fused_add_rmsnorm takes the variance of the unrounded
 one), and the tap mix is rounded to bf16 before its norm.
+
+Measured on one R9700, greedy, 256 tokens a prompt, `--num-speculative-tokens 7`; acceptance is the
+share of drafted tokens the target kept, and a step emits that many plus one:
+
+| prompt | NVFP4 experts, without / with | int8 experts (`inkling2-mini-i8.recipe`), without / with | acceptance | tokens a step |
+|---|---|---|---|---|
+| code (a Python class) | 28.6 / 19.7 t/s | 35.9 / 57.7 t/s | 24-27 % | 2.7-2.8 |
+| prose (German) | 28.6 / 12.6 t/s | 35.9 / 35.8 t/s | 11 % | 1.7-1.8 |
+| reasoning (arithmetic) | 28.1 / 29.6 t/s | 35.9 / 78.6 t/s | 39-40 % | 3.8 |
+
+By draft position, given the earlier ones held: 60, 58, 64, 58, 60, 83, 65 %. The greedy outputs with
+and without the drafter are identical on all three prompts. A verify runs eight rows through the
+experts, up to 64 distinct experts a step, and the NVFP4 experts' kernel has no WMMA path: there
+the verify costs more than the accepted tokens save, so serve the drafter with the int8 recipe.
 
 ---
 
