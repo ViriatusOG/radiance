@@ -164,21 +164,13 @@ static void check_table() {
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64");
-        /* The query and the writer come as a pair, and the pair is the rule: a row with a hook must
-         * supply the relayout that produces the form the hook names (abi/rad_abi.h -- a query
-         * answering RAD_OK is a promise the loader keeps on the row's word), and no row may carry an
-         * unrelayout, because nothing in this library invents a format a tool would need to invert.
-         * A hook with a null writer is the failure the engine reports at load -- `could not produce
-         * 'output.weight' (rad.planes) from fp8_e4m3*bf16[128x128]: unsupported` -- and a relayout
-         * without a hook is a row repacking a weight nobody asked to have repacked.
-                         || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled");
-        /* A layout hook and its relayout writer come as a pair (abi/rad_abi.h: a query answering
-         * RAD_OK promises the loader the writer produces that form; a hook without one fails at
-         * load). No row may carry an unrelayout, since this library invents no format a tool
-         * would need to invert. */
-        if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
-            || (k->relayout && !k->layout) || k->unrelayout)
+        if (!std::strcmp(k->name, "gemm_nt_q_iqr")) {
+            if (!k->layout || !k->relayout || !k->unrelayout || !k->opd_shape)
+                fail("row '%s' lacks a packed weight or operand description hook", k->name);
+        } else if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
+                   || (k->relayout && !k->layout) || k->unrelayout) {
             fail("row '%s' declares a layout hook; libr3d stores weights in order", k->name);
+        }
         if (!k->computes || !*k->computes || !k->shape || !*k->shape || !k->dtypes ||
             !*k->dtypes)
             fail("row '%s' is missing prose", k->name);
@@ -2496,6 +2488,10 @@ static int run_row(int i) {
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
         skip("no device visible");
+        return 0;
+    }
+    if (!std::strcmp(k->name, "gemm_nt_q_iqr")) {
+        skip("canonical operands require trellis relayout; covered by r3d_iqr_device_test_card");
         return 0;
     }
     const int hand = k->opd_shape ? 0

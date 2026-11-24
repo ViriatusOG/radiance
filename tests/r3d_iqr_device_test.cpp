@@ -138,16 +138,17 @@ void differential(const RadKernelInfo& row, RadStream stream, unsigned bits, int
     }
     DeviceBuffer input(activation, stream), input_scale(activation_scales, stream), packed(weight, stream),
                  packed_scale(scales, stream), result(output, stream);
-    RadTensor tensors[]{matrix(input.data, RAD_I8, rows, reduction, input_pitch),
+    const int scale_view_width = grouped ? groups : reduction;
+    RadTensor tensors[7]{matrix(input.data, RAD_I8, rows, reduction, input_pitch),
                         matrix(input_scale.data, RAD_F32, rows, groups, scale_pitch),
                         matrix(packed.data, layout[0].dtype, columns, reduction),
-                        matrix(packed_scale.data, layout[1].dtype, columns, grouped ? groups : reduction),
+                        matrix(packed_scale.data, layout[1].dtype, columns, scale_view_width),
                         matrix(static_cast<uint16_t*>(result.data) + guard, RAD_BF16, rows, columns, out_pitch)};
     if (rows > 1) {
         tensors[4].rank = 3; tensors[4].shape[1] = columns / 16; tensors[4].shape[2] = 16;
         tensors[4].stride[1] = 16; tensors[4].stride[2] = 1;
     }
-    RadArgs args{}; args.t = tensors; args.n_t = 5; args.p = params; args.n_p = 5;
+    RadArgs args{}; args.t = tensors; args.n_t = 7; args.p = params; args.n_p = 5;
     check(row.launch(&args, stream), "launch");
     check(rad_memcpy_async(output.data(), result.data, output.size() * sizeof(uint16_t), stream), "download");
     check(rad_stream_sync(stream), "sync");

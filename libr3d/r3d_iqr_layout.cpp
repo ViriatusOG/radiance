@@ -99,6 +99,25 @@ int64_t stored_bytes(const View& view, int operand) {
 
 }
 
+extern "C" int r3d_shape_gemm_iqr(const RadParam* params, int count, int operand, RadOpdDesc* output) {
+    if (!output || operand < 0 || operand > 6) return RAD_E_INVAL;
+    const int64_t rows = rad_param_geti(params, count, "M", 0);
+    const int64_t columns = rad_param_geti(params, count, "N", 0);
+    const int64_t reduction = rad_param_geti(params, count, "K", 0);
+    if (rows < 1 || rows > 2048 || columns < 128 || columns % 128 || reduction < 128
+        || reduction % 128 || rad_param_geti(params, count, "group", 128) != 128)
+        return RAD_E_SHAPE;
+    *output = RadOpdDesc{};
+    output->idx_const = -1;
+    if (operand >= 5) { output->flags = RAD_OPD_F_ABSENT; return RAD_OK; }
+    output->rank = 2;
+    output->dtype = operand == 0 || operand == 2 ? RAD_I8 : operand == 4 ? RAD_BF16 : RAD_F32;
+    output->shape[0] = operand == 2 || operand == 3 ? columns : rows;
+    output->shape[1] = operand == 4 ? columns : operand == 1 || operand == 3 ? reduction / 128 : reduction;
+    if (operand == 1 || operand == 3) output->fill = RAD_FILL_SIGMOID;
+    return RAD_OK;
+}
+
 extern "C" int r3d_rad_layout_iqr(const RadParam* params, int count, int operand,
     const RadEncoding* encoding, const int* selected, const RadTensor* planes,
     int plane_count, RadLayout* output) {

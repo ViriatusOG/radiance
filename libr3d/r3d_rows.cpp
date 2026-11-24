@@ -42,17 +42,8 @@
  */
 
 #include "r3d_plugin.h"
+#include "r3d_i8_gemm_rows.h"
 #include "rad_abi_layout.h"
-
-#ifdef R3D_DENSE_IQR
-extern "C" int r3d_rad_gemm_iqr(const RadArgs*, RadStream);
-extern "C" int r3d_rad_layout_iqr(const RadParam*, int, int, const RadEncoding*,
-                                  const int*, const RadTensor*, int, RadLayout*);
-extern "C" int r3d_rad_relayout_iqr(const RadParam*, int, int, const RadEncoding*,
-                                    const int*, const RadTensor*, int, void*, int64_t);
-extern "C" int r3d_rad_unrelayout_iqr(const RadParam*, int, int, const RadEncoding*,
-                                      const int*, const void*, int64_t, const RadTensor*, int);
-#endif
 
 #ifndef R3D_BUILD_TARGET
 #define R3D_BUILD_TARGET "gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151"
@@ -244,18 +235,6 @@ static const RadParamSpec pGemm[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR(
  * libr4d's, and the loader compares positionally. */
 static const RadOperandSpec oGemm[] = { { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
                                         { "y", RAD_OPD_OUT, 0 } };
-
-/* `w_rb` is libr4d's (docs/OPS.md), accepted and ignored: an int8 weight's per-row scale plane
- * holds each block's value in every row, and the trellis forms that need it are IQR dtypes, which
- * no row here serves. */
-static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                       P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
-                                       P_INTO("split_n"), P_INTO("w_rb") };
-static const RadOperandSpec oGemmQ[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 1 },
-                                         { "b", RAD_OPD_WEIGHT, 0 },
-                                         { "b_scale", RAD_OPD_WEIGHT, 0 },
-                                         { "y", RAD_OPD_OUT, 0 }, { "a_sum", RAD_OPD_IN, 1 },
-                                         { "b_ref", RAD_OPD_WEIGHT, 1 } };
 
 /* --- gated-delta-net --- */
 static const RadParamSpec pGdnKktSolve[] = { P_INT("M"), P_INT("head_k"), P_CHUNK("chunk") };
@@ -776,7 +755,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gemm_nt_f32", pGemm, oGemm,
            "BF16 activations times F32 weights, F32 accumulation and output; preserves routing "
            "and index gate precision."),
-    SCHEMA("gemm_nt_q", pGemmQ, oGemmQ,
+    SCHEMA("gemm_nt_q", r3d_i8_gemm::params, r3d_i8_gemm::operands,
            "The same product against a quantised weight. `dtype` names the scheme: fp8a16 a bf16 "
            "activation against E4M3 codes, fp8a8 quant_act_fp8's codes and scales, i8a8 int8 on "
            "both axes. `group` is the activation's scale width; `pb1` and `pb2` the weight's block, "
@@ -1553,11 +1532,6 @@ static const RadConstraint cGemmQFp8a16[] = { C_IN("dtype", "fp8a16"),
 static const RadConstraint cGemmQFp8a8[]  = { C_IN("dtype", "fp8a8"),
                                               C_EQ("group", R3D_FP8_BLOCK), C_GE("M", 1),
                                               C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
-/* The int8 trunk GEMM: i8a8 and its rotated twin i8a8h are one launch (the rotation is in the
- * stored weight and in the activation's quantiser). Every M: the kernel tiles M itself. */
-static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8 i8a8h"),
-                                              C_EQ("group", R3D_W8_GROUP), C_GE("M", 1),
-                                              C_DIV("K", 128), C_GE("N", 1) };
 
 /* ================================================================== the rows
  *
@@ -1642,19 +1616,9 @@ static const RadConstraint cDflashSelect[] = { C_IN("dtype", "bf16"), C_GE("M", 
                                                C_LE("top_k", 256), C_GE("rank", 1),
                                                C_GE("n_vocab", 1) };
 
-#ifdef R3D_DENSE_IQR
-static const RadConstraint cDenseIqr[] = { C_IN("dtype", "i8a8h"), C_EQ("group", 128),
-       C_GE("M", 1), C_LE("M", 2048), C_GE("N", 128), C_DIV("N", 128), C_GE("K", 128), C_DIV("K", 128) };
-#endif
-
 static const RadKernelInfo kKernels[] = {
 #ifdef R3D_DENSE_IQR
-{ "gemm_nt_q_iqr", "gemm_nt_q", "gemm", "Computed-trellis IQR with exact integer group sums",
-  "u3/u4/u5, L16, run 128 or 256, BF16 group scales or factored F32 scales",
-  "rotated int8 activations against packed weights, bf16 output",
-  RAD_DOMAIN_DEVICE, 1, ROW(cDenseIqr), NOTUNE,
-  nullptr, nullptr, r3d_rad_gemm_iqr, nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
-  nullptr, r3d_rad_unrelayout_iqr },
+    r3d_i8_gemm::packed,
 #endif
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
  *
@@ -2731,23 +2695,7 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r3d_rad_gemm_nt_q_w8a8_m64,
    nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_w8a8 },
 
-{ "gemm_nt_q_i8a8", "gemm_nt_q", "gemm",
-  "the int8 trunk grid (i8a8, and i8a8h, its rotated twin): signed int8 codes against row-major "
-  "int8 activations, the group's integer sub-sum scaled by the activation's (row, group) scale "
-  "and the weight's (row, group) scale",
-  "group 128, K a multiple of it, every M; below M = 128 a wave is a 16-column tile over one "
-  "16-row tile (M <= 16) or two, the weight read from global at each step; from M = 128 a block "
-  "is a 128x128 output tile with a group of both operands staged in LDS, so a prefill chunk "
-  "reads the weight once per 128 rows",
-  "I8 a row-major with an f32 scale per (row, 128 of K) -- quant_act_i8g's output, or "
-  "had_quant_act_i8g's at i8a8h; I8 codes b with a bf16 scale per (row, 128 of K), bf16 y, fp32 "
-  "accumulation in ascending group order; the sub-sums are exact integers under 2^24, and the "
-  "store is the only narrowing; each group term rounds as quant_dot's (two multiplies, an add, "
-  "none fused), so the row is bit-identical to the reference; no zero point, so no a_sum",
-  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
-  ROW(cGemmQI8), NOTUNE,
-  nullptr, nullptr, r3d_rad_gemm_nt_q_i8a8,
-  nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_i8a8 },
+    r3d_i8_gemm::native,
 
     { "silu_mul_bf16", "silu_mul", "elem",
       "silu(gate) * up over one fused gate_up plane, the gate the first half",
