@@ -131,6 +131,12 @@ static const RadParamSpec* find_param(const RadOpSchema* s, const char* key) {
  * default outside its axis (the loader refuses the whole plugin), a row whose `op` names another
  * op's schema, a description whose operand count disagrees with its schema (every case skipped).
  */
+static bool is_expert_iqr_row(const char* name) {
+    return name && (!std::strcmp(name, "model_moe_iqr_768_512_strict") ||
+                    !std::strcmp(name, "model_moe_iqr_512_768_strict") ||
+                    !std::strcmp(name, "model_moe_iqr_1280_1280_strict"));
+}
+
 static void check_table() {
     const int n = rows();
     std::printf("== rows: %d, schemas: %d\n", n, schemas());
@@ -152,19 +158,14 @@ static void check_table() {
         if (!k->launch) fail("row '%s' has no launch", k->name);
         if (k->init && !k->fini) fail("row '%s' inits without a fini", k->name);
         if (k->domain != RAD_DOMAIN_DEVICE) fail("row '%s' is not a device row", k->name);
-        /* No row repacks a weight; kernels read the container's stored order. The exception is the
-         * container's quantised weight (codes and scales as planes behind one operand), which the
-         * mapped tier places only if a loaded library can read it in place. The rows below cover
-         * w2a8's {1,group} grid with a zero, and the fp8a8 GEMM's and lm_head's {128,128} grid
-         * without, each transcribed from the reference's hook. Any other name is a rule change and
-         * should fail here. */
+        /* These rows can read joined weight planes in the container's stored order. */
         const bool joined = 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")
                          || 0 == std::strcmp(k->name, "logits_gemm_bf16")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_fp8a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64");
-        if (!std::strcmp(k->name, "gemm_nt_q_iqr")) {
+        if (!std::strcmp(k->name, "gemm_nt_q_iqr") || is_expert_iqr_row(k->name)) {
             if (!k->layout || !k->relayout || !k->unrelayout || !k->opd_shape)
                 fail("row '%s' lacks a packed weight or operand description hook", k->name);
         } else if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
@@ -2479,6 +2480,10 @@ static int run_row(int i) {
     const RadKernelInfo* k = row_at(i);
     if (!k) return 1;
     std::printf("== %s (%s)\n", k->name, k->op);
+    if (is_expert_iqr_row(k->name)) {
+        skip("packed expert tables require the r3d_moe_iqr_host and r3d_moe_iqr_gpu fixtures");
+        return 0;
+    }
 #ifndef RAD_HAVE_HIP
     (void)i;
     skip("built without the HIP runtime: no device run");

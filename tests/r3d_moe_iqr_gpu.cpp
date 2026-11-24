@@ -200,7 +200,34 @@ int main(int argc, char** argv) {
         const auto* row = rows[index] = match(geometry);
         IQR_CHECK(row && name == row->name && row->layout && row->relayout && row->unrelayout
             && row->opd_shape && row->launch && !row->scratch);
+        RadOpdDesc desc{};
+        for (int operand : {0, 1}) {
+            IQR_CHECK(row->opd_shape(geometry.data(), geometry.size(), operand, &desc) == RAD_OK);
+            IQR_CHECK(desc.rank == 2 && desc.shape[0] == 2 && desc.shape[1] == (operand ? 20 : 2560)
+                && desc.dtype == (operand ? RAD_F32 : RAD_I8));
+        }
+        IQR_CHECK(row->opd_shape(geometry.data(), geometry.size(), 4, &desc) == RAD_OK
+            && desc.rank == 1 && desc.shape[0] == 20 && desc.dtype == RAD_I32
+            && desc.flags == RAD_OPD_F_IDX_UNIQUE && desc.idx_max == 20);
+        for (int operand : {-1, 10})
+            IQR_CHECK(row->opd_shape(geometry.data(), geometry.size(), operand, &desc) == RAD_E_INVAL);
+        std::array<RadTensor, 10> empty{};
+        RadArgs args{};
+        args.p = geometry.data();
+        args.n_p = geometry.size();
+        args.t = empty.data();
+        for (int arity : {8, 9, 10, 11}) {
+            args.n_t = arity;
+            IQR_CHECK(row->launch(&args, nullptr) == (arity == 9 || arity == 10 ? RAD_E_SHAPE : RAD_E_INVAL));
+        }
         auto invalid = geometry;
+        for (int tokens : {0, 1, 2048, 2049}) {
+            invalid[0] = RAD_INT("M", tokens);
+            const bool supported = tokens == 1 || tokens == 2048;
+            IQR_CHECK(match(invalid) == (supported ? row : nullptr));
+            IQR_CHECK(row->opd_shape(invalid.data(), invalid.size(), 8, &desc) == (supported ? RAD_OK : RAD_E_SHAPE));
+        }
+        invalid = geometry;
         invalid[5] = RAD_INT("n_expert", 510);
         IQR_CHECK(!match(invalid));
         invalid = geometry;
