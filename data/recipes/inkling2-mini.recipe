@@ -29,3 +29,11 @@ blk.22.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fw
 blk.22.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 blk.23.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 blk.23.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+# The DSpark drafter (rad-convert --draft-model <release>/mtp.safetensors), when present: the weights
+# its plugin derives at convert are stored bf16, as the reference holds them -- the softmax of
+# `fuse_weight` (one row a draft layer and the head's) and the Markov head's fold of `hidden_out`
+# into the lm_head. Every other drafter tensor is bf16 in the release and copied.
+dspark.alpha.*                   cast dtype=bf16
+dspark.markov.fold               cast dtype=bf16
+dspark.markov.fold_b             cast dtype=bf16

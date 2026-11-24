@@ -30,6 +30,7 @@
  * (core/format/checkpoint.cpp, regroup_inkling_static_w), so the plugin reads one layout.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_dspark_inkling.h>
 
 #include <cmath>
 #include <cstring>
@@ -124,6 +125,16 @@ struct Model {
     rad_op op_embed = 0, op_embed_norm = 0, op_out_mix = 0, op_out_norm = 0, op_rows = 0;
     rad_op op_head = 0, op_softcap = 0, op_pad = 0, op_ones = 0, op_minus = 0;
     rad_op op_pre = 0, op_bank_blk = 0, op_bank_cur = 0, op_reset = 0;
+
+    /* The DSpark drafter (mtp.safetensors), when the container carries it and the serve drafts:
+     * the stream at the tapped applications (`draft.target_layer_ids`, an id of kApps being the
+     * final normed output), one bf16 column slice a tap of b_taps, and the drafter's graph. */
+    bool    have_ds = false;
+    int     n_taps = 0, tap_at[DsparkInkling::N_TAPS] = {};
+    rad_buf b_taps = 0;
+    rad_op  op_tap = 0, op_tap_out = 0;
+    DsparkInkling ds{};
+    DsparkInkling::Wire dsw{};
 
     std::vector<Layer> layers;
 };
@@ -393,6 +404,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_yn  = decl_b(b, nm.f("yn"), RAD_BF16, {T, m.H});
     m.b_hout = decl_b(b, nm.f("hout"), RAD_BF16, {g.max_logit_rows, m.H});
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32, {g.max_logit_rows, g.n_vocab});
+    m.have_ds = ctx->max_spec > 0 && rad_meta_geti(meta, "draft.block_size", 0) > 0;
+    if (m.have_ds) {
+        m.n_taps = parse_layer_ids(rad_meta_gets(meta, "draft.target_layer_ids", nullptr), kApps + 1,
+                                   m.tap_at, DsparkInkling::N_TAPS);
+        if (m.n_taps != DsparkInkling::N_TAPS) {
+            fprintf(stderr, "radiance: inkling2: the drafter names %d trunk taps in 0..%d; its "
+                            "graph mixes %d\n", m.n_taps, kApps, (int)DsparkInkling::N_TAPS);
+            return RAD_E_UNSUPPORTED;
+        }
+        m.b_taps = decl_b(b, nm.f("draft_src"), RAD_BF16, {T, (int64_t)m.n_taps * m.H});
+        if (!m.b_taps) return RAD_E_INVAL;
+        /* written at four points of the step and read by the drafter's passes after it */
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_taps));
+    }
     /* The planner bounds a buffer's life by the op range its declared uses span, in declaration
      * order, but a step runs the 24 physical layers' ops 48 times. A buffer that carries values
      * across applications (the stream, the prelude, the banks, the block planes, the constants)
@@ -638,6 +663,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.op_reset = ew("mul", T, m.H, {m.b_pre, m.b_ones}, m.b_s);
         m.op_out_mix = mix(4, m.b_s, m.w_out_q, m.b_yo, m.b_blk);
         m.op_out_norm = rms(T, m.H, m.w_out_norm, m.b_yo, m.b_yn);
+        if (m.have_ds) {
+            /* a tap is a copy (times one, exact) of the stream into its column slice */
+            m.op_tap = ew("mul", T, m.H, {m.b_s, m.b_ones}, m.b_taps);
+            m.op_tap_out = ew("mul", T, m.H, {m.b_yn, m.b_ones}, m.b_taps);
+            if (!m.op_tap || !m.op_tap_out) return RAD_E_INVAL;
+        }
         m.op_rows = rw(b, RAD_OP(b, "gather_rows", RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
                                                          RAD_INT("n", m.H), RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS), {m.b_yn}, {m.b_hout});
@@ -887,6 +918,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
         }
     }
+
+    /* The drafter last: its passes run after the whole trunk, and the planner lays lifetimes out in
+     * declaration order. Its layers take the absolute indices past the 48 applications. */
+    if (m.have_ds) {
+        DsparkInkling::Target t{};
+        t.embed = m.w_embed;
+        t.embed_norm = m.w_embed_norm;
+        t.head = m.w_head;
+        t.ck_head = nm.ckpt("%s.unembed.weight", pfx);
+        RAD_ARCH_TRY(declare_dspark_inkling(&m.ds, &m.dsw, b, nm, meta, ctx, g, m.b_taps, kApps, t,
+                                            m.VR, m.fcap));
+    }
     return RAD_OK;
 }
 
@@ -1068,9 +1111,16 @@ static void run_layer(RadCtx* c, const Model& m, const RadBatch* batch, int a, b
 
 static void step(RadCtx* c, const RadBatch* batch) {
     const Model& m = g_model[rad_slot(c)];
+    /* A drafter pass: positive is the query pass over [anchor, masks], negative the context pass
+     * over the rows the trunk step just ran. */
+    if (batch->draft_pass != 0 && m.have_ds) {
+        if (batch->draft_pass > 0) m.ds.step(c, batch);
+        else                       m.ds.context(c, batch);
+        return;
+    }
     if (batch->draft_pass || batch->spec_parent || batch->enc || batch->n_mm_rows > 0) {
-        rad_step_fail(c, "inkling2: this step asks for an encoder, a draft pass or media rows, and "
-                         "the program declares none of them");
+        rad_step_fail(c, "inkling2: this step asks for an encoder, a draft pass, a tree verify or "
+                         "media rows, and the program declares none of them");
         return;
     }
     const int64_t T = batch->n_tok;
@@ -1091,6 +1141,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE(c, m.op_reset, brows(m.b_pre, T), brows(m.b_ones, T), brows(m.b_s, T));
         }
         const bool control = a >= 18 && a < 42;
+        /* a drafter's tap at application a reads the stream entering it */
+        for (int t = 0; t < m.n_taps; ++t)
+            if (m.op_tap && m.tap_at[t] == a)
+                RAD_ISSUE_N(c, m.op_tap, T, brows(m.b_s, T), brows(m.b_ones, T),
+                            bcol(m.b_taps, (int64_t)t * m.H, m.H, T));
         run_layer(c, m, batch, a, control);
     }
 
@@ -1098,6 +1153,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE_N(c, m.op_out_mix, T, RAD_B_N(m.b_blk, 0, 4), brows(m.b_s, T), RAD_NONE, RAD_W(m.w_out_q), RAD_NONE,
                 brows(m.b_yo, T));
     RAD_ISSUE_N(c, m.op_out_norm, T, brows(m.b_yo, T), RAD_W(m.w_out_norm), brows(m.b_yn, T));
+    for (int t = 0; t < m.n_taps; ++t)
+        if (m.op_tap_out && m.tap_at[t] == kApps)
+            RAD_ISSUE_N(c, m.op_tap_out, T, brows(m.b_yn, T), brows(m.b_ones, T),
+                        bcol(m.b_taps, (int64_t)t * m.H, m.H, T));
     if (batch->n_out > 0) {
         const int64_t N = batch->n_out;
         RAD_ISSUE_N(c, m.op_rows, N, brows(m.b_yn, T), praw(batch->out_ids, RAD_I32, N), brows(m.b_hout, N));
@@ -1108,6 +1167,23 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 RAD_ISSUE_N(c, m.op_pad, N, bcol(m.b_logits, m.VR, m.VN - m.VR, N));
         }
     }
+}
+
+/* The speculation depth this container supports: zero without a drafter, else the DSpark block's
+ * mask positions (block_size - 1), fixed because the drafter denoises exactly that many. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    out->draft_depth = 0;
+    out->draft_depth_fixed = 0;
+    const long long bs = rad_meta_geti(meta, "draft.block_size", 0);
+    if (bs <= 0) return RAD_OK;
+    if (bs < 2) {
+        fprintf(stderr, "radiance: inkling2: the drafter's block_size is %lld\n", bs);
+        return RAD_E_FORMAT;
+    }
+    out->draft_depth = (int)(bs - 1);
+    out->draft_depth_fixed = 1;
+    return RAD_OK;
 }
 
 /* ============================================================== the reply format
@@ -1139,6 +1215,7 @@ static const RadChatFormat* chat_format(const RadModelMeta*) {
 #ifndef RAD_ARCH_NO_EXPORTS
 /* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
 RAD_ARCH_MULTI_INSTANCE()
+RAD_ARCH_PROBE(inkling2)
 RAD_ARCH_PLUGIN(inkling2, "inkling2", "", "0.1.0",
                 "Inkling 2 Mini's text backbone: the loop checkpoint's 48 layer applications over 24 "
                 "physical layers, block attention residuals, relative-position attention with a sink, "

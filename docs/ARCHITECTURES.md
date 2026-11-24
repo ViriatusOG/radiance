@@ -29,7 +29,7 @@ plugin claims.
 | `arch/bailing_hybrid_gguf_q5km` | `bailinghybrid` | `gguf_ftype_17` | the same tiny family, Q5_K_M GGUF release, served whole |
 | `arch/bailing_hybrid_gguf_q6k` | `bailinghybrid` | `gguf_ftype_18` | the same tiny family, Q6_K GGUF release, served whole |
 | `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them; pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
-| `arch/inkling2` | `inkling2` | `nvfp4` experts, `mxfp8` experts | Inkling 2 Mini (`inkling2_loop`), NVFP4 and MXFP8 experts, text only: a 24-layer loop (prelude, core run three times, coda) over 48 applications with their own KV and convolution states, sliding (1024) and full attention, block attention residuals, loop controllers, 128 sigmoid-routed SiTU experts at top-8. Not yet written: this row is the contract ([geometry](#inkling2-inkling-2-mini)) |
+| `arch/inkling2` | `inkling2` | `nvfp4` experts, `mxfp8` experts | Inkling 2 Mini (`inkling2_loop`), NVFP4 and MXFP8 experts, text only: a 24-layer loop (prelude, core run three times, coda) over 48 applications with their own KV and convolution states, sliding (1024) and full attention, block attention residuals, loop controllers, 128 sigmoid-routed SiTU experts at top-8 ([geometry](#inkling2-inkling-2-mini)). Optional DSpark drafter from the release's `mtp.safetensors` (`rad-convert --draft-model <release>/mtp.safetensors`, `arch/common/rad_block_dspark_inkling.h`), seven tokens a block |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16 or IQ8R, one rank |
 | `arch/lfm3_bf16` | `lfm3` | *(empty)* | LiquidAI's LFM3 (LFM3-1.7B), bf16 or IQ8R, one rank: LFM2's short convolutions with full and sliding-window (256) GQA attention, sandwich norms, a partial rotary on the full layers and a sigmoid gate per query head. Text only |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
@@ -2733,6 +2733,55 @@ top-16 at each of the 12 positions: on one R9700 the top-1 agrees at 12 of 12, t
 10, the mean |Δlogp| over the reference's top-16 is 0.036 and the largest 0.23; on the host backend
 12, 10, 0.045 and 0.24. The stream after each of the 48 layer applications stays within 1 to 6% of
 the reference's (relative L2), the bf16 activations and the experts' int8 inputs.
+
+## The DSpark drafter (`mtp.safetensors`)
+
+The release ships a drafter beside the target, configured by config.json's `mtp_config`, and the
+plugin serves it through the core's block drive (`RAD_DRAFT_BLOCK`) at the one depth it was trained
+for: seven tokens, `--num-speculative-tokens 7`, which `probe()` states as fixed. The reference is
+vLLM's `models/inkling2` (`nvidia/dspark.py`, `ops/dspark.py`).
+
+```
+rad-convert Inkling-2-Mini -o inkling2-mini.rad --recipe data/recipes/inkling2-mini.recipe \
+    --draft-model Inkling-2-Mini/mtp.safetensors
+```
+
+```
+DSpark drafter (mtp_config: 3 layers, hidden 2304, 24 heads / 8 kv x 128, ffn 9216, block 8)
+  taps: the stream entering applications 5, 23 and 41, and the normed output (48); bf16, 4 x 2304
+  context, per committed token and layer i:
+    c = rms(sum_t softmax(fuse_weight[i])_t tap_t) * dflare_norm_i
+    k = rope(rms_head(c @ k_proj_ctx_i) * k_norm_ctx_i) ;  v = c @ v_proj_ctx_i     into the layer's cache
+  query, [anchor, MASK x 7] at positions p .. p + 7:
+    x = [embed_norm(embed(anchor)), mask_embed x 7]       the target's embedding and embed_norm
+    layers 0 and 2 see the 1024 positions before the anchor and the block, layer 1 everything;
+    no causal mask inside the block; q/k per-head norms, neox RoPE theta 1e6, SiLU MLP
+    the residual is bf16, each norm after the first reads (residual += sublayer) first
+  head, the 7 mask rows: base = bf16(rms(x) @ lm_head^T), then dspark_rnn_markov_greedy
+    f_rnn = rms(sum_t softmax(fuse_weight[3])_t tap_t of the last committed token) * markov dflare_norm
+    fold = lm_head @ hidden_out (and its bias), derived at convert
+```
+
+Traps:
+
+- **The anchor predicts nothing** (`sample_from_anchor` false): mask row j sits at the anchor's
+  position + j and proposes the token there, so the block is depth + 1 rows and the head reads rows
+  1..7. Reading rows 0..6 drafts every token one position early, and acceptance drops to chance.
+- **The mask rows are `mask_embed` itself, not the embedding of a mask id.** The core stages a mask
+  id in every block row past the anchor (`n_vocab - 1`, a padding row of the table that is never
+  sampled); the graph overwrites those rows with `mask_embed` through a one-row table placed at that
+  id, and puts the anchors' normed embeddings over them through the sequences' first rows.
+- **f_rnn is read at the last committed token, not at the anchor's position**
+  (`RadBatch::anchor_rows`, in the context pass's rows).
+- **The tap at 48 is after the final norm;** 5, 23 and 41 are the stream entering that
+  application, not leaving it.
+
+Kernels: the drafter's attention is `attn_paged_anchor_window` (local layers, window 1025) and
+`attn_paged` (layer 1) at head_dim 128, gqa 3, scalar only (the WMMA tile has no gqa-3 form);
+`mix_rows` for the tap mixes; the walk is `dspark_rnn_markov_greedy`. Two KV groups,
+`kv_draft_local` (windowed) and `kv_draft_full`. Two roundings differ from the reference: each norm
+after a residual add reads the bf16 sum (fused_add_rmsnorm takes the variance of the unrounded
+one), and the tap mix is rounded to bf16 before its norm.
 
 ---
 

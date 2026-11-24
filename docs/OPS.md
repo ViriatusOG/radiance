@@ -1047,7 +1047,8 @@ is the attn_paged layout with its per-slot f16 scales.
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
 verify, thousands in a prefill chunk, and libr4d has a different kernel for each band.
-`attn_paged_anchor_window` has the same layout but different visibility: the first query position
+`attn_paged_anchor_window` (libr4d: head_dim 128 at gqa 1 and 3, 256 and 512 at gqa 1/2/4/8) has the
+same layout but different visibility: the first query position
 in each sequence is the shared anchor for every query row, with the lower-bound predicate
 `anchor - key < window`; causal mode additionally masks keys after the anchor. It is a distinct op
 name so an older plugin cannot silently interpret this as per-query `attn_paged`.
@@ -3691,6 +3692,7 @@ candidates, and what enters the head from the trunk.
 |---|---|---|
 | `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | BF16 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
 | `dflash_markov_greedy_f32` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | F32 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
+| `dspark_rnn_markov_greedy` | `M` `steps` `rank` `n_embd` `n_vocab` `softcap` `anchor_stride`/opt `dtype` | F32 `logits`, BF16 `hidden`, BF16 `frnn`, `anchor`, `w1`w, `rnn_w`w, `rnn_b`w, `fold_w`w, `fold_b`w → `scratch`, `tile_scores`, `tile_tokens`, `tokens` |
 
 `dflash_markov_greedy` implements the DSpark full-vocabulary greedy walk, not DFlash2's
 candidate-lattice selector. For every position it adds `sum_r pred[previous,r] * succ[token,r]`
@@ -3703,6 +3705,27 @@ pinned llama.cpp reference also uses F32 base logits, but reduction orders may d
 argmax chooses the last equal maximum; its GPU reduction uses a backend-specific order. This op's
 lower-id tie rule is not a claim of reference tie equivalence. Near-tie proposal equivalence is
 therefore not established.
+
+`dspark_rnn_markov_greedy` is Inkling 2's recurrent Markov head (`markov_head_type: rnn_hidden`,
+`arch/common/rad_block_dspark_inkling.h`). Per sequence a rank-R state starts at zero and the
+predecessor at the anchor (`anchor[m * anchor_stride]`); at draft position l, with `rnn_w` the
+[3R, 2R + 2E] projection whose columns are [state, w1[previous], hidden, frnn]:
+
+```
+ctx[l]  = rnn_b + rnn_w[:, 2R:] @ [hidden[m*steps + l], frnn[m]]       f32, once per position
+raw     = ctx[l] + rnn_w[:, :2R] @ [state, w1[prev]]                     f32
+gate    = bf(sigmoid(bf(raw[0:R]))),  cand = bf(tanh(bf(raw[R:2R]))),  out = bf(raw[2R:3R])
+state   = bf(bf(gate * state) + bf(bf(1 - gate) * cand)),  latent = bf(tanh(out))
+score_v = bf(softcap * tanh(bf(bf(logits[l, v]) + bf(fold_b[v] + latent . fold_w[v])) / softcap))
+prev    = argmax_v score_v over [0, n_vocab), NaN as -inf, ties to the lower id
+```
+
+`bf` rounds to bf16 where each torch op of the reference does (vLLM `models/inkling2`), and the f32
+`logits` are rounded once as the reference's bf16 GEMM output is. `fold_w`/`fold_b` are the lm_head
+times `hidden_out` (and its bias), derived at convert (`RAD_MAP_MATMUL`). `scratch` is
+[M, steps * 3R + 2R] f32: each sequence's contexts, then its final state and latent; the tile planes
+are the device's vocabulary reduction, as for `dflash_markov_greedy`. Steps 1..16, rank a multiple
+of 32 up to 512.
 
 ### DFlash2
 
