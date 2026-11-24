@@ -82,6 +82,17 @@ template <> struct Geo<128> { static constexpr int R = 32, BK = 32; };
 template <> struct Geo<256> { static constexpr int R = 32, BK = 32; };
 template <> struct Geo<512> { static constexpr int R = 16, BK = 16; };
 
+/* The scalar kernel's rows a workgroup at a head ratio: Geo's R where the ratio divides it, else
+ * the largest multiple of lcm(kWaves, GQA) that fits (24 at gqa 3: eight positions of three heads,
+ * an Inkling DSpark block). Never more than Geo's R, so the split-KV scratch it sizes still holds. */
+constexpr int gcd_c(int a, int b) { return b ? gcd_c(b, a % b) : a; }
+template <int HD, int GQA> struct RowsOf {
+    static constexpr int L = kWaves / gcd_c(kWaves, GQA) * GQA;
+    static constexpr int R = Geo<HD>::R % GQA == 0 ? Geo<HD>::R
+                           : (Geo<HD>::R / L > 0 ? Geo<HD>::R / L * L : L);
+    static_assert(R <= Geo<HD>::R, "the split-KV scratch is sized at Geo's rows");
+};
+
 /* ------------------------------------------------------------------ device helpers */
 __device__ __forceinline__ int lane_id() { return (int)(threadIdx.x & 31u); }
 
@@ -278,7 +289,7 @@ __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* 
  * since its blocks return early. */
 template <int HD, int GQA, int KV8, bool TREE = false>
 __device__ __forceinline__ void attn_body(AttnArgs A) {
-    constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, RW = R / kWaves, BQ = R / GQA;
+    constexpr int R = RowsOf<HD, GQA>::R, BK = Geo<HD>::BK, RW = R / kWaves, BQ = R / GQA;
     constexpr int NC = HD / 128;                     /* 4-element chunks a lane holds of a row */
     constexpr int ESZ = KV8 ? 1 : 2;
     constexpr int TAIL = KV8 == 2 ? 4 : 0;           /* the int8 cache's two f16 scales */
@@ -987,7 +998,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
  * over the splits that saw a key, four at a time, each lane accumulating its 4 * NC dims. */
 template <int HD, int GQA>
 __device__ __forceinline__ void merge_body(AttnArgs A) {
-    constexpr int R = Geo<HD>::R, NC = HD / 128;
+    constexpr int R = RowsOf<HD, GQA>::R, NC = HD / 128;
     static_assert(kMaxSplit <= 64, "two splits a lane");
     const int tile = (int)blockIdx.x, kh = (int)blockIdx.y;
     const int lane = lane_id(), wave = (int)(threadIdx.x >> 5);
@@ -1146,7 +1157,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
 
 template <int HD, int GQA, int KV8, bool TREE = false, bool SHARED = false, bool FWD = false>
 static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
-    constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
+    constexpr int R = RowsOf<HD, GQA>::R, BK = Geo<HD>::BK, BQ = R / GQA, ESZ = KV8 ? 1 : 2;
     /* A slot's elements: K then V, and for the int8 cache its four bytes of scales
      * (abi/rad_builder.h, rad_kv_row_elems). */
     constexpr int SLOT_E = 2 * HD + (KV8 == 2 ? 4 : 0);
@@ -1244,8 +1255,9 @@ static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
     /* WMMA path for prefill-shaped steps: longest query >= kWmmaMinQ rows and mean >= half that.
      * Decode and verify batches keep the scalar kernel and its split-KV. Needs 16-byte aligned
      * query and output rows. Both kernels agree with libref within 0.02 (Gemma 4 26B-A4B operands)
-     * and differ from each other only in summation order. */
-    {
+     * and differ from each other only in summation order. A head ratio that does not divide the
+     * WMMA tile's rows (gqa 3) has no WMMA form and stays scalar at every shape. */
+    if constexpr (WGeo<HD>::R % GQA == 0) {
         int64_t qmax_w = qlen_u;
         if (cu) {
             qmax_w = rad_args_geti_or(a, "q_len", rows);
@@ -1373,8 +1385,9 @@ extern "C" {
         return r4d_win::launch_attn<HD, G, 2>(a, s);                                              \
     }
 /* h128 gqa16: Muse Glimmer's sliding layers, 32 query heads over 2 KV heads; the same
- * launch_attn the sink variant below already runs at this geometry. */
-R4D_WIN_DEF(128, 1) R4D_WIN_DEF(128, 4) R4D_WIN_DEF(128, 16)
+ * launch_attn the sink variant below already runs at this geometry. h128 gqa3: Inkling 2's DSpark
+ * drafter, 24 query heads over 8, scalar only (RowsOf). */
+R4D_WIN_DEF(128, 1) R4D_WIN_DEF(128, 3) R4D_WIN_DEF(128, 4) R4D_WIN_DEF(128, 16)
 R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
 R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8) R4D_WIN_DEF(512, 16)
 #undef R4D_WIN_DEF
@@ -1412,7 +1425,7 @@ R4D_WIN_TREE_DEF(512, 1) R4D_WIN_TREE_DEF(512, 2) R4D_WIN_TREE_DEF(512, 4) R4D_W
     int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_i8kv(const RadArgs* a, RadStream s) {        \
         return r4d_win::launch_attn<HD, G, 2, false, true>(a, s);                                \
     }
-R4D_WIN_ANCHOR_DEF(128, 1)
+R4D_WIN_ANCHOR_DEF(128, 1) R4D_WIN_ANCHOR_DEF(128, 3)
 R4D_WIN_ANCHOR_DEF(256, 1) R4D_WIN_ANCHOR_DEF(256, 2) R4D_WIN_ANCHOR_DEF(256, 4) R4D_WIN_ANCHOR_DEF(256, 8)
 R4D_WIN_ANCHOR_DEF(512, 1) R4D_WIN_ANCHOR_DEF(512, 2) R4D_WIN_ANCHOR_DEF(512, 4) R4D_WIN_ANCHOR_DEF(512, 8)
 #undef R4D_WIN_ANCHOR_DEF

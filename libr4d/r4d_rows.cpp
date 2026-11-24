@@ -4657,6 +4657,7 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
 R4D_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) R4D_WIN_C(cWinH128G1I8, 128, 1, "i8", 0)
+R4D_WIN_C(cWinH128G3Bf16, 128, 3, "bf16", 0) R4D_WIN_C(cWinH128G3I8, 128, 3, "i8", 0)
 R4D_WIN_C(cWinH128G4Bf16, 128, 4, "bf16", 0) R4D_WIN_C(cWinH128G4I8, 128, 4, "i8", 0)
 R4D_WIN_C(cWinH128G8Bf16, 128, 8, "bf16", 0) R4D_WIN_C(cWinH128G8I8, 128, 8, "i8", 0)
 R4D_WIN_C(cWinH128G16Bf16, 128, 16, "bf16", 0) R4D_WIN_C(cWinH128G16I8, 128, 16, "i8", 0)
@@ -4670,6 +4671,7 @@ R4D_WIN_C(cWinH512G4Bf16, 512, 4, "bf16", 0) R4D_WIN_C(cWinH512G4I8, 512, 4, "i8
 R4D_WIN_C(cWinH512G8Bf16, 512, 8, "bf16", 0) R4D_WIN_C(cWinH512G8I8, 512, 8, "i8", 0)
 /* DSpark uses the same geometry constraints, but requires a positive window. */
 R4D_WIN_C(cAnchorH128G1Bf16, 128, 1, "bf16", 1) R4D_WIN_C(cAnchorH128G1I8, 128, 1, "i8", 1)
+R4D_WIN_C(cAnchorH128G3Bf16, 128, 3, "bf16", 1) R4D_WIN_C(cAnchorH128G3I8, 128, 3, "i8", 1)
 R4D_WIN_C(cAnchorH256G1Bf16, 256, 1, "bf16", 1) R4D_WIN_C(cAnchorH256G1I8, 256, 1, "i8", 1)
 R4D_WIN_C(cAnchorH256G2Bf16, 256, 2, "bf16", 1) R4D_WIN_C(cAnchorH256G2I8, 256, 2, "i8", 1)
 R4D_WIN_C(cAnchorH256G4Bf16, 256, 4, "bf16", 1) R4D_WIN_C(cAnchorH256G4I8, 256, 4, "i8", 1)
@@ -7954,7 +7956,7 @@ static const RadKernelInfo kKernels[] = {
 #define R4D_WIN_PAIR(HD, GQ)                                                                       \
     R4D_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
     R4D_WIN_ROW(HD, GQ, i8kv, i8, cWinH##HD##G##GQ##I8, "int8 (an f16 scale of K and of V per token and head)")
-R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 4)
+R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 3) R4D_WIN_PAIR(128, 4)
 R4D_WIN_PAIR(128, 16)   /* Muse Glimmer's 32/2-head sliding layers */
 R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
@@ -8020,7 +8022,7 @@ R4D_REL_ROW(8, i8kv, i8kv, cRelG8I8, "int8 (an f16 scale of K and of V per token
 #define R4D_ANCHOR_PAIR(HD, GQ)                                                                   \
     R4D_ANCHOR_ROW(HD, GQ, bf16kv, bf16kv, cAnchorH##HD##G##GQ##Bf16, "bf16")                     \
     R4D_ANCHOR_ROW(HD, GQ, i8kv, i8kv, cAnchorH##HD##G##GQ##I8, "int8 (an f16 scale of K and of V per token and head)")
-R4D_ANCHOR_PAIR(128, 1)
+R4D_ANCHOR_PAIR(128, 1) R4D_ANCHOR_PAIR(128, 3)   /* Inkling 2 DSpark: 24 heads over 8 */
 R4D_ANCHOR_PAIR(256, 1) R4D_ANCHOR_PAIR(256, 2) R4D_ANCHOR_PAIR(256, 4) R4D_ANCHOR_PAIR(256, 8)
 R4D_ANCHOR_PAIR(512, 1) R4D_ANCHOR_PAIR(512, 2) R4D_ANCHOR_PAIR(512, 4) R4D_ANCHOR_PAIR(512, 8)
 #undef R4D_ANCHOR_PAIR

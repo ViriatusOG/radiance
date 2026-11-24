@@ -124,8 +124,9 @@ static void head_chain(Fn head, Fn walk) {
     std::puts("F32 head -> Markov near tie and BF16 negative control: PASS");
 }
 
-static void attention(Fn shared, Fn ordinary, int G, int ctx0, int ctx1, int causal) {
-    constexpr int M=2, Q=7, H=256, BS=16, W=513;
+static void attention(Fn shared, Fn ordinary, int G, int ctx0, int ctx1, int causal,
+                      int H=256, int Q=7, int W=513) {
+    constexpr int M=2, BS=16;
     const int ctx[M]={ctx0,ctx1}, blocks=(std::max(ctx0,ctx1)+15)/16, nblocks=M*blocks;
     std::vector<uint16_t> q(M*Q*G*H,bf(0)), kv((size_t)nblocks*BS*2*H,bf(0)), out(M*Q*G*H,bf(0));
     std::vector<int> bt(M*blocks), su{ctx0,ctx1}, cu{0,Q,2*Q};
@@ -157,7 +158,7 @@ static void attention(Fn shared, Fn ordinary, int G, int ctx0, int ctx1, int cau
         double sum=0, acc=0;
         for(int j=lo;j<hi;++j) {
             size_t base=((size_t)bt[s*blocks+j/BS]*BS+j%BS)*2*H;
-            double weight=std::exp((h%2?-1.:1.)*fb(kv[base])/16.0);
+            double weight=std::exp((h%2?-1.:1.)*fb(kv[base])/std::sqrt((double)H));
             sum+=weight; acc+=weight*fb(kv[base+H]);
         }
         double want=acc/sum; size_t i=(s*Q+row)*G+h;
@@ -171,7 +172,8 @@ static void attention(Fn shared, Fn ordinary, int G, int ctx0, int ctx1, int cau
     for(size_t i=0;i<expected.size();++i)
         if(std::abs(fb(wrong[i*H])-expected[i])>0.03) distinguished=true;
     check(distinguished,"attention per-row window negative control");
-    std::printf("attention gqa=%d ctx=%d,%d causal=%d shared oracle and negative control: PASS\n",G,ctx0,ctx1,causal);
+    std::printf("attention h%d gqa=%d q=%d window=%d ctx=%d,%d causal=%d shared oracle and negative control: PASS\n",
+                H,G,Q,W,ctx0,ctx1,causal);
 }
 
 // Real checkpoint head slice, but synthetic BF16 activations and zero Markov weights. This tests
@@ -215,6 +217,74 @@ static void checkpoint_head(Fn head, Fn walk, const char* weights_path) {
     std::printf("real head slice V=%d K=%d synthetic rows=%d: max_abs=%.9g rel_l2=%.9g min_top_margin=%.9g F32_vs_FP64_top1_mismatch=0 BF16_rounded_top1_changed=%d BF16_top_ties=%d\n",V,K,M,maxerr,std::sqrt(se/sr),minmargin,changed,ties);
 }
 
+
+/* Inkling 2's recurrent walk (dspark_rnn_markov_greedy) against a scalar oracle written from the
+ * reference's formulas (vLLM models/inkling2 dspark.py): the per-position contexts, the gated state
+ * with its bf16 roundings, the folded bias and the softcapped greedy scan, at the drafter's own
+ * 7 steps and an anchor stride of 8. Sums run in another order on the card, so a token is only
+ * required to match where the oracle's best score beats the runner-up; past a step that does not,
+ * that sequence's chain is no longer compared. */
+static float rbf(float x) { return fb(bf(x)); }
+static void rnn_walk(Fn fn) {
+    constexpr int M=3, S=7, R=64, E=48, V=300, W=2*R+2*E, NT=(V+63)/64, SW=S*3*R+2*R, AS=8;
+    unsigned seed=12345; auto rnd=[&]{ seed=seed*1664525u+1013904223u; return ((seed>>8)&0xffff)/32768.f-1.f; };
+    std::vector<float> lg((size_t)M*S*V); for(auto& x:lg) x=rbf(2.5f*rnd());
+    std::vector<uint16_t> hid((size_t)M*S*E), fr((size_t)M*E), w1((size_t)V*R), rw((size_t)3*R*W), rb(3*R), fw((size_t)V*R), fbs(V);
+    for(auto& x:hid) x=bf(rnd()); for(auto& x:fr) x=bf(rnd()); for(auto& x:w1) x=bf(rnd());
+    for(auto& x:rw) x=bf(0.15f*rnd()); for(auto& x:rb) x=bf(0.2f*rnd());
+    for(auto& x:fw) x=bf(rnd()); for(auto& x:fbs) x=bf(0.5f*rnd());
+    std::vector<int> anchor(M*AS,-1); for(int m=0;m<M;++m) anchor[m*AS]=17+m*41;
+    std::vector<float> scratch((size_t)M*SW,-777.f), ts((size_t)M*NT,-777.f);
+    std::vector<int> ti((size_t)M*NT,-777), out((size_t)M*S,-777);
+    Device<float> dl(lg), dsc(scratch), dts(ts); Device<uint16_t> dh(hid), dfr(fr), dw1(w1), drw(rw), drb(rb), dfw(fw), dfb(fbs);
+    Device<int> da(anchor), dti(ti), dout(out);
+    RadTensor a[]={t(dl.p,RAD_F32,{M*S,V}),t(dh.p,RAD_BF16,{M*S,E}),t(dfr.p,RAD_BF16,{M,E}),t(da.p,RAD_I32,{M*AS}),
+        t(dw1.p,RAD_BF16,{V,R}),t(drw.p,RAD_BF16,{3*R,W}),t(drb.p,RAD_BF16,{3*R}),t(dfw.p,RAD_BF16,{V,R}),t(dfb.p,RAD_BF16,{V}),
+        t(dsc.p,RAD_F32,{M,SW}),t(dts.p,RAD_F32,{M,NT}),t(dti.p,RAD_I32,{M,NT}),t(dout.p,RAD_I32,{M,S})};
+    RadParam cap{}; cap.key="softcap"; cap.kind=RAD_P_F64; cap.dval=30.0;
+    RadParam par[]={pi("M",M),pi("steps",S),pi("rank",R),pi("n_embd",E),pi("n_vocab",V),cap,pi("anchor_stride",AS),ps("dtype","bf16")};
+    RadArgs args{}; args.t=a; args.n_t=13; args.p=par; args.n_p=8;
+    check(fn(&args,nullptr)==RAD_OK,"rnn walk launch"); hipcheck(hipDeviceSynchronize());
+    auto gs=dsc.get(); auto go=dout.get();
+    int compared=0, ctxbad=0;
+    for(int m=0;m<M;++m) {
+        std::vector<double> ctx((size_t)S*3*R);
+        for(int l=0;l<S;++l) for(int j=0;j<3*R;++j) {
+            double acc=fb(rb[j]);
+            for(int i=0;i<E;++i) acc+=(double)fb(rw[(size_t)j*W+2*R+i])*fb(hid[((size_t)m*S+l)*E+i]);
+            for(int i=0;i<E;++i) acc+=(double)fb(rw[(size_t)j*W+2*R+E+i])*fb(fr[(size_t)m*E+i]);
+            ctx[(size_t)l*3*R+j]=acc;
+            if(std::abs(gs[(size_t)m*SW+l*3*R+j]-acc)>1e-3*(1+std::abs(acc))) ++ctxbad;
+        }
+        std::vector<float> st(R,0.f), lat(R,0.f);
+        int prev=anchor[m*AS]; bool live=true;
+        for(int l=0;l<S && live;++l) {
+            std::vector<float> raw(3*R);
+            for(int j=0;j<3*R;++j) { double acc=ctx[(size_t)l*3*R+j];
+                for(int i=0;i<R;++i) acc+=(double)fb(rw[(size_t)j*W+i])*st[i];
+                for(int i=0;i<R;++i) acc+=(double)fb(rw[(size_t)j*W+R+i])*fb(w1[(size_t)prev*R+i]);
+                raw[j]=(float)acc; }
+            for(int r=0;r<R;++r) { float g=rbf(1.f/(1.f+std::exp(-rbf(raw[r])))), c=rbf(std::tanh(rbf(raw[R+r]))), o=rbf(raw[2*R+r]);
+                st[r]=rbf(rbf(g*st[r])+rbf(rbf(1.f-g)*c)); lat[r]=rbf(std::tanh(o)); }
+            float best=-INFINITY, second=-INFINITY; int win=0;
+            for(int v=0;v<V;++v) { double d=fb(fbs[v]); for(int r=0;r<R;++r) d+=(double)lat[r]*fb(fw[(size_t)v*R+r]);
+                float x=rbf(rbf(lg[((size_t)m*S+l)*V+v])+rbf((float)d)), sc=rbf(30.f*std::tanh(x/30.f));
+                if(sc>best) { second=best; best=sc; win=v; } else if(sc>second) second=sc; }
+            if(best>second) { check(go[(size_t)m*S+l]==win,"rnn walk token versus oracle"); ++compared; }
+            else live=false;
+            prev=go[(size_t)m*S+l];
+            if(!live) break;
+        }
+        if(live) for(int r=0;r<R;++r) {
+            check(std::abs(gs[(size_t)m*SW+S*3*R+r]-st[r])<=std::abs(st[r])/64+1e-6,"rnn final state");
+            check(std::abs(gs[(size_t)m*SW+S*3*R+R+r]-lat[r])<=std::abs(lat[r])/64+1e-6,"rnn final latent");
+        }
+    }
+    check(ctxbad==0,"rnn contexts versus FP64 oracle");
+    check(compared>=M*S/2,"rnn walk: too few decisive steps to compare");
+    std::printf("rnn walk M=%d steps=%d rank=%d n_embd=%d vocab=%d: %d decisive steps match, contexts and state agree: PASS\n",M,S,R,E,V,compared);
+}
+
 int main(int argc,char** argv) {
     check(argc==2 || (argc==4 && !std::strcmp(argv[2],"--head-weights")),"usage: dspark_device_test libr4d.so [--head-weights file]");
     int n_devices = 0;
@@ -235,5 +305,14 @@ int main(int argc,char** argv) {
             attention(symbol(h,shared),symbol(h,ordinary),g,521,1050,causal);
         }
     }
+    /* Inkling 2's drafter: head_dim 128, 24 query heads over 8 (gqa 3), its 8-row block and a
+     * 1024-position history (window 1025); one block a launch and a block spanning two tiles. */
+    for(int causal:{0,1}) {
+        attention(symbol(h,"r4d_rad_attn_anchor_window_h128_gqa3_bf16kv"),symbol(h,"r4d_rad_attn_window_h128_gqa3_bf16"),
+                  3,1040,1100,causal,128,8,1025);
+        attention(symbol(h,"r4d_rad_attn_anchor_window_h128_gqa3_bf16kv"),symbol(h,"r4d_rad_attn_window_h128_gqa3_bf16"),
+                  3,1041,1300,causal,128,13,1025);
+    }
+    rnn_walk(symbol(h,"r4d_rad_dspark_rnn_markov_greedy"));
     dlclose(h); std::puts("DSpark device differential: PASS");
 }
