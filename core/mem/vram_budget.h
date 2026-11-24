@@ -129,6 +129,15 @@ struct VramBudget {
     std::string report;       /* the block the engine prints at startup */
 };
 
+/* The reserve for a rank's actual card, falling back to the model-wide flag. A fleet card
+ * override replaces the flag rather than adding to it. */
+int64_t vram_budget_headroom_mib(const Config& cfg, size_t rank);
+
+/* Extra MiB a rank can safely give its expert weights while preserving every card's own reserve
+ * and the common KV split. Zero for a fleet broker claim. */
+int64_t vram_budget_rank_spare_mib(const Config& cfg, const std::vector<VramFacts>& per_rank,
+                                   size_t rank);
+
 /* Writes cfg.vram_weights_mib / cfg.vram_kv_mib, the one number every downstream consumer reads
  * (an uneven world's cheaper rank re-splits it with vram_budget_rank_split). Takes the smallest
  * capacity and free VRAM across ranks and the largest arena, so the split fits every card.

@@ -894,6 +894,9 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* A fleet may replace that reserve on named cards (e.g. a desktop card). The single-model
+     * path has no broker, so the budget and each rank's pool plan need this map directly. */
+    std::map<int, int64_t> card_headroom_mib;
     /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
      * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
     int64_t gpu_memory_mib = 0;

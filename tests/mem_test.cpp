@@ -7535,6 +7535,39 @@ TEST(gpu_memory_mib_is_the_inverse_of_gpu_headroom_mib) {
     }
 }
 
+/* A fleet with one TP model still bypasses the load broker. Its card override must reach the
+ * ordinary budget, or the desktop card will settle near the global 96 MiB reserve. */
+TEST(a_single_model_fleet_reserves_the_named_card_headroom) {
+    constexpr int64_t MiB = 1 << 20;
+    Config c = derive_config();
+    c.devices = { 0, 1 };
+    c.card_headroom_mib[1] = 1536;
+    VramBudget b;
+    CHECK_OK(vram_budget_trial(c, { hand_facts(false), hand_facts(false) }, &b));
+    CHECK_EQ(b.headroom, 1536 * MiB);
+    CHECK_EQ(b.claimable, 13656 * MiB);
+    CHECK_EQ(vram_budget_rank_spare_mib(c, { hand_facts(false), hand_facts(false) }, 0), 1440ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(c, { hand_facts(false), hand_facts(false) }, 1), 0ll);
+
+    Config global = c;
+    global.card_headroom_mib.clear();
+    global.gpu_headroom_mib = 1536;
+    VramBudget all;
+    CHECK_OK(vram_budget_trial(global, { hand_facts(false), hand_facts(false) }, &all));
+    CHECK_EQ(b.claimable, all.claimable);
+    CHECK_EQ(vram_budget_rank_spare_mib(global, { hand_facts(false), hand_facts(false) }, 0), 0ll);
+    CHECK_EQ(vram_budget_headroom_mib(c, 0), 96ll);
+    CHECK_EQ(vram_budget_headroom_mib(c, 1), 1536ll);
+
+    /* A broker grant has already left each card's reserve outside the claim. */
+    Config broker = c;
+    broker.vram_claim = 12000 * MiB;
+    VramBudget claimed;
+    CHECK_OK(vram_budget_trial(broker, { hand_facts(false), hand_facts(false) }, &claimed));
+    CHECK_EQ(claimed.headroom, 0ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(broker, { hand_facts(false), hand_facts(false) }, 0), 0ll);
+}
+
 /* Over random cards and programs the split either refuses by name or hands out no more than the
  * card: every granted pool plus every fixed term fits the capacity, with at most the MiB each of
  * the two pools may round into the headroom. The shares add up to the elastic part, the static

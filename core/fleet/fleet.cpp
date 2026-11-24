@@ -2040,6 +2040,7 @@ void Fleet::load_op(Model& m) {
     const auto t0 = std::chrono::steady_clock::now();
     front_.loading(name);
     Config cfg = m.entry.cfg;
+    cfg.card_headroom_mib = fc_.card_headroom_mib;
     if (cfg.proceed_incompatible) Engine::print_unsupported_banner();
     if (!resolve_hf_model(cfg)) {
         fail(m, "its repository could not be fetched (see the log)");
@@ -2483,6 +2484,9 @@ std::string Fleet::reload() {
     if (a.host != b.host || a.port != b.port || a.api_key != b.api_key ||
         a.http_threads != b.http_threads || a.cors != b.cors || nf.cards != fc_.cards)
         return "server: and cards: changes need a restart";
+    /* A loaded single-model engine has already split its pools against these reserves. */
+    if (nf.card_headroom_mib != fc_.card_headroom_mib)
+        return "memory.card-headroom-mib changes need a restart";
     for (const ModelEntry& e : nf.models)
         for (int c : e.cards)
             if (std::find(cards_.begin(), cards_.end(), c) == cards_.end())

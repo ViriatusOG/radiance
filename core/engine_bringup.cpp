@@ -2237,6 +2237,20 @@ int Engine::plan() {
                          ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
                          : "");
         }
+        /* A named card's larger reserve determines the common TP split. Other cards may spend
+         * their additional room on experts without changing the KV coverage shared by all ranks. */
+        if (!broker_ && !cfg_.card_headroom_mib.empty() && cfg_.placement == "expert_tiered") {
+            for (size_t i = 0; i < facts.size(); ++i) {
+                const int64_t spare = vram_budget_rank_spare_mib(cfg_, facts, i);
+                const int64_t cap = (facts[i].statics + expert_vram_floor(wfs[i], 0)) / kMiB;
+                const int64_t add = std::min(spare,
+                    std::max<int64_t>(cap - rank_cfg_[i].vram_weights_mib, 0));
+                if (add <= 0) continue;
+                rank_cfg_[i].vram_weights_mib += add;
+                RAD_INFO("card %d uses %lld MiB of room above its own headroom for resident experts",
+                         ranks_[i]->device, (long long)add);
+            }
+        }
     }
 
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
@@ -5495,10 +5509,12 @@ int Engine::start() {
      * Too much means VRAM left unused, costly when experts do not fit; up to 256 MiB of slack
      * (MiB rounding, plugin workspaces) is silent. */
     const int64_t MiB = 1024 * 1024;
-    const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
     const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
+        const int64_t headroom = vram_budget_headroom_mib(cfg_, ri) * MiB;
+        const bool named_headroom = cfg_.card_headroom_mib.count(r->device) != 0;
+        const char* reserve_name = named_headroom ? "memory.card-headroom-mib" : "--gpu-headroom-mib";
         LogRank lr(r->index);
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
@@ -5510,14 +5526,17 @@ int Engine::start() {
         const int64_t got  = props.vram_free;
         const int64_t room = got - late;
         const std::string asked =
-            late > 0 ? fmt("%s (the %s --gpu-headroom-mib and %s kept for the step staging and "
+            late > 0 ? fmt("%s (the %s %s and %s kept for the step staging and "
                            "for what is built on first use)", humanb(want).c_str(),
-                           humanb(headroom).c_str(), humanb(late).c_str())
-                     : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
+                           humanb(headroom).c_str(), reserve_name, humanb(late).c_str())
+                     : fmt("%s %s", humanb(want).c_str(), reserve_name);
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
-            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
-            const std::string fix = cfg_.gpu_memory_mib > 0
+            const int64_t need_head = vram_budget_headroom_mib(cfg_, ri) + raise_mib;
+            const std::string fix = named_headroom
+                ? fmt("Set memory.card-headroom-mib for card %d to at least %lld.", r->device,
+                      (long long)need_head)
+                : cfg_.gpu_memory_mib > 0
                 ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
                       "for one.",
                       (long long)(props.vram_bytes / MiB - need_head))

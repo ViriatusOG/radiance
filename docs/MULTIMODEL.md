@@ -209,6 +209,11 @@ A key at the wrong level is refused with the level it belongs to. An unknown key
 the closest known key. `served-model-name` is gone: the entry's name is the model id, and `aliases`
 adds more.
 
+With one TP model, `memory.card-headroom-mib` also applies to the model's VRAM split. The card
+with least room after its own reserve sets the common KV pool; under `expert_tiered`, a card with
+more room uses it for resident experts. Changing the per-card reserves requires a restart, since
+the loaded model's pools were sized against them.
+
 ### 4.4 Single-model use
 
 A one-model YAML is the only way to run one model too. `radiance --model X ...` is refused with a

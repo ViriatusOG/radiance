@@ -771,6 +771,7 @@ that is not serving and waits for room is `waiting`, and its `waiting_for` names
 "Waiting for room". `POST /admin/models/NAME/{load,park,unload,pin,unpin}` moves one model, and
 `POST /admin/reload` or SIGHUP re-reads the file: changed models reload,
 removed ones leave, added ones register, and a `server:` or `cards:` change needs a restart.
+Changing `memory.card-headroom-mib` also needs a restart because the loaded pools keep their split.
 Without an api key these answer loopback callers only. Every model on one card runs its own queues
 beside the others (MULTIMODEL.md §9 has the measurement against taking turns).
 
