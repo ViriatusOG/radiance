@@ -561,6 +561,26 @@ inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const 
     return rad_decl_name_map(b, &m);
 }
 
+/* The product `left @ right` of two checkpoint tensors, computed at convert (RAD_MAP_MATMUL): a
+ * linear folded into the one after it. `right` may be a vector, giving a vector. */
+inline int map_matmul(RadBuilder* b, const char* declared, const char* left, const char* right) {
+    RadNameMap m = map_base(declared, RAD_MAP_MATMUL);
+    m.n_src  = 2;
+    m.src[0] = left;
+    m.src[1] = right;
+    return rad_decl_name_map(b, &m);
+}
+
+/* The softmax of a checkpoint tensor along its last dimension (RAD_MAP_SOFTMAX); `row` >= 0 keeps
+ * that row alone, a vector. */
+inline int map_softmax(RadBuilder* b, const char* declared, const char* src, int row = -1) {
+    RadNameMap m = map_base(declared, RAD_MAP_SOFTMAX);
+    m.n_src        = 1;
+    m.src[0]       = src;
+    m.src_index[0] = row;
+    return rad_decl_name_map(b, &m);
+}
+
 /* A checkpoint tensor copied through unchanged. */
 inline int map_copy(RadBuilder* b, const char* declared, const char* src) {
     RadNameMap m = map_base(declared, RAD_MAP_COPY);

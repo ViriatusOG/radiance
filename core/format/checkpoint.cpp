@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <thread>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -2141,6 +2142,34 @@ int Checkpoint::add_draft(const std::string& dir, const std::string& prefix) {
                 path_.c_str());
         return RAD_E_UNSUPPORTED;
     }
+    /* A drafter that ships beside its target as one file, with its config inside the target's
+     * own: Inkling 2's `mtp.safetensors`, described by config.json's `mtp_config`. Its tensors go
+     * under `prefix` as a repository's do, and `mtp_config.<key>` is published as `<prefix><key>`,
+     * so a plugin reads the one `draft.` config whichever way the drafter shipped. */
+    std::error_code fec;
+    if (std::filesystem::is_regular_file(dir, fec)) {
+        if (dir.size() < 12 || dir.compare(dir.size() - 12, 12, ".safetensors") != 0) {
+            RAD_ERR("drafter %s: a drafter given as a file is one .safetensors; a repository is "
+                    "given as its directory", dir.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        const std::string mc = "mtp_config.";
+        const size_t n_keys = meta_.keys.size();
+        bool any = false;
+        for (size_t i = 0; i < n_keys; ++i)
+            if (meta_.keys[i].rfind(mc, 0) == 0) {
+                meta_.kv(prefix + meta_.keys[i].substr(mc.size()), meta_.vals[i]);
+                any = true;
+            }
+        if (!any) {
+            RAD_ERR("drafter %s: a single-file drafter takes its config from the target's "
+                    "config.json (`mtp_config`), and %s has none", dir.c_str(), path_.c_str());
+            return RAD_E_FORMAT;
+        }
+        RAD_TRY(add_shard(dir, prefix, nullptr));
+        meta_.finish();
+        return RAD_OK;
+    }
     RAD_TRY(meta_merge_config_json(dir, prefix.empty() || prefix.back() != '.'
                                             ? prefix
                                             : prefix.substr(0, prefix.size() - 1), &meta_));
@@ -2887,6 +2916,125 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
     return RAD_OK;
 }
 
+/* RAD_MAP_MATMUL: src[0] [n, k] times src[1] [k, m], or [k] giving [n]. Each output element is
+ * summed in f64 over k in ascending order and rounded once to f32, so the product does not depend
+ * on how the rows are split over threads. */
+static int resolve_matmul(Checkpoint& ck, const RadNameMap& m, bool optional, CkptWeight* out,
+                          std::string* why) {
+    auto refuse = [&](int rc, std::string msg) {
+        if (why) *why = std::move(msg);
+        return rc;
+    };
+    const SrcTensor* a = ck.find(m.src[0]);
+    const SrcTensor* b = ck.find(m.src[1]);
+    if (!a || !b) {
+        if (optional && !a && !b) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
+        return refuse(RAD_E_NOTFOUND, "it needs checkpoint tensors '" + std::string(m.src[0]) +
+                                      "' and '" + m.src[1] + "', not both in " + ck.path());
+    }
+    if (a->shape.size() != 2 || (b->shape.size() != 1 && b->shape.size() != 2))
+        return refuse(RAD_E_SHAPE, "'" + a->name + "' times '" + b->name + "' is a matrix "
+                                   "times a matrix or a vector; they have rank " +
+                                   std::to_string(a->shape.size()) + " and " +
+                                   std::to_string(b->shape.size()));
+    const int64_t n = a->shape[0], k = a->shape[1];
+    const int64_t mm = b->shape.size() == 2 ? b->shape[1] : 1;
+    if (b->shape[0] != k)
+        return refuse(RAD_E_SHAPE, "'" + a->name + "' has " + std::to_string(k) + " columns "
+                                   "and '" + b->name + "' " + std::to_string(b->shape[0]) +
+                                   " rows");
+    std::vector<float> af((size_t)(n * k)), bf((size_t)(k * mm));
+    if (piece_f32(*a, 0, n * k, af.data()) < 0 || piece_f32(*b, 0, k * mm, bf.data()) < 0)
+        return refuse(RAD_E_FORMAT, "'" + a->name + "' or '" + b->name + "' cannot be read as "
+                                    "f32");
+    /* B transposed to [m, k] in f64, so the inner loop reads both factors contiguously. */
+    std::vector<double> bt((size_t)(mm * k));
+    for (int64_t i = 0; i < k; ++i)
+        for (int64_t j = 0; j < mm; ++j) bt[(size_t)(j * k + i)] = bf[(size_t)(i * mm + j)];
+    out->derived.assign((size_t)(n * mm), 0.0f);
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const int64_t n_thr = std::min<int64_t>(hw, std::max<int64_t>(1, n / 64));
+    std::vector<std::thread> pool;
+    for (int64_t t = 0; t < n_thr; ++t)
+        pool.emplace_back([&, t] {
+            std::vector<double> row((size_t)k);
+            for (int64_t r = t; r < n; r += n_thr) {
+                for (int64_t i = 0; i < k; ++i) row[(size_t)i] = af[(size_t)(r * k + i)];
+                for (int64_t j = 0; j < mm; ++j) {
+                    const double* bj = &bt[(size_t)(j * k)];
+                    double s = 0.0;
+                    for (int64_t i = 0; i < k; ++i) s += row[(size_t)i] * bj[i];
+                    out->derived[(size_t)(r * mm + j)] = (float)s;
+                }
+            }
+        });
+    for (auto& th : pool) th.join();
+    out->rank = b->shape.size() == 2 ? 2u : 1u;
+    out->shape[0] = n;
+    if (out->rank == 2) out->shape[1] = mm;
+    out->pieces.assign(1, a);
+    out->scales.assign(1, nullptr);
+    out->concat_dim = 0;
+    rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+    out->trivial = false;
+    out->why = "it is '" + a->name + "' times '" + b->name + "', at convert -- a recipe rule "
+               "stores it";
+    return RAD_OK;
+}
+
+/* RAD_MAP_SOFTMAX: softmax of src[0] along its last dimension, each row in f64 with its maximum
+ * subtracted, rounded once to f32; src_index[0] >= 0 keeps that row alone. */
+static int resolve_softmax(Checkpoint& ck, const RadNameMap& m, bool optional, CkptWeight* out,
+                           std::string* why) {
+    auto refuse = [&](int rc, std::string msg) {
+        if (why) *why = std::move(msg);
+        return rc;
+    };
+    const SrcTensor* a = ck.find(m.src[0]);
+    if (!a) {
+        if (optional) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
+        return refuse(RAD_E_NOTFOUND, "it needs checkpoint tensor '" + std::string(m.src[0]) +
+                                      "', not in " + ck.path());
+    }
+    if (a->shape.empty())
+        return refuse(RAD_E_SHAPE, "'" + a->name + "' is a scalar; a softmax needs a row");
+    const int64_t cols = a->shape.back();
+    int64_t n = 1;
+    for (int64_t x : a->shape) n *= x;
+    const int64_t rows = n / cols;
+    const int64_t r0 = m.src_index[0] >= 0 ? m.src_index[0] : 0;
+    const int64_t nr = m.src_index[0] >= 0 ? 1 : rows;
+    if (r0 + nr > rows)
+        return refuse(RAD_E_SHAPE, "row " + std::to_string(m.src_index[0]) + " of '" + a->name +
+                                   "', which has " + std::to_string(rows));
+    std::vector<float> src((size_t)n);
+    if (piece_f32(*a, 0, n, src.data()) < 0)
+        return refuse(RAD_E_FORMAT, "'" + a->name + "' cannot be read as f32");
+    out->derived.assign((size_t)(nr * cols), 0.0f);
+    for (int64_t r = 0; r < nr; ++r) {
+        const float* x = &src[(size_t)((r0 + r) * cols)];
+        double mx = x[0], sum = 0.0;
+        for (int64_t c = 1; c < cols; ++c) mx = std::max(mx, (double)x[c]);
+        for (int64_t c = 0; c < cols; ++c) sum += std::exp((double)x[c] - mx);
+        for (int64_t c = 0; c < cols; ++c)
+            out->derived[(size_t)(r * cols + c)] = (float)(std::exp((double)x[c] - mx) / sum);
+    }
+    if (m.src_index[0] >= 0) {
+        out->rank = 1;
+        out->shape[0] = cols;
+    } else {
+        out->rank = (uint32_t)a->shape.size();
+        for (size_t i = 0; i < a->shape.size(); ++i) out->shape[i] = a->shape[i];
+    }
+    out->pieces.assign(1, a);
+    out->scales.assign(1, nullptr);
+    out->concat_dim = 0;
+    rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+    out->trivial = false;
+    out->why = "it is the softmax of '" + a->name + "', at convert -- a recipe rule stores it";
+    return RAD_OK;
+}
+
 int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, bool optional,
                  CkptWeight* out, std::string* why) {
     auto refuse = [&](int rc, std::string m) {
@@ -2904,6 +3052,10 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.empty()) return refuse(RAD_E_NOTFOUND, "the name map has no entry for it");
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
+    if (maps.front()->mode == RAD_MAP_MATMUL)
+        return resolve_matmul(ck, *maps.front(), optional, out, why);
+    if (maps.front()->mode == RAD_MAP_SOFTMAX)
+        return resolve_softmax(ck, *maps.front(), optional, out, why);
     if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
         maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS)
         return resolve_derived(ck, maps, optional, out, why);

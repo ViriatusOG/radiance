@@ -616,7 +616,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_MATMUL = 8, RAD_MAP_SOFTMAX = 9 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -677,8 +678,18 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * RAD_MAP_MATMUL is the product of two sources, src[0] [n, k] times src[1] [k, m] (or [k], giving
+ * [n]): a linear folded into the one after it. A DSpark Markov head whose rank-r latent goes
+ * through `hidden_out` and then the target's lm_head reads `lm_head @ hidden_out` instead, a
+ * [vocab, r] table, so each draft position scores the vocabulary at the rank's width rather than
+ * the hidden width (Inkling 2's drafter: 256 against 2304).
+ *
+ * RAD_MAP_SOFTMAX is the softmax of src[0] along its last dimension, row by row; src_index[0] >= 0
+ * keeps that one row (a vector). A learned mixture a reference normalises once at load (Inkling 2's
+ * drafter mixes its four trunk taps with softmax(fuse_weight[layer])) is stored normalised.
+ *
+ * TRANSPOSE, EMA, TAP, COLS, MATMUL and SOFTMAX are computed at convert in f32 (MATMUL and SOFTMAX
+ * summed in f64), like WNORM, and stored as the recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 

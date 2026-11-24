@@ -2824,6 +2824,83 @@ TEST(a_drafter_merges_under_its_prefix_without_resizing_the_trunk) {
     }
 }
 
+/* Inkling 2 ships its drafter as one file beside the target (mtp.safetensors), configured by the
+ * target's own `mtp_config`: the file's tensors merge under the prefix and the config is published
+ * as `draft.<key>`. A file that is not a .safetensors, or a target with no mtp_config, is refused. */
+TEST(a_single_file_drafter_takes_its_config_from_mtp_config) {
+    const std::string dir = write_checkpoint(
+        { bf16("embed.weight", { 4, 4 }, 1.0f) },
+        R"({"model_type":"qwen3_5","hidden_size":256,"num_hidden_layers":2,
+            "mtp_config":{"block_size":8,"num_hidden_layers":3,"target_layer_ids":[5,23]}})");
+    write_shard(dir + "/mtp.safetensors", { bf16("fuse_weight", { 2, 2 }, 7.0f) });
+    {
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        REQUIRE_EQ(ck.add_draft(dir + "/mtp.safetensors", "draft."), RAD_OK);
+        const SrcTensor* fw = ck.find("draft.fuse_weight");
+        REQUIRE(fw != nullptr);
+        CHECK_EQ(rad_load_f32(fw->data, RAD_BF16, 1), 8.0f);
+        const MetaOwn& m = ck.meta();
+        CHECK(m.get("draft.block_size") && std::string(m.get("draft.block_size")) == "8");
+        CHECK(m.get("draft.num_hidden_layers") &&
+              std::string(m.get("draft.num_hidden_layers")) == "3");
+        CHECK_EQ(m.m.n_layers, (int64_t)2);                  /* the trunk keeps its own */
+        CHECK_EQ(m.m.n_kv, (int)m.keys.size());
+    }
+    write_file(dir + "/notes.txt", "x");
+    {
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK_EQ(ck.add_draft(dir + "/notes.txt", "draft."), (int)RAD_E_UNSUPPORTED);
+    }
+    const std::string bare = write_checkpoint({ bf16("embed.weight", { 4, 4 }, 1.0f) }, kConfig);
+    write_shard(bare + "/mtp.safetensors", { bf16("fuse_weight", { 2, 2 }, 7.0f) });
+    {
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(bare), RAD_OK);
+        CHECK_EQ(ck.add_draft(bare + "/mtp.safetensors", "draft."), (int)RAD_E_FORMAT);
+    }
+}
+
+/* RAD_MAP_MATMUL folds a projection into the one before it at convert, as Inkling 2's drafter folds
+ * its Markov head's hidden_out into the lm_head; a vector right factor gives a vector.
+ * RAD_MAP_SOFTMAX takes one row's softmax (the drafter's tap weights). Neither is stored as the
+ * checkpoint holds it. */
+TEST(derived_matmul_and_softmax_weights) {
+    const std::string dir = write_checkpoint(
+        { bf16("l", { 3, 2 }, 0.0f), bf16("r", { 2, 4 }, 1.0f), bf16("b", { 2 }, 10.0f),
+          bf16("f", { 2, 3 }, 0.0f), bf16("odd", { 3, 3 }, 0.0f) }, "{}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("lr", RAD_MAP_MATMUL, { "l", "r" }));
+    prog.name_map.push_back(map("lb", RAD_MAP_MATMUL, { "l", "b" }));
+    prog.name_map.push_back(map("bad", RAD_MAP_MATMUL, { "l", "odd" }));
+    prog.name_map.push_back(map("sm", RAD_MAP_SOFTMAX, { "f" }, { 1 }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "lr", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    REQUIRE_EQ(w.rank, 2u);
+    CHECK_EQ(w.shape[0], (int64_t)3);
+    CHECK_EQ(w.shape[1], (int64_t)4);
+    std::vector<float> f(4);
+    REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, f.data(), &why), RAD_OK);   /* [2, 3] @ r */
+    for (int j = 0; j < 4; ++j) CHECK_EQ(f[(size_t)j], 2.0f * (1 + j) + 3.0f * (5 + j));
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "lb", false, &w, &why), RAD_OK);
+    REQUIRE_EQ(w.rank, 1u);
+    CHECK_EQ(w.shape[0], (int64_t)3);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);   /* a vector is one row */
+    CHECK_EQ(f[2], 4.0f * 10 + 5.0f * 11);
+    CHECK(ckpt_resolve(ck, prog, "bad", false, &w, &why) != RAD_OK);
+    CHECK(why.find("columns") != std::string::npos);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "sm", false, &w, &why), RAD_OK);   /* row [3, 4, 5] */
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
+    const double z = 1.0 + std::exp(1.0) + std::exp(2.0);
+    CHECK(std::fabs(f[0] - (float)(1.0 / z)) < 1e-7f);
+    CHECK(std::fabs(f[2] - (float)(std::exp(2.0) / z)) < 1e-7f);
+}
+
 /* ================================================================== NVFP4 and per-row FP8 */
 namespace {
 

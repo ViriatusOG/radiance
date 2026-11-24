@@ -132,7 +132,9 @@ rad-convert [options] <input> -o <model.rad>
       --max-tok N      the max_tok declare is run at (default 8192)
       --max-ctx N      the context bound declare is run at. Default: the checkpoint's
                        training context
-      --draft-model DIR  a drafter that ships as its own repository, merged under `draft.`
+      --draft-model DIR  a drafter that ships as its own repository, merged under `draft.`;
+                       or one .safetensors file whose config is the target's `mtp_config`
+                       (Inkling 2's mtp.safetensors), its keys published as `draft.<key>`
       --kv-cache-dtype T  bf16 | i8, the cache width declare is run at. Default: the first of
                        bf16, i8 at which every op resolves; the container is the same at either
       --max-spec N     the max_spec declare is run at (default 4, or the block a drafter

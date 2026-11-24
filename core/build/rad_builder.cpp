@@ -1046,21 +1046,28 @@ int Builder::decl_name_map(const RadNameMap* m) {
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
         m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
-        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS && m->mode != RAD_MAP_MATMUL &&
+        m->mode != RAD_MAP_SOFTMAX) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
-    if ((m->mode == RAD_MAP_WNORM || m->mode == RAD_MAP_EMA) && m->n_src != 2) {
+    if ((m->mode == RAD_MAP_WNORM || m->mode == RAD_MAP_EMA || m->mode == RAD_MAP_MATMUL) &&
+        m->n_src != 2) {
         err(RAD_E_INVAL, "name map for '%s': a %s map names two sources (%s), not %d",
-            m->declared, m->mode == RAD_MAP_EMA ? "codebook" : "weight-norm",
-            m->mode == RAD_MAP_EMA ? "the embedding sums and the cluster usage"
-                                   : "the magnitude and the direction", m->n_src);
+            m->declared,
+            m->mode == RAD_MAP_EMA ? "codebook" : m->mode == RAD_MAP_MATMUL ? "product"
+                                                                            : "weight-norm",
+            m->mode == RAD_MAP_EMA      ? "the embedding sums and the cluster usage"
+            : m->mode == RAD_MAP_MATMUL ? "the left and the right factor"
+                                        : "the magnitude and the direction", m->n_src);
         return RAD_E_INVAL;
     }
-    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&
+    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS ||
+         m->mode == RAD_MAP_SOFTMAX) &&
         m->n_src != 1) {
         err(RAD_E_INVAL, "name map for '%s': a %s map names one source, not %d", m->declared,
-            m->mode == RAD_MAP_TAP ? "tap" : m->mode == RAD_MAP_COLS ? "column" : "transpose",
+            m->mode == RAD_MAP_TAP ? "tap" : m->mode == RAD_MAP_COLS ? "column"
+            : m->mode == RAD_MAP_SOFTMAX ? "softmax" : "transpose",
             m->n_src);
         return RAD_E_INVAL;
     }
