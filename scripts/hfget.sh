@@ -56,7 +56,7 @@ if [ -n "$HFGET_CHILD" ]; then
     out=$HFGET_DEST/$path
     man=$HFGET_DEST/.hfget-manifest
     rec=""; [ -f "$man" ] && rec=$(p="$path" awk -F'\t' '$2==ENVIRON["p"]{print $1; exit}' "$man")
-    if [ -f "$out" ] && [ "$(wc -c < "$out")" = "$size" ]; then
+    if [ -f "$out" ] && [ "$(stat -c %s "$out")" = "$size" ]; then
         if [ -z "$rec" ] || [ "$rec" = "$key" ]; then  # warm: size ok AND content-key matches (or unrecorded)
             echo "  = $path"
             printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
@@ -65,7 +65,7 @@ if [ -n "$HFGET_CHILD" ]; then
         rm -f "$out"                                   # same size, new content: resume is size-based, so start fresh
         echo "  ~ $path (same size, new content)"
     elif [ -f "$out" ]; then
-        echo "  + $path (resuming at $(wc -c < "$out") of $size)"
+        echo "  + $path (resuming at $(stat -c %s "$out") of $size)"
     else
         echo "  > $path"
     fi
@@ -78,7 +78,7 @@ if [ -n "$HFGET_CHILD" ]; then
         curl -sSL --fail --retry 5 --retry-delay 5 --retry-all-errors -C - \
              -o "$out" "https://huggingface.co/$HFGET_REPO/resolve/$HFGET_REV/$path"
     fi
-    got=$(wc -c < "$out")
+    got=$(stat -c %s "$out")
     [ "$got" = "$size" ] || { echo "hfget: $path is $got bytes, listing says $size" >&2; exit 1; }
     # An LFS name carries the sha256 the hub claims. Believe it only after computing it: the
     # size check alone would take a swapped file at the same length, and a spliced resume at a
@@ -173,7 +173,7 @@ todo=0
 while IFS= read -r line; do
     size=${line%%	*}; rest=${line#*	}; oid=${rest%%	*}; path=${rest#*	}
     cur=0
-    if [ -f "$dest/$path" ]; then cur=$(wc -c < "$dest/$path"); fi
+    if [ -f "$dest/$path" ]; then cur=$(stat -c %s "$dest/$path"); fi
     if [ "$cur" = "$size" ] && [ -f "$dest/.hfget-manifest" ]; then
         rec=$(p="$path" awk -F'\t' '$2==ENVIRON["p"]{print $1; exit}' "$dest/.hfget-manifest")
         if [ -n "$rec" ] && [ "$rec" != "${oid:-$size}" ]; then cur=0; fi
