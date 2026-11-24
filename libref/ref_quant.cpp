@@ -910,6 +910,143 @@ int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
     return ref_markov_greedy(a, RAD_BF16);
 }
 
+/* ------------------------------------------------------ dspark_rnn_markov_greedy */
+/* `logits`, `hidden`, `frnn`, `anchor`, `w1`w, `rnn_w`w, `rnn_b`w, `fold_w`w, `fold_b`w ->
+ * `scratch`, tile-local winners and `tokens`.
+ *
+ * Inkling 2's DSpark Markov head (`markov_head_type: rnn_hidden`), as the reference runs it (vLLM
+ * models/inkling2 dspark.py and ops/dspark.py). Per sequence, a rank-R recurrent state starts at
+ * zero and the predecessor at the anchor; at draft position l:
+ *
+ *   ctx[l]  = rnn_b + rnn_w[:, 2R:] @ [hidden[l], frnn]                    f32, once per position
+ *   raw     = ctx[l] + rnn_w[:, :2R] @ [state, w1[prev]]                  f32
+ *   gate    = bf(sigmoid(bf(raw[0:R]))),  cand = bf(tanh(bf(raw[R:2R]))),  out = bf(raw[2R:3R])
+ *   state   = bf(bf(gate * state) + bf(bf(1 - gate) * cand))
+ *   latent  = bf(tanh(out))
+ *   bias[v] = bf(fold_b[v] + latent . fold_w[v])                            fold = lm_head @ hidden_out
+ *   score[v]= bf(softcap * tanh(bf(bf(logits[l, v]) + bias[v]) / softcap))
+ *   prev    = argmax_v score[v], NaN as -inf, ties to the lower id
+ *
+ * `bf` rounds to bf16: every torch op of the reference rounds its output, and its base logits come
+ * from a bf16 GEMM, hence the rounding of the f32 `logits` this op is handed. The scan covers ids
+ * [0, n_vocab), which a caller sets to the trained vocabulary. `scratch` [M, steps*3R + 2R] f32
+ * holds each sequence's contexts, state and latent; the tile planes are the device row's
+ * decomposition, written here the same way. */
+int ref_dspark_rnn_markov_greedy(const RadArgs* a, RadStream) {
+    if (a->n_t < 13) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *hidden = &a->t[1], *frnn = &a->t[2], *anchor = &a->t[3];
+    const RadTensor *w1 = &a->t[4], *rw = &a->t[5], *rb = &a->t[6], *fw = &a->t[7], *fb = &a->t[8];
+    const RadTensor *scratch = &a->t[9], *tile_scores = &a->t[10], *tile_tokens = &a->t[11];
+    const RadTensor *out = &a->t[12];
+    for (const RadTensor* t : { logits, hidden, frnn, anchor, w1, rw, rb, fw, fb, scratch,
+                                tile_scores, tile_tokens, out })
+        if (!t->data) return RAD_E_INVAL;
+    if (logits->dtype != RAD_F32 || hidden->dtype != RAD_BF16 || frnn->dtype != RAD_BF16 ||
+        w1->dtype != RAD_BF16 || rw->dtype != RAD_BF16 || rb->dtype != RAD_BF16 ||
+        fw->dtype != RAD_BF16 || fb->dtype != RAD_BF16 || scratch->dtype != RAD_F32 ||
+        tile_scores->dtype != RAD_F32 || tile_tokens->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (anchor->dtype != RAD_I32) return RAD_E_SHAPE;
+
+    const int64_t steps = p_int(a, "steps", 0);
+    const int64_t R = p_int(a, "rank", 0);
+    const int64_t E = p_int(a, "n_embd", 0);
+    const int64_t V = p_int(a, "n_vocab", 0);
+    const int64_t astr = p_int(a, "anchor_stride", 1);
+    const float cap = p_f32(a, "softcap", 0.0f);
+    const int64_t lrow = logits->rank == 2 ? logits->shape[1] : 0;
+    const int64_t M = steps > 0 && lrow > 0
+                    ? band_rows(numel(logits) / (steps * lrow), p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || E <= 0 || V <= 0 || V > lrow || astr <= 0 ||
+        !(cap > 0.0f))
+        return RAD_E_SHAPE;
+    const int64_t W = 2 * R + 2 * E, n_tiles = (V + 63) / 64, sw = steps * 3 * R + 2 * R;
+    if (numel(hidden) < M * steps * E || numel(frnn) < M * E ||
+        numel(anchor) < (M - 1) * astr + 1 || numel(w1) < V * R || numel(rw) < 3 * R * W ||
+        numel(rb) < 3 * R || numel(fw) < V * R || numel(fb) < V || numel(scratch) < M * sw ||
+        numel(tile_scores) < M * n_tiles || numel(tile_tokens) < M * n_tiles ||
+        numel(out) < M * steps)
+        return RAD_E_SHAPE;
+    auto bf = [](float x) { return bf16_to_f32(f32_to_bf16(x)); };
+
+    REF_PAR_FOR(M * steps * (V * R + 3 * R * W))
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t sb = rowoff(scratch, m, sw);
+        float* ctx = (float*)scratch->data + sb;          /* [steps, 3R] */
+        float* state = ctx + steps * 3 * R;                /* [R] */
+        float* latent = state + R;                         /* [R] */
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t hb = rowoff(hidden, m * steps + l, E), fbase = rowoff(frnn, m, E);
+            for (int64_t j = 0; j < 3 * R; ++j) {
+                const int64_t wb = rowoff(rw, j, W) + 2 * R * laststride(rw);
+                float acc = ldt(rb, j * laststride(rb));
+                for (int64_t i = 0; i < E; ++i)
+                    acc += ldt(rw, wb + i * laststride(rw)) * ldt(hidden, hb + i * laststride(hidden));
+                for (int64_t i = 0; i < E; ++i)
+                    acc += ldt(rw, wb + (E + i) * laststride(rw)) *
+                           ldt(frnn, fbase + i * laststride(frnn));
+                ctx[l * 3 * R + j] = acc;
+            }
+        }
+        for (int64_t r = 0; r < R; ++r) state[r] = 0.0f;
+
+        std::vector<float> prevw((size_t)R), raw((size_t)(3 * R));
+        int64_t pid = ld_int(anchor->dtype, anchor->data, offlin(anchor, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const bool pid_ok = pid >= 0 && pid < V;
+            for (int64_t r = 0; r < R; ++r)
+                prevw[(size_t)r] = pid_ok ? ldt(w1, rowoff(w1, pid, R) + r * laststride(w1)) : 0.0f;
+            for (int64_t j = 0; j < 3 * R; ++j) {
+                const int64_t wb = rowoff(rw, j, W);
+                float acc = ctx[l * 3 * R + j];
+                for (int64_t i = 0; i < R; ++i) acc += ldt(rw, wb + i * laststride(rw)) * state[i];
+                for (int64_t i = 0; i < R; ++i)
+                    acc += ldt(rw, wb + (R + i) * laststride(rw)) * prevw[(size_t)i];
+                raw[(size_t)j] = acc;
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                const float g = bf(1.0f / (1.0f + std::exp(-bf(raw[(size_t)r]))));
+                const float c = bf(std::tanh(bf(raw[(size_t)(R + r)])));
+                const float o = bf(raw[(size_t)(2 * R + r)]);
+                state[r] = bf(bf(g * state[r]) + bf(bf(1.0f - g) * c));
+                latent[r] = bf(std::tanh(o));
+            }
+
+            const int64_t lb = rowoff(logits, m * steps + l, lrow);
+            float global_best = -INFINITY;
+            int64_t global_token = 0;
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64, end = std::min<int64_t>(first + 64, V);
+                float best = -INFINITY;
+                int64_t best_token = first;
+                for (int64_t v = first; v < end; ++v) {
+                    float dot = ldt(fb, v * laststride(fb));
+                    const int64_t fwb = rowoff(fw, v, R);
+                    for (int64_t r = 0; r < R; ++r) dot += latent[r] * ldt(fw, fwb + r * laststride(fw));
+                    const float x = bf(bf(ldt(logits, lb + v * laststride(logits))) + bf(dot));
+                    float score = bf(cap * std::tanh(x / cap));
+                    if (std::isnan(score)) score = -INFINITY;
+                    if (score > best || (score == best && v < best_token)) {
+                        best = score;
+                        best_token = v;
+                    }
+                }
+                stt(tile_scores, rowoff(tile_scores, m, n_tiles) + tile * laststride(tile_scores),
+                    best);
+                st_int(tile_tokens->dtype, tile_tokens->data,
+                       rowoff(tile_tokens, m, n_tiles) + tile * laststride(tile_tokens), best_token);
+                if (best > global_best || (best == global_best && best_token < global_token)) {
+                    global_best = best;
+                    global_token = best_token;
+                }
+            }
+            st_int(out->dtype, out->data, rowoff(out, m, steps) + l * laststride(out), global_token);
+            pid = global_token;
+        }
+    }
+    return RAD_OK;
+}
+
 int ref_dflash_markov_greedy_f32(const RadArgs* a, RadStream) {
     return ref_markov_greedy(a, RAD_F32);
 }

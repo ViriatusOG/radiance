@@ -816,6 +816,22 @@ static const RadOperandSpec oDflashMarkov[] = {
     { "tile_scores", RAD_OPD_OUT, 0 }, { "tile_tokens", RAD_OPD_OUT, 0 },
     { "tokens", RAD_OPD_OUT, 0 },
 };
+/* Inkling 2's recurrent DSpark walk (dspark_rnn_markov_greedy): dflash_markov_greedy's scan with a
+ * rank-R gated state in place of the fixed bigram, and the folded head. */
+static const RadParamSpec pDsparkRnn[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "steps", RAD_P_INT, RAD_REQUIRED },
+    { "rank", RAD_P_INT, RAD_REQUIRED }, { "n_embd", RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED }, { "softcap", RAD_P_F64, RAD_REQUIRED },
+    { "anchor_stride", RAD_P_INT, RAD_OPTIONAL }, { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDsparkRnn[] = {
+    { "logits", RAD_OPD_IN, 0 }, { "hidden", RAD_OPD_IN, 0 }, { "frnn", RAD_OPD_IN, 0 },
+    { "anchor", RAD_OPD_IN, 0 }, { "w1", RAD_OPD_WEIGHT, 0 }, { "rnn_w", RAD_OPD_WEIGHT, 0 },
+    { "rnn_b", RAD_OPD_WEIGHT, 0 }, { "fold_w", RAD_OPD_WEIGHT, 0 },
+    { "fold_b", RAD_OPD_WEIGHT, 0 }, { "scratch", RAD_OPD_OUT, 0 },
+    { "tile_scores", RAD_OPD_OUT, 0 }, { "tile_tokens", RAD_OPD_OUT, 0 },
+    { "tokens", RAD_OPD_OUT, 0 },
+};
 /* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
 static const RadParamSpec pDflashTree[] = {
     { "M",       RAD_P_INT, RAD_REQUIRED },
@@ -3862,6 +3878,11 @@ static const RadOpSchema kSchemas[] = {
            "next position's predecessor."),
     SCHEMA("dflash_markov_greedy_f32", pDflashMarkov, oDflashMarkov,
            "DSpark full-vocabulary greedy walk with F32 base logits and BF16 codebooks."),
+    SCHEMA("dspark_rnn_markov_greedy", pDsparkRnn, oDsparkRnn,
+           "Inkling 2's recurrent DSpark Markov walk: a rank-R gated state over [state, "
+           "w1[previous]] and the position's [hidden, frnn] context, its latent through the "
+           "folded head added to the bf16 base logit, softcapped, and the greedy argmax (lower id "
+           "on ties) the next predecessor; rounded to bf16 where the reference rounds."),
     SCHEMA("dflash_tree", pDflashTree, oDflashTree,
            "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
            "a taken node's children are the valid candidates at the next position, each with log "
@@ -5105,6 +5126,12 @@ static const RadConstraint cDflashSelect[] = {
 };
 static const RadConstraint cDflashMarkov[] = {
     C_GE("steps", 1), C_DIV("rank", 32), C_LE("rank", 512),
+    C_GE("n_vocab", 1), C_IN("dtype", "bf16"),
+};
+/* The recurrent walk keeps its state, input and pre-activations in LDS (2R + 3R floats) and its
+ * per-position context sums in registers (steps of them). */
+static const RadConstraint cDsparkRnn[] = {
+    C_GE("steps", 1), C_LE("steps", 16), C_DIV("rank", 32), C_LE("rank", 512),
     C_GE("n_vocab", 1), C_IN("dtype", "bf16"),
 };
 /* dflash_tree's frontier (nodes x top_k children) and its node table live in LDS. */
@@ -10485,6 +10512,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cDflashMarkov), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_markov_greedy_f32, nullptr, nullptr, nullptr,
   r4d_shape_dflash_markov_f32 },
+
+{ "dspark_rnn_markov_greedy_bf16", "dspark_rnn_markov_greedy", "dflash",
+  "Inkling 2's recurrent DSpark Markov walk: the [hidden, frnn] contexts once, then per position "
+  "the gated state update and a full-vocabulary scan with the folded head",
+  "steps 1..16, rank a multiple of 32 and <= 512, 64 vocabulary ids per scratch tile",
+  "f32 logits, bf16 rows and weights, i32 anchor, f32 scratch, f32/i32 tile winners, i32 tokens",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDsparkRnn), NOTUNE,
+  nullptr, nullptr, r4d_rad_dspark_rnn_markov_greedy, nullptr, nullptr, nullptr,
+  r4d_shape_dspark_rnn_markov },
 
 { "dflash_select_bf16", "dflash_select", "dflash",
   "DFlash2 candidate selector: the low-rank edge scores and the greedy walk over them, one "

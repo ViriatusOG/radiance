@@ -2612,6 +2612,35 @@ int ref_dflash_markov_greedy_f32_shape(const RadParam* p, int n_p, int operand, 
     return ref_markov_shape(p, n_p, operand, out, RAD_F32, "dflash_markov_greedy_f32");
 }
 
+/* Inkling 2's recurrent DSpark walk: the scan's tile planes as dflash_markov_greedy's, plus the
+ * per-sequence scratch (its contexts, state and latent). */
+int ref_dspark_rnn_markov_greedy_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t R = gi(p, n_p, "rank", 0);
+    const int64_t E = gi(p, n_p, "n_embd", 0);
+    const int64_t nv = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr = gi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || R <= 0 || E <= 0 || nv <= 0 || astr <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps, tiles = (nv + 63) / 64;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { rows, nv });                                  /* logits */
+    o.t((uint32_t)RAD_BF16, { rows, E });                                  /* hidden */
+    o.t((uint32_t)RAD_BF16, { M, E });                                     /* frnn */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);               /* anchor */
+    o.t((uint32_t)RAD_BF16, { nv, R });                                    /* w1 */
+    o.t((uint32_t)RAD_BF16, { 3 * R, 2 * R + 2 * E });                     /* rnn_w */
+    o.t((uint32_t)RAD_BF16, { 3 * R });                                    /* rnn_b */
+    o.t((uint32_t)RAD_BF16, { nv, R });                                    /* fold_w */
+    o.t((uint32_t)RAD_BF16, { nv });                                       /* fold_b */
+    o.t((uint32_t)RAD_F32, { M, steps * 3 * R + 2 * R });                  /* scratch */
+    o.t((uint32_t)RAD_F32, { M, tiles });                                  /* tile_scores */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, tiles }, nv, -1, 0);               /* tile_tokens */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);               /* tokens */
+    return o.finish("dspark_rnn_markov_greedy", operand, out);
+}
+
 /* dflash_select's operands, then `nodes` tokens and parents a sequence. */
 int ref_dflash_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M     = gi(p, n_p, "M", 0);

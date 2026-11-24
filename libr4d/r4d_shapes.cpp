@@ -2367,3 +2367,34 @@ extern "C" int r4d_shape_dflash_markov_f32(const RadParam* p, int n_p, int opera
     if (rc == RAD_OK && operand == 0) out->dtype = RAD_F32;
     return rc;
 }
+
+extern "C" int r4d_shape_dspark_rnn_markov(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t steps = pi(p, n_p, "steps");
+    const int64_t R = pi(p, n_p, "rank");
+    const int64_t E = pi(p, n_p, "n_embd");
+    const int64_t V = pi(p, n_p, "n_vocab");
+    const int64_t astr = pi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || R <= 0 || E <= 0 || V <= 0 || astr < 1)
+        return RAD_E_UNSUPPORTED;
+    const int64_t tiles = (V + 63) / 64;
+    const int64_t rows = M * steps;
+    const uint32_t B = RAD_BF16;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, rows, V),
+        opd(B, rows, E),
+        opd(B, M, E),
+        opd_idx((M - 1) * astr + 1, 0, V),
+        opd(B, V, R),
+        opd(B, 3 * R, 2 * R + 2 * E),
+        opd(B, 3 * R),
+        opd(B, V, R),
+        opd(B, V),
+        opd((uint32_t)RAD_F32, M, steps * 3 * R + 2 * R),
+        opd((uint32_t)RAD_F32, M, tiles),
+        opd_idx(M, tiles, V),
+        opd_idx(M, steps, V),
+    };
+    R4D_PICK(l);
+}

@@ -359,6 +359,14 @@ static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O
 static const RadOperandSpec oDflashMarkov[] = { OPD("logits"), OPD("anchor"), WGT("pred"),
                                                 WGT("succ"), OUT("tile_scores"),
                                                 OUT("tile_tokens"), OUT("tokens") };
+static const RadParamSpec pDsparkRnn[] = { P_INT("M"), P_INT("steps"), P_INT("rank"),
+                                           P_INT("n_embd"), P_INT("n_vocab"), P_F64("softcap"),
+                                           P_INTO("anchor_stride"), P_STR("dtype") };
+static const RadOperandSpec oDsparkRnn[] = { OPD("logits"), OPD("hidden"), OPD("frnn"),
+                                             OPD("anchor"), WGT("w1"), WGT("rnn_w"), WGT("rnn_b"),
+                                             WGT("fold_w"), WGT("fold_b"), OUT("scratch"),
+                                             OUT("tile_scores"), OUT("tile_tokens"),
+                                             OUT("tokens") };
 static const RadParamSpec pDflashTree[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                             P_INT("rank"), P_INT("n_vocab"),
                                             P_INTO("anchor_stride"), P_INT("nodes"),
@@ -1632,6 +1640,11 @@ static const RadOpSchema kSchemas[] = {
   "ties), then use that token as the next predecessor." },
 { "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
   "Full-vocabulary greedy Markov walk with F32 base logits and BF16 codebooks." },
+{ "dspark_rnn_markov_greedy", ARR(pDsparkRnn), ARR(oDsparkRnn),
+  "Inkling 2's recurrent DSpark Markov head: a rank-R state gated over [state, w1[previous]] and "
+  "the position's [hidden, frnn] context, its tanh latent through the folded head "
+  "(lm_head @ hidden_out) added to the bf16 base logit, softcapped, and the greedy argmax (lower "
+  "id on ties) the next predecessor; every step rounded to bf16 as the reference's torch ops are." },
 { "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
   "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
   "is the anchor, each selected node's children are the valid candidates at the next position "
@@ -2707,6 +2720,10 @@ SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
        "Full-vocabulary greedy Markov walk with F32 base logits",
        "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
        ref_dflash_markov_greedy_f32),
+SIMPLE("ref_dspark_rnn_markov_greedy", "dspark_rnn_markov_greedy", "draft",
+       "Inkling 2's recurrent (rnn_hidden) DSpark Markov walk",
+       "f32 logits, bf16 rows and weights, f32 scratch and tile winners, i32 tokens out",
+       ref_dspark_rnn_markov_greedy),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),

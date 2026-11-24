@@ -1452,7 +1452,7 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
-        "dflash_markov_greedy", "dflash_markov_greedy_f32",
+        "dflash_markov_greedy", "dflash_markov_greedy_f32", "dspark_rnn_markov_greedy",
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
         "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
         "rmsnorm_had_quant_i8",
@@ -10774,6 +10774,70 @@ TEST(dflash_markov_f32_preserves_a_near_tie_and_refuses_bf16) {
     CHECK_EQ(out.iat(0), 0);
 }
 
+/* Inkling 2's recurrent Markov head. Each input path decides one choice on its own, so a path read
+ * from the wrong columns or rows picks another token:
+ *   sequence 0  step 0: the base logit (token 5); step 1: the previous token's w1 row through the
+ *               `out` gate row 0 (latent 0 = tanh 2, fold row 9), and its `cand` row 3 moves the
+ *               state by (1 - sigmoid 0) * tanh 2;
+ *   sequence 1  step 0: the hidden row (column 2R + 0, `out` row 1, latent 1 = tanh -3, fold row
+ *               20 at -2); step 1: f_rnn (column 2R + E + 1, `out` row 2, fold row 66 in the
+ *               second vocabulary tile), which also feeds step 0 but loses there. */
+TEST(dspark_rnn_markov_greedy_reads_each_path_in_its_own_columns) {
+    constexpr int V = 70, R = 32, E = 4, M = 2, steps = 2, W = 2 * R + 2 * E, tiles = 2;
+    constexpr int sw = steps * 3 * R + 2 * R;
+    std::vector<float> lg(M * steps * V, 0.0f), hid(M * steps * E, 0.0f), fr(M * E, 0.0f);
+    std::vector<float> w1(V * R, 0.0f), rw(3 * R * W, 0.0f), rb(3 * R, 0.0f);
+    std::vector<float> fw(V * R, 0.0f), fbias(V, 0.0f);
+    lg[(0 * steps + 0) * V + 5] = 1.0f;
+    w1[5 * R + 0] = 1.0f;
+    rw[(2 * R + 0) * W + R + 0] = 2.0f;        /* out row 0 <- w1[prev] column 0 */
+    rw[(R + 3) * W + R + 0] = 2.0f;            /* cand row 3 <- w1[prev] column 0 */
+    fw[9 * R + 0] = 4.0f;
+    hid[(1 * steps + 0) * E + 0] = 1.0f;
+    rw[(2 * R + 1) * W + 2 * R + 0] = -3.0f;   /* out row 1 <- hidden column 0 */
+    fw[20 * R + 1] = -2.0f;
+    fr[1 * E + 1] = 1.0f;
+    rw[(2 * R + 2) * W + 2 * R + E + 1] = 1.0f; /* out row 2 <- f_rnn column 1 */
+    fw[66 * R + 2] = 1.0f;
+    T logits(RAD_F32, {M * steps, V}); logits.f(lg);
+    T hidden(RAD_BF16, {M * steps, E}); hidden.f(hid);
+    T frnn(RAD_BF16, {M, E}); frnn.f(fr);
+    T anchor(RAD_I32, {M * 2}); anchor.n({3, -1, 4, -1});
+    T tw1(RAD_BF16, {V, R}); tw1.f(w1);
+    T trw(RAD_BF16, {3 * R, W}); trw.f(rw);
+    T trb(RAD_BF16, {3 * R}); trb.f(rb);
+    T tfw(RAD_BF16, {V, R}); tfw.f(fw);
+    T tfb(RAD_BF16, {V}); tfb.f(fbias);
+    T scratch(RAD_F32, {M, sw});
+    T tile_scores(RAD_F32, {M, tiles}), tile_tokens(RAD_I32, {M, tiles}), out(RAD_I32, {M, steps});
+    A a; a.t(logits).t(hidden).t(frnn).t(anchor).t(tw1).t(trw).t(trb).t(tfw).t(tfb)
+          .t(scratch).t(tile_scores).t(tile_tokens).t(out)
+          .i("M", M).i("steps", steps).i("rank", R).i("n_embd", E).i("n_vocab", V)
+          .d("softcap", 30.0).i("anchor_stride", 2).s("dtype", "bf16");
+    CHECK_OK(run("dspark_rnn_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 5LL);
+    CHECK_EQ(out.iat(1), 9LL);
+    CHECK_EQ(out.iat(2), 20LL);
+    CHECK_EQ(out.iat(3), 66LL);
+    /* the contexts: sequence 1's hidden row at step 0 only, its f_rnn at both */
+    CHECK_EQ(scratch.at(sw + 0 * 3 * R + 2 * R + 1), -3.0f);
+    CHECK_EQ(scratch.at(sw + 1 * 3 * R + 2 * R + 1), 0.0f);
+    CHECK_EQ(scratch.at(sw + 0 * 3 * R + 2 * R + 2), 1.0f);
+    CHECK_EQ(scratch.at(sw + 1 * 3 * R + 2 * R + 2), 1.0f);
+    /* sequence 0's state after step 1: bf(bf(0.5 * 0) + bf(bf(1 - 0.5) * bf(tanh 2))), its latent */
+    const float cand = bf16_to_f32(f32_to_bf16(std::tanh(2.0f)));
+    const float st3 = bf16_to_f32(f32_to_bf16(bf16_to_f32(f32_to_bf16(0.5f * cand))));
+    CHECK_EQ(scratch.at(steps * 3 * R + 3), st3);
+    CHECK_EQ(scratch.at(steps * 3 * R + R + 0), cand);
+    /* the last step's tile winners: sequence 1's 66 in the second tile, a zero row's lowest id */
+    CHECK_EQ(tile_tokens.iat(tiles + 1), 66LL);
+    CHECK_EQ(tile_tokens.iat(tiles + 0), 0LL);
+    /* an f32-only operand handed bf16 is refused */
+    T bf_logits(RAD_BF16, {M * steps, V});
+    a.ts[0] = bf_logits.t;
+    CHECK(run("dspark_rnn_markov_greedy", a) != RAD_OK);
+}
+
 /* Independent pitches in the two scratch arrays are part of the tensor contract. Guard cells
  * distinguish correct row addressing from treating both outputs as tightly packed. */
 TEST(dflash_markov_greedy_padded_scratch_rows) {
@@ -11372,6 +11436,10 @@ std::vector<Geo> geometries() {
                                              .s("dtype", "bf16")),
         G("dflash_markov_greedy_f32", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
                                                  .i("n_vocab", 130).i("anchor_stride", 1)
+                                                 .s("dtype", "bf16")),
+        G("dspark_rnn_markov_greedy", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
+                                                 .i("n_embd", 16).i("n_vocab", 130)
+                                                 .d("softcap", 30.0).i("anchor_stride", 1)
                                                  .s("dtype", "bf16")),
         G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                  .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
