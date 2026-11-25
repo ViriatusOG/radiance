@@ -2394,6 +2394,16 @@ TEST(a_sink_counts_preempted_time_only_inside_its_decode_window) {
     CHECK_EQ(s.preempted_ns(), p);
 }
 
+/* prompt_ms times the first prefill, so the prompt counts are the first placement's too: a
+ * recompute after preemption, with its own prefix hit, does not replace them. */
+TEST(a_sink_keeps_the_first_placements_prompt_counts) {
+    Sink s;
+    s.set_prompt_stats(100000, 90000);
+    s.set_prompt_stats(100000, 0);                /* the recompute found nothing cached */
+    CHECK_EQ(s.n_prompt(), 100000);
+    CHECK_EQ(s.n_cached(), 90000);
+}
+
 /* A request the scheduler refuses gets id 0 and a failed sink, so the HTTP thread waiting on the
  * sink answers instead of hanging. An empty prompt is refused before the scheduler reads any
  * state, so an uninitialised one serves. */

@@ -89,7 +89,8 @@ public:
      * IScheduler::cancel() also tells it; this is the cheap path with no lookup. */
     bool cancel_requested() const { return cancel_.load(std::memory_order_acquire); }
 
-    /* Admission accounting, set once by the scheduler when the prompt is placed. */
+    /* Admission accounting, from the first time the scheduler places the prompt; a recompute
+     * after preemption does not replace it. */
     void set_prompt_stats(int32_t n_prompt, int32_t n_cached);
 
     /* Marks the first step the scheduler gives this request, where its prompt phase starts, so

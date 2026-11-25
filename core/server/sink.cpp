@@ -122,6 +122,11 @@ void Sink::fail(int rad_status, const char* why) {
 }
 
 void Sink::set_prompt_stats(int32_t n_prompt, int32_t n_cached) {
+    /* The first placement wins. A request preempted after it re-places its prompt on recompute,
+     * often with a different prefix hit, and prompt_ms times the first prefill only: taking the
+     * recompute's counts paired one prefill's tokens with another's time (82,727 tokens "in"
+     * 3.6 s, 22.7k tok/s). */
+    if (n_prompt_.load(std::memory_order_relaxed) > 0) return;
     n_prompt_.store(n_prompt, std::memory_order_release);
     n_cached_.store(n_cached, std::memory_order_release);
 }
