@@ -86,6 +86,12 @@ bool Sink::push(int32_t token, const TokenLogprobs* lp, int64_t now) {
     const int64_t t_now = (now >= 0 ? now : now_ns()) - t_start_ns_;
     if (h == 0) t_first_.store(t_now, std::memory_order_release);
     t_last_.store(t_now, std::memory_order_release);
+    /* After t_last_, so a reader that sees the preemption also sees the token that bounds it. */
+    if (preempt_owed_ > 0) {
+        n_preempt_.store(n_preempt_.load(std::memory_order_relaxed) + preempt_owed_,
+                         std::memory_order_release);
+        preempt_owed_ = 0;
+    }
 
     /* A wake only while the consumer is asleep (asleep_): at hundreds of streams a wake per
      * token per stream, for consumers already awake draining, is a syscall each on the
@@ -130,6 +136,16 @@ void Sink::set_prompt_progress(int32_t processed, int32_t total, int32_t cached)
 void Sink::mark_admitted() {
     if (t_admit_.load(std::memory_order_relaxed) < 0)
         t_admit_.store(now_ns() - t_start_ns_, std::memory_order_release);
+    if (t_preempt_ >= 0) {
+        preempt_owed_ += now_ns() - t_start_ns_ - t_preempt_;
+        t_preempt_ = -1;
+    }
+}
+
+/* A preemption before the first token is prompt time, which prompt_ms already covers. */
+void Sink::mark_preempted() {
+    if (head_.load(std::memory_order_relaxed) == 0 || t_preempt_ >= 0) return;
+    t_preempt_ = now_ns() - t_start_ns_;
 }
 
 /* One producer, so a load and a store suffice. */

@@ -17,6 +17,7 @@
 #include <deque>
 #include <limits>
 #include <random>
+#include <thread>
 
 /* ================================================================== parsing */
 
@@ -2197,6 +2198,7 @@ TEST(a_response_carries_its_requests_timings_and_draft_counts) {
         CHECK_EQ(t["predicted_n"].get<int64_t>(), predicted);
         CHECK(t["prompt_ms"].is_number());
         CHECK(t["predicted_ms"].is_number());
+        CHECK_NEAR(t["preempted_ms"].get<double>(), 0.0, 0.0);   /* never preempted */
         CHECK(t["prompt_ms"].get<double>() >= 0.0);
         for (const char* k : { "prompt_per_token_ms", "prompt_per_second",
                                "predicted_per_token_ms", "predicted_per_second" })
@@ -2280,6 +2282,7 @@ TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
     CHECK_NEAR(j["prompt_per_token_ms"].get<double>(), 0.5, 1e-12);
     CHECK_NEAR(j["predicted_per_second"].get<double>(), 100.0, 1e-9);
     CHECK_NEAR(j["predicted_per_token_ms"].get<double>(), 10.0, 1e-12);
+    CHECK_NEAR(j["preempted_ms"].get<double>(), 0.0, 0.0);
     CHECK(!j.contains("draft_n"));
 
     t.decode_n = 0;
@@ -2362,6 +2365,33 @@ TEST(a_sink_keeps_its_first_admission_and_sums_its_drafts) {
     s.add_drafts(3, 3);
     CHECK_EQ(s.n_drafted(), (int64_t)7);
     CHECK_EQ(s.n_draft_accepted(), (int64_t)5);
+}
+
+/* Preempted time counts between the first token and the last: a preemption before the first token
+ * is prompt time, and one no token follows (a request cancelled while it waited) is after the
+ * last. What counts is the wait from preemption to re-admission. */
+TEST(a_sink_counts_preempted_time_only_inside_its_decode_window) {
+    Sink s;
+    s.mark_preempted();                           /* before the first token */
+    s.mark_admitted();
+    s.push(1);
+    CHECK_EQ(s.preempted_ns(), (int64_t)0);
+
+    s.mark_preempted();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    s.mark_admitted();
+    CHECK_EQ(s.preempted_ns(), (int64_t)0);       /* no token after it yet */
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    s.push(2);
+    const int64_t p = s.preempted_ns();
+    CHECK(p >= 20000000);
+    CHECK(p < s.t_last_token_ns() - s.t_first_token_ns());   /* the 5 ms after it ran */
+
+    s.mark_preempted();                           /* cancelled while waiting: never counted */
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    s.mark_admitted();
+    s.finish(Finish::Cancelled);
+    CHECK_EQ(s.preempted_ns(), p);
 }
 
 /* A request the scheduler refuses gets id 0 and a failed sink, so the HTTP thread waiting on the

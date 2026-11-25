@@ -869,10 +869,14 @@ UsageOut Server::usage_of(const OaiRequest& r, const std::vector<Generation>& ge
 
 /* Where the request's time went, from its sinks (one for a choice's final chunk, all for the
  * request). Each sink counts from its own construction, so times are moved onto the steady clock
- * first; `received_ns` (body arrival, -1 when unknown) is already on it. Fields: TimingsOut. */
+ * first; `received_ns` (body arrival, -1 when unknown) is already on it. Fields: TimingsOut.
+ *
+ * preempted_ms is the most any one sink spent preempted, not the sum: choices of one request are
+ * preempted together or overlap, and a sum could exceed the window predicted_ms spans. */
 TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t received_ns) {
     TimingsOut t;
     int64_t admit = INT64_MAX, first_lo = INT64_MAX, first_hi = INT64_MIN, last = INT64_MIN;
+    int64_t preempted = 0;
     bool admitted = true;
     for (size_t i = 0; i < n; ++i) {
         const Sink& s = *sinks[i];
@@ -882,6 +886,7 @@ TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t receiv
         t.draft_n_accepted += s.n_draft_accepted();
         const int64_t tf = s.t_first_token_ns();
         if (tf < 0) continue;
+        preempted = std::max(preempted, s.preempted_ns());   /* first: it orders t_last below */
         t.valid = true;
         t.cache_n  += s.n_cached();
         t.prompt_n += s.n_prompt() - s.n_cached();
@@ -896,6 +901,7 @@ TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t receiv
     if (!t.valid) return t;
     if (admitted) t.prompt_ms = (double)(first_hi - admit) * 1e-6;
     t.predicted_ms = (double)(last - first_lo) * 1e-6;
+    t.preempted_ms = std::min((double)preempted * 1e-6, t.predicted_ms);
     if (received_ns >= 0) {
         t.ttft_ms  = (double)(first_lo - received_ns) * 1e-6;
         t.total_ms = (double)(last - received_ns) * 1e-6;
