@@ -25,7 +25,7 @@ set -e
 BUILD=
 CLEAN=0
 SAN=
-CMAKE_ARGS=""
+CMAKE_ARGS=
 
 while [ $# -gt 0 ]; do
     case "$1" in
