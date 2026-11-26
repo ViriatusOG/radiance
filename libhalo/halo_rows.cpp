@@ -2007,6 +2007,29 @@ static const RadOperandSpec oAttnResMix[] = {
     { "states", RAD_OPD_IN, 1 },  { "cur", RAD_OPD_IN, 0 },   { "addend", RAD_OPD_IN, 1 },
     { "query", RAD_OPD_WEIGHT, 0 }, { "w", RAD_OPD_WEIGHT, 1 }, { "y", RAD_OPD_OUT, 0 },
 };
+/* attn_paged_rel (Inkling 2): attn_paged's parameters and the two widths of its bias. */
+static const RadParamSpec pAttnPagedRel[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8"),
+    P_INT("d_rel"), P_INT("extent"),
+};
+/* attn_paged_rel's operands: r [q_len, n_head, d_rel] and the sinks [q_len, n_head] are per-row
+ * activations, rel_proj [d_rel, extent] is a weight. */
+static const RadOperandSpec oAttnPagedRel[] = {
+    { "q",           RAD_OPD_IN,     0 },
+    { "kv_cache",    RAD_OPD_IN,     0 },
+    { "block_table", RAD_OPD_IN,     0 },
+    { "seqused",     RAD_OPD_IN,     0 },
+    { "k_descale",   RAD_OPD_IN,     1 },
+    { "v_descale",   RAD_OPD_IN,     1 },
+    { "cu_seqlens",  RAD_OPD_IN,     1 },
+    { "r",           RAD_OPD_IN,     0 },
+    { "rel_proj",    RAD_OPD_WEIGHT, 0 },
+    { "sink",        RAD_OPD_IN,     0 },
+    { "out",         RAD_OPD_OUT,    0 },
+};
+
 static const RadParamSpec pMnDtype[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -3510,6 +3533,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("attn_res_mix", pAttnResMix, oAttnResMix,
            "block attention residuals: a softmax over depth of the rms-normed states, cur + addend, "
            "per query; the mix is rms-normed and gained by w when present."),
+    SCHEMA("attn_paged_rel", pAttnPagedRel, oAttnPagedRel,
+           "attn_paged with a relative-position bias r . rel_proj[:, d] on each score at distance "
+           "d < extent, and one sink logit per query row and head, in the maximum and the "
+           "denominator, with no value."),
     SCHEMA("l2_clip", pL2Clip, oL2Clip,
            "y[r][i] = x[r][i] * w[i] * min(1, threshold / (||x*w over i's group|| + 1e-6)) * tau[r], "
            "tau = 1 + alpha * ln(max(1, (positions[r] + 1) / floor)) with positions, else 1. "
@@ -6303,6 +6330,17 @@ static const RadConstraint cAttnResMix[] = {
     C_GE("n_state", 0), C_LE("n_state", 15), C_GE("n_query", 1), C_LE("n_query", 4),
     C_IN("dtype", "bf16"),
 };
+#define HALO_REL_C(NAME, G, KV)                                                                    \
+    static const RadConstraint NAME[] = {                                                          \
+        C_EQ("head_dim", 128), C_EQ("gqa", G), C_EQ("block_size", 16), C_GE("causal", 0),          \
+        C_GE("window", 0), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                          \
+    };
+HALO_REL_C(cRelG1Bf16, 1, "bf16") HALO_REL_C(cRelG1I8, 1, "i8")
+HALO_REL_C(cRelG2Bf16, 2, "bf16") HALO_REL_C(cRelG2I8, 2, "i8")
+HALO_REL_C(cRelG3Bf16, 3, "bf16") HALO_REL_C(cRelG3I8, 3, "i8")
+HALO_REL_C(cRelG4Bf16, 4, "bf16") HALO_REL_C(cRelG4I8, 4, "i8")
+HALO_REL_C(cRelG8Bf16, 8, "bf16") HALO_REL_C(cRelG8I8, 8, "i8")
+#undef HALO_REL_C
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
  * that window's memory bandwidth without taking the compute units the other lane needs. */
@@ -7162,6 +7200,31 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnResMix), NOTUNE,
   nullptr, nullptr, halo_rad_attn_res_mix, nullptr, nullptr, nullptr,
   halo_shape_attn_res_mix },
+/* attn_paged_rel (Inkling 2's attention, halo_attn_rel.hip): head_dim 128 at gqa 1, 2, 3, 4 and 8,
+ * bf16 or int8 cache, any window (0 is full) and causal or not. The split-KV decode kernel serves
+ * a decode and a verify, the generic kernel everything else (the WMMA prefill and packed verify are
+ * not yet ported to gfx1151: HALO_REL_WMMA). */
+#define HALO_REL_ROW(G, KVN, KVS, C, KVDOC)                                                        \
+{ "attn_rel_h128_gqa" #G "_" #KVN, "attn_paged_rel", "attn",                                       \
+  "paged attention with a relative-position bias and a sink logit per row; a workgroup a (row, "  \
+  "head) pair, one thread a dimension",                                                            \
+  "head_dim 128, " #G " queries per kv head, paged block 16, any q_len, varlen, any window",       \
+  "bf16 query, bf16 r, rel_proj and sinks, " KVDOC " kv cache, bf16 out, f32 math",               \
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,                                                               \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, halo_rad_attn_rel_h128_##KVS, halo_rad_attn_rel_scratch, nullptr, nullptr,   \
+  halo_shape_attn_paged_rel },
+HALO_REL_ROW(1, bf16kv, bf16kv, cRelG1Bf16, "bf16")
+HALO_REL_ROW(1, i8kv, i8kv, cRelG1I8, "int8 (an f16 scale of K and of V per token and head)")
+HALO_REL_ROW(2, bf16kv, bf16kv, cRelG2Bf16, "bf16")
+HALO_REL_ROW(2, i8kv, i8kv, cRelG2I8, "int8 (an f16 scale of K and of V per token and head)")
+HALO_REL_ROW(3, bf16kv, bf16kv, cRelG3Bf16, "bf16")
+HALO_REL_ROW(3, i8kv, i8kv, cRelG3I8, "int8 (an f16 scale of K and of V per token and head)")
+HALO_REL_ROW(4, bf16kv, bf16kv, cRelG4Bf16, "bf16")
+HALO_REL_ROW(4, i8kv, i8kv, cRelG4I8, "int8 (an f16 scale of K and of V per token and head)")
+HALO_REL_ROW(8, bf16kv, bf16kv, cRelG8Bf16, "bf16")
+HALO_REL_ROW(8, i8kv, i8kv, cRelG8I8, "int8 (an f16 scale of K and of V per token and head)")
+#undef HALO_REL_ROW
 
 { "gelu_mul_bf16", "gelu_mul", "elem",
   "gelu-gated product over a fused [M, 2n] gate_up",

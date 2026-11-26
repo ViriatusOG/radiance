@@ -219,7 +219,16 @@ double rel_l2(const std::vector<uint16_t>& ref, const std::vector<uint16_t>& got
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s libr4d.so libref.so\n", argv[0]); return 2; }
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s libr4d.so libref.so [prefix [--no-packed]]\n", argv[0]);
+        return 2;
+    }
+    /* The scratch hook's and split counter's prefix: `halo` for libhalo. --no-packed names a
+     * library whose verify takes the decode kernel (libhalo until its WMMA verify is ported): the
+     * packed-verify cases still run against libref, but their split counts are libr4d's packed
+     * kernel's and are not checked. */
+    const std::string pfx = argc > 3 ? argv[3] : "r4d";
+    const bool no_packed = argc > 4 && std::strcmp(argv[4], "--no-packed") == 0;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) { std::printf("no card visible: skipped\n"); return 77; }
 
@@ -286,7 +295,7 @@ int main(int argc, char** argv) {
         void* scratch = nullptr;
         int64_t scratch_bytes = 0;
         if (c.scratch) {
-            auto scratch_fn = reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(hr4d, "r4d_rad_attn_rel_scratch"));
+            auto scratch_fn = reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(hr4d, (pfx + "_rad_attn_rel_scratch").c_str()));
             if (!scratch_fn) { std::printf("  %-64s no scratch hook\n", c.name); ++fails; continue; }
             scratch_bytes = scratch_fn(nullptr);
             hipcheck(hipMalloc(&scratch, (size_t)scratch_bytes), "scratch");
@@ -299,8 +308,9 @@ int main(int argc, char** argv) {
         hipcheck(hipDeviceSynchronize(), "sync");
         int splits = -1;
         bool splits_ok = true;
-        if (c.want_splits >= 0) {
-            auto last = reinterpret_cast<int (*)()>(dlsym(hr4d, "r4d_attn_rel_last_splits"));
+        const bool packed_case = std::strncmp(c.name, "packed", 6) == 0;
+        if (c.want_splits >= 0 && !(no_packed && packed_case)) {
+            auto last = reinterpret_cast<int (*)()>(dlsym(hr4d, (pfx + "_attn_rel_last_splits").c_str()));
             splits = last ? last() : -1;
             splits_ok = splits == c.want_splits;
         }
