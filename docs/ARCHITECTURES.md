@@ -2887,12 +2887,19 @@ rotated int8 conversion of the release; the calibration container the plugin dec
 about 53 GB, served at `tp: 2`), and the plugin's CALIBRATION comment and the recipe's header say
 what it records. The attention linears are rotated int8 at a bf16 scale per (row, 128 of K), the
 head unrotated int8 at a bf16 scale per (row, 128). The token embedding is the same unrotated int8
-form, which arch/inkling2 gathers with `embed_lookup` (libr4d's `embed_lookup_iqr`, the codes kept
-at their width and each gathered row decoded), vocabulary-sharded as a bf16 table is: 448.6 MiB
+form, which arch/inkling2 gathers with `embed_lookup` (libr4d's and libhalo's `embed_lookup_iqr`,
+the codes kept at their width and each gathered row decoded), vocabulary-sharded as a bf16 table is: 448.6 MiB
 against 883.4 bf16, and its pinned host copy 224.3 MiB a rank at tp 2. Against the release's own
 form (NVFP4 experts, MXFP8 experts re-quantised, bf16 trunk) in the KL mode over the 97-document
 corpus (115522 positions, top-512 reference): mean KL 0.00663, top-1 agreement 97.60 %, perplexity
 2.896 against 2.884.
+
+**Strix Halo.** On gfx1151 libhalo serves the model's own ops: `attn_paged_rel` (the WMMA
+prefill, the packed WMMA verify and the split-KV decode, at a bf16 or int8 cache), `sconv_res` and
+`sconv_res_add`, `attn_res_mix`, `l2_clip` and `situ_mul`, beside the trunk's int8 and IQR rows. A
+weight only a host kernel reads keeps its whole placement group in the container's mapping, so
+each of these needs its device row for the layers' weights to reach the card at all, not only for
+speed. The vision tower's `grid_embed_hw` still runs on the host.
 
 **incoai's DFlash2 drafter.** The container is converted with `--draft-model` pointing at
 incoai/Inkling-2-Mini-DFlash2 (a `DFlash2DraftModel`: five layers, the selector, block 8;
