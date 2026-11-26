@@ -159,6 +159,7 @@ set(HALO_UNITS
   "halo_sample_ngram_f32|"
   "halo_sample_stages_f32|"
   "halo_scale_rows_bf16|"
+  "halo_situ|"
   "halo_ssd|"
   "halo_upscaler|"
   "halo_video|"

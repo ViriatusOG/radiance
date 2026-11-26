@@ -1950,6 +1950,10 @@ static const RadOperandSpec oRmsNorm[] = {
     { "y", RAD_OPD_OUT,    0 },
 };
 
+/* Inkling 2's elementwise ops, as libr4d declares them (the schemas are shared). */
+static const RadParamSpec pSituMul[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("gate_cap"), P_F64O("up_cap"),
+};
 static const RadParamSpec pMnDtype[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -3251,6 +3255,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("silu_mul", pMnDtype, oGateUp,
            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
             "which is the order rad-convert fuses gate_proj and up_proj in."),
+    SCHEMA("situ_mul", pSituMul, oGateUp,
+           "SiTU over a fused gate_up, the gate first: gcap * tanh(g / gcap) * sigmoid(g) * ucap * "
+           "tanh(u / ucap), the sigmoid on the raw gate. A cap of 0 leaves that side uncapped."),
     SCHEMA("gelu_mul", pMnDtype, oGateUp,
            "y[.., i] = gelu_tanh(gate_up[.., i]) * gate_up[.., n + i], the tanh approximation "
            "(gemma's gelu_pytorch_tanh), and the GATE IS THE FIRST HALF as in silu_mul. Its own "
@@ -7043,6 +7050,14 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, halo_rad_silu_mul, nullptr, nullptr, nullptr,
+  halo_shape_silu_mul },
+{ "situ_mul_bf16", "situ_mul", "elem",
+  "SiTU gated product over a fused [M, 2n] gate_up, Inkling 2's expert activation",
+  "any n; the gate is the first half; a cap of 0 is no softcap",
+  "bf16 in and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, halo_rad_situ_mul, nullptr, nullptr, nullptr,
   halo_shape_silu_mul },
 
 { "gelu_mul_bf16", "gelu_mul", "elem",

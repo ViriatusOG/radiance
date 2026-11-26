@@ -37880,6 +37880,55 @@ static void device_phase(const Plugin& pl) {
             iqr_embed_case(pl, f, 512, 640, 3.25f);
         }
     }
+    if (sel("situ_mul_bf16")) {
+        /* SiTU over a fused gate_up against the formula in double: libr4d's case (both caps), and
+         * Inkling 2 Mini's expert width (n 1152, not a multiple of the workgroup) with its caps
+         * and with the up cap off. */
+        const RadKernelInfo* r = find(pl, "situ_mul_bf16");
+        if (!r) ok("situ_mul_bf16", false, "row absent");
+        struct SituCase { const char* name; int64_t Ms, ns; double gcap, ucap; };
+        const SituCase cs[] = {
+            { "situ_mul_bf16 against the formula", 4, 128, 4.0, 25.0 },
+            { "situ_mul_bf16 against the formula, n 1152", 16, 1152, 4.0, 25.0 },
+            { "situ_mul_bf16 against the formula, up cap 0", 7, 1152, 4.0, 0.0 },
+        };
+        for (const SituCase& c : cs) {
+            if (!r) break;
+            const int64_t Ms = c.Ms, ns = c.ns;
+            std::vector<uint16_t> gu((size_t)(Ms * 2 * ns)), y((size_t)(Ms * ns), 0);
+            for (size_t i = 0; i < gu.size(); ++i)
+                gu[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 801) - 400) * 0.02f);
+            void* dg = dalloc(gu.size() * 2);
+            void* dy = dalloc(y.size() * 2);
+            if (!dg || !dy) { ok(c.name, false, "hipMalloc failed"); continue; }
+            st_memcpy(dg, gu.data(), gu.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dy, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = { T(dg, RAD_BF16, { Ms, 2 * ns }), T(dy, RAD_BF16, { Ms, ns }) };
+            std::vector<RadParam> ps = { PI("M", Ms), PI("n", ns), PS("dtype", "bf16"),
+                                         PF("gate_cap", c.gcap), PF("up_cap", c.ucap) };
+            RadArgs a{};
+            a.t = ts.data(); a.n_t = 2; a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            const int rc = r->launch(&a, nullptr);
+            const bool synced = st_stream_sync(nullptr) == hipSuccess;
+            st_memcpy(y.data(), dy, y.size() * 2, hipMemcpyDeviceToHost);
+            int bad = 0; double worst = 0;
+            for (int64_t t = 0; t < Ms; ++t)
+                for (int64_t i = 0; i < ns; ++i) {
+                    const double g = h_bf16(gu[(size_t)(t * 2 * ns + i)]);
+                    const double u = h_bf16(gu[(size_t)(t * 2 * ns + ns + i)]);
+                    const double ga = c.gcap > 0 ? c.gcap * std::tanh(g / c.gcap) : g;
+                    const double ua = c.ucap > 0 ? c.ucap * std::tanh(u / c.ucap) : u;
+                    const double ref = ga * (1.0 / (1.0 + std::exp(-g))) * ua;
+                    const double err = std::fabs((double)h_bf16(y[(size_t)(t * ns + i)]) - ref);
+                    if (err > 1e-2 * std::fabs(ref) + 1e-3) ++bad;
+                    worst = std::max(worst, err);
+                }
+            std::printf("    %s: %lld values, bad=%d worst=%.3g\n", c.name, (long long)(Ms * ns), bad, worst);
+            ok(c.name, rc == RAD_OK && synced && bad == 0,
+               "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) + " worst=" + std::to_string(worst));
+        }
+    }
     /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)100 })

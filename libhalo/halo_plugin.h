@@ -951,6 +951,8 @@ int halo_rad_fill            (const RadArgs*, RadStream);
 int halo_rad_logit_softcap   (const RadArgs*, RadStream);
 int halo_rad_scale           (const RadArgs*, RadStream);
 int halo_rad_silu_mul        (const RadArgs*, RadStream);
+/* SiTU over a fused gate_up (halo_situ.hip). */
+int halo_rad_situ_mul        (const RadArgs*, RadStream);
 int halo_rad_swiglu_clamped(const RadArgs*, RadStream);
 int halo_rad_swiglu_step(const RadArgs*, RadStream);
 int halo_rad_swiglu_clamped_quant_fp8(const RadArgs*, RadStream);
