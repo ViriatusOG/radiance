@@ -955,6 +955,10 @@ int halo_rad_silu_mul        (const RadArgs*, RadStream);
 int halo_rad_situ_mul        (const RadArgs*, RadStream);
 /* Inkling 2's per-group L2 clip (halo_l2_clip_bf16.hip). */
 int halo_rad_l2_clip         (const RadArgs*, RadStream);
+/* Inkling 2's short convolution with its residual, and the stream-residual form
+ * (halo_ple_conv_bf16.hip). */
+int     halo_rad_sconv_res       (const RadArgs*, RadStream);
+int     halo_rad_sconv_res_add   (const RadArgs*, RadStream);
 int halo_rad_swiglu_clamped(const RadArgs*, RadStream);
 int halo_rad_swiglu_step(const RadArgs*, RadStream);
 int halo_rad_swiglu_clamped_quant_fp8(const RadArgs*, RadStream);

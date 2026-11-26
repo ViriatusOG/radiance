@@ -1969,6 +1969,36 @@ static const RadOperandSpec oL2Clip[] = {
     { "positions", RAD_OPD_IN,     1 },
     { "y",         RAD_OPD_OUT,    0 },
 };
+static const RadParamSpec pSconvRes[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "width", RAD_P_INT, RAD_REQUIRED },
+    { "heads", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oSconvRes[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "dyn",          RAD_OPD_IN,     1 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
+static const RadOperandSpec oSconvResAdd[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "dyn",          RAD_OPD_IN,     1 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+    { "add_resid",    RAD_OPD_IN,     0 },
+};
 static const RadParamSpec pMnDtype[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -3462,6 +3492,13 @@ static const RadOpSchema kSchemas[] = {
            "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
            "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
            "The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's."),
+    SCHEMA("sconv_res", pSconvRes, oSconvRes,
+           "y[t][c] = (x[t][c] + sum_lag (w[c][k-1-lag] + dyn[t][c/(n/heads)][lag]) * "
+           "x[t-lag][c]) / sqrt(m*k + 1), causal_conv1d's window with the input as the residual; "
+           "m = 2 with dyn, 1 without (heads 0). The state, `has_init`, `cache_idx` and "
+           "`num_accepted` are causal_conv1d's."),
+    SCHEMA("sconv_res_add", pSconvRes, oSconvResAdd,
+           "Inkling 2 device-only fusion: y = add_resid + sconv_res(x); `y` may alias `add_resid`."),
     SCHEMA("l2_clip", pL2Clip, oL2Clip,
            "y[r][i] = x[r][i] * w[i] * min(1, threshold / (||x*w over i's group|| + 1e-6)) * tau[r], "
            "tau = 1 + alpha * ln(max(1, (positions[r] + 1) / floor)) with positions, else 1. "
@@ -6249,6 +6286,8 @@ static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype"
 /* No tunable axes. */
 #define NOTUNE nullptr, 0, nullptr
 static const RadConstraint cL2Clip[] = { C_IN("dtype", "bf16"), C_GE("group", 1) };
+static const RadConstraint cSconvRes[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
+                                           C_LE("width", 8), C_GE("heads", 0) };
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
  * that window's memory bandwidth without taking the compute units the other lane needs. */
@@ -7086,6 +7125,20 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cL2Clip), NOTUNE,
   nullptr, nullptr, halo_rad_l2_clip },
+{ "sconv_res_bf16", "sconv_res", "conv",
+  "Inkling 2's short convolution with its residual and dynamic taps; one thread a channel",
+  "width up to 8, undilated; heads 0 or a count dividing n",
+  "bf16 activations, weights, dyn and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cSconvRes), NOTUNE,
+  nullptr, nullptr, halo_rad_sconv_res },
+{ "sconv_res_add_bf16", "sconv_res_add", "conv",
+  "Inkling 2's short convolution with stream residual add (`y = add_resid + sconv_res(x)`)",
+  "width up to 8, undilated; heads 0 or a count dividing n",
+  "bf16 activations, weights, add_resid, dyn and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cSconvRes), NOTUNE,
+  nullptr, nullptr, halo_rad_sconv_res_add },
 
 { "gelu_mul_bf16", "gelu_mul", "elem",
   "gelu-gated product over a fused [M, 2n] gate_up",
