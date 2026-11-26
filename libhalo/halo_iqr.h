@@ -202,7 +202,7 @@ HALO_IQR_HD constexpr bool built(uint32_t w) {
     X(kTable, 2, 0, 0, 0, kBf16, 1) X(kTable, 3, 0, 0, 0, kBf16, 1)                              \
     X(kTable, 4, 0, 0, 0, kBf16, 1) X(kTable, 5, 0, 0, 0, kBf16, 1)                              \
     X(kZero, 6, 0, 0, 0, kBf16, 0) X(kZero, 7, 0, 0, 0, kBf16, 0)                                \
-    X(kZero, 8, 0, 0, 0, kBf16, 0)                                                               \
+    X(kZero, 8, 0, 0, 0, kBf16, 0) X(kSigned, 8, 0, 0, 0, kBf16, 0)                              \
     X(kTrellis, 2, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 3, 0, 12, 0, kE4m3Tensor, 1)             \
     X(kTrellis, 4, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 5, 0, 12, 0, kE4m3Tensor, 1)             \
     X(kTrellis, 6, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 7, 0, 12, 0, kE4m3Tensor, 1)

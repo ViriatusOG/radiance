@@ -18526,7 +18526,9 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
         return x ^ (x >> 31);
     };
     Planes p;
-    if (f.kind == 5) {
+    if (f.kind == 1) {
+        p.enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    } else if (f.kind == 5) {
         rad_enc_clear(&p.enc);
         rad_enc_copy_str(p.enc.scheme, "trellis");
         rad_enc_add_plane(&p.enc, "codes", kU[f.B], 1, 1);
@@ -18542,7 +18544,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
     if (f.rot) rad_enc_copy_str(p.enc.transform, "fwht128");
     p.size(rows, dim);
     const int ic = p.find("codes"), is = p.find("scale"), is2 = p.find("scale.1");
-    const int ia = f.kind == 5 ? p.find("trellis") : f.kind == 3 ? p.find("table") : p.find("zero");
+    const int ia = f.kind == 1 ? -1 : f.kind == 5 ? p.find("trellis") : f.kind == 3 ? p.find("table") : p.find("zero");
     for (int64_t n = 0; n < rows; ++n)
         for (int64_t c = 0; c < dim; ++c)
             rad_store_bits(p.data[(size_t)ic].data() + n * p.row_bytes(ic), f.B, c,
@@ -18552,7 +18554,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
             for (int64_t g = 0; g < nkb; ++g)
                 rad_store_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), std::max(f.B, 6), g,
                                (uint32_t)((1 << (std::max(f.B, 6) - 1)) - 8 + rnd() % 17));
-    else
+    else if (ia >= 0)
         for (auto& v : p.data[(size_t)ia]) v = (uint8_t)(int8_t)((int)(rnd() % 255) - 127);
     for (int64_t i = 0; i < rows * nkb; ++i) {
         if (f.two) p.data[(size_t)is][(size_t)i] = (uint8_t)(0x30 + rnd() % 0x28);
@@ -18578,7 +18580,8 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
         std::vector<float> v((size_t)dim);
         for (int64_t k = 0; k < dim; ++k) {
             int q;
-            if (f.kind == 3) q = ((const int8_t*)p.data[(size_t)ia].data())[code(n, k)];
+            if (f.kind == 1) q = (int8_t)(uint8_t)code(n, k);
+            else if (f.kind == 3) q = ((const int8_t*)p.data[(size_t)ia].data())[code(n, k)];
             else if (f.kind == 2) q = (int)code(n, k) - (int)rad_load_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), std::max(f.B, 6), k / 128);
             else {
                 uint32_t st = 0;
@@ -18614,6 +18617,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
     std::vector<const char*> roles;
     const int rc = f.kind == 5 ? (f.two ? stored(r, lp, 1, p, { "codes", "scale", "scale.1", "trellis" }, &wq, &lay)
                                         : stored(r, lp, 1, p, { "codes", "scale", "trellis" }, &wq, &lay))
+                 : f.kind == 1 ? stored(r, lp, 1, p, { "codes", "scale" }, &wq, &lay)
                  : f.kind == 3 ? stored(r, lp, 1, p, { "codes", "scale", "table" }, &wq, &lay)
                                : stored(r, lp, 1, p, { "codes", "scale", "zero" }, &wq, &lay);
     if (rc != RAD_OK) { ok(nm, false, "relayout rc " + std::to_string(rc)); return; }
@@ -37867,7 +37871,7 @@ static void device_phase(const Plugin& pl) {
         const IqrEmbedCase es[] = {
             { 3, 2, 0, false, false }, { 3, 3, 0, false, false }, { 3, 4, 0, false, true },
             { 3, 5, 0, false, false }, { 2, 6, 0, false, false }, { 2, 7, 0, false, false },
-            { 2, 8, 0, false, false }, { 5, 2, 12, true, true },
+            { 2, 8, 0, false, false }, { 1, 8, 0, false, false }, { 5, 2, 12, true, true },
             { 5, 3, 12, true, true }, { 5, 4, 12, true, true }, { 5, 5, 12, true, true },
             { 5, 6, 12, true, true }, { 5, 7, 12, true, true },
         };
