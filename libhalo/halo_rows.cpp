@@ -7201,9 +7201,9 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_attn_res_mix, nullptr, nullptr, nullptr,
   halo_shape_attn_res_mix },
 /* attn_paged_rel (Inkling 2's attention, halo_attn_rel.hip): head_dim 128 at gqa 1, 2, 3, 4 and 8,
- * bf16 or int8 cache, any window (0 is full) and causal or not. The split-KV decode kernel serves
- * a decode and a verify, the generic kernel everything else (the WMMA prefill and packed verify are
- * not yet ported to gfx1151: HALO_REL_WMMA). */
+ * bf16 or int8 cache, any window (0 is full) and causal or not. One entry per cache form picks the
+ * kernel per launch: the WMMA prefill, the packed WMMA verify, the split-KV decode, or the generic
+ * kernel for the shapes the others do not take. */
 #define HALO_REL_ROW(G, KVN, KVS, C, KVDOC)                                                        \
 { "attn_rel_h128_gqa" #G "_" #KVN, "attn_paged_rel", "attn",                                       \
   "paged attention with a relative-position bias and a sink logit per row; a workgroup a (row, "  \

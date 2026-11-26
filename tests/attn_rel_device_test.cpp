@@ -227,8 +227,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     /* The scratch hook's and split counter's prefix: `halo` for libhalo. --no-packed names a
-     * library whose verify takes the decode kernel (libhalo until its WMMA verify is ported): the
-     * packed-verify cases still run against libref, but their split counts are libr4d's packed
+     * library whose verify takes the decode kernel (a port without the packed WMMA verify): the
+     * packed-verify cases still run against libref, but their split counts are the packed
      * kernel's and are not checked. */
     const std::string pfx = argc > 3 ? argv[3] : "r4d";
     const bool no_packed = argc > 4 && std::strcmp(argv[4], "--no-packed") == 0;

@@ -2,16 +2,16 @@
  * then ported to gfx1151; see libhalo/README.md.
  *
  * gfx1151 port state: the split-KV decode kernel, its merge and the generic kernel are ported as
- * they stand (wave32, no WMMA). The WMMA prefill (rel_wmma_kernel) is ported to gfx1151's
- * 16x16x16 fragment layout (halo_dt16.h): a lane's A / B fragment is its sixteen k values and its
- * accumulator element e is row 2*e + (lane>>4), where gfx12 has eight and 8*(lane>>4) + e. The
- * packed verify (rel_vfy_kernel) is still gfx12's and compiled out: HALO_REL_WMMA_VERIFY 0 sends a
- * verify to the decode kernel, which serves every shape. */
+ * they stand (wave32, no WMMA). The WMMA prefill (rel_wmma_kernel) and packed verify
+ * (rel_vfy_kernel) are ported to gfx1151's 16x16x16 fragment layout (halo_dt16.h): a lane's A / B
+ * fragment is its sixteen k values and its accumulator element e is row 2*e + (lane>>4), where
+ * gfx12 has eight and 8*(lane>>4) + e. HALO_REL_WMMA_PREFILL / HALO_REL_WMMA_VERIFY 0 send a
+ * prefill to the generic kernel and a verify to the decode kernel instead. */
 #ifndef HALO_REL_WMMA_PREFILL
 #define HALO_REL_WMMA_PREFILL 1
 #endif
 #ifndef HALO_REL_WMMA_VERIFY
-#define HALO_REL_WMMA_VERIFY 0
+#define HALO_REL_WMMA_VERIFY 1
 #endif
 /* halo_attn_rel.hip -- Inkling 2's attention, attn_paged_rel (libref/ref_attn.cpp's
  * ref_attn_paged_rel is the contract): attn_paged with a relative-position bias on each score and
@@ -65,7 +65,6 @@ constexpr int kWBQ          = 128;
 constexpr int kWKS          = kHd * 2 + 16;   /* 272 bytes per key row of K tile (bank-free) */
 constexpr int kWVS          = 48;             /* 48 bytes per dim row of V^T tile: 16 f16 + pad */
 
-typedef short    rel_v8s __attribute__((ext_vector_type(8)));
 typedef float    rel_v8f __attribute__((ext_vector_type(8)));
 typedef _Float16 rel_v8h __attribute__((ext_vector_type(8)));
 
@@ -810,14 +809,6 @@ __device__ __forceinline__ float ex2(float x) {
 __device__ __forceinline__ int imin(int a, int b) { return a < b ? a : b; }
 __device__ __forceinline__ int imax(int a, int b) { return a > b ? a : b; }
 
-#if HALO_REL_WMMA_VERIFY
-__device__ __forceinline__ rel_v8f wmma_bf16(rel_v8s a, rel_v8s b, rel_v8f c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
-}
-__device__ __forceinline__ rel_v8f wmma_f16(rel_v8h a, rel_v8h b, rel_v8f c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
-}
-#endif  /* HALO_REL_WMMA_VERIFY */
 __device__ __forceinline__ unsigned f16_bits(float f) {
     if (f == f) f = __builtin_fminf(__builtin_fmaxf(f, -65504.0f), 65504.0f);
     return (unsigned)__builtin_bit_cast(unsigned short, (_Float16)f);
@@ -1345,6 +1336,9 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     constexpr int ESZ = I8 ? 1 : 2;
     constexpr int SLOT = 2 * kHd * ESZ + (I8 ? 4 : 0);
     constexpr int CW = 16 / ESZ;
+    /* gfx1151: Q, K, r and rel_proj enter the WMMA as bf16, P and V as f16 (halo_dt16.h). */
+    typedef DT16<0> WQ;
+    typedef DT16<1> WP;
     constexpr int NCH = kHd / CW;
     constexpr int NKI = 16 * NCH;
     constexpr int NVI = 8 * NCH;
@@ -1401,11 +1395,14 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     const int pos = qbase + prow;
     const bool wact = wave * 16 < npos;
 
-    rel_v8s rf{};
+    WQ::frag rf{};
     if constexpr (DR16) {
         const uint16_t* rp_q = (const uint16_t*)A.r + (long long)(tok0 + prow) * A.r_rs +
-                               (long long)head * A.r_hs + 8 * h;
-        rf = __builtin_bit_cast(rel_v8s, rval ? ld_u4(rp_q) : make_uint4(0u, 0u, 0u, 0u));
+                               (long long)head * A.r_hs;
+        const uint4 u0 = rval ? ld_u4(rp_q) : make_uint4(0u, 0u, 0u, 0u);
+        const uint4 u1 = rval ? ld_u4(rp_q + 8) : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+        rf = WQ::mk(w8);
     } else {
         for (int qr = wave; qr < npos; qr += kWThreads / 32) {
             const uint16_t* rq = (const uint16_t*)A.r + (long long)(tok0 + qr / gqa) * A.r_rs +
@@ -1416,17 +1413,19 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         __syncthreads();
     }
 
-    rel_v8s qf[kHd / 16];
+    WQ::frag qf[kHd / 16];
     {
         const uint16_t* qp = (const uint16_t*)A.q + (long long)(tok0 + prow) * A.q_rs +
-                             (long long)head * A.q_hs + 8 * h;
+                             (long long)head * A.q_hs;
 #pragma unroll
         for (int kc = 0; kc < kHd / 16; ++kc) {
-            const uint4 w = rval ? ld_u4(qp + kc * 16) : make_uint4(0u, 0u, 0u, 0u);
-            qf[kc] = __builtin_bit_cast(rel_v8s, w);
+            const uint4 u0 = rval ? ld_u4(qp + kc * 16) : make_uint4(0u, 0u, 0u, 0u);
+            const uint4 u1 = rval ? ld_u4(qp + kc * 16 + 8) : make_uint4(0u, 0u, 0u, 0u);
+            const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+            qf[kc] = WQ::mk(w8);
         }
     }
-    rel_v8f oacc[kHd / 16];
+    v8f oacc[kHd / 16];
 #pragma unroll
     for (int mc = 0; mc < kHd / 16; ++mc)
 #pragma unroll
@@ -1583,16 +1582,23 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         if constexpr (DR16) {
             if (need_rp) {
                 if (wact) {
-                    rel_v8f b0 = {}, b1 = {};
-                    const uint4 a0 = ld_u4(&s_rp[pw + n][8 * h]);
-                    const uint4 a1 = ld_u4(&s_rp[pw + 16 + n][8 * h]);
-                    b0 = wmma_bf16(__builtin_bit_cast(rel_v8s, a0), rf, b0);
-                    b1 = wmma_bf16(__builtin_bit_cast(rel_v8s, a1), rf, b1);
+                    v8f b0 = {}, b1 = {};
+                    {
+                        const uint4 x0 = *(const uint4*)&s_rp[pw + n][0];
+                        const uint4 x1 = *(const uint4*)&s_rp[pw + n][8];
+                        const uint4 y0 = *(const uint4*)&s_rp[pw + 16 + n][0];
+                        const uint4 y1 = *(const uint4*)&s_rp[pw + 16 + n][8];
+                        const uint32_t wa[8] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
+                        const uint32_t wb[8] = { y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w };
+                        b0 = WQ::wmma(WQ::mk(wa), rf, b0);
+                        b1 = WQ::wmma(WQ::mk(wb), rf, b1);
+                    }
+                    /* Element e is distance row 2*e + h of each sixteen (halo_dt16.h). */
                     float* sb = &s_bias[wave][n][0];
 #pragma unroll
                     for (int e = 0; e < 8; ++e) {
-                        sb[8 * h + e]      = b0[e];
-                        sb[16 + 8 * h + e] = b1[e];
+                        sb[2 * e + h]      = b0[e];
+                        sb[16 + 2 * e + h] = b1[e];
                     }
                 }
                 lds_barrier();
@@ -1602,27 +1608,31 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         if (!wact) continue;
 
         /* S^T = K * Q^T over all 128 dims (8 WMMAs, NS=1). */
-        rel_v8f sacc;
+        v8f sacc;
 #pragma unroll
         for (int e = 0; e < 8; ++e) sacc[e] = 0.0f;
         {
-            const uint8_t* ka = kb + n * kWKS + (8 * h) * 2;
+            /* A = K row n, its sixteen dims a chunk; element e of the result is key 2*e + h. */
+            const uint8_t* ka = kb + n * kWKS;
 #pragma unroll
-            for (int kc = 0; kc < kHd / 16; ++kc)
-                sacc = wmma_bf16(__builtin_bit_cast(rel_v8s, *(const uint4*)(ka + kc * 32)),
-                                 qf[kc], sacc);
+            for (int kc = 0; kc < kHd / 16; ++kc) {
+                const uint4 u0 = *(const uint4*)(ka + kc * 32);
+                const uint4 u1 = *(const uint4*)(ka + kc * 32 + 16);
+                const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+                sacc = WQ::wmma(WQ::mk(w8), qf[kc], sacc);
+            }
         }
 
         if constexpr (I8) {
 #pragma unroll
             for (int e = 0; e < 8; ++e)
                 sacc[e] *= (float)__builtin_bit_cast(
-                    _Float16, (unsigned short)(s_sc[8 * h + e] & 0xffffu));
+                    _Float16, (unsigned short)(s_sc[2 * e + h] & 0xffffu));
         }
 
         /* Add relative bias r[qrow] . rp[:, dist] and convert score to log2 domain. */
         float sv[8], mx = -__builtin_inff();
-        const int u0 = prow + 15 - 8 * h;
+        const int u0 = prow + 15 - h;   /* key 2*e + h: the rel_proj row is u0 - 2*e */
         const int d_rel = (int)A.d_rel;
         const bool interior = rval && tok && k0 >= lo && (k0 + 15) < hi &&
                               (!causal || (k0 + 15) <= pos) &&
@@ -1639,10 +1649,10 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         } else if constexpr (DR16) {
             if (interior && need_rp && (pos - (k0 + 15)) >= 0 && (pos - k0) < (int)A.extent) {
                 const float* sb = &s_bias[wave][n][0];
-                const int m0 = 15 + (prow - pw) - 8 * h;
+                const int m0 = 15 + (prow - pw) - h;
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    sv[e] = (sacc[e] * sscale + sb[m0 - e]) * kLog2e;
+                    sv[e] = (sacc[e] * sscale + sb[m0 - 2 * e]) * kLog2e;
                     mx = __builtin_fmaxf(mx, sv[e]);
                 }
                 fast = true;
@@ -1651,7 +1661,7 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         if (!fast) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const int kk = k0 + 8 * h + e;
+                const int kk = k0 + 2 * e + h;
                 bool vis = rval && tok && kk >= lo && kk < hi;
                 if (causal) vis = vis && kk <= pos;
                 if (window > 0) vis = vis && (pos - kk < window) && (causal || kk - pos < window);
@@ -1659,9 +1669,9 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
                     float bias = 0.0f;
                     const int dist = pos - kk;
                     if (need_rp && dist >= 0 && dist < (int)A.extent) {
-                        const int u = u0 - e;
+                        const int u = u0 - 2 * e;
                         if constexpr (DR16) {
-                            bias = s_bias[wave][n][15 + (prow - pw) - 8 * h - e];
+                            bias = s_bias[wave][n][15 + (prow - pw) - h - 2 * e];
                         } else {
                             for (int c = 0; c < d_rel; ++c)
                                 bias += bf(s_r[qrow][c]) * bf(s_rp[u][c]);
@@ -1677,36 +1687,51 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         mx = __builtin_fmaxf(mx, wshfl_xor(mx, 16));
         const float mn = __builtin_fmaxf(m, mx);
         const float corr = mn == -__builtin_inff() ? 1.0f : (m == -__builtin_inff() ? 0.0f : ex2(m - mn));
+        /* P in f16 (element e: key 2*e + h), held as the f16 values in f32 so the denominator
+         * sums P as rounded, as libr4d's does; packed with WP::pk below (see rel_wmma_kernel). */
         float ps = 0.0f;
-        rel_v8h pf;
+        float pv[8];
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const float pe = (sv[e] == -__builtin_inff() || mn == -__builtin_inff())
                                  ? 0.0f
                                  : ex2(sv[e] - mn);
-            pf[e] = (_Float16)pe;
-            ps += (float)pf[e];
+            pv[e] = (float)(_Float16)pe;
+            ps += pv[e];
         }
         l = l * corr + ps;
         m = mn;
         if constexpr (I8) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const float pe = (float)pf[e];
                 const float vs = (float)__builtin_bit_cast(
-                    _Float16, (unsigned short)(s_sc[8 * h + e] >> 16));
-                pf[e] = pe != 0.0f ? (_Float16)(pe * vs) : (_Float16)0.0f;
+                    _Float16, (unsigned short)(s_sc[2 * e + h] >> 16));
+                pv[e] = pv[e] != 0.0f ? (float)(_Float16)(pv[e] * vs) : 0.0f;
             }
         }
-        const uint8_t* va = vb + n * kWVS + h * 16;
+        /* The B fragment wants the tile's sixteen keys in order; a lane holds one parity of them,
+         * so p16w interleaves the half-pair's eight values (halo_dt16.h). */
+        WP::frag pfrag;
+        {
+            uint32_t pw4[4], pw16[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) pw4[i] = WP::pk(pv[2 * i], pv[2 * i + 1]);
+            p16w<WP>(pw4, pw16);
+            pfrag = WP::mk(pw16);
+        }
+        /* A = V^T row n (dim mc*16 + n): the tile's sixteen keys, 32 bytes of its staged row. */
+        const uint8_t* va = vb + n * kWVS;
         if (__builtin_amdgcn_ballot_w32(corr != 1.0f) != 0) {
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc) oacc[mc] *= corr;
         }
 #pragma unroll
-        for (int mc = 0; mc < kHd / 16; ++mc)
-            oacc[mc] = wmma_f16(__builtin_bit_cast(rel_v8h, *(const uint4*)(va + mc * 16 * kWVS)),
-                                pf, oacc[mc]);
+        for (int mc = 0; mc < kHd / 16; ++mc) {
+            const uint4 u0 = *(const uint4*)(va + mc * 16 * kWVS);
+            const uint4 u1 = *(const uint4*)(va + mc * 16 * kWVS + 16);
+            const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+            oacc[mc] = WP::wmma(WP::mk(w8), pfrag, oacc[mc]);
+        }
     }
 
     const float lt2 = l + wshfl_xor(l, 16);
@@ -1720,7 +1745,7 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc)
 #pragma unroll
-                for (int e = 0; e < 8; ++e) dst[mc * 16 + 8 * h + e] = oacc[mc][e] * vds;
+                for (int e = 0; e < 8; ++e) dst[mc * 16 + 2 * e + h] = oacc[mc][e] * vds;   /* dim 2*e + h */
             if (h == 0) {
                 dst[kHd]     = m == -__builtin_inff() ? m : m * 0.69314718055994531f;
                 dst[kHd + 1] = lt2;
@@ -1730,11 +1755,12 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     }
     if (rval) {
         uint16_t* op = (uint16_t*)A.out + (long long)(tok0 + prow) * A.o_rs +
-                       (long long)head * A.o_hs + 8 * h;
+                       (long long)head * A.o_hs + h;   /* element e: head dim 2*e + h */
         if (m == -__builtin_inff()) {
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc)
-                *(uint4*)(op + mc * 16) = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) op[mc * 16 + 2 * e] = 0;
         } else {
             const float sk_log2 = ld_bf_or_f(A.sk, A.s_f32,
                                              (long long)(tok0 + prow) * A.s_rs +
@@ -1746,11 +1772,8 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
             const float inv = den > 0.0f ? (vds * alpha) / den : 0.0f;
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc)
-                *(uint4*)(op + mc * 16) = make_uint4(
-                    pack2(oacc[mc][0] * inv, oacc[mc][1] * inv),
-                    pack2(oacc[mc][2] * inv, oacc[mc][3] * inv),
-                    pack2(oacc[mc][4] * inv, oacc[mc][5] * inv),
-                    pack2(oacc[mc][6] * inv, oacc[mc][7] * inv));
+#pragma unroll
+                for (int e = 0; e < 8; ++e) op[mc * 16 + 2 * e] = tobf(oacc[mc][e] * inv);
         }
     }
 }

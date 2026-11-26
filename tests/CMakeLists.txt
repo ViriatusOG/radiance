@@ -362,11 +362,11 @@ foreach(t ${RAD_TESTS})
         TIMEOUT ${RAD_TEST_TIMEOUT}
         ENVIRONMENT "${RAD_TEST_CARD_ENV}")
     endif()
-    # ...and libhalo's, whose verify takes the decode kernel until its WMMA verify is ported.
+    # ...and libhalo's, the same cases and split counts.
     if(RAD_HIP_FOUND AND TARGET libhalo AND TARGET libref)
       add_dependencies(${n} libhalo libref)
       add_test(NAME ${n}_halo COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libhalo.so
-                                     ${RAD_PLUGIN_OUT}/kernels/libref.so halo --no-packed)
+                                     ${RAD_PLUGIN_OUT}/kernels/libref.so halo)
       set_tests_properties(${n}_halo PROPERTIES
         LABELS gpu
         SKIP_RETURN_CODE 77
