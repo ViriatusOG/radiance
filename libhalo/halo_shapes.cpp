@@ -1118,6 +1118,23 @@ extern "C" int halo_shape_attn_paged(const RadParam* p, int n_p, int operand,
     HALO_PICK(l);
 }
 
+/* attn_res_mix, as libref describes it. The states are dense here; a caller's pitched buffer is
+ * a view of the same operand. No states at depth 0. (libr4d's, as shared.) */
+extern "C" int halo_shape_attn_res_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t nS = pi(p, n_p, "n_state"), nQ = pi(p, n_p, "n_query");
+    if (M <= 0 || n <= 0 || nS < 0 || nQ <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        nS > 0 ? opd((uint32_t)RAD_BF16, nS, M, n) : opd_none(),   /* states */
+        opd((uint32_t)RAD_BF16, M, n),                             /* cur */
+        opd((uint32_t)RAD_BF16, M, n),                             /* addend */
+        opd((uint32_t)RAD_F32, nQ, n),                             /* query */
+        opd((uint32_t)RAD_F32, nQ, n),                             /* w */
+        opd((uint32_t)RAD_BF16, nQ, M, n),                         /* y */
+    };
+    HALO_PICK(l);
+}
+
 /* attn_paged_sink -- attn_paged's operands with `sinks` [n_head] f32 before `out`. */
 extern "C" int halo_shape_attn_paged_sink(const RadParam* p, int n_p, int operand,
                                           RadOpdDesc* out) {

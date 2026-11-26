@@ -37880,6 +37880,92 @@ static void device_phase(const Plugin& pl) {
             iqr_embed_case(pl, f, 512, 640, 3.25f);
         }
     }
+    if (sel("attn_res_mix_bf16")) {
+        /* Block attention residuals against the contract in double (OPS.md): two states and cur
+         * as the depth, two queries, no addend and no gain. */
+        const RadKernelInfo* r = find(pl, "attn_res_mix_bf16");
+        if (!r) ok("attn_res_mix_bf16", false, "row absent");
+        else {
+            const int64_t Mt = 3, nn = 64, nst = 2, nqr = 2;
+            const float eps = 1e-6f;
+            std::vector<uint16_t> hs((size_t)(nst * Mt * nn)), hc((size_t)(Mt * nn));
+            std::vector<float> hq((size_t)(nqr * nn));
+            std::vector<uint16_t> hy16((size_t)(nqr * Mt * nn), 0);
+            for (size_t i = 0; i < hs.size(); ++i)
+                hs[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 401) - 200) * 0.01f);
+            for (size_t i = 0; i < hc.size(); ++i)
+                hc[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i ^ 977u) % 401) - 200) * 0.02f);
+            for (size_t i = 0; i < hq.size(); ++i)
+                hq[i] = (float)((int)(st_mix32((uint32_t)i ^ 31u) % 201) - 100) * 0.01f;
+            void* dS = dalloc(hs.size() * 2);
+            void* dC = dalloc(hc.size() * 2);
+            void* dQ = dalloc(hq.size() * 4);
+            void* dY = dalloc(hy16.size() * 2);
+            if (!dS || !dC || !dQ || !dY) ok("attn_res_mix_bf16", false, "hipMalloc failed");
+            else {
+                st_memcpy(dS, hs.data(), hs.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(dC, hc.data(), hc.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(dQ, hq.data(), hq.size() * 4, hipMemcpyHostToDevice);
+                st_memcpy(dY, hy16.data(), hy16.size() * 2, hipMemcpyHostToDevice);
+                std::vector<RadTensor> ts = { T(dS, RAD_BF16, { nst, Mt, nn }),
+                                              T(dC, RAD_BF16, { Mt, nn }),
+                                              T(nullptr, RAD_BF16, { 0 }),
+                                              T(dQ, RAD_F32, { nqr, nn }),
+                                              T(nullptr, RAD_F32, { 0 }),
+                                              T(dY, RAD_BF16, { nqr, Mt, nn }) };
+                absent(ts[2]); absent(ts[4]);
+                std::vector<RadParam> ps = { PI("M", Mt), PI("n", nn), PI("n_state", nst),
+                                             PI("n_query", nqr), PS("dtype", "bf16"),
+                                             PF("eps", eps) };
+                RadArgs a{};
+                a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+                a.world_size = 1;
+                const int rc = r->launch(&a, nullptr);
+                const bool synced = st_stream_sync(nullptr) == hipSuccess;
+                st_memcpy(hy16.data(), dY, hy16.size() * 2, hipMemcpyDeviceToHost);
+                int bad = 0; double worst = 0;
+                for (int64_t t = 0; t < Mt; ++t) {
+                    std::vector<std::vector<double>> vh(nst + 1, std::vector<double>(nn));
+                    for (int64_t d = 0; d <= nst; ++d) {
+                        double ss = 0;
+                        for (int64_t i = 0; i < nn; ++i) {
+                            const double v = d < nst ? h_bf16(hs[(size_t)((d * Mt + t) * nn + i)])
+                                                     : h_bf16(hc[(size_t)(t * nn + i)]);
+                            ss += v * v;
+                        }
+                        const double inv = 1.0 / std::sqrt(ss / nn + eps);
+                        for (int64_t i = 0; i < nn; ++i)
+                            vh[(size_t)d][(size_t)i] = (d < nst ? h_bf16(hs[(size_t)((d * Mt + t) * nn + i)])
+                                                                : h_bf16(hc[(size_t)(t * nn + i)])) * inv;
+                    }
+                    for (int64_t q = 0; q < nqr; ++q) {
+                        std::vector<double> sc((size_t)(nst + 1));
+                        double mx = -1e300;
+                        for (int64_t d = 0; d <= nst; ++d) {
+                            double dot = 0;
+                            for (int64_t i = 0; i < nn; ++i) dot += vh[(size_t)d][(size_t)i] * hq[(size_t)(q * nn + i)];
+                            sc[(size_t)d] = dot / std::sqrt((double)nn);
+                            mx = std::max(mx, sc[(size_t)d]);
+                        }
+                        double den = 0;
+                        for (double& s : sc) { s = std::exp(s - mx); den += s; }
+                        for (int64_t i = 0; i < nn; ++i) {
+                            double m = 0;
+                            for (int64_t d = 0; d <= nst; ++d) m += sc[(size_t)d] / den * vh[(size_t)d][(size_t)i];
+                            const double got = h_bf16(hy16[(size_t)((q * Mt + t) * nn + i)]);
+                            const double err = std::fabs(got - m);
+                            if (err > 1e-2 * std::fabs(m) + 2e-3) ++bad;
+                            worst = std::max(worst, err);
+                        }
+                    }
+                }
+                std::printf("    attn_res_mix_bf16: %lld values, bad=%d worst=%.3g\n", (long long)(Mt * nqr * nn), bad, worst);
+                ok("attn_res_mix_bf16 against the contract", rc == RAD_OK && synced && bad == 0,
+                   "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) +
+                       " worst=" + std::to_string(worst));
+            }
+        }
+    }
     if (sel("situ_mul_bf16")) {
         /* SiTU over a fused gate_up against the formula in double: libr4d's case (both caps), and
          * Inkling 2 Mini's expert width (n 1152, not a multiple of the workgroup) with its caps

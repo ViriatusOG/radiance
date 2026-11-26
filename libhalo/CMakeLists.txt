@@ -58,6 +58,7 @@ set(HALO_UNITS
   "halo_attn_paged_h256_gqa6|"
   "halo_attn_paged_h256_gqa6_bs4|"
   "halo_attn_paged_window|"
+  "halo_attn_res|"
   "halo_attn_vit_h72_bf16|"
   "halo_audio|"
   "halo_conv2d_nhwc|"

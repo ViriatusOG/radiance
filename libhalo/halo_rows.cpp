@@ -1999,6 +1999,14 @@ static const RadOperandSpec oSconvResAdd[] = {
     { "y",            RAD_OPD_OUT,    0 },
     { "add_resid",    RAD_OPD_IN,     0 },
 };
+/* Block attention residuals (halo_attn_res.hip). states is absent at n_state 0. */
+static const RadParamSpec pAttnResMix[] = {
+    P_INT("M"), P_INT("n"), P_INT("n_state"), P_INT("n_query"), P_STR("dtype"), P_F64("eps"),
+};
+static const RadOperandSpec oAttnResMix[] = {
+    { "states", RAD_OPD_IN, 1 },  { "cur", RAD_OPD_IN, 0 },   { "addend", RAD_OPD_IN, 1 },
+    { "query", RAD_OPD_WEIGHT, 0 }, { "w", RAD_OPD_WEIGHT, 1 }, { "y", RAD_OPD_OUT, 0 },
+};
 static const RadParamSpec pMnDtype[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -3499,6 +3507,9 @@ static const RadOpSchema kSchemas[] = {
            "`num_accepted` are causal_conv1d's."),
     SCHEMA("sconv_res_add", pSconvRes, oSconvResAdd,
            "Inkling 2 device-only fusion: y = add_resid + sconv_res(x); `y` may alias `add_resid`."),
+    SCHEMA("attn_res_mix", pAttnResMix, oAttnResMix,
+           "block attention residuals: a softmax over depth of the rms-normed states, cur + addend, "
+           "per query; the mix is rms-normed and gained by w when present."),
     SCHEMA("l2_clip", pL2Clip, oL2Clip,
            "y[r][i] = x[r][i] * w[i] * min(1, threshold / (||x*w over i's group|| + 1e-6)) * tau[r], "
            "tau = 1 + alpha * ln(max(1, (positions[r] + 1) / floor)) with positions, else 1. "
@@ -6288,6 +6299,10 @@ static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype"
 static const RadConstraint cL2Clip[] = { C_IN("dtype", "bf16"), C_GE("group", 1) };
 static const RadConstraint cSconvRes[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
                                            C_LE("width", 8), C_GE("heads", 0) };
+static const RadConstraint cAttnResMix[] = {
+    C_GE("n_state", 0), C_LE("n_state", 15), C_GE("n_query", 1), C_LE("n_query", 4),
+    C_IN("dtype", "bf16"),
+};
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
  * that window's memory bandwidth without taking the compute units the other lane needs. */
@@ -7139,6 +7154,14 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cSconvRes), NOTUNE,
   nullptr, nullptr, halo_rad_sconv_res_add },
+{ "attn_res_mix_bf16", "attn_res_mix", "norm",
+  "block attention residuals over bf16 states, cur and addend, f32 query and gain",
+  "any M and n; one workgroup a row; depth at most 16, queries at most 4",
+  "bf16 states, cur, addend and y; f32 query and w",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cAttnResMix), NOTUNE,
+  nullptr, nullptr, halo_rad_attn_res_mix, nullptr, nullptr, nullptr,
+  halo_shape_attn_res_mix },
 
 { "gelu_mul_bf16", "gelu_mul", "elem",
   "gelu-gated product over a fused [M, 2n] gate_up",
