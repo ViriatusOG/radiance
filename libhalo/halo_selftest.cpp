@@ -13645,6 +13645,11 @@ struct ConvRef {
     std::vector<char> live;                 /* [T]: a token some sequence committed */
     std::vector<int32_t> cu, sidx, hini, nacc;
     bool have_sidx = false, have_hini = false, have_nacc = false;
+    /* Two sequences of one launch that share a slot write its window with nothing ordering their
+     * blocks, so each value may come from either. `alt_sidx` is the slot table with the later of
+     * them dropped (the earlier one's window); a value of the window is then accepted from either
+     * mirror, and every other byte must still match. Empty: one mirror, byte for byte. */
+    std::vector<int32_t> alt_sidx;
     std::vector<uint16_t> stb;              /* the window, before and after the step */
     void *dcs = nullptr, *dy = nullptr;     /* the device's state (kept across a chain) and y */
 };
@@ -13759,6 +13764,7 @@ int cv_launch(const RadKernelInfo* r, ConvRef& c) {
  * window the step left, byte for byte. */
 void cv_check(const RadKernelInfo* r, ConvRef& c, const std::string& tag, double tol) {
     const int rc = cv_launch(r, c);
+    const std::vector<uint16_t> before = c.stb;
     cv_model(c);   /* after the upload, so the mirror convolves the bytes the device reads */
     if (rc != RAD_OK) { ok(tag.c_str(), false, "rc " + std::to_string(rc)); return; }
     const std::vector<uint16_t> gy = down_u16(c.dy, (size_t)(c.T * c.yld));
@@ -13776,10 +13782,28 @@ void cv_check(const RadKernelInfo* r, ConvRef& c, const std::string& tag, double
               (long long)nlive, (long long)c.T, (long long)c.wid, (long long)c.dil,
               (long long)c.n, c.have_resid ? "silu + residual" : "silu"), got, want, tol);
     const std::vector<uint16_t> gs = down_u16(c.dcs, c.stb.size());
-    const int64_t sdiff = differ(gs, c.stb);
-    ok(fmt("%s: the window after the step, byte for byte (%lld slots x %lld x %lld)", tag.c_str(),
-           (long long)c.slots, (long long)c.n, (long long)c.state_len).c_str(), sdiff == 0,
-       std::to_string(sdiff) + " of " + std::to_string(c.stb.size()) + " bytes differ");
+    if (c.alt_sidx.empty()) {
+        const int64_t sdiff = differ(gs, c.stb);
+        ok(fmt("%s: the window after the step, byte for byte (%lld slots x %lld x %lld)", tag.c_str(),
+               (long long)c.slots, (long long)c.n, (long long)c.state_len).c_str(), sdiff == 0,
+           std::to_string(sdiff) + " of " + std::to_string(c.stb.size()) + " bytes differ");
+    } else {
+        ConvRef alt = c;
+        alt.stb = before;
+        alt.sidx = c.alt_sidx;
+        cv_model(alt);
+        int64_t bad = 0, other = 0;
+        for (size_t i = 0; i < gs.size(); ++i) {
+            if (gs[i] == c.stb[i]) continue;
+            if (gs[i] == alt.stb[i]) ++other; else ++bad;
+        }
+        ok(fmt("%s: the window after the step, each value one writer's (%lld slots x %lld x %lld)",
+               tag.c_str(), (long long)c.slots, (long long)c.n, (long long)c.state_len).c_str(),
+           bad == 0, std::to_string(bad) + " of " + std::to_string(c.stb.size()) +
+                         " values neither writer's (" + std::to_string(other) +
+                         " the earlier writer's)");
+        c.stb = gs;   /* a later step of a chain reads what the device kept */
+    }
     const int64_t pad = cv_pad_moved(gy, c.T, c.n, c.yld);
     ok(fmt("%s: y's row padding [%lld, %lld) untouched", tag.c_str(), (long long)c.n,
            (long long)c.yld).c_str(), pad == 0, std::to_string(pad) + " markers moved");
@@ -13861,7 +13885,9 @@ void causal_conv1d_cases(const Plugin& pl) {
         cv_check(r, c2, "causal_conv1d_bf16 the step after it, reading at offset zero", 2e-3);
     }
     /* The branches: a cold window over a slot holding a stale value, a slot shared by two
-     * sequences, and a negative `cache_idx`, whose sequence writes neither y nor the window. */
+     * sequences (both cold, so neither reads it; the window it is left holding is either one's,
+     * value by value), and a negative `cache_idx`, whose sequence writes neither y nor the
+     * window. */
     {
         ConvRef c;
         c.causal = true;
@@ -13870,6 +13896,7 @@ void causal_conv1d_cases(const Plugin& pl) {
         c.slots = 3; c.state_len = 3;
         c.cu = { 0, 3, 6, 9, 12, 15 };
         c.sidx = { 0, 1, 2, 0, -1 };
+        c.alt_sidx = { 0, 1, 2, -1, -1 };   /* sequences 0 and 3 share slot 0 */
         c.have_sidx = true;
         c.hini = { 0, 1, 1, 0, 1 };
         c.have_hini = true;
