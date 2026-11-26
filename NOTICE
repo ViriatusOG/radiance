@@ -35,7 +35,9 @@ Written by Deadcode, with contributions from:
   and compose files, and the kernel report's fixture, and Ling-3.0-flash on an IQ8R trunk with its
   clamped gated products writing rotated int8 codes, Nemotron-3.5-Bolt-74B-A9B on an int8 trunk
   (rotated experts and the LiLiCorr backbone reading rotated int8 codes), and the bidirectional
-  media span counted from the window group's first position
+  media span counted from the window group's first position, and Gemma 4 dense on EXL3-V3
+  (gemma4_exl3, with a quantised token table and per-layer table), and NVIDIA's 2-bit
+  Nemotron-3.5-Bolt-74B-A9B on one card
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
   coupling with its cooperative verify (--draft-coupling), the W4A8 prefill's tail scale read, the
@@ -57,7 +59,7 @@ Written by Deadcode, with contributions from:
   the packed MoE prefill run map, the spanned prefill's routed pass and its tail snapshot inside the
   last chunk, block and traversal verification of the coupled MTP chain (--draft-verify), adaptive
   and load-aware draft depth (--draft-depth, --draft-depth-load), SuffixDecoding as a step selector
-  (--draft-suffix), and the tiled QSA prefill form
+  (--draft-suffix), and the tiled QSA prefill form, and the qwen35_exl3 QAD plugin skeleton
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
@@ -75,7 +77,10 @@ Written by Deadcode, with contributions from:
   (--preempt-wait-ms), prompt lookup alone (--spec-ngram) with each sequence's n-gram index and the
   gate that verifies a proposal only when it pays, and DeepSeek-V4.1's reply format with its DSML
   tool calls, and expert_stats_report.py, and the KL mode's own line in the VRAM shortfall report,
-  and the fresh prefill's room gate (--prefill-room-gate)
+  and the fresh prefill's room gate (--prefill-room-gate), and DeepSeek-V4.1-Flash on 2.x -- its
+  vision tower, its IQ1_S and IQ2_XXS containers, and linears and experts served in llama.cpp's own
+  blocks with their GEMMs in libref, libavx and libr4d -- and GGML IQ2_XXS and IQ3_XXS packed on the
+  card
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
@@ -124,9 +129,11 @@ Written by Deadcode, with contributions from:
   overdue one keeping its place, and hc_read's decode forms G, S and B3 restored for ROCm 7.2
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
-  linears' operands directly
+  linears' operands directly, and bf16x12, bf16 weights packed losslessly in 12.25 bits, with its
+  GEMMs, and Qwen3.8-27B in bf16 with the DFlash2 drafter rescored against a bf16 head
 - davetha: JSON Schema patterns read unanchored, with their shorthand classes and escapes, and the
-  README's abliterated Flash-Next container
+  README's abliterated Flash-Next container, and the vision-encoder and per-card hardware figures on
+  the dashboard's Performance page
 - Nunze: the eight-rank all-reduce's bands, weighted shards from the PCIe links and pieces, the
   sampler's candidate width at eight ranks, the image test stage's parallelism, budgets and
   exclusions, jinja's dotted integer index, GLM-5.3-Flash's kernels in libr4d and tool calls whose
@@ -144,7 +151,8 @@ Written by Deadcode, with contributions from:
 - Memoria: the dashboard's decode floor and recent window, the sparklines' percentile range, and the
   bringup time in /stats, the acceptance tiles' live figures and statsdump's size-capped rotation,
   the dashboard's history line, session extremes, card-count changes and Requests-header JSON
-  export, with the page's JavaScript driven by tests/js
+  export, with the page's JavaScript driven by tests/js, and seven dashboard tile and history
+  defects
 - C_Tamas: control vectors, loaded when the deployment asks and applied as a per-layer residual
   projection, KV streaming for a context bigger than VRAM (--kv-resident), and the dashboard's
   request history, KV streaming traffic and one-unit KV meter, and the mapped tier kept in the page
@@ -165,9 +173,16 @@ Written by Deadcode, with contributions from:
   the head-256 prefill softmax rescaled by row rather than by wave, Spark 2.5 (spark25: bf16 and
   rotated-int8 IQ8R checkpoints, tensor parallelism with exact collectives, reasoning and tagged
   tool calls) with its DSpark drafter (exact attention and Markov walk ops), the prefill split keyed
-  by live KV bounds, and --gpu-memory-mib, and the calibrated U5 gate and W5NL down recipe, U4 gates with W6NL down experts, Muse Glimmer IQ4R-V4 with a
-  quantised DFlash2, and Qwen3.8-27B's native MTP draft head (vhead, the U2 head over a
-  vocabulary-split target, its coupled proposals and calibration)
+  by live KV bounds, and --gpu-memory-mib, and the calibrated U5 gate and W5NL down recipe, U4 gates
+  with W6NL down experts, Muse Glimmer IQ4R-V4 with a quantised DFlash2, and Qwen3.8-27B's native
+  MTP draft head (vhead, the U2 head over a vocabulary-split target, its coupled proposals and
+  calibration), and Inkling 2 Mini -- its text backbone and loop, its NVFP4 and MXFP8 experts
+  imported, the int8 trunk, the vision tower, tensor parallelism, the DSpark drafter, tool calls,
+  the reasoning count and its decode and prefill kernels (gemm_nt_q_multi, attn_paged_rel's decode
+  and its verify rows sharing each K and V tile, the NVFP4 MoE forms) -- rad-convert's GPU
+  trellis jobs kept fed and --reuse-only, Muse Glimmer's
+  vision tower reading the container's int8 codes in place, and the LoRA plain-bf16 view taken only
+  where an adapter targets it
 - launch80_assets: tuning collectives as the exchange they serve at the served configuration, the
   per-layer embeddings' read-ahead queue and gather regimes, and the step loop's stall watch, and
   Meta Muse Glimmer 30B -- the museglimmer plugins, its windowed vision tower, its DFlash drafter,
@@ -184,7 +199,9 @@ Written by Deadcode, with contributions from:
 - nickreese: GBNF bounded-repetition chains shared across identical operands
 - Dad_Vibes: hc_read's decode kernels as one grid, its tiled up-mix pipelined and its one-grid wait
   trapping past its deadline, and gemm_fp8a8's narrow form with its scales staged through LDS and
-  its gated three-tile form at 8 waves
+  its gated three-tile form at 8 waves, and the DeepSeek-V4.1-Flash fork's v1.1 configurations and
+  measurements, with its ports of mikoskinen's full-vocabulary DSpark walk and adaptive-window
+  drafting
 - RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library, and its wave-matrix rewrite: the GEMMs
   retiled to 16x128 blocks, the grouped MoE GEMMs, the norms and quantisers, and the QSA and MoE
   router rows, its MoE GEMMs at w4a8 and w4a4 with dequant_w4, row_topk_merge, ngram_ids and the
@@ -199,7 +216,8 @@ Written by Deadcode, with contributions from:
 - Brandon Bertelsen: Cloudflare's clef and clef-flash with their joint schema head on the card
   (seg_softmax_pool, a request's words for the plugin), Convai Innovations' Laya decision models,
   Mica on /v1/systemone, and Metaspace prepending only to text not already starting with its
-  replacement
+  replacement, and MiniMax-H3's song guide, an audio reference pinned from a frame with both stereo
+  channels kept
 - Gaspa79: NVIDIA's Nemotron 3.5 Embed 1B and 8B -- the nemotron35_embed plugin, its Pixtral tower
   and their CPU path -- and Nemotron 3.5 Rerank 8B on /rerank, with its BF16 masked mean
   (seg_mean_bf16_sum)
@@ -211,13 +229,16 @@ Written by Deadcode, with contributions from:
   other rank's read of a row instead of reading it again
 - AnimusNull: GLM-5.3-Flash on four cards -- its experts split by width, the small-M MXFP4 expert
   form at the TP4 slices, the indexer's take-all steps -- its E4M3 latent cache (mla_attn's fp8kv
-  rows), and the DMA lane's room check over a reused fence slot
+  rows), and the DMA lane's room check over a reused fence slot, and GLM-5.3-Flash on 2.x: its IQR
+  and IQ8R container, plugin/glm with mla_attn over an int8 latent cache, chained decode launches
+  and tp4.yaml
 - neuromanMD: libr3d's MXFP4 GEMM leaving VRAM exponent planes unscanned from the host, and its
   branch-free e4m3_to_f32
 - everplays: the paged attention at seven queries a KV head, head_dim 128 (Nanbeige4.3-33B), and
   Recursive Flint -- its plugin, the sink-aware WMMA prefill attention and the fused prologue at
   rotary_dim 0
-- Kezi: the decode tile arms of the int4 and int5 x int8 GEMM
+- Kezi: the decode tile arms of the int4 and int5 x int8 GEMM, and draft trees for Qwen3.8-27B's
+  DFlash2 drafts (the tree verify rows and the gdn fold)
 - dschmitz: the two-rank fused writes' host-mailbox twins taking their chained forms, the card
   telemetry's junction temperature, and a replayed tool call's blank arguments read as the empty
   object with arguments that are not JSON refused naming the call
@@ -225,19 +246,44 @@ Written by Deadcode, with contributions from:
 - tnhnyzc: the mixed-step service-time target (mixed-step-target-ms)
 - aelfwyne: the diagnosis of draft trees refusing the int8 KV cache's rows
 - DokterSmol: LiquidAI's LFM3 (lfm3_bf16: bf16, int8 and IQ8R trunks, the windowed attention at
-  head_dim 128 with four queries a KV head on libr4d and libhalo)
+  head_dim 128 with four queries a KV head on libr4d and libhalo), and LFM3-1.7B on RDNA3 iGPUs in
+  libr3d (the int8 trunk GEMM, attn_paged decode at depth, had_quant_act_i8g at whole groups)
 - rkcth: Qwen-Image 2.1's, Krea 2's and MiniMax-H3's deployment pixel and reference limits, a video
   job held through its model's drain, tensor-parallel queues guarded beside single-rank engines,
   guidance requests refused past the sequence limit, adapter image requests queued in order, model
   discovery that leaves idle timers alone, host room reserved atomically for loads and fills, idle
-  expert-cache capacity restored, and LoRA rank truncation that drops dependent columns
+  expert-cache capacity restored, and LoRA rank truncation that drops dependent columns, and Wan 2.2
+  TI2V-5B's text-to-video and first-frame video, Krea 2's instruction edits with one or two
+  references and its registered outfill, LoRA on the image generators (rotated inputs, bias deltas
+  and row-mixer adapters per request, combinations checked without a GPU slot, versioned adapter
+  snapshots), the DSpark drafter's full and local-window KV groups, --draft-max-lanes,
+  --draft-min-accept and --draft-window-ckpt, MiniMax-H3's model-declared sparse attention profiles,
+  the wide scalar head and the opt-in f32 WMMA logits row, and parked weights rebuilt on the CPU,
+  memory ownership kept across a failed handoff, quiescent callbacks serialised, admission errors
+  kept and staging recycled only once its copies land
 - dowjames: runtime LoRA on a rotated int8 trunk (plain fp GEMM sites over transform-basis weights,
-  the lora_plain kernel library) and served adapters listed as children in /admin/fleet
+  the lora_plain kernel library) and served adapters listed as children in /admin/fleet, and the
+  dashboard's per-LoRA attribution
 - kaczy44: Gemma 4 26B-A4B's vision tower and rad-convert --add-vision
 - Itoash: a tool-call delimiter that does not end the turn, and Ling 3.0's function names ending at
-  whitespace
+  whitespace, and LTX-2's chunk ceiling raised to 40
 - jintakhan: gemma4_bf16's sliding-window attention ported to gemma4
 - forestjohnson: the dashboard behind a reverse proxy at a relative path
+- zihaomu: libr3d's packed dense IQR GEMM and routed IQR expert gate/up rows on gfx1100, libhalo's
+  GEMV decode form for the w4nl64a8i8h MoE down, memory.card-headroom-mib on single-model
+  tensor-parallel budgets, and the build with ROCm's clang as the host compiler
+- Hero422: the EXL3 dense rows on the card (exl3r4d's fast dense row and its prefill form),
+  qwen35_exl3's tensor parallelism and the token table as a Lloyd codebook (embed_tq)
+- kevinjd: memory.queue-reserve, the hardware queues a card keeps ready, closed when a model leaves
+  the card
+- Foundry: memory.pinned-numa-node
+- Warzuponus: Inkling 2's tool calls (message_open and object_args_key) and jinja's tojson with
+  sort_keys
+- morevgalex: int8 experts for drama-3 (fishomni)
+- millaguie: Inkling 2's image processor, transformers' bit for bit, and reasoning_effort "none"
+  and "minimal" passed to a template that takes them as levels
+- lowell80: the tested C++ compiler in the build guide
+- kepler_62f: hfget's file sizes measured with stat
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.
@@ -300,3 +346,22 @@ f88f8d9104726747791283ab156d2fcdb29e90a7:
 https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16/tree/f88f8d9104726747791283ab156d2fcdb29e90a7
 It is covered by the same retained OpenMDW-1.1 license.
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+radiance-exl3
+-------------
+
+exl3/ is radiance-exl3 (Copyright 2026 Dylan Johnston, Apache-2.0; exl3/LICENSE and exl3/NOTICE),
+imported from mikoskinen/r9700-exact-serving: the EXL3 kernel libraries exl3r4d and exl3ref, the
+exl3 quantiser and their common decode. arch/common/exl3/ carries copies of three of its headers.
+Its EXL3 decode is a transcription of exllamav3's (Copyright (c) 2025 Turboderp, MIT License), whose
+notice exl3/NOTICE reproduces.
+
+r9700-exact-serving
+-------------------
+
+Parts of the DeepSeek-V4.1-Flash support are ported from mikoskinen/r9700-exact-serving
+(Copyright 2026 Mikael Koskinen, Apache-2.0): libr4d's multi-row decode forms of the ggml GEMMs
+(r4d_ds41_ggml_mr.hip), the full-vocabulary DSpark walk (r4d_ds41_walk.hip) and their r4d_selftest checks, the weight sidecar
+(core/engine_bringup.cpp, tools/rad_sidecar.cpp), and the scheduler's depth-0 and lookup / head
+hybrid drafting (core/sched/draft.cpp, core/sched/scheduler.cpp). The commits each came from are
+named in this repository's history.

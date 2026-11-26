@@ -190,12 +190,7 @@ private:
                   { in }, { out });
     }
     rad_op cast(RadBuilder* b, rad_buf in, rad_buf out) const {
-        return rw(b,
-                  RAD_OP(b, "cast",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", width),
-                                    RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                         RAD_NOWEIGHTS),
-                  { in }, { out });
+        return cast_op(b, g.max_tok, width, "bf16", "bf16", in, out);
     }
 };
 }

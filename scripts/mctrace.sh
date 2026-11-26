@@ -4,6 +4,7 @@
 # on a 64-CU card leaves most of it idle).
 #   N=<decode tokens> OUT=<trace dir> scripts/mctrace.sh
 P=8102
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/mctrace.XXXXXX"); trap 'rm -rf "$WORK"' EXIT INT TERM
 M="${M:-$HOME/models/rad/minicpm5-2b-dspark.v2.rad}"
 N="${N:-140}"
 OUT="${OUT:-$HOME/traces/mc}"
@@ -25,8 +26,8 @@ for i in $(seq 1 90); do
   sleep 2
 done
 curl -s -m 900 http://localhost:$P/v1/completions -H "Content-Type: application/json" \
-  -d "{\"model\":\"m\",\"prompt\":\"Write a long essay about the sea.\",\"max_tokens\":$N,\"temperature\":0,\"ignore_eos\":true}" -o /tmp/mct.out
-echo "completion=$(jq -r .usage.completion_tokens /tmp/mct.out 2>/dev/null)"
+  -d "{\"model\":\"m\",\"prompt\":\"Write a long essay about the sea.\",\"max_tokens\":$N,\"temperature\":0,\"ignore_eos\":true}" -o "$WORK/mct.out"
+echo "completion=$(jq -r .usage.completion_tokens "$WORK/mct.out" 2>/dev/null)"
 pkill -f "bin/radianc[e]"
 for i in $(seq 1 60); do pgrep -f "bin/radianc[e]" >/dev/null || break; sleep 1; done
 for i in $(seq 1 120); do [ -s "$OUT/k_kernel_trace.csv" ] && break; sleep 2; done

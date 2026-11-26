@@ -802,7 +802,8 @@ AVX_KERNEL(vq_encode) {
         return v;
     };
     const std::vector<float> wi = dense(iw, dim * n), bi = dense(ib, dim);
-    const std::vector<float> raw = dense(cb, bins * dim), wo = dense(ow, n * dim), bo = dense(ob, n);
+    const std::vector<float> raw = dense(cb, bins * dim), wo = dense(ow, n * dim),
+        bo = dense(ob, n);
     std::vector<float> cn((size_t)(bins * dim));
     for (int64_t c = 0; c < bins; ++c) {
         const float* cr = raw.data() + c * dim;
@@ -977,7 +978,8 @@ AVX_KERNEL(ras_pick) {
     for (int64_t i = 0; i < n; ++i) {
         const int64_t hb = at(lane, i) * W;
         if (clear)
-            for (int64_t w = 0; w < W; ++w) st_int_dt(hist->dtype, hist->data, offlin(hist, hb + w), -1);
+            for (int64_t w = 0; w < W; ++w)
+                st_int_dt(hist->dtype, hist->data, offlin(hist, hb + w), -1);
         const int64_t f = at(first, rep * i);
         int64_t pick = f;
         if (f >= lo && f < hi)
@@ -1097,8 +1099,8 @@ AVX_KERNEL(fourier_embed) {
 }
 
 /* ------------------------------------------------------------------ win_input */
-/* y[cu[e] + k] = [lat | zeros | cond] of row k of lane win_lane[e], zeros for the conditioning of an
- * unconditional entry (pair -2). */
+/* y[cu[e] + k] = [lat | zeros | cond] of row k of lane win_lane[e], zeros for the conditioning
+ * of an unconditional entry (pair -2). */
 AVX_KERNEL(win_input) {
     if (!rad_args_have(a, 6)) return RAD_E_INVAL;
     const RadTensor *lat = &a->t[0], *cond = &a->t[1], *lcu = &a->t[2], *wl = &a->t[3];

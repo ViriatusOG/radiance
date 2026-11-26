@@ -644,7 +644,53 @@ int RadWriter::begin(const char* path) {
     }
 
     began_ = true;
+    resume_ = false;
     return RAD_OK;
+}
+
+/* A killed write resumed: neither file is truncated, so the planes the journal marked are still at
+ * their offsets. Its spill is kept as well (a kill before seal() leaves the blob there; the seal
+ * below rebases writes onto the target). The target's own tail is rewritten by finish(). */
+int RadWriter::begin_resume(const char* path) {
+    if (began_) return RAD_E_STATE;
+    if (!path || !*path) return RAD_E_INVAL;
+
+    path_       = path;
+    spill_path_ = path_ + ".blob.tmp";
+    sealed_ = late_ = false;
+
+    fd_out_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd_out_ < 0) { RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno)); return RAD_E_IO; }
+
+    fd_spill_ = ::open(spill_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    spill_base_ = 0;
+    if (fd_spill_ < 0) {
+        RAD_ERR("%s: %s", spill_path_.c_str(), std::strerror(errno));
+        ::close(fd_out_); fd_out_ = -1;
+        return RAD_E_IO;
+    }
+
+    began_ = true;
+    resume_ = true;
+    return RAD_OK;
+}
+
+/* After seal(): the weight's planes are already where finish() will find them. */
+int RadWriter::mark_weight_done(int64_t idx) {
+    if (!began_ || !sealed_ || idx < 0 || idx >= (int64_t)dir_.size()) return RAD_E_STATE;
+    for (uint32_t k = 0; k < dir_[idx].n_planes; ++k) {
+        const size_t pi = (size_t)(dir_[idx].plane_first + k);
+        written_[pi] = (int64_t)planes_[pi].bytes;
+    }
+    return RAD_OK;
+}
+
+/* Deliberate checkpoint: keep what was written for a resume, unlike abort()'s discard. */
+void RadWriter::abort_keep() {
+    if (fd_out_ >= 0)   ::close(fd_out_);
+    if (fd_spill_ >= 0) ::close(fd_spill_);
+    fd_out_ = fd_spill_ = -1;
+    began_ = append_ = resume_ = false;
 }
 
 void RadWriter::abort() {
@@ -666,7 +712,15 @@ void RadWriter::abort() {
         }
         if (fd_spill_ >= 0) ::close(fd_spill_);
         fd_out_ = fd_spill_ = -1;
-        began_ = append_ = false;
+        began_ = append_ = resume_ = false;
+        return;
+    }
+    if (resume_) {
+        /* A resumable write: both files hold every plane the journal marked, so keep them. */
+        if (fd_out_ >= 0)   ::close(fd_out_);
+        if (fd_spill_ >= 0) ::close(fd_spill_);
+        fd_out_ = fd_spill_ = -1;
+        began_ = resume_ = false;
         return;
     }
     if (fd_out_ >= 0)   ::close(fd_out_);

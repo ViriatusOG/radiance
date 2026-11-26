@@ -873,7 +873,7 @@ private:
     int64_t  file_buf_bytes_ = 0;
     char*    windows_ = nullptr;
     int      n_windows_ = 0;
-    char*    calm_ = nullptr;      /* zeroed: dummy table entries read zeros, not NaN */
+    char*    zero_region_ = nullptr; /* zeroed: dummy table entries read zeros, not NaN */
     int      win_next_ = 0;
     std::vector<RadEvent> win_ev_;
     std::vector<uint8_t>  win_rec_;

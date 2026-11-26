@@ -199,7 +199,7 @@ scheduler:
 | Level | Keys |
 |---|---|
 | `server:` | `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `log` (`info`/`debug`/`trace`), `radiance-home`, `kernels`, `download-dir`, `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `cards:` | `all` or a list of card indices |
+| `cards:` | `all` or a list of card indices. A fleet serves one card architecture: the first card listed (here, else by the first model that lists `cards`) chooses it, so a machine whose card 0 is an RDNA3 card serves on its RDNA4 cards when those are listed; `all` is the discrete cards of card 0's architecture |
 | `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier`, `pinned-numa-node`, `queue-reserve` (1-24, default 8: the HW queues a card keeps ready, §7.1) |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `stuck-exit`, `warm-up` |
 | `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park`, `cards` |
@@ -694,7 +694,8 @@ no request waiting, no load, restore or park running. Displacing a warm model la
 its weights come back from its container (§7.2). A warm load gives way to everything:
 
 - it takes room only from free memory and from other warm models (a model a request has used
-  stays, and no parked model unloads for it);
+  stays, parked or not; a warm model the warm-up parked unloads for it, so a model loaded later
+  in the file does not leave the first one cold);
 - it does not wait for room, and one that finds none leaves its model cold without an error (a
   request that came for it meanwhile asks for it again);
 - a request for a warm model makes it an ordinary one.

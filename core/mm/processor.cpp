@@ -56,7 +56,31 @@ static const float kMuseDefaultMean[3] = { 0.5f, 0.5f, 0.5f };
 static const float kMuseDefaultStd[3]  = { 0.5f, 0.5f, 0.5f };
 
 int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
-    /* Only the requested noncausal Mistral3/Ministral3 wrapper selects this new path. */
+    /* DeepSeek-V4.1's own tower (vision_config.model_type deepseek_v41_vision): 14-pixel patches,
+     * a 3x3 aligner (downsample_ratio 3), pad to a multiple of 14 on grey 127, ((u / 255) - 0.5) /
+     * 0.5 in bf16, patches (channel, y, x) raster order. The prompt holds ONE placeholder id
+     * (image_token_id, 129264) expanded into the span; the span's rows are the aligner's rows plus
+     * learned image_start / image_end / image_newline vectors (types 0..3). max_image_tokens caps
+     * a span's LLM rows, so the preprocessor shrinks a picture until its aligner grid fits:
+     * n_llm_h * (n_llm_w + 1) + 2. */
+    if (!std::strcmp(rad_meta_gets(&m, "vision_config.model_type", ""), "deepseek_v41_vision")) {
+        family = Family::DeepSeek41;
+        patch = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 14);
+        merge = (int32_t)rad_meta_geti(&m, "vision_config.downsample_ratio", 3);
+        temporal = 1;
+        tok_image = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        max_image_tokens = (int32_t)rad_meta_geti(&m, "vision_config.max_image_tokens", 1024);
+        image_token = rad_meta_gets(&m, "processor.image_token", "<image>");
+        mean[0] = mean[1] = mean[2] = 0.5f;
+        stdv[0] = stdv[1] = stdv[2] = 0.5f;
+        image_min_pixels = (int64_t)rad_meta_geti(&m, "vision_config.min_pixels", 295936);
+        /* The aligner's cap: max_image_tokens rows of 14*downsample pixels a side is the largest
+         * grid a span may hold. The build shrinks a picture to it (image_processor.py 46-66). */
+        const int64_t cap = (int64_t)max_image_tokens * merge * merge * patch * patch;
+        image_max_pixels = video_max_pixels = cap;
+        video_min_pixels = image_min_pixels;
+        return check(why);
+    }
     if (!std::strcmp(rad_meta_gets(&m, "model_type", ""), "mistral3") &&
         !std::strcmp(rad_meta_gets(&m, "text_config.model_type", ""), "ministral3") &&
         !std::strcmp(rad_meta_gets(&m, "vision_config.model_type", ""), "pixtral") &&
@@ -366,6 +390,38 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         }
         return RAD_OK;
     }
+    /* Thinking Machines' Inkling 2: the tower states its patch and merge; the processor config
+     * names the placeholder (image_token) and the vocabulary spells it and <|content_image|>
+     * (resolved at Processor::init). The reference processor has no token cap; llama.cpp's mtmd
+     * bounds a picture at 4096 cells, which is kept as the deployment's ceiling. */
+    if (mt && !std::strcmp(mt, "inkling2_vision")) {
+        family   = Family::Inkling2;
+        patch    = (int32_t)rad_meta_geti(&m, "vision_config.native_patch_size", 0);
+        merge    = (int32_t)rad_meta_geti(&m, "vision_config.adapter_merge_size", 0);
+        temporal = 1;
+        if (patch <= 0 || merge <= 0) {
+            if (why) *why = "the container states no Inkling 2 tower geometry (vision_config."
+                            "native_patch_size, adapter_merge_size)";
+            return RAD_E_NOTFOUND;
+        }
+        image_token = rad_meta_gets(&m, "processor.image_token", "<|unused_200054|>");
+        max_image_tokens = (int32_t)rad_meta_geti(&m, "processor.image_processor.max_image_tokens",
+                                                  4096);
+        read_triple(m, "processor.image_processor.image_mean", mean);
+        read_triple(m, "processor.image_processor.image_std", stdv);
+        const int64_t f2 = (int64_t)factor() * factor();
+        image_min_pixels = video_min_pixels = f2;
+        image_max_pixels = video_max_pixels = std::max<int64_t>(f2, (int64_t)max_image_tokens * f2);
+        std::string bad;
+        if (max_image_tokens < 1) bad = "max_image_tokens must be positive";
+        if (bad.empty() && check(&bad) < 0) bad = "the container's Inkling 2 processor "
+                                                  "configuration is inconsistent: " + bad;
+        if (!bad.empty()) {
+            if (why) *why = bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     /* Gemma 4 12B ("unified") has no tower: its embedder takes a whole 48 x 48 pooling window as
      * one patch, so a patch is a row (merge 1), and its values are u / 255. The sizes are the
      * same: a window is 48 pixels a side either way. */
@@ -475,6 +531,15 @@ int VisionConfig::check(std::string* why) const {
     if (max_frames < min_frames)
         return no("max_frames " + std::to_string(max_frames) + " is below min_frames " +
                   std::to_string(min_frames));
+    if (family == Family::DeepSeek41 &&
+        (patch != 14 || merge != 3 || temporal != 1 || tok_image < 0 || max_image_tokens < 1 ||
+         image_token.empty()))
+        return no("DeepSeek-V4.1 requires 14-pixel patches, downsample 3, an image token id and "
+                   "max_image_tokens");
+    if (family == Family::DeepSeek41)
+        for (int i = 0; i < 3; ++i)
+            if (!std::isfinite(mean[i]) || !std::isfinite(stdv[i]))
+                return no("DeepSeek-V4.1 requires finite image means and deviations");
     if (family == Family::Pixtral &&
         (patch != 14 || merge != 2 || temporal != 1 || tok_image < 0 ||
          pixtral_longest_edge < factor() || pixtral_longest_edge % factor() ||
@@ -685,24 +750,22 @@ int glm5next_size(int64_t h, int64_t w, int32_t temporal, int32_t factor, int64_
 std::vector<int64_t> sample_frames_gemma4(const VideoInfo& info, double fps, int32_t max_frames) {
     const int64_t total = info.n_frames;
     if (total <= 0) return {};
-    std::vector<int64_t> idx;
-    if (info.fps > 0.0) {
-        const double step = info.fps / fps;
-        const double duration = (double)total / info.fps;
-        const int64_t n = std::max<int64_t>(1, (int64_t)(duration * fps));
-        for (int64_t i = 0; i < n; ++i)
-            idx.push_back(std::min<int64_t>(total - 1, (int64_t)((double)i * step)));
-    } else {
-        for (int64_t i = 0; i < total; ++i) idx.push_back(i);
-    }
-    if (max_frames > 0 && (int64_t)idx.size() > max_frames) {
-        std::vector<int64_t> keep((size_t)max_frames);
-        const double span = (double)(idx.size() - 1);
-        for (int32_t i = 0; i < max_frames; ++i) {
-            const double t = max_frames == 1 ? 0.0 : span * (double)i / (double)(max_frames - 1);
-            keep[(size_t)i] = idx[(size_t)(int64_t)t];
-        }
-        idx.swap(keep);
+    const bool timed = info.fps > 0.0;
+    const double step = timed ? info.fps / fps : 1.0;
+    const double duration = timed ? (double)total / info.fps : 0.0;
+    const int64_t n = timed ? std::max<int64_t>(1, (int64_t)(duration * fps)) : total;
+    auto frame = [&](int64_t i) {
+        return std::min<int64_t>(total - 1, (int64_t)((double)i * step));
+    };
+    /* The container's frame rate can make the full list enormous, so only the kept frames are
+     * ever built. */
+    const int64_t kept = max_frames > 0 ? std::min<int64_t>(n, max_frames) : n;
+    std::vector<int64_t> idx((size_t)kept);
+    const double span = (double)(n - 1);
+    for (int64_t i = 0; i < kept; ++i) {
+        if (kept == n) { idx[(size_t)i] = frame(i); continue; }
+        const double t = kept == 1 ? 0.0 : span * (double)i / (double)(kept - 1);
+        idx[(size_t)i] = frame((int64_t)t);
     }
     return idx;
 }
@@ -1250,6 +1313,9 @@ void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_
     const double factor = std::min(std::sqrt((double)avail / (double)(ch * cw)), 1.0);
     int64_t th = (int64_t)std::floor(factor * (double)ch);
     int64_t tw = (int64_t)std::floor(factor * (double)cw);
+    /* A very thin picture floors a side to 0, which the growth below would divide by. */
+    th = std::max<int64_t>(th, 1);
+    tw = std::max<int64_t>(tw, 1);
     if (avail > lo && th * tw < lo) {
         const double up = std::sqrt((double)lo / (double)(th * tw));
         th = (int64_t)std::ceil(up * (double)th);
@@ -1584,6 +1650,29 @@ void patchify_radio(const VisionConfig& c, const std::vector<const std::vector<f
     }
 }
 
+/* RAD_E_INVAL, with `why` set, when an image of `patches` patches is more than one encoder pass
+ * holds. */
+int check_image_patches(const VisionConfig& c, int64_t patches, std::string* why) {
+    if (patches <= c.max_patches) return RAD_OK;
+    if (why) *why = "the image resizes to more patches than one encoder pass holds";
+    return RAD_E_INVAL;
+}
+
+/* The same for a video: a frame of `frame_patches` patches against one encoder pass, and the whole
+ * item against the server's per-video patch budget. */
+int check_video_patches(const VisionConfig& c, int64_t frame_patches, const Item& it,
+                        std::string* why) {
+    if (frame_patches > c.max_patches) {
+        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    if (it.n_patch > c.max_video_patches) {
+        if (why) *why = "the video is over the server's patch budget for one video";
+        return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
 /* Radio's item geometry: finish_item's, with the prefix rows counted in the patches. */
 void finish_item_radio(const VisionConfig& c, Item* it) {
     it->patch_dim  = c.patch_dim();
@@ -1709,6 +1798,19 @@ int Processor::init(const VisionConfig& cfg,
             cfg_.max_video_patches =
                 (int64_t)((cfg.max_frames + cfg.temporal - 1) / cfg.temporal) *
                 (int64_t)cfg_.max_frame_rows * cfg.merge * cfg.merge;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
+    if (cfg.family == Family::Inkling2) {
+        /* Both markers are vocabulary words. A picture is one segment of one pass with its class
+         * row, so the cap is lowered to the cells a pass holds. */
+        if (!token_id) return RAD_E_INVAL;
+        cfg_.tok_image = token_id(cfg.image_token);
+        cfg_.tok_start = token_id("<|content_image|>");
+        if (cfg_.tok_image < 0 || cfg_.tok_start < 0) return RAD_E_NOTFOUND;
+        const int64_t pass_tok = (cfg.max_patches - 1) / ((int64_t)cfg.merge * cfg.merge);
+        if (pass_tok < 1) return RAD_E_INVAL;
+        if (cfg_.max_image_tokens > pass_tok) cfg_.max_image_tokens = (int32_t)pass_tok;
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
@@ -2182,10 +2284,7 @@ int Processor::image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::s
     it->grid_w = (int32_t)(w / c.patch);
     it->rope_1d = true;
     finish_item(c, it.get());
-    if (it->n_patch > c.max_patches) {
-        if (why) *why = "the image resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_image_patches(c, it->n_patch, why); st != RAD_OK) return st;
     std::vector<const Frame*> frames((size_t)c.temporal, &canvas);
     patchify(c, frames, it.get());
     one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
@@ -2254,6 +2353,120 @@ int Processor::image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::st
     return RAD_OK;
 }
 
+/* DeepSeek-V4.1's ViT grid plan, image_processor.py's plan_image_grid + safe_resize: sides ceil
+ * to whole patches, then the largest aspect-preserving multiple of patch * downsample whose span
+ * n_llm_h * (n_llm_w + 1) + 2 fits vision_max_image_tokens (solve_resize_ratio's formula). */
+static int64_t ds41_side(int64_t px, int64_t cell) { return px / cell + (px % cell ? 1 : 0); }
+
+static void ds41_plan(int64_t h, int64_t w, int64_t p, int64_t merge, int64_t max_n, int64_t* bh,
+                      int64_t* bw) {
+    *bh = *bw = 0;
+    if (h <= 0 || w <= 0 || max_n <= 3) return;
+    const int64_t cell = p * merge;
+    int64_t ch = (h + p - 1) / p * p, cw = (w + p - 1) / p * p;
+    if (ds41_side(ch, cell) * (ds41_side(cw, cell) + 1) + 2 <= max_n) {
+        *bh = ch;
+        *bw = cw;
+        return;
+    }
+    const double r = (double)h / (double)w;
+    const double mw = std::sqrt((double)(max_n - 2) / r + 0.25) - 0.5;
+    const double mh = mw * r;
+    if (mw < 1.0) {
+        *bh = (max_n - 2) / 2 * cell;
+        *bw = cell;
+        return;
+    }
+    if (mh < 1.0) {
+        *bh = cell;
+        *bw = (max_n - 3) * cell;
+        return;
+    }
+    const double beta = std::min(std::floor(mw) * (double)cell / (double)w,
+                                 std::floor(mh) * (double)cell / (double)h);
+    *bh = std::max<int64_t>(1, (int64_t)((double)h * beta / (double)p)) * p;
+    *bw = std::max<int64_t>(1, (int64_t)((double)w * beta / (double)p)) * p;
+}
+
+/* DeepSeek-V4.1's image: grow under min_pixels by sqrt, pad to the planned size on grey 127,
+ * ((u / 255) - 0.5) / 0.5 in bf16, patches (channel, y, x) in raster order. The span is one
+ * placeholder id repeated with its type array, as image_token_types writes it. */
+int Processor::image_deepseek41(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    if (!out || f.h <= 0 || f.w <= 0 || (int64_t)f.h * f.w > c.max_source_pixels ||
+        f.rgb.size() != (uint64_t)f.h * f.w * 3) {
+        if (why) *why = "invalid DeepSeek-V4.1 RGB frame or source pixel limit exceeded";
+        return RAD_E_INVAL;
+    }
+    int64_t h = f.h, w = f.w;
+    if (w * h < c.image_min_pixels) {
+        const double s = std::sqrt((double)c.image_min_pixels / (double)(w * h));
+        w = (int64_t)((double)w * s);
+        h = (int64_t)((double)h * s);
+    }
+    int64_t bh = 0, bw = 0;
+    ds41_plan(h, w, c.patch, c.merge, c.max_image_tokens, &bh, &bw);
+    if (bh <= 0 || bw <= 0 || (bh / c.patch) * (bw / c.patch) > c.max_patches) {
+        if (why) *why = "DeepSeek-V4.1 image is empty after resize or exceeds one encoder pass";
+        return RAD_E_INVAL;
+    }
+    Frame padded;
+    pad_bicubic(f, (int32_t)bw, (int32_t)bh, 127, &padded);
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)(bh / c.patch);
+    it->grid_w = (int32_t)(bw / c.patch);
+    it->rope_1d = true;
+    it->patch_raster = true;
+    finish_item(c, it.get());
+    /* gemm_nt_bias stages 8-wide; 3*14*14 = 588 is not a multiple of 8. The extra columns stay
+     * zero (the pixel buffer is value-initialised below). */
+    it->patch_dim = (it->patch_dim + 7) & ~7LL;
+    it->rows_h = (it->grid_h + c.merge - 1) / c.merge;
+    it->rows_w = (it->grid_w + c.merge - 1) / c.merge;
+    it->seg_rows = it->rows_h * it->rows_w;
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v)
+            lut[ch][v] = rad_f32_to_bf16((float)v * (2.0f / 255.0f) - 1.0f);
+    const int64_t raw = 3LL * c.temporal * c.patch * c.patch, tail = it->patch_dim - raw;
+    it->pixels.resize((size_t)it->n_patch * it->patch_dim, 0);
+    auto* dst = it->pixels.data();
+    for (int py = 0; py < it->grid_h; ++py)
+        for (int px = 0; px < it->grid_w; ++px) {
+            for (int ch = 0; ch < 3; ++ch)
+                for (int y = 0; y < c.patch; ++y)
+                    for (int x = 0; x < c.patch; ++x)
+                        *dst++ = lut[ch][padded.rgb[
+                            ((size_t)(py * c.patch + y) * bw + px * c.patch + x) * 3 + ch]];
+            dst += tail;
+        }
+    it->seg_at.push_back(0);
+    it->types.push_back(0);
+    it->row_tokens.push_back((int32_t)it->expand.size());
+    it->expand.push_back(c.tok_image);
+    for (int32_t y = 0; y < it->rows_h; ++y) {
+        for (int32_t x = 0; x < it->rows_w; ++x) {
+            it->types.push_back(1);
+            /* Every span position is an explicit placeholder row: the span's embeddings are
+             * assembled by type (image rows from the encoder, the rest from the learned table),
+             * so the whole span stages from Item::embd as one flat run. */
+            it->row_tokens.push_back((int32_t)it->expand.size());
+            it->expand.push_back(c.tok_image);
+        }
+        it->types.push_back(2);
+        it->row_tokens.push_back((int32_t)it->expand.size());
+        it->expand.push_back(c.tok_image);
+    }
+    it->types.push_back(3);
+    it->row_tokens.push_back((int32_t)it->expand.size());
+    it->expand.push_back(c.tok_image);
+    content_key(*it, &it->key_hi, &it->key_lo);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 /* NVIDIA's Nemotron-H Omni image processor: one tile, sized by radio_size, resized with torch's
  * antialiased bicubic on float pixels (none when the size already fits). */
 int Processor::image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
@@ -2269,10 +2482,7 @@ int Processor::image_radio(const Frame& f, std::shared_ptr<Item>* out, std::stri
     it->grid_w = wp;
     it->rope_1d = true;
     finish_item_radio(c, it.get());
-    if (it->n_patch > c.max_patches) {
-        if (why) *why = "the image resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_image_patches(c, it->n_patch, why); st != RAD_OK) return st;
     patchify_radio(c, { &px }, false, it.get());
     one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
     *out = std::move(it);
@@ -2298,14 +2508,9 @@ int Processor::video_radio(const Video& v, std::shared_ptr<Item>* out, std::stri
     it->grid_w = wp;
     it->rope_1d = true;
     finish_item_radio(c, it.get());
-    if (c.radio_prefix + (int64_t)hp * wp > c.max_patches) {
-        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
-    if (it->n_patch > c.max_video_patches) {
-        if (why) *why = "the video is over the server's patch budget for one video";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_video_patches(c, c.radio_prefix + (int64_t)hp * wp, *it, why);
+        st != RAD_OK)
+        return st;
     std::vector<std::vector<float>> resized((size_t)nf);
     for (int64_t i = 0; i < nf; ++i)
         resize_bicubic_aa_f32(v.frames[(size_t)i], wp * c.patch, hp * c.patch, &resized[(size_t)i]);
@@ -2362,14 +2567,112 @@ int Processor::image_muse(const Frame& f, std::shared_ptr<Item>* out, std::strin
     it->grid_h = (int32_t)(h / c.patch);
     it->grid_w = (int32_t)(w / c.patch);
     finish_item(c, it.get());
-    if (it->n_patch > c.max_patches) {
-        if (why) *why = "the image resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_image_patches(c, it->n_patch, why); st != RAD_OK) return st;
     /* An image fills the temporal depth by repetition, as the reference's expand does. */
     std::vector<const Frame*> frames((size_t)c.temporal, &r);
     patchify_muse(c, frames, it.get());
     one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+/* Inkling 2's picture (Family::Inkling2): its cells, ceil(h / 40) x ceil(w / 40), are what the
+ * reference encodes with no resize; past the cap it is shrunk first, aspect kept, until its cells
+ * fit (mtmd's bound -- the reference has none). */
+int inkling2_size(int64_t h, int64_t w, int32_t factor, int64_t max_tokens, int64_t* oh,
+                  int64_t* ow, std::string* why) {
+    if (h <= 0 || w <= 0) { if (why) *why = "the picture has no size"; return RAD_E_INVAL; }
+    if (max_tokens < 1 || factor < 1) {
+        if (why) *why = "the token budget is empty";
+        return RAD_E_INVAL;
+    }
+    auto cells = [&](int64_t a, int64_t b) {
+        return ((a + factor - 1) / factor) * ((b + factor - 1) / factor);
+    };
+    int64_t rh = h, rw = w;
+    if (cells(h, w) > max_tokens) {
+        const double s = std::sqrt((double)max_tokens * factor * factor / ((double)h * (double)w));
+        rh = std::max<int64_t>(1, (int64_t)std::floor((double)h * s));
+        rw = std::max<int64_t>(1, (int64_t)std::floor((double)w * s));
+        /* The ceilings can still overshoot by a row or a column: shrink the longer side a
+         * pixel at a time, keeping the aspect as near as whole pixels allow. */
+        while (cells(rh, rw) > max_tokens) {
+            if (rh * w > rw * h) --rh; else --rw;
+            if (rh < 1 || rw < 1) { if (why) *why = "the picture cannot fit its cap"; return RAD_E_INVAL; }
+        }
+    }
+    *oh = rh;
+    *ow = rw;
+    return RAD_OK;
+}
+
+/* Inkling 2's patch rows: one zero row (the class token's), then the patches in merge-block order,
+ * each (y, x, channel), the canvas padded bottom and right with the raw value -1. Every value is
+ * transformers' Inkling2ImageProcessor's: its fused rescale and normalisation, (u - 255 mean) /
+ * (255 std) in f32 with the configuration's mean and deviation, rounded to bf16, which a byte
+ * table and the padding's own value hold. */
+int Processor::image_inkling2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    const int32_t F = c.factor(), P = c.patch, M = c.merge;
+    int64_t h = 0, w = 0;
+    RAD_TRY(inkling2_size(f.h, f.w, F, c.max_image_tokens, &h, &w, why));
+    Frame r;
+    const Frame* src = &f;
+    if (h != f.h || w != f.w) {
+        resize_bicubic(f, (int32_t)w, (int32_t)h, &r);
+        src = &r;
+    }
+    const int64_t rows = (h + F - 1) / F, cols = (w + F - 1) / F;
+    auto it = std::make_shared<Item>();
+    it->kind       = Kind::Image;
+    it->grid_t     = 1;
+    it->grid_h     = (int32_t)(rows * M);
+    it->grid_w     = (int32_t)(cols * M);
+    it->rope_1d    = true;
+    it->patch_dim  = c.patch_dim();
+    it->seg_prefix = 1;
+    it->prefix_at_origin = true;
+    it->rows_h     = (int32_t)rows;
+    it->rows_w     = (int32_t)cols;
+    it->seg_rows   = it->rows_h * it->rows_w;
+    it->n_seg      = 1;
+    it->n_patch    = 1 + (int64_t)it->grid_h * it->grid_w;
+    if (it->n_patch > c.max_patches) {
+        if (why) *why = "the image is more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    /* The reference folds the 1/255 rescale into the normalisation's constants: one subtraction
+     * and one division a value, in f32. vLLM's gather_patches reaches the same number through a
+     * CLIP normalisation in bf16 and back, and lands one bf16 step away on about a value in four. */
+    auto value = [&](float u, int ch) {
+        return rad_f32_to_bf16((u - c.mean[ch] * 255.0f) / (c.stdv[ch] * 255.0f));
+    };
+    uint16_t lut[3][256], pad[3];
+    for (int ch = 0; ch < 3; ++ch) {
+        for (int v = 0; v < 256; ++v) lut[ch][v] = value((float)v, ch);
+        pad[ch] = value(-1.0f, ch);
+    }
+    it->pixels.assign((size_t)it->n_patch * (size_t)it->patch_dim, 0);
+    uint16_t* dst = it->pixels.data() + it->patch_dim;   /* the class row stays zero */
+    for (int64_t bh = 0; bh < rows; ++bh)
+        for (int64_t bw = 0; bw < cols; ++bw)
+            for (int mh = 0; mh < M; ++mh)
+                for (int mw = 0; mw < M; ++mw) {
+                    const int64_t py0 = (bh * M + mh) * P, px0 = (bw * M + mw) * P;
+                    for (int y = 0; y < P; ++y)
+                        for (int x = 0; x < P; ++x)
+                            for (int ch = 0; ch < 3; ++ch) {
+                                const int64_t py = py0 + y, px = px0 + x;
+                                *dst++ = py < h && px < w
+                                    ? lut[ch][src->rgb[((size_t)py * w + px) * 3 + ch]]
+                                    : pad[ch];
+                            }
+                }
+    content_key(*it, &it->key_hi, &it->key_lo);
+    it->expand.reserve((size_t)it->seg_rows + 1);
+    it->expand.push_back(c.tok_start);
+    it->seg_at.push_back(1);
+    it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_image);
     *out = std::move(it);
     return RAD_OK;
 }
@@ -2400,14 +2703,9 @@ int Processor::video_muse(const Video& v, std::shared_ptr<Item>* out, std::strin
     it->grid_h = (int32_t)(h / c.patch);
     it->grid_w = (int32_t)(w / c.patch);
     finish_item(c, it.get());
-    if ((int64_t)it->grid_h * it->grid_w > c.max_patches) {
-        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
-    if (it->n_patch > c.max_video_patches) {
-        if (why) *why = "the video is over the server's patch budget for one video";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_video_patches(c, (int64_t)it->grid_h * it->grid_w, *it, why);
+        st != RAD_OK)
+        return st;
 
     /* Resize each distinct frame once; padding repeats share the resized copy. */
     std::vector<Frame> resized(v.frames.size());
@@ -2446,11 +2744,13 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     }
     if (c.family == Family::Gemma4) return image_gemma4(f, c.image_soft_tokens, out, why);
     if (c.family == Family::Pixtral) return image_pixtral(f, out, why);
+    if (c.family == Family::DeepSeek41) return image_deepseek41(f, out, why);
     if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
     if (c.family == Family::Glm5Next) return image_glm5next(f, out, why);
     if (c.family == Family::Radio) return image_radio(f, out, why);
     if (c.family == Family::MuseGlimmer) return image_muse(f, out, why);
     if (c.family == Family::UnlimitedOcr) return image_unlimitedocr(f, mode, out, why);
+    if (c.family == Family::Inkling2) return image_inkling2(f, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
                                &h, &w, why));
@@ -2462,10 +2762,7 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     it->grid_h = (int32_t)(h / c.patch);
     it->grid_w = (int32_t)(w / c.patch);
     finish_item(c, it.get());
-    if (it->n_patch > c.max_patches) {
-        if (why) *why = "the image resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_image_patches(c, it->n_patch, why); st != RAD_OK) return st;
     /* An image fills the temporal depth by repetition. */
     std::vector<const Frame*> frames((size_t)c.temporal, &r);
     patchify(c, frames, it.get());
@@ -2583,14 +2880,9 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
     it->grid_h = (int32_t)(h / c.patch);
     it->grid_w = (int32_t)(w / c.patch);
     finish_item(c, it.get());
-    if ((int64_t)it->grid_h * it->grid_w > c.max_patches) {
-        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
-        return RAD_E_INVAL;
-    }
-    if (it->n_patch > c.max_video_patches) {
-        if (why) *why = "the video is over the server's patch budget for one video";
-        return RAD_E_INVAL;
-    }
+    if (const int st = check_video_patches(c, (int64_t)it->grid_h * it->grid_w, *it, why);
+        st != RAD_OK)
+        return st;
 
     /* Resize each distinct frame once; padding repeats share the resized copy. */
     std::vector<Frame> resized(v.frames.size());
@@ -2654,7 +2946,15 @@ int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
         }
     }
     Frame f;
-    RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    if (cfg_.family == Family::Inkling2) {
+        /* The reference keeps a picture's alpha and composites it onto its checkerboard; an
+         * opaque picture comes out as its RGB. */
+        FrameRGBA fa;
+        RAD_TRY(decode_image_rgba(bytes, n, cfg_.max_source_pixels, &fa, why));
+        composite_checkerboard(fa, &f);
+    } else {
+        RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    }
     if (max_pixels > 0 && (int64_t)f.w * f.h > max_pixels) {
         Frame capped;
         cap_area(f, max_pixels, &capped);
@@ -2719,6 +3019,13 @@ int Processor::encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, i
     /* Scaled to cover the canvas, aspect kept, then cropped at the centre: ComfyUI's last-frame
      * resize. */
     const double s = std::max((double)w / (double)f.w, (double)h / (double)f.h);
+    /* A very thin source is magnified by its long side's ratio; the result may not exceed the
+     * largest source the server accepts (2^26 pixels at least). */
+    if ((double)f.w * s * (double)f.h * s >
+        std::max<double>((double)cfg_.max_source_pixels, (double)((int64_t)1 << 26))) {
+        if (why) *why = "the picture is too elongated to cover the frame";
+        return RAD_E_INVAL;
+    }
     int32_t cw = (int32_t)std::llround((double)f.w * s);
     int32_t ch = (int32_t)std::llround((double)f.h * s);
     if (cw < w) cw = w;
@@ -2801,7 +3108,7 @@ std::vector<int64_t> muse_sample_cb(const VideoInfo& info, const void* user) {
 int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
                      std::string* why) const {
     if (cfg_.family == Family::Lfm2 || cfg_.family == Family::Glm5Next ||
-        cfg_.family == Family::Pixtral) {
+        cfg_.family == Family::Pixtral || cfg_.family == Family::Inkling2) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
     }

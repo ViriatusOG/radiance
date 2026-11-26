@@ -15,7 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -31,11 +30,9 @@ namespace fs = std::filesystem;
 namespace {
 
 std::string slurp(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return std::string();
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string s;
+    read_file_bytes(path, &s);
+    return s;
 }
 
 std::string trim(std::string s) {
@@ -126,7 +123,7 @@ void read_card(const std::string& root, const std::string& bdf, bool pm, CardFac
     c->runtime_control = line(dev + "/power/control");
     c->iommu_type      = line(dev + "/iommu_group/type");
     for (const std::string& d : list(dev + "/drm"))
-        if (d.rfind("card", 0) == 0 && d.size() > 4 && std::isdigit((unsigned char)d[4])) c->drm = d;
+        if (d.starts_with("card") && d.size() > 4 && std::isdigit((unsigned char)d[4])) c->drm = d;
 
     /* Every hop up to the root port, not just the card's link: a card with an on-board switch
      * reports its endpoint at full speed regardless of the slot, so a parked root port shows only
@@ -298,7 +295,7 @@ void read_host(const std::string& root, HostFacts* h) {
         std::istringstream in(slurp(root + "/etc/os-release"));
         std::string l;
         while (std::getline(in, l))
-            if (l.rfind("PRETTY_NAME=", 0) == 0) {
+            if (l.starts_with("PRETTY_NAME=")) {
                 h->distro = l.substr(12);
                 if (h->distro.size() >= 2 && h->distro.front() == '"') h->distro = h->distro.substr(1, h->distro.size() - 2);
             }
@@ -320,7 +317,7 @@ void read_host(const std::string& root, HostFacts* h) {
         int64_t lim = -1;
         while (std::getline(in, l)) {
             int64_t v = -1;
-            if (l.rfind("0::", 0) == 0)
+            if (l.starts_with("0::"))
                 v = cgroup_limit(root + "/sys/fs/cgroup", l.substr(3), "memory.max");
             else if (l.find(":memory:") != std::string::npos)
                 v = cgroup_limit(root + "/sys/fs/cgroup/memory", l.substr(l.find(":memory:") + 8),
@@ -341,7 +338,7 @@ void read_host(const std::string& root, HostFacts* h) {
                                              "pci=", "default_hugepagesz" };
         while (in >> t)
             for (const char* k : kKeep)
-                if (t.rfind(k, 0) == 0) { h->cmdline += (h->cmdline.empty() ? "" : " ") + t; break; }
+                if (t.starts_with(k)) { h->cmdline += (h->cmdline.empty() ? "" : " ") + t; break; }
     }
     {
         /* Passthrough or translated. The cards' IOMMU group type (identity = passthrough) is the
@@ -396,7 +393,7 @@ Facts collect(const std::string& root, const std::vector<std::string>* managed) 
     /* Every display-class device, used by the engine or not (an iGPU, an excluded card). */
     for (const std::string& d : list(root + "/sys/bus/pci/devices")) {
         const std::string cls = line(root + "/sys/bus/pci/devices/" + d + "/class");
-        if (cls.rfind("0x03", 0) != 0) continue;
+        if (!cls.starts_with("0x03")) continue;
         const bool pm =
             !managed || std::find(managed->begin(), managed->end(), d) != managed->end();
         CardFacts c;

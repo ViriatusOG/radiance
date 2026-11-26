@@ -39,7 +39,7 @@ TEST(a_target_splits_into_a_path_and_decoded_query_parameters) {
     std::map<std::string, std::string> q;
     parse_target("/v1/models/foo?x=1&y=two", &path, &q);
     CHECK_EQ(path, std::string("/v1/models/foo"));
-    CHECK_EQ(q.size(), 2u);
+    REQUIRE_EQ(q.size(), 2u);
     CHECK_EQ(q["x"], std::string("1"));
     CHECK_EQ(q["y"], std::string("two"));
 
@@ -53,7 +53,7 @@ TEST(a_target_splits_into_a_path_and_decoded_query_parameters) {
      * to tell it from a key that was never sent. */
     std::map<std::string, std::string> flag;
     parse_target("/x?stream", &path, &flag);
-    CHECK_EQ(flag.size(), 1u);
+    REQUIRE_EQ(flag.size(), 1u);
     CHECK(flag.count("stream") == 1);
     CHECK_EQ(flag["stream"], std::string(""));
 
@@ -144,7 +144,7 @@ TEST(base64_carries_every_byte_value_including_zero) {
     CHECK_EQ(enc.size(), (size_t)344);
     std::vector<uint8_t> back;
     CHECK(base64_decode(enc, &back));
-    CHECK_EQ(back.size(), (size_t)256);
+    REQUIRE_EQ(back.size(), (size_t)256);
     for (int i = 0; i < 256; ++i) CHECK_EQ((int)back[(size_t)i], i);
 
     /* The standard alphabet, not the URL-safe one: a decoder chooses by the characters it sees,
@@ -326,7 +326,7 @@ TEST(the_bucket_ladders_are_sorted_positive_and_the_ones_vllm_publishes) {
         { "latency", buckets_latency(), 21, 0.3,   7680.0 },
     };
     for (auto& c : cases) {
-        CHECK_EQ(c.b.size(), c.n);
+        REQUIRE_EQ(c.b.size(), c.n);
         CHECK_NEAR(c.b.front(), c.first, 1e-12);
         CHECK_NEAR(c.b.back(), c.last, 1e-9);
         for (size_t i = 0; i < c.b.size(); ++i) {
@@ -341,10 +341,10 @@ TEST(the_bucket_ladders_are_sorted_positive_and_the_ones_vllm_publishes) {
 TEST(the_token_ladder_is_mantissas_1_2_5_stopping_past_the_context) {
     /* vLLM's build_1_2_5_buckets: a 32K-context model gets 1..20000 and no more. */
     const std::vector<double> b = buckets_1_2_5(32768);
-    CHECK(!b.empty());
+    REQUIRE(!b.empty());
     CHECK_NEAR(b.front(), 1.0, 1e-12);
     CHECK_NEAR(b.back(), 20000.0, 1e-9);
-    CHECK_EQ(b.size(), 14u);
+    REQUIRE_EQ(b.size(), 14u);
     for (size_t i = 1; i < b.size(); ++i) CHECK(b[i] > b[i - 1]);
     /* Every entry is a mantissa of 1, 2 or 5 at some decade. */
     for (double v : b) {
@@ -357,7 +357,7 @@ TEST(the_token_ladder_is_mantissas_1_2_5_stopping_past_the_context) {
     for (double v : b) CHECK(v <= 32768.0);
 
     const std::vector<double> big = buckets_1_2_5(200000);
-    CHECK(big.size() > b.size());
+    REQUIRE(big.size() > b.size());
     CHECK_NEAR(big.back(), 200000.0, 1e-9);        /* the bound itself is kept when it is on the
                                                     * ladder, since it can be observed */
 

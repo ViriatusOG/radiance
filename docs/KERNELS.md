@@ -27,7 +27,7 @@ pass reached; the Rows nothing ran section lists the rest.
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `libavx` | 0.1.0 | host | 237 | 58 of 237 | 237 of 277 | 59 of 59 | 1743 | 1742 | 0 | 1.82e-03 | 20992.02 |
 | `libr4d` | 0.5.0 | device | 551 | 72 of 551 | 270 of 277 | 59 of 59 | 1743 | 1742 | 0 | 4.27e-03 | 11.46 |
-| `spechub` | 0.1.0 | device+host | 6 | 0 of 6 | 3 of 277 | 0 of 59 | 0 | 0 | 0 | - | - |
+| `spechub` | 0.1.0 | device+host | 8 | 0 of 8 | 3 of 277 | 0 of 59 | 0 | 0 | 0 | - | - |
 | `libref` (oracle) | 0.1.0 | host | 237 | 58 of 237 | 237 of 277 | 59 of 59 | 1743 | 1742 | 0 | 1.82e-03 | 20996.53 |
 
 Rows declaring an optional hook (tuning, fusion, weight layout):

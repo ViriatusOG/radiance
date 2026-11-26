@@ -122,10 +122,10 @@ bool ip_in_cidr(const std::string& addr, const std::string& cidr) {
     const Cidr c = parse_cidr(cidr);
     uint8_t a[16];
     bool v6 = false;
-    if (!c.ok || !parse_addr(addr, &v6, a) || v6 != c.v6) return false;
     /* Families must agree. inet_pton does not map: an IPv4 socket is not inside an IPv6
      * network that happens to embed the same bytes, so a vouched ::ffff:0:0/96 does not
      * vouch for 1.2.3.4 -- an operator who means both writes both. */
+    if (!c.ok || !parse_addr(addr, &v6, a) || v6 != c.v6) return false;
     int left = c.bits;
     const int len = v6 ? 16 : 4;
     for (int i = 0; i < len && left > 0; ++i) {
@@ -281,7 +281,7 @@ std::vector<std::string> Router::routes() const {
 }
 
 bool anthropic_path(const std::string& path) {
-    return path == "/v1/messages" || path.rfind("/v1/messages/", 0) == 0;
+    return path == "/v1/messages" || path.starts_with("/v1/messages/");
 }
 
 const char* anthropic_error_type(int status) {
@@ -555,21 +555,16 @@ private:
     httplib::ws::WebSocket& ws_;
 };
 
-static std::string lower_ascii(std::string s) {
-    for (char& c : s) c = (char)std::tolower((unsigned char)c);
-    return s;
-}
-
 bool HttpRequest::is_cross_origin() const {
     const std::string origin = header("Origin");
     if (origin.empty()) return false;
     const size_t at = origin.find("://");
     const std::string auth = at == std::string::npos ? origin : origin.substr(at + 3);
-    return lower_ascii(auth) != lower_ascii(header("Host"));
+    return ascii_lower(auth) != ascii_lower(header("Host"));
 }
 
 std::string HttpRequest::host_authority() const {
-    std::string h = lower_ascii(header("Host"));
+    std::string h = ascii_lower(header("Host"));
     if (h.empty()) return h;
     if (h.front() == '[') {
         /* "[::1]:8000": the address is what the brackets hold. */
@@ -609,13 +604,10 @@ bool local_operator(const HttpRequest& req, const std::string& bind_host,
     if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
                                          passed host_is_loopback on its empty peer */
     for (const std::string& a : local_hosts) {
-        std::string want = a;
-        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
-        if (want == host) return true;
+        if (ascii_lower(a) == host) return true;
     }
     /* Bound to one concrete address, the box answers to that name on itself. */
-    std::string bind = bind_host;
-    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
+    std::string bind = ascii_lower(bind_host);
     if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
         bind = bind.substr(1, bind.size() - 2);
     if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
@@ -648,8 +640,9 @@ static bool offers_key(const std::string& protocols, const std::string& key) {
  * pre-routing handler and does not export. A request it rejects is routed as a plain GET, so the
  * pre-routing handler must not leave such a request to httplib either. */
 static bool is_socket_upgrade(const httplib::Request& q) {
-    if (q.method != "GET" || lower_ascii(q.get_header_value("Upgrade")) != "websocket") return false;
-    if (lower_ascii(q.get_header_value("Connection")).find("upgrade") == std::string::npos)
+    if (q.method != "GET" || ascii_lower(q.get_header_value("Upgrade")) != "websocket")
+        return false;
+    if (ascii_lower(q.get_header_value("Connection")).find("upgrade") == std::string::npos)
         return false;
     const std::string key = q.get_header_value("Sec-WebSocket-Key");
     if (key.size() != 24 || key[22] != '=' || key[23] != '=') return false;
@@ -814,10 +807,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         hres.set_chunked_content_provider(
             st->content_type,
             [st](size_t /*offset*/, httplib::DataSink& sink) -> bool {
-                /* The vendored 0.64 wraps this whole side of the socket in serve_guarded, so a
-                 * throwing next() can no longer unwind the task queue; the catch stays as the
-                 * place this file says what happened -- guarded or not, an unlogged stream
-                 * death is one nobody can debug. */
+                /* httplib guards this side of the socket, but a stream that dies by exception
+                 * must still be logged here. */
                 std::string chunk;
                 bool more = true;
                 try {
@@ -944,7 +935,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
             std::string origin = q.get_header_value("Origin");
             const size_t at = origin.find("://");
             if (at != std::string::npos) origin = origin.substr(at + 3);
-            if (lower_ascii(origin) != lower_ascii(q.get_header_value("Host")))
+            if (ascii_lower(origin) != ascii_lower(q.get_header_value("Host")))
                 return refuse(403, "permission_error",
                               "a page on another origin may not open this socket (--no-cors)");
         }

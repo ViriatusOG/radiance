@@ -101,7 +101,8 @@ static void bench_peak(Lib& avx, int threads) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(threads)
 #endif
-            for (int64_t i = 0; i < (int64_t)n; ++i) A[(size_t)i] = B[(size_t)i] + 0.5f * C[(size_t)i];
+            for (int64_t i = 0; i < (int64_t)n; ++i)
+                A[(size_t)i] = B[(size_t)i] + 0.5f * C[(size_t)i];
             ts.push_back(now_s() - t0);
         }
         const double dt = median(ts);
@@ -163,7 +164,8 @@ static void bench_cvt(Lib& avx, Lib& ref) {
             const uint32_t sdt = pr.opd[0].d.dtype;
             const double src_bytes = (double)dt_bytes(sdt, N);
             char line[512];
-            int off = std::snprintf(line, sizeof line, "  %-12s", (std::string(from) + "->" + to).c_str());
+            int off = std::snprintf(line, sizeof line, "  %-12s",
+                                    (std::string(from) + "->" + to).c_str());
             for (int lvl = 0; lvl < AVX_N_LEVELS; ++lvl) {
                 if (avx.isa_force && avx.isa_force(lvl) != lvl) {
                     off += std::snprintf(line + off, sizeof line - off, " %10s", "n/a");
@@ -304,7 +306,8 @@ bool build(const RadKernelInfo* k, const Form& f, int64_t N, int64_t K, const ch
                 if (ex == 0) out->sdt = f.sdt;
             } else if (rc == RAD_OK && k->relayout) {
                 b.reset(new Buf(L.bytes));
-                if (k->relayout(p, 2, opd + v, &e, sel, t, n, b->p, L.bytes) != RAD_OK) return false;
+                if (k->relayout(p, 2, opd + v, &e, sel, t, n, b->p, L.bytes) != RAD_OK)
+                    return false;
                 if (ex == 0) (v ? out->sdt : out->cdt) = L.dtype;
             } else {
                 std::fprintf(stderr, "  %s: %s's layout refused %s (%d)\n", f.dtype, k->name,
@@ -1092,7 +1095,8 @@ int main(int argc, char** argv) {
                 "                  model's geometry (1.3 GB of experts), and stop\n"
                 "  --moe-dtype L   the codebook forms --moe runs, comma-separated (default\n"
                 "                  w4nl64a8h; also w4nla8h, w4nl32a8h, w5nl64a8h)\n"
-                "  --threads N     OpenMP threads for the ceilings, the kernels, --moe and --joined\n"
+                "  --threads N     OpenMP threads for the ceilings, the kernels, "
+                "--moe and --joined\n"
                 "                  (default 1)\n"
                 "  --level L       time only ISA level L (0 scalar .. 3 avx512)\n"
                 "  --no-ref        do not time libref (it is not timed past 2e10 FLOP anyway)\n"
@@ -1179,7 +1183,7 @@ int main(int argc, char** argv) {
         }
         std::printf(" %8.1f  %-14s  %s\n", best > 0 ? r.t_ref / best : 0.0, rate, r.geom.c_str());
     }
-    std::printf("\nx(ref) is the speedup over libref's scalar loop; judge libavx by the rate column\n"
-                "against the --peak ceilings.\n");
+    std::printf("\nx(ref) is the speedup over libref's scalar loop; judge libavx by the rate "
+                "column\nagainst the --peak ceilings.\n");
     return 0;
 }

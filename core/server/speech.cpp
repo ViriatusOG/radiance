@@ -38,13 +38,9 @@ namespace rad {
 namespace server {
 
 std::string SpeechFormat::language_name(const std::string& lang) const {
-    auto lower = [](std::string s) {
-        for (char& c : s) c = (char)std::tolower((unsigned char)c);
-        return s;
-    };
-    const std::string l = lower(lang);
+    const std::string l = ascii_lower(lang);
     for (const auto& p : languages)
-        if (lower(p.first) == l || lower(p.second) == l) return p.second;
+        if (ascii_lower(p.first) == l || ascii_lower(p.second) == l) return p.second;
     return std::string();
 }
 
@@ -105,11 +101,6 @@ Heard read_reply(const SpeechFormat& f, const std::string& reply, const std::str
      * language. */
     h.language = f.language_name(said);
     return h;
-}
-
-std::string lower(std::string s) {
-    for (char& c : s) c = (char)std::tolower((unsigned char)c);
-    return s;
 }
 
 }  /* namespace */
@@ -253,7 +244,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         return error_response(err_unsupported("response_format",
                                               "json, text or verbose_json; not '" + fmt + "'"),
                               req.peer);
-    const std::string stream_s = lower(field("stream"));
+    const std::string stream_s = ascii_lower(field("stream"));
     const bool stream = stream_s == "true" || stream_s == "1";
     if (!stream_s.empty() && !stream && stream_s != "false" && stream_s != "0")
         return error_response(err_bad("stream", "expected true or false"), req.peer);
@@ -440,8 +431,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
                     retire(job->gens);
                     release_job();
                     if (req.peer_gone()) {
-                        metrics_.observe_http(499);
-                        return HttpResponse::text(499, "client closed request\n");
+                        return client_closed();
                     }
                     return error_response(err_overloaded("the server is shutting down"), req.peer);
                 }
@@ -463,7 +453,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
             for (const Heard& h : job->heard)
                 if (lang.empty() && !h.language.empty()) lang = h.language;
             o["task"] = "transcribe";
-            o["language"] = lower(lang);
+            o["language"] = ascii_lower(lang);
             o["duration"] = (double)job->samples.size() / rate;
             o["text"] = text;
             json segs = json::array();

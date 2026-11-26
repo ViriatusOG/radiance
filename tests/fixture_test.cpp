@@ -232,7 +232,7 @@ TEST(an_integer_operand_round_trips_exactly) {
     rad_narrow(flags, RAD_BOOL, 4, packed.data());
     std::vector<float> back;
     rad_widen(packed.data(), RAD_BOOL, 4, &back);
-    CHECK_EQ((int64_t)back.size(), (int64_t)4);
+    REQUIRE_EQ((int64_t)back.size(), (int64_t)4);
     for (int i = 0; i < 4 && i < (int)back.size(); ++i)
         CHECK_EQ(back[(size_t)i], flags[i] != 0.0f ? 1.0f : 0.0f);
 }
@@ -307,7 +307,7 @@ TEST(a_weight_is_drawn_at_the_scale_a_checkpoint_holds) {
 TEST(a_small_operand_is_sampled_exhaustively) {
     std::vector<int64_t> pos;
     kf_sample_positions(42, 300, &pos);
-    CHECK_EQ((int64_t)pos.size(), 300);
+    REQUIRE_EQ((int64_t)pos.size(), 300);
     for (int64_t i = 0; i < 300; ++i) CHECK_EQ(pos[(size_t)i], i);
     /* Below the sample count nothing is drawn, so the seed does not matter. */
     std::vector<int64_t> other;
@@ -381,7 +381,7 @@ TEST(a_non_finite_element_is_counted_and_kept_out_of_the_norm) {
     kf_reduce(v.data(), (int64_t)v.size(), 1, &ss, &nf, &sample);
     CHECK_EQ(nf, (int64_t)2);
     CHECK_EQ(ss, 8.0 * 4.0);          /* the eight finite 2.0s */
-    CHECK_EQ((int64_t)sample.size(), (int64_t)v.size());
+    REQUIRE_EQ((int64_t)sample.size(), (int64_t)v.size());
     CHECK(std::isnan(sample[3]));
     CHECK(std::isinf(sample[7]));
 }
@@ -397,7 +397,7 @@ TEST(the_reduction_samples_the_positions_a_reader_will_ask_for) {
 
     std::vector<int64_t> pos;
     kf_sample_positions(0x1234ull, n, &pos);
-    CHECK_EQ(sample.size(), pos.size());
+    REQUIRE_EQ(sample.size(), pos.size());
     for (size_t i = 0; i < pos.size() && i < sample.size(); ++i)
         CHECK_EQ(sample[i], (float)pos[i]);
 }
@@ -417,7 +417,7 @@ TEST(a_cumulative_length_operand_is_the_batch_shape_not_a_draw) {
     d.is_index = true;
     d.idx_cu = true;
     const std::vector<float> v = draw_f32({ d }, 0, /*M=*/100, 0xAAAA);
-    CHECK_EQ((int64_t)v.size(), (int64_t)5);
+    REQUIRE_EQ((int64_t)v.size(), (int64_t)5);
     CHECK_EQ(v[0], 0.0f);
     CHECK_EQ(v[4], 100.0f);
     for (size_t i = 1; i < v.size(); ++i) CHECK(v[i] >= v[i - 1]);
@@ -651,7 +651,7 @@ TEST(a_fixture_survives_a_save_and_a_load) {
     CHECK_EQ(g.seed, c.seed);
     CHECK_EQ(g.m, c.m);
     CHECK_EQ(g.band, c.band);
-    CHECK_EQ(g.params.size(), c.params.size());
+    REQUIRE_EQ(g.params.size(), c.params.size());
     for (size_t i = 0; i < g.params.size() && i < c.params.size(); ++i) {
         CHECK_EQ(g.params[i].key, c.params[i].key);
         CHECK_EQ(g.params[i].kind, c.params[i].kind);
@@ -659,7 +659,7 @@ TEST(a_fixture_survives_a_save_and_a_load) {
         CHECK_EQ(g.params[i].d, c.params[i].d);
         CHECK_EQ(g.params[i].s, c.params[i].s);
     }
-    CHECK_EQ(g.opd.size(), c.opd.size());
+    REQUIRE_EQ(g.opd.size(), c.opd.size());
     for (size_t i = 0; i < g.opd.size() && i < c.opd.size(); ++i) {
         const KfOperand& a = g.opd[i];
         const KfOperand& b = c.opd[i];
@@ -751,8 +751,7 @@ TEST(a_truncated_fixture_is_refused) {
     CHECK_OK(fx.save(path));
 
     FILE* f = std::fopen(path.c_str(), "rb");
-    CHECK(f != nullptr);
-    if (!f) return;
+    REQUIRE(f != nullptr);
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
     std::fclose(f);
@@ -2111,7 +2110,7 @@ TEST(the_fallback_shape_table_agrees_with_the_reference) {
             CHECK(false);
             continue;
         }
-        CHECK_EQ((int)tab.size(), schema->n_operands);
+        REQUIRE_EQ((int)tab.size(), schema->n_operands);
         for (size_t k = 0; k < tab.size() && k < hook.size(); ++k) {
             const bool same = tab[k].absent == hook[k].absent &&
                               (tab[k].absent || (tab[k].dtype == hook[k].dtype &&

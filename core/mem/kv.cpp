@@ -276,14 +276,14 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     /* Then the window behind a checkpoint, after the linear state (see has_window_snapshot). A
      * trunk's window rides in the slot whether or not linear state is beside it: a hit resumes at
      * a snapshot either way, and without the window there it could not resume at all. A drafter's
-     * window rides there only on a model without linear state (set_drafter_window_snapshot). */
-    bool has_state = false;
-    for (const auto& p : plans_) has_state = has_state || p.stateful();
+     * window rides there only where the engine asks (set_drafter_window_snapshot): on a model
+     * without linear state by default, and beside linear state under --checkpoint-draft-window. The
+     * engine owns that policy (Engine::drafter_window_snap). */
     for (size_t i = 1; i < plans_.size(); ++i) {
         KVGroupPlan& p = plans_[i];
         p.drafter = groups[i].drafter;
         p.win_snap = p.kind == RAD_KV_WINDOW && p.window_blocks > 0 && !p.runtime_win &&
-                     (!groups[i].drafter || (snap_drafter_ && !has_state));
+                     (!groups[i].drafter || snap_drafter_);
         if (p.win_snap && !p.zero && p.n_layers > 0)
             window_ck_bytes_ += p.window_blocks * p.bytes_per_block;
     }
@@ -1118,7 +1118,15 @@ bool KVManager::can_grow(uint64_t id, int64_t n_tokens) const {
         const auto& p = plans_[g];
         if (p.paged()) {
             const int64_t first = s->first_block_pos[g] / p.block_size;
-            const int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            /* A window recycles; ensure() and make_room cap the table at the window. Counting
+             * the whole prompt here would refuse every prompt longer than the window pool (about
+             * 4800 tokens for DeepSeek-V4.1's QSA window) while can_ever_fit, which caps, still
+             * says yes, so the admission gate would wait forever. */
+            if (p.kind == RAD_KV_WINDOW) {
+                if (s->win[g].set) want = window_table_len(p, s->win[g], n_tokens) - first;
+                else               want = std::min(want, window_seq_cap(p));
+            }
             int64_t need = want - (int64_t)s->blocks[g].size();
             if (need < 0) need = 0;
             /* ensure() takes one copy-on-write block for a partially filled block; include it
@@ -1902,8 +1910,10 @@ int KVManager::checkpoint_stage_out(int32_t ck, RadStream s) {
     return rad_memcpy_async(dst, stage_, stage_bytes_, s);
 }
 
-bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out) const {
+bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out,
+                            bool* bad_drafter) const {
     out->clear();
+    if (bad_drafter) *bad_drafter = false;
     const Seq* s = find(id);
     if (!s || pos <= 0) return false;
     /* A runtime window is excluded from window snapshots (set_window): the window length is
@@ -1916,11 +1926,15 @@ bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out)
         out->resize(row0 + (size_t)p.window_blocks, -1);
         if (p.zero || p.block_size <= 0 || pos % p.block_size != 0) {
             if (p.zero) continue;
+            if (bad_drafter) *bad_drafter = p.drafter;
             return false;
         }
         const int64_t lo = window_lo(p, pos), hi = pos / p.block_size;
         const int64_t first = s->first_block_pos[g] / p.block_size;
-        if (lo < first || hi - first > (int64_t)s->blocks[g].size()) return false;
+        if (lo < first || hi - first > (int64_t)s->blocks[g].size()) {
+            if (bad_drafter) *bad_drafter = p.drafter;
+            return false;
+        }
         for (int64_t j = lo; j < hi; ++j)
             (*out)[row0 + (size_t)(j - lo)] = s->blocks[g][(size_t)(j - first)];
     }

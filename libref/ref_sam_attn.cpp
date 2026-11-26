@@ -6,10 +6,10 @@
  *
  *     scale * q.k  +  q.Rh[i_h, j_h]  +  q.Rw[i_w, j_w]
  *
- * where Rh = get_rel_pos(rel_pos_h, q_h, k_h) indexes the table at (i_h - j_h + len - 1) and the dot
- * runs over the whole head_dim of the head's own q (deepencoder computes r_q of shape
- * (B*heads, q_h, q_w, head_dim) and einsums "bhwc,hkc->bhwk"). So the per-pair term folds into
- * neither q, k nor v: no plain attention op can carry it, which is why this op exists.
+ * where Rh = get_rel_pos(rel_pos_h, q_h, k_h) indexes the table at (i_h - j_h + len - 1) and the
+ * dot runs over the whole head_dim of the head's own q (deepencoder computes r_q of shape (B*heads,
+ * q_h, q_w, head_dim) and einsums "bhwc,hkc->bhwk"). So the per-pair term folds into neither q, k
+ * nor v: no plain attention op can carry it, which is why this op exists.
  *
  * ============================== Windows ==============================
  *
@@ -35,7 +35,6 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 
-#include <algorithm>
 #include <cmath>
 #include <vector>
 

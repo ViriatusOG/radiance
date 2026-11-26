@@ -102,7 +102,8 @@ static inline void fp8_group(const float* v, float* out, int64_t k0, int64_t k1,
  *
  * A fused fp8 op replaces a pair that writes a bf16 tensor and then quantises it. So the codes are
  * taken over the bf16-narrowed value whatever the activation dtype, and `out_bf16` holds that
- * value (libref's contract, ref_quant.cpp). The helpers below therefore narrow before quantising. */
+ * value (libref's contract, ref_quant.cpp). The helpers below therefore narrow before
+ * quantising. */
 
 /* Round v[0, n) through bf16 in place. `tmp` holds n floats (room for the n bf16). */
 static inline void narrow_bf16(float* v, int64_t n, float* tmp) {

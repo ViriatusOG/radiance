@@ -1,0 +1,22 @@
+# Fish Audio drama-3 with rotated int8 routed experts. The release directory must include codec.pth.
+#
+#   rad-convert /path/to/drama-3 \
+#       --recipe data/recipes/drama3-i8.recipe -o drama3-i8.rad
+
+blk.*.ffn_gate_up_exps.*.weight      rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down_exps.*.weight         rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+# The encoder's residual quantiser selects the nearest code in f32.
+codec.*.n1.weight                    cast dtype=f32
+codec.*.n2.weight                    cast dtype=f32
+codec.*.ls1.weight                   cast dtype=f32
+codec.*.ls2.weight                   cast dtype=f32
+codec.norm.weight                    cast dtype=f32
+codec.up*.ln.*                       cast dtype=f32
+codec.up*.gamma                      cast dtype=f32
+codec.*.alpha                        cast dtype=f32
+codec.enc.*norm.weight               cast dtype=f32
+codec.enc.down*.ln.*                 cast dtype=f32
+codec.enc.down*.gamma                cast dtype=f32
+codec.enc.vq*                        cast dtype=f32
+codec.*                              cast dtype=bf16

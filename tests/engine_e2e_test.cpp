@@ -27,6 +27,7 @@
 
 #include "mm/media.h"
 #include "server/oai.h"
+#include "format/radfile.h"
 
 #include "util/json.h"
 
@@ -1024,6 +1025,47 @@ TEST(qwen35_two_ranks_agree_with_one_within_rounding) {
         { "RADIANCE_HOST_DEVICES=2" }));
 }
 
+/* Inkling 2 at two ranks (arch/inkling2, TENSOR PARALLELISM): the heads, the experts' columns and
+ * the vocabulary split, the depth mixes, controllers and router replicated, and two all-reduces a
+ * layer application. Its padded head puts the padding on the second rank only, which fills it; a
+ * fill at the first rank's offset would leave 20 untrained columns in the softmax and move the KL.
+ * At 64 tokens a chunk the convolution states and the window cross chunk boundaries on each rank's
+ * own channels.
+ *
+ * The random tiny model amplifies rounding over its 48 applications far more than a trained one:
+ * its router has near ties, and a pick flipped by the all-reduce's other rounding moves the logits
+ * by nats (mean KL 3.6 against one rank, the same as with one split alone). Its router biases are
+ * therefore spread so that the picks are fixed, and its head is gentler (logits about 1 apart).
+ * What remains is the rounding carried through the loop: a stream about 0.7% off after the first
+ * application and 15% after the 48th, mean KL about 0.008, where a wrong head, channel or vocabulary
+ * cut is wrong from the first application and scores in nats. */
+TEST(inkling2_two_ranks_agree_with_one_within_rounding) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_inkling2_tp");
+    const std::string model = d / "inkling2";
+    REQUIRE(::mkdir(model.c_str(), 0755) == 0);
+    tiny::Inkling2 s;
+    s.vocab = 320;
+    s.vocab_real = 300;
+    s.route_bias = 2.0f;
+    s.head = 1.0f;
+    REQUIRE(tiny::write_inkling2(model, s));
+    for (const char* chunk : { "512", "64" }) {
+        const json rep = score_against_reference(
+            model, w.corpus_short,
+            { "--tp", "2", "--max-num-batched-tokens", chunk, "--max-num-seqs", "1" },
+            { "RADIANCE_HOST_DEVICES=2" });
+        REQUIRE(rep.is_object() && rep.contains("all"));
+        const double mean = rep["all"]["kld"]["mean"].get<double>();
+        const double ratio = rep["all"]["ppl"]["ratio"].get<double>();
+        fprintf(stderr, "    inkling2 at two ranks, chunks of %s: mean KL %.2g, perplexity ratio %.4f\n",
+                chunk, mean, ratio);
+        CHECK(mean < 0.03);
+        CHECK(std::fabs(ratio - 1.0) < 0.02);
+    }
+}
+
 /* ================================================================== runtime LoRA */
 
 /* A PEFT adapter over the qwen35 checkpoint on every linear runtime LoRA follows (the gated
@@ -1877,6 +1919,7 @@ const std::vector<int32_t>& repetitive_prompt() {
  * the recurrent state (qwen35) each roll back what was rejected. */
 TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
     REQUIRE(world().ok);
+    int64_t all_drafted = 0, all_accepted = 0;
     for (const Family& f : kSpecFamilies) {
         Server plain, spec;
         REQUIRE(plain.start(world().*f.model, kPlain));
@@ -1891,17 +1934,21 @@ TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
             fprintf(stderr, "    %s plain %s\n    %s spec  %s\n", f.name, show(ta).c_str(), f.name,
                     show(tb).c_str());
         CHECK(ta == tb);
-        /* The check means something only when drafts were made and some were wrong. */
-        const int64_t drafted = timing(b, "draft_n");
-        const int64_t accepted = timing(b, "draft_n_accepted");
-        if (!(drafted > accepted && accepted > 0))
-            fprintf(stderr, "    %s drafted %lld, accepted %lld\n", f.name, (long long)drafted,
-                    (long long)accepted);
-        CHECK(drafted > accepted);
-        CHECK(accepted > 0);
+        /* The check means something only where drafts were made and some were wrong. How many
+         * lookups the gate makes depends on step timing (sched/lookup.h), so one family may take
+         * every draft it made; across the families some must be taken and some rejected. */
+        const int64_t drafted = std::max<int64_t>(timing(b, "draft_n"), 0);
+        const int64_t accepted = std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+        fprintf(stderr, "    %s drafted %lld, accepted %lld\n", f.name, (long long)drafted,
+                (long long)accepted);
+        CHECK(drafted >= accepted);
+        all_drafted += drafted;
+        all_accepted += accepted;
         CHECK_EQ(plain.stop(), 0);
         CHECK_EQ(spec.stop(), 0);
     }
+    CHECK(all_drafted > all_accepted);
+    CHECK(all_accepted > 0);
 }
 
 /* Sampling draws each position's random number from (seed, position), so a seeded request repeats
@@ -1923,12 +1970,12 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
                            completion(repetitive_prompt(), 64, 0.5, 99)));
         const std::vector<int32_t> greedy =
             tokens_of(post(plain.port, "/completion", completion(repetitive_prompt(), 64)));
-        const std::string oracle = world().dir / (std::string("oracle-") + f.name);
+        const std::string spec_oracle = world().dir / (std::string("oracle-") + f.name);
         std::string ids;
         for (int32_t t : a) ids += std::to_string(t) + " ";
-        REQUIRE(tiny::write_text(oracle, ids));
+        REQUIRE(tiny::write_text(spec_oracle, ids));
         std::vector<std::string> args = kSpec;
-        args.insert(args.end(), { "--debug-draft-oracle", oracle });
+        args.insert(args.end(), { "--debug-draft-oracle", spec_oracle });
         REQUIRE(spec.start(world().*f.model, args));
         int status = 0;
         const json sb = post(spec.port, "/completion", req, &status);
@@ -1941,11 +1988,151 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
         CHECK(a == b);
         CHECK(a != other);
         CHECK(a != greedy);
-        const int64_t drafted = timing(sb, "draft_n");
-        if (drafted <= 0) fprintf(stderr, "    %s: nothing drafted\n", f.name);
-        CHECK(drafted > 0);
+        /* Prompt lookup verifies a proposal only when it pays at the measured step cost
+         * (sched/lookup.h), and this sampled reply hardly repeats, so whether `spec` verified
+         * anything depends on the host's timings. The verify path at this temperature is held to
+         * the plain draw through the harness instead, which is always verified: it proposes the
+         * plain run's own reply with 30% of the drafts corrupted, so verifies accept and reject. */
+        const std::string oracle =
+            radtest::tmp_path(std::string("oracle-sampled-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : a) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server orc;
+        REQUIRE(orc.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                              "--debug-draft-oracle", oracle }));
+        const json ob = post(orc.port, "/completion", req);
+        CHECK_EQ(orc.stop(), 0);
+        if (a != tokens_of(ob)) fprintf(stderr, "    %s plain %s\n    %s oracle %s\n", f.name,
+                                        show(a).c_str(), f.name, show(tokens_of(ob)).c_str());
+        CHECK(a == tokens_of(ob));
+        const int64_t drafted = timing(ob, "draft_n"), accepted = timing(ob, "draft_n_accepted");
+        fprintf(stderr, "    %s: harness drafted %lld, accepted %lld (lookup drafted %lld)\n", f.name,
+                (long long)drafted, (long long)accepted,
+                (long long)std::max<int64_t>(0, timing(sb, "draft_n")));
+        CHECK(drafted > accepted);
+        CHECK(accepted > 0);
         CHECK_EQ(plain.stop(), 0);
         CHECK_EQ(spec.stop(), 0);
+    }
+}
+
+/* --spec-ngram K: prompt lookup alone at window K, here with single-token patterns allowed and,
+ * in the second arm, the adaptive window cutting each sequence's lookups to its own acceptance.
+ * Greedy text must equal one-token-a-step decoding token for token, a seeded draw must repeat
+ * its plain run's draw (a lookup draft is a point mass, for which accepting on agreement with the
+ * target's draw is the speculative-sampling rule: accept with probability p(x), else a draw from
+ * p without x), and the timings must show lookups made, some taken and some not, over all the
+ * runs: how many lookups the gate makes depends on step timing, so one run may take all of its own.
+ * The code-edit
+ * prompt asks for a copy with a rename, the case prompt lookup is for. */
+TEST(spec_ngram_alone_returns_the_tokens_plain_decoding_returns) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<std::string> kArms[] = {
+        { "--spec-ngram", "4", "--spec-ngram-min", "1", "--no-prefix-cache" },
+        { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" } };
+    int64_t all_drafted = 0, all_accepted = 0;
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        for (const std::vector<std::string>& arm : kArms) {
+            Server ng;
+            REQUIRE(ng.start(world().*f.model, arm));
+            CHECK(has(ng.output(), "speculation: prompt lookup only (--spec-ngram 4)"));
+            int64_t drafted = 0, accepted = 0;
+            for (const std::vector<int32_t>* p : { &repetitive_prompt(), &edit }) {
+                const json a = post(plain.port, "/completion", completion(*p, 48));
+                int status = 0;
+                const json b = post(ng.port, "/completion", completion(*p, 48), &status);
+                CHECK_EQ(status, 200);
+                const std::vector<int32_t> ta = tokens_of(a), tb = tokens_of(b);
+                CHECK_EQ(ta.size(), (size_t)48);
+                if (ta != tb)
+                    fprintf(stderr, "    %s %s plain %s\n    ngram %s\n", f.name, arm[3].c_str(),
+                            show(ta).c_str(), show(tb).c_str());
+                CHECK(ta == tb);
+                drafted += std::max<int64_t>(timing(b, "draft_n"), 0);
+                accepted += std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+            }
+            fprintf(stderr, "    %s %s %s: drafted %lld, accepted %lld\n", f.name, arm[2].c_str(),
+                    arm[3].c_str(), (long long)drafted, (long long)accepted);
+            CHECK(drafted >= accepted);
+            all_drafted += drafted;
+            all_accepted += accepted;
+
+            const json req = completion(repetitive_prompt(), 64, 0.7, 4321);
+            const std::vector<int32_t> sa = tokens_of(post(plain.port, "/completion", req));
+            const json sb = post(ng.port, "/completion", req);
+            if (sa != tokens_of(sb))
+                fprintf(stderr, "    %s seeded plain %s\n    ngram %s\n", f.name, show(sa).c_str(),
+                        show(tokens_of(sb)).c_str());
+            CHECK(sa == tokens_of(sb));
+            CHECK_EQ(ng.stop(), 0);
+        }
+        CHECK_EQ(plain.stop(), 0);
+    }
+    CHECK(all_drafted > all_accepted);
+    CHECK(all_accepted > 0);
+}
+
+/* The verify path with rejections at every depth, on text that never repeats: the harness
+ * (--debug-draft-oracle) proposes from the plain run's own continuation with 30% of the
+ * drafts corrupted, so a verify accepts 0..4 drafts and rolls back the rest, on each family's
+ * recurrent state, conv window and sliding window. Text and logprobs must be the plain run's. */
+TEST(verifies_that_reject_at_every_depth_return_the_plain_tokens) {
+    REQUIRE(world().ok);
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        const std::vector<int32_t> p = prompt_ids(77, 50);
+        const json a = post(plain.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(plain.stop(), 0);
+        const std::vector<int32_t> ta = tokens_of(a);
+        REQUIRE(ta.size() == 40);
+        const std::string oracle = radtest::tmp_path(std::string("oracle-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : ta) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server ng;
+        REQUIRE(ng.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                             "--debug-draft-oracle", oracle }));
+        const json b = post(ng.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(ng.stop(), 0);
+        const std::vector<int32_t> tb = tokens_of(b);
+        if (ta != tb)
+            fprintf(stderr, "    %s plain %s\n    oracle %s\n", f.name, show(ta).c_str(),
+                    show(tb).c_str());
+        CHECK(ta == tb);
+        const int64_t drafted = timing(b, "draft_n"), accepted = timing(b, "draft_n_accepted");
+        fprintf(stderr, "    %s: drafted %lld, accepted %lld\n", f.name, (long long)drafted,
+                (long long)accepted);
+        CHECK(drafted > 2 * accepted);
+        CHECK(accepted > 4);
+        /* Every emitted token's logprobs are its own row's, verify row or decode row alike. */
+        double worst = 0;
+        const json& pa = a["completion_probabilities"];
+        const json& pb = b["completion_probabilities"];
+        REQUIRE(pa.size() == pb.size());
+        for (size_t i = 0; i < pa.size(); ++i)
+            worst = std::max(worst,
+                             std::fabs(pa[i]["top_logprobs"][0]["logprob"].get<double>() -
+                                       pb[i]["top_logprobs"][0]["logprob"].get<double>()));
+        fprintf(stderr, "    %s: worst |dlogprob| %.3g\n", f.name, worst);
+        CHECK(worst < 0.1);
     }
 }
 
@@ -2623,6 +2810,55 @@ double psnr(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
 }
 
 }  /* namespace */
+
+/* A transformed input must carry the adapter through the same public request path as its base.
+ * Basis reconstruction is covered separately in gen_lora_test; this verifies it reaches pixels. */
+TEST(rotated_generator_lora_changes_pixels_and_leaves_base_requests_exact) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const auto& model = qwen_image();
+    REQUIRE(!model.i8.empty());
+    tiny::TempDir dir("e2e_qimg_rotated_lora");
+    REQUIRE(dir.ok());
+    const std::string adapter = dir / "rotated.safetensors";
+    tiny::Rng rng(81);
+    const std::string key = "transformer.transformer_blocks.0.attn.to_q";
+    REQUIRE(tiny::write_safetensors(adapter, {
+        tiny::noise(key + ".lora_A.weight", {1, 128}, rng, 1.0f, 0, "F32"),
+        tiny::noise(key + ".lora_B.weight", {128, 1}, rng, 1.0f, 0, "F32")}));
+    Server server;
+    const bool started = server.start(model.i8, {"--lora", "rotated=" + adapter,
+        "--max-loras", "1", "--max-lora-rank", "1", "--image-gen-max-pixels", "4096"},
+        device_env(2048));
+    if (!started) fprintf(stderr, "generator startup failed:\n%s\n", server.output().c_str());
+    REQUIRE(started);
+    std::vector<std::vector<uint8_t>> pixels;
+    for (bool adapted : {false, true, true, false}) {
+        json request = {{"prompt", "a red cat on a blue mat"}, {"size", "64x64"},
+            {"seed", 7}, {"num_inference_steps", 2}, {"true_cfg_scale", 1.0},
+            {"output_format", "png"}};
+        if (adapted) request["loras"] = json::array({"rotated"});
+        int status = 0;
+        const json response = post(server.port, "/v1/images/generations", request, &status);
+        if (status != 200) fprintf(stderr, "image request failed (%d): %s\n%s\n", status,
+            response.dump().c_str(), tail(server.output()).c_str());
+        REQUIRE_EQ(status, 200);
+        REQUIRE(response.contains("data") && response["data"].size() == 1);
+        std::vector<uint8_t> png;
+        REQUIRE(rad::server::base64_decode(response["data"][0].value("b64_json", std::string()), &png));
+        rad::mm::FrameRGBA image;
+        std::string why;
+        REQUIRE_EQ(rad::mm::decode_image_rgba(png.data(), png.size(), 1 << 20, &image, &why), RAD_OK);
+        REQUIRE_EQ(image.w, 64); REQUIRE_EQ(image.h, 64);
+        pixels.push_back(std::move(image.rgba));
+    }
+    CHECK(pixels[0] == pixels[3]);
+    CHECK(pixels[1] == pixels[2]);
+    bool rgb_changed = false;
+    for (size_t i = 0; i < pixels[0].size(); ++i)
+        if (i % 4 != 3 && pixels[0][i] != pixels[1][i]) rgb_changed = true;
+    CHECK(rgb_changed);
+    CHECK_EQ(server.stop(), 0);
+}
 
 /* Qwen-Image on the host backend with libavx alone, no reference library loaded: every op the
  * generator declares has a libavx row, the picture comes back, a seed repeats it byte for byte, and
@@ -3442,6 +3678,93 @@ TEST(undersized_guidance_is_rejected_without_blocking_the_image_server) {
         }
         CHECK_EQ(server.stop(), 0);
     }
+}
+
+/* rad-sidecar quantises some of a container's plain weights into a sidecar, and --weight-sidecar serves its
+ * entries in place of the container's. The sidecar of llama.rad's bf16 head under
+ * the int8 rule llama_i8head.rad was converted with must give exactly that container's numbers: the same quantiser
+ * over the same values writes the same planes, and the loader reads them from the sidecar into the same stored form.
+ * Refused: a rule over a quantised entry (rad-sidecar), a sidecar written from another container, an entry the
+ * container does not hold, one of another shape. */
+TEST(a_weight_sidecar_serves_its_entries_in_place_of_the_containers) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_dlw");
+    REQUIRE(d.ok());
+    const std::string rule = "output.weight=rtn:codes=i8,group=128,scale=bf16,clamp=sym";
+    std::string slog;
+    const int st = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "head_i8.rad", "--quant", rule }, engine_env(),
+                             &slog);
+    if (st != 0) fprintf(stderr, "    rad-sidecar exited %d:\n%s\n", st, tail(slog).c_str());
+    REQUIRE_EQ(st, 0);
+    CHECK(has(slog, "1 entries of llama.rad"));
+    std::string rlog;
+    const std::string ref = w.reference(w.llama_i8head, w.corpus_short, &rlog);
+    REQUIRE(!ref.empty());
+    std::vector<std::string> a = { "--kld-record", d / "s1", "--kld-corpus", w.corpus_short, "--max-num-batched-tokens",
+                                   "512", "--max-num-seqs", "1" };
+    /* The arguments with --weight-sidecar `file`. */
+    auto with_side = [&](const std::string& file) {
+        std::vector<std::string> v = a;
+        v.push_back("--weight-sidecar");
+        v.push_back(file);
+        return v;
+    };
+    Ran s1 = radiance(w.llama_rad, with_side(d / "head_i8.rad"));
+    REQUIRE_RAN(s1);
+    CHECK(has(s1.log, "weight sidecar: 1 entries"));
+    CHECK(has(s1.log, "read from the weight sidecar"));
+    std::string why;
+    const bool same = same_recording(ref, d / "s1", &why);
+    if (!same) fprintf(stderr, "    sidecar vs llama_i8head.rad: %s\n", why.c_str());
+    CHECK(same);
+    /* without it: llama.rad's own numbers, which differ from the int8 head's */
+    const std::string ref0 = w.reference(w.llama_rad, w.corpus_short, &rlog);
+    REQUIRE(!ref0.empty());
+    CHECK(!same_recording(ref0, d / "s1", &why));
+
+    /* a quantised entry is not quantised again */
+    const int st2 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad.rad", "--quant",
+                                "blk.0.attn_qkv.weight=rtn:codes=i8,group=128,scale=bf16" }, engine_env(), &slog);
+    CHECK(st2 != 0);
+    CHECK(has(slog, "not a quantised one again"));
+    /* hand-made sidecars: one written from another container (its recorded size not llama.rad's), an entry the
+     * container does not hold, and its head at another shape. */
+    rad::RadFile f;
+    REQUIRE_EQ(f.open(w.llama_rad.c_str()), 0);
+    const RadFileEntry* head = f.find("output.weight");
+    REQUIRE(head != nullptr);
+    auto handmade = [&](const std::string& path, const std::string& name, int64_t rows, int64_t of_bytes = -1) {
+        rad::RadWriter wr;
+        if (wr.begin(path.c_str()) != 0) return false;
+        wr.set_arch(f.str(f.header().arch_id));
+        wr.meta_i("sidecar.container_bytes", of_bytes >= 0 ? of_bytes : f.size());
+        rad::RadWriter::Weight ww;
+        ww.name = name;
+        ww.enc = rad_enc_plain(RAD_BF16);
+        ww.rank = 2;
+        ww.shape[0] = rows;
+        ww.shape[1] = head->shape[1];
+        std::vector<uint8_t> zeros((size_t)(rows * head->shape[1] * 2), 0);
+        const void* pl[1] = { zeros.data() };
+        if (wr.add_weight(ww, pl) < 0) { wr.abort(); return false; }
+        return wr.finish() == 0;
+    };
+    REQUIRE(handmade(d / "other.rad", "output.weight", head->shape[0], f.size() + 4096));
+    a[1] = d / "s2";
+    Ran s2 = radiance(w.llama_rad, with_side(d / "other.rad"));
+    CHECK(s2.status != 0);
+    CHECK(has(s2.log, "a sidecar serves only the container rad-sidecar read"));
+    REQUIRE(handmade(d / "noname.rad", "no.such.weight", head->shape[0]));
+    a[1] = d / "s3";
+    Ran s3 = radiance(w.llama_rad, with_side(d / "noname.rad"));
+    CHECK(s3.status != 0);
+    CHECK(has(s3.log, "is not an entry of"));
+    REQUIRE(handmade(d / "reshape.rad", "output.weight", head->shape[0] / 2));
+    a[1] = d / "s4";
+    Ran s4 = radiance(w.llama_rad, with_side(d / "reshape.rad"));
+    CHECK(s4.status != 0);
+    CHECK(has(s4.log, "it does not reshape it"));
 }
 
 RAD_TEST_MAIN()

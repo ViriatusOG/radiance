@@ -27,10 +27,7 @@ namespace {
 
 struct Root {
     std::string dir;
-    Root() {
-        std::string tmpl = radtest::tmp_path("root.XXXXXX");
-        dir = mkdtemp(tmpl.data()) ? tmpl : "";
-    }
+    Root() : dir(radtest::make_tmp_dir("root")) {}
     void put(const std::string& rel, const std::string& text) const {
         const fs::path p = fs::path(dir) / rel.substr(1);
         fs::create_directories(p.parent_path());

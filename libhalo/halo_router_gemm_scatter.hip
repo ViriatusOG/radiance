@@ -426,8 +426,9 @@ static bool rg_m16_legal(long long K, int wv, int sk) {
 }
 
 /* A tuned split the row's register file accepts, else the smallest legal split that puts 1280
- * waves (one card) in flight, else the largest legal one. 0 means the row has no legal split and
- * forwards to _m64, so the fused op stays on the WMMA phase too. */
+ * waves (one card) in flight, else the largest legal one, then more splits while a split's slice
+ * passes four 256-wide tiles (the row's streaming form, halo_gemm_bf16_nt_m16.hip). 0 means the
+ * row has no legal split and forwards to _m64, so the fused op stays on the WMMA phase too. */
 static int rg_m16_sk(long long K, long long N, int wv, int sk) {
     if (sk > 0 && rg_m16_legal(K, wv, sk)) return sk;
     static const int ladder[] = { 1, 2, 4, 5, 8, 10, 16, 20, 32 };
@@ -437,6 +438,9 @@ static int rg_m16_sk(long long K, long long N, int wv, int sk) {
         got = cand;
         if (N * cand >= 1280) break;
     }
+    if (!got) return 0;
+    for (int cand : ladder)
+        if (cand > got && K / got > 4 * 32 * 8 && rg_m16_legal(K, wv, cand)) got = cand;
     return got;
 }
 

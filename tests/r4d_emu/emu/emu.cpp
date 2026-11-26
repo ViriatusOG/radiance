@@ -307,9 +307,36 @@ emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     std::memcpy(pb.v, &b, 8);
     return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return g_fp8.v[v]; });
 }
-emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
-    std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
-    std::abort();
+emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool clamp) {
+    Bytes8 pa, pb;
+    std::memcpy(pa.v, &a, 8);
+    std::memcpy(pb.v, &b, 8);
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    for (int e = 0; e < 8; ++e) { g_qa[w][par][l][e] = pa[e]; g_qb[w][par][l][e] = pb[e]; }
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    auto cvt = [](uint8_t v, bool s) -> int { return s ? (int)(int8_t)v : (int)v; };
+    int64_t acc[8];
+    for (int e = 0; e < 8; ++e) acc[e] = (int64_t)c[e];
+    for (int k = 0; k < 16; ++k) {
+        const int slot = 16 * (k >> 3), el = k & 7;
+        const int bk = cvt(g_qb[w][par][N + slot][el], sb);
+        for (int e = 0; e < 8; ++e) {
+            acc[e] += (int64_t)cvt(g_qa[w][par][8 * h + e + slot][el], sa) * (int64_t)bk;
+        }
+    }
+    emu_v8i d;
+    for (int e = 0; e < 8; ++e) {
+        int64_t v = acc[e];
+        if (clamp) {
+            if (v < -2147483648LL) v = -2147483648LL;
+            if (v >  2147483647LL) v =  2147483647LL;
+        }
+        d[e] = (int)v;
+    }
+    return d;
 }
 unsigned emu_ballot(bool p) {
     int l;

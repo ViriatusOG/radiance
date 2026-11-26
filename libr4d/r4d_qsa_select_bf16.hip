@@ -15,7 +15,7 @@
 // order within the set is irrelevant. The set is exact and deterministic: ties break to the lower
 // block index by prefix count, never by atomic completion order.
 //
-// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"

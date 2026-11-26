@@ -649,7 +649,7 @@ TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
     CHECK_EQ((int)g.refs[2].kind, (int)gen::VideoRefMedia::VIDEO_AUDIO);
     CHECK_EQ(g.refs[2].enc_channels, 2);
     CHECK_EQ(g.refs[2].enc_n, (int64_t)850);
-    CHECK_EQ(g.refs[2].enc_samples.size(), (size_t)2 * 850);
+    REQUIRE_EQ(g.refs[2].enc_samples.size(), (size_t)2 * 850);
     CHECK_EQ(g.refs[2].enc_samples[0], g.refs[2].enc_samples[850]);   /* both channels the same tone */
     CHECK_EQ((int)g.refs[3].kind, (int)gen::VideoRefMedia::AUDIO);
     CHECK_EQ(g.refs[3].enc_n, (int64_t)850);
@@ -1091,7 +1091,7 @@ TEST(a_song_guide_rides_reference_media) {
     CHECK_EQ(g.refs[1].frame, 100);
     CHECK_EQ(g.refs[1].enc_channels, 2);
     CHECK_EQ(g.refs[1].enc_n, (int64_t)850);
-    CHECK_EQ(g.refs[1].enc_samples.size(), (size_t)2 * 850);
+    REQUIRE_EQ(g.refs[1].enc_samples.size(), (size_t)2 * 850);
     CHECK_EQ(g.refs[1].enc_samples[0], 0.5f);     /* the left channel */
     CHECK_EQ(g.refs[1].enc_samples[850], 1.5f);   /* the right, its own samples */
     std::vector<int32_t> want;

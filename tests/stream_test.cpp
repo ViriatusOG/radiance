@@ -302,8 +302,7 @@ const std::string kOpen = "<tool_call>\n<function=bash>\n<parameter=command>\nca
  * call's bytes and the line break before them, which the reader takes as the call's separator
  * once the call has opened. The buffered body restores both as text. */
 void drop_open_call(std::string& text) {
-    CHECK(ends_with(text, kOpen));
-    if (!ends_with(text, kOpen)) return;
+    REQUIRE(ends_with(text, kOpen));
     text.resize(text.size() - kOpen.size());
     while (!text.empty() && text.back() == '\n') text.pop_back();
 }

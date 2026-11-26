@@ -19,6 +19,12 @@ endforeach()
 file(GLOB _top CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(REMOVE_ITEM _top ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 list(APPEND RAD_CORE_SRC ${_top})
+# llama.cpp's block layouts as affine planes, shared with libquant's `ggml` quantiser, so a GGUF's
+# blocks import as the same planes that quantiser writes (format/checkpoint.cpp). Compiled from
+# libquant's own sources: the plugin stays buildable out of tree, and both read one definition.
+list(APPEND RAD_CORE_SRC ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_dequant.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
 
 # util/simd_kernels.cpp compiled once per ISA level, like libavx: the shipped binary runs on
 # machines it was not built on, so the level is picked at runtime (util/simd.cpp, baseline) and
@@ -78,6 +84,7 @@ target_include_directories(rad_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/abi
   ${CMAKE_SOURCE_DIR}/vendor)
+target_include_directories(rad_core PRIVATE ${CMAKE_SOURCE_DIR}/libquant)
 
 if(TARGET rad_vendor)
   target_link_libraries(rad_core PUBLIC rad_vendor)

@@ -7,7 +7,6 @@
 #include <dlfcn.h>
 #include <memory>
 #include <random>
-#define REQUIRE_OK(expr) REQUIRE_EQ((expr), RAD_OK)
 
 namespace {
 struct Library {

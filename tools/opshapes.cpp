@@ -154,16 +154,17 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
         add((uint32_t)RAD_F32, {M, (n + group - 1) / group});
     }
     else if (op == "gemm_nt_q") {
-        /* Block-scaled fp8, mxfp4 and the 2-bit asymmetric grid, sized from each kernel's stored layout.
-         * `gemm_nt_q`'s scale grids belong to the reading kernel, not the schema. The fp8 grid is the
-         * checkpoint's: E4M3 [N][K] with a bf16 [ceil(N/128)][ceil(K/128)] scale plane, `group` 128.
+        /* Block-scaled fp8, mxfp4 and the 2-bit asymmetric grid, sized from each kernel's stored
+         * layout. `gemm_nt_q`'s scale grids belong to the reading kernel, not the schema. The fp8
+         * grid is the checkpoint's: E4M3 [N][K] with a bf16 [ceil(N/128)][ceil(K/128)] scale
+         * plane, `group` 128.
          * libref describes the symmetric integer grids, so a tool takes those from its hook; a grid
-         * with a zero point is declined there (ref_planes.h joins scale and zero into one operand).
-         * Anything else is skipped and counted. `a_sum` and `b_ref` belong to the asymmetric-integer
-         * and mxfp4 grids. */
+         * with a zero point is declined there (ref_planes.h joins scale and zero into one
+         * operand). Anything else is skipped and counted. `a_sum` and `b_ref` belong to the
+         * asymmetric-integer and mxfp4 grids. */
         const char* q = g.get_s("dtype");
         /* OCP-MXFP4: e2m1 codes with one E8M0 exponent per 32 of K (`group` 32), against the fp8
-         * activation pair (E4M3 plus an f32 scale per row and 128 of K, as LinearFP8 feeds it).
+         * activation pair (E4M3 plus an f32 scale per row and 128 of K, as LinearQ feeds it).
          * Weights are in libr4d's stored layout and sized in bytes: codes K/2 per row in fragment
          * order, exponents [K/32][N], per-row reference [N]. Random bytes suffice for timing. */
         if (q && std::strcmp(q, "mxfp4a8") == 0) {
@@ -188,7 +189,7 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
                 return RAD_E_UNSUPPORTED;
             add((uint32_t)RAD_I8,   {M, K});                /* a       -- int8 codes */
             add((uint32_t)RAD_F32,  {M, 1});                /* a_scale -- one f32 per row */
-            add((uint32_t)RAD_U8,   {N, K / 4});            /* b       -- u2 codes, fragment order */
+            add((uint32_t)RAD_U8,   {N, K / 4});            /* b       -- u2 codes, fragments */
             add((uint32_t)RAD_U32,  {N, K / group});        /* b_scale -- scale+zero dwords */
             add((uint32_t)RAD_BF16, {M, N});                /* y */
             add((uint32_t)RAD_F32,  {K / group, (M + 15) / 16 * 16});  /* a_sum, group-major */
@@ -298,7 +299,7 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
      *
      * Head counts are not op parameters; they come from container metadata via `ctx`. Without
      * them the op is skipped, not guessed. */
-    else if (op.rfind("gdn_", 0) == 0 && op != "gdn_gated_rmsnorm") {
+    else if (op.starts_with("gdn_") && op != "gdn_gated_rmsnorm") {
         if (!ctx || ctx->n_head_k <= 0 || ctx->n_head_v <= 0) return RAD_E_UNSUPPORTED;
         const int64_t Hk = ctx->n_head_k, Hv = ctx->n_head_v;
         const int64_t hk = gi("head_k", 0), hv = gi("head_v", hk);
@@ -523,7 +524,8 @@ void rad_widen(const void* src, uint32_t dtype, int64_t n, std::vector<float>* o
             for (int64_t i = 0; i < n; ++i) (*out)[(size_t)i] = (float)((const uint32_t*)src)[i];
             break;
         case RAD_BOOL:
-            for (int64_t i = 0; i < n; ++i) (*out)[(size_t)i] = ((const uint8_t*)src)[i] ? 1.0f : 0.0f;
+            for (int64_t i = 0; i < n; ++i)
+                (*out)[(size_t)i] = ((const uint8_t*)src)[i] ? 1.0f : 0.0f;
             break;
         default:
             /* Plugin-private dtype: left zeroed; the caller reports a zero reference as such. */
@@ -578,7 +580,9 @@ void rad_narrow(const float* src, uint32_t dtype, int64_t n, void* dst) {
                     int e = (int)((u >> 23) & 0xFFu) - 127;
                     uint32_t mm = (u & 0x7FFFFFu) >> 20;
                     const uint32_t rem = u & 0xFFFFFu, half = 1u << 19;
-                    if (rem > half || (rem == half && (mm & 1u))) { if (++mm == 8u) { mm = 0; ++e; } }
+                    if (rem > half || (rem == half && (mm & 1u))) {
+                        if (++mm == 8u) { mm = 0; ++e; }
+                    }
                     if (e > 8) { e = 8; mm = 7; }
                     ((uint8_t*)dst)[i] = (uint8_t)(sign | ((uint32_t)(e + 7) << 3) | mm);
                 } else {

@@ -1,6 +1,6 @@
 /* plugin/glm/glm.hip -- swiglu_clamped_had_quant_i8g on the card.
  *
- * libr4d's gated quantiser body (r4d_fused_quant_fp8.hip, gated_quant_fp8_body with ROT and I8) with
+ * libr4d's gated quantiser body (r4d_fused_quant.hip, gated_quant_fp8_body with ROT and I8) with
  * swiglu_clamped's expression (r4d_glm.hip, swiglu_clamped_kernel) in place of the plain SiLU: a wave
  * a scale group, four consecutive columns a lane, which is r4d_fwht_wave<128>'s mapping, so the
  * rotation stays in registers. Each element is rounded to bf16 and read back before the rotation,

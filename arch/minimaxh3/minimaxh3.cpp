@@ -77,7 +77,7 @@
  * ============================== WHAT IS QUANTISED ==============================
  *
  * Every linear of the text encoder, of the refiner and of the DiT's blocks, and the modulation
- * projections, are block fp8, or the DiT's int8 at int8 activations (LinearFP8 / DenseFP8 read what
+ * projections, are block fp8, or the DiT's int8 at int8 activations (LinearQ / DenseQ read what
  * the container holds). A curve-form checkpoint reads its timestep embeddings off a table it
  * ships, and its modulation projections, eight wide, are bf16. The small
  * linears around them keep the checkpoint's precision: the timestep MLP and the four patch
@@ -96,7 +96,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_vit.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
 #include "rad_ref2va_pack.h"
 #include "rad_vae_geom.h"
@@ -105,7 +105,6 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -192,7 +191,7 @@ static int64_t tiles_of(int64_t lat_h, int64_t lat_w) {
 
 /* Whether a frame of w x h pixels is one this model makes. */
 static int64_t video_area(int64_t requested) {
-    return requested > 0 ? std::min<int64_t>(requested, kMaxArea) : kMaxArea;
+    return requested > 0 ? std::min<int64_t>(requested, kMaxArea) : (int64_t)kMaxArea;
 }
 
 static bool size_ok(int64_t w, int64_t h, int64_t area) {
@@ -279,9 +278,9 @@ static int64_t decode_rows(const RadVideoGeom* g) {
 /* ================================================================== the model's parts */
 struct TeLayer {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_n2 = 0, op_ar2 = 0, op_add2 = 0;
     rad_op     op_qkr_m = 0;  /* `op_qkr` at interleaved M-RoPE, for a prompt with pictures */
@@ -290,9 +289,9 @@ struct TeLayer {
 /* A token refiner block: a plain pre-norm transformer block, no rotary, no modulation. */
 struct RefBlock {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_n1 = 0, op_qkn = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_n2 = 0, op_ar2 = 0, op_add2 = 0;
 };
@@ -301,9 +300,9 @@ struct RefBlock {
  * previous block's MLP branch (none for block 0), the second this block's attention branch. */
 struct DitBlock {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_attn{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_attn{};
+    GateQuant gq{};
     rad_op     op_mq1 = 0, op_mq2 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_ar2 = 0;
     rad_op     op_sel = 0, op_vsa = 0;
     rad_op     op_kq = 0;          /* the keys to int8 codes for the attention's scores */
@@ -311,7 +310,7 @@ struct DitBlock {
     /* The three modulation projections, one a modality, this rank's share of their rows; a
      * curve-form checkpoint's are bf16 (ada_w). A rotated int8 one adds its bias after the GEMM
      * (op_ada_b). */
-    DenseFP8   ada[3];
+    DenseQ   ada[3];
     rad_weight ada_w[3] = {}, ada_b[3] = {};
     rad_op     op_ada[3] = {}, op_ada_b[3] = {};
 };
@@ -416,7 +415,7 @@ struct Model {
     rad_weight w_tok = 0;
     rad_op  op_embed = 0;
     rad_buf b_tx = 0, b_tkv = 0, b_th2 = 0, b_tgu = 0;
-    ActFP8  a_th{}, a_tattn{}, a_tffn{};
+    ActQ  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
 
     /* ---- the text encoder's Qwen3-VL vision tower, for the pictures a prompt shows, when the
@@ -430,7 +429,7 @@ struct Model {
     rad_weight w_ce = 0, b_ce = 0, w_fn = 0;
     rad_op  op_ce = 0, op_fn = 0;
     rad_buf b_rh = 0, b_rqkv = 0, b_rao = 0, b_rgu = 0;
-    ActFP8  a_rh{}, a_rattn{}, a_rffn{};
+    ActQ  a_rh{}, a_rattn{}, a_rffn{};
     RefBlock rb[2];
 
     /* ---- the timestep MLP and the per-step tables. A curve-form checkpoint has a table of
@@ -440,9 +439,9 @@ struct Model {
     rad_weight w_t1 = 0, b_t1 = 0, w_t2 = 0, b_t2 = 0, w_no = 0, b_no = 0, w_ttable = 0;
     rad_op  op_temb = 0, op_temb_pv = 0, op_temb_pa = 0, op_t1 = 0, op_ts = 0, op_t2 = 0,
             op_ts2 = 0, op_no = 0;
-    QuantFP8 q_temb{};
+    QuantAct q_temb{};
     rad_buf b_tproj = 0, b_te1 = 0, b_te1s = 0, b_temb = 0;
-    ActFP8  a_temb{};
+    ActQ  a_temb{};
 
     /* ---- the lanes (PERSIST) */
     rad_buf b_text = 0;          /* [lanes * kMaxText, D] bf16: the refined prompt */
@@ -474,15 +473,15 @@ struct Model {
     std::vector<double> rungs;
     rad_buf b_h = 0, b_qkv = 0, b_ao = 0, b_gu = 0, b_hn = 0, b_hf = 0, b_vel = 0,
             b_avel = 0;
-    ActFP8  a_hm{}, a_attn{}, a_ffn{};
+    ActQ  a_hm{}, a_attn{}, a_ffn{};
     /* The DiT's linears are int8 (W8A8): their activations are int8 codes as well. */
     bool    dit_i8 = false;
     /* The text encoder's, the refiner's and the modulation projections' linears are rotated int8
      * (IQ8R, or the 128-group form where K is not whole 256s), each read off its first weight:
      * their activations then carry int8 pairs at that weight's scale group in place of the E4M3
-     * ones (ActFP8::declare_pair). */
+     * ones (ActQ::declare_pair). */
     bool    te_i8 = false, ref_i8 = false, ada_i8 = false;
-    int64_t te_g8 = RAD_FP8_BLOCK, ref_g8 = RAD_FP8_BLOCK, ada_g8 = RAD_FP8_BLOCK;
+    int64_t te_g8 = RAD_SCALE_GROUP, ref_g8 = RAD_SCALE_GROUP, ada_g8 = RAD_SCALE_GROUP;
     std::vector<DitBlock> dit;
     rad_weight w_no_n = 0, w_vout = 0, b_vout = 0, w_aout = 0, b_aout = 0;
     rad_op  op_nout = 0, op_hcast = 0, op_vout = 0, op_aout = 0, op_ev = 0, op_ea = 0;
@@ -596,20 +595,6 @@ struct Model {
 
 static Model g_model[MAX_SLOTS];
 
-/* A space-separated list off the container (rad-convert flattens arrays that way). */
-static std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
-    std::vector<double> v;
-    const char* s = rad_meta_gets(m, key, nullptr);
-    while (s && *s) {
-        char* e = nullptr;
-        const double x = std::strtod(s, &e);
-        if (e == s) { ++s; continue; }
-        v.push_back(x);
-        s = e;
-    }
-    return v;
-}
-
 static std::string join_list(const std::vector<double>& v) {
     std::string s;
     for (size_t i = 0; i < v.size(); ++i) {
@@ -618,13 +603,6 @@ static std::string join_list(const std::vector<double>& v) {
         s += t;
     }
     return s;
-}
-
-/* A weight copied as the checkpoint holds it, under `group`, read whole on every rank. */
-static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
-                        std::initializer_list<int64_t> shape, int access, int group) {
-    if (map_copy(b, dn, src) < 0) return 0;
-    return decl_w(b, dn, dtype, shape, access, RAD_SHARD_NONE, grp_layer(group));
 }
 
 /* A linear with a bias, `gemm_nt_bias` at `dtype` (bf16 or f32), read whole on every rank. */
@@ -639,22 +617,6 @@ static rad_op dense_bias(RadBuilder* b, Names& nm, const char* dn, const char* s
                                    RAD_STR("dtype", dtype)),
                         RAD_WEIGHTS(*w, *bias)),
               { in }, { out });
-}
-
-static rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, const char* dtype,
-                    rad_buf in, rad_buf out) {
-    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                          RAD_STR("dtype", dtype)),
-                        RAD_NOWEIGHTS),
-              { in }, { out });
-}
-
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, const char* dtype, rad_buf a, rad_buf c,
-                     rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", dtype)),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
 }
 
 /* (a + b) / div, each step rounded to y's dtype. */
@@ -680,13 +642,7 @@ static rad_op rmsnorm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad
 static rad_op all_reduce(RadBuilder* b, const Geom& g, rad_buf x, int64_t rows, int64_t n,
                          const char* dtype = "bf16", bool overlap = false) {
     if (g.world <= 1) return 0;
-    return rw(b, RAD_OP(b, "all_reduce",
-                        RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", n, rows * n),
-                                   RAD_STR("dtype", dtype), RAD_INT("exact", g.wire_exact),
-                                   RAD_INT("min_bytes", g.wire_min_bytes),
-                                   RAD_INT("overlap", overlap ? 1 : 0)),
-                        RAD_NOWEIGHTS),
-              { x }, { x });
+    return decl_all_reduce_overlap(b, g, x, n, rows, dtype, overlap ? 1 : 0);
 }
 
 /* ================================================================== check_format */
@@ -1058,9 +1014,9 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.temb_w = td;
     const int acc = RAD_ACCESS_PER_REQUEST;
     const int gx = kGrpTemb;
-    if (!G && td % RAD_FP8_BLOCK) {
+    if (!G && td % RAD_SCALE_GROUP) {
         fprintf(stderr, "radiance: minimaxh3: the timestep embedding is %lld wide, not whole "
-                        "%d-column blocks\n", (long long)td, RAD_FP8_BLOCK);
+                        "%d-column blocks\n", (long long)td, RAD_SCALE_GROUP);
         return RAD_E_INVAL;
     }
     /* Every step's embeddings in four blocks of S: the video's schedule, the soundtrack's, then
@@ -1191,7 +1147,7 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                     }
                     RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
                 }
-                /* The row slice is mapped above (DenseFP8 takes that as its argument). */
+                /* The row slice is mapped above (DenseQ takes that as its argument). */
                 B.ada[md].w8h_ok = m.ada_i8;
                 RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
                                                grp_layer(grp), { src_w }, {}, true));
@@ -1218,7 +1174,7 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                     B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
                                                 RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
                                                            RAD_INT("K", td),
-                                                           RAD_INT("group", RAD_FP8_BLOCK),
+                                                           RAD_INT("group", RAD_SCALE_GROUP),
                                                            RAD_STR("dtype", "fp8a8")),
                                                 RAD_WEIGHTS(B.ada[md].w, B.ada[md].s,
                                                             B.ada_b[md])),
@@ -1271,11 +1227,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                  RAD_NOWEIGHTS),
                        { m.b_ada }, { m.b_modg });
     else
-        m.op_modg = rw(b, RAD_OP(b, "cast",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", row),
-                                            RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                 RAD_NOWEIGHTS),
-                       { m.b_ada }, { m.b_modg });
+        m.op_modg = cast_op(b, 1, row, "bf16", "bf16", m.b_ada, m.b_modg);
 
     /* ---- the packed sequence: the lane's prompt rows, the soundtrack's and the video's latents
      * through their f32 projections, rounded to bf16 as the reference packs them */
@@ -1338,7 +1290,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     auto mod_q = [&](rad_weight w, bool gated) {
         rad_op op = RAD_OP(b, m.dit_i8 ? "rms_mod_quant_i8" : "rms_mod_quant_fp8",
                            RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
-                                      RAD_INT("group", RAD_FP8_BLOCK),
+                                      RAD_INT("group", RAD_SCALE_GROUP),
                                       RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16")),
                            RAD_WEIGHTS(w));
         if (!op) return op;
@@ -1390,11 +1342,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                 RAD_WEIGHTS(B.w_qn, B.w_kn)),
                       { m.b_qkv }, { m.b_qkv });
         /* The keys to int8 codes and scales per (row, head) for the attention's scores. */
-        B.op_kq = rw(b, RAD_OP(b, "quant_act_i8g",
-                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", qd),
-                                          RAD_INT("group", hd), RAD_STR("dtype", "bf16")),
-                               RAD_NOWEIGHTS),
-                     { m.b_qkv }, { m.b_k8, m.b_ks });
+        B.op_kq = decl_quant_act(b, "quant_act_i8g", T, qd, hd, m.b_qkv, m.b_k8, m.b_ks);
         /* The values to E4M3 with a scale per column (one dimension of one head), for P.V on
          * the fp8 matrix instruction. */
         B.op_vq = rw(b, RAD_OP(b, "quant_cols_fp8",
@@ -1500,11 +1448,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         m.op_nout = op;
     }
     m.b_hf = decl_b(b, nm.f("dit.hf"), RAD_F32, { (int64_t)kHeadRows, D });
-    m.op_hcast = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kHeadRows), RAD_INT("n", D),
-                                         RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                              RAD_NOWEIGHTS),
-                    { m.b_hn }, { m.b_hf });
+    m.op_hcast = cast_op(b, (int64_t)kHeadRows, D, "bf16", "f32", m.b_hn, m.b_hf);
     m.b_vel = decl_b(b, nm.f("dit.vel"), RAD_F32, { m.maxV, kPatchVals });
     m.b_avel = decl_b(b, nm.f("dit.avel"), RAD_F32, { m.maxA, kAudioC });
     m.op_vout = dense_bias(b, nm, "dit.video_out", "transformer.proj_out", RAD_F32, "f32",
@@ -2039,11 +1983,7 @@ static int declare_ups(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                              RAD_NOWEIGHTS),
                    { m.b_vstate }, { m.b_uin32 });
     m.b_uin = decl_b(b, nm.f("ups.in"), RAD_BF16, { V, kC });
-    m.op_ucast = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("n", kC),
-                                         RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
-                              RAD_NOWEIGHTS),
-                    { m.b_uin32 }, { m.b_uin });
+    m.op_ucast = cast_op(b, V, kC, "f32", "bf16", m.b_uin32, m.b_uin);
 
     /* ---- the factor's embedding: Linear(1, E), SiLU, Linear(E, E), then every residual block's
      * SiLU and Linear(E, 2C), each into its own row */
@@ -2426,11 +2366,7 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("dtype", "f32")),
                                RAD_NOWEIGHTS),
                      { m.b_vtile }, { m.b_epix32 });
-    m.op_ve_pcast = rw(b, RAD_OP(b, "cast",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, Rmax), RAD_INT("n", 3),
-                                            RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
-                                 RAD_NOWEIGHTS),
-                       { m.b_epix32 }, { m.b_epix });
+    m.op_ve_pcast = cast_op(b, Rmax, 3, "f32", "bf16", m.b_epix32, m.b_epix);
     /* Mapped by the presence check above. */
     m.ve_cinw = decl_w(b, nm.f("venc.cin.weight"), RAD_F32, { (int64_t)dims[0], 3, 3, 3, 3 },
                        acc, RAD_SHARD_NONE, grp_layer(kGrpVencH));
@@ -2718,11 +2654,7 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("dtype", "f32")),
                                RAD_WEIGHTS(A.al)),
                      { m.b_ax[blk] }, { m.b_et1[blk] });
-        A.op_ci = rw(b, RAD_OP(b, "cast",
-                               RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", u),
-                                          RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
-                               RAD_NOWEIGHTS),
-                     { m.b_et1[blk] }, { A.bi });
+        A.op_ci = cast_op(b, R, u, "f32", "bf16", m.b_et1[blk], A.bi);
         RAD_ARCH_TRY(map_wnorm(b, nm.f("aenc.d%d.w", blk), nm.ckpt("%s.4.weight_g", ds),
                                nm.ckpt("%s.4.weight_v", ds)));
         A.dnw = decl_w(b, nm.f("aenc.d%d.w", blk), RAD_BF16, { d, u, 2 * s }, acc, RAD_SHARD_NONE,
@@ -2739,11 +2671,7 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("dtype", "bf16")),
                                RAD_WEIGHTS(A.dnw, A.dnb)),
                      { A.bi }, { A.bo });
-        A.op_co = rw(b, RAD_OP(b, "cast",
-                               RAD_PARAMS(RAD_RANGE("M", 1, no), RAD_INT("n", d),
-                                          RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                               RAD_NOWEIGHTS),
-                     { A.bo }, { m.b_ax[blk + 1] });
+        A.op_co = cast_op(b, no, d, "bf16", "f32", A.bo, m.b_ax[blk + 1]);
         if (!A.op_al || !A.op_ci || !A.op_dn || !A.op_co) return RAD_E_INVAL;
     }
 
@@ -2834,11 +2762,7 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.b_ax2 = decl_b(b, nm.f("aenc.xfin"), RAD_BF16, { T, kAudioC });
     m.b_amb = decl_b(b, nm.f("aenc.mono"), RAD_F32, { T, kAudioC });
     m.b_amb2 = decl_b(b, nm.f("aenc.mp"), RAD_F32, { T, kAudioC });
-    m.op_ae_cast6 = rw(b, RAD_OP(b, "cast",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", ld),
-                                            RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
-                                 RAD_NOWEIGHTS),
-                       { m.b_ax6 }, { m.b_apb });
+    m.op_ae_cast6 = cast_op(b, T, ld, "f32", "bf16", m.b_ax6, m.b_apb);
     if (!m.op_ae_cast6) return RAD_E_INVAL;
     auto ln = [&](rad_weight w, rad_weight b2, int64_t n, rad_buf x, rad_buf y) -> rad_op {
         if (!w || !b2) return 0;
@@ -2894,11 +2818,7 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         !m.p_op_ln1 || !m.p_op_proj || !m.p_op_hadd || !m.p_op_ln2 || !m.p_op_mln || !m.p_op_gu ||
         !m.p_op_act || !m.p_op_w2 || !m.p_op_xadd || !m.p_op_hs || !m.p_op_hsd)
         return RAD_E_INVAL;
-    m.op_ae_castx = rw(b, RAD_OP(b, "cast",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", kAudioC),
-                                            RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                                 RAD_NOWEIGHTS),
-                       { m.b_ax2 }, { m.b_amb });
+    m.op_ae_castx = cast_op(b, T, kAudioC, "bf16", "f32", m.b_ax2, m.b_amb);
     if (!m.op_ae_castx) return RAD_E_INVAL;
     /* Mapped by the presence check above. */
     m.ae_mpw = decl_w(b, nm.f("aenc.mp.weight"), RAD_F32, { kAudioC, kAudioC, 1 }, acc,
@@ -2973,7 +2893,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.D = gd.n_embd;
     /* A rank holds 6 / world of a modality's six vectors, which keeps each [shift | scale] pair and
      * its gate on one rank. */
-    if (6 % m.W || (6 * m.D / m.W) % RAD_FP8_BLOCK) {
+    if (6 % m.W || (6 * m.D / m.W) % RAD_SCALE_GROUP) {
         fprintf(stderr, "radiance: minimaxh3: %d ranks do not split the six modulation vectors "
                         "into whole fp8 blocks; use 1 or 2\n", (int)m.W);
         return RAD_E_UNSUPPORTED;
@@ -3309,7 +3229,7 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brow_slice(m.b_text, lane * kMaxText, T, D));
 
     /* ---- every step's timestep embedding, the four blocks of declare_tables. At its own rows:
-     * QuantFP8::step bands by the rows it is issued for. */
+     * QuantAct::step bands by the rows it is issued for. */
     const int64_t fd = 256, td = m.temb_w, TT = 4 * S;
     if (m.curve > 0) {
         /* The table is operand 2, after the output. */
@@ -3379,7 +3299,7 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
                 RAD_ISSUE_N(c, B.op_ada_b[md], S, brows(m.b_adat, S), RAD_W(B.ada_b[md]), out);
             } else
                 RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q, r0, S, td),
-                            brow_slice(m.a_temb.s, r0, S, td / RAD_FP8_BLOCK), RAD_W(B.ada[md].w),
+                            brow_slice(m.a_temb.s, r0, S, td / RAD_SCALE_GROUP), RAD_W(B.ada[md].w),
                             RAD_W(B.ada[md].s), RAD_W(B.ada_b[md]), out);
         }
     }
@@ -3486,7 +3406,8 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
             if (aud)
                 for (int64_t ch = 0, t = n / kAudioCh; ch < kAudioCh; ++ch)
                     RAD_ISSUE_N(c, m.op_ain, t,
-                                brow_slice(m.b_enca, row + ch * (kEncSlotRowsA / kAudioCh), t,
+                                brow_slice(m.b_enca,
+                                           row + ch * ((int64_t)kEncSlotRowsA / kAudioCh), t,
                                            kAudioC),
                                 RAD_W(m.w_ain), RAD_W(m.b_ain), RAD_NONE,
                                 brow_slice(m.b_h, s.start + ch * t, t, D));
@@ -3507,7 +3428,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, 2);
     const RadOperand pos = praw2(V->pos, RAD_F32, 3, R);
     /* Chunk k of block l's six, for every group: on rank k / (6 / world), at its column. */
-    const int64_t per = 6 / g.world, nD = D / RAD_FP8_BLOCK;
+    const int64_t per = 6 / g.world, nD = D / RAD_SCALE_GROUP;
     auto mod = [&](int64_t l, int k, int chunks) {
         const int64_t r = k / per;
         return bcol_at(m.b_modg, r * L * kMaxSegs + l * kMaxSegs, m.Ws, (k % per) * D, chunks * D,

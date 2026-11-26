@@ -287,7 +287,8 @@ __device__ __forceinline__ void vocab_tile(const Head& h, const Cls& cl, uint32_
                 const uint32_t ks = p * kBlock + kk * kK;
                 const i2v af = frag_of(a8[kk / 4u], kk % 4u);
 #pragma unroll
-                for (uint32_t j = 0; j < NT; ++j) raw[j] = mma8<true>(af, frag<FK>(s_bh, j * 16, ks, lane), raw[j]);
+                for (uint32_t j = 0; j < NT; ++j)
+                    raw[j] = mma_i8(af, frag<FK>(s_bh, j * 16, ks, lane), raw[j]);
             }
 #pragma unroll
             for (uint32_t j = 0; j < NT; ++j)
@@ -299,7 +300,8 @@ __device__ __forceinline__ void vocab_tile(const Head& h, const Cls& cl, uint32_
                 const uint32_t ks = p * kBlock + kk * kK;
                 const i2v af = frag_of(a8[kk / 4u], kk % 4u);
 #pragma unroll
-                for (uint32_t j = 0; j < NT; ++j) raw[j] = mma8<true>(af, frag<FK>(s_bl, j * 16, ks, lane), raw[j]);
+                for (uint32_t j = 0; j < NT; ++j)
+                    raw[j] = mma_i8(af, frag<FK>(s_bl, j * 16, ks, lane), raw[j]);
             }
             /* the block's factor (shared by every row) times each token's activation scale */
             const float f = alive ? fold_f32<F>(c, wrow0, kb) : 0.0f;
@@ -309,7 +311,7 @@ __device__ __forceinline__ void vocab_tile(const Head& h, const Cls& cl, uint32_
                 const float ws = tok < nb ? f * XS[(size_t)tok * h.nkb + kb] : 0.0f;
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t) {
-                    acc[j][t] = fmaf(acc_val<true>(raw[j][t]), ws, acc[j][t]);
+                    acc[j][t] = fmaf(acc_i32(raw[j][t]), ws, acc[j][t]);
                     raw[j][t] = 0.0f;
                 }
             }

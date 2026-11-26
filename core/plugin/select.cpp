@@ -96,6 +96,22 @@ bool kernel_constraint(const KernelRow& r, std::string_view key, int c_op, long 
 }
 
 /* ------------------------------------------------------------------ selection */
+/* Writes the winner into the trace. Each skipped derived key takes the winner's RAD_C_EQ value; a
+ * kernel with no EQ on it (e.g. ref's `block_size >= 1`) leaves it unknown rather than zero, and
+ * the caller decides. */
+static void record_winner(const KernelRow& best, const std::vector<std::string>& derived_keys,
+                          SelectionTrace& t) {
+    t.kernel   = best.info->name;
+    t.plugin   = best.plugin;
+    t.priority = best.info->priority;
+    for (const std::string& key : derived_keys) {
+        SelectionTrace::DerivedParam d;
+        d.key   = key;
+        d.known = kernel_constraint(best, key, RAD_C_EQ, &d.value);
+        t.derived.push_back(std::move(d));
+    }
+}
+
 const KernelRow* Registry::select(std::string_view op, const Geometry& g, int domain,
                                   SelectionTrace* why, bool record, const RowFilter* accept) {
     SelectionTrace local;
@@ -112,17 +128,7 @@ const KernelRow* Registry::select(std::string_view op, const Geometry& g, int do
                                       t, &misses);
 
     if (best) {
-        t.kernel   = best->info->name;
-        t.plugin   = best->plugin;
-        t.priority = best->info->priority;
-        /* Each skipped derived key takes the winner's RAD_C_EQ value. A kernel with no EQ on it
-         * (e.g. ref's `block_size >= 1`) leaves it unknown rather than zero; the caller decides. */
-        for (const std::string& key : derived_keys) {
-            SelectionTrace::DerivedParam d;
-            d.key   = key;
-            d.known = kernel_constraint(*best, key, RAD_C_EQ, &d.value);
-            t.derived.push_back(std::move(d));
-        }
+        record_winner(*best, derived_keys, t);
     } else if (!rows) {
         const std::string did = near_miss(op);
         t.reason = fmt("no loaded kernel plugin implements op '%s'%s", t.op.c_str(),
@@ -155,15 +161,7 @@ const KernelRow* Registry::select_in(std::string_view plugin, std::string_view o
     const KernelRow* best = scan_rows(rows_for(op), g, domain, device_facts_, derived_keys,
                                       accept, plugin, t, &misses);
     if (best) {
-        t.kernel   = best->info->name;
-        t.plugin   = best->plugin;
-        t.priority = best->info->priority;
-        for (const std::string& key : derived_keys) {
-            SelectionTrace::DerivedParam d;
-            d.key   = key;
-            d.known = kernel_constraint(*best, key, RAD_C_EQ, &d.value);
-            t.derived.push_back(std::move(d));
-        }
+        record_winner(*best, derived_keys, t);
     } else {
         for (size_t i = 0; i < misses.size(); ++i) t.reason += (i ? "; " : "") + misses[i];
         if (t.reason.empty())

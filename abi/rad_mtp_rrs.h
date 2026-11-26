@@ -17,15 +17,15 @@
  * Verify (Sequoia, Chen et al. 2024, Alg. 1; SpecInfer's multi-step verification with the draft
  * law renormalised after each removal). P_1 = the target's law, q_1 = Q. For i = 1..m:
  *     accept x_i with probability min(1, P_i(x_i) / q_i(x_i));
- *     on rejection  P_{i+1} = norm(max(P_i - q_i, 0)),   q_{i+1} = q_i with x_i removed, renormalised.
+ *     on rejection  P_{i+1} = norm(max(P_i - q_i, 0)),  q_{i+1} = q_i without x_i, renormalised.
  * All rejected: the token is a draw from P_{m+1}. Exactness (induction on m): after a rejection of
  * the first draft the continuation depends on x_1 only through q_2, and P_2 = norm(max(P - q, 0))
  * does not depend on x_1 at all, so by the hypothesis it emits ~ P_2 whatever x_1 was; then
  * P(emit y) = sum_x q(x) min(1, P(x)/q(x)) [x = y] + P(reject) P_2(y) = min(P, q)(y) +
  * max(P - q, 0)(y) = P(y). The emitted token is the accepted child's token, or a residual draw that
- * has no mass on any rejected child (P_{i+1}(x_i) = 0 after a rejection), so the core's rule "follow
- * the first child whose token is the sampler's token at the row" (ADV_ACCEPT) walks exactly the
- * decision made here and needs no change.
+ * has no mass on any rejected child (P_{i+1}(x_i) = 0 after a rejection), so the core's rule
+ * "follow the first child whose token is the sampler's token at the row" (ADV_ACCEPT) walks exactly
+ * the decision made here and needs no change.
  *
  * Wire: the node's RadMtpCoupleState holds Q (ids, q), the children in draft order in ids[0 ..
  * nkids), x = ids[0]. A state with nkids <= 1 is the chain's (rad_mtp_couple_decide, bit for bit).
@@ -126,21 +126,23 @@ static inline RAD_RRS_HD int rad_mtp_rrs_prefix(const RadMtpCoupleState& s, cons
 
 /* The acceptance uniform of the i-th child at output position `pos`: the first is the chain's. */
 static inline RAD_RRS_HD double rad_mtp_rrs_uaccept(uint64_t seed, uint64_t pos, int i) {
-    return rad_spechub_uniform(seed, pos, i == 0 ? (uint64_t)RAD_SAMPLE_KEY_ACCEPT
-                                                 : RAD_MTP_RRS_KEY_ACCEPT ^ rad_mtp_rrs_mix((uint64_t)i));
+    return rad_spechub_uniform(seed, pos,
+                               i == 0 ? (uint64_t)RAD_SAMPLE_KEY_ACCEPT
+                                      : RAD_MTP_RRS_KEY_ACCEPT ^ rad_mtp_rrs_mix((uint64_t)i));
 }
 
 /* The verify of a node with nkids >= 2 children: the recursion above over the sampler's surviving
  * candidates (ids/val, n of them, FP64 P = softmax of val). Writes the emitted token to *out and
  * returns true, or false for an invalid target (the row keeps the ordinary token).
  *
- * The decision reads the live candidates (id >= 0, value not -inf) in ascending order through a view
- * `C::each(f)`, f(id, w, k) -> bool (false stops): w = exp(val - top) in FP64, k the id's slot in the
- * state's support (the first match) or s.count when it is outside. The host view (RadRrsHostCands)
- * computes them on the fly; the device verify (plugin/spechub/spechub.hip) compacts the live
- * candidates and computes every w and k with the whole workgroup, then runs this same function on one
- * lane over the stored values, so the ordered sums, and with them the token, are the host's. `pq_out`
- * and `sum_out` (optional) hand back P's masses on the support and their normaliser (the export). */
+ * The decision reads the live candidates (id >= 0, value not -inf) in ascending order through a
+ * view `C::each(f)`, f(id, w, k) -> bool (false stops): w = exp(val - top) in FP64, k the id's slot
+ * in the state's support (the first match) or s.count when it is outside. The host view
+ * (RadRrsHostCands) computes them on the fly; the device verify (plugin/spechub/spechub.hip)
+ * compacts the live candidates and computes every w and k with the whole workgroup, then runs this
+ * same function on one lane over the stored values, so the ordered sums, and with them the token,
+ * are the host's. `pq_out` and `sum_out` (optional) hand back P's masses on the support and their
+ * normaliser (the export). */
 template <class C>
 static inline RAD_RRS_HD bool rad_mtp_rrs_decide_over(const RadMtpCoupleState& s, const C& cs,
                                                       uint64_t seed, uint64_t pos, int32_t* out,
@@ -166,7 +168,10 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide_over(const RadMtpCoupleState& s
         for (int k = 0; k < s.count; ++k) sq += qr[k];
         if (!(sq > 0)) break;
         const double qx = qr[i] / sq;
-        if (r[i] >= qx || rad_mtp_rrs_uaccept(seed, pos, i) * qx < r[i]) { *out = s.ids[i]; return true; }
+        if (r[i] >= qx || rad_mtp_rrs_uaccept(seed, pos, i) * qx < r[i]) {
+            *out = s.ids[i];
+            return true;
+        }
         double z = so * pout;
         for (int k = 0; k < s.count; ++k) {
             const double d = r[k] - qr[k] / sq;
@@ -245,17 +250,18 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, con
 /* ================================================================== RheoSampling siblings
  *
  * --draft-siblings rheo (--draft-rheo-m m). Hu et al. 2025 (arXiv 2502.18779, Thm 8, the greedy
- * multi-draft verifier) and RheoSampling (arXiv 2609.21827): instead of Gumbel-top-k siblings, a node's
- * children are
- *     T  = the m tokens of largest Q, in descending q order (deterministic, rank slots 0 .. m-1), and
+ * multi-draft verifier) and RheoSampling (arXiv 2609.21827): instead of Gumbel-top-k siblings, a
+ * node's children are
+ *     T  = the m tokens of largest Q, in descending q order (deterministic, slots 0 .. m-1), and
  *     u  ~ Qt, ONE token sampled from the tail law Qt(x) = Q(x) / z over the support outside T,
  *          z = Q(outside T), in slot m;
  * the draft order stored in the state is ids = [T..., u, the rest of the support in descending q],
- * scheme = m + 1. A node whose support has no more than m tokens has no tail child (all of it is T).
+ * scheme = m + 1. A node whose support has no more than m tokens has no tail child (all of it
+ * is T).
  *
  * Verify (derived here, not quoted; the law is checked by tests/mtp_rrs_test.cpp by exhaustive
  * enumeration). P = the target's law, children present = the first nkids of the draft order.
- *   tail child present (nkids > |T|, which with a prefix draft order means every T token is a child):
+ *   tail child present (nkids > |T|, i.e. with a prefix draft order every T token is a child):
  *       accept u with probability min(1, P(u) / Qt(u))                       -> emit u
  *       else emit y ~ R / |R|,   R(y) = P(y)               y in T or off Q's support,
  *                                R(y) = max(P(y) - Qt(y), 0)  y in the tail support (R(u) = 0 here)
@@ -271,12 +277,14 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, con
  * m = 0 is the single-draft maximal coupling of the chain (rad_mtp_couple_decide) with the sampled
  * child in slot 0.
  */
-#define RAD_MTP_RRS_KEY_TAIL_C 8   /* candidate index of the tail draw in the draft stream (0..7 are Gumbel's) */
+/* The candidate index of the tail draw in the draft stream (0..7 are Gumbel's). */
+#define RAD_MTP_RRS_KEY_TAIL_C 8
 
 /* Slot priorities of a rheo node (functions of Q alone, non-increasing): slots 0 .. m-1 carry the
- * log of the j-th largest q, slot m RheoSampling's proxy log min{q_(m-1), z} (z = the tail mass; with
- * m = 0, z = 1), -inf for the other slots and for slots past the support. */
-static inline RAD_RRS_HD void rad_mtp_rrs_slot_logq_rheo(const RadMtpCoupleState& s, int m, float* ov) {
+ * log of the j-th largest q, slot m RheoSampling's proxy log min{q_(m-1), z} (z = the tail mass;
+ * with m = 0, z = 1), -inf for the other slots and for slots past the support. */
+static inline RAD_RRS_HD void rad_mtp_rrs_slot_logq_rheo(const RadMtpCoupleState& s, int m,
+                                                         float* ov) {
     double qs[8];
     const int n = s.count < 8 ? s.count : 8;
     for (int i = 0; i < n; ++i) qs[i] = s.q[i];
@@ -298,9 +306,11 @@ static inline RAD_RRS_HD void rad_mtp_rrs_slot_logq_rheo(const RadMtpCoupleState
 }
 
 /* Draw a rheo node's children: reorder Q's support into [top-m by q desc, the sampled tail child,
- * the rest by q desc], set x = ids[0], scheme = m + 1 and nkids = min(nkids, children possible). The
- * tail child is the inverse-CDF draw of Qt with the draft stream's uniform of (seed, base, node). */
-static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo_u(RadMtpCoupleState* s, double ut, int nkids, int m) {
+ * the rest by q desc], set x = ids[0], scheme = m + 1 and nkids = min(nkids, children possible).
+ * The tail child is the inverse-CDF draw of Qt with the draft stream's uniform of (seed, base,
+ * node). */
+static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo_u(RadMtpCoupleState* s, double ut, int nkids,
+                                                      int m) {
     int ord[8];
     const int n = s->count;
     for (int i = 0; i < n; ++i) ord[i] = i;
@@ -330,15 +340,19 @@ static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo_u(RadMtpCoupleState* s, doub
     s->scheme = m + 1;
     s->nkids = nkids < cap ? nkids : cap;
 }
-static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo(RadMtpCoupleState* s, uint64_t node, int nkids, int m) {
-    rad_mtp_rrs_draw_rheo_u(s, rad_mtp_rrs_gumbel_u(s->draw.seed, s->draw.base, node, RAD_MTP_RRS_KEY_TAIL_C),
-                            nkids, m);
+static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo(RadMtpCoupleState* s, uint64_t node, int nkids,
+                                                    int m) {
+    const double ut =
+        rad_mtp_rrs_gumbel_u(s->draw.seed, s->draw.base, node, RAD_MTP_RRS_KEY_TAIL_C);
+    rad_mtp_rrs_draw_rheo_u(s, ut, nkids, m);
 }
 
-/* The verify of a rheo node (any nkids >= 0): the rule above. Same contract as rad_mtp_rrs_decide. */
-static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo_u(const RadMtpCoupleState& s, const int32_t* ids,
-                                                        const float* val, int64_t n, int64_t vocab,
-                                                        double u_accept, double u_resid, int32_t* out) {
+/* The verify of a rheo node (any nkids >= 0): the rule above. Same contract as
+ * rad_mtp_rrs_decide. */
+static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo_u(const RadMtpCoupleState& s,
+                                                        const int32_t* ids, const float* val,
+                                                        int64_t n, int64_t vocab, double u_accept,
+                                                        double u_resid, int32_t* out) {
     float top = -INFINITY;
     for (int64_t j = 0; j < n; ++j) {
         if (ids[j] < 0) continue;
@@ -369,7 +383,8 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo_u(const RadMtpCoupleState&
             qt[k] = v > 1 ? 1 : v;   /* clamp: rounding must not push a one-token tail past 1 */
             dominated = dominated && pq[k] >= qt[k];
         }
-        for (int k = 0; k < s.count; ++k) r[k] = k < nt ? pq[k] : rad_spechub_positive(pq[k] - qt[k]);
+        for (int k = 0; k < s.count; ++k)
+            r[k] = k < nt ? pq[k] : rad_spechub_positive(pq[k] - qt[k]);
     }
     /* mass of candidate j in R (the tail case) or in P (otherwise); Q tokens count once. */
     unsigned seen = 0;
@@ -414,9 +429,10 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo_u(const RadMtpCoupleState&
     *out = last;
     return last >= 0;
 }
-static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo(const RadMtpCoupleState& s, const int32_t* ids,
-                                                      const float* val, int64_t n, int64_t vocab,
-                                                      uint64_t seed, uint64_t pos, int32_t* out) {
+static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo(const RadMtpCoupleState& s,
+                                                      const int32_t* ids, const float* val,
+                                                      int64_t n, int64_t vocab, uint64_t seed,
+                                                      uint64_t pos, int32_t* out) {
     return rad_mtp_rrs_decide_rheo_u(s, ids, val, n, vocab,
                                      rad_spechub_uniform(seed, pos, RAD_SAMPLE_KEY_ACCEPT),
                                      rad_spechub_uniform(seed, pos, RAD_SAMPLE_KEY_RESID), out);

@@ -9,7 +9,7 @@
 
 #include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_muse_dflash.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
 #include <cstring>
 
@@ -88,7 +88,7 @@ inline int declare_muse_dflash2(Dflash2* ds, Dflash2::Wire* w, rad_kvgroup* kv,
     const int64_t qd  = dg.n_head * dg.head_dim;
     const int64_t kvd = dg.n_head_kv * dg.head_dim;
     const uint32_t act_dtype = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
-    const int64_t act_group = dc.act_i8 ? dc.act_g8 : RAD_FP8_BLOCK;
+    const int64_t act_group = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_SCALE_GROUP;
     const auto act_groups = [act_group](int64_t n) { return (n + act_group - 1) / act_group; };
     int64_t qr = dg.max_seqs * dc.block;
     if (qr > dg.max_tok) qr = dg.max_tok;

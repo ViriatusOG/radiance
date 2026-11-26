@@ -132,6 +132,10 @@ extern "C" int halo_rad_gated_had_quant_i8(const RadArgs* args, RadStream stream
   // `act` names the activation ("silu" or "sigmoid"); `mode` is this kernel's integer for it.
   const int mode = halo_act_code(args, "act", "mode", 0);
   if (mode != 0 && mode != 1) return HALO_NO(RAD_E_INVAL);
+  /* The caps belong to SiTU, which this kernel does not compute; with silu or sigmoid they would be
+   * silently ignored, so a set cap is refused. */
+  if (halo_getf(args, "gate_cap", 0.0) != 0.0 || halo_getf(args, "up_cap", 0.0) != 0.0)
+    return HALO_NO(RAD_E_UNSUPPORTED);
   if (halo_numel(q) != M * K) return HALO_NO(RAD_E_SHAPE);
 
   const int thr = halo_act_threads((int)M, (int)K);

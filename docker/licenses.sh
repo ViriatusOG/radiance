@@ -13,6 +13,7 @@ set -eu
 R=$1; shift
 D=$R/usr/share/doc
 W=$(mktemp -d)
+trap 'rm -rf "$W"' EXIT
 mkdir -p "$D"
 
 owner() {   # owner PATH -- the package that installed PATH, under any name usrmerge gives it
@@ -104,4 +105,3 @@ if [ -n "$ffmpeg" ]; then
 fi
 mkdir -p "$R/usr/share"
 cp -a /usr/share/common-licenses "$R/usr/share/"
-rm -rf "$W"

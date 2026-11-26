@@ -28,11 +28,8 @@ using namespace rad;
 
 namespace {
 
-/* A new empty directory under the test's temporary directory, or "" when it cannot be made. */
-std::string temp_dir() {
-    std::string tmpl = radtest::tmp_path("dir.XXXXXX");
-    return ::mkdtemp(tmpl.data()) ? tmpl : std::string();
-}
+/* A new empty directory under the test's temporary directory. */
+std::string temp_dir() { return radtest::make_tmp_dir("dir"); }
 
 Geometry geom(std::initializer_list<std::pair<const char*, const char*>> kv) {
     Geometry g;
@@ -145,11 +142,11 @@ TEST(a_copy_is_judged_exactly) {
 /* Every float output of every op the checked-in fixtures record resolves to a row chosen for it,
  * not the catch-all. A new op gets a tolerance deliberately, not by default. */
 TEST(every_op_in_the_checked_in_fixtures_has_a_tolerance_row_of_its_own) {
-    const char* home = std::getenv("RADIANCE_HOME");
-    if (!home || !*home) return;
     for (const char* leaf : { "kernels.rkb", "kernels_moe.rkb" }) {
+        const std::string path = home() + "/" + leaf;
         Kfixture fx;
-        if (fx.load(std::string(home) + "/" + leaf) != RAD_OK) continue;
+        if (fx.load(path) != RAD_OK) ARTIFACT_MISSING(path);
+        REQUIRE(!fx.cases.empty());
         std::set<std::string> bad;
         for (const KfCase& c : fx.cases) {
             Geometry g;

@@ -51,18 +51,8 @@ RadTensor tensor(void* p, uint32_t dt, std::vector<int64_t> shape, std::vector<i
     return t;
 }
 
-uint16_t bf16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    x += 0x7fff + ((x >> 16) & 1);
-    return (uint16_t)(x >> 16);
-}
-float fbf16(uint16_t b) {
-    uint32_t x = (uint32_t)b << 16;
-    float f;
-    std::memcpy(&f, &x, 4);
-    return f;
-}
+uint16_t bf16(float f) { return rad_f32_to_bf16(f); }
+float fbf16(uint16_t b) { return rad_bf16_to_f32(b); }
 
 /* One launch: M rows of n columns in groups of g, x and y at row pitch P, the scale and positions
  * present or absent, y either its own buffer or x. Checked against the formula. */

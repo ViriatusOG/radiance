@@ -9080,7 +9080,12 @@ void conv1d_cases(const Plugin& pl) {
                         C{ 6, 3, 2, 1, 1, 0, 1 }, C{ 16, 32, 4, 1, 1, 0, 2 },
                         C{ 16, 128, 16, 1, 1, 1, 8 }, C{ 6, 3, 8, 1, 1, 1, 4 },
                         C{ 16, 32, 2, 1, 1, 0, 2 }, C{ 16, 64, 4, 1, 1, 1, 2, 8 },
-                        C{ 6, 3, 8, 1, 1, 0, 4, 8 } }) {
+                        C{ 6, 3, 8, 1, 1, 0, 4, 8 },
+                        /* Breeze-TTS-2's codec on the WMMA form: a K of 7 x 96, not whole 64-wide
+                         * tiles; a dilated 192-channel layer; and 4096 channels out, which takes
+                         * the 128 x 128 tile. */
+                        C{ 96, 96, 7, 9, 1, 1, 1 }, C{ 192, 192, 7, 3, 1, 1, 1 },
+                        C{ 64, 4096, 3, 1, 1, 1, 1 } }) {
         /* Bounds of whole strides: 13 and 30 rounded up to the stride; the op reads them times
          * cu_div. */
         const int64_t s1 = (13 + c.st - 1) / c.st * c.st, s2 = (30 + c.st - 1) / c.st * c.st;
@@ -37930,6 +37935,18 @@ static void device_phase(const Plugin& pl) {
             bf16_gemm_numeric(pl, row, 16, 5120, 25600);
         }
         bf16_gemm_numeric(pl, "gemm_bf16_nt_m64", 64, 5120, 25600);
+        /* More rows than the _m16 tile, as Breeze-TTS-2's depth decoder's whole-stack form
+         * issues to it (16 rows a sequence, two sequences under guidance): the streaming form's
+         * column pairs. */
+        bf16_gemm_numeric(pl, "gemm_bf16_nt_m16", 32, 1024, 1024);
+        /* The streaming form's splits and slices: one row, two (a guided pair) at four splits of
+         * 2048, a K that is not whole 256-wide tiles, the column pairs at 32 rows over two
+         * splits, and a K that takes 32 splits (one 1024-wide slice each). */
+        bf16_gemm_numeric(pl, "gemm_bf16_nt_m16", 1, 2048, 2048);
+        bf16_gemm_numeric(pl, "gemm_bf16_nt_m16", 2, 1024, 8192);
+        bf16_gemm_numeric(pl, "gemm_bf16_nt_m16", 7, 333, 1000);
+        bf16_gemm_numeric(pl, "gemm_bf16_nt_m16", 32, 1000, 2048);
+        bf16_gemm_numeric(pl, "gemm_bf16_nt_m16", 2, 64, 32768);
     }
     if (sel("gemm_bf16_nt_tiled")) {
         if (!g_case) std::printf("\nthe tiled bf16 GEMM, against the skinny one\n");

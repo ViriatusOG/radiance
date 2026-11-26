@@ -35,6 +35,7 @@ struct StatsScheduler : FakeScheduler {
         r.kv_tokens = 960;
         r.n_draft = 3;
         r.slot = 2;
+        r.lora = "style";
         r.age_s = 4.5;
         r.ttft_s = 0.25;
         r.prefill_s = 0.20;
@@ -47,6 +48,7 @@ struct StatsScheduler : FakeScheduler {
         s.id = 7;
         s.model = "m";
         s.label = "conv-7";
+        s.lora = "style";
         s.n_tokens = 5000;
         s.bytes = 1 << 20;
         s.idle_s = 12.0;
@@ -188,6 +190,11 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s.value("running", (int64_t)0), (int64_t)1);
     CHECK_EQ(s.value("kv_tokens_cached", (int64_t)0), (int64_t)300);
     CHECK_EQ(s.value("kv_tokens_max", (int64_t)0), (int64_t)6000);
+    CHECK_EQ(s.value("kv_tokens_total", (int64_t)0), (int64_t)4000);
+    /* No step runs in this fixture; one that did would carry its phase and age. */
+    CHECK_EQ(s.value("step_open_phase", (int64_t)0), (int64_t)-1);
+    CHECK_NEAR(s.value("step_open_s", -1.0), 0.0, 1e-12);
+    CHECK(s["experts"].value("tiered", false));
     REQUIRE(s["draft_positions"].size() == 2);
     CHECK_NEAR(s["draft_positions"][1]["rate"].get<double>(), 0.25, 1e-12);
     CHECK_EQ(s["draft_positions"][1]["reached"].get<int64_t>(), (int64_t)8);

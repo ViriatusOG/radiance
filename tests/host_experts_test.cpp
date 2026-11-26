@@ -1,7 +1,7 @@
 /* host_experts_test.cpp -- Qwen3.8-Flash-Next's routed feed-forward, declared for a CPU-only engine
  * against libavx alone (`--kernels libavx` on the host backend).
  *
- * The block is arch/common/rad_block_moe_fp8.h with the connection around it
+ * The block is arch/common/rad_block_moe_q.h with the connection around it
  * (arch/common/rad_block_hc.h), declared as qwen4exp_fp8 declares them, at a small geometry with
  * the served container's structure and encodings (data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe):
  * the connection's read writing the rotated E4M3 codes and the int8 plain codes, the router, its
@@ -20,7 +20,7 @@
 #include "rad_internal.h"
 
 #include <arch/rad_block_hc.h>
-#include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_moe_q.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -74,7 +74,7 @@ int sources(const char* dtype, const std::string& name, WeightSource* out) {
         out->rank = 2;
         out->shape[0] = gu ? 2 * kFF : kEmbd;
         out->shape[1] = gu ? kEmbd : kFF;
-        out->enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, RAD_FP8_BLOCK);
+        out->enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, RAD_SCALE_GROUP);
         return RAD_OK;
     }
     return RAD_E_NOTFOUND;
@@ -102,7 +102,7 @@ RadBuildCtx ctx() {
 }
 
 /* The connection and the block on `b`, as qwen4exp_fp8 declares one layer's feed-forward. */
-int declare_layer(RadBuilder* b, MoeFP8* mlp, HyperConn* hc) {
+int declare_layer(RadBuilder* b, MoeQ* mlp, HyperConn* hc) {
     Names nm;
     Geom g;
     g.n_layer = 1;
@@ -115,26 +115,26 @@ int declare_layer(RadBuilder* b, MoeFP8* mlp, HyperConn* hc) {
     g.dtype = "bf16";
     g.act_dtype = RAD_BF16;
 
-    MoeFP8::Config mc;
+    MoeQ::Config mc;
     mc.n_expert = mc.n_expert_all = kExperts;
     mc.top_k = kTopK;
     mc.n_ff_exp = kFF;
     mc.n_ff_shared = kFF;
     mc.rows = kTok;
-    MoeFP8::Src ms{};
+    MoeQ::Src ms{};
     RAD_ARCH_TRY(moe_expert_sources(b, nm, "format", "model.layers.0.mlp.experts", &ms));
-    RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ms, &mc));
+    RAD_ARCH_TRY(MoeQ::probe(b, nm, 0, ms, &mc));
     if (!mc.expert_rot || !mc.expert_nl) return RAD_E_DTYPE;
 
     const int64_t T = kTok, ER = mc.rows * mc.top_k;
-    ActFP8 x, hr, eff, sff;
+    ActQ x, hr, eff, sff;
     x.x = decl_b(b, nm.f("x"), RAD_BF16, { T, kEmbd });
     RAD_ARCH_TRY(x.declare_qs(b, nm, g, "x", kEmbd, 0, true));
     x.q8_fed = true;
-    RAD_ARCH_TRY(hr.declare_qs(b, nm, g, "moe_hr", kEmbd, 0, true, false, RAD_FP8_BLOCK));
+    RAD_ARCH_TRY(hr.declare_qs(b, nm, g, "moe_hr", kEmbd, 0, true, false, RAD_SCALE_GROUP));
     hr.q8_fed = hr.q8_rot = true;
     eff.x = decl_b(b, nm.f("moe_eff"), RAD_BF16, { ER, kFF });
-    RAD_ARCH_TRY(eff.declare_qs(b, nm, g, "moe_eff", kFF, ER, true, false, RAD_FP8_BLOCK));
+    RAD_ARCH_TRY(eff.declare_qs(b, nm, g, "moe_eff", kFF, ER, true, false, RAD_SCALE_GROUP));
     eff.q8_fed = eff.q8_rot = true;
     sff.x = decl_b(b, nm.f("moe_sff"), RAD_BF16, { T, kFF });
     RAD_ARCH_TRY(sff.declare_qs(b, nm, g, "moe_sff", kFF, 0, true));
@@ -158,7 +158,7 @@ int declare_layer(RadBuilder* b, MoeFP8* mlp, HyperConn* hc) {
     hs.inject_w = nm.ckpt("model.layers.0.mlp_hyper_connection.block_inject_weight.weight");
     RAD_ARCH_TRY(hc->declare(b, nm, g, "blk.0.ffn_hc", hcfg, hw, hs));
 
-    MoeFP8::Wire mw{};
+    MoeQ::Wire mw{};
     mw.x = hw.h;
     mw.h = x;
     mw.hr = hr;
@@ -201,7 +201,7 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
         b.set_sources([dtype](const std::string& name, const Program&, WeightSource* out) {
             return sources(dtype, name, out);
         });
-        MoeFP8 mlp;
+        MoeQ mlp;
         HyperConn hc;
         std::string log;
         int rc = RAD_OK;

@@ -69,6 +69,9 @@ if(OpenMP_CXX_FOUND)
 else()
   message(STATUS "rad-convert: no OpenMP -- conversion will run single-threaded")
 endif()
+# rad-sidecar: a container's plain weights quantised into a small sidecar container that the engine serves in
+# their place (the `weight-sidecar` setting); the quantisers rad-convert runs.
+rad_add_tool(rad-sidecar  rad_sidecar.cpp)
 rad_add_tool(rad-kbench    rad_kbench.cpp)
 # The timing pass (--bench): the only part of rad-kbench that needs the device layer's internals.
 target_sources(rad-kbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kbench_timer.cpp)
@@ -87,7 +90,7 @@ set_target_properties(rad-gbnf-check PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE
 
 # rad-schemas matters most in an installed prefix: it needs only the four exports every kernel
 # plugin has, so it can debug an out-of-tree plugin the engine cannot load.
-install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokcheck rad-yaml
+install(TARGETS rad-info rad-convert rad-sidecar rad-kbench rad-tune rad-schemas rad-tokcheck rad-yaml
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # rad-chatparse: the reply parser's acceptance run against a checkpoint's real tokenizer and chat

@@ -128,6 +128,9 @@ class ReplyStream;
  * prompt opened it, or the format has no opener). An empty `close` means no reasoning block. */
 struct ReasoningMarkers {
     std::string open, close;
+    /* The header every message of the reply opens with (ChatFormat::message_open), which comes
+     * before the opener when the reply opens its own block; empty for none. */
+    std::string frame;
     bool        starts_open = false;
 };
 

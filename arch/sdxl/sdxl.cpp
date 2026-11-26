@@ -53,10 +53,7 @@
 #include <arch/rad_vae2d.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -512,14 +509,6 @@ static rad_op dense(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weigh
     return rw(b, h, { in }, { out });
 }
 
-static rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, rad_buf in,
-                    rad_buf out) {
-    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                          RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { in }, { out });
-}
-
 static rad_op tstep_embed(RadBuilder* b, int64_t rows, int64_t n, rad_buf out) {
     return rw(b, RAD_OP(b, "timestep_embed",
                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("scale", 1.0),
@@ -627,11 +616,7 @@ static int declare_text(RadBuilder* b, Model& m, TextEnc& E, const char* root, i
             !Y.op_f1 || !Y.op_act || !Y.op_f2)
             return RAD_E_INVAL;
         if (l == tap)
-            E.op_tap = rw(b, RAD_OP(b, "cast",
-                                    RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D),
-                                               RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                    RAD_NOWEIGHTS),
-                          { E.x }, { m.b_ctx });
+            E.op_tap = cast_op(b, T, D, "bf16", "bf16", E.x, m.b_ctx);
     }
     if (!E.op_tap) return RAD_E_INVAL;
     if (!pooled) return RAD_OK;
@@ -740,11 +725,7 @@ static int declare_emb(RadBuilder* b, Model& m) {
     m.op_t1 = dense(b, 1, kTemb, 320, m.w_t1, m.b_t1, m.b_tproj, m.b_te1);
     m.op_ts = unary(b, "silu", 1, kTemb, m.b_te1, m.b_te1s);
     m.op_t2 = dense(b, 1, kTemb, kTemb, m.w_t2, m.b_t2, m.b_te1s, m.b_temb);
-    m.op_pool = rw(b, RAD_OP(b, "cast",
-                             RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", kPooled),
-                                        RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                             RAD_NOWEIGHTS),
-                   { m.b_pstore }, { m.b_add });
+    m.op_pool = cast_op(b, 1, kPooled, "bf16", "bf16", m.b_pstore, m.b_add);
     /* (height, width), (0, 0), (height, width): each value's 256-wide sinusoid, laid end to end
      * after the pooled vector. */
     m.op_szo = tstep_embed(b, 2, 256, m.b_add);
@@ -875,11 +856,7 @@ static int declare_decoder(RadBuilder* b, Model& m) {
                                           RAD_INT("round", 0)),
                                RAD_NOWEIGHTS),
                      { m.b_state, m.b_prev }, { m.b_dlf });
-    m.op_dcast = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, NT), RAD_INT("n", kLatC),
-                                         RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
-                              RAD_NOWEIGHTS),
-                    { m.b_dlf }, { m.b_decin });
+    m.op_dcast = cast_op(b, NT, kLatC, "f32", "bf16", m.b_dlf, m.b_decin);
     if (!m.op_dscale || !m.op_dcast) return RAD_E_INVAL;
     const int64_t ch[4] = { 512, 512, 256, 128 };
     const double eps = 1e-6;

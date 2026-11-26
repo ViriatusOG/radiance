@@ -51,7 +51,8 @@ RAD_PHILOX_HD float rad_philox_normal(uint64_t seed, uint64_t e) {
  * (an audio window's noise is stream 1 + its index). */
 RAD_PHILOX_HD float rad_philox_normal_s(uint64_t seed, uint64_t stream, uint64_t e) {
     const uint64_t g = e >> 2;
-    uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream, (uint32_t)(stream >> 32) };
+    uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream,
+                      (uint32_t)(stream >> 32) };
     rad_philox4x32_10(c, (uint32_t)seed, (uint32_t)(seed >> 32));
     const int j = (int)(e & 3u);
     const uint32_t wa = c[(j >> 1) * 2], wb = c[(j >> 1) * 2 + 1];
@@ -67,7 +68,8 @@ RAD_PHILOX_HD float rad_philox_normal_s(uint64_t seed, uint64_t stream, uint64_t
  * it. */
 RAD_PHILOX_HD float rad_philox_uniform_s(uint64_t seed, uint64_t stream, uint64_t e) {
     const uint64_t g = e >> 2;
-    uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream, (uint32_t)(stream >> 32) };
+    uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream,
+                      (uint32_t)(stream >> 32) };
     rad_philox4x32_10(c, (uint32_t)seed, (uint32_t)(seed >> 32));
     return ((float)(c[e & 3u] >> 8) + 0.5f) * (1.0f / 16777216.0f);
 }

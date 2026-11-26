@@ -97,24 +97,30 @@ RadMtpCoupleDraw make_draw(uint64_t seed, uint64_t base, uint64_t seq, int card,
     return d;
 }
 
+/* A device other than the host backend is present. */
+bool have_card() {
+    RadDeviceProps dp{};
+    return rad_dev_count() >= 1 && rad_dev_props(0, &dp) == RAD_OK && !dp.is_host_backend;
+}
+
 }  /* namespace */
 
-/* The queue's scratch is sized by a kernel's private segment times every lane it may run: couple_verify
- * once carried the block row's planes (17.8 KB a lane, with a workgroup of 128 lanes of which one
- * works) and the first sampled tree (>= 5 rows) faulted the queue with OUT_OF_RESOURCES once
- * HSA_NO_SCRATCH_RECLAIM kept the scratch resident. Pin the code object: the workgroup kernel keeps
- * a small private segment (the serial helper that needs the big one is a kernel of its own). Runs
- * without a card: it reads the plugin's own code object. */
+/* The queue's scratch is sized by a kernel's private segment times every lane it may run. A
+ * couple_verify carrying the block row's planes would need 17.8 KB a lane in a workgroup of 128
+ * lanes of which one works, and a sampled tree of five or more rows would fault the queue with
+ * OUT_OF_RESOURCES once HSA_NO_SCRATCH_RECLAIM keeps the scratch resident. So the code object is
+ * pinned: the workgroup kernel keeps a small private segment (the serial helper that needs the big
+ * one is a kernel of its own). Runs without a card: it reads the plugin's own code object. */
 TEST(the_verify_kernels_ask_for_little_scratch) {
     FILE* f = std::fopen(RAD_SPECHUB_LIB, "rb");
-    if (!f) { fprintf(stderr, "  SKIP: %s not readable\n", RAD_SPECHUB_LIB); return; }
+    if (!f) ARTIFACT_MISSING(RAD_SPECHUB_LIB);
     std::vector<unsigned char> img;
     unsigned char buf[65536];
     for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) img.insert(img.end(), buf, buf + n);
     std::fclose(f);
     static const char kMagic[] = "__CLANG_OFFLOAD_BUNDLE__";
     auto at = std::search(img.begin(), img.end(), kMagic, kMagic + sizeof kMagic - 1);
-    if (at == img.end()) { fprintf(stderr, "  SKIP: no device code in the plugin\n"); return; }
+    if (at == img.end()) SKIP("no device code in the plugin");
     const void* co = nullptr;
     size_t cosz = 0;
     std::string why;
@@ -143,16 +149,13 @@ TEST(the_verify_kernels_ask_for_little_scratch) {
 }
 
 TEST(the_device_verify_row_agrees_with_the_host_row) {
-    RadDeviceProps dp{};
-    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) {
-        fprintf(stderr, "  SKIP %s: no card\n", ::radtest::current());
-        return;
-    }
+    if (!have_card()) SKIP("no card");
     Plugin pl;
-    if (!pl.open(RAD_SPECHUB_LIB)) { fprintf(stderr, "  SKIP: %s did not load\n", RAD_SPECHUB_LIB); return; }
+    if (!pl.open(RAD_SPECHUB_LIB))
+        ARTIFACT_MISSING(std::string(RAD_SPECHUB_LIB) + " does not load");
     const RadKernelInfo* dver = pl.row("spechub_mtp_couple_verify");
     const RadKernelInfo* hver = pl.row("ref_mtp_couple_verify");
-    if (!dver) { fprintf(stderr, "  SKIP: the plugin has no device rows\n"); return; }
+    if (!dver) SKIP("the plugin has no device rows");
     REQUIRE(hver);
     RadStream s{};
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
@@ -246,16 +249,13 @@ TEST(the_device_verify_row_agrees_with_the_host_row) {
  * several chunks of the workgroup) and 1100 (past the LDS plane: one thread runs the helper) slots,
  * with holes; tokens must agree row for row, rows the block does not decide keep their sentinel. */
 TEST(the_device_block_verify_agrees_with_the_host_row) {
-    RadDeviceProps dp{};
-    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) {
-        fprintf(stderr, "  SKIP %s: no card\n", ::radtest::current());
-        return;
-    }
+    if (!have_card()) SKIP("no card");
     Plugin pl;
-    if (!pl.open(RAD_SPECHUB_LIB)) { fprintf(stderr, "  SKIP: %s did not load\n", RAD_SPECHUB_LIB); return; }
+    if (!pl.open(RAD_SPECHUB_LIB))
+        ARTIFACT_MISSING(std::string(RAD_SPECHUB_LIB) + " does not load");
     const RadKernelInfo* dver = pl.row("spechub_mtp_couple_verify");
     const RadKernelInfo* hver = pl.row("ref_mtp_couple_verify");
-    if (!dver) { fprintf(stderr, "  SKIP: the plugin has no device rows\n"); return; }
+    if (!dver) SKIP("the plugin has no device rows");
     REQUIRE(hver);
     RadStream s{};
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
@@ -354,16 +354,13 @@ TEST(the_device_block_verify_agrees_with_the_host_row) {
  * do not depend on the order) and runs the header's walk over it, so the tokens must be identical;
  * planes of 12, 1024 and 1100 slots. */
 TEST(the_device_traversal_verify_agrees_with_the_host_row) {
-    RadDeviceProps dp{};
-    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) {
-        fprintf(stderr, "  SKIP %s: no card\n", ::radtest::current());
-        return;
-    }
+    if (!have_card()) SKIP("no card");
     Plugin pl;
-    if (!pl.open(RAD_SPECHUB_LIB)) { fprintf(stderr, "  SKIP: %s did not load\n", RAD_SPECHUB_LIB); return; }
+    if (!pl.open(RAD_SPECHUB_LIB))
+        ARTIFACT_MISSING(std::string(RAD_SPECHUB_LIB) + " does not load");
     const RadKernelInfo* dtr = pl.row("spechub_mtp_trav_verify");
     const RadKernelInfo* htr = pl.row("ref_mtp_trav_verify");
-    if (!dtr) { fprintf(stderr, "  SKIP: the plugin has no traversal device row\n"); return; }
+    if (!dtr) SKIP("the plugin has no traversal device row");
     REQUIRE(htr);
     RadStream s{};
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
@@ -468,16 +465,13 @@ TEST(the_device_traversal_verify_agrees_with_the_host_row) {
  * lack draft tokens, and planes of 24, 1024 (the sampler's), 2048 (two passes a lane), 1100 and 4100
  * slots (no whole chunks; the fixed-point unit one bit coarser) with holes and -inf entries. */
 TEST(the_device_traversal_verify_agrees_with_the_host_row_on_mixed_requests) {
-    RadDeviceProps dp{};
-    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) {
-        fprintf(stderr, "  SKIP %s: no card\n", ::radtest::current());
-        return;
-    }
+    if (!have_card()) SKIP("no card");
     Plugin pl;
-    if (!pl.open(RAD_SPECHUB_LIB)) { fprintf(stderr, "  SKIP: %s did not load\n", RAD_SPECHUB_LIB); return; }
+    if (!pl.open(RAD_SPECHUB_LIB))
+        ARTIFACT_MISSING(std::string(RAD_SPECHUB_LIB) + " does not load");
     const RadKernelInfo* dtr = pl.row("spechub_mtp_trav_verify");
     const RadKernelInfo* htr = pl.row("ref_mtp_trav_verify");
-    if (!dtr) { fprintf(stderr, "  SKIP: the plugin has no traversal device row\n"); return; }
+    if (!dtr) SKIP("the plugin has no traversal device row");
     REQUIRE(htr);
     RadStream s{};
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
@@ -620,8 +614,7 @@ TEST(the_device_traversal_verify_agrees_with_the_host_row_on_mixed_requests) {
  * or 1024 (top_k 0). Eight different blocks are cycled. */
 TEST(block_verify_microbenchmark) {
     if (!getenv("RAD_BLOCK_BENCH")) return;
-    RadDeviceProps dp{};
-    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) return;
+    if (!have_card()) return;
     Plugin pl;
     const char* lib = getenv("RAD_BENCH_LIB") ? getenv("RAD_BENCH_LIB") : RAD_SPECHUB_LIB;
     REQUIRE(pl.open(lib));
@@ -792,8 +785,7 @@ void fill_trav_req(TravReq* x, const TravShape& sh, int NC, int live, int kind, 
 
 TEST(trav_verify_microbenchmark) {
     if (!getenv("RAD_TRAV_BENCH")) return;
-    RadDeviceProps dp{};
-    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) return;
+    if (!have_card()) return;
     Plugin pl, plr;
     const char* lib = getenv("RAD_BENCH_LIB") ? getenv("RAD_BENCH_LIB") : RAD_SPECHUB_LIB;
     REQUIRE(pl.open(lib));

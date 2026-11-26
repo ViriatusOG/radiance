@@ -21,10 +21,6 @@ using ojson = Json;
 
 namespace {
 
-/* The whitespace set std::isspace accepts in the C locale, which is the set the format's grammar
- * skips between tags. */
-inline bool is_ws(unsigned char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
-
 /* The whitespace a reasoning block may consist of and still count as empty. */
 inline bool is_blank(unsigned char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
 
@@ -925,6 +921,154 @@ struct Tool {
     bool has_props = false;
     bool has_required = false;
 };
+
+/* DeepSeek-V4.1's unconstrained output has been seen to write DSML tags with the typed argument
+ * tags but without the `invoke` prefix on the first call (`<skill_view">`), or with a bare
+ * `<invoke name="...">` instead of the format's `name_prefix`. The grammar only opens a call at
+ * `name_prefix`, so such a reply otherwise becomes plain content: no `tool_calls`, finish reason
+ * `stop`. This fallback reads the tags after the reply is complete, when the normal parser found
+ * no call at all. It accepts the format's DSML marker on any tag, whitespace around it, a bare
+ * `<tool_name">` opener, and both `string="true"`/`string="false"` argument tags. It is a reply
+ * parser concern, not a per-model special case: any format declaring tools and typed tags can
+ * reach it, and it only runs when the request sent tools and the normal read found no calls. */
+static constexpr std::string_view kDsml = "\xEF\xBD\x9C" "DSML" "\xEF\xBD\x9C";
+
+static bool tool_declared(const std::vector<Tool>& tools, std::string_view name) {
+    for (const Tool& t : tools)
+        if (t.name == name) return true;
+    return false;
+}
+
+/* At `at` a call opener: `<... invoke name="NAME">`, or the observed bare `<NAME">`. `body` is
+ * just after the tag's `>`. */
+static bool loose_call_open(std::string_view s, size_t at, const std::vector<Tool>& tools,
+                            std::string& name, size_t& body) {
+    if (at >= s.size() || s[at] != '<') return false;
+    size_t p = at + 1;
+    if (s.compare(p, kDsml.size(), kDsml) == 0) {
+        p += kDsml.size();
+        while (p < s.size() && is_ws((unsigned char)s[p])) ++p;
+    }
+    if (p + 7 <= s.size() && s.compare(p, 7, "invoke ") == 0) {
+        const size_t q = s.find("name=\"", p);
+        if (q == std::string_view::npos || q + 6 >= s.size()) return false;
+        const size_t e = s.find('"', q + 6);
+        if (e == std::string_view::npos) return false;
+        name.assign(s.substr(q + 6, e - (q + 6)));
+        if (!tool_declared(tools, name)) return false;
+        body = s.find('>', e);
+        return body != std::string_view::npos && ++body != 0;
+    }
+    size_t q = p;
+    while (q < s.size() && (isalnum((unsigned char)s[q]) || s[q] == '_' || s[q] == '.' ||
+                            s[q] == ':' || s[q] == '-')) ++q;
+    if (q == p) return false;
+    name.assign(s.substr(p, q - p));
+    if (!tool_declared(tools, name)) return false;
+    while (q < s.size() && is_ws((unsigned char)s[q])) ++q;
+    if (q >= s.size() || (s[q] != '>' && s[q] != '"')) return false;
+    body = s.find('>', q);
+    return body != std::string_view::npos && ++body != 0;
+}
+
+/* The argument tag after `at`: `<... parameter name="ARG" string="true|false">value</parameter>`.
+ * The value is returned with its tag removed; `is_text` follows the tag's `string` attribute. */
+static bool loose_argument(std::string_view s, size_t at, size_t end, std::string& name,
+                           std::string& value, bool& is_text) {
+    const size_t p = s.find("parameter", at);
+    if (p == std::string_view::npos || p >= end) return false;
+    const size_t q = s.find("name=\"", p);
+    if (q == std::string_view::npos || q + 6 >= end) return false;
+    const size_t e = s.find('"', q + 6);
+    if (e == std::string_view::npos || e >= end) return false;
+    name.assign(s.substr(q + 6, e - (q + 6)));
+    const size_t close = s.find('>', e);
+    if (close == std::string_view::npos || close >= end) return false;
+    size_t tail = s.find("</parameter", close + 1);
+    if (tail == std::string_view::npos)
+        tail = s.find("</" + std::string(kDsml) + " parameter", close + 1);
+    if (tail == std::string_view::npos || tail > end) return false;
+    is_text = true;
+    const size_t type = s.find("string=\"", e);
+    if (type != std::string_view::npos && type < close) {
+        const size_t type_end = s.find('"', type + 8);
+        if (type_end != std::string_view::npos && type_end < close)
+            is_text = s.compare(type + 8, type_end - (type + 8), "false") != 0;
+    }
+    value.assign(s.substr(close + 1, tail - (close + 1)));
+    return true;
+}
+
+/* Read a DSML reply the normal parser missed. Returns true and fills `msg.calls`/`msg.content`
+ * when a declared tool call was found. */
+static bool parse_loose_dsml(ReplyMessage& msg, const std::vector<Tool>& tools) {
+    const std::string_view s(msg.content);
+    size_t first = std::string_view::npos;
+    for (size_t at = s.find('<'); at != std::string_view::npos; at = s.find('<', at + 1)) {
+        std::string name;
+        size_t body = 0;
+        if (loose_call_open(s, at, tools, name, body)) { first = at; break; }
+    }
+    if (first == std::string_view::npos) return false;
+    const size_t section_end = s.find("</calls", first);
+    const size_t last_end = s.find("</invoke", first);
+    if (section_end == std::string_view::npos && last_end == std::string_view::npos) return false;
+
+    std::vector<ReplyCall> calls;
+    size_t last_call_end = first;   /* the last parsed call's `</invoke` */
+    size_t p = first;
+    while (p != std::string_view::npos && p < s.size()) {
+        std::string name;
+        size_t body = 0;
+        if (!loose_call_open(s, p, tools, name, body)) break;
+        const size_t call_end = s.find("</invoke", body);
+        if (call_end == std::string_view::npos || (section_end != std::string_view::npos && call_end > section_end)) break;
+        std::string args = "{";
+        bool first_arg = true;
+        size_t arg = body;
+        while (true) {
+            std::string aname, avalue;
+            bool is_text = true;
+            if (!loose_argument(s, arg, call_end, aname, avalue, is_text)) break;
+            if (!first_arg) args += ',';
+            args += json_quote(aname);
+            args += ':';
+            if (is_text) {
+                args += json_quote(avalue);
+            } else {
+                if (Json::accept(avalue)) args += avalue;
+                else args += json_quote(avalue);
+            }
+            first_arg = false;
+            const size_t gt = s.find('>', s.find("</parameter", arg) == std::string_view::npos
+                                            ? s.find("</" + std::string(kDsml) + " parameter", arg)
+                                            : s.find("</parameter", arg));
+            if (gt == std::string_view::npos) break;
+            arg = gt + 1;
+        }
+        args += '}';
+        ReplyCall c;
+        c.name = name;
+        c.arguments = std::move(args);
+        c.closed = true;
+        calls.push_back(std::move(c));
+        last_call_end = call_end;
+        const size_t next_call = s.find('<', call_end + 8);
+        if (next_call == std::string_view::npos || (section_end != std::string_view::npos && next_call > section_end)) break;
+        p = next_call;
+    }
+    if (calls.empty()) return false;
+    /* The calls are cut out, together with their section's close when there is one. */
+    size_t end = s.find('>', section_end != std::string_view::npos ? section_end : last_call_end);
+    end = end == std::string_view::npos ? s.size() : end + 1;
+    msg.content = std::string(s.substr(0, first)) + std::string(s.substr(end));
+    size_t b = 0, e2 = msg.content.size();
+    while (b < e2 && is_ws((unsigned char)msg.content[b])) ++b;
+    while (e2 > b && is_ws((unsigned char)msg.content[e2 - 1])) --e2;
+    msg.content = msg.content.substr(b, e2 - b);
+    msg.calls = std::move(calls);
+    return true;
+}
 }  /* namespace */
 
 struct ReplyParser::Impl {
@@ -950,7 +1094,12 @@ const ChatFormat& ReplyParser::format() const { return impl_->fmt->format(); }
 size_t ReplyParser::hold_bound() const {
     size_t term = 0;
     for (const std::string& t : impl_->terminators) term = std::max(term, t.size());
-    return impl_->fmt->impl().longest + std::max(term, kFenceOpen.size()) + ValueOut::kHead + 1 +
+    /* The message frame holds a header and the opener after it, or name_suffix. */
+    const ReplyFormat::Impl& F = impl_->fmt->impl();
+    size_t frame = 0;
+    if (!F.f.message_open.empty())
+        frame = F.f.message_open.size() + std::max(F.open_core.size(), F.f.content_open.size());
+    return F.longest + frame + std::max(term, kFenceOpen.size()) + ValueOut::kHead + 1 +
            3 * 3 + ValueOut::kScalar;
 }
 
@@ -960,6 +1109,7 @@ ReasoningMarkers ReplyParser::reasoning() const {
     if (!F.f.has_reasoning()) return m;
     m.open  = F.open_core;
     m.close = F.close_core;
+    m.frame = F.f.message_open;
     /* `tail` starts at the opener when the prompt holds one; a prompt that also closed the block
      * (thinking off) leaves the reply after it. With no opener the stream starts in the block
      * (after_lead). */
@@ -1154,6 +1304,7 @@ struct ReplyStream::Impl {
         content.init(P.terminators.empty() ? nullptr : &P.terms, &P.terminators);
         st = P.pure ? St::Text : St::LeadWs;
         think_hold_on = P.calls && !F.f.reasoning_breaks.empty();
+        frame_init();
         if (P.anywhere) {
             text_dfa = P.calls ? &F.text_think : &F.think_only;
             n_open = P.calls ? F.openers.size() : 0;
@@ -1665,7 +1816,7 @@ struct ReplyStream::Impl {
             0, name.size() - F.ns_core.size()));
         ReplyCall c;
         c.name.assign(nm);
-        c.at = att_at >= P.tail.size() ? att_at - P.tail.size() : 0;
+        c.at = fr_raw(att_at >= P.tail.size() ? att_at - P.tail.size() : 0);
         c.content_at = msg.content.size();
         c.content_held = content.pending();
         msg.calls.push_back(std::move(c));
@@ -2934,6 +3085,347 @@ struct ReplyStream::Impl {
         if (t && t->has_required && argc == 0) lenient();
     }
 
+
+    /* ------------------------------------------------------------ the message frame
+     *
+     * Read ahead of everything else, for a format whose messages open with a header
+     * (ChatFormat::message_open) or whose call object is an envelope (object_args_key). It
+     * rewrites the reply into the shape the rest of the parser reads: a header before the
+     * reasoning opener or the content header is dropped (the reasoning opener stays, the content
+     * header goes with it), a header before anything else is passed on as the call's
+     * name_prefix, and an envelope after a call's name is cut down to its arguments object. It
+     * holds a header and the opener after it, or an envelope's head (`{"name":"f","args":`) or
+     * tail (`}`), each bounded; everything else goes straight through, so the arguments still
+     * stream. The bytes it drops are logged, so a call's position is still the reply's
+     * (ReplyCall::at). */
+    enum class Fr : uint8_t { Scan, Head, EnvHead, EnvValue, EnvTail };
+    Fr          fr = Fr::Scan;
+    std::string fh;                    /* the bytes held */
+    std::string fpass;                 /* bytes passed on, not yet read by the parser */
+    bool        fr_on = false, fr_env = false;
+    bool        fr_lead[256] = {};     /* a byte that may begin the header or name_suffix */
+    size_t      fr_out = 0, fr_dropped = 0;
+    std::vector<std::pair<size_t, size_t>> fr_drops;   /* (offset passed on, dropped so far) */
+    /* the envelope: whether its key came first, and how far its arguments have been read */
+    bool        env_reversed = false;
+    int         ev_depth = 0;
+    bool        ev_started = false, ev_str = false, ev_esc = false, et_str = false, et_esc = false;
+    size_t      ev_end = 0;            /* bytes of call_end's core matched outside a string */
+    static constexpr size_t kMaxEnvHead = kMaxLooseName + 64;
+
+    void frame_init() {
+        const std::string& h = F.f.message_open;
+        fr_env = P.calls && F.f.args_envelope();
+        fr_on = !h.empty() || fr_env;
+        if (!h.empty()) fr_lead[(unsigned char)h[0]] = true;
+        if (fr_env) fr_lead[(unsigned char)F.f.name_suffix[0]] = true;
+    }
+    void fr_pass(std::string_view s) { fpass.append(s); }
+    void fr_flush() {
+        if (fpass.empty()) return;
+        std::string s;
+        s.swap(fpass);
+        feed(s);
+        fr_out += s.size();
+    }
+    void fr_drop(size_t n) {
+        fr_flush();
+        if (n == 0) return;
+        fr_dropped += n;
+        fr_drops.emplace_back(fr_out, fr_dropped);
+    }
+    /* A position in what was passed on (after the prompt's tail), as a position in the reply. */
+    size_t fr_raw(size_t at) const {
+        for (size_t i = fr_drops.size(); i-- > 0;)
+            if (fr_drops[i].first <= at) return at + fr_drops[i].second;
+        return at;
+    }
+    static bool starts(std::string_view lit, std::string_view s) {
+        return !lit.empty() && s.size() <= lit.size() && lit.compare(0, s.size(), s) == 0;
+    }
+    void fr_name_check(const std::string& quoted) {
+        std::string nm = quoted;
+        try {
+            const Json v = Json::parse(quoted);
+            if (v.is_string()) nm = v.get<std::string>();
+        } catch (...) {
+        }
+        if (msg.calls.empty() || msg.calls.back().name != nm) lenient();
+    }
+    void fr_again(const std::string& s) {
+        for (char x : s) fr_byte(x);
+    }
+
+    void frame_feed(std::string_view in) {
+        size_t i = 0;
+        while (i < in.size()) {
+            if (fr == Fr::Scan && fh.empty()) {
+                size_t j = i;
+                while (j < in.size() && !fr_lead[(unsigned char)in[j]]) ++j;
+                fr_pass(in.substr(i, j - i));
+                i = j;
+                if (i == in.size()) break;
+            }
+            fr_byte(in[i++]);
+        }
+        fr_flush();
+    }
+
+    void frame_finish() {
+        switch (fr) {
+        case Fr::Scan: case Fr::Head: case Fr::EnvHead:
+            /* an unfinished header or envelope head: as written */
+            fr_pass(fh);
+            break;
+        case Fr::EnvTail:
+            fr_drop(fh.size());
+            lenient();
+            break;
+        case Fr::EnvValue:
+            break;
+        }
+        fh.clear();
+        fr = Fr::Scan;
+        fr_flush();
+    }
+
+    /* The envelope's head as held: still undecided, or what it turned out to be. */
+    enum class Eh : uint8_t { Need, Canonical, KeyFirst, NameOnly, NameThenOther, Plain };
+    Eh env_head(std::string* nm, size_t* other_at) const {
+        const std::string& s = fh;
+        size_t i = 0;
+        auto ws = [&] { while (i < s.size() && is_ws((unsigned char)s[i])) ++i; };
+        /* a JSON string at s[i]: 1 read into *out, 0 not complete yet */
+        auto str = [&](std::string* out) {
+            bool esc = false;
+            for (size_t j = i + 1; j < s.size(); ++j) {
+                if (esc) esc = false;
+                else if (s[j] == '\\') esc = true;
+                else if (s[j] == '"') { *out = s.substr(i, j + 1 - i); i = j + 1; return 1; }
+            }
+            return 0;
+        };
+        const std::string qkey = "\"" + F.f.object_args_key + "\"";
+        ws();
+        if (i == s.size()) return Eh::Need;
+        if (s[i] != '{') return Eh::Plain;
+        ++i; ws();
+        if (i == s.size()) return Eh::Need;
+        if (s[i] != '"') return Eh::Plain;
+        std::string k;
+        if (!str(&k)) return Eh::Need;
+        const bool is_name = k == "\"name\"", is_key = k == qkey;
+        if (!is_name && !is_key) return Eh::Plain;
+        ws();
+        if (i == s.size()) return Eh::Need;
+        if (s[i] != ':') return Eh::Plain;
+        ++i;
+        if (is_key) return Eh::KeyFirst;
+        ws();
+        if (i == s.size()) return Eh::Need;
+        if (s[i] != '"') return Eh::Plain;
+        if (!str(nm)) return Eh::Need;
+        ws();
+        if (i == s.size()) return Eh::Need;
+        if (s[i] == '}') return Eh::NameOnly;
+        if (s[i] != ',') return Eh::Plain;
+        ++i; ws();
+        if (i == s.size()) return Eh::Need;
+        if (s[i] != '"') return Eh::Plain;
+        *other_at = i;
+        if (!str(&k)) return Eh::Need;
+        if (k != qkey) return Eh::NameThenOther;
+        ws();
+        if (i == s.size()) return Eh::Need;
+        return s[i] == ':' ? Eh::Canonical : Eh::NameThenOther;
+    }
+
+    void env_start(bool reversed) {
+        fh.clear();
+        env_reversed = reversed;
+        ev_depth = 0;
+        ev_started = ev_str = ev_esc = et_str = et_esc = false;
+        ev_end = 0;
+        fr = Fr::EnvValue;
+    }
+
+    void fr_byte(char ch) {
+        const unsigned char c = (unsigned char)ch;
+        const std::string& h = F.f.message_open;
+        switch (fr) {
+        case Fr::Scan: {
+            fh.push_back(ch);
+            if (!h.empty() && fh == h) { fr = Fr::Head; return; }
+            if (fr_env && fh == F.f.name_suffix) {
+                fr_pass(fh);
+                fh.clear();
+                fr_flush();
+                /* a call's name ended: its envelope follows */
+                if (st == St::ObjStart) fr = Fr::EnvHead;
+                return;
+            }
+            if (starts(h, fh) || (fr_env && starts(F.f.name_suffix, fh))) return;
+            const std::string again = fh.substr(1);
+            fr_pass(std::string_view(fh).substr(0, 1));
+            fh.clear();
+            fr_again(again);
+            return;
+        }
+        case Fr::Head: {
+            fh.push_back(ch);
+            const std::string_view rest = std::string_view(fh).substr(h.size());
+            const std::string& ro = F.open_core;
+            const std::string& co = F.f.content_open;
+            if (!ro.empty() && rest == ro) {
+                fr_drop(h.size());
+                fr_pass(ro);
+                fh.clear();
+                fr = Fr::Scan;
+                return;
+            }
+            if (!co.empty() && rest == co) {
+                fr_drop(fh.size());
+                fh.clear();
+                fr = Fr::Scan;
+                return;
+            }
+            if (starts(ro, rest) || starts(co, rest)) return;
+            /* A header before anything else is read as written: a call's opener. */
+            const std::string again(rest);
+            fr_pass(h);
+            fh.clear();
+            fr = Fr::Scan;
+            fr_again(again);
+            return;
+        }
+        case Fr::EnvHead: {
+            if (fh.empty() && is_ws(c)) { fr_pass(std::string_view(&ch, 1)); return; }
+            fh.push_back(ch);
+            std::string nm;
+            size_t other = 0;
+            switch (env_head(&nm, &other)) {
+            case Eh::Need:
+                if (fh.size() > kMaxEnvHead) {
+                    lenient();
+                    fr_pass(fh);
+                    fh.clear();
+                    fr = Fr::Scan;
+                }
+                return;
+            case Eh::Canonical:
+                fr_name_check(nm);
+                fr_drop(fh.size());
+                env_start(false);
+                return;
+            case Eh::KeyFirst:
+                lenient();
+                fr_drop(fh.size());
+                env_start(true);
+                return;
+            case Eh::NameOnly:
+                /* named, with no arguments */
+                lenient();
+                fr_name_check(nm);
+                fr_drop(fh.size() - 2);
+                fr_pass("{}");
+                break;
+            case Eh::NameThenOther: {
+                /* named, then the arguments' own members: the object without its name */
+                lenient();
+                fr_name_check(nm);
+                const std::string keep = "{" + fh.substr(other);
+                fr_drop(fh.size() - keep.size());
+                fr_pass(keep);
+                break;
+            }
+            case Eh::Plain:
+                /* no envelope: the object is the arguments */
+                lenient();
+                fr_pass(fh);
+                break;
+            }
+            fh.clear();
+            fr = Fr::Scan;
+            return;
+        }
+        case Fr::EnvValue: {
+            const std::string& ec = F.end_core;
+            if (!ev_str && !ec.empty()) {
+                ev_end = c == (unsigned char)ec[ev_end] ? ev_end + 1
+                                                        : (c == (unsigned char)ec[0] ? 1 : 0);
+                if (ev_end == ec.size()) {
+                    /* The call ended inside its arguments: the envelope is left open, and the
+                     * arguments' reader says what the object was. */
+                    lenient();
+                    fr_pass(std::string_view(&ch, 1));
+                    fr = Fr::Scan;
+                    return;
+                }
+            }
+            if (!ev_started) {
+                if (is_ws(c)) { fr_pass(std::string_view(&ch, 1)); return; }
+                ev_started = true;
+            }
+            if (ev_str) {
+                if (ev_esc) ev_esc = false;
+                else if (c == '\\') ev_esc = true;
+                else if (c == '"') ev_str = false;
+                fr_pass(std::string_view(&ch, 1));
+                return;
+            }
+            if ((c == '}' || c == ']' || c == ',') && ev_depth == 0) {
+                /* a scalar, or nothing, ended by the envelope's own punctuation */
+                fr = Fr::EnvTail;
+                fr_byte(ch);
+                return;
+            }
+            fr_pass(std::string_view(&ch, 1));
+            if (c == '"') ev_str = true;
+            else if (c == '{' || c == '[') ++ev_depth;
+            else if ((c == '}' || c == ']') && --ev_depth == 0) fr = Fr::EnvTail;
+            return;
+        }
+        case Fr::EnvTail: {
+            fh.push_back(ch);
+            if (et_str) {
+                if (et_esc) et_esc = false;
+                else if (c == '\\') et_esc = true;
+                else if (c == '"') et_str = false;
+                return;
+            }
+            if (c == '"') { et_str = true; return; }
+            const std::string& ec = F.end_core;
+            if (!ec.empty() && fh.size() >= ec.size() &&
+                fh.compare(fh.size() - ec.size(), ec.size(), ec) == 0) {
+                /* the call's end with the envelope unclosed */
+                lenient();
+                fr_drop(fh.size() - ec.size());
+                fr_pass(ec);
+                fh.clear();
+                fr = Fr::Scan;
+                return;
+            }
+            if (c == '}') {
+                /* The envelope's close: what stood before it is the envelope's, not the
+                 * arguments'. Only a close alone is the grammar's. */
+                size_t k = 0;
+                while (k < fh.size() && is_ws((unsigned char)fh[k])) ++k;
+                if (env_reversed || k + 1 != fh.size()) lenient();
+                fr_drop(fh.size());
+                fh.clear();
+                fr = Fr::Scan;
+                return;
+            }
+            if (fh.size() > kMaxEnvHead) {
+                lenient();
+                fr_drop(fh.size());
+                fh.clear();
+            }
+            return;
+        }
+        }
+    }
+
     /* ------------------------------------------------------------ driving */
 
     /* Read `in`, whose first byte is at `at` in the stream. */
@@ -3078,6 +3570,10 @@ struct ReplyStream::Impl {
         if (think_hold_on) flush_think_hold(true);
         if (!think_text) think_pend.clear();
         content.finish(msg.content);
+        /* The grammar opens a call only at name_prefix; an unconstrained DeepSeek reply can write
+         * the typed tags without it. Recover that reply here, after content has been read, so a
+         * finished message carries structured calls rather than markup. */
+        if (P.calls && msg.calls.empty()) parse_loose_dsml(msg, P.tools);
         if (cur >= 0) publish(cur, true);
         publish(0, true);
         publish(1, true);
@@ -3099,7 +3595,10 @@ void ReplyStream::feed(std::string_view bytes, std::vector<ReplyEvent>* out) {
     if (m.finished) return;
     m.out = out;
     m.feed_tail();
-    if (!bytes.empty()) m.feed(bytes);
+    if (!bytes.empty()) {
+        if (m.fr_on) m.frame_feed(bytes);
+        else m.feed(bytes);
+    }
     if (m.cur >= 0) m.publish(m.cur, false);
     m.out = nullptr;
 }
@@ -3109,6 +3608,7 @@ void ReplyStream::finish(std::vector<ReplyEvent>* out) {
     if (m.finished) return;
     m.out = out;
     m.feed_tail();
+    if (m.fr_on) m.frame_finish();
     m.finish_all();
     m.finished = true;
     m.out = nullptr;
@@ -3140,10 +3640,14 @@ ReplyHeld ReplyStream::held() const {
     h.delimiter = m.hold.size() + lhold + m.val.held() + m.content.held_other() +
                   (m.msg.reasoning.size() - m.sent_r) + (m.msg.content.size() - m.sent_c) +
                   (m.msg.calls.empty() ? 0 : m.msg.calls.back().arguments.size() - m.sent_a) +
-                  m.srun.size() + m.qtail.size();
+                  m.srun.size() + m.qtail.size() +
+                  (m.fr == ReplyStream::Impl::Fr::Scan || m.fr == ReplyStream::Impl::Fr::Head
+                       ? m.fh.size() : 0);
     h.space = m.content.held_space() + m.think_pend.size();
     h.structure = m.att.size() + m.name.size() + m.vheld.size() + m.val.held_container() +
-                  m.jhi.size();
+                  m.jhi.size() +
+                  (m.fr == ReplyStream::Impl::Fr::EnvHead || m.fr == ReplyStream::Impl::Fr::EnvTail
+                       ? m.fh.size() : 0);
     return h;
 }
 

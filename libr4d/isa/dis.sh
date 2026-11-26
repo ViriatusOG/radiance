@@ -1,7 +1,7 @@
 #!/bin/sh
 # Disassemble ONE kernel out of one translation unit, into $ISA_OUT/one.s.
 #
-#   BUILD=... dis.sh r4d_gemm_fp8a8 gemm_8a8_prefill_kernelILb0E
+#   BUILD=... dis.sh r4d_gemm_i8a8 gemm_8a8_prefill_kernelILi0ELj128E
 #
 # The pattern is a substring of the MANGLED name, which is how a template instantiation is named:
 # res.sh prints those, and the template parameter order is in the kernel declaration. llvm-objdump

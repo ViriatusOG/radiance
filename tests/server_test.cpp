@@ -69,7 +69,7 @@ TEST(oai_parses_a_full_chat_request_into_sampling_params) {
     CHECK(!r.sp.grammar.empty());          /* response_format compiled to a grammar */
     CHECK(r.tools_present);
     CHECK(r.parse_tools);
-    CHECK_EQ((int)r.prompts.size(), 1);
+    REQUIRE_EQ((int)r.prompts.size(), 1);
     CHECK_EQ(r.n_choices(), 2);
     CHECK(r.id.rfind("chatcmpl-", 0) == 0);
     /* The template ran and the prompt tokenised. */
@@ -151,7 +151,7 @@ TEST(oai_parses_a_completion_prompt_in_every_shape) {
     {
         OaiRequest r; ApiError e;
         CHECK_OK(parse_completion_request(R"({"prompt":"ab"})", f.odeps(), lim, &r, &e));
-        CHECK_EQ((int)r.prompts.size(), 1);
+        REQUIRE_EQ((int)r.prompts.size(), 1);
         CHECK_EQ((int)r.prompts[0].tokens.size(), 2);
     }
     {
@@ -163,7 +163,7 @@ TEST(oai_parses_a_completion_prompt_in_every_shape) {
     {
         OaiRequest r; ApiError e;
         CHECK_OK(parse_completion_request(R"({"prompt":[104,105]})", f.odeps(), lim, &r, &e));
-        CHECK_EQ((int)r.prompts.size(), 1);
+        REQUIRE_EQ((int)r.prompts.size(), 1);
         CHECK_EQ(r.prompts[0].text, std::string("hi"));
     }
     {
@@ -1109,7 +1109,7 @@ TEST(an_effort_the_template_refuses_is_answered_with_the_set_it_takes) {
     const json j = json::parse(f.srv->router().call("GET", "/server_info").body);
     const json& caps = j["capabilities"]["reasoning_efforts"];
     REQUIRE(caps.is_array());
-    CHECK_EQ(caps.size(), 5u);
+    REQUIRE_EQ(caps.size(), 5u);
     CHECK_EQ(caps[2].get<std::string>(), std::string("low"));
 }
 
@@ -1131,6 +1131,182 @@ TEST(a_template_that_takes_any_effort_publishes_no_set) {
                              f.odeps(), lim, &r, &e) < 0);
     CHECK_EQ(e.param, std::string("messages"));
     CHECK(has(e.message, "does not take custom"));
+}
+
+/* ------------------------------------------------------------------ "none" as a level
+ *
+ * OpenAI's "none" and "minimal" are enable_thinking = false for a template that reads the switch.
+ * Inkling 2's does not: its ladder runs none/minimal/low/medium/high/xhigh/max and a render
+ * naming no effort is written at "high". Turned into the switch, a request's "none" rendered
+ * that default. The probe tells the two kinds apart by rendering, and no model is named. */
+
+/* A template shaped like Inkling 2's: the whole ladder, a default level, no enable_thinking. */
+static void ladder_template(FakeChatTemplate* t) {
+    t->efforts = { "\"none\"", "\"minimal\"", "\"low\"", "\"medium\"", "\"high\"",
+                   "\"xhigh\"", "\"max\"" };
+    t->default_effort = "\"high\"";
+    t->reads_enable_thinking = false;
+}
+
+TEST(none_reaches_a_template_that_has_it_as_a_level) {
+    Fixture f;
+    ladder_template(&f.tmpl);
+    const std::vector<std::string> set = f.srv->probe_reasoning_efforts();
+    CHECK_EQ(set.size(), 5u);   /* the published levels are still low..max */
+    CHECK_EQ(f.srv->template_default_effort(), std::string("high"));
+    const std::vector<std::string>& off = f.srv->template_off_efforts();
+    REQUIRE_EQ(off.size(), 2u);
+    CHECK_EQ(off[0], std::string("none"));
+    CHECK_EQ(off[1], std::string("minimal"));
+
+    OaiLimits lim = f.limits();
+    lim.reasoning_efforts = set;
+    lim.template_off_efforts = off;
+    /* Every spelling of the effort; enable_thinking stays as it was, since "minimal" may still
+     * reason and the reply is parsed by that field. */
+    for (const char* extra : { R"("reasoning_effort":"none")", R"("reasoning":{"effort":"none"})" }) {
+        const OaiRequest r = chat_with(f, lim, extra);
+        CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"none\""));
+        CHECK(f.tmpl.last_opt.enable_thinking);
+        REQUIRE(!r.prompts.empty());
+        CHECK(has(r.prompts[0].text, "[reasoning_effort=\"none\"]"));
+        CHECK(!has(r.prompts[0].text, "high"));
+    }
+    chat_with(f, lim, R"("reasoning_effort":"minimal")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"minimal\""));
+    CHECK(f.tmpl.last_opt.enable_thinking);
+    /* A request naming none still gets the template's own default. */
+    chat_with(f, lim, "");
+    CHECK(!f.tmpl.last_opt.template_kwargs.count("reasoning_effort"));
+
+    /* An explicit chat_template_kwargs entry wins over the top-level word. */
+    chat_with(f, lim, R"("reasoning_effort":"none","chat_template_kwargs":{"reasoning_effort":"low"})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"low\""));
+    /* And the kwargs spelling of "none" is the template's, as it always was. */
+    chat_with(f, lim, R"("chat_template_kwargs":{"reasoning_effort":"none"})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"none\""));
+
+    /* The map can name the word, in either spelling of the request. */
+    lim.reasoning_effort_map = { { "low", "none" }, { "none", "medium" } };
+    for (const char* extra : { R"("reasoning_effort":"low")",
+                               R"("chat_template_kwargs":{"reasoning_effort":"low"})" }) {
+        chat_with(f, lim, extra);
+        CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"none\""));
+        CHECK(f.tmpl.last_opt.enable_thinking);
+    }
+    chat_with(f, lim, R"("reasoning_effort":"none")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"medium\""));
+    lim.reasoning_effort_map.clear();
+
+    /* The 400 for a word outside the set no longer says the two words turn thinking off. */
+    OaiRequest r;
+    ApiError e;
+    CHECK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],
+                                 "reasoning_effort":"ultra"})", f.odeps(), lim, &r, &e) < 0);
+    CHECK_EQ(e.code, std::string("unsupported_value"));
+    CHECK(has(e.message, "levels of its own"));
+    CHECK(!has(e.message, "turn thinking off"));
+
+    /* A render refused for another reason is not blamed on a passed "none". */
+    f.tmpl.refuse_kwarg = "custom";
+    CHECK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],
+                                 "reasoning_effort":"none","chat_template_kwargs":{"custom":1}})",
+                             f.odeps(), lim, &r, &e) < 0);
+    CHECK_EQ(e.param, std::string("messages"));
+    CHECK(has(e.message, "does not take custom"));
+    f.tmpl.refuse_kwarg.clear();
+
+    /* /server_info lists the same words either way: a client may send all seven. */
+    const json j = json::parse(f.srv->router().call("GET", "/server_info").body);
+    CHECK_EQ(j["capabilities"]["reasoning_efforts"].size(), 7u);
+}
+
+/* The deployment's default, --reasoning-effort none: the level on a ladder template, the switch
+ * on the other kind, and in both dropped by a request that says anything about thinking. */
+TEST(a_default_of_none_is_the_templates_level_or_the_switch) {
+    {
+        Fixture f;
+        ladder_template(&f.tmpl);
+        f.srv->probe_reasoning_efforts();
+        OaiLimits lim = f.limits();
+        lim.template_off_efforts = f.srv->template_off_efforts();
+        lim.default_reasoning_effort = "none";
+        chat_with(f, lim, "");
+        CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"none\""));
+        CHECK(f.tmpl.last_opt.enable_thinking);
+        chat_with(f, lim, R"("reasoning_effort":"low")");
+        CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"low\""));
+        chat_with(f, lim, R"("chat_template_kwargs":{"reasoning_effort":"max"})");
+        CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"max\""));
+        /* A caller asking for thinking is not answered with the deployment's none. */
+        chat_with(f, lim, R"("enable_thinking":true)");
+        CHECK(!f.tmpl.last_opt.template_kwargs.count("reasoning_effort"));
+    }
+    {
+        Fixture f;
+        f.tmpl.efforts = { "\"xhigh\"", "\"medium\"", "\"low\"" };
+        f.srv->probe_reasoning_efforts();
+        CHECK(f.srv->template_off_efforts().empty());
+        OaiLimits lim = f.limits();
+        lim.default_reasoning_effort = "none";
+        chat_with(f, lim, "");
+        CHECK(!f.tmpl.last_opt.enable_thinking);
+        CHECK(!f.tmpl.last_opt.template_kwargs.count("reasoning_effort"));
+        chat_with(f, lim, R"("enable_thinking":true)");
+        CHECK(f.tmpl.last_opt.enable_thinking);
+    }
+}
+
+/* A template that reads enable_thinking renders "none" and "minimal" exactly as before, whatever
+ * its effort set: its own (Qwen3.8's), any word, or even a ladder that has the two words. And a
+ * word that the template takes but renders as no word is not shown to be a level. */
+TEST(none_stays_the_thinking_switch_where_the_template_reads_it) {
+    Fixture f;
+    f.tmpl.efforts = { "\"xhigh\"", "\"medium\"", "\"low\"" };
+    f.tmpl.default_effort = "\"xhigh\"";
+    f.srv->probe_reasoning_efforts();
+    CHECK(f.srv->template_off_efforts().empty());
+    OaiLimits lim = f.limits();
+    lim.template_off_efforts = f.srv->template_off_efforts();
+    for (const char* w : { "none", "minimal" }) {
+        const OaiRequest r = chat_with(f, lim, std::string(R"("reasoning_effort":")") + w + "\"");
+        CHECK(!f.tmpl.last_opt.enable_thinking);
+        CHECK(!f.tmpl.last_opt.template_kwargs.count("reasoning_effort"));
+        REQUIRE(!r.prompts.empty());
+        CHECK_EQ(r.prompts[0].text,
+                 std::string("[nothink][reasoning_effort=\"xhigh\"]<user>hi<assistant>"));
+    }
+    const json j = json::parse(f.srv->router().call("GET", "/server_info").body);
+    CHECK_EQ(j["capabilities"]["reasoning_efforts"].size(), 5u);
+
+    /* Any word, switch read: the default fake. */
+    Fixture any;
+    any.srv->probe_reasoning_efforts();
+    CHECK(any.srv->template_off_efforts().empty());
+
+    /* The whole ladder and the switch too: the switch is what the server has always sent. */
+    Fixture both;
+    ladder_template(&both.tmpl);
+    both.tmpl.reads_enable_thinking = true;
+    both.srv->probe_reasoning_efforts();
+    CHECK(both.srv->template_off_efforts().empty());
+
+    /* No switch, and only "none" on the ladder: "minimal" is refused, so it is not passed. */
+    Fixture one;
+    one.tmpl.efforts = { "\"none\"", "\"low\"", "\"high\"" };
+    one.tmpl.reads_enable_thinking = false;
+    one.srv->probe_reasoning_efforts();
+    REQUIRE_EQ(one.srv->template_off_efforts().size(), 1u);
+    CHECK_EQ(one.srv->template_off_efforts()[0], std::string("none"));
+    CHECK(has(off_efforts_note(one.srv->template_off_efforts()), "does not read"));
+
+    /* No switch, and "none" is the level a silent request already gets: nothing to pass. */
+    Fixture dflt;
+    dflt.tmpl.efforts = { "\"none\"", "\"low\"" };
+    dflt.tmpl.default_effort = "\"none\"";
+    dflt.tmpl.reads_enable_thinking = false;
+    dflt.srv->probe_reasoning_efforts();
+    CHECK(dflt.srv->template_off_efforts().empty());
 }
 
 /* --reasoning-effort-map: the deployment's word replaces the request's before the template sees
@@ -2200,7 +2376,7 @@ TEST(a_refused_request_fails_its_sink) {
     rs[1].sink = &b;
     std::vector<uint64_t> ids;
     br.submit_all(rs, &ids);
-    CHECK_EQ(ids.size(), (size_t)2);
+    REQUIRE_EQ(ids.size(), (size_t)2);
     for (int i = 0; i < 2; ++i) CHECK_EQ(ids[(size_t)i], (uint64_t)0);
     for (Sink* s : {&a, &b}) {
         CHECK(s->finish_reason() == Finish::Error);
@@ -2418,6 +2594,13 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     f.sched.m.prefix_hit_rate = 0.25;
     f.sched.m.decode_tps = 180.5;
     f.sched.m.draft_acceptance = 0.61;
+    f.sched.m.draft_reach_declined_steps = 9;
+    f.sched.m.draft_gated_steps = 4;
+    f.sched.m.draft_acc_gated_steps = 6;
+    f.sched.m.draft_refill_tokens = 512;
+    f.sched.m.window_seed_failures = 3;
+    f.sched.m.draft_window_stale_ckpts = 5;
+    f.sched.m.draft_spec_off_seqs = 2;
     f.sched.m.preemptions = 2;
 
     /* One completed request so the histograms have an observation in them. */
@@ -2468,6 +2651,18 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_NEAR(find_one("vllm:num_requests_waiting{"), 7.0, 1e-9);
     CHECK_NEAR(find_one("vllm:gpu_cache_usage_perc{"), 0.42, 1e-9);
     CHECK_NEAR(find_one("radiance:draft_acceptance_ratio{"), 0.61, 1e-9);
+    /* Why a block drafter stayed quiet, one counter a cause. */
+    CHECK_EQ(d.type["radiance:draft_reach_declined_steps_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:draft_spec_off_sequences"], std::string("gauge"));
+    CHECK_NEAR(find_one("radiance:draft_reach_declined_steps_total{"), 9.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:draft_gated_steps_total{"), 4.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:draft_acc_gated_steps_total{"), 6.0, 1e-9);
+    CHECK_EQ(d.type["radiance:prefix_window_seed_failures_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:draft_window_stale_ckpt_total"], std::string("counter"));
+    CHECK_NEAR(find_one("radiance:prefix_window_seed_failures_total{"), 3.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:draft_window_stale_ckpt_total{"), 5.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:draft_refill_tokens_total{"), 512.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:draft_spec_off_sequences{"), 2.0, 1e-9);
     CHECK_NEAR(find_one("vllm:generation_tokens_total{"), 5.0, 1e-9);
     /* This server streams nothing, so every streaming number is zero. */
     CHECK_NEAR(find_one("radiance:kv_resident_blocks{"), 0.0, 1e-9);
@@ -3398,14 +3593,14 @@ TEST(embeddings_take_the_models_named_prompts_and_its_fields) {
         OaiRequest r; ApiError e;
         CHECK_OK(parse_embeddings_request(R"({"input":"capital?","prompt_name":"query"})", d,
                                           f.limits(), &r, &e));
-        CHECK_EQ(r.prompts.size(), (size_t)1);
+        REQUIRE_EQ(r.prompts.size(), (size_t)1);
         CHECK_EQ(r.prompts[0].text, std::string("task: search result | query: capital?"));
     }
     {
         OaiRequest r; ApiError e;
         CHECK_OK(parse_embeddings_request(R"({"input":["a","b"],"prompt_name":"query"})", d,
                                           f.limits(), &r, &e));
-        CHECK_EQ(r.prompts.size(), (size_t)2);
+        REQUIRE_EQ(r.prompts.size(), (size_t)2);
         CHECK_EQ(r.prompts[1].text, std::string("task: search result | query: b"));
     }
     {
@@ -3433,7 +3628,7 @@ TEST(embeddings_take_the_models_named_prompts_and_its_fields) {
         OaiRequest r; ApiError e;
         CHECK_OK(parse_embeddings_request(
             R"({"messages":[{"role":"user","content":"hello"}]})", d, f.limits(), &r, &e));
-        CHECK_EQ(r.prompts.size(), (size_t)1);
+        REQUIRE_EQ(r.prompts.size(), (size_t)1);
         CHECK(!r.prompts[0].tokens.empty());
         CHECK(parse_embeddings_request(
                   R"({"input":"x","messages":[{"role":"user","content":"hello"}]})", d,
@@ -4581,7 +4776,7 @@ TEST(a_namespaces_tools_are_offered_flat_and_answered_apart) {
     CHECK_EQ(c["tools"][1]["function"].value("name", ""), std::string("crm__find"));
     CHECK_EQ(c["messages"][1]["tool_calls"][0]["function"].value("name", ""), std::string("crm__find"));
     CHECK_EQ(c["tool_choice"]["function"].value("name", ""), std::string("crm__find"));
-    CHECK_EQ(ns.size(), (size_t)1);
+    REQUIRE_EQ(ns.size(), (size_t)1);
     CHECK_EQ(ns["crm__find"].first, std::string("crm"));
     CHECK_EQ(json::parse(echo)["tools"].size(), (size_t)2);      /* echoed as sent */
 
@@ -4673,8 +4868,56 @@ TEST(the_native_completion_answers_in_llama_servers_shape) {
     CHECK(!has(body, "[DONE]"));
     f.sched.join_all();
 
-    /* return_tokens is the native endpoint's own; elsewhere it is guarded at its off value. */
-    CHECK_EQ(f.post("/v1/completions", R"({"prompt":"ab","return_tokens":true})").status, 400);
+}
+
+/* return_tokens (llama-server's name) or return_token_ids (vLLM's) on the OpenAI endpoints: each
+ * choice carries its generated ids as `token_ids`, and a stream's chunks carry the ids since the
+ * previous chunk, so the chunks together hold every id once. */
+TEST(the_openai_endpoints_return_the_generated_ids_when_asked) {
+    Fixture f;
+    HttpResponse r = f.post("/v1/completions", R"({"prompt":"ab","return_tokens":true})");
+    CHECK_EQ(r.status, 200);
+    json o = json::parse(r.body);
+    CHECK_EQ(o["choices"][0]["token_ids"].size(), (size_t)5);
+    CHECK_EQ(o["usage"]["completion_tokens"].get<int64_t>(), (int64_t)5);
+    f.sched.join_all();
+
+    r = f.post("/v1/chat/completions",
+               R"({"messages":[{"role":"user","content":"hi"}],"return_token_ids":true})");
+    CHECK_EQ(r.status, 200);
+    o = json::parse(r.body);
+    CHECK_EQ(o["choices"][0]["token_ids"].size(), (size_t)5);
+    f.sched.join_all();
+
+    /* Not asked: no field. */
+    r = f.post("/v1/completions", R"({"prompt":"ab"})");
+    CHECK(!json::parse(r.body)["choices"][0].contains("token_ids"));
+    f.sched.join_all();
+
+    for (const char* body : { R"({"prompt":"ab","stream":true,"return_tokens":true})",
+                              R"({"messages":[{"role":"user","content":"hi"}],"stream":true,
+                                  "return_tokens":true})" }) {
+        const bool chat = std::string(body).find("messages") != std::string::npos;
+        HttpResponse s = f.post(chat ? "/v1/chat/completions" : "/v1/completions", body);
+        CHECK_EQ(s.status, 200);
+        int bad = 0;
+        size_t ids = 0;
+        for (const std::string& payload : sse_payloads(drain(s), &bad)) {
+            if (payload == "[DONE]") continue;
+            const json event = json::parse(payload);
+            if (event["choices"].empty()) continue;
+            const json& choice = event["choices"][0];
+            if (choice.contains("token_ids")) ids += choice["token_ids"].size();
+        }
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(ids, (size_t)5);
+        f.sched.join_all();
+    }
+
+    /* A non-boolean is refused by name. */
+    r = f.post("/v1/completions", R"({"prompt":"ab","return_token_ids":"yes"})");
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(json::parse(r.body)["error"]["param"].get<std::string>(), std::string("return_token_ids"));
 }
 
 /* ================================================================== logprobs */
@@ -5001,7 +5244,7 @@ TEST(tokenize_pieces_carry_bytes_unsigned) {
     HttpResponse r = f.post("/tokenize", R"({"content":"\u00e9","with_pieces":true})");
     CHECK_EQ(r.status, 200);
     const json t = json::parse(r.body)["tokens"];
-    CHECK_EQ(t.size(), (size_t)2);
+    REQUIRE_EQ(t.size(), (size_t)2);
     CHECK(t[0]["piece"] == json::array({ 0xC3 }));
     CHECK(t[1]["piece"] == json::array({ 0xA9 }));
 }
@@ -5334,7 +5577,6 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "audio",               { nullptr, json::parse(R"({"voice":"x"})") } },
         { "n_indent",            { 0, 4 } },
         { "t_max_predict_ms",    { 0, 100 } },
-        { "return_tokens",       { false, true } },
         { "grammar_lazy",        { false, true } },
         { "grammar_triggers",    { json::array(), json::parse(R"([{"type":1,"value":"x"}])") } },
         { "preserved_tokens",    { json::array(), json::parse(R"(["<x>"])") } },
@@ -5343,8 +5585,7 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
     };
     /* Where a guarded key is the endpoint's own field and served. */
     auto served_on = [](const std::string& key, const std::string& ep) {
-        return (key == "return_tokens" && ep == "native") ||
-               (key == "preserved_tokens" && (ep == "completion" || ep == "native"));
+        return key == "preserved_tokens" && (ep == "completion" || ep == "native");
     };
     for (const std::string& key : pol.guarded) {
         auto g = guards.find(key);
@@ -5921,7 +6162,7 @@ TEST(infill_lays_out_the_repository_and_trims_the_oldest_context_first) {
         f.sched.join_all();
         REQUIRE(f.sched.seen.size() == 1);
         const std::vector<int32_t>& p = f.sched.seen[0].prompt;
-        CHECK_EQ(p.size(), (size_t)(1 + (300 - 256 - 7) + 6));
+        REQUIRE_EQ(p.size(), (size_t)(1 + (300 - 256 - 7) + 6));
         CHECK_EQ(p.front(), 1);
         CHECK(std::vector<int32_t>(p.end() - 6, p.end()) == fim);
     }

@@ -412,8 +412,7 @@ TEST(the_coupled_token_follows_the_target_for_random_target_and_head_pairs) {
                                         rad_spechub_uniform(seed, (uint64_t)t, RAD_SAMPLE_KEY_ACCEPT),
                                         rad_spechub_uniform(seed, (uint64_t)t, RAD_SAMPLE_KEY_RESID),
                                         &out));
-            CHECK(out >= 0 && out < vocab);
-            if (out < 0 || out >= vocab) return;
+            REQUIRE(out >= 0 && out < vocab);
             ++cnt[(size_t)out];
             acc += out == s.x;
         }

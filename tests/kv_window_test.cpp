@@ -402,11 +402,11 @@ TEST(rswa_ring_always_covers_the_last_w_tokens) {
 
 /* The card's advance (core/sched/advance_impl.h, adv_groups) runs AFTER the batch builder and
  * overwrites every group's `seqused` and slot_mapping, so for a runtime window it must reproduce
- * the ring's mapping. This is the P4a GPU fault: the advance wrote used = ctx + n (177 for a
- * 176-token held span) and mapped a wrapped position linearly, so the decode walked
- * bt[ceil(used/16)-1] = bt[11] -- the first entry past the 11-block table, which the builder pads
- * with -1 -- and faulted the card below the KV pool. With block 16 and the ring 8 blocks
- * (128 tokens), the table is the reference's 3 blocks plus the ring's 8. */
+ * the ring's mapping. Writing used = ctx + n (177 for a 176-token held span) and mapping a wrapped
+ * position linearly would make the decode walk bt[ceil(used/16)-1] = bt[11], the first entry past
+ * the 11-block table, which the builder pads with -1, and fault the card below the KV pool. With
+ * block 16 and the ring 8 blocks (128 tokens), the table is the reference's 3 blocks plus the
+ * ring's 8. */
 TEST(rswa_advance_keeps_the_ring_span_and_slots) {
     const int64_t B = 16, PITCH = 32;
     const int32_t ring_pos = 48, ring_blocks = 8, table_len = 11;

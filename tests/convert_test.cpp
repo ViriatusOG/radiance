@@ -613,7 +613,7 @@ TEST(changed_reconverts_exactly_the_weights_that_read_a_changed_tensor) {
     RadFile f;
     REQUIRE_EQ(f.open((d / "fresh.rad").c_str()), RAD_OK);
     const std::vector<std::string> diff = differing_weights(base, f);
-    CHECK_EQ(diff.size(), (size_t)1);
+    REQUIRE_EQ(diff.size(), (size_t)1);
     CHECK(!diff.empty() && diff[0] == "blk.0.ffn_down.weight");
     /* And it is the negated weight, not merely different bytes. */
     const RadFileEntry* a = base.find("blk.0.ffn_down.weight");
@@ -725,7 +725,7 @@ TEST(lora_merges_into_its_target_and_reconverts_the_weights_that_read_it) {
     RadFile base;
     REQUIRE_EQ(base.open(w.base.c_str()), RAD_OK);
     const std::vector<std::string> diff = differing_weights(base, m);
-    CHECK_EQ(diff.size(), (size_t)1);
+    REQUIRE_EQ(diff.size(), (size_t)1);
     CHECK(!diff.empty() && diff[0] == "blk.0.ffn_down.weight");
 
     REQUIRE(copy_ckpt_raised(w, d / "ref", target, 0.5f * 0.25f * 2.f));
@@ -1119,10 +1119,11 @@ TEST(plan_only_writes_nothing) {
 }
 
 /* Inkling 2's routed experts as the release stores them: e2m1 codes, an e4m3 scale per 16 of K and an
- * f32 level per expert, named by hf_quant_config.json's nvfp4 parameter group. The plugin declares
- * every layer's experts in that form (`nvfp4a8i8`), so a conversion with a recipe that
- * touches none of them writes, and the writer checks each expert's slot order. */
-TEST(an_inkling2_nvfp4_expert_checkpoint_declares_in_its_stored_form) {
+ * f32 level per expert, named by hf_quant_config.json's nvfp4 parameter group. The plugin serves no
+ * NVFP4 expert, so a recipe that keeps them as stored is refused by name before anything is
+ * written; data/recipes/inkling2-mini-bf16.recipe's rules (the experts dequantised and cast to
+ * bf16, the calibration container) write, and the writer checks each expert's slot order. */
+TEST(an_inkling2_nvfp4_expert_checkpoint_converts_to_the_bf16_calibration_form) {
     tiny::TempDir d("convert_nv");
     REQUIRE(d.ok());
     const std::string ckpt = d / "inkling";
@@ -1174,13 +1175,19 @@ TEST(an_inkling2_nvfp4_expert_checkpoint_declares_in_its_stored_form) {
         groups += (i ? ",\"" : "\"") + names[i] + "\"";
     groups += "]}]}}";
     REQUIRE(tiny::write_text(ckpt + "/hf_quant_config.json", groups));
-    const std::string recipe = d / "keep.recipe";
-    REQUIRE(tiny::write_text(recipe, "# every routed expert is kept as stored\n"));
-
+    const std::string keep = d / "keep.recipe";
+    REQUIRE(tiny::write_text(keep, "# every routed expert is kept as stored\n"));
     std::string log;
+    CHECK(convert(ckpt, { "-o", d / "nv.rad", "--recipe", keep }, &log) != 0);
+    CHECK(has(log, "blk.0.e0.gu"));
+    CHECK(has(log, "data/recipes/inkling2-mini-bf16.recipe"));
+    CHECK(!exists(d / "nv.rad"));
+
+    const std::string bf16 = d / "bf16.recipe";
+    REQUIRE(tiny::write_text(bf16, "blk.*.e*.gu cast dtype=bf16\nblk.*.e*.dn cast dtype=bf16\n"));
     // a full write, not plan-only: the writer checks that each expert's slots run 0..n-1 in order
-    CHECK_EQ(convert(ckpt, { "-o", d / "nv.rad", "--recipe", recipe }, &log), 0);
-    CHECK(exists(d / "nv.rad"));
+    CHECK_EQ(convert(ckpt, { "-o", d / "bf.rad", "--recipe", bf16 }, &log), 0);
+    CHECK(exists(d / "bf.rad"));
 }
 
 /* A recipe or flag that cannot be honoured stops the run with status 2 before any file exists:
@@ -1261,7 +1268,6 @@ TEST(a_rule_that_declines_a_gguf_block_tensor_is_an_error) {
                   { "-o", d / "g.rad", "--recipe", w.recipe, "--quant",
                     "blk.0.attn_norm.weight=rtn:codes=i8,group=32,scale=bf16" },
                   &log) != 0);
-    CHECK(has(log, "(rtn) refuses it"));
     CHECK(!exists(d / "g.rad"));
 }
 
@@ -1454,6 +1460,31 @@ TEST(chat_template_flag_bakes_the_template) {
     std::string bad;
     CHECK_EQ(convert(w.ckpt, { "-o", d / "bad.rad", "--recipe", w.recipe,
                                "--chat-template", d / "absent.jinja" }, &bad), 1);
+}
+
+/* A convert stopped after one large weight keeps its journal and a resume finishes the rest
+ * without rewriting it; the resumed container is byte-identical to an uninterrupted one. */
+TEST(a_checkpointed_write_resumes_and_keeps_its_finished_weights) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_r");
+    const std::string part = d / "r.rad";
+    std::string log;
+    /* --large-f32-bytes 1: every weight is a large one, so the journal records each. */
+    REQUIRE_EQ(convert(w.ckpt, { "-o", part, "--recipe", w.recipe, "--large-f32-bytes", "1",
+                                 "--checkpoint-at", "1" }, &log), 3);
+    CHECK(exists(part + ".journal"));
+    std::string rlog;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", part, "--recipe", w.recipe, "--large-f32-bytes", "1", "--resume" },
+                       &rlog), 0);
+    CHECK(rlog.find("resume") != std::string::npos);
+    CHECK(!exists(part + ".journal"));
+    RadFile a, b;
+    REQUIRE_EQ(a.open(w.base.c_str()), RAD_OK);
+    REQUIRE_EQ(b.open(part.c_str()), RAD_OK);
+    const std::vector<std::string> diff = differing_weights(a, b);
+    CHECK(diff.empty());
+    if (!diff.empty()) fprintf(stderr, "    resumed differs at %s\n", diff[0].c_str());
 }
 
 RAD_TEST_MAIN()

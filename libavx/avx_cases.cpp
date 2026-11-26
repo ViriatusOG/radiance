@@ -96,7 +96,8 @@ std::vector<Case> build_cases() {
                                    HI("cu_div", 2), HI("valid_stride", 2), HI("t_last", tl),
                                    HS("dtype", dt) });
         add("conv1d_dw", { HI("M", 26), HI("n", 645), HI("k", 5), HS("dtype", dt) });
-        add("conv1d_dw", { HI("M", 24), HI("n", 64), HI("k", 5), HI("cu_div", 4), HS("dtype", dt) });
+        add("conv1d_dw", { HI("M", 24), HI("n", 64), HI("k", 5), HI("cu_div", 4),
+                           HS("dtype", dt) });
         add("rel_sinusoid", { HI("M", 13), HI("n", 1024), HF("max_timescale", 10000.0),
                               HS("dtype", dt) });
         add("pool_rows",   { HI("M", 27), HI("n", 645), HI("k", 9), HF("mult", 27.712812921102035),
@@ -170,7 +171,8 @@ std::vector<Case> build_cases() {
             add("router_sigmoid_group_topk",
                 { HI("M", 5), HI("n_expert", 512), HI("top_k", 8), HI("n_group", 8),
                   HI("topk_group", 4), HI("norm", norm), HF("route_scale", 2.5), HS("dtype", dt) });
-        add("mla_attn_paged", { HI("M", 5), HI("heads", 3), HI("latent_dim", 64), HI("rope_dim", 16),
+        add("mla_attn_paged", { HI("M", 5), HI("heads", 3), HI("latent_dim", 64),
+                                HI("rope_dim", 16),
                                 HI("block_size", 4), HF("scale", 0.0721687836), HI("ctx", 23),
                                 HS("dtype", dt) });
         add("mla_attn", { HI("M", 3), HI("latent_dim", 32), HI("heads", 2), HI("blocks", 7),
@@ -226,15 +228,6 @@ std::vector<Case> build_cases() {
         add("moe_gemm_q",
             { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
               HI("group", 128), HS("a_order", order), HS("dtype", "mxfp4a8") });
-    /* NVFP4 experts: e2m1 codes, an E4M3 scale per 16 of K and a level, against an int8
-     * activation at one scale per 64 of K (the scale grid is libref's logical description). */
-    for (const char* order : { "token", "sorted" })
-        add("moe_gemm_q",
-            { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
-              HI("group", 64), HS("a_order", order), HS("dtype", "nvfp4a8i8") });
-    add("moe_gemm_q",
-        { HI("M", 9), HI("N", 128), HI("K", 256), HI("N_odd", 64), HI("n_expert", 8),
-          HI("top_k", 2), HI("group", 64), HS("a_order", "token"), HS("dtype", "nvfp4a8i8") });
     /* One scale per column over the rows: no group. */
     add("quant_cols_fp8", { HI("M", 5), HI("n", 256), HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
     add("quant_cols_fp8", { HI("M", 7), HI("n", 96), HS("dtype", "f32") }, EB(7, 96, 4, 1.25));
@@ -267,10 +260,6 @@ std::vector<Case> build_cases() {
                                     HS("dtype", "bf16") });
         add("dequant",            { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
-        /* The unrotated sibling, grouped at 128 and at a width of two groups, plain and SiTU. */
-    add("gated_quant_i8", { HI("M", 3), HI("n", 256), HI("group", 128), HS("dtype", "f32") });
-    add("gated_quant_i8", { HI("M", 4), HI("n", 192), HI("group", 64), HS("dtype", "f32"),
-                            HS("act", "situ"), HF("gate_cap", 4.0), HF("up_cap", 25.0) });
     add("gated_had_quant_i8", { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16"), HS("act", "silu"), HI("mode", 0) });
         add("rmsnorm_had_quant_i8", { HI("M", 5), HI("n", 256), HF("eps", 1e-6),
@@ -403,6 +392,27 @@ std::vector<Case> build_cases() {
                                 HI("vocab_offset", 0), HF("mult", 22.625) });
         add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
                                 HI("vocab_offset", 0), HF("wscale", 0.01) });
+        for (const char* ty : { "q8_0", "q6_K", "iq4_nl" }) {
+            const int K = std::strcmp(ty, "q6_K") ? 96 : 256;
+            add("gemm_nt_ggml", { HI("M", 4), HI("N", 33), HI("K", K), HS("type", ty),
+                                  HS("dtype", dt) });
+            add("logits_gemm_ggml", { HI("M", 3), HI("n_vocab", 40), HI("n_embd", K),
+                                      HS("type", ty),
+                                      HS("dtype", dt) });
+            add("embed_lookup_ggml", { HI("M", 7), HI("n_embd", K), HI("n_vocab", 20),
+                                       HS("type", ty),
+                                       HS("dtype", dt) });
+        }
+        for (const char* order : { "token", "sorted" })
+            add("moe_gemm_ggml", { HI("M", 5), HI("N", 16), HI("K", 64), HI("n_expert", 4),
+                                   HI("top_k", 2), HS("a_order", order), HS("type", "q8_0"),
+                                   HS("dtype", dt) });
+        add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64),
+                                     HI("group", 32),
+                                     HS("dtype", dt), HI("vocab_offset", 0), HF("mult", 1) });
+        add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 96), HI("n_vocab", 64),
+                                     HI("group", 8),
+                                     HS("dtype", dt), HI("vocab_offset", 0), HF("mult", 22.625) });
     }
 
     /* Attention. q_len 1 is decode, 17 a ragged verify window, 64 the prefill panel form
@@ -418,9 +428,12 @@ std::vector<Case> build_cases() {
     for (const char* dt : { "f32", "bf16" })
         for (int qlen : { 1, 17 })
             add("attn_paged_anchor_window", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
-                                              HI("block_size", 16), HI("causal", 1), HI("window", 8),
-                                              HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
-                                              HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+                                              HI("block_size", 16), HI("causal", 1),
+                                                  HI("window", 8),
+                                              HS("q_dtype", dt), HS("kv_dtype", dt),
+                                                  HF("scale", 0.125),
+                                              HI("max_ctx", 128), HI("n_head", 8),
+                                                  HI("max_seqs", 2) });
     /* The tree form over the same shapes (its described parents are ordinary rows, -2). */
     for (const char* dt : { "f32", "bf16" })
         for (int qlen : { 1, 17 })
@@ -534,8 +547,8 @@ std::vector<Case> build_cases() {
     for (const char* dt : { "f32", "bf16", "i8", "fp8_e4m3" })
         add("kv_store", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
                           HI("block_size", 16), HS("kv_dtype", dt) });
-    /* The streamed store, on one block and one ring slot (ref_shapes.cpp says why); the resident and
-     * mirror-only split is built by hand in avx_check_hand.cpp. */
+    /* The streamed store, on one block and one ring slot (ref_shapes.cpp says why); the resident
+     * and mirror-only split is built by hand in avx_check_hand.cpp. */
     for (const char* dt : { "i8", "bf16", "fp8_e4m3" }) {
         add("kv_store_streamed", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
                                    HI("block_size", 32), HS("kv_dtype", dt) });
@@ -590,7 +603,8 @@ std::vector<Case> build_cases() {
                       HI("rotary_dim", 64), HS("dtype", "bf16"), HF("yarn_factor", 0),
                       HF("yarn_magnitude", magnitude) });
         add("rope_table", { HI("M", 12), HI("rot", 64), HF("theta", 1e7), HF("scale", 1),
-                            HS("dtype", "f32"), HF("yarn_factor", 0), HF("yarn_magnitude", magnitude) });
+                            HS("dtype", "f32"), HF("yarn_factor", 0),
+                                HF("yarn_magnitude", magnitude) });
     }
     /* QSA's compressed key at Flash-Next's geometry (n 128, ratio 4, 64-wide rotary), plain and
      * with YaRN; positions are drawn up to block count times ratio. */
@@ -641,10 +655,11 @@ std::vector<Case> build_cases() {
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
                       HI("work", 3), HS("dtype", "f32") });
-    /* The residency map at a decode step's geometry and at the edges a description can reach: a ring
-     * shallower and deeper than the id space, one query row, a pitch of one, and a `block_bytes`
-     * that is not a whole vector (the copy's tail). The described map is all-resident, so misses,
-     * evictions, second chances and overflow are built by hand in avx_check_hand.cpp. */
+    /* The residency map at a decode step's geometry and at the edges a description can reach: a
+     * ring shallower and deeper than the id space, one query row, a pitch of one, and a
+     * `block_bytes` that is not a whole vector (the copy's tail). The described map is
+     * all-resident, so misses, evictions, second chances and overflow are built by hand in
+     * avx_check_hand.cpp. */
     add("kv_resolve", { HI("M", 4), HI("blocks", 300), HI("slots", 96), HI("sel_pitch", 33),
                         HI("block_bytes", 256) });
     add("kv_resolve", { HI("M", 6), HI("blocks", 64), HI("slots", 128), HI("sel_pitch", 17),
@@ -713,6 +728,17 @@ std::vector<Case> build_cases() {
         add("grid_embed_cpe", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
         add("grid_embed_cpe", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 3),
                                 HS("dtype", dt) });
+        add("grid_embed_hw", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
+        add("grid_embed_hw", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 1),
+                               HS("dtype", dt) });
+        /* The table resample as its own table: the identity grid, a grid that shrinks the table
+         * and one that grows it past it. */
+        add("posemb_resample", { HI("S_h", 8), HI("S_w", 8), HI("T_h", 8), HI("T_w", 8),
+                                 HI("n", 72), HS("dtype", dt) });
+        add("posemb_resample", { HI("S_h", 6), HI("S_w", 6), HI("T_h", 3), HI("T_w", 11),
+                                 HI("n", 72), HS("dtype", dt) });
+        add("posemb_resample", { HI("S_h", 4), HI("S_w", 6), HI("T_h", 13), HI("T_w", 9),
+                                 HI("n", 72), HS("dtype", dt) });
     }
 
     /* SiTU at the model's caps, uncapped on one side, and at a width past the vector body. */
@@ -852,6 +878,22 @@ std::vector<Case> build_cases() {
                                        HF("eps", 1e-6), HF("l2_eps", 1e-6),
                                        HF("softplus_thr", 20.0), HS("act", "silu"),
                                        HI("state_fp16", 0), HI("n_head_k", 2), HI("n_seq", 2) });
+    /* The tree forms over libref's description, every row an ordinary causal one (-2): the chain
+     * op's answer. Branching trees are avx_check_hand.cpp's. */
+    add("gdn_conv_update_tree", { HI("q_len", 2), HI("head_k", 32), HI("head_v", 32),
+                                  HI("conv_width", 4), HI("max_query_len", 2),
+                                  HI("n_head_k", 2), HI("n_head_v", 2), HI("n_seq", 2) });
+    add("gdn_recurrent_update_tree", { HI("q_len", 2), HI("head_k", 32), HI("head_v", 32),
+                                       HI("n_head_v", 2), HF("scale", 0.176), HF("eps", 1e-6),
+                                       HF("l2_eps", 1e-6), HF("softplus_thr", 20.0),
+                                       HS("act", "silu"), HI("state_fp16", 0), HI("n_head_k", 2),
+                                       HI("n_seq", 2) });
+    add("gdn_conv_recurrent_update_tree", { HI("q_len", 2), HI("head_k", 32), HI("head_v", 32),
+                                            HI("conv_width", 4), HI("n_head_v", 2),
+                                            HF("scale", 0.176), HF("eps", 1e-6),
+                                            HF("l2_eps", 1e-6), HF("softplus_thr", 20.0),
+                                            HS("act", "silu"), HI("state_fp16", 0),
+                                            HI("n_head_k", 2), HI("n_seq", 2) });
     for (const char* act : { "silu", "sigmoid" })
         add("gdn_gated_rmsnorm", { HI("M", 12), HI("channels", 128), HF("eps", 1e-6),
                                    HS("act", act) });
@@ -1076,6 +1118,53 @@ std::vector<Case> build_cases() {
                         HS("dtype", "bf16") });
     add("vtile_join", { HI("M", 400), HI("tile", 3), HI("overlap", 1), HI("n", 5),
                         HS("dtype", "f32") });
+
+    /* ================================================================== Wan 2.2 TI2V
+     *
+     * The DiT's row ops at an odd width, every modulation group and gate; the sampler step over
+     * both velocity dtypes; the rotary table and the unpatch over libref's latent cubes (every
+     * geom entry the same, M a bound); the VAE's history at both plane sizes libref describes,
+     * both modes, with and without reset, and its expand over the shortcut's repeats and the
+     * temporal shuffle; UMT5's attention over sequences past the last distance bucket (128).
+     * Uneven grids, split time rows, guidance, a first step and packed sequences are
+     * avx_check_hand.cpp's. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("flow_unipc_step", { HI("M", 9), HI("n", 645), HS("dtype", dt) });
+        add("wan_rope", { HI("M", 7), HI("heads", 3), HS("dtype", dt) });
+        for (int M : { 16, 54 })
+            add("wan_unpatch", { HI("M", M), HI("n", 7), HS("dtype", dt) });
+    }
+    for (int group : { 0, 3 })
+        for (int round : { 0, 1 })
+            add("wan_mod_norm", { HI("M", 7), HI("n", 645), HI("group", group), HF("eps", 1e-6),
+                                  HI("round_norm", round), HS("dtype", "bf16") });
+    for (int group : { -1, 0 })
+        add("wan_mod_norm", { HI("M", 7), HI("n", 645), HI("group", group), HF("eps", 1e-6),
+                              HI("round_norm", 0), HS("dtype", "f32") });
+    for (int gate : { -1, 2, 5 })
+        add("wan_gated_add", { HI("M", 7), HI("n", 645), HI("gate", gate), HS("dtype", "f32") });
+    add("timestep_embed_f64", { HI("M", 3), HI("n", 256), HF("max_period", 10000.0),
+                                HS("dtype", "f32") });
+    add("timestep_embed_f64", { HI("M", 5), HI("n", 6), HF("max_period", 300.0),
+                                HS("dtype", "f32") });
+    for (int M : { 16, 250 })
+        add("wan_rope_table", { HI("M", M), HS("dtype", "f32") });
+    for (int M : { 2, 9 })
+        add("wan_vae_frame_cu", { HI("M", M) });
+    for (int M : { 6, 5 })
+        for (int temporal : { 0, 1 })
+            for (int reset : { 0, 1 })
+                add("wan_vae_history", { HI("M", M), HI("temporal", temporal), HI("reset", reset),
+                                         HS("dtype", "bf16") });
+    struct Expand { int cin, cout, st, s, drop, temporal; };
+    for (const Expand& e : { Expand{ 8, 8, 2, 2, 1, 0 }, Expand{ 32, 8, 2, 2, 0, 0 },
+                             Expand{ 12, 6, 1, 2, 0, 0 }, Expand{ 16, 8, 2, 1, 0, 1 } })
+        add("wan_vae_expand", { HI("M", 27), HI("cin", e.cin), HI("cout", e.cout), HI("st", e.st),
+                                HI("s", e.s), HI("drop", e.drop), HI("temporal", e.temporal),
+                                HS("dtype", "bf16") });
+    add("attn_umt5", { HI("M", 150), HI("heads", 2), HS("dtype", "bf16") });
+    add("attn_umt5", { HI("M", 37), HI("heads", 3), HS("dtype", "bf16") });
+    add("gelu_umt5", { HI("M", 6), HI("n", 645), HS("dtype", "bf16") });
 
     /* The latent upscaler over libref's cube volumes (c x c x c, the largest M holds; every geom
      * entry c, so the resize is the identity here): the 3-D convolution at odd channel counts,
@@ -1337,6 +1426,84 @@ std::vector<Case> build_cases() {
     add("sub_i32", { HI("M", 1) });
     add("sub_i32", { HI("M", 37) });
 
+    /* DeepSeek-V4.1's ops, scaled down from the model (hc 4, 512-wide latent heads of 64-dim rope,
+     * a 4:1 and a 128:1 compressor, top-k over the compressed positions). */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("mhc_mix", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20),
+                         HF("eps", 1e-5), HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("mhc_collapse", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        for (const char* score : { "sigmoid", "sqrtsoftplus", "softmax" })
+            add("router_scored_topk",
+                { HI("M", 5), HI("n_expert", 256), HI("top_k", 6), HI("norm", 1),
+                  HF("route_scale", 1.5), HS("score", score), HS("dtype", dt) });
+        for (const char* mode : { "gptj", "neox" })
+            for (int inv : { 0, 1 })
+                add("ds41_rope_rows", { HI("M", 5), HI("n_head", 3), HI("head_dim", 96),
+                                        HI("rot", 32),
+                                   HI("off", 64), HS("mode", mode), HI("inverse", inv),
+                                   HS("dtype", dt) });
+        add("ds41_rope_rows", { HI("M", 4), HI("n_head", 2), HI("head_dim", 64), HI("rot", 64),
+                           HI("off", 0), HS("mode", "gptj"), HI("inverse", 0), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 448), HI("block", 64),
+                                 HS("format", "fp8_e4m3"),
+                                 HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 192), HI("block", 64),
+                                 HS("format", "fp8_e4m3"),
+                                 HS("scale", "f32"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 160), HI("block", 32),
+                                 HS("format", "fp4_e2m1"),
+                                 HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 144), HI("block", 16),
+                                 HS("format", "fp4_e2m1"),
+                                 HS("scale", "e4m3"), HS("dtype", dt) });
+        for (int ratio : { 4, 64 })
+            add("softmax_pool", { HI("M", 5), HI("n", 131), HI("ratio", ratio), HS("dtype", dt) });
+        /* The window alone, then with the compressed entries. A drawn window_used of 0 leaves a
+         * row no key, so the window-only geometry is one whose draw holds some. */
+        add("attn_sparse_sink", { HI("M", 12), HI("heads", 3), HI("dim", 64), HI("window", 6),
+                                  HI("ratio", 0), HI("topk", 0), HF("scale", 0.125),
+                                      HS("dtype", dt) });
+        add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 64), HI("window", 8),
+                                  HI("ratio", 4), HI("topk", 5), HF("scale", 0.125),
+                                      HS("dtype", dt) });
+        add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt) });
+        /* A run of a step scored in runs (row_part): rows 2 M .. 3 M - 1 of a 3 M-row step. */
+        add("index_score", { HI("M", 4), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
+                             HI("row_part", 2) });
+        add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
+        /* Block-scaled E4M3 entries (rad_kv_fp8.h): stored, attended and scored. */
+        for (const char* kf : { "e4m3_e4m3_16", "e4m3_ue8m0_32" }) {
+            add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 64), HI("window", 8),
+                                      HI("ratio", 4), HI("topk", 5), HF("scale", 0.125),
+                                          HS("dtype", dt),
+                                      HS("latent_format", kf) });
+            add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                                 HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
+                                 HS("key_format", kf) });
+            add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt),
+                                 HS("format", kf) });
+        }
+        add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
+                                 HF("gate_eps", 1e-6), HS("dtype", dt) });
+    }
+    add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
+                              HI("ratio", 1) });
+    add("index_candidates", { HI("M", 6), HI("width", 21), HI("block", 4), HI("topk_blocks", 3),
+                              HI("ratio", 1) });
+    /* 35 blocks: keep is two words a row. */
+    add("index_candidates", { HI("M", 5), HI("width", 140), HI("block", 4), HI("topk_blocks", 20),
+                              HI("ratio", 1) });
+    add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1) });
+    add("index_topk", { HI("M", 9), HI("width", 9), HI("topk", 4), HI("ratio", 2) });
+    /* keep's bits over blocks of 3 (a short last block) and of 2 across two words. */
+    add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1),
+                        HI("block", 3) });
+    add("index_topk", { HI("M", 6), HI("width", 90), HI("topk", 6), HI("ratio", 1),
+                        HI("block", 2) });
+    add("token_map", { HI("M", 9), HI("n_vocab", 50) });
+
     /* The row-form names: every case of the base op again under the name. */
     {
         const char* const forms[][2] = { { "rmsnorm", "rmsnorm_rows" }, { "rope", "rope_rows" } };
@@ -1404,7 +1571,8 @@ std::vector<Case> build_cases() {
     speed("gdn_recurrent_update", { HI("q_len", 1), HI("head_k", 128), HI("head_v", 128),
                                     HI("n_head_v", 48), HF("scale", 0.176), HF("eps", 1e-6),
                                     HF("l2_eps", 1e-6), HF("softplus_thr", 20.0), HS("act", "silu"),
-                                    HI("state_fp16", 0), HI("n_head_k", 16), HI("n_seq", 2) }, 0, 0);
+                                    HI("state_fp16", 0), HI("n_head_k", 16), HI("n_seq", 2) }, 0,
+                                        0);
     speed("gdn_kkt_solve", { HI("M", 512), HI("head_k", 128), HI("chunk", 64),
                              HI("n_head_k", 16), HI("n_head_v", 48), HI("n_seq", 2) }, 0, 0);
     /* Conv prep at model shape: conv_dim 10240 = 2*16*128 + 48*128, width 4, over a 512 chunk. */
@@ -1418,7 +1586,8 @@ std::vector<Case> build_cases() {
     speed("logits_gemm", { HI("M", 1), HI("n_vocab", 32000), HI("n_embd", 2048),
                            HS("dtype", "bf16") }, (double)32000 * 2048 * 2, 2.0 * 32000 * 2048);
     speed("sample_argmax", { HI("M", 1), HI("n_vocab", 32000) }, (double)32000 * 4, 0);
-    speed("sample_logprobs", { HI("M", 1), HI("n_vocab", 32000), HI("k", 20) }, (double)32000 * 4, 0);
+    speed("sample_logprobs", { HI("M", 1), HI("n_vocab", 32000), HI("k", 20) }, (double)32000 * 4,
+          0);
     speed("sample_topk", { HI("M", 1), HI("n_vocab", 32000), HI("vocab_off", 0) }, 0, 0);
     /* Decode attention over a real context: 16 query heads in groups of 4, 2048 cached keys. */
     speed("attn_paged", { HI("q_len", 1), HI("head_dim", 128), HI("gqa", 4), HI("block_size", 16),

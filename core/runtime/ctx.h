@@ -20,6 +20,7 @@
 #include "arena.h"
 #include "rank_barrier.h"
 #include "residency.h"
+#include "rowprefetch.h"
 #include "stager.h"
 #include "wtab.h"
 #include "device/device.h"
@@ -92,6 +93,9 @@ struct OpPlan {
     /* Its position in the declared order, or its anchor's for a core-appended op: what the second
      * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
     int32_t       order = 0;
+    /* A row gather (runtime/rowprefetch.h): on the host, its rows on the mapped tier are read
+     * ahead before the kernel runs. Matched by name once here, like `billed`. */
+    bool          row_gather = false;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -197,6 +201,9 @@ struct CtxDesc {
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
     uint64_t        (*arch_pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
+    /* --row-prefetch: a host gather's rows on the mapped tier are read ahead of (or beside) its
+     * kernel (runtime/rowprefetch.h). */
+    bool            row_prefetch = true;
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
      * run_step), since a recording keyed on the batch would replay the wrong pass. */
@@ -392,6 +399,16 @@ public:
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
      * tests read it. Teardown's drain is not counted. */
     int64_t     host_syncs()   const { return n_host_syncs_; }
+    /* Of those, the host-op joins that drained the stream because an operand is untracked by the
+     * host arena (host_join_drains); tests read it. */
+    int64_t     host_drains()  const { return n_host_drains_; }
+    /* Host gathers whose rows were read ahead from the mapped tier, and the pages they advised
+     * (runtime/rowprefetch.h); tests read them. */
+    int64_t     row_prefetch_calls() const { return rowpf_calls_; }
+    int64_t     row_prefetch_pages() const { return rowpf_pages_; }
+    /* Of the calls, those whose read-ahead ran beside the kernel (runtime/rowprefetch.h). */
+    int64_t     row_prefetch_beside_calls() const { return rowpf_beside_calls_; }
+    bool        row_prefetch_busy() const { return rowpf_worker_ && rowpf_worker_->busy(); }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -403,6 +420,25 @@ public:
      * Relaxed atomics: written by this rank's step thread, read by any thread. */
     int64_t     ar_calls() const { return ar_calls_.load(std::memory_order_relaxed); }
     int64_t     ar_bytes() const { return ar_bytes_.load(std::memory_order_relaxed); }
+
+    /* Card to card: what this rank's collectives sent to each rank, by the route the kernel
+     * library took for each message, which only it knows. The library counts a pass that is issued
+     * in full (its export r4d_ar_traffic_rank, handed in once by set_traffic_source); a
+     * pass played from a tape never reaches the library, so record_pass keeps the difference its
+     * recording made and play adds it again. `to` is bytes to each rank; a route's `calls` and
+     * `bytes` are messages and their payload; `uncounted` is the library's fused collectives, which
+     * the table leaves out. `present` false: the kernel library keeps no such count. */
+    enum { kTrafficRanks = 16, kTrafficRoutes = 5 };
+    struct LinkTraffic {
+        int64_t to[kTrafficRanks] = {};
+        int64_t route_calls[kTrafficRoutes] = {}, route_bytes[kTrafficRoutes] = {};
+        int64_t uncounted = 0;
+        bool    present = false;
+    };
+    using TrafficFn = int (*)(int rank, long long* to, int cap, long long* routes, int cap_routes,
+                              long long* uncounted);
+    static void set_traffic_source(TrafficFn fn);
+    LinkTraffic traffic() const;
 
     /* How each pass was run. A play writes recorded packets; every other outcome walks the issue
      * path. `issued_*` split unplayed passes by cause: no key, key refused, key seen first time.
@@ -579,6 +615,7 @@ private:
         /* The lanes with a host-arena touch pending when the op joined: the device ops this
          * pass issued before it among them, which a play submits again without passing issue(). */
         bool             touch[2] = { false, false };
+        RowPrefetch      rp{};             /* its rows read ahead at every play (rowprefetch.h) */
     };
     struct PassTape {
         uint64_t key = 0;
@@ -589,6 +626,7 @@ private:
         std::vector<TapeXp> xp;
         /* What the recording added to the Ctx's counters, and the bookkeeping it ended on. */
         int64_t  issues = 0, ar_calls = 0, ar_bytes = 0, stream_waits = 0, host_syncs = 0;
+        LinkTraffic traffic;      /* what the recording added to the kernel library's count */
         bool     touch_pending[2] = {};
         bool     scratch_open[2] = {};
         int64_t  plays = 0;
@@ -756,7 +794,7 @@ private:
      *    per-block `seq & 1`, so collectives that race differently on two ranks pick different
      *    slots for the same message and deadlock or corrupt.
      *
-     * 2. A device-wide arrival counter must be per stream. `split_ctr` in r4d_gemm_fp8a8.hip (the
+     * 2. A device-wide arrival counter must be per stream. `split_ctr` in r4d_gemm_i8a8.hip (the
      *    self-resetting split-K finisher counter) is sound only because its launches are ordered
      *    by one stream, so there is one counter block per stream. Any other plugin kernel with a
      *    device-wide counter must do the same or stay off lane 1; nothing here can check it.
@@ -800,6 +838,20 @@ private:
     int       host_join(const RadOperand* opd, int n_opd);
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
     int       host_join_wait(bool drain);
+    /* Read ahead a host gather's rows on the mapped tier (runtime/rowprefetch.h): which tables
+     * this issue reads there, then the madvise over the rows `t[0]` names -- in front of the
+     * kernel, or beside it on rowpf_worker_ when longer than kRowAheadInline and its sampled rows
+     * are resident; row_prefetch_done() after the kernel returns stops and joins that. Off with
+     * --row-prefetch off (CtxDesc::row_prefetch). */
+    bool      row_prefetch_on_ = true;
+    RowPrefetchScratch rowpf_;
+    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;
+    std::unique_ptr<RowPrefetchWorker> rowpf_worker_;
+    bool      rowpf_beside_ = false;   /* a read-ahead runs beside the kernel being launched */
+    void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
+                                const RadTensor* t, RowPrefetch* out) const;
+    void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);
+    void      row_prefetch_done();
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */
@@ -904,7 +956,11 @@ private:
     int64_t n_stream_waits_ = 0;
     int64_t n_wtab_patches_ = 0;
     int64_t n_host_syncs_ = 0;
+    int64_t n_host_drains_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
+    /* The traffic of the passes played from tapes (traffic() adds the library's own count). */
+    std::atomic<int64_t> tr_to_[kTrafficRanks] = {}, tr_calls_[kTrafficRoutes] = {}, tr_bytes_[kTrafficRoutes] = {};
+    bool traffic_lib(LinkTraffic* out) const;
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};
     std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0};

@@ -332,7 +332,8 @@ float q8_row(float* x, int64_t n) {
     for (int64_t d = 0; d < n; ++d) am = std::max(am, std::fabs(x[d]));
     const float sc = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
     const float inv = 1.0f / sc;
-    for (int64_t d = 0; d < n; ++d) x[d] = std::rint(std::min(std::max(x[d] * inv, -127.0f), 127.0f));
+    for (int64_t d = 0; d < n; ++d)
+        x[d] = std::rint(std::min(std::max(x[d] * inv, -127.0f), 127.0f));
     return sc;
 }
 

@@ -20,8 +20,8 @@
  *     tau < g:  X_1 .. X_tau are emitted, then Y ~ max(p_tau P_tau - Q_{tau+1}, 0) normalised.
  *
  * Exactness is checked in tests/mtp_block_test.cpp by exact enumeration of the draft tree of a toy
- * model (the law of the emitted tokens computed in closed form, to 1e-12) and by a chi-square of the
- * real device-shared code, with a negative control (the same rule with a wrong residual).
+ * model (the law of the emitted tokens computed in closed form, to 1e-12) and by a chi-square of
+ * the real device-shared code, with a negative control (the same rule with a wrong residual).
  *
  * Y may equal X_{tau+1}; the core then takes that draft as accepted (ADV_ACCEPT: "the draft is the
  * sampler's token at this row") and reads the next row, which keeps its ordinary pick: a draw from
@@ -90,7 +90,9 @@ static inline RAD_BLK_HD void rad_mtp_block_scan(RadBlockRow* r, int64_t vocab) 
     r->top = top;
 }
 
-static inline RAD_BLK_HD bool rad_mtp_block_live(int32_t id, float v) { return id >= 0 && v != -INFINITY; }
+static inline RAD_BLK_HD bool rad_mtp_block_live(int32_t id, float v) {
+    return id >= 0 && v != -INFINITY;
+}
 
 /* A lane's partial sums of one row: v[0..7] the mass on Q's ids (by their place in the state),
  * v[8] the mass off Q's support, v[9] the total. */
@@ -208,9 +210,11 @@ static inline RAD_BLK_HD void rad_mtp_block_plan(const RadMtpCoupleState* st,
 
 /* tau: the first i, counting down from g, whose uniform falls below h_i. The uniforms are keyed by
  * the block's first output position, so no row's own draws are reused. */
-static inline RAD_BLK_HD int rad_mtp_block_tau(const RadBlockPlan& pl, uint64_t seed, uint64_t pos0) {
+static inline RAD_BLK_HD int rad_mtp_block_tau(const RadBlockPlan& pl, uint64_t seed,
+                                               uint64_t pos0) {
     for (int i = pl.g; i > 0; --i)
-        if (rad_spechub_uniform(seed, pos0, RAD_MTP_BLOCK_KEY_STOP + (uint64_t)i) < pl.h[i]) return i;
+        if (rad_spechub_uniform(seed, pos0, RAD_MTP_BLOCK_KEY_STOP + (uint64_t)i) < pl.h[i])
+            return i;
     return 0;
 }
 
@@ -247,7 +251,10 @@ static inline RAD_BLK_HD bool rad_mtp_block_resid_walk(const RadBlockRow& r,
                                                        const RadBlockLane* lane, int32_t* out) {
     double on[8];
     double total = 0;
-    for (int k = 0; k < s.count; ++k) { on[k] = rad_spechub_positive(p * t.pq[k] - s.q[k]); total += on[k]; }
+    for (int k = 0; k < s.count; ++k) {
+        on[k] = rad_spechub_positive(p * t.pq[k] - s.q[k]);
+        total += on[k];
+    }
     double offt = 0;
     for (int l = 0; l < RAD_MTP_BLOCK_LANES; ++l) offt += lane[l].off;
     total += offt;
@@ -295,7 +302,8 @@ static inline RAD_BLK_HD bool rad_mtp_block_resid_draw(const RadBlockRow& r,
     for (int l = 0; l < RAD_MTP_BLOCK_LANES; ++l) lane[l] = RadBlockLane{ 0, 0, -1, -1 };
     for (int64_t j = 0; j < r.n; ++j)
         if (rad_mtp_block_live(r.ids[j], r.val[j]))
-            rad_mtp_block_lane_add(&lane[j % RAD_MTP_BLOCK_LANES], s, t, p, r.ids[j], r.val[j], r.top);
+            rad_mtp_block_lane_add(&lane[j % RAD_MTP_BLOCK_LANES], s, t, p, r.ids[j], r.val[j],
+                                   r.top);
     return rad_mtp_block_resid_walk(r, s, t, p, u, lane, out);
 }
 
@@ -315,8 +323,8 @@ static inline RAD_BLK_HD bool rad_mtp_block_decide(const RadMtpCoupleState* st,
     *tau = t;
     *y = -1;
     if (t >= g) return true;
-    return rad_mtp_block_resid_draw(rows[t], st[t], stat[t], pl.p[t],
-                                    rad_spechub_uniform(seed, pos0 + (uint64_t)t, RAD_SAMPLE_KEY_RESID), y);
+    const double u = rad_spechub_uniform(seed, pos0 + (uint64_t)t, RAD_SAMPLE_KEY_RESID);
+    return rad_mtp_block_resid_draw(rows[t], st[t], stat[t], pl.p[t], u, y);
 }
 
 #endif /* __cplusplus */

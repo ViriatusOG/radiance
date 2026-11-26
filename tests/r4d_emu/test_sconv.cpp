@@ -183,6 +183,56 @@ void speculative(bool dyn) {
     step({ 7 }, 1, 1, "after one row kept, read at 0");
 }
 
+void sconv_add_cases() {
+    const int64_t M = 6, n = 16, k = 4, S = 5;
+    const std::vector<float> wf = wave((size_t)(n * k), 0.2f), xf = wave((size_t)(M * n), 0.5f),
+                             rf = wave((size_t)(M * n), 1.1f);
+    std::vector<uint16_t> w = bf(wf), x = bf(xf), add_r = bf(rf);
+    const std::vector<float> wq = fl(w), xq = fl(x), rq = fl(add_r);
+    std::vector<int32_t> cu = { 0, 2, 6 }, ci = { 0, 1 }, hi = { 0, 0 };
+    std::vector<double> sc0 = ref_seq(rows(xq, { 0, 1 }, n), 2, n, wq, {}, 0, k);
+    std::vector<double> sc1 = ref_seq(rows(xq, { 2, 3, 4, 5 }, n), 4, n, wq, {}, 0, k);
+    std::vector<double> want = sc0;
+    want.insert(want.end(), sc1.begin(), sc1.end());
+    for (int64_t i = 0; i < M * n; ++i)
+        want[(size_t)i] = rq[(size_t)i] + (double)rad_bf16_to_f32(rad_f32_to_bf16((float)want[(size_t)i]));
+
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool alias = pass == 1;
+        const char* what = alias ? "sconv_res_add in-place (y == add_resid)" : "sconv_res_add out-of-place";
+        std::vector<uint16_t> cs((size_t)(2 * n * S), 0);
+        std::vector<uint16_t> rc_buf = add_r, y((size_t)(M * n), 0);
+        uint16_t* dst = alias ? rc_buf.data() : y.data();
+        RadTensor t[10] = {
+            tens(x.data(), RAD_BF16, { M, n }),
+            tens(w.data(), RAD_BF16, { n, k }),
+            tens(cs.data(), RAD_BF16, { 2, n, S }),
+            tens(cu.data(), RAD_I32, { 3 }),
+            RadTensor{},
+            tens(ci.data(), RAD_I32, { 2 }),
+            tens(hi.data(), RAD_I32, { 2 }),
+            RadTensor{},
+            tens(dst, RAD_BF16, { M, n }),
+            tens(rc_buf.data(), RAD_BF16, { M, n }),
+        };
+        Params P;
+        P.i("M", M); P.i("n", n); P.i("width", k); P.i("heads", 0); P.str("dtype", "bf16");
+        RadArgs a{}; a.t = t; a.n_t = 10; a.p = P.p.data(); a.n_p = (int)P.p.size();
+        const int rc = r4d_rad_sconv_res_add(&a, nullptr);
+        if (rc != RAD_OK) { std::printf("  %-44s launch %d\n", what, rc); ++failures; continue; }
+        double worst = 0;
+        bool ok = true;
+        for (int64_t i = 0; i < M * n; ++i) {
+            const double g = rad_bf16_to_f32(dst[(size_t)i]);
+            const double e = std::fabs(g - want[(size_t)i]);
+            worst = std::max(worst, e / (std::fabs(want[(size_t)i]) + 1e-2));
+            if (e > 0.01 * std::fabs(want[(size_t)i]) + 2e-3) ok = false;
+        }
+        std::printf("  %-44s worst %.2e  %s\n", what, worst, ok ? "PASS" : "FAIL");
+        if (!ok) ++failures;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -191,6 +241,7 @@ int main() {
     prefill(false);
     speculative(true);
     speculative(false);
+    sconv_add_cases();
     std::printf("sconv_res: %d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

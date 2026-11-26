@@ -5,8 +5,8 @@
 // tok[m] - vocab_offset, a zero row for an id outside this rank's rows, times `mult` with one
 // rounding. A row's value is the form's int8 value times its (row, 128) scale in f32, the 128-wide
 // Hadamard undone in f32 on a rotated table (libquant's butterfly order: span 1, 2, .., 64, each
-// pair (a, b) to (a + b, a - b)), rounded to bf16 to nearest even: the values the table's bf16
-// widening at load produced, bit for bit.
+// pair (a, b) to (a + b, a - b)), rounded to bf16 to nearest even: the table's exact decode to
+// bf16, bit for bit.
 
 #include "r4d.h"
 #include "r4d_args.h"

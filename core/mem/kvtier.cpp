@@ -607,9 +607,8 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
     s.label = std::move(kept_label);
     at_root.push_back(id);
     /* Rows under one root are pruned only when the root block goes, and a prompt every request
-     * shares (a decision model's instructions) never goes: the list grew by a row a request and
-     * each insert walked it under the lock the engine threads take (#375: prefill from 9k to
-     * 2.5k tok/s after 500K requests). Past kRootSessions the least recently used row is
+     * shares never goes, so the list grows by a row per request and each insert walks it under
+     * the lock the engine threads take. Past kRootSessions the least recently used row is
      * dropped; a row is bookkeeping, so its blocks stay cached. */
     if (at_root.size() > kRootSessions) {
         uint64_t oldest = 0, oldest_ns = ~uint64_t{0};

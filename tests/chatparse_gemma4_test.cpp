@@ -282,7 +282,7 @@ TEST(rendered_replies_read_back_as_the_template_wrote_them) {
         /* llama.cpp's parser reads the same calls and reasoning byte for byte. Where the template
          * writes content after the calls (its past-turn order, not the model's), the old parser
          * drops it and the new one keeps it. */
-        CHECK_EQ(o.calls.size(), m.calls.size());
+        REQUIRE_EQ(o.calls.size(), m.calls.size());
         for (size_t i = 0; i < std::min(o.calls.size(), m.calls.size()); ++i) {
             CHECK_EQ(o.calls[i].name, m.calls[i].name);
             CHECK_EQ(o.calls[i].arguments, m.calls[i].arguments);

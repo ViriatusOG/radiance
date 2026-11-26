@@ -153,7 +153,8 @@ inline int ClefHead::declare(RadBuilder* b, const RadModelMeta* meta, const RadB
     if (bs <= 0) return RAD_E_STATE;
     /* Rows a request may hold: the context, or the head's own bound where that is less (the
      * server refuses a longer prompt before it is admitted). */
-    const int64_t rows = g.max_ctx < RAD_CLEF_MAX_PROMPT ? g.max_ctx : RAD_CLEF_MAX_PROMPT;
+    const int64_t rows = g.max_ctx < (int64_t)RAD_CLEF_MAX_PROMPT ? g.max_ctx
+                                                                  : (int64_t)RAD_CLEF_MAX_PROMPT;
     nblk = (rows + bs - 1) / bs;
     NM   = nblk * bs;
     n_vocab = g.n_vocab;
@@ -501,11 +502,7 @@ inline int ClefHead::declare(RadBuilder* b, const RadModelMeta* meta, const RadB
     op_cp_abs  = rw(b, copy(), { b_abs }, { b_feat });
     op_rs1     = rw(b, gemmb(OM, W, 4 * W, "gelu", rs1_w, rs1_b), { b_feat }, { b_r });
     op_rs2     = rw(b, gemmb(OM, 1, W, "none", rs2_w, rs2_b), { b_r }, { b_out3 });
-    op_cast    = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 3 * OM),
-                                         RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                              RAD_NOWEIGHTS),
-                    { b_out3 }, { b_logits });
+    op_cast    = cast_op(b, 1, 3 * OM, "bf16", "f32", b_out3, b_logits);
 
     rad_note(b, "clef's joint schema head on the card: width %lld, %lld heads of %lld, "
                 "feedforward %lld, %lld routing + %lld decoder layers; hn cached as a FULL group "

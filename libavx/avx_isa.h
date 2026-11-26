@@ -83,12 +83,22 @@ int         avx_par_force(int threads);
     X(mla_project)                                                                                \
     X(dsa_score)                                                                                  \
     X(mla_attn)                                                                                   \
+    X(gemm_nt_ggml)         X(moe_gemm_ggml)                                                      \
+    X(logits_gemm_ggml)     X(embed_lookup_ggml)                                                  \
+    X(mhc_mix)              X(mhc_collapse)                                                       \
+    X(router_scored_topk)                                                                         \
+    X(rope_rows)                                                                                  \
+    X(quant_roundtrip)      X(softmax_pool)                                                       \
+    X(attn_sparse_sink)                                                                           \
+    X(index_score)          X(index_candidates)     X(index_topk)                                 \
+    X(entry_store)                                                                                \
+    X(token_map)            X(stream_gate_add)                                                    \
     X(mla_attn_paged)                                                                             \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(sconv_res)                                                                                  \
-    X(grid_embed_cpe)       X(grid_embed_pad)       X(window_order)                               \
+    X(grid_embed_cpe)       X(grid_embed_pad)       X(window_order)       X(posemb_resample)      \
     X(lili_cand)            X(lili_attn)            X(lili_factor)          X(lili_walk)          \
-    X(attn_res_mix)         X(situ_mul)                                                           \
+    X(attn_res_mix)         X(situ_mul)             X(grid_embed_hw)                              \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
     X(scatter_rows)         X(ngram_ids)            X(ple_conv_bias)                              \
@@ -102,17 +112,19 @@ int         avx_par_force(int threads);
     X(rel_sinusoid)         X(seg_sinusoid)         X(conv2d_unfold)                              \
     X(position_scale)                                                                            \
     X(embed_attn)           X(ministral_rope)        X(pixtral_rope)         X(pixtral_merge)      \
+    X(ds41_vit_rope2d)      X(ds41_pack3x3)          X(ds41_span_rows)       X(router_scored_topk_vl) \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
-    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) X(gated_quant_i8) \
+    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)                         \
     X(dequant)              X(quant_cols_fp8)       X(had_quant_act_i8g)    X(dequant_w4)         \
     X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
+    X(embed_lookup_planes)                                                                       \
     X(lora_shrink)          X(lora_expand)          X(lora_expand_mm)                             \
     /* ---- attention */                                                                          \
-    X(attn_paged)           X(attn_paged_sink)      X(attn_paged_rel)       X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
+    X(attn_paged)           X(attn_paged_sink)      X(attn_paged_rel)       X(attn_dense)           X(attn_dense_ref) X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
     X(sam_attn)             \
@@ -124,6 +136,7 @@ int         avx_par_force(int threads);
     /* ---- gated delta net */                                                                    \
     X(gdn_conv_prep)        X(gdn_conv_update)      X(gdn_kkt_solve)        X(gdn_chunk_scan)     \
     X(gdn_recurrent_update) X(gdn_conv_recurrent_update)                X(gdn_gated_rmsnorm)  \
+    X(gdn_conv_update_tree) X(gdn_recurrent_update_tree) X(gdn_conv_recurrent_update_tree)        \
     /* ---- collectives */                                                                        \
     X(all_reduce)           X(all_gather)                                                         \
     /* ---- image generation */                                                                   \
@@ -139,6 +152,10 @@ int         avx_par_force(int threads);
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)         X(flow_res_multistep) \
     X(cond_aug)             X(vtile_plan)           X(vtile_crop)           X(vtile_join)         \
+    /* ---- Wan 2.2 TI2V */                                                                       \
+    X(flow_unipc_step)      X(timestep_embed_f64)   X(wan_vae_frame_cu)     X(wan_vae_history)    \
+    X(wan_vae_expand)       X(wan_unpatch)          X(wan_mod_norm)         X(wan_gated_add)      \
+    X(wan_rope_table)       X(wan_rope)             X(attn_umt5)            X(gelu_umt5)          \
     /* ---- LTX-2 */                                                                              \
     X(rope_split)           X(head_gate)            X(ltx_guide)            X(pixel_norm)         \
     X(d2s3d)                X(s2d3d)                X(pix_patch)                                  \

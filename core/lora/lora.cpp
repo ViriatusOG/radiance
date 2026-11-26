@@ -324,9 +324,35 @@ void compositions(int P, int n, std::vector<std::vector<std::pair<int, int>>>* o
     if (n >= 1 && n <= P) rec(0, n);
 }
 
+constexpr int64_t kLoraTransformWidth = 128;
+
+/* These paths read row-major, unnormalised H128(x) codes plus their scales. The INT8 scale
+ * group may cover two transforms. The asymmetric U4 path shares the same input basis. */
+bool accepts_fwht128_input(const Program& prog, const OpInfo& op, const WeightInfo& w) {
+    if (!gen_scope(prog) || op.op != "gemm_nt_q" || !w.enc_known ||
+        w.enc.n_planes == 0 ||
+        std::strncmp(w.enc.transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    const char* dtype = op.base.get_s("dtype");
+    long long group = 0;
+    if (!dtype || !op.base.get_i("group", &group)) return false;
+    if (std::strcmp(dtype, "i8a8h") == 0 && w.enc.plane[0].dtype == RAD_I8)
+        return group == kLoraTransformWidth || group == 2 * kLoraTransformWidth;
+    if (std::strcmp(dtype, "w4a8i8_asym") != 0 || group != kLoraTransformWidth ||
+        w.enc.plane[0].dtype != RAD_U4 || !rad_enc_is(&w.enc, "affine") || w.enc.n_planes != 3)
+        return false;
+    const RadEncPlane* scale = rad_enc_plane(&w.enc, "scale");
+    const RadEncPlane* zero = rad_enc_plane(&w.enc, "zero");
+    return w.enc.plane[0].block[1] == 1 && scale && zero && scale->dtype == RAD_F16 &&
+           (zero->dtype == RAD_U8 || zero->dtype == RAD_U4) &&
+           scale->block[0] == 1 && zero->block[0] == 1 &&
+           scale->block[1] == group && zero->block[1] == group;
+}
+
 bool same_layout(const Site& a, const Site& b) {
     if (a.weight != b.weight || a.shard != b.shard || a.K_r != b.K_r || a.k_lo != b.k_lo ||
         a.K_full != b.K_full || a.N_r != b.N_r || a.R != b.R || a.n_modules != b.n_modules ||
+        a.fwht128_input != b.fwht128_input ||
         a.parts_resolved != b.parts_resolved || a.part_total != b.part_total ||
         a.part_lo != b.part_lo || a.part_hi != b.part_hi || a.part_y != b.part_y ||
         a.parts.size() != b.parts.size() || a.sources.size() != b.sources.size())
@@ -356,6 +382,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
     s.weight = W.name;
     s.shard = W.decl.shard;
     s.max_rank = max_rank;
+    s.fwht128_input = accepts_fwht128_input(prog, op, W);
 
     if (W.decl.rank != 2)
         return fail(err, RAD_E_SHAPE, fmt("weight '%s' is rank %u; a LoRA site needs a matrix",
@@ -392,6 +419,10 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
             s.K_full = s.K_r * world;
         }
     }
+
+    if (s.fwht128_input && (s.K_r % kLoraTransformWidth || s.k_lo % kLoraTransformWidth))
+        return fail(err, RAD_E_SHAPE, fmt("weight '%s': LoRA column slice must align to the "
+                                          "128-column Hadamard blocks", W.name.c_str()));
 
     /* ---- rows: share.cpp's per-part cut, in each part's own units. */
     const int P = W.decl.n_row_parts > 1 ? W.decl.n_row_parts : 1;
@@ -626,7 +657,8 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
      * library's layout/relayout hooks presenting the planes in the plain basis at load (a plain
      * kernel with no such hook is refused at declare by its own layout, RAD_E_DTYPE). A resolved
      * plain GEMM over a transformed encoding is therefore basis-safe for the adapter epilogue. */
-    if ((gq || gqb) && w.enc_known && w.enc.transform[0])
+    if ((gq || gqb) && w.enc_known && w.enc.transform[0] &&
+        !accepts_fwht128_input(prog, op, w))
         return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed a "
                       "transformed activation", w.name.c_str(), (int)RAD_ENC_STR, w.enc.transform));
     return true;
@@ -1014,6 +1046,29 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     return pack_modules(sites, max_rank, mods, info, packed, err);
 }
 
+namespace {
+
+/* For the unnormalised H, <H(A)/128, H(x)> = <A, x>. Transform the original factor
+ * in float and round once when writing the BF16 slot. B and the module scale stay unchanged. */
+void pack_fwht128_row(uint16_t* dst, const StTensor& factor, int64_t offset, int64_t columns) {
+    for (int64_t block = 0; block < columns; block += kLoraTransformWidth) {
+        float values[kLoraTransformWidth];
+        for (int64_t i = 0; i < kLoraTransformWidth; ++i)
+            values[i] = elem_f32(factor, offset + block + i);
+        for (int64_t half = 1; half < kLoraTransformWidth; half *= 2)
+            for (int64_t base = 0; base < kLoraTransformWidth; base += 2 * half)
+                for (int64_t i = base; i < base + half; ++i) {
+                    const float lo = values[i], hi = values[i + half];
+                    values[i] = lo + hi;
+                    values[i + half] = lo - hi;
+                }
+        for (int64_t i = 0; i < kLoraTransformWidth; ++i)
+            dst[block + i] = rad_f32_to_bf16(values[i] / kLoraTransformWidth);
+    }
+}
+
+}  // namespace
+
 int pack_modules(const std::vector<Site>& sites, int max_rank,
                  const std::map<std::string, AdModule>& mods, AdapterInfo* info,
                  std::vector<PackedSite>* packed, std::string* err, bool compact) {
@@ -1231,9 +1286,13 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
             const StTensor& A = *am[i]->A;
             const int64_t r = am[i]->rank, kc = A.shape[1];
             const int64_t t0 = off[i];
-            for (int64_t j = 0; j < r; ++j)
-                for (int64_t k = 0; k < s.K_r; ++k)
-                    out.a[(size_t)((t0 + j) * s.K_r + k)] = elem_bf16(A, j * kc + s.k_lo + k);
+            for (int64_t j = 0; j < r; ++j) {
+                uint16_t* dst = out.a.data() + (t0 + j) * s.K_r;
+                const int64_t src = j * kc + s.k_lo;
+                if (s.fwht128_input) pack_fwht128_row(dst, A, src, s.K_r);
+                else
+                    for (int64_t k = 0; k < s.K_r; ++k) dst[k] = elem_bf16(A, src + k);
+            }
         }
         for (const SitePart& sp : parts) {
             size_t i = 0;
@@ -1250,6 +1309,89 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
                 out.scale[(size_t)yr] = am[i]->scale;
             }
         }
+    }
+    return RAD_OK;
+}
+
+std::map<std::string, std::string> generator_placement_issues(
+    const Program& prog, const TargetSet& targets, const std::set<uint32_t>& resolved) {
+    const MapIndex maps(prog);
+    std::map<std::string, std::string> issues;
+    for (uint32_t index : resolved) {
+        if (index == 0 || index >= prog.ops.size()) continue;
+        const auto& op = prog.ops[index];
+        if (op.anchor >= 0) continue; // Core adapter ops read pools, not checkpoint matrices.
+        for (rad_weight weight : op.weights) {
+            if (!targeted_idx(prog, maps, weight, targets)) continue;
+            const auto& info = prog.weights[weight];
+            bool carries = false;
+            if (op.lora_site >= 0 && (size_t)op.lora_site < prog.lora_sites.size()) {
+                const auto& site = prog.lora_sites[(size_t)op.lora_site];
+                const rad_weight base = b_weight(op);
+                carries = site.gemm == index && site.pool >= 0 &&
+                          (size_t)site.pool < prog.lora_pools.size() &&
+                          base > 0 && base < prog.weights.size() &&
+                          prog.lora_pools[(size_t)site.pool].weight == prog.weights[base].name &&
+                          prog.weights[base].source == info.source;
+            }
+            if (op.op == "mix_rows") {
+                const auto replacement = prog.lora_replacements.find(weight);
+                carries = replacement != prog.lora_replacements.end() &&
+                          replacement->second.row_mixer;
+            }
+            if (carries) continue;
+            if (const auto* entries = maps.find(info.source))
+                for (const auto* entry : *entries)
+                    for (int k = 0; k < entry->n_src && k < 8; ++k) {
+                        if (!entry->src[k] || !source_targeted(prog, targets, entry->src[k])) continue;
+                        const std::string module = module_of(entry->src[k], nullptr);
+                        issues.try_emplace(module, fmt("resolved op %u '%s' over '%s' has no "
+                                                       "adapter path", index, op.op.c_str(),
+                                                       info.name.c_str()));
+                    }
+        }
+    }
+    return issues;
+}
+
+int check_generator_placement(const std::vector<AdapterInfo>& per_rank,
+    const std::vector<std::map<std::string, std::string>>& issues,
+    const std::set<std::string>& row_mixers, std::string* err,
+    const std::vector<std::set<std::string>>& required_slices) {
+    if (per_rank.empty() || per_rank.size() != issues.size())
+        return fail(err, RAD_E_STATE, "adapter placement has no matching rank reports");
+    if (!required_slices.empty() && required_slices.size() != per_rank.size())
+        return fail(err, RAD_E_STATE, "adapter placement has no matching slice reports");
+    for (const auto& requested : per_rank.front().modules) {
+        std::string module = requested.name.substr(0, requested.name.find('@'));
+        std::vector<std::string> spellings{module};
+        if (module.starts_with("model.") && !module.starts_with("model.language_model."))
+            spellings.push_back("model.language_model." + module.substr(6));
+        if (module.starts_with("model.language_model."))
+            spellings.push_back("model." + module.substr(21));
+        bool packed = false;
+        for (size_t rank = 0; rank < per_rank.size(); ++rank) {
+            for (const auto& spelling : spellings)
+                if (const auto found = issues[rank].find(spelling); found != issues[rank].end())
+                    return fail(err, RAD_E_INVAL, fmt("rank %zu: %s: %s", rank,
+                        requested.name.c_str(), found->second.c_str()));
+            for (const auto& placed : per_rank[rank].modules)
+                if (placed.name == requested.name && placed.pool >= 0) packed = true;
+            if (!required_slices.empty())
+                for (const auto& slice : required_slices[rank]) {
+                    const auto canonical = slice.substr(0, slice.find('@'));
+                    if (std::find(spellings.begin(), spellings.end(), canonical) == spellings.end()) continue;
+                    bool found = false;
+                    for (const auto& placed : per_rank[rank].modules)
+                        found = found || (placed.base == slice && placed.pool >= 0);
+                    if (!found)
+                        return fail(err, RAD_E_INVAL, fmt("rank %zu: required matrix slice %s "
+                                                        "was not packed", rank, slice.c_str()));
+                }
+        }
+        if (!packed && !row_mixers.count(module))
+            return fail(err, RAD_E_INVAL, "adapter module " + requested.name +
+                        " has no packed matrix site or all-rank row-mixer replacement");
     }
     return RAD_OK;
 }

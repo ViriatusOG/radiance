@@ -263,7 +263,7 @@ TEST(gen_config_reads_suppress_tokens) {
     GenSampling g;
     CHECK(gen_sampling_parse(R"({"temperature": 1.0, "suppress_tokens": [258883, 258882]})",
                              "test", &g));
-    CHECK_EQ((int)g.suppress.size(), 2);
+    REQUIRE_EQ((int)g.suppress.size(), 2);
     CHECK_EQ(g.suppress[0], 258883);
     CHECK_EQ(g.suppress[1], 258882);
     const SamplingParams sp = g.onto(SamplingParams{});
@@ -273,7 +273,7 @@ TEST(gen_config_reads_suppress_tokens) {
     /* The container's flattened copy: the array as a space-separated string. */
     GenSampling kv;
     CHECK(gen_sampling_from_kv(kv_of({ { "suppress_tokens", "258883 258882" } }), &kv));
-    CHECK_EQ((int)kv.suppress.size(), 2);
+    REQUIRE_EQ((int)kv.suppress.size(), 2);
     CHECK_EQ(kv.suppress[1], 258882);
 
     /* An entry that is no id is dropped on its own, and a non-array is dropped whole. */

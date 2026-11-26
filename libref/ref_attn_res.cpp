@@ -5,8 +5,8 @@
  *                 (v_i . query[q]) / sqrt(n), the softmax over i weights the normalised values, and
  *                 with `w` the mix is rms-normalised again and gained by w[q].
  *
- * The planes of `states` may sit further apart than M rows: a caller keeps a [max_blocks, max_tok, n]
- * buffer and passes its first n_state planes, so the plane stride is the tensor's own.
+ * The planes of `states` may sit further apart than M rows: a caller keeps a [max_blocks, max_tok,
+ * n] buffer and passes its first n_state planes, so the plane stride is the tensor's own.
  */
 #include <cstdint>
 #include "ref_common.h"
@@ -40,7 +40,9 @@ int ref_attn_res_mix(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     if (numel(cur) < M * n || numel(qry) < nQ * n) return RAD_E_SHAPE;
     if (add && numel(add) < M * n) return RAD_E_SHAPE;
-    if (qry->rank != 2 || qry->shape[1] != n || (wt && (wt->rank != 2 || wt->shape[1] != n)))
+    const bool wt1 = wt && wt->rank == 1 && nQ == 1 && wt->shape[0] == n;
+    if (qry->rank != 2 || qry->shape[1] != n ||
+        (wt && !wt1 && (wt->rank != 2 || wt->shape[1] != n)))
         return RAD_E_SHAPE;
     if (wt && numel(wt) < nQ * n) return RAD_E_SHAPE;
 
@@ -98,7 +100,8 @@ int ref_attn_res_mix(const RadArgs* a, RadStream) {
                 for (int64_t c = 0; c < n; ++c) ss2 += m[(size_t)c] * m[(size_t)c];
                 const float r = 1.0f / std::sqrt(ss2 / (float)n + eps);
                 for (int64_t c = 0; c < n; ++c)
-                    m[(size_t)c] = m[(size_t)c] * r * ldt(wt, q * wt->stride[0] + c * ws);
+                    m[(size_t)c] = m[(size_t)c] * r * ldt(wt,
+                                                          (wt1 ? 0 : q * wt->stride[0]) + c * ws);
             }
             const int64_t yb = y2 ? t * y->stride[0] : q * y->stride[0] + t * y->stride[1];
             for (int64_t c = 0; c < n; ++c) stt(y, yb + c * ys, m[(size_t)c]);

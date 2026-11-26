@@ -485,12 +485,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.media = AudioTower::present(meta) && ctx->max_audio_frames > 0;
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, g.n_embd, m.b_x));
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                                  RAD_PARAMS(RAD_INT("world_size", g.world),
-                                             RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                             RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                                  RAD_NOWEIGHTS),
-                              {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
 
     AttnBF16::Wire aw{};
     aw.x = m.b_x; aw.h = m.b_h; aw.q = m.b_q; aw.k = m.b_k; aw.v = m.b_v; aw.attn = m.b_attn;

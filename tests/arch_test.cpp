@@ -78,6 +78,8 @@
 #include "../arch/anima/anima.cpp"
 /* Krea 2: a generator conditioned on twelve tapped layers of Qwen3-VL. */
 #include "../arch/krea2/krea2.cpp"
+/* Inkling 2's loop backbone, for its DFlash2 drafter. */
+#include "../arch/inkling2/inkling2.cpp"
 
 /* ==================================================================== fixtures and helpers */
 namespace {
@@ -410,7 +412,7 @@ TEST(fp8_qk_attention_normalizes_before_neox_rope) {
     const rad_kvgroup kv = rad_decl_kv_group(&b, "kv_attn", &kd);
     CHECK_OK(rad_bind_layer_kv(&b, 0, kv));
 
-    AttnQKFP8::Wire w{};
+    AttnQK::Wire w{};
     w.x = decl_b(&b, nm.f("x"), RAD_BF16, {g.max_tok, g.n_embd});
     w.h.x = decl_b(&b, nm.f("h"), RAD_BF16, {g.max_tok, g.n_embd});
     CHECK_OK(w.h.declare_qs(&b, nm, g, "h", g.n_embd));
@@ -425,7 +427,7 @@ TEST(fp8_qk_attention_normalizes_before_neox_rope) {
                              RAD_NOWEIGHTS),
                          {}, {w.x});
 
-    AttnQKFP8::Src src{};
+    AttnQK::Src src{};
     src.norm = nm.ckpt("model.layers.0.input_layernorm.weight");
     src.q = nm.ckpt("model.layers.0.self_attn.q_proj.weight");
     src.k = nm.ckpt("model.layers.0.self_attn.k_proj.weight");
@@ -433,7 +435,7 @@ TEST(fp8_qk_attention_normalizes_before_neox_rope) {
     src.q_norm = nm.ckpt("model.layers.0.self_attn.q_norm.weight");
     src.k_norm = nm.ckpt("model.layers.0.self_attn.k_norm.weight");
     src.o = nm.ckpt("model.layers.0.self_attn.o_proj.weight");
-    AttnQKFP8 attn;
+    AttnQK attn;
     CHECK_OK(attn.declare(&b, nm, g, 0, kv, w, src));
 
     const RecWeight* qw = find_w(b, "blk.0.attn_q.weight");
@@ -2612,7 +2614,7 @@ TEST(qsa_without_a_stream_the_selection_is_never_resolved) {
 }
 
 /* At or below the exactness bound nothing reads the selection, so the indexer issues none of its
- * query side (docs/QSA.md, "Below the bound"; AttnGatedFP8::qsa_use, QsaIndexer::step): a step of
+ * query side (docs/QSA.md, "Below the bound"; AttnGatedQ::qsa_use, QsaIndexer::step): a step of
  * several rows a sequence -- a chain verify -- attends densely over the block table, and a step of
  * one row a sequence issues the sparse row's launch over the sequence's own table and length. The
  * stateful half (work list, block keys, tail) runs on every step either way. Above the bound, by
@@ -3628,7 +3630,7 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
          * protected here, so class = expert number mod 4). These literals are the TP4 MoE contract:
          * five 128-blocks over four ranks, the odd block rotating with the class. They are written
          * out rather than recomputed from the plugin's formula on purpose. */
-        const int64_t blk = 128;                    /* RAD_FP8_BLOCK, the scale block width */
+        const int64_t blk = 128;                    /* RAD_SCALE_GROUP, the scale block width */
         const int64_t nblk = meta.n_ff / blk;        /* five at the fixture's 640 */
         const int64_t cls_lo[4][4] = { { 0, 512, 384, 256 }, { 256, 0, 512, 384 },
                                        { 384, 256, 0, 512 }, { 512, 384, 256, 0 } };
@@ -9868,7 +9870,7 @@ TEST(qwen35_fp8_steps_lint_clean_with_its_mtp_head) {
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 3, false, 0);
 }
 
-/* A mixed step's dense attention is issued once per band (AttnGatedFP8::step): the decode
+/* A mixed step's dense attention is issued once per band (AttnGatedQ::step): the decode
  * sequences as a prefix at their own band, then the prefill chunks at the op's top band with
  * their per-sequence arrays past the decode sequences and q, out and cu at absolute rows. A pure
  * step issues one attention a layer. */
@@ -10089,6 +10091,58 @@ TEST(qwen35_fp8_dflash2_drafter_takes_a_power_of_two_block) {
         CHECK_EQ(p.draft_depth, 7);
         CHECK_EQ(p.draft_depth_fixed, 1);
         CHECK_EQ(p.chain_pays, 0);   /* chained launches measured even here */
+    }
+}
+
+/* Asked for trees (RadBuildCtx::draft_tree), the DFlash2 drafter keeps its trained block of 8 and
+ * grows `max_spec` nodes over it: every trunk layer declares its tree form (the attention's
+ * attn_paged_tree, the delta net's fold over a tree), the selector is dflash_tree, and the core is
+ * told the parents. Not asked, or asked at the block's own depth, nothing of it is declared. */
+TEST(qwen35_fp8_dflash2_drafter_grows_a_tree_over_its_trained_block) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    for (int tree = 0; tree < 2; ++tree) {
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(0, 1, tree ? 15 : 7);
+        ctx.draft_tree = tree;
+        REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int64_t n_attn = 0, n_gdn = 0, n_full = 0, n_sel = 0;
+        for (const RecOp& o : b.ops) {
+            n_attn += o.op == "attn_paged_tree";
+            n_gdn  += o.op == "gdn_conv_recurrent_update_tree";
+            n_full += o.op == "attn_paged";
+            n_sel  += o.op == "dflash_tree";
+        }
+        CHECK_EQ(b.drafter_parents != 0, tree != 0);
+        CHECK_EQ(n_sel > 0, tree != 0);
+        CHECK_EQ(b.drafter.block, 8);
+        CHECK_EQ(b.drafter.depth, tree ? 15 : 7);
+        CHECK_EQ(n_attn > 0, tree != 0);
+        CHECK_EQ(n_gdn > 0, tree != 0);
+        if (tree) {
+            const RecBuf* par = find_b(b, "dflash_parents");
+            REQUIRE(par != nullptr);
+            CHECK_EQ(par->d.shape[1], 15);
+            CHECK(noted(b, "a tree of 15 nodes a step"));
+        }
+        (void)n_full;
+    }
+    {   /* Asked at the drafter's own depth, the chain stays and nothing of a tree is declared. */
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(0, 1, 7);
+        ctx.draft_tree = 1;
+        REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int64_t n_tree = 0;
+        for (const RecOp& o : b.ops)
+            n_tree += o.op == "attn_paged_tree" || o.op == "gdn_conv_recurrent_update_tree" ||
+                      o.op == "dflash_tree";
+        CHECK_EQ(n_tree, 0);
+        CHECK_EQ(b.drafter_parents, 0);
+        CHECK_EQ(b.drafter.depth, 7);
+    }
+    {   /* The probe asks for trees; RADIANCE_QWEN_TREE=0 is the way out. */
+        RadArchProbe p{};
+        CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
+        CHECK_EQ(p.tree_pays, 1);
     }
 }
 
@@ -10804,7 +10858,7 @@ TEST(gemma3_under_a_lossy_wire_small_steps_keep_the_fused_junction) {
         ctx.tp_wire_min_bytes = 128 * 1024;
         REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
         const gemma3::Model& m = gemma3::g_model[rank];
-        CHECK(!m.fuse_mx && m.fuse && m.fuse_ar);
+        CHECK(m.fuse && m.fuse_ar);
         auto issued = [&](const RadCtx& c, std::initializer_list<const char*> names) {
             int n = 0;
             for (const RecIssue& i : c.issues)
@@ -14824,7 +14878,7 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
 }
 
 /* qwen35_w8a8 at two ranks where libr4d serves the `_had_quant_i8g` norms (a_h.q8_fed): the norms write
- * rotated int8 codes, which the pipelined prefill's boundary norms (NormQuantFP8::step_plain) do not issue,
+ * rotated int8 codes, which the pipelined prefill's boundary norms (NormQuant::step_plain) do not issue,
  * so the prefill stays serial there: the step whole, nothing on the second lane, no step failure. Where
  * the forms are not served each projection quantises its own input and the pipeline runs as on
  * qwen35_fp8. A pipeline over the int8 codes would hand the int8 op the boundary norm's E4M3 codes,
@@ -14935,7 +14989,7 @@ static void n_rank_serial_case(int world, bool gemma) {
             return gemma ? gemma3::declare(&b, mk.meta(), &ctx) : qwen35_fp8::declare(&b, mk.meta(), &ctx);
         });
         REQUIRE_EQ(rc, RAD_OK);
-        CHECK(!(gemma ? gemma3::g_model[rank].pipe_on : qwen35_fp8::g_model[rank].pipe_on));
+        if (!gemma) CHECK(!qwen35_fp8::g_model[rank].pipe_on);
         const auto pf = kit(b, {}, { 2048 }, 0);
         const auto v = run_passes(b, gemma ? gemma3::step : qwen35_fp8::step, { pf.get() }, rank, world);
         CHECK_PASSES(b, v);
@@ -15757,4 +15811,245 @@ TEST(krea2_explicit_edit_conversion_requires_vision_metadata) {
     mk.set("pipeline.krea_reference_encoder", "0");
     CHECK_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
     CHECK_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+}
+
+/* ============ inkling2 + DFlash2: incoai's Inkling-2-Mini-DFlash2 ============ */
+namespace {
+/* Inkling 2 Mini's text config as rad-convert writes it (the keys arch/inkling2 reads, no vision
+ * tower), with incoai's DFlash2 drafter's config.json merged under `draft.` (lists space
+ * separated, booleans 1/0). */
+MetaKV ink2_df2_meta() {
+    RadModelMeta m{};
+    m.arch_id = "inkling2";
+    m.name = "test-inkling2-mini";
+    m.quant = "bf16";
+    m.n_layers = 24;
+    m.n_embd = 2304;
+    m.n_head = 24;
+    m.n_head_kv = 8;
+    m.head_dim = 128;
+    m.n_ff = 1152;
+    m.n_vocab = 201024;
+    m.n_expert = 128;
+    m.n_expert_used = 8;
+    m.rms_eps = 1e-6f;
+    m.rope_theta = 1e4f;
+    m.rope_scale = 1.0f;
+    MetaKV k(m);
+    const char* kv[][2] = {
+        { "model_type", "inkling2_loop" }, { "eos_token_id", "200006" },
+        { "d_rel", "16" }, { "rel_extent", "1024" }, { "log_scaling_n_floor", "8192" },
+        { "log_scaling_alpha", "0.1" }, { "qk_l2_clip_threshold", "22.627416997969522" },
+        { "rel_l2_clip_threshold", "8" },
+        { "local_layer_ids", "0 1 2 3 4 6 7 8 9 10 12 13 14 15 16 18 19 20 21 22" },
+        { "sconv_kernel_size", "4" }, { "unpadded_vocab_size", "200058" },
+        { "final_logit_softcapping", "30" }, { "sliding_window_size", "1024" },
+        { "n_layers_per_attn_res_block", "6" }, { "n_routed_experts", "128" },
+        { "num_experts_per_tok", "8" }, { "n_shared_experts", "0" },
+        { "intermediate_size", "1152" }, { "mlp_gate_softcap", "4" }, { "mlp_up_softcap", "25" },
+        { "route_scale", "8" }, { "use_gate_bias", "1" }, { "loop_config.core_start", "6" },
+        { "loop_config.core_end", "18" }, { "loop_config.num_passes", "3" },
+        { "loop_config.gate_rank", "64" },
+        { "draft.architectures", "DFlash2DraftModel" }, { "draft.model_type", "qwen3" },
+        { "draft.hidden_size", "2304" }, { "draft.num_hidden_layers", "5" },
+        { "draft.num_attention_heads", "32" }, { "draft.num_key_value_heads", "8" },
+        { "draft.head_dim", "128" }, { "draft.intermediate_size", "6912" },
+        { "draft.rms_norm_eps", "1e-06" }, { "draft.rope_parameters.rope_theta", "10000.0" },
+        { "draft.sliding_window", "2048" }, { "draft.use_sliding_window", "1" },
+        { "draft.is_causal", "0" }, { "draft.vocab_size", "201024" },
+        { "draft.dflash_config.block_size", "8" }, { "draft.dflash_config.conv_group_size", "16" },
+        { "draft.dflash_config.conv_kernel_size", "2" },
+        { "draft.dflash_config.final_logit_softcapping", "30.0" },
+        { "draft.dflash_config.mask_token_id", "200056" },
+        { "draft.dflash_config.selector_rank", "256" },
+        { "draft.dflash_config.selector_softcap_mode", "after_correction" },
+        { "draft.dflash_config.selector_top_k", "16" },
+        { "draft.dflash_config.target_layer_ids", "5 23 41 48" },
+    };
+    for (const auto& p : kv) k.set(p[0], p[1]);
+    return k;
+}
+
+/* IQR-V4's expert form, as data/recipes/inkling2-mini-iq4r-v4.recipe writes it: u4 codes of the
+ * computed trellis (runs of `run` rows) under one f32 scale a row and one a 128-K block, fwht128. */
+RadEncoding ink2_iqr(int64_t run) {
+    RadEncoding e{};
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
+    e.plane[t].block[0] = run;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+}  /* namespace */
+
+/* Inkling 2 declares incoai's DFlash2 drafter as it was trained (the SGLang integration it ships
+ * with): depth 7, mask 200056, a 2048-token window; the four streams it reads (entering
+ * applications 5, 23 and 41, and the final norm's output) copied into its tap buffer, four per
+ * trunk step; the looked-up rows normed by the trunk's embed_norm; the
+ * candidates from the trunk's own head (one weight read by both logits_gemm ops, no draft-head
+ * copy) over the real vocabulary, the 966 padded rows filled on the rank that holds them; no cap
+ * on the unary logits (the softcap comes after the edge correction, which the greedy walk's argmax
+ * does not see). At two ranks the candidates are merged across the vocabulary shards. */
+TEST(inkling2_declares_incoais_dflash2_drafter) {
+    MetaKV mk = ink2_df2_meta();
+    RadArchProbe p{};
+    CHECK_OK(inkling2::probe(mk.meta(), &p));
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+
+    for (int world : { 1, 2 }) {
+        const int rank = world - 1;   /* the rank holding the head's padded rows */
+        RadBuilder b;
+        RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+        rad_enc_copy_str(r8.transform, "fwht128");
+        /* the experts IQR-V4 (gate_up's runs 128 rows, down's 256), the drafter's linears int8 */
+        b.encs = { { "dflash.fc.", r8 }, { "dflash.blk.", r8 }, { ".gu", ink2_iqr(128) },
+                   { ".dn", ink2_iqr(256) } };
+        RadBuildCtx ctx = build_ctx(rank, world);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(inkling2::declare(&b, mk.meta(), &ctx), RAD_OK);
+
+        const RecOp* egu = find_op(b, "moe_gemm_q", 0);
+        REQUIRE(egu != nullptr);
+        CHECK_EQ(pstr(egu, "dtype"), std::string("i8a8h"));
+        CHECK_EQ(count_op(b, "situ_mul"), 24);
+        CHECK_EQ(b.drafter_name, std::string("dflash2"));
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+        CHECK_EQ(b.drafter.depth, 7);
+        CHECK_EQ((int)b.drafter.block, 8);
+        CHECK_EQ(b.drafter.mask_token, 200056);
+        CHECK_EQ(b.drafter.window, 2048);
+        CHECK(buf_named(b, "ds_taps") == 0);
+        const int src = buf_named(b, "df_src");
+        REQUIRE(src > 0);
+        CHECK_EQ(b.bufs[src - 1].d.shape[1], 4 * 2304);
+        const rad_kvgroup kvd = kv_named(b, "kv_draft");
+        REQUIRE(kvd != 0);
+        CHECK_EQ((int)b.kv_groups[kvd - 1].d.kind, (int)RAD_KV_WINDOW);
+        CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, 8 / world);
+
+        int n_w = 0;
+        for (const auto& w : b.weights) n_w += w.name.find("dflash.draft_head") != std::string::npos;
+        CHECK_EQ(n_w, 0);
+        const RecOp* h0 = find_op(b, "logits_gemm", 0);
+        const RecOp* h1 = find_op(b, "logits_gemm", 1);
+        REQUIRE(h0 != nullptr && h1 != nullptr);
+        CHECK(h0->w == h1->w);
+        CHECK_EQ(pint(h1, "n_vocab"), 201024 / world);
+        int n_pad = 0;
+        for (const auto& o : b.ops) n_pad += o.op == "fill" && pint(&o, "n") == 966;
+        CHECK_EQ(n_pad, 2);   /* the trunk's logits and the drafter's */
+        int n_cap = 0;   /* over a vocabulary row: the trunk's alone */
+        for (const auto& o : b.ops) n_cap += o.op == "logit_softcap" && pint(&o, "n") == 201024 / world;
+        CHECK_EQ(n_cap, 1);
+        const RecOp* tk = find_op(b, "row_topk", 0);
+        REQUIRE(tk != nullptr);
+        CHECK_EQ(pstr(tk, "dtype"), std::string("f32"));
+        CHECK_EQ(count_op(b, "row_topk_merge"), world > 1 ? 1 : 0);
+        CHECK_EQ(count_op(b, "dflash_select"), 2);   /* the block's walk and the short block's */
+        CHECK_EQ(count_op(b, "logit_rerank"), 0);
+        const RecOp* te = find_op(b, "embed_lookup", 0);
+        const RecOp* de = find_op(b, "embed_lookup", 1);
+        REQUIRE(te != nullptr && de != nullptr);
+        CHECK(te->w == de->w);
+        rad_weight en = 0;
+        for (size_t i = 0; i < b.weights.size(); ++i)
+            if (b.weights[i].name == "embed_norm.weight") en = (rad_weight)(i + 1);
+        REQUIRE(en != 0);
+        int n_enorm = 0;
+        for (const auto& o : b.ops) n_enorm += o.op == "rmsnorm" && o.w.size() == 1 && o.w[0] == en;
+        CHECK_EQ(n_enorm, 2);   /* the trunk's embed_norm and the drafter's, one weight */
+
+        for (int64_t n_seq : { 1, 2 }) {
+            const auto ver = kit(b, std::vector<int>((size_t)n_seq, 8), {});
+            const auto ctxp = context_pass(b, *ver);
+            const auto qry = query_pass(b, n_seq, 8, 7);
+            const auto v = run_passes(b, inkling2::step, { ver.get(), ctxp.get(), qry.get() },
+                                      rank, world);
+            CHECK_PASSES(b, v);
+            CHECK_EQ(count_writes_to(b, *v[0], src), 4);
+        }
+    }
+}
+
+/* The bf16 calibration container (data/recipes/inkling2-mini-bf16.recipe) under --calib-dir, at one
+ * rank and at two: bf16 experts split evenly (576 of the 1152 columns a rank at two, the buffers
+ * between the expert GEMMs that wide), one Gram scratch a rank over every rank's columns gathered
+ * (1152), the SiTU product gathered at two ranks, and the four pooled Grams (gate_up's input and
+ * the attention's three) of each layer the rank records (layer % world), plus the per-expert down
+ * tap. No IQR quantiser is declared. */
+TEST(inkling2_bf16_experts_declare_the_calibration_taps_at_one_and_two_ranks) {
+    MetaKV mk = ink2_df2_meta();
+    for (int world : { 1, 2 }) for (int rank = 0; rank < world; ++rank) {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx(rank, world);
+        ctx.max_tok = 512;
+        ctx.calib_dir = "/nonexistent/calib";
+        ctx.calib_tokens = 4096;
+        REQUIRE_EQ(inkling2::declare(&b, mk.meta(), &ctx), RAD_OK);
+
+        const int64_t fw = 1152 / world, K = 8, E = 128;
+        const int act = buf_named(b, "act");
+        REQUIRE(act > 0);
+        CHECK_EQ(b.bufs[act - 1].d.shape[1], fw);
+        const RecOp* egu = find_op(b, "moe_gemm", 0);
+        REQUIRE(egu != nullptr);
+        CHECK_EQ(pint(egu, "N"), 2 * fw);
+        CHECK_EQ(count_op(b, "moe_gemm_q"), 0);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 0);
+        const int scr = buf_named(b, "calib.scratch");
+        REQUIRE(scr > 0);
+        CHECK_EQ(b.bufs[scr - 1].d.shape[0], E * 1152);
+        CHECK_EQ(b.bufs[scr - 1].d.shape[1], 1152);
+        const int gat = buf_named(b, "calib.gathered");
+        CHECK_EQ(gat > 0, world > 1);
+        if (gat > 0) {
+            CHECK_EQ(b.bufs[gat - 1].d.shape[0], ctx.max_tok * K);
+            CHECK_EQ(b.bufs[gat - 1].d.shape[1], 1152);
+            int n_gather = 0;
+            for (const auto& o : b.ops) n_gather += o.op == "all_gather" && pint(&o, "row") == fw;
+            CHECK_EQ(n_gather, 1);
+        }
+        const int owned = 24 / world;
+        CHECK_EQ(count_op(b, "gram_accum"), 1 + 4 * owned);
+        for (int l = 0; l < 24; ++l) {
+            const std::string gu = "calib.blk." + std::to_string(l) + ".gu";
+            CHECK_EQ(buf_named(b, gu.c_str()) > 0, l % world == rank);
+        }
+    }
+}
+
+/* Only IQR-V4 and the bf16 calibration form are served: a container whose experts are in another
+ * form (the old rotated int8 IQ8R container's) is refused by name, and so is a container carrying
+ * the release's own DSpark drafter, with or without speculation. */
+TEST(inkling2_refuses_int8_experts_and_the_dspark_drafter_by_name) {
+    MetaKV mk = ink2_df2_meta();
+    {
+        RadBuilder b;
+        RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+        rad_enc_copy_str(r8.transform, "fwht128");
+        b.encs = { { ".gu", r8 }, { ".dn", r8 } };
+        RadBuildCtx ctx = build_ctx(0, 1);
+        CHECK_EQ(inkling2::declare(&b, mk.meta(), &ctx), RAD_E_DTYPE);
+    }
+    MetaKV ds = ink2_df2_meta();
+    ds.set("draft.architectures", "Inkling2DSparkModel");
+    ds.set("draft.model_type", "inkling2_dspark");
+    ds.set("draft.block_size", "8");
+    RadArchProbe p{};
+    CHECK_OK(inkling2::probe(ds.meta(), &p));
+    CHECK_EQ(p.draft_depth, 0);
+    for (int spec : { 0, 7 }) {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx(0, 1);
+        ctx.max_spec = spec;
+        CHECK_EQ(inkling2::declare(&b, ds.meta(), &ctx), RAD_E_UNSUPPORTED);
+        CHECK(b.drafter_name.empty());
+    }
 }

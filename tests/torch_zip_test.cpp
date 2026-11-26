@@ -391,8 +391,7 @@ TEST(malformed_archives_are_refused_or_read_inside_the_file) {
  * `codec.<name>`; a torch copy of the model's own weights is passed over, and a file the reader
  * refuses is left out with a warning rather than failing the checkpoint. */
 TEST(a_pth_beside_the_safetensors_joins_the_checkpoint_under_its_stem) {
-    std::string d = radtest::tmp_path("tz.XXXXXX");
-    REQUIRE(mkdtemp(d.data()) != nullptr);
+    const std::string d = radtest::make_tmp_dir("tz");
     auto write = [&](const std::string& name, const std::string& bytes) {
         FILE* f = std::fopen((d + "/" + name).c_str(), "wb");
         REQUIRE(f != nullptr);

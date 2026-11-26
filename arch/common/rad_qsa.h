@@ -16,7 +16,7 @@
 #define RAD_QSA_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"
+#include "rad_linear.h"
 
 #include <atomic>
 
@@ -106,7 +106,7 @@ struct QsaIndexer {
     Wire       w{};
     int        layer = 0;
     rad_weight  w_qn = 0, w_kn = 0;
-    LinearFP8   proj{};
+    LinearQ   proj{};
     rad_kvgroup kv_bk = 0;
     rad_op      op_norm = 0, op_rope = 0, op_qprep = 0;
     /* Most rows `op_qprep` may be issued over (0 when not declared): `qk_fuse_rows`, a correctness
@@ -120,21 +120,21 @@ struct QsaIndexer {
      * in/out). It must be declared immediately before `qsa_block_key`: `Builder::find_kv_consumer`
      * binds a group to the first later-declared op with a `block_size`. */
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Config& cfg,
-                const Wire& wire, const ActFP8& in, rad_kvgroup* bk);
+                const Wire& wire, const ActQ& in, rad_kvgroup* bk);
     /* `win_cu`, device: {0, plane_rows}, the one sequence of a window of a step wider than the
      * score plane (Config::plane_rows); null where no step is.
      *
      * `use` is what the layer's attention reads of the selection this step (QsaUse, rad_arch.h;
-     * AttnGatedFP8::qsa_use): the default issues the query, the scores and the selection as every
+     * AttnGatedQ::qsa_use): the default issues the query, the scores and the selection as every
      * step did before. `first` is whether this is the first full-attention layer the pass issues:
      * at or below the bound the selection is made there once and read by every layer after it (the
      * buffers are the model's, live across its layers, and nothing else writes them). The default
      * makes it at every layer. */
-    void step(RadCtx* c, const ActFP8& in, const RadBatch* batch,
+    void step(RadCtx* c, const ActQ& in, const RadBatch* batch,
               const int32_t* win_cu = nullptr, int use = kQsaSelect, bool first = true) const;
     /* Stores the pass's block keys and tail exactly as step() does, with no query, score or
-     * selection (see AttnGatedFP8::store_kv). */
-    void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
+     * selection (see AttnGatedQ::store_kv). */
+    void store(RadCtx* c, const ActQ& in, const RadBatch* batch) const;
     /* `part` 0 issues all of it; 1, 2 and 3 its three stages apart and in that order (the work
      * list, the block keys, the tail store), for a caller that issues them behind another block's
      * launches (deferrable, below). */
@@ -153,7 +153,7 @@ struct QsaIndexer {
     }
     /* What step() issues on a deferrable step, a piece at a time: the projection, then
      * store_keys's stages 1..3. */
-    void step_proj(RadCtx* c, const ActFP8& in, const RadBatch* batch) const {
+    void step_proj(RadCtx* c, const ActQ& in, const RadBatch* batch) const {
         proj.step(c, in, w.qk, batch->n_tok);
     }
     void step_part(RadCtx* c, const RadBatch* batch, int part) const {
@@ -162,7 +162,7 @@ struct QsaIndexer {
 };
 
 inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
-                               const Config& cfg, const Wire& wire, const ActFP8& in,
+                               const Config& cfg, const Wire& wire, const ActQ& in,
                                rad_kvgroup* bk) {
     g = geom; c = cfg; w = wire; layer = l;
     if (!c.qk_proj || !c.q_norm) return RAD_OK;          /* no indexer on this layer */
@@ -291,7 +291,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                   {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
 
     /* When the attention group streams, the attention block resolves `sel` to ring slots after its
-     * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
+     * layer's store (AttnGatedQ::step); prefill runs on the stage and never resolves. */
     return RAD_OK;
 }
 
@@ -362,13 +362,13 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, int part) 
     return true;
 }
 
-inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
+inline void QsaIndexer::store(RadCtx* c_, const ActQ& in, const RadBatch* batch) const {
     if (!on()) return;
     proj.step(c_, in, w.qk, batch->n_tok);
     (void)store_keys(c_, batch);
 }
 
-inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
+inline void QsaIndexer::step(RadCtx* c_, const ActQ& in, const RadBatch* batch,
                              const int32_t* win_cu, int use, bool first) const {
     if (!on()) return;
     const int64_t T = batch->n_tok, S = batch->n_seq;
@@ -424,7 +424,7 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
     if (!c.emit_sel) return;
     /* Nothing reads a selection of this layer's: the step is at or below the exactness bound and
      * its attention reads the block table, or the selection the pass's first full-attention layer
-     * made (AttnGatedFP8::qsa_use). */
+     * made (AttnGatedQ::qsa_use). */
     if (use == kQsaUnread) return;
 
     /* Narrow the score columns to the live history. Both kernels size their grid from the

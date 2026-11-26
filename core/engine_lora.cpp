@@ -433,8 +433,13 @@ int Engine::gen_lora_start() {
         if (!device_is_host()) {
             for (size_t op = 1; op < P.ops.size(); ++op)
                 if (r.ctx.op_domain((rad_op)op) == RAD_DOMAIN_HOST)
-                    for (rad_weight weight : P.ops[op].weights)
+                    for (rad_weight weight : P.ops[op].weights) {
+                        const auto replacement = P.lora_replacements.find(weight);
+                        if (replacement != P.lora_replacements.end() && replacement->second.row_mixer)
+                            P.lora_placement_issues.try_emplace(replacement->second.module,
+                                "row-mixer replacement is unavailable to a host reader");
                         P.lora_replacements.erase(weight);
+                    }
         }
         std::set<std::string> rank_biases;
         for (const auto& [weight, replacement] : P.lora_replacements)
@@ -476,6 +481,8 @@ int Engine::gen_lora_start() {
         auto& replacements = rank->program.lora_replacements;
         for (auto it = replacements.begin(); it != replacements.end();) {
             if (it->second.row_mixer && mixer_rank_count[it->second.module] != ranks_.size()) {
+                rank->program.lora_placement_issues.try_emplace(it->second.module,
+                    "row-mixer replacement is not eligible on every rank");
                 rank->lora_base_weights.erase(it->first);
                 it = replacements.erase(it);
             } else {
@@ -536,10 +543,9 @@ int Engine::gen_lora_prepare_replacements(
             (*replacements)[i].push_back({bias.slots, std::move(data)});
         }
         if (matched.size() != deltas.size()) {
-            for (const auto& [module, values] : deltas) {
-                (void)values;
-                if (!matched.count(module)) {
-                    *err = "no supported bias operand for " + module;
+            for (const auto& delta : deltas) {
+                if (!matched.count(delta.first)) {
+                    *err = "no supported bias operand for " + delta.first;
                     return RAD_E_UNSUPPORTED;
                 }
             }
@@ -599,10 +605,20 @@ std::vector<std::string> Engine::gen_lora_names() const {
     return std::vector<std::string>(n.begin(), n.end());
 }
 
-
-
 int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
                              std::shared_ptr<void>* hold, std::string* note, std::string* err) {
+    return gen_lora_request(uses_in, slot, hold, note, err, false);
+}
+
+int Engine::gen_lora_validate(const std::vector<LoraUse>& uses, std::string* err) {
+    int32_t slot;
+    std::shared_ptr<void> hold;
+    return gen_lora_request(uses, &slot, &hold, nullptr, err, true);
+}
+
+int Engine::gen_lora_request(const std::vector<LoraUse>& uses_in, int32_t* slot,
+                             std::shared_ptr<void>* hold, std::string* note, std::string* err,
+                             bool validate_only) {
     *slot = -1;
     hold->reset();
     if (note) note->clear();
@@ -618,7 +634,11 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     }
     std::vector<LoraUse> uses;
     for (const auto& [n, w] : by) if (w != 0.0) uses.push_back({ n, w });
-    if (uses.empty()) return RAD_OK;
+    if (uses.empty()) {
+        if (!validate_only) return RAD_OK;
+        *err = "expected a nonzero adapter combination";
+        return RAD_E_INVAL;
+    }
     if (uses.size() > 16) { *err = fmt("%zu adapters in one request; at most 16", uses.size()); return RAD_E_INVAL; }
     uint64_t uid = 0;
     std::vector<AdapterEntry> sources(uses.size());
@@ -635,31 +655,33 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     RAD_TRY(resolve_sources());
     // An already packed revision does not wait behind unrelated expensive composition.
     bool all_held = false;
-    if (lora_table_.acquire(key, slot, &uid, hold, &all_held) == RAD_OK) return RAD_OK;
-    if (all_held) { *err = "all adapter slots are in use"; return RAD_E_FULL; }
+    if (!validate_only && lora_table_.acquire(key, slot, &uid, hold, &all_held) == RAD_OK) return RAD_OK;
+    if (!validate_only && all_held) { *err = "all adapter slots are in use"; return RAD_E_FULL; }
     std::lock_guard<std::mutex> lk(lora_mu_);
     // A load, unload or replacement may have happened while waiting for the composer.
     RAD_TRY(resolve_sources());
-    if (lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
+    if (!validate_only && lora_table_.acquire(key, slot, &uid, hold) == RAD_OK) return RAD_OK;
     const auto t0 = std::chrono::steady_clock::now();
     /* A slot: free, or freed from the least recently used combination no request holds. */
     const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int sl = -1;
-    for (;;) {
-        bool cooling = false;
-        const int s = lora_table_.reserve(key, &sl, &cooling, err);
-        if (s >= 0) break;
-        if (s == RAD_E_FULL && !cooling) {
-            std::string ev;
-            if (lora_table_.evict_idle(&ev) == RAD_OK) continue;
-            *err = fmt("all %d adapter slots are held by running requests with other adapters "
-                       "(--max-loras); retry when one finishes", cfg_.lora.slots());
-            return RAD_E_FULL;
+    if (!validate_only) {
+        for (;;) {
+            bool cooling = false;
+            const int s = lora_table_.reserve(key, &sl, &cooling, err);
+            if (s >= 0) break;
+            if (s == RAD_E_FULL && !cooling) {
+                std::string ev;
+                if (lora_table_.evict_idle(&ev) == RAD_OK) continue;
+                *err = fmt("all %d adapter slots are held by running requests with other adapters "
+                           "(--max-loras); retry when one finishes", cfg_.lora.slots());
+                return RAD_E_FULL;
+            }
+            if (s != RAD_E_FULL || stopping_.load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= give_up)
+                return s;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        if (s != RAD_E_FULL || stopping_.load(std::memory_order_acquire) ||
-            std::chrono::steady_clock::now() >= give_up)
-            return s;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     // reserve() only selects a free UID-zero slot under lora_mu_. Until publish(), any
     // snapshot/compose/copy failure leaves it unpublished and available to the next load.
@@ -678,6 +700,11 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     RAD_TRY(lora::compose(*lora_keys_, ss, rank, &comp, &rep, err));
     std::map<std::string, std::vector<float>> biases;
     RAD_TRY(lora::compose_biases(*lora_keys_, ss, gen_bias_modules_, &rep.skipped, &biases, err));
+    if (validate_only && (!rep.unplaced.empty() || !rep.skipped.empty())) {
+        *err = "adapter combination is incompatible: " +
+               (!rep.unplaced.empty() ? rep.unplaced.front() : rep.skipped.front());
+        return RAD_E_INVAL;
+    }
     if (rep.modules == 0 && biases.empty()) {
         *err = "none of the adapters' modules is a module of this model" +
                (rep.unplaced.empty() ? std::string() : " (" + rep.unplaced[0] + ")");
@@ -685,9 +712,9 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     }
     const std::map<std::string, lora::AdModule> mods = lora::as_modules(comp, *lora_keys_);
     std::vector<std::vector<lora::PackedSite>> packed(ranks_.size());
+    std::vector<lora::AdapterInfo> placement(ranks_.size());
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
-        lora::AdapterInfo info;
-        const int s = lora::pack_modules(ranks_[ri]->lora_sites, rank, mods, &info, &packed[ri], err,
+        const int s = lora::pack_modules(ranks_[ri]->lora_sites, rank, mods, &placement[ri], &packed[ri], err,
                                          /*compact=*/true);
         if (s < 0) {
             if (ranks_.size() > 1) *err = fmt("rank %zu: ", ri) + *err;
@@ -698,6 +725,35 @@ int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
     }
     LoraReplacements replacements;
     RAD_TRY(gen_lora_prepare_replacements(comp, biases, &replacements, err));
+    if (validate_only) {
+        std::vector<std::map<std::string, std::string>> issues;
+        std::vector<std::set<std::string>> required_slices(ranks_.size());
+        std::set<std::string> mixers;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            const auto& program = ranks_[i]->program;
+            issues.push_back(program.lora_placement_issues);
+            for (const auto& site : ranks_[i]->lora_sites) {
+                if (!site.gemm || site.gemm >= program.ops.size() ||
+                    program.ops[site.gemm].lora_site < 0) continue;
+                for (const auto& source : site.sources)
+                    if (source.targeted) required_slices[i].insert(source.module);
+            }
+            std::set<std::string> local;
+            for (const auto& [weight, replacement] : program.lora_replacements)
+                if (replacement.row_mixer) local.insert(replacement.module);
+            if (i == 0) mixers = std::move(local);
+            else std::erase_if(mixers, [&](const auto& name) { return !local.count(name); });
+        }
+        RAD_TRY(lora::check_generator_placement(placement, issues, mixers, err, required_slices));
+        if (!rep.unplaced.empty() || !rep.skipped.empty() || !rep.over_rank.empty() || rep.exact != rep.modules) {
+            *err = "adapter combination is not exact: " +
+                   (!rep.unplaced.empty() ? rep.unplaced.front() :
+                    !rep.skipped.empty() ? rep.skipped.front() : !rep.over_rank.empty() ? rep.over_rank + " has a structural rank upper bound above the slot capacity" :
+                    rep.worst_module + " was approximated");
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     RAD_TRY(lora_copy(sl, packed, err, &replacements));
     /* The ranks each pool takes in this slot, before a pass can name the slot (the publish). */
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {

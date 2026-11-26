@@ -1,5 +1,5 @@
-// Shared device code for the block-scaled FP8 family: the 16x16x16 fp8 WMMA fragment map, the
-// E4M3 decoders and the bf16 block-scale load.
+// Shared device code for the 8-bit WMMA kernels: the 16x16x16 fp8 and int8 WMMA fragment map, the
+// E4M3 decoders and the bf16 scale load.
 //
 // ---- lane->element mapping (undocumented by AMD; ROCm issue #6025) ------------------------------
 //
@@ -56,22 +56,24 @@ __device__ __forceinline__ f8v mma(i2v a, i2v b, f8v c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
 }
 
-// Int8 twin for the same kernels at i8 codes: v_wmma_i32_16x16x16_iu8, both operands signed, at
-// the fp8 rate. The int32 accumulator is carried in f8v registers as bits so one accumulator type
-// serves both; acc_val reads a slot back as a number. A 128-K block sums at most 128 * 127 * 127,
-// well inside int32.
+// Int8 form: v_wmma_i32_16x16x16_iu8, both operands signed, at the fp8 rate. The int32 accumulator
+// is carried in f8v registers as bits so one accumulator type serves both forms; acc_i32 reads a
+// slot back as a number. A 128-K block sums at most 128 * 127 * 127, well inside int32.
 typedef int i8v __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ f8v mma_i8(i2v a, i2v b, f8v c) {
+    return __builtin_bit_cast(f8v, __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                                       true, a, true, b, __builtin_bit_cast(i8v, c), false));
+}
+__device__ __forceinline__ float acc_i32(float x) { return (float)__builtin_bit_cast(int, x); }
+// The int8 or fp8 form by template flag, for the kernels that serve both.
 template <bool I8>
 __device__ __forceinline__ f8v mma8(i2v a, i2v b, f8v c) {
-    if constexpr (I8)
-        return __builtin_bit_cast(f8v, __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
-                                           true, a, true, b, __builtin_bit_cast(i8v, c), false));
-    else
-        return mma(a, b, c);
+    if constexpr (I8) return mma_i8(a, b, c);
+    else return mma(a, b, c);
 }
 template <bool I8>
 __device__ __forceinline__ float acc_val(float x) {
-    if constexpr (I8) return (float)__builtin_bit_cast(int, x);
+    if constexpr (I8) return acc_i32(x);
     else return x;
 }
 
@@ -95,8 +97,8 @@ __device__ __forceinline__ f8v acc_zero() {
 // all bytes except 0x7F and 0xFF, E4M3-fn's NaN encodings: hardware returns NaN, the fallback
 // +-480. Both quantisers clamp to +-448 = 0x7E, so real data never holds them.
 //
-// No subnormal-free fast path: a checkpoint weight may hold subnormals, which such a path would
-// decode as 2^-7 * 1.MMM instead of MMM * 2^-9.
+// No subnormal-free fast path: a stored byte may be subnormal, which such a path would decode as
+// 2^-7 * 1.MMM instead of MMM * 2^-9.
 __device__ __forceinline__ float e4m3(uint32_t b) {
 #if __has_builtin(__builtin_amdgcn_cvt_f32_fp8)
     return __builtin_amdgcn_cvt_f32_fp8(b, 0);
@@ -126,13 +128,9 @@ __device__ __forceinline__ v2f e4m3_pk(uint32_t q) {
 #endif
 }
 
-// ---- block scale --------------------------------------------------------------------------------
+// ---- bf16 scale ---------------------------------------------------------------------------------
 //
-// The checkpoint's BF16 `weight_scale_inv` (one per 128x128 tile, row-major) is read natively:
-// decode is one shift and one bitcast. Converting to UE8M0 would round every tile's gain to a
-// power of two and force requantising the E4M3 bytes, for no saving (the scale plane is 21.8 KiB
-// against an 89 MiB weight at gate_proj's shape). Unlike UE8M0, bf16 needs no zero test:
-// `0u << 16` is +0.0f.
+// A bf16 scale decodes with one shift and one bitcast, and needs no zero test: `0u << 16` is +0.0f.
 __device__ __forceinline__ float bscale(uint16_t s) {
     return __uint_as_float((uint32_t)s << 16);
 }
@@ -142,7 +140,7 @@ __device__ __forceinline__ float bscale(uint32_t s) {
     return __uint_as_float(s << 16);
 }
 
-// ---- LDS staging, shared by both fp8a8 instantiations -------------------------------------------
+// ---- LDS staging ---------------------------------------------------------------------------
 //
 // A fragment is 8 B per lane, so a 64 B row holds 8 granules, and a fragment read is one granule
 // column over sixteen consecutive rows. LDS has 32 banks of 4 B; a row pitch of P bytes puts row r

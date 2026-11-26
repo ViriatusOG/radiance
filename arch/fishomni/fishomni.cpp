@@ -8,9 +8,10 @@
  *   Backbone: the language model of Qwen3.5-35B-A3B, unchanged -- 40 layers of 2048, three gated
  *   delta-net layers to one gated attention layer (16 query heads over 2 KV heads of 256, NeoX
  *   rotary on 64 dims at theta 1e7), a routed feed-forward in every layer (256 experts of 512, 8 a
- *   token, and a gated shared expert of 512), (1 + w) norms. Only the routed experts are fp8
- *   (`quant_method: bsgemm-moe`, E4M3 with an f32 scale a 128 x 128 block); everything else is
- *   bf16. A prompt row is a token; an audio row is one frame of the codec's ten codes, embedded as
+ *   token, and a gated shared expert of 512), (1 + w) norms. Only the routed experts use fp8 in
+ *   the source checkpoint (`quant_method: bsgemm-moe`, E4M3 with one f32 scale per 128 x 128
+ *   block). The int8 recipe converts these experts and keeps the rest of the backbone in bf16.
+ *   A prompt row is a token; an audio row is one frame of the codec's ten codes, embedded as
  *   (E_lm[248099 + c0] + E_cb[4096 + c1]) / sqrt 2: the first code through its semantic token,
  *   the second through section 1 of the codebook table.
  *
@@ -62,9 +63,9 @@
  * samples.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_block_attn_gated_fp8.h>
-#include <arch/rad_block_gdn_fp8.h>
-#include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_attn_gated_q.h>
+#include <arch/rad_block_gdn_q.h>
+#include <arch/rad_block_moe_q.h>
 
 #include <algorithm>
 #include <cmath>
@@ -100,7 +101,8 @@ constexpr int kShared = 4, kTower = kShared + (int)kCodes - 1;
  * token and every head; the main token uncapped (256, cfg_topk_sample's widest) and each head at
  * top-k 30, as SGLang-Omni draws them. fish-speech's server defaults (0.7, 0.7, 30 for both) make
  * the model fall silent after a tag or a speaker's line and never come back: over 40 takes of
- * four short scripts, 8 ran to their length in silence against none here (docs/ARCHITECTURES.md). */
+ * four short scripts, 8 ran to their length in silence against none here
+ * (docs/ARCHITECTURES.md). */
 constexpr int64_t kMainTopK = 256, kHeadTopK = 30;
 static const double kTemp = 1.0, kTopP = 0.9;
 /* The repetition-aware redraw, fixed by the training recipe (tower.py): when the first draw is
@@ -156,9 +158,9 @@ enum : int { kGrpTower = 40, kGrpFrame = 53, kGrpCodec = 100 };
 /* ================================================================== the networks */
 struct Layer {
     int          full = 0;
-    AttnGatedFP8 attn;
-    GdnFP8       gdn;
-    MoeFP8       mlp;
+    AttnGatedQ attn;
+    GdnQ       gdn;
+    MoeQ       mlp;
 };
 
 /* A tower layer (tower.py's TowerLayer): the code embedding and the two norms into eh_proj, the
@@ -237,23 +239,23 @@ struct Model {
     Names nm{""};
     Geom  g{};                      /* the backbone's */
     Geom  gt{};                     /* the tower's */
-    GdnFP8::Config gcfg{};
-    MoeFP8::Config moecfg{};
+    GdnQ::Config gcfg{};
+    MoeQ::Config moecfg{};
     int64_t n_rot = 0, n_rot_t = 0, n_main = 0, lanes = 0;
     rad_kvgroup kv_full = 0, kv_state = 0, kv_conv = 0;
 
     /* ---- the backbone: the residual stream, its normed copy, and the blocks' working set */
     rad_buf b_x = 0;
-    ActFP8  a_h{};
+    ActQ  a_h{};
     rad_buf b_qg = 0, b_k = 0, b_v = 0, b_q = 0, b_rope_cs = 0;
-    ActFP8  a_attn{};
-    ActFP8  a_in{}, a_go{};
+    ActQ  a_attn{};
+    ActQ  a_in{}, a_go{};
     rad_buf b_ab = 0, b_gq = 0, b_gk = 0, b_gv = 0, b_gdec = 0, b_beta = 0, b_kkt = 0;
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_sorted = 0, b_eoff = 0, b_ecnt = 0;
     rad_buf b_egu = 0, b_edn = 0, b_emoe = 0;
-    ActFP8  a_eff{};
+    ActQ  a_eff{};
     rad_buf b_sgu = 0, b_sout = 0, b_sgate = 0;
-    ActFP8  a_sff{};
+    ActQ  a_sff{};
     rad_weight w_tok = 0, w_out_norm = 0;
     rad_op  op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_rope_cs = 0;
     std::vector<Layer> layers;
@@ -261,9 +263,9 @@ struct Model {
     /* ---- a lane's state (PERSIST) */
     rad_buf b_hid = 0;            /* [lanes, 2048] the last row's final-norm hidden state */
     rad_buf b_status = 0;         /* [lanes] i32 */
-    rad_buf b_hist = 0;           /* [lanes * 10, kMaxFrames] i32: each lane's codes, codebook rows */
+    rad_buf b_hist = 0;           /* [lanes * 10, kMaxFrames] i32: each lane's codes, by codebook */
     rad_buf b_ras = 0;            /* [lanes, 16] i32: the last 16 main picks (candidate indices) */
-    rad_buf b_u = 0;              /* [lanes, 2048] the last frame's codes 2..9, embedded and summed */
+    rad_buf b_u = 0;              /* [lanes, 2048] the last frame's codes 2..9, embedded, summed */
 
     /* ---- the frame */
     rad_weight w_cand = 0;        /* [4097, 2048] the lm_head's candidate rows */
@@ -334,57 +336,6 @@ static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, double
               x, { y });
 }
 
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf a, rad_buf c, rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
-}
-
-static rad_op gemm_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w, rad_buf x,
-                      rad_buf y) {
-    return rw(b, RAD_OP(b, "gemm_nt",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w)),
-              { x }, { y });
-}
-
-static rad_op gemm_bias_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
-                           rad_weight bias, rad_buf x, rad_buf y) {
-    return rw(b, RAD_OP(b, "gemm_nt_bias",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w, bias)),
-              { x }, { y });
-}
-
-static rad_op rows_op(RadBuilder* b, const char* op, int64_t rows, int64_t n,
-                      std::initializer_list<rad_buf> in, std::initializer_list<rad_buf> out) {
-    return rw(b, RAD_OP(b, op,
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              in, out);
-}
-
-static rad_op mulw_op(RadBuilder* b, int64_t rows, int64_t n, rad_weight w, rad_buf x, rad_buf y) {
-    return rw(b, RAD_OP(b, "mul_weight",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w)),
-              { x }, { y });
-}
-
-static rad_op iota_op(RadBuilder* b, int64_t rows, int64_t start, int64_t step, rad_buf y) {
-    return rw(b, RAD_OP(b, "iota",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("start", start),
-                                   RAD_INT("step", step)),
-                        RAD_NOWEIGHTS),
-              {}, { y });
-}
-
 static rad_op cu_op(RadBuilder* b, int64_t mult, rad_buf len, rad_buf y) {
     return rw(b, RAD_OP(b, "cu_repeat",
                         RAD_PARAMS(RAD_RANGE("M", 1, 2), RAD_INT("mult", mult)),
@@ -394,13 +345,7 @@ static rad_op cu_op(RadBuilder* b, int64_t mult, rad_buf len, rad_buf y) {
 
 static rad_op ar_op(RadBuilder* b, const Geom& g, rad_buf x) {
     if (g.world <= 1) return 0;
-    return rw(b, RAD_OP(b, "all_reduce",
-                        RAD_PARAMS(RAD_INT("world_size", g.world),
-                                   RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                   RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                   RAD_INT("min_bytes", g.wire_min_bytes)),
-                        RAD_NOWEIGHTS),
-              { x }, { x });
+    return decl_all_reduce(b, g, x);
 }
 
 /* A frame draw: `k` largest, Fish's nucleus over the whole candidate set first (rad OPS.md,
@@ -424,25 +369,27 @@ static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t
 }
 
 /* ================================================================== check_format */
-/* The container's statement of what it is. Every mismatch below would still make sound -- a
- * different template, another codebook layout, an fp8 format read as this one -- so each is a
- * refusal by name rather than a silent default. */
+/* The container's statement of what it is. The metadata describes Fish's source checkpoint,
+ * which a conversion carries over unchanged; the converted experts' encoding is read from the
+ * weights in declare_trunk. Every mismatch below would still make sound -- a different template,
+ * another codebook layout, another release's experts read as this one -- so each is a refusal by
+ * name rather than a silent default. */
 static int check_format(const RadModelMeta* meta) {
     const char* method = rad_meta_gets(meta, "quantization_config.quant_method", nullptr);
     const char* block  = rad_meta_gets(meta, "quantization_config.weight_block_size", nullptr);
     if (!method || std::strcmp(method, "bsgemm-moe") != 0) {
-        fprintf(stderr, "radiance: fishomni serves Fish Audio's released drama-3, whose routed "
-                        "experts are block-scaled fp8 (quant_method 'bsgemm-moe'); this container "
+        fprintf(stderr, "radiance: fishomni serves Fish Audio's released drama-3, whose source "
+                        "experts use quant_method 'bsgemm-moe'; this checkpoint "
                         "says '%s'\n", method ? method : "(none)");
         return RAD_E_UNSUPPORTED;
     }
     if (block) {
         long long b0 = 0, b1 = 0;
         if (std::sscanf(block, "%lld %lld", &b0, &b1) != 2) { b0 = 0; b1 = 0; }
-        if (b0 != RAD_FP8_BLOCK || b1 != RAD_FP8_BLOCK) {
-            fprintf(stderr, "radiance: fishomni refuses weight_block_size [%lld, %lld]: libr4d's "
-                            "block-scaled GEMMs are compiled at %d in both dimensions\n",
-                    b0, b1, RAD_FP8_BLOCK);
+        if (b0 != RAD_SCALE_GROUP || b1 != RAD_SCALE_GROUP) {
+            fprintf(stderr, "radiance: fishomni: source weight_block_size [%lld, %lld] differs "
+                            "from drama-3's %d in both dimensions\n",
+                    b0, b1, RAD_SCALE_GROUP);
             return RAD_E_UNSUPPORTED;
         }
     }
@@ -482,9 +429,8 @@ static int check_format(const RadModelMeta* meta) {
 
 /* ================================================================== the backbone */
 /* qwen35moe_fp8's trunk, written out (arch/qwen35_fp8/qwen35_fp8.cpp, QWEN35_MOE): the same
- * blocks, metadata and names, without its drafters, vision tower and int8 build. Its bf16 linears
- * (attention, delta net, shared expert) are served by LinearFP8's plain branch beside the fp8
- * experts. */
+ * blocks, metadata and names. Its bf16 linears (attention, delta net and shared expert) read
+ * the plain activations. Only the routed experts use the converted encoding. */
 static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx,
                          Model& m) {
     Geom& g = m.g;
@@ -502,7 +448,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
                                       g.n_layer, interval, {"full_attention"}));
     m.n_main = g.n_layer;
 
-    /* GemmaRMSNorm everywhere but the delta net's output norm (rad_block_gdn_fp8.h). */
+    /* GemmaRMSNorm everywhere but the delta net's output norm (rad_block_gdn_q.h). */
     g.wadd    = 1.0f;
     g.wadd_qk = 1.0f;
 
@@ -516,7 +462,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
     }
     RAD_ARCH_TRY(yarn_from(g, meta, "", m.n_rot));
 
-    GdnFP8::Config& gc = m.gcfg;
+    GdnQ::Config& gc = m.gcfg;
     const int64_t n_head_k_all = meta_int2(meta, "qwen35.ssm.group_count",
                                            "linear_num_key_heads", 0);
     const int64_t n_head_v_all = meta_int2(meta, "qwen35.ssm.time_step_rank",
@@ -590,7 +536,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
 
     /* ---- the routing geometry; `n_ff` is already the per-rank expert width */
     {
-        MoeFP8::Config& mc = m.moecfg;
+        MoeQ::Config& mc = m.moecfg;
         mc.n_expert = meta->n_expert;
         mc.top_k    = meta->n_expert_used > 0 ? meta->n_expert_used
                                               : meta_int2(meta, "qwen35.expert_used_count",
@@ -618,15 +564,14 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
         m.b_ecnt    = decl_b(b, nm.f("moe_cnt"),    RAD_I32,     {mc.n_expert}, RAD_BUF_PERSIST);
         m.b_egu     = decl_b(b, nm.f("moe_gate_up"), g.act_dtype, {K, 2 * mc.n_ff_exp});
         m.a_eff.x   = decl_b(b, nm.f("moe_ffn"),    g.act_dtype, {K, mc.n_ff_exp});
-        m.a_eff.q   = decl_b(b, nm.f("moe_ffn.q"),  RAD_F8E4M3,  {K, mc.n_ff_exp});
-        m.a_eff.s   = decl_b(b, nm.f("moe_ffn.s"),  RAD_F32,     {K, fp8_blocks(mc.n_ff_exp)});
         m.b_edn     = decl_b(b, nm.f("moe_down"),   g.act_dtype, {K, g.n_embd});
         if (mc.n_ff_shared > 0) {
             m.b_emoe  = decl_b(b, nm.f("moe_out"),   g.act_dtype, {R, g.n_embd});
             m.b_sgu   = decl_b(b, nm.f("shexp_gate_up"), g.act_dtype, {R, 2 * mc.n_ff_shared});
             m.a_sff.x = decl_b(b, nm.f("shexp_ffn"),     g.act_dtype, {R, mc.n_ff_shared});
             m.a_sff.q = decl_b(b, nm.f("shexp_ffn.q"),   RAD_F8E4M3,  {R, mc.n_ff_shared});
-            m.a_sff.s = decl_b(b, nm.f("shexp_ffn.s"),   RAD_F32, {R, fp8_blocks(mc.n_ff_shared)});
+            m.a_sff.s = decl_b(b, nm.f("shexp_ffn.s"),   RAD_F32,
+                              {R, scale_groups(mc.n_ff_shared)});
             m.b_sout  = decl_b(b, nm.f("shexp_out"),     g.act_dtype, {R, g.n_embd});
             m.b_sgate = decl_b(b, nm.f("shexp_gate"),    g.act_dtype, {R, 1});
         }
@@ -652,12 +597,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
      * on every rank (replicated tables), and a reduction there would sum it world times. Exact:
      * it sums disjoint rows. */
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                               RAD_NOWEIGHTS),
-                           {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
     m.op_rope_cs = rw(b, decl_rotary(b, g, "rope_table",
                          RAD_PARAMS(RAD_RANGE("M", 1, qk_fuse_rows(g)), RAD_INT("rot", m.n_rot),
                                     RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
@@ -665,17 +605,17 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
                          RAD_NOWEIGHTS),
                      {}, {m.b_rope_cs});
 
-    AttnGatedFP8::Wire aw{};
+    AttnGatedQ::Wire aw{};
     aw.x = m.b_x; aw.h = m.a_h; aw.qg = m.b_qg; aw.k = m.b_k; aw.v = m.b_v;
     aw.q = m.b_q; aw.attn = m.a_attn;
     aw.cos_sin = m.op_rope_cs ? m.b_rope_cs : 0;
 
-    GdnFP8::Wire gw{};
+    GdnQ::Wire gw{};
     gw.x = m.b_x; gw.h = m.a_h; gw.in = m.a_in; gw.ab = m.b_ab;
     gw.q = m.b_gq; gw.k = m.b_gk; gw.v = m.b_gv;
     gw.gdec = m.b_gdec; gw.beta = m.b_beta; gw.kkt = m.b_kkt; gw.o = m.a_go;
 
-    MoeFP8::Wire mw{};
+    MoeQ::Wire mw{};
     mw.x = m.b_x; mw.h = m.a_h;
     mw.logits = m.b_rlogits; mw.ids = m.b_eids; mw.ew = m.b_ew;
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
@@ -690,7 +630,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
         const LayerFold f = layer_fold(g, l, m.n_main, nullptr, 0, false);
         const char* pre = "model.language_model.layers";
         if (lay.full) {
-            AttnGatedFP8::Src as{};
+            AttnGatedQ::Src as{};
             as.norm   = nm.ckpt("%s.%lld.input_layernorm.weight",  pre, (long long)l);
             as.qg     = nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l);
             as.k      = nm.ckpt("%s.%lld.self_attn.k_proj.weight", pre, (long long)l);
@@ -702,7 +642,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
                                           f.mix_fold, false, f.mix_ar_in, f.mix_ar_out));
         } else {
-            GdnFP8::Src gs{};
+            GdnQ::Src gs{};
             gs.norm     = nm.ckpt("%s.%lld.input_layernorm.weight",         pre, (long long)l);
             gs.in_qkv   = nm.ckpt("%s.%lld.linear_attn.in_proj_qkv.weight", pre, (long long)l);
             gs.in_a     = nm.ckpt("%s.%lld.linear_attn.in_proj_a.weight",   pre, (long long)l);
@@ -718,7 +658,7 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
             RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs,
                                          f.mix_fold, false, f.mix_ar_in, f.mix_ar_out));
         }
-        MoeFP8::Src ms{};
+        MoeQ::Src ms{};
         ms.cfg     = m.moecfg;
         ms.norm    = nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l);
         ms.router  = nm.ckpt("%s.%lld.mlp.gate.weight",                 pre, (long long)l);
@@ -727,9 +667,19 @@ static int declare_trunk(RadBuilder* b, const RadModelMeta* meta, const RadBuild
             ms.shared      = nm.ckpt("%s.%lld.mlp.shared_expert",             pre, (long long)l);
             ms.shared_gate = nm.ckpt("%s.%lld.mlp.shared_expert_gate.weight", pre, (long long)l);
         }
-        /* The experts' stored format, read from the layer's first: the release's scale planes are
-         * f32 (fp8a8f32), not the bf16 Qwen3.6's are. */
-        RAD_ARCH_TRY(MoeFP8::probe(b, nm, (int)l, ms, &ms.cfg));
+        RAD_ARCH_TRY(MoeQ::probe(b, nm, (int)l, ms, &ms.cfg));
+        /* Int8 gate/up needs a rotated copy of the bf16 norm output used by the shared expert.
+         * The down projection needs one activation row per routed slot in this pass. */
+        if (ms.cfg.expert_i8 && !mw.hr.q8) {
+            RAD_ARCH_TRY(mw.hr.declare_qs(b, nm, g, "moe_hr", g.n_embd, g.max_tok, true, false));
+            mw.hr.q8_fed = mw.hr.q8_rot = true;
+            RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "moe_ffn", ms.cfg.n_ff_exp,
+                                           ms.cfg.rows * ms.cfg.top_k, true, false));
+        } else if (!ms.cfg.expert_i8 && !ms.cfg.expert_bf16 && !mw.eff.q) {
+            RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "moe_ffn", ms.cfg.n_ff_exp,
+                                           ms.cfg.rows * ms.cfg.top_k));
+        }
+        mw.eff.q8_fed = mw.eff.q8_rot = ms.cfg.expert_i8 != 0;
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, true, f.mlp_add,
                                      f.mlp_ar_in, f.mlp_ar_out));
     }
@@ -972,7 +922,8 @@ static int declare_tower(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                   src("transformer_layer.feed_forward.w3.weight") }));
         L.w_gu = decl_w(b, dn("gate_up.weight"), RAD_BF16, { 2 * ff, D }, RAD_ACCESS_PER_TOKEN,
                         RAD_SHARD_ROW, grp_layer(grp), 0, { ff, ff });
-        RAD_ARCH_TRY(map_copy(b, dn("down.weight"), src("transformer_layer.feed_forward.w2.weight")));
+        RAD_ARCH_TRY(map_copy(b, dn("down.weight"),
+                              src("transformer_layer.feed_forward.w2.weight")));
         L.w_down = decl_w(b, dn("down.weight"), RAD_BF16, { D, ff }, RAD_ACCESS_PER_TOKEN,
                           RAD_SHARD_COL, grp_layer(grp));
         if (!L.w_emb || !L.w_en || !L.w_hn || !L.w_an || !L.w_fn || !L.w_fin || !L.w_qn ||
@@ -1306,7 +1257,8 @@ static int declare_codec(RadBuilder* b, Model& m) {
     m.op_cnst = iota_op(b, 1, NC, 0, m.b_cconst);
     for (int s = 0; s < kRates; ++s) {
         m.b_ccu[s] = decl_b(b, nm.f("codec.cu%d", s), RAD_I32, { 2 });
-        m.op_ccu[s] = s == 0 ? cu_op(b, 1, 0, m.b_ccu[0]) : cu_op(b, kRate[s], m.b_cconst, m.b_ccu[s]);
+        m.op_ccu[s] = s == 0 ? cu_op(b, 1, 0, m.b_ccu[0])
+                             : cu_op(b, kRate[s], m.b_cconst, m.b_ccu[s]);
         if (!m.op_ccu[s]) return RAD_E_INVAL;
     }
     for (int k = 0; k < kCodes; ++k) {
@@ -1490,12 +1442,7 @@ static int declare_codec(RadBuilder* b, Model& m) {
                        rows[4], m.b_vt[4], 0, m.b_vout, m.b_ccu[7], "tanh"));
     m.b_audio = decl_b(b, nm.f("codec.audio"), RAD_F32, { kVocChunk * kSamplesPerFrame, 1 },
                        RAD_BUF_PERSIST);
-    m.op_fcast = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, kVocChunk * kSamplesPerFrame),
-                                         RAD_INT("n", 1), RAD_STR("from", "bf16"),
-                                         RAD_STR("to", "f32")),
-                              RAD_NOWEIGHTS),
-                    { m.b_vout }, { m.b_audio });
+    m.op_fcast = cast_op(b, kVocChunk * kSamplesPerFrame, 1, "bf16", "f32", m.b_vout, m.b_audio);
     return m.w_cn && m.op_cn && m.w_fa && m.op_fs && m.op_fcast && m.op_cnst ? RAD_OK
                                                                              : RAD_E_INVAL;
 }
@@ -1910,8 +1857,7 @@ struct TowerAt {
 
 static void step_tower(RadCtx* c, const Model& m, const TowerAt& at) {
     const Geom& g = m.gt;
-    const int64_t R = at.R, D = g.n_embd, hd = g.head_dim, Sx = m.lanes;
-    const int64_t qd = g.n_head * hd;
+    const int64_t R = at.R, D = g.n_embd, Sx = m.lanes;
     /* Row k of the code-major [10, lanes] plane, narrowed to this pass's lanes. */
     auto code = [&](int k) {
         RadOperand o = brow_slice(m.b_codes, k, 1, Sx);
@@ -1975,7 +1921,6 @@ static void step_tower(RadCtx* c, const Model& m, const TowerAt& at) {
                         RAD_NONE, RAD_NONE, RAD_NONE);
         }
     }
-    (void)qd;
 }
 
 static void step_prompt(RadCtx* c, const RadBatch* batch, const Model& m) {
@@ -2356,7 +2301,7 @@ extern "C" int64_t rad_arch_text_prepare(int field, const char* in, char* out, i
 /* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(fishomni, "fishomni", "bsgemm-moe", "0.1.0",
-                "Fish Audio drama-3: the Qwen3.5-35B-A3B backbone (block-scaled fp8 experts), a "
-                "13-layer codebook tower over its full-attention cache, and Fish S2's modified "
+                "Fish Audio drama-3: the Qwen3.5-35B-A3B backbone with converted routed experts, "
+                "a 13-layer codebook tower over its full-attention cache, and Fish S2's modified "
                 "DAC; 44.1 kHz mono speech")
 #endif

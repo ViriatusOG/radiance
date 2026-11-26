@@ -20,8 +20,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -47,15 +45,6 @@ void usage() {
 
 using Clock = std::chrono::steady_clock;
 double secs(Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); }
-
-bool read_file(const std::string& path, std::string* out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    *out = ss.str();
-    return true;
-}
 
 std::string basename_of(const std::string& p) {
     const size_t s = p.find_last_of('/');
@@ -89,7 +78,8 @@ bool report_diff(const Tokenizer& tok, const char* what, const std::vector<int32
     auto show = [&](const char* name, const std::vector<int32_t>& v) {
         std::printf("      %-9s", name);
         for (size_t k = lo; k < std::min(v.size(), i + ctx); ++k)
-            std::printf("%s%d'%s'", k == i ? " >>" : " ", v[k], printable(tok.piece(v[k], true)).c_str());
+            std::printf("%s%d'%s'", k == i ? " >>" : " ", v[k],
+                        printable(tok.piece(v[k], true)).c_str());
         std::printf("\n");
     };
     show("tokenizer", a);
@@ -121,7 +111,8 @@ std::vector<std::string> conversation(const Vocab& v, const std::string& text, i
     std::string conv;
     for (size_t k = 0; k < msgs.size(); ++k) {
         const char* role = k % 2 ? "assistant" : "user";
-        conv += chatml ? std::string("<|im_start|>") + role + "\n" + msgs[k] + "<|im_end|>\n" : msgs[k];
+        conv += chatml ? std::string("<|im_start|>") + role + "\n" + msgs[k] + "<|im_end|>\n"
+                       : msgs[k];
         prompts.push_back(conv + (chatml ? "<|im_start|>assistant\n" : ""));
     }
     return prompts;
@@ -137,17 +128,26 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "rad-tokcheck: %s needs a value\n", a.c_str()); std::exit(2); }
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "rad-tokcheck: %s needs a value\n", a.c_str());
+                std::exit(2);
+            }
             return argv[++i];
         };
         if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a == "--hf-dir")  hf_dir = next();
         else if (a == "--no-ref")  ref = false;
         else if (a == "--user")    parse_special = false;
-        else if (a == "--turns")   turns = (int)rad_flag_int("rad-tokcheck", "--turns", next(), 0, INT32_MAX);
-        else if (a == "--repeat")  repeat = (int)rad_flag_int("rad-tokcheck", "--repeat", next(), 1, INT32_MAX);
-        else if (a == "--context") ctx = (int)rad_flag_int("rad-tokcheck", "--context", next(), 0, INT32_MAX);
-        else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "rad-tokcheck: unknown option %s\n", a.c_str()); return 2; }
+        else if (a == "--turns")
+            turns = (int)rad_flag_int("rad-tokcheck", "--turns", next(), 0, INT32_MAX);
+        else if (a == "--repeat")
+            repeat = (int)rad_flag_int("rad-tokcheck", "--repeat", next(), 1, INT32_MAX);
+        else if (a == "--context")
+            ctx = (int)rad_flag_int("rad-tokcheck", "--context", next(), 0, INT32_MAX);
+        else if (!a.empty() && a[0] == '-') {
+            std::fprintf(stderr, "rad-tokcheck: unknown option %s\n", a.c_str());
+            return 2;
+        }
         else args.push_back(a);
     }
     if (args.size() < 2) { usage(); return 2; }
@@ -162,7 +162,8 @@ int main(int argc, char** argv) {
     Tokenizer tok;
     if (tok.init(vocab) < 0) return 1;
     tok.set_segment_cache(false);
-    std::printf("%s: %d tokens, vocab load %.1f ms\n", args[0].c_str(), vocab->n_tokens(), load_s * 1e3);
+    std::printf("%s: %d tokens, vocab load %.1f ms\n", args[0].c_str(), vocab->n_tokens(),
+                load_s * 1e3);
 
     int bad = 0;
     size_t total_bytes = 0;
@@ -170,7 +171,11 @@ int main(int argc, char** argv) {
     size_t total_ids = 0, hf_checked = 0;
     for (size_t f = 1; f < args.size(); ++f) {
         std::string text;
-        if (!read_file(args[f], &text)) { std::printf("  %s: cannot read\n", args[f].c_str()); ++bad; continue; }
+        if (!read_file_bytes(args[f], &text)) {
+            std::printf("  %s: cannot read\n", args[f].c_str());
+            ++bad;
+            continue;
+        }
         std::printf("  %s: %zu bytes\n", args[f].c_str(), text.size());
 
         /* The first encode is reported separately from the best repeat: the vocab caches which
@@ -180,12 +185,17 @@ int main(int argc, char** argv) {
         for (int r = 0; r < repeat; ++r) {
             ids.clear();
             const auto t0 = Clock::now();
-            if (tok.encode(text, ids, false, parse_special) < 0) { std::printf("    encode failed\n"); ++bad; break; }
+            if (tok.encode(text, ids, false, parse_special) < 0) {
+                std::printf("    encode failed\n");
+                ++bad;
+                break;
+            }
             const double t = secs(t0);
             if (r == 0) first = t;
             best = std::min(best, t);
         }
-        std::printf("    tokenizer  %8zu ids  %8.2f ms  %7.1f MB/s  (first encode %.2f ms, %.1f MB/s)\n",
+        std::printf("    tokenizer  %8zu ids  %8.2f ms  %7.1f MB/s  (first encode %.2f ms, "
+                    "%.1f MB/s)\n",
                     ids.size(), best * 1e3, text.size() / best / 1e6, first * 1e3,
                     text.size() / first / 1e6);
         total_bytes += text.size();
@@ -200,8 +210,8 @@ int main(int argc, char** argv) {
             if (st < 0) {
                 std::printf("    reference  failed (%d)\n", st);
             } else {
-                std::printf("    reference  %8zu ids  %8.2f ms  %7.1f MB/s\n", rids.size(), rs * 1e3,
-                            text.size() / rs / 1e6);
+                std::printf("    reference  %8zu ids  %8.2f ms  %7.1f MB/s\n", rids.size(),
+                            rs * 1e3, text.size() / rs / 1e6);
                 total_ref += rs;
                 if (report_diff(tok, "reference", ids, rids, text, ctx)) ++bad;
                 else std::printf("    reference  identical\n");
@@ -211,7 +221,7 @@ int main(int argc, char** argv) {
         if (!hf_dir.empty()) {
             std::string raw;
             const std::string path = hf_dir + "/" + basename_of(args[f]) + ".ids";
-            if (!read_file(path, &raw)) {
+            if (!read_file_bytes(path, &raw)) {
                 std::printf("    huggingface: no %s\n", path.c_str());
             } else {
                 std::vector<int32_t> hids(raw.size() / 4);
@@ -225,7 +235,11 @@ int main(int argc, char** argv) {
         if (turns > 0) {
             const std::vector<std::string> prompts = conversation(*vocab, text, turns);
             Tokenizer cached;
-            if (cached.init(vocab) < 0) { std::printf("    multi-turn: init failed\n"); ++bad; continue; }
+            if (cached.init(vocab) < 0) {
+                std::printf("    multi-turn: init failed\n");
+                ++bad;
+                continue;
+            }
             cached.clear_cache();
             double cold = 0, warm = 0, cold_last = 0, warm_last = 0, rtot = 0, rlast = 0;
             size_t prompt_bytes = 0;
@@ -260,14 +274,19 @@ int main(int argc, char** argv) {
                 }
             }
             const Tokenizer::CacheStats cs = cached.cache_stats();
-            std::printf("    %zu turns, %.1f MB re-sent (last prompt %zu bytes): %s\n", prompts.size(),
-                        prompt_bytes / 1e6, prompts.empty() ? 0 : prompts.back().size(),
-                        same ? "cached ids identical to uncached on every turn" : "cached ids differ");
-            std::printf("      uncached   %9.1f ms total, last turn %8.2f ms\n", cold * 1e3, cold_last * 1e3);
-            std::printf("      cached     %9.1f ms total, last turn %8.2f ms  (%llu hits, %zu entries, %.1f MB)\n",
-                        warm * 1e3, warm_last * 1e3, (unsigned long long)cs.hits, cs.entries, cs.bytes / 1e6);
+            std::printf("    %zu turns, %.1f MB re-sent (last prompt %zu bytes): %s\n",
+                        prompts.size(), prompt_bytes / 1e6,
+                        prompts.empty() ? 0 : prompts.back().size(),
+                        same ? "cached ids identical to uncached on every turn"
+                             : "cached ids differ");
+            std::printf("      uncached   %9.1f ms total, last turn %8.2f ms\n", cold * 1e3,
+                        cold_last * 1e3);
+            std::printf("      cached     %9.1f ms total, last turn %8.2f ms  "
+                        "(%llu hits, %zu entries, %.1f MB)\n", warm * 1e3, warm_last * 1e3,
+                        (unsigned long long)cs.hits, cs.entries, cs.bytes / 1e6);
             if (ref)
-                std::printf("      reference  %9.1f ms total, last turn %8.2f ms\n", rtot * 1e3, rlast * 1e3);
+                std::printf("      reference  %9.1f ms total, last turn %8.2f ms\n", rtot * 1e3,
+                            rlast * 1e3);
             if (!same) ++bad;
         }
     }

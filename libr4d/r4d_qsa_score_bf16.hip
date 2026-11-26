@@ -15,7 +15,7 @@
 //
 // An absent entry scores -inf, not zero: tables are padded, and a real score can be zero.
 //
-// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"
@@ -349,7 +349,7 @@ void qsa_score_mx_kernel(QSA_SCORE_MX_PARAMS) {
 #undef QSA_SCORE_MX_PARAMS
 
 /* Form override for tests (r4d_selftest compares the two): 0 = automatic, 1 = scalar,
- * 2 = matrix. Like r4d_gemm_fp8a8_pin_mw. */
+ * 2 = matrix. */
 int g_qsa_form = 0;
 
 }  // namespace

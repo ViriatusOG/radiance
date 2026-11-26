@@ -1,9 +1,9 @@
 /* ref_sample.cpp -- the sampler ops.
  *
  * Sampling runs as kernels, not on the host: at a 151K vocab and batch 256 the logits are ~77 MiB
- * per step, and copying them for a host chain would cost bandwidth and a synchronisation on the step
- * path (spec §13). core/sample/ keeps llama.cpp's chain as a host reference; this is an independent
- * second implementation of the same arithmetic, so comparing the two is meaningful.
+ * per step, and copying them for a host chain would cost bandwidth and a synchronisation on the
+ * step path (spec §13). core/sample/ keeps llama.cpp's chain as a host reference; this is an
+ * independent second implementation of the same arithmetic, so comparing the two is meaningful.
  *
  * ============================== Every scalar is per row ==============================
  *
@@ -24,8 +24,8 @@
  * buffer gives 40 candidates and 984 holes.
  *
  * A greedy row (RAD_SP_GREEDY) has no candidates; its token is sample_argmax's. In a mixed batch
- * every stage runs over every row, so top-k and the merge write it an empty set, narrowing leaves it
- * alone, and the pick must not overwrite its token with a draw.
+ * every stage runs over every row, so top-k and the merge write it an empty set, narrowing leaves
+ * it alone, and the pick must not overwrite its token with a draw.
  */
 #include "ref_common.h"
 #include "ref_ops.h"
@@ -782,7 +782,10 @@ int ref_sample_merge_topk(const RadArgs* a, RadStream) {
                 if (id < 0) continue;
                 const bool after = v < taken_v || (v == taken_v && id > taken_i);
                 if (!after) continue;
-                if (best_id < 0 || v > best || (v == best && id < best_id)) { best = v; best_id = id; }
+                if (best_id < 0 || v > best || (v == best && id < best_id)) {
+                    best = v;
+                    best_id = id;
+                }
             }
             st_int(ci->dtype, ci->data, ib + r * is, best_id);
             stt(cv, vb + r * vs, best_id >= 0 ? best : -INFINITY);

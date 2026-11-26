@@ -19,12 +19,13 @@
 #      replay proves the installed tools serve from the out-of-tree home, so three cheap ops that
 #      every host library implements (a norm, the fp8 activation quantiser, a gated activation)
 #      are enough;
-#   5. with HIP_COMPILER given, the device library the tree built (libr4d) is built out of tree
-#      too, for HIP_TARGETS and at the tree's RAD_HIP_VOPD_REPEATABLE (VOPD_REPEATABLE, default
-#      OFF; on LLVM 24 it decides whether VOPD pairs, so it changes the code), and compiles to the
-#      tree's device code. A replay of a device library needs a card, and this test must not touch
-#      one a server is using; the same instructions mean the tree's own GPU suite (ctest -L gpu)
-#      has already checked what the out-of-tree build produced.
+#   5. with HIP_COMPILER given, the device libraries the tree built (libr4d, and exl3r4d and
+#      plugin/exl3i on a gfx1201 build) are built out of tree too, for HIP_TARGETS and at the
+#      tree's RAD_HIP_VOPD_REPEATABLE (VOPD_REPEATABLE, default OFF; on LLVM 24 it decides whether
+#      VOPD pairs, so it changes the code), and compile to the tree's device code. A replay of a
+#      device library needs a card, and this test must not touch one a server is using; the same
+#      instructions mean the tree's own GPU suite (ctest -L gpu) has already checked what the
+#      out-of-tree build produced.
 set -eu
 B=$1; S=$2; W=$3
 HIPC=${4:-}; HIPT=${5:-}; VOPD=${6:-OFF}; CXXC=${7:-}; BT=${8:-}
@@ -59,25 +60,46 @@ run "$W/logs/install.log" cmake --install "$B" --prefix "$P"
 # there are dozens of them: those are built several at a time (`small`, below).
 dirs="libref libquant"
 [ -d "$S/libavx" ] && [ -f "$B/radiance_home/kernels/libavx.so" ] && dirs="$dirs libavx"
+# The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
+# comparison below without it. Each declares the family it serves, so a tree built for one family
+# produces one of them: libr3d returns without a target when RAD_GPU_TARGETS holds no gfx11, exl3r4d
+# and plugin/exl3i without a gfx1201, and the checks below compare the two builds of the same list,
+# not a fixed list.
+# A device library by name; dir_of gives its directory under the source and build trees.
+dir_of() {
+  case "$1" in exl3r4d) echo exl3/kernels/exl3r4d ;; exl3i) echo plugin/exl3i ;; *) echo "$1" ;; esac
+}
+devlibs=""
+for d in libr4d libr3d exl3r4d exl3i; do
+  [ -f "$S/$(dir_of $d)/CMakeLists.txt" ] && [ -f "$B/radiance_home/kernels/$d.so" ] && devlibs="$devlibs $d"
+done
+devdirs=""
+[ -n "$HIPC" ] && for d in $devlibs; do devdirs="$devdirs $(dir_of $d)"; done
+is_dev() { case " $devlibs " in *" $1 "*) return 0 ;; esac; return 1; }
+in_tree_home() {   # in_tree_home NAME -- the tree's build made plugin NAME, of any of the three kinds
+  for k in kernels architectures quantizers; do
+    [ -f "$B/radiance_home/$k/$1.so" ] && return 0
+  done
+  return 1
+}
+
 small=""
+# radiance-exl3's host plugins (exl3/): the reference kernels and the quantiser.
+for d in exl3/kernels/exl3ref exl3/quantizers/exl3; do
+  [ -f "$S/$d/CMakeLists.txt" ] && dirs="$dirs $d"
+done
 for d in "$S"/arch/*/ "$S"/plugin/*/; do
   [ -f "$d/CMakeLists.txt" ] || continue
   # A plugin under plugin/ that the tree's build does not make (a source drop, built by hand) is
-  # not compared: the tree's home has no copy of it.
-  case "$d" in "$S"/plugin/*) [ -f "$B/radiance_home/kernels/$(basename "$d").so" ] || continue ;; esac
+  # not compared: the tree's home has no copy of it. A device library there is built with the
+  # others below.
+  case "$d" in
+    "$S"/plugin/*)
+      in_tree_home "$(basename "$d")" || continue
+      is_dev "$(basename "$d")" && continue ;;
+  esac
   small="$small $(basename "$(dirname "$d")")/$(basename "$d")"
 done
-# The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
-# comparison below without it. Each declares the family it serves, so a tree built for one family
-# produces one of them: libr3d returns without a target when RAD_GPU_TARGETS holds no gfx11, and the
-# checks below compare the two builds of the same list, not a fixed list.
-devlibs=""
-for d in libr4d libr3d; do
-  [ -f "$S/$d/CMakeLists.txt" ] && [ -f "$B/radiance_home/kernels/$d.so" ] && devlibs="$devlibs $d"
-done
-devdirs=""
-[ -n "$HIPC" ] && devdirs="$devlibs"
-is_dev() { case " $devlibs " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Each plugin installs its plugin file under $H and anything else it ships (libr4d's r4d_selftest)
 # under the package's prefix, as a third party installing into that radiance would.
@@ -267,7 +289,7 @@ if [ -n "$HIPC" ]; then
     cksum < "$W/co/.rodata"
   }
   for lib in $devlibs; do
-    td="$B/$lib/CMakeFiles/$lib.dir"
+    td="$B/$(dir_of $lib)/CMakeFiles/$lib.dir"
     od="$W/b/$lib/CMakeFiles/$lib.dir"
     [ "$(ls "$td"/*.hip.o | wc -l)" = "$(ls "$od"/*.hip.o | wc -l)" ] ||
       fail "$lib compiles a different set of HIP sources out of tree"

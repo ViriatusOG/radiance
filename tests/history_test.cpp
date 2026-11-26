@@ -32,14 +32,15 @@ double of(const History::Row& r, const std::string& k) {
 }
 bool has(const History::Row& r, const std::string& k) { return std::isfinite(of(r, k)); }
 
-/* steps_prefill / steps_mixed stay 0 unless a test passes them: they are what proves a sample
- * carried prefill work, and the prefill rate is withheld without that proof. */
+/* steps_prefill / steps_mixed stay 0 unless a test passes them: they show a sample carried prefill
+ * work. */
 json stats(int64_t started, double steps_decode, double step_ns_decode, double total_requests,
            double steps_prefill = 0, double steps_mixed = 0) {
     return json::parse(R"({"started_at": )" + std::to_string(started) + R"(, "decode_tps": 120.5, "prefill_tps": 900,
         "steps_prefill": )" + std::to_string(steps_prefill) + R"(, "steps_mixed": )" + std::to_string(steps_mixed) + R"(,
         "running": 2, "waiting": 1, "preempted": 0, "in_flight": 3, "prefix_hit_rate": 0.75,
-        "kv_bytes_used": 4000, "kv_bytes_total": 16000, "kv_tokens_used": 1000, "kv_tokens_cached": 250,
+        "kv_bytes_used": 4000, "kv_bytes_total": 16000, "kv_tokens_used": 1000, "kv_tokens_total": 4000, "kv_tokens_max": 6000,
+        "kv_tokens_cached": 250,
         "step_ns_decode_best": 21000000, "jobs": {"running": 0, "done": 0, "last_ms": 0},
         "steps": )" + std::to_string(steps_decode) + R"(, "step_ns": )" + std::to_string(step_ns_decode) + R"(,
         "steps_decode": )" + std::to_string(steps_decode) + R"(, "step_ns_decode": )" + std::to_string(step_ns_decode) + R"(,
@@ -59,6 +60,12 @@ TEST(one_stats_object_yields_the_instantaneous_figures_and_no_rate) {
     /* A quarter of the tokens are kept turns, so a quarter of the bytes. */
     CHECK_EQ(of(r, "kvKept"), 1000.0);
     CHECK_EQ(of(r, "kvRead"), 3000.0);
+    /* The pool in tokens: held, what it holds now, and the most its carve could hold. */
+    CHECK_EQ(of(r, "kvTokUsed"), 1000.0);
+    CHECK_EQ(of(r, "kvTokCap"), 4000.0);
+    CHECK_EQ(of(r, "kvTokMax"), 6000.0);
+    CHECK_EQ(of(r, "kvTokKept"), 250.0);
+    CHECK_EQ(of(r, "kvTokRead"), 750.0);
     CHECK_EQ(of(r, "stepBest"), 21.0);
     CHECK(!has(r, "step"));
     CHECK(!has(r, "reqRate"));
@@ -79,12 +86,16 @@ TEST(two_stats_objects_yield_rates_over_the_time_between_them) {
     CHECK_EQ(of(idle, "reqRate"), 0.0);
 }
 
-/* A frozen queue: the engine's decode rate is its own recent average, so it keeps reporting
- * the last healthy one after the device stopped advancing. That number is no better than a
- * leftover: the chart must show a gap while the step counters stand still. */
+/* The engine's decode rate is its own recent average and holds its last value when the device stops
+ * advancing: while requests decode and no decode step finished, the rate is a gap, not that value. */
 TEST(a_frozen_decode_rate_is_a_gap_not_a_stale_number) {
-    const json a = stats(7, 100, 2.2e9, 10), frozen = stats(7, 100, 2.2e9, 10);  /* nothing moved */
+    const json a = stats(7, 100, 2.2e9, 10);
+    json frozen = stats(7, 100, 2.2e9, 10);                       /* nothing moved */
+    frozen["requests"] = json::parse(R"([{"id": "r1", "state": "decode"}])");
     CHECK(!has(History::model_row(frozen, &a, 1.0), "decode"));
+    CHECK_EQ(of(History::model_row(frozen, &a, 1.0), "busy"), 1.0);
+    /* With nothing decoding the held average is no reading at all: the rate is 0. */
+    CHECK_EQ(of(History::model_row(stats(7, 100, 2.2e9, 10), &a, 1.0), "decode"), 0.0);
     /* The engine's own zero is a reading -- idle, nothing accepted -- not a leftover. */
     json idle = stats(7, 100, 2.2e9, 10);
     idle["decode_tps"] = 0.0;
@@ -141,14 +152,16 @@ TEST(the_encoder_figures_come_from_two_stats_objects_and_a_reset_is_a_gap) {
 }
 
 
-/* The same trap as the frozen decode rate, from the other side. The scheduler ages the prefill
- * window only when NOTHING is stepping, so while the model decodes prefill_tps holds the last
- * prompt's rate: on a live lane it drew a flat ~3,500 tok/s prefill line across four minutes the
- * model spent decoding, and the page's graph joined the gaps around it and called it throughput. */
-TEST(a_held_prefill_rate_is_a_gap_not_a_steady_throughput) {
+/* The prefill average is aged only by steps, so while the model only decodes it holds the last
+ * prompt's rate: with no prompt in prefill the rate reads 0, not that value. */
+TEST(a_held_prefill_rate_reads_zero_not_a_steady_throughput) {
     const json a = stats(7, 100, 2.2e9, 10);
-    /* Fifty decode steps and no prefill work: the number is a leftover, so it is not emitted. */
-    CHECK(!has(History::model_row(stats(7, 150, 3.3e9, 10), &a, 1.0), "prefill"));
+    /* Fifty decode steps and no prefill work: the held number is a leftover; the rate is 0. */
+    CHECK_EQ(of(History::model_row(stats(7, 150, 3.3e9, 10), &a, 1.0), "prefill"), 0.0);
+    /* A prompt in prefill whose step has not finished yet: the rate is under way, so it stands. */
+    json prefilling = stats(7, 150, 3.3e9, 10);
+    prefilling["requests"] = json::parse(R"([{"id": "r1", "state": "prefill"}])");
+    CHECK_EQ(of(History::model_row(prefilling, &a, 1.0), "prefill"), 900.0);
     /* One prefill-bearing step in the interval proves it is current. A mixed step carries a
      * prefill chunk as well as decode rows, so either shape licenses the figure. */
     CHECK_EQ(of(History::model_row(stats(7, 150, 3.3e9, 10, 1, 0), &a, 1.0), "prefill"), 900.0);
@@ -159,6 +172,47 @@ TEST(a_held_prefill_rate_is_a_gap_not_a_steady_throughput) {
     CHECK_EQ(of(History::model_row(idle, &a, 1.0), "prefill"), 0.0);
     /* The ring's first sample has nothing to be gated against, so the figure stands. */
     CHECK_EQ(of(History::model_row(stats(7, 100, 2.2e9, 10), nullptr, 0), "prefill"), 900.0);
+}
+
+/* A prefill chunk can run for seconds and the counters are published when it ends, so the samples
+ * inside it see no step advance: with the step open as a prefill-bearing one, the engine's last
+ * rate is what is under way, and a zero (no prompt measured yet) is not a reading. */
+TEST(a_running_prefill_step_keeps_the_prefill_line_drawing) {
+    const json a = stats(7, 100, 2.2e9, 10);
+    json inside = a;
+    inside["step_open_phase"] = 0;
+    inside["step_open_s"] = 1.5;
+    CHECK_EQ(of(History::model_row(inside, &a, 0.2), "prefill"), 900.0);
+    inside["step_open_phase"] = 2;
+    CHECK_EQ(of(History::model_row(inside, &a, 0.2), "prefill"), 900.0);
+    inside["prefill_tps"] = 0.0;
+    CHECK(!has(History::model_row(inside, &a, 0.2), "prefill"));
+    /* An open decode step with no prompt in prefill: the prefill rate is 0. */
+    json decoding = a;
+    decoding["step_open_phase"] = 1;
+    CHECK_EQ(of(History::model_row(decoding, &a, 0.2), "prefill"), 0.0);
+    /* An idle model with no requests, no step open and none finished is not busy. */
+    json idle = a;
+    idle["running"] = 0;
+    idle["step_open_phase"] = -1;
+    CHECK_EQ(of(History::model_row(idle, &a, 0.2), "busy"), 0.0);
+}
+
+/* Experts that all sit in VRAM have no hit rate and no moves to chart. */
+TEST(expert_hits_and_moves_need_a_tiered_model) {
+    json a = stats(7, 100, 2.2e9, 10), b = stats(7, 150, 3.3e9, 10);
+    for (json* s : { &a, &b }) (*s)["experts"] = { { "tiered", false }, { "routed", 0 }, { "routed_res", 0 },
+                                                   { "promotions", 0 }, { "demotions", 0 } };
+    b["experts"]["routed"] = 100;
+    b["experts"]["routed_res"] = 100;
+    b["experts"]["promotions"] = 4;
+    CHECK(!has(History::model_row(b, &a, 1.0), "expHit"));
+    CHECK(!has(History::model_row(b, &a, 1.0), "expIn"));
+    a["experts"]["tiered"] = true;
+    b["experts"]["tiered"] = true;
+    const History::Row r = History::model_row(b, &a, 2.0);
+    CHECK_EQ(of(r, "expHit"), 1.0);
+    CHECK_EQ(of(r, "expIn"), 2.0);
 }
 
 TEST(the_fleet_row_holds_telemetry_states_and_bytes_per_card) {

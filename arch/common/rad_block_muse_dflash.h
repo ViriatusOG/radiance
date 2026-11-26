@@ -45,7 +45,7 @@
  *
  * ============================== PRECISION ==============================
  *
- * Block fp8 or OCP-MXFP4 weights (`DenseFP8`, whichever the recipe wrote), read against an E4M3
+ * Block fp8 or OCP-MXFP4 weights (`DenseQ`, whichever the recipe wrote), read against an E4M3
  * activation quantised per row and 128 of K; the residual stream stays f32, which is what the
  * reference's autocast does and what keeps five stacked layers of 6656-wide adds from drifting.
  * The per-head q/k gains and both norms stay bf16.
@@ -70,22 +70,12 @@
 #define RAD_BLOCK_MUSE_DFLASH_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"   /* DenseFP8: the block fp8 / MXFP4 linear */
+#include "rad_linear.h"   /* DenseQ: the block fp8 / MXFP4 linear */
 
 namespace rad {
 namespace arch {
 
-/* The builder refuses a declaration it cannot serve and says why in its own words; this names which
- * handle did not come back, so that message reads against a line of this file. An op that resolves
- * to no kernel is recorded and handed back null -- it is only an error if the block issues it -- so
- * without this a missing kernel surfaces as a bare "invalid argument" at startup. */
-#define MD_REFUSED(...) ::rad::arch::muse_drafter_refused({ __VA_ARGS__ })
-inline int muse_drafter_refused(std::initializer_list<const char*> what) {
-    std::string list;
-    for (const char* w : what) { if (!list.empty()) list += ", "; list += w; }
-    std::fprintf(stderr, "Muse Glimmer drafter: the builder gave no handle for %s\n", list.c_str());
-    return RAD_E_INVAL;
-}
+#define MD_REFUSED(...) ::rad::arch::declare_refused("Muse Glimmer drafter", { __VA_ARGS__ })
 
 struct MuseDflash {
     enum { MAX_LAYERS = 8 };
@@ -126,8 +116,8 @@ struct MuseDflash {
 
         /* ---- fp8 codes and scales of the activations the linears read (`quant_act_fp8`), one
          * pair per activation rather than per linear: q, k and v all read the same `h`. The
-         * scale plane is one f32 a 128-value block (`fp8_blocks`), which is the grid a
-         * block-scaled fp8 GEMM reads (`DenseFP8`). */
+         * scale plane is one f32 a 128-value block (`scale_groups`), which is the grid a
+         * block-scaled fp8 GEMM reads (`DenseQ`). */
         rad_buf srcq = 0, srcs = 0;  /* [max_tok, n_taps * n_embd] e4m3 | [.., /128] f32 */
         rad_buf cnq  = 0, cns  = 0;  /* [max_tok, n_embd]         the normed context, k/v's input */
         rad_buf hq   = 0, hs   = 0;  /* [qrows,   n_embd]         the normed stream */
@@ -156,20 +146,13 @@ struct MuseDflash {
      * whole block is staged and verified per sequence, so at several sequences its 13 extra rows
      * cost more than the drafts they add. */
     int64_t block_lo = 0;
-    int64_t long_steps() const { return cfg.steps(); }
     int64_t qrows = 0, crows = 0, srows = 0;
     rad_kvgroup kv = 0;
 
     /* ---- model-scope weights */
-    DenseFP8 w_fc{};                         /* block fp8 or MXFP4, per the recipe */
+    DenseQ w_fc{};                         /* block fp8 or MXFP4, per the recipe */
     rad_weight b_fc = 0;                     /* the same linear in bf16, when nothing quantised it */
     bool     quant = false;                  /* the container's linears are quantised */
-    /* Test switch: declare the column-split linears (o, down) replicated instead of split plus an
-     * all_reduce, to tell a wrong reduce from a wrong split. */
-    static constexpr bool kRepOut = false;
-    /* Test switch: at a vocab-sharded head, all-gather the draft logits and take a plain argmax
-     * instead of the top-2 pair walk. Same answer by construction, so a difference is the walk's. */
-    static constexpr bool kGatherLogits = true;
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_fcnorm[MAX_LAYERS] = {};      /* one row of `fc_norm` a tap */
     rad_weight w_mk1 = 0, w_mk2 = 0;           /* markov_w1 (pred), markov_w2 (succ) */
@@ -178,10 +161,10 @@ struct MuseDflash {
 
     /* ---- per-layer weights */
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
-    DenseFP8 w_q[MAX_LAYERS]{}, w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
+    DenseQ w_q[MAX_LAYERS]{}, w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
     rad_weight b_q[MAX_LAYERS] = {}, b_k[MAX_LAYERS] = {}, b_v[MAX_LAYERS] = {}, b_o[MAX_LAYERS] = {};
     rad_weight w_qn[MAX_LAYERS] = {}, w_kn[MAX_LAYERS] = {}, w_gate[MAX_LAYERS] = {};
-    DenseFP8 w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
+    DenseQ w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
     rad_weight b_gu[MAX_LAYERS] = {}, b_dn[MAX_LAYERS] = {};
 
     /* ---- the context pass */
@@ -198,7 +181,7 @@ struct MuseDflash {
     rad_op op_qp[MAX_LAYERS] = {}, op_kp[MAX_LAYERS] = {}, op_vp[MAX_LAYERS] = {};
     rad_op op_qn[MAX_LAYERS] = {}, op_kn[MAX_LAYERS] = {}, op_gp[MAX_LAYERS] = {};
     rad_op op_op[MAX_LAYERS] = {}, op_gu[MAX_LAYERS] = {}, op_dn[MAX_LAYERS] = {};
-    rad_op op_widen2 = 0, op_widen3 = 0;
+    rad_op op_widen2 = 0;
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn = 0;
     /* one activation quantiser an input */
     rad_op op_qsrc = 0, op_qcn = 0, op_qh = 0, op_qat = 0, op_qff = 0;
@@ -278,9 +261,9 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                             RAD_WEIGHTS(wt)),
                    {x}, {y});
     };
-    /* A linear over a quantised weight: DenseFP8 picks `fp8a8` or `mxfp4a8` from the container's
+    /* A linear over a quantised weight: DenseQ picks `fp8a8` or `mxfp4a8` from the container's
      * encoding of that weight, and both read the same E4M3 activation pair. */
-    auto qgemm = [&](int64_t rows, int64_t n, int64_t k, DenseFP8& wt,
+    auto qgemm = [&](int64_t rows, int64_t n, int64_t k, DenseQ& wt,
                      rad_buf xq, rad_buf xs, rad_buf y) {
         return wt.gemm(b, rows, n, k, {xq, xs}, {y});
     };
@@ -289,7 +272,7 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
     auto qact = [&](rad_buf x, rad_buf xq, rad_buf xs, int64_t rows, int64_t n) {
         return rw(b, RAD_OP(b, "quant_act_fp8",
                             RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                       RAD_INT("group", RAD_FP8_BLOCK),
+                                       RAD_INT("group", RAD_SCALE_GROUP),
                                        RAD_STR("dtype", "bf16")),
                             RAD_NOWEIGHTS),
                   {x}, {xq, xs});
@@ -301,13 +284,13 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
         RAD_ARCH_TRY(map_linear(b, wn, { nm.ckpt("%s.encoder.fc.weight", ck) }));
         RadEncoding enc{};
         /* `weight_enc` is true for a plain bf16 plane too, so ask which encoding: block fp8
-         * (e4m3 codes, bf16 scale per 128x128), OCP-MXFP4 or M2XFP4 are what `DenseFP8` reads. */
+         * (e4m3 codes, bf16 scale per 128x128), OCP-MXFP4 or M2XFP4 are what `DenseQ` reads. */
         const RadEncPlane* sc = nullptr;
         const bool known = weight_enc(b, wn, &enc);
         const bool blk_fp8 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 &&
                              !enc.transform[0] && enc.plane[0].dtype == RAD_F8E4M3 &&
                              (sc = rad_enc_plane(&enc, "scale")) &&
-                             sc->block[0] == RAD_FP8_BLOCK && sc->block[1] == RAD_FP8_BLOCK;
+                             sc->block[0] == RAD_SCALE_GROUP && sc->block[1] == RAD_SCALE_GROUP;
         quant = blk_fp8 || (known && (linear_is_mxfp4(enc) || linear_is_m2xfp4(enc)));
         if (quant) {
             RAD_ARCH_TRY(w_fc.declare(b, nm, nm.f("dspark.fc"), E, cfg.n_taps * E,
@@ -388,11 +371,11 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
             *out = decl_w(b, name, RAD_BF16, shape, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
             return *out ? RAD_OK : RAD_E_INVAL;
         };
-        /* A linear, block fp8 or MXFP4 as the recipe wrote it (`DenseFP8::declare` reads which
+        /* A linear, block fp8 or MXFP4 as the recipe wrote it (`DenseQ::declare` reads which
          * from the container's encoding and maps the name itself). More than one source is a
          * concatenation, whose row parts say where each piece begins, so `act_mul` reads
          * [gate | up] as one weight. */
-        auto lin_w = [&](DenseFP8* out, rad_weight* bout, const char* suffix,
+        auto lin_w = [&](DenseQ* out, rad_weight* bout, const char* suffix,
                          std::initializer_list<const char*> srcs,
                          std::initializer_list<int64_t> shape,
                          std::initializer_list<int64_t> parts = {},
@@ -434,12 +417,12 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
         RAD_ARCH_TRY(lin_w(&w_v[i], &b_v[i], "attn_v", { SRC("self_attn.v_proj.weight") }, {kvd, E}, {},
                            RAD_SHARD_ROW));
         RAD_ARCH_TRY(lin_w(&w_o[i], &b_o[i], "attn_output", { SRC("self_attn.o_proj.weight") }, {E, qd}, {},
-                           kRepOut ? RAD_SHARD_NONE : RAD_SHARD_COL));
+                           RAD_SHARD_COL));
         RAD_ARCH_TRY(lin_w(&w_gu[i], &b_gu[i], "ffn_gate_up",
                            { SRC("mlp.gate_proj.weight"), SRC("mlp.up_proj.weight") },
                            {2 * g.n_ff, E}, { g.n_ff, g.n_ff }, RAD_SHARD_ROW));
         RAD_ARCH_TRY(lin_w(&w_dn[i], &b_dn[i], "ffn_down", { SRC("mlp.down_proj.weight") },
-                           {E, g.n_ff}, {}, kRepOut ? RAD_SHARD_NONE : RAD_SHARD_COL));
+                           {E, g.n_ff}, {}, RAD_SHARD_COL));
         if (cfg.gate)
             RAD_ARCH_TRY(lin_b(&w_gate[i], "attn_gate", { SRC("self_attn.g_proj.weight") },
                                {g.n_head, E}));
@@ -557,23 +540,10 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
      * and dspark's. Exact, because a lossy wire would move the one embedded anchor row the whole
      * block conditions on. */
     if (g.world > 1)
-        op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                            RAD_PARAMS(RAD_INT("world_size", g.world),
-                                       RAD_RANGE("numel", E, qrows * E),
-                                       RAD_STR("dtype", "bf16"), RAD_INT("exact", 1)),
-                            RAD_NOWEIGHTS),
-                        {w.h}, {w.h});
-    op_widen = rw(b, RAD_OP(b, "cast",
-                            RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
-                                       RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                            RAD_NOWEIGHTS),
-                  {w.h}, {w.x});
+        op_embed_ar = decl_all_reduce_exact(b, g, w.h, E, qrows, "bf16");
+    op_widen = cast_op(b, qrows, E, "bf16", "f32", w.h, w.x);
     /* One widen and one add serve both residual sites a layer: same shapes, same buffers. */
-    op_widen2 = rw(b, RAD_OP(b, "cast",
-                             RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
-                                        RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                             RAD_NOWEIGHTS),
-                   {w.h}, {w.delta});
+    op_widen2 = cast_op(b, qrows, E, "bf16", "f32", w.h, w.delta);
     op_add = rw(b, RAD_OP(b, "add",
                           RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
                                      RAD_STR("dtype", "f32")),
@@ -621,7 +591,7 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
          * `gemm_nt_q_gated_mx`): it writes the quantised SwiGLU output down reads, so `w.ff`
          * stays for the fallback. */
         if (quant)
-            op_gug[i] = (w_gu[i].mx || w_gu[i].m2x)
+            op_gug[i] = w_gu[i].mx
                         ? decl_gated_fold_mx(b, qrows, 2 * g.n_ff, E, w_gu[i].w, w_gu[i].s,
                                              w_gu[i].ref, {w.hq, w.hs}, {w.ffq, w.ffs},
                                              &gated_rows)
@@ -688,13 +658,7 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                           RAD_NOWEIGHTS),
                 {w.gate_up}, {w.ff});
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                          RAD_PARAMS(RAD_INT("world_size", g.world),
-                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                     RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
-                                     RAD_INT("min_bytes", g.wire_min_bytes)),
-                          RAD_NOWEIGHTS),
-                    {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h, g.n_embd, g.max_tok, "bf16");
     op_outnorm = rw(b, RAD_OP(b, "rmsnorm",
                               RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
                                          RAD_F64("eps", g.eps), RAD_F64("wadd", 0.0),
@@ -741,12 +705,8 @@ inline int MuseDflash::declare(RadBuilder* b, Names& nm, const Geom& geom, const
         /* No bigram bias: the draft is the argmax of the target's own head over the predicting
          * rows, exactly `main_model_output_embeddings(...).argmax(-1)` in the reference. R = 1
          * writes one id a row, which is the [sequences, steps] proposal plane. */
-        op_dlogbf = rw(b, RAD_OP(b, "cast",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_vocab),
-                                            RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
-                                 RAD_NOWEIGHTS),
-                       {w.dlog}, {w.dlog_bf});
-        if (sharded && kGatherLogits) {
+        op_dlogbf = cast_op(b, srows, g.n_vocab, "f32", "bf16", w.dlog, w.dlog_bf);
+        if (sharded) {
             op_dgath_lg = rw(b, RAD_OP(b, "all_gather",
                             RAD_PARAMS(RAD_INT("world_size", g.world),
                                        RAD_INT("numel", srows * g.n_vocab),
@@ -917,7 +877,7 @@ inline void MuseDflash::step(RadCtx* c, const RadBatch* batch) const {
             RAD_ISSUE_N(c, op_op[i], T, brows(cfg.gate ? w.attng : w.attn, T), RAD_W(b_o[i]),
                         brows(w.h, T));
         }
-        if (op_ar && !kRepOut) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+        if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_widen2, T, brows(w.h, T), brows(w.delta, T));
         RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.delta, T), brows(w.x, T));
 
@@ -927,7 +887,7 @@ inline void MuseDflash::step(RadCtx* c, const RadBatch* batch) const {
         if (op_gug[i] && T <= gated_rows) {
             /* The MXFP4 fold takes the reference plane as a third weight; the fp8 tile does
              * not, and its schema is one operand shorter. */
-            if (w_gu[i].mx || w_gu[i].m2x)
+            if (w_gu[i].mx)
                 RAD_ISSUE_N(c, op_gug[i], T, brows(w.hq, T), brows(w.hs, T), RAD_W(w_gu[i].w),
                             RAD_W(w_gu[i].s), RAD_W(w_gu[i].ref), brows(w.ffq, T),
                             brows(w.ffs, T), RAD_NONE);
@@ -950,7 +910,7 @@ inline void MuseDflash::step(RadCtx* c, const RadBatch* batch) const {
                         RAD_W(w_dn[i].s), brows(w.h, T), RAD_NONE, w_dn[i].bref());
         else
             RAD_ISSUE_N(c, op_dn[i], T, brows(w.ff, T), RAD_W(b_dn[i]), brows(w.h, T));
-        if (op_ar && !kRepOut) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+        if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_widen2, T, brows(w.h, T), brows(w.delta, T));
         RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.delta, T), brows(w.x, T));
     }
@@ -1213,15 +1173,15 @@ inline int declare_muse_dflash(MuseDflash* ds, MuseDflash::Wire* w, rad_kvgroup*
     /* The linears are block fp8 or MXFP4, so every activation feeding one has an E4M3 plane and
      * an f32 scale a 128 values. */
     dw.srcq = decl_b(b, nm.f("ds_srcq"), RAD_F8E4M3, {dg.max_tok, c.n_taps * dg.n_embd});
-    dw.srcs = decl_b(b, nm.f("ds_srcs"), RAD_F32, {dg.max_tok, fp8_blocks(c.n_taps * dg.n_embd)});
+    dw.srcs = decl_b(b, nm.f("ds_srcs"), RAD_F32, {dg.max_tok, scale_groups(c.n_taps * dg.n_embd)});
     dw.cnq  = decl_b(b, nm.f("ds_cnq"),  RAD_F8E4M3, {dg.max_tok, dg.n_embd});
-    dw.cns  = decl_b(b, nm.f("ds_cns"),  RAD_F32,    {dg.max_tok, fp8_blocks(dg.n_embd)});
+    dw.cns  = decl_b(b, nm.f("ds_cns"),  RAD_F32,    {dg.max_tok, scale_groups(dg.n_embd)});
     dw.hq   = decl_b(b, nm.f("ds_hq"),   RAD_F8E4M3, {qr, dg.n_embd});
-    dw.hs   = decl_b(b, nm.f("ds_hs"),   RAD_F32,    {qr, fp8_blocks(dg.n_embd)});
+    dw.hs   = decl_b(b, nm.f("ds_hs"),   RAD_F32,    {qr, scale_groups(dg.n_embd)});
     dw.atq  = decl_b(b, nm.f("ds_atq"),  RAD_F8E4M3, {qr, qd});
-    dw.ats  = decl_b(b, nm.f("ds_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
+    dw.ats  = decl_b(b, nm.f("ds_ats"),  RAD_F32,    {qr, scale_groups(qd)});
     dw.ffq  = decl_b(b, nm.f("ds_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffs  = decl_b(b, nm.f("ds_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    dw.ffs  = decl_b(b, nm.f("ds_ffs"),  RAD_F32,    {qr, scale_groups(dg.n_ff)});
     dw.hg    = decl_b(b, nm.f("ds_hg"), RAD_BF16, {sr, dg.n_embd});
     dw.dlog  = decl_b(b, nm.f("ds_dlog"), RAD_F32, {sr, dg.n_vocab});
     /* Vocab-sharded, the head's rows are this rank's slice and the top-1 must be taken over every

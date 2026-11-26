@@ -24,7 +24,12 @@
 #include "kvstream/stage.h"
 #include "runtime/rank_barrier.h"
 #include "runtime/residency.h"
+#include "runtime/rowprefetch.h"
 #include "runtime/wtab.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -246,9 +251,10 @@ struct Fixture {
         return (rad_op)(P.ops.size() - 1);
     }
 
+    bool row_prefetch = true;   /* CtxDesc::row_prefetch */
+
     int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false,
-              uint64_t (*pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr) {
-        CtxDesc d;
+              uint64_t (*pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr) {        CtxDesc d;
         d.program     = &P;
         d.rank        = 1;
         d.world_size  = 2;
@@ -256,6 +262,7 @@ struct Fixture {
         d.arch_pass_key = pass_key;
         d.residency   = res;
         d.profile_ops = profile;
+        d.row_prefetch = row_prefetch;
         d.kv          = kv;
         d.registry    = registry;
         /* The arch bodies here issue whatever a case asks, which the batch does not describe, so
@@ -303,7 +310,7 @@ TEST(bucket_table_indexes_at_band_boundaries) {
         }
     }));
 
-    CHECK_EQ(g_rec.size(), sizeof(probes) / sizeof(probes[0]));
+    REQUIRE_EQ(g_rec.size(), sizeof(probes) / sizeof(probes[0]));
     for (size_t i = 0; i < g_rec.size() && i < sizeof(want) / sizeof(want[0]); ++i) {
         CHECK_EQ(std::string(g_rec[i].kernel), std::string(want[i]));
         /* The geometry the kernel sees is the band's, collapsed to its upper bound. */
@@ -316,7 +323,7 @@ TEST(bucket_table_indexes_at_band_boundaries) {
         RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
         CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
     }));
-    CHECK_EQ(g_rec.size(), (size_t)1);
+    REQUIRE_EQ(g_rec.size(), (size_t)1);
     CHECK_EQ(std::string(g_rec[0].kernel), std::string("m64"));
 
     /* The rank's identity reaches the kernel, since collectives need it (spec §9). */
@@ -356,7 +363,7 @@ TEST(arena_offsets_and_operand_offsets) {
         RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B_N(y, 8, 63) };
         CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
     }));
-    CHECK_EQ(g_rec.size(), (size_t)1);
+    REQUIRE_EQ(g_rec.size(), (size_t)1);
     CHECK_EQ(g_rec[0].n_t, 3);
     CHECK(g_rec[0].t[0].data == base + 0);
     CHECK(g_rec[0].t[1].data == (void*)g_weight_bytes);
@@ -435,7 +442,7 @@ TEST(rows_narrows_dim0_and_keeps_strides) {
         RadOperand opd[3] = { RAD_B_N(x, 0, 7), RAD_W(w), RAD_B_N(y, 0, 7) };
         CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
     }));
-    CHECK_EQ(g_rec.size(), (size_t)1);
+    REQUIRE_EQ(g_rec.size(), (size_t)1);
     CHECK_EQ(g_rec[0].t[0].shape[0], (int64_t)7);
     CHECK_EQ(g_rec[0].t[0].shape[1], (int64_t)4);
     CHECK_EQ(g_rec[0].t[0].stride[0], (int64_t)4);   /* unchanged: it is a product of dims 1.. */
@@ -472,7 +479,7 @@ TEST(negative_launch_aborts_the_step_by_name) {
 
     CHECK_EQ(s, RAD_E_SHAPE);
     CHECK_EQ(second, RAD_E_SHAPE);
-    CHECK_EQ(g_rec.size(), (size_t)1);              /* only the failing kernel ever ran */
+    REQUIRE_EQ(g_rec.size(), (size_t)1);              /* only the failing kernel ever ran */
     CHECK_EQ(std::string(g_rec[0].kernel), std::string("bad"));
 
     const char* msg = f.ctx.step_error();
@@ -529,7 +536,7 @@ TEST(pending_weight_waits_on_the_stream_not_the_host) {
     CHECK_EQ(f.ctx.host_syncs(), (int64_t)0);
     CHECK_EQ(rad::rad_dev_host_blocks() - blocks0, (int64_t)0);
     /* The residency table, not WeightInfo, decided where the bytes are. */
-    CHECK_EQ(g_rec.size(), (size_t)2);
+    REQUIRE_EQ(g_rec.size(), (size_t)2);
     CHECK(g_rec[0].t[1].data == (void*)g_moved_bytes);
     CHECK(g_rec[0].t[1].data != (void*)g_weight_bytes);
 
@@ -1069,8 +1076,7 @@ TEST(scratch_users_on_two_lanes_are_ordered_one_behind_the_other) {
 
     g_scr_src = (uint8_t*)rad_dev_alloc(kScrBytes, RAD_MEM_DEVICE);
     g_scr_dst = (uint8_t*)rad_dev_alloc(kScrBytes, RAD_MEM_DEVICE);
-    CHECK(g_scr_src && g_scr_dst);
-    if (!g_scr_src || !g_scr_dst) return;
+    REQUIRE(g_scr_src && g_scr_dst);
 
     for (int round = 0; round < 4; ++round) {
         const int first = round & 1;   /* which lane writes; the other reads */
@@ -1268,7 +1274,7 @@ TEST(raw_operand_carries_the_pointer_and_refuses_an_offset) {
         opd[1].rows = 4;
         CHECK_OK(c.issue(op, opd, 2, RAD_N_BATCH));
     }));
-    CHECK_EQ(g_rec.size(), (size_t)1);
+    REQUIRE_EQ(g_rec.size(), (size_t)1);
     CHECK(g_rec[0].t[1].data == (void*)positions);
     CHECK_EQ(g_rec[0].t[1].shape[0], (int64_t)4);
 
@@ -1812,7 +1818,7 @@ TEST(a_buffer_operand_reaching_past_its_declaration_is_refused_by_name) {
     CHECK_OK(f.start());
     /* The last four columns of every row: inside, though it starts four elements in. */
     CHECK_OK(issue_once(f, 0, op, { RAD_B_COL(y, 4, 4) }));
-    CHECK_EQ(g_rec.size(), (size_t)1);
+    REQUIRE_EQ(g_rec.size(), (size_t)1);
     CHECK_EQ(g_rec[0].t[0].shape[1], (int64_t)4);
     CHECK_EQ(g_rec[0].t[0].stride[0], (int64_t)8);
     int step = 1;
@@ -2005,7 +2011,7 @@ TEST(kv_pools_bind_each_layer_to_its_place_in_the_group) {
     }, &b);
     REQUIRE_EQ(b.size(), (size_t)4);
     CHECK(b[0].base == nullptr);
-    CHECK_EQ(b[1].layer_slot.size(), (size_t)12);
+    REQUIRE_EQ(b[1].layer_slot.size(), (size_t)12);
     CHECK_EQ(b[1].layer_slot[3], 0);
     CHECK_EQ(b[1].layer_slot[7], 1);
     CHECK_EQ(b[1].layer_slot[11], 2);
@@ -2499,6 +2505,51 @@ TEST(a_played_pass_joins_its_host_op_to_the_device_op_it_replays) {
         CHECK_OK(rad_stream_sync(f.ctx.stream()));
     }
     if (f.ctx.records_passes()) CHECK(f.ctx.pass_counts().played > 0);
+}
+
+/* What lets an architecture overlap a host gather with the device (deepseek41 issues every Engram
+ * layer's ngram_ids before the first block, rad_block_ple.h its ids() at the top of the step): a
+ * host op whose operands are host-arena buffers joins the last device op that touched the host
+ * arena, so device work on device buffers issued after that producer is not waited for. One
+ * device-domain operand makes the join drain the stream instead. */
+TEST(a_host_op_on_host_buffers_joins_its_producer_without_draining) {
+    ord_setup();
+    Fixture f;
+    rad_buf hb = f.add_buffer("ids", RAD_I32, 4, 1, 0);
+    f.P.buffers[hb].decl.domain = RAD_DOMAIN_HOST;
+    rad_buf da = f.add_buffer("act_a", RAD_I32, 4, 1, 0);
+    rad_buf db = f.add_buffer("act_b", RAD_I32, 4, 1, 0);
+    rad_op prod = f.add_op("rope", "M", { 8192 }, { k_late_write }, { "late_write" }, nullptr, {});
+    rad_op work = f.add_op("rope", "M", { 8192 }, { k_copy }, { "copy" }, nullptr, {});
+    rad_op hst = host_op(f, k_host_read, "host_read");
+    CHECK_OK(f.start());
+    REQUIRE(f.ctx.set_op_domain(hst, RAD_DOMAIN_HOST) == RAD_OK);
+    for (int round = 0; round < 3; ++round) {
+        *g_ord_value = 3000 + round;
+        *(int32_t*)f.ctx.buf_ptr(hb) = -7;            /* the poison */
+        g_ord_seen = -1;
+        CHECK_OK(f.step(4, round, [&](Ctx& c) {
+            const RadOperand ids[1] = { RAD_B(hb) };
+            const RadOperand cp[2] = { RAD_B(da), RAD_B(db) };
+            CHECK_OK(c.issue(prod, ids, 1, RAD_N_BATCH));
+            for (int i = 0; i < 4; ++i) CHECK_OK(c.issue(work, cp, 2, RAD_N_BATCH));
+            CHECK_OK(c.issue(hst, ids, 1, RAD_N_BATCH));
+        }));
+        CHECK_EQ(g_ord_seen, 3000 + round);
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+    }
+    CHECK_EQ(f.ctx.host_syncs(), (int64_t)3);
+    CHECK_EQ(f.ctx.host_drains(), (int64_t)0);
+
+    /* The same read with a device-domain operand beside the ids: the join drains. */
+    CHECK_OK(f.step(4, 3, [&](Ctx& c) {
+        const RadOperand ids[1] = { RAD_B(hb) };
+        const RadOperand both[2] = { RAD_B(hb), RAD_B(da) };
+        CHECK_OK(c.issue(prod, ids, 1, RAD_N_BATCH));
+        CHECK_OK(c.issue(hst, both, 2, RAD_N_BATCH));
+    }));
+    CHECK_OK(rad_stream_sync(f.ctx.stream()));
+    CHECK_EQ(f.ctx.host_drains(), (int64_t)1);
 }
 
 /* A host op naming memory the arena does not track (a raw pointer) cannot know which device op
@@ -3116,6 +3167,347 @@ TEST(repeat_mode_flags_a_kernel_that_is_not_a_function_of_its_inputs) {
     CHECK_OK(good.status);
     CHECK(!has(good.log, "repeat #"));
     CHECK(has(good.log, "1 issue(s) run twice, 0 of them answered differently"));
+}
+
+/* ================================================================== row read-ahead
+ * A host gather from a table on the mapped tier (--ngram-placement disk) has every page its rows
+ * cover asked for before its kernel runs (runtime/rowprefetch.h), so the kernel's faults wait on
+ * reads in flight together instead of issuing them one at a time. */
+namespace {
+
+/* The pages a set of emitted runs covers, as page indices from `base`. */
+std::vector<int64_t> run_pages(const std::vector<rad::PageRun>& runs, uintptr_t base, int64_t pg) {
+    std::vector<int64_t> v;
+    for (const rad::PageRun& r : runs)
+        for (uintptr_t a = r.first; a < r.second; a += (uintptr_t)pg) v.push_back((int64_t)((a - base) / pg));
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+}
+
+}  /* namespace */
+
+/* The arithmetic alone: each row's pages in every table, ids outside [0, rows) after the offset
+ * skipped, duplicates and neighbours merged into one sorted run, strided ids read through their
+ * strides, and an id dtype it cannot read refused rather than guessed. */
+TEST(row_read_ahead_covers_each_rows_pages_and_nothing_else) {
+    const int64_t pg = 4096;
+    alignas(4096) static uint8_t tabs[12 * 4096];
+    uint8_t* const a_tab = tabs;              /* 8 pages */
+    uint8_t* const b_tab = tabs + 10 * 4096;  /* after it, so the runs sort A then B */
+    RadTensor t[3]{};
+    t[1].data = a_tab;
+    t[2].data = b_tab;
+    rad::RowPrefetch rp;
+    rp.n = 2;
+    rp.opd[0] = 1; rp.row_bytes[0] = 1000;   /* rows straddle pages */
+    rp.opd[1] = 2; rp.row_bytes[1] = 16;
+    rp.rows = 30;
+    rp.voff = 10;
+    /* ids - 10: 0, 1, 3, -1 (skipped), 30 (skipped), 4, 0 again, 27 */
+    int32_t ids[8] = { 10, 11, 13, 9, 40, 14, 10, 37 };
+    RadTensor it{};
+    it.data = ids; it.dtype = RAD_I32; it.rank = 1; it.shape[0] = 8; it.stride[0] = 1;
+    rad::RowPrefetchScratch s;
+    s.reserve(64);
+    std::vector<rad::PageRun> got;
+    const int64_t pages = rad::row_page_runs(rp, it, 8, t, pg, &s,
+                                             [&](const rad::PageRun& r) { got.push_back(r); });
+    /* table A: rows 0,1,3 in page 0, row 4 [4000, 5000) pages 0-1, row 27 [27000, 28000) page 6;
+     * table B: rows 0..27 at 16 B, all page 0. */
+    CHECK_EQ(pages, (int64_t)4);
+    REQUIRE_EQ(got.size(), (size_t)3);
+    CHECK(got[0].first == (uintptr_t)a_tab && got[0].second == (uintptr_t)a_tab + 2 * pg);
+    CHECK(got[1].first == (uintptr_t)a_tab + 6 * pg && got[1].second == (uintptr_t)a_tab + 7 * pg);
+    CHECK(got[2].first == (uintptr_t)b_tab && got[2].second == (uintptr_t)b_tab + pg);
+    for (size_t i = 1; i < got.size(); ++i) CHECK(got[i - 1].second < got[i].first);
+
+    /* A scratch of two flushes as it fills; the pages covered are the same. */
+    rad::RowPrefetchScratch small;
+    small.reserve(2);
+    std::vector<rad::PageRun> got2;
+    CHECK(rad::row_page_runs(rp, it, 8, t, pg, &small,
+                             [&](const rad::PageRun& r) { got2.push_back(r); }) >= 4);
+    CHECK(run_pages(got2, (uintptr_t)a_tab, pg) == run_pages(got, (uintptr_t)a_tab, pg));
+
+    /* [2, 3] ids at a row pitch of 4 (padded), as int64: rows 0,1,3 and 4,0,27. */
+    int64_t ids2[8] = { 10, 11, 13, -99, 14, 10, 37, -99 };
+    RadTensor i2{};
+    i2.data = ids2; i2.dtype = RAD_I64; i2.rank = 2;
+    i2.shape[0] = 2; i2.shape[1] = 3; i2.stride[0] = 4; i2.stride[1] = 1;
+    std::vector<rad::PageRun> got3;
+    CHECK_EQ(rad::row_page_runs(rp, i2, 6, t, pg, &s, [&](const rad::PageRun& r) { got3.push_back(r); }),
+             (int64_t)4);
+    CHECK(got3 == got);
+
+    /* Fewer ids than the tensor holds: only the first m count. */
+    std::vector<rad::PageRun> got4;
+    CHECK_EQ(rad::row_page_runs(rp, it, 3, t, pg, &s, [&](const rad::PageRun& r) { got4.push_back(r); }),
+             (int64_t)2);
+
+    /* Float ids: refused, nothing emitted. */
+    float fids[2] = { 10.f, 11.f };
+    RadTensor ft{};
+    ft.data = fids; ft.dtype = RAD_F32; ft.rank = 1; ft.shape[0] = 2; ft.stride[0] = 1;
+    int emitted = 0;
+    CHECK_EQ(rad::row_page_runs(rp, ft, 2, t, pg, &s, [&](const rad::PageRun&) { ++emitted; }), (int64_t)-1);
+    CHECK_EQ(emitted, 0);
+    CHECK(rad::row_gather_op("embed_lookup_planes") && rad::row_gather_op("embed_lookup_q") &&
+          rad::row_gather_op("embed_lookup") && rad::row_gather_op("embed_lookup_ggml"));
+    CHECK(!rad::row_gather_op("gemm_nt") && !rad::row_gather_op("gather_rows"));
+}
+
+namespace {
+
+/* A table file whose pages are out of the page cache, mapped read-only like the container. */
+struct ColdTable {
+    int      fd = -1;
+    uint8_t* base = nullptr;
+    int64_t  bytes = 0;
+    bool     cold = false;
+    ColdTable(const std::string& path, int64_t n) : bytes(n) {
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return;
+        /* Incompressible bytes: a compressing filesystem (btrfs) fills the page cache with a
+         * whole compressed extent's pages when it reads one, which is not a read ahead. */
+        std::vector<uint8_t> buf((size_t)n);
+        uint64_t x = 0x9E3779B97F4A7C15ull;
+        for (int64_t i = 0; i < n; ++i) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            buf[(size_t)i] = (uint8_t)(x >> 24);
+        }
+        if (::write(fd, buf.data(), (size_t)n) != (ssize_t)n) return;
+        ::fsync(fd);
+        ::posix_fadvise(fd, 0, n, POSIX_FADV_DONTNEED);
+        void* m = ::mmap(nullptr, (size_t)n, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m == MAP_FAILED) return;
+        base = (uint8_t*)m;
+        ::posix_madvise(base, (size_t)n, POSIX_MADV_RANDOM);
+        cold = resident_pages(0, n) == 0;
+    }
+    ~ColdTable() {
+        if (base) ::munmap(base, (size_t)bytes);
+        if (fd >= 0) ::close(fd);
+    }
+    int64_t resident_pages(int64_t off, int64_t len) const {
+        const int64_t pg = rad::row_prefetch_page();
+        const int64_t a = off / pg * pg, n = (off + len + pg - 1) / pg - off / pg;
+        std::vector<unsigned char> v((size_t)n);
+        if (::mincore(base + a, (size_t)(n * pg), v.data()) != 0) return -1;
+        int64_t r = 0;
+        for (unsigned char c : v) r += c & 1;
+        return r;
+    }
+};
+
+const ColdTable* g_cold = nullptr;
+int64_t g_cold_rb = 0, g_cold_rows = 0;
+int64_t g_cold_n = 4;            /* ids the probe kernel reads */
+double  g_cold_wait_ms = 0;      /* how long the probe kernel waits for its rows */
+bool    g_cold_rows_in = false;  /* every row it was asked for came in */
+int64_t g_cold_other = -1;       /* resident pages of a row nobody asked for */
+int64_t g_cold_other_row = 900;
+
+/* A gather that reads nothing itself: it waits, up to g_cold_wait_ms, for the pages of the rows
+ * its ids name to arrive in the page cache. Only a read ahead can bring them. */
+int k_cold_gather(const RadArgs* a, RadStream) {
+    const int32_t* ids = (const int32_t*)a->t[0].data;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t pg = rad::row_prefetch_page();
+    const int64_t np = (g_cold_rows * g_cold_rb + pg - 1) / pg;
+    std::vector<unsigned char> v((size_t)np);
+    g_cold_rows_in = false;
+    for (;;) {
+        /* One mincore over the table, then the named rows' pages from it. */
+        bool all = ::mincore(g_cold->base, (size_t)(np * pg), v.data()) == 0;
+        for (int64_t i = 0; all && i < g_cold_n; ++i) {
+            if (ids[i] < 0 || ids[i] >= g_cold_rows) continue;
+            const int64_t a0 = ids[i] * g_cold_rb / pg, a1 = (ids[i] * g_cold_rb + g_cold_rb - 1) / pg;
+            for (int64_t p = a0; p <= a1; ++p)
+                if (!(v[(size_t)p] & 1)) all = false;
+        }
+        if (all) { g_cold_rows_in = true; break; }
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() >
+            g_cold_wait_ms)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    g_cold_other = g_cold->resident_pages(g_cold_other_row * g_cold_rb, g_cold_rb);
+    return RAD_OK;
+}
+
+/* One step issuing an embed_lookup_q over a mapped table of `rows` x `rb` from `ct`, with the
+ * ids `ids` (n of them). Returns the Ctx's read-ahead counters. */
+struct ColdRun { int status = RAD_OK; int64_t calls = 0, pages = 0, beside = 0; bool busy_after = false; };
+ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t* ids, int64_t n,
+                 double wait_ms, bool fetches_rows = false, bool row_prefetch = true) {
+    ColdRun out;
+    g_cold = &ct;
+    g_cold_rb = rb;
+    g_cold_rows = rows;
+    g_cold_n = n;
+    g_cold_wait_ms = wait_ms;
+    Fixture f;
+    rad_buf ib = f.add_buffer("ids", RAD_I32, n, 1, 0);
+    f.P.buffers[ib].decl.domain = RAD_DOMAIN_HOST;
+    rad_buf xb = f.add_buffer("x", RAD_BF16, n, 8, 256);
+    rad_weight w = f.add_weight("ngram.weight", RAD_U8, rows, rb, ct.base);
+    rad::WeightInfo& wi = f.P.weights[w];
+    wi.tier = rad::Tier::Mapped;
+    wi.site = rad::Site::Host;
+    wi.logical_bytes = wi.stored_bytes = rows * rb;
+    wi.stored_dtype = RAD_U8;
+    wi.stored_rank = 2;
+    wi.stored_shape[0] = rows;
+    wi.stored_shape[1] = rb;
+    rad_op op = f.add_op("embed_lookup_q", "M", { 8192 }, { nullptr }, { nullptr }, nullptr, { w });
+    f.P.ops[op].base.set_i("n_vocab", rows);
+    attach_host_row(f, op, k_cold_gather, "cold_gather");
+    f.rows.back().fetches_rows = fetches_rows;   /* rad_kernel_fetches_rows */
+    for (rad::Band& band : f.P.ops[op].bands) band.dom[RAD_DOMAIN_HOST].geom.set_i("n_vocab", rows);
+    f.row_prefetch = row_prefetch;
+    out.status = f.start();
+    if (out.status < 0) return out;
+    if (f.ctx.set_op_domain(op, RAD_DOMAIN_HOST) != RAD_OK) { out.status = RAD_E_STATE; return out; }
+    std::memcpy(f.ctx.buf_ptr(ib), ids, (size_t)n * sizeof(int32_t));
+    out.status = f.step(n, 0, [&](Ctx& c) {
+        const RadOperand o[3] = { RAD_B(ib), RAD_W(w), RAD_B(xb) };
+        CHECK_OK(c.issue(op, o, 3, RAD_N_BATCH));
+    });
+    out.busy_after = f.ctx.row_prefetch_busy();
+    out.calls = f.ctx.row_prefetch_calls();
+    out.pages = f.ctx.row_prefetch_pages();
+    out.beside = f.ctx.row_prefetch_beside_calls();
+    rad_stream_sync(f.ctx.stream());
+    f.ctx.shutdown();
+    return out;
+}
+
+}  /* namespace */
+
+/* Through the issue path: a host gather (embed_lookup_q) over a weight on the mapped tier has its
+ * rows' pages asked for before its kernel, so they arrive without the kernel touching them; a row
+ * it does not name stays out, and an id past the table is skipped. --row-prefetch off
+ * (CtxDesc::row_prefetch) turns it off. */
+TEST(a_host_gather_from_the_mapped_tier_reads_its_rows_ahead_of_its_kernel) {
+    if (!rad::device_is_host()) SKIP("the probe kernel runs on the host backend's host domain");
+    const int64_t rows = 1024, rb = 1000;   /* 250 pages; rows straddle pages */
+    const int32_t ids[4] = { 3, 200, 201, 4000 };   /* 4000: past the table, skipped */
+    g_cold_other_row = 900;
+    {
+        ColdTable ct(radtest::tmp_path("rowpf-a.bin"), rows * rb);
+        if (!ct.base) SKIP("could not write and map a table under %s", radtest::tmpdir().c_str());
+        if (!ct.cold) SKIP("this filesystem keeps a file's pages cached after POSIX_FADV_DONTNEED "
+                           "(tmpfs?), so a read ahead cannot be told from none");
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 3000.0);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)1);
+        CHECK_EQ(r.beside, (int64_t)0);   /* 4 ids: in front of the kernel */
+        /* row 3: [3000, 4000) page 0; rows 200-201: [200000, 202000) pages 48-49 */
+        CHECK_EQ(r.pages, (int64_t)3);
+        CHECK(g_cold_rows_in);
+        CHECK_EQ(g_cold_other, (int64_t)0);   /* row 900, page 219: nobody asked */
+    }
+    {
+        ColdTable ct(radtest::tmp_path("rowpf-b.bin"), rows * rb);
+        REQUIRE(ct.base && ct.cold);
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 50.0, false, false);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)0);
+        CHECK(!g_cold_rows_in);
+    }
+    {
+        /* A kernel that fetches its rows itself (rad_kernel_fetches_rows) is left alone. */
+        ColdTable ct(radtest::tmp_path("rowpf-c.bin"), rows * rb);
+        REQUIRE(ct.base && ct.cold);
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 50.0, true);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)0);
+        CHECK(!g_cold_rows_in);
+    }
+}
+
+/* A read-ahead longer than kRowAheadInline (a prefill chunk's gather) samples its rows' residency:
+ * cold, it runs in front of the kernel as a short one does (the rows arrive without the kernel
+ * touching them, a row nobody named stays out); warm, it runs beside the kernel, and when the
+ * kernel returns before the helper is through, the helper has stopped by the time the issue
+ * returns (it reads the ids, which the next step rewrites). One sampled page out sends it in front
+ * again. */
+TEST(a_long_host_gather_reads_its_rows_ahead_beside_its_kernel_when_they_are_resident) {
+    if (!rad::device_is_host()) SKIP("the probe kernel runs on the host backend's host domain");
+    const int64_t rows = 8192, rb = 4096;   /* a page a row, 32 MiB */
+    std::vector<int32_t> ids(6000);         /* the op's band ends at 8192 rows */
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t)(i * 4 % 8000 + i * 4 / 8000);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const int64_t n = (int64_t)ids.size();
+    REQUIRE(n > rad::kRowAheadInline);
+    g_cold_other_row = 8100;   /* past every named row (ids < 8000 + 3) */
+    auto warm = [&](const ColdTable& ct) {
+        volatile uint8_t s = 0;
+        for (int64_t p = 0; p < rows * rb; p += 4096) s = s + ct.base[p];
+        (void)s;
+    };
+    {
+        ColdTable ct(radtest::tmp_path("rowpf-d.bin"), rows * rb);
+        if (!ct.base) SKIP("could not write and map a table under %s", radtest::tmpdir().c_str());
+        if (!ct.cold) SKIP("this filesystem keeps a file's pages cached after POSIX_FADV_DONTNEED "
+                           "(tmpfs?), so a read ahead cannot be told from none");
+        const ColdRun r = cold_run(ct, rows, rb, ids.data(), n, 20000.0);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)1);
+        CHECK_EQ(r.beside, (int64_t)0);   /* cold: in front */
+        CHECK(g_cold_rows_in);
+        CHECK_EQ(r.pages, n);
+        CHECK_EQ(g_cold_other, (int64_t)0);
+    }
+    {
+        /* Warm, and the kernel returns at once: beside, and stopped and idle at the return. */
+        ColdTable ct(radtest::tmp_path("rowpf-e.bin"), rows * rb);
+        REQUIRE(ct.base && ct.cold);
+        warm(ct);
+        const ColdRun r = cold_run(ct, rows, rb, ids.data(), n, 0.0);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)1);
+        CHECK_EQ(r.beside, (int64_t)1);
+        CHECK(g_cold_rows_in);
+        CHECK(!r.busy_after);
+        CHECK(r.pages <= n);
+    }
+    {
+        /* The sample itself: every sampled row in -> true; the first sampled row's page out
+         * -> false; a cold table -> false. */
+        ColdTable ct(radtest::tmp_path("rowpf-f.bin"), rows * rb);
+        REQUIRE(ct.base && ct.cold);
+        RadTensor t[2]{};
+        t[0].data = ids.data(); t[0].dtype = RAD_I32; t[0].rank = 1; t[0].shape[0] = n; t[0].stride[0] = 1;
+        t[1].data = ct.base;
+        rad::RowPrefetch rp;
+        rp.n = 1; rp.opd[0] = 1; rp.row_bytes[0] = rb; rp.rows = rows;
+        CHECK(!rad::row_pages_resident(rp, t[0], n, t));
+        warm(ct);
+        CHECK(rad::row_pages_resident(rp, t[0], n, t));
+        const int64_t first = ids[(size_t)(n / (2 * rad::kRowAheadSample))];
+        ::madvise(ct.base + first * rb, 4096, MADV_DONTNEED);
+        ::posix_fadvise(ct.fd, first * rb, 4096, POSIX_FADV_DONTNEED);
+        CHECK(!rad::row_pages_resident(rp, t[0], n, t));
+    }
+}
+
+/* libavx's embed_lookup_q reads a file-backed table itself (direct reads, its own row cache) and
+ * says so; its plain embed_lookup reads through the mapping and does not. */
+TEST(the_loader_reads_which_kernels_fetch_their_own_rows) {
+    rad::Registry reg;
+    const std::string lib = radiance_home() + "/kernels/libavx.so";
+    if (radiance_home().empty() || reg.load_plugin(lib, 0) < 0) ARTIFACT_MISSING(lib);
+    int q = 0, plain = 0;
+    for (const rad::KernelRow& r : reg.rows()) {
+        if (r.plugin != "libavx" && r.plugin.find("avx") == std::string::npos) continue;
+        if (std::string(r.info->op) == "embed_lookup_q") { ++q; CHECK(r.fetches_rows); }
+        if (std::string(r.info->op) == "embed_lookup") { ++plain; CHECK(!r.fetches_rows); }
+    }
+    CHECK(q > 0);
+    CHECK(plain > 0);
 }
 
 RAD_TEST_MAIN_HOST_KARGS()

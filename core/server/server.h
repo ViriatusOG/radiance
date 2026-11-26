@@ -203,7 +203,8 @@ struct ServerOptions {
      * left out; `gen_lora_names` is GET /v1/loras. Unset without adapters. */
     std::function<int(const std::vector<std::pair<std::string, double>>&, int32_t*,
                       std::shared_ptr<void>*, std::string*, std::string*)> gen_lora_acquire;
-    std::function<std::vector<std::string>()>                                gen_lora_names;
+    std::function<std::vector<std::string>()> gen_lora_names;
+    std::function<int(const std::vector<std::pair<std::string, double>>&, std::string*)> gen_lora_validate;
 
     std::string api_key;
     /* Extra Host authorities the keyless "loopback only" guards accept (--allow-host): names an
@@ -255,11 +256,17 @@ public:
     /* The reasoning efforts the chat template takes, found by parsing a one-message chat with each
      * known word (low, medium, high, xhigh, max), with no deployment defaults. If the template
      * also takes a nonsense word it takes any word, and the result is empty. Used to refuse words
-     * outside the set and for /server_info; called once, before run(). */
+     * outside the set and for /server_info; called once, before run(). Also settles how "none"
+     * and "minimal" reach this template (probe_off_efforts). */
     std::vector<std::string> probe_reasoning_efforts();
     /* The effort the template applies to a request that names none, found by the probe above as
      * the one whose render is the same; "" when none matches or the probe found no set. */
     const std::string& template_default_effort() const { return template_default_effort_; }
+    /* Which of "none" and "minimal" the probe above found the template takes as levels of its
+     * own (OaiLimits::template_off_efforts); empty when they turn thinking off. */
+    const std::vector<std::string>& template_off_efforts() const {
+        return lim_.template_off_efforts;
+    }
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
@@ -339,6 +346,7 @@ private:
     void realtime_run(RealtimeSession& s, WsConn& ws);
     bool realtime_loop(RealtimeSession& s, WsConn& ws);
     HttpResponse handle_models(const HttpRequest& req);
+    HttpResponse handle_validate_loras(const HttpRequest& req);
     HttpResponse handle_loras(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
     std::optional<HttpResponse> refuse_text(const std::string& peer,
@@ -431,6 +439,8 @@ private:
 
     HttpResponse error_response(const ApiError& e, const std::string& peer,
                                 ApiShape shape = ApiShape::OpenAI);
+    /* The 499 answer for a request whose client hung up, counted in the HTTP metrics. */
+    HttpResponse client_closed();
     /* Request log: one info line at admission and one from record() at the end (who asked what,
      * how long, how it ended). The debug level adds the opening of the last user message. */
     void log_admitted(const OaiRequest& r) const;

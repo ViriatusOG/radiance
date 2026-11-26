@@ -4,6 +4,8 @@
 #include "engine_priv.h"
 #include "../core/fleet/fleet.cpp"
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 
 namespace rad {
 struct EngineMemoryTestAccess {
@@ -24,10 +26,9 @@ struct FleetMemoryTestAccess {
         const std::string original = "models:\n  primary:\n    model: /m/primary.rad\n  secondary:\n    model: /m/secondary.rad\n";
         FleetConfig config;
         REQUIRE_EQ(parse(original, "guard.yaml", &config), RAD_OK);
-        char path[] = "/tmp/radiance-fleet-guard-XXXXXX";
-        const int fd = mkstemp(path);
-        REQUIRE(fd >= 0);
-        close(fd);
+        const std::string path = radtest::tmp_path("fleet-guard.yaml");
+        std::ofstream(path).close();   /* the file a reload reads: empty until a step writes it */
+        REQUIRE(std::filesystem::exists(path));
         config.path = path;
         Fleet fleet(config);
         for (const auto& entry : config.models)
@@ -46,9 +47,9 @@ struct FleetMemoryTestAccess {
         REQUIRE_EQ(rad_stream_gate(stream, &gate), RAD_OK);
         /* Open the gate even if a later check fails: destructors must not see the injected fault. */
         struct Cleanup {
-            void*& gate; const char* path;
-            ~Cleanup() { if (gate) rad_gate_open(gate); std::remove(path); }
-        } cleanup{gate, path};
+            void*& gate;
+            ~Cleanup() { if (gate) rad_gate_open(gate); }
+        } cleanup{gate};
         CHECK_EQ(before->prepare_unload(), RAD_E_STATE);
         CHECK(!fleet.unload(*model, 0, "test refused unload"));
         CHECK(!fleet.take_from(*model, {}, "test refused eviction"));

@@ -18,11 +18,13 @@ endif()
 
 file(GLOB LQ_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 
-# Trellis GPTQ on the card (lq_gpu.h) where radiance has a device build; the host-only build answers
-# --gpus with RAD_E_UNSUPPORTED (lq_gpu.cpp).
+# GPTQ over a trellis grid and the GGML IQ2/IQ3 pack on the card (lq_gpu.h and lq_ggml_gpu.h)
+# where radiance has a device build; the host-only build answers --gpus with RAD_E_UNSUPPORTED
+# (lq_gpu.cpp) and lq_ggml.cpp keeps its host loop.
 set(LQ_HIP_SRC "")
 if(RAD_HIP_FOUND)
-  set(LQ_HIP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/lq_tcq_gpu.hip)
+  set(LQ_HIP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/lq_tcq_gpu.hip
+                 ${CMAKE_CURRENT_SOURCE_DIR}/lq_ggml_gpu.hip)
 endif()
 
 rad_add_plugin(libquant quantizers SOURCES ${LQ_SRC} HIP_SOURCES ${LQ_HIP_SRC}
@@ -32,8 +34,9 @@ if(LQ_HIP_SRC)
 endif()
 
 # -ffp-contract=off: quantiser output is a stored file, so two builds must produce the same bytes. A
-# compiler-chosen FMA can move a value on a rounding boundary into the next code.
-target_compile_options(libquant PRIVATE -ffp-contract=off)
+# compiler-chosen FMA can move a value on a rounding boundary into the next code. The GGML card
+# kernel also needs no fast-math: it must use the host's sqrt/divide/bit rounds.
+target_compile_options(libquant PRIVATE -ffp-contract=off -fno-fast-math)
 
 # Optional OpenMP over rows (GPTQ and round-to-nearest over large tables are long serial loops).
 # Rows are independent, so the result does not depend on the thread count.

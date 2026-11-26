@@ -53,27 +53,12 @@ RadTensor tensor(void* p, uint32_t dt, std::vector<int64_t> shape) {
     return t;
 }
 
-uint16_t bf16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    x += 0x7fff + ((x >> 16) & 1);
-    return (uint16_t)(x >> 16);
-}
-float fbf16(uint16_t b) {
-    uint32_t x = (uint32_t)b << 16;
-    float f;
-    std::memcpy(&f, &x, 4);
-    return f;
-}
+uint16_t bf16(float f) { return rad_f32_to_bf16(f); }
+float fbf16(uint16_t b) { return rad_bf16_to_f32(b); }
 std::vector<uint16_t> to_bf16(const std::vector<float>& v) {
     std::vector<uint16_t> b(v.size());
     for (size_t i = 0; i < v.size(); ++i) b[i] = bf16(v[i]);
     return b;
-}
-std::vector<float> from_bf16(const std::vector<uint16_t>& b) {
-    std::vector<float> v(b.size());
-    for (size_t i = 0; i < b.size(); ++i) v[i] = fbf16(b[i]);
-    return v;
 }
 /* A deterministic pattern in [-1, 1], varied by `seed`, rounded to bf16 as the kernel reads it, so
  * the reference and the kernel see the same inputs. */

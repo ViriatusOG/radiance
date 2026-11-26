@@ -737,7 +737,8 @@ AVX_BF16_TARGET static inline void qk_rows(const uint16_t* const* qr, const uint
     #pragma GCC unroll 8
     for (int i = 0; i < MB_; ++i)
         #pragma GCC unroll 4
-        for (int v = 0; v < 4; ++v) _mm512_storeu_ps(S + i * ldS + 16 * v, _mm512_mul_ps(acc[i][v], vs));
+        for (int v = 0; v < 4; ++v)
+            _mm512_storeu_ps(S + i * ldS + 16 * v, _mm512_mul_ps(acc[i][v], vs));
 }
 
 /* acc[r][c0 .. c0+63] += P[r] . V for MB_ rows, in bf16 pairs: pp[r * 32 + k2] holds row r's
@@ -891,7 +892,8 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
                 float* sr = S + r * KT;
                 const float tmax = _mm512_reduce_max_ps(
                     _mm512_max_ps(_mm512_max_ps(_mm512_loadu_ps(sr), _mm512_loadu_ps(sr + 16)),
-                                  _mm512_max_ps(_mm512_loadu_ps(sr + 32), _mm512_loadu_ps(sr + 48))));
+                                  _mm512_max_ps(_mm512_loadu_ps(sr + 32),
+                                                _mm512_loadu_ps(sr + 48))));
                 if (tmax == -INFINITY) {
                     for (int64_t j = 0; j < KT; ++j) sr[j] = 0.0f;
                     continue;
@@ -924,8 +926,8 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
                 /* Interleave two key rows, 32 columns per step: the first output holds
                  * (k0[d], k1[d]) for d = 0..15, the second for d = 16..31. */
                 const __m512i ilo = _mm512_set_epi16(47, 15, 46, 14, 45, 13, 44, 12, 43, 11, 42, 10,
-                                                     41, 9, 40, 8, 39, 7, 38, 6, 37, 5, 36, 4, 35, 3,
-                                                     34, 2, 33, 1, 32, 0);
+                                                     41, 9, 40, 8, 39, 7, 38, 6, 37, 5, 36, 4,
+                                                     35, 3, 34, 2, 33, 1, 32, 0);
                 const __m512i ihi = _mm512_set_epi16(63, 31, 62, 30, 61, 29, 60, 28, 59, 27, 58, 26,
                                                      57, 25, 56, 24, 55, 23, 54, 22, 53, 21, 52, 20,
                                                      51, 19, 50, 18, 49, 17, 48, 16);
@@ -937,7 +939,8 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
                         const __m512i a = _mm512_loadu_si512((const void*)(v0 + d));
                         const __m512i bb = two ? _mm512_loadu_si512((const void*)(v0 + v_rs + d))
                                                : _mm512_setzero_si512();
-                        _mm512_storeu_si512((void*)(dst + d), _mm512_permutex2var_epi16(a, ilo, bb));
+                        _mm512_storeu_si512((void*)(dst + d),
+                                            _mm512_permutex2var_epi16(a, ilo, bb));
                         _mm512_storeu_si512((void*)(dst + d + 16),
                                             _mm512_permutex2var_epi16(a, ihi, bb));
                     }
@@ -947,7 +950,8 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
             for (int64_t r = 0; r < R; ++r) p_to_bf16_pairs(S + r * KT, ppack + r * 32);
             for (int64_t c0 = 0; c0 < D; c0 += 64) {
                 int64_t r = 0;
-                for (; r + 6 <= R; r += 6) pv_rows<6>(acc + r * D, D, ppack + r * 32, vpack, K2, c0);
+                for (; r + 6 <= R; r += 6)
+                    pv_rows<6>(acc + r * D, D, ppack + r * 32, vpack, K2, c0);
                 for (; r < R; ++r) pv_rows<1>(acc + r * D, D, ppack + r * 32, vpack, K2, c0);
             }
         }
@@ -990,8 +994,8 @@ AVX_KERNEL(attn_paged_tree) {
  *
  * Same online softmax as the paged form; K and V rows are consecutive in memory, so the prefetcher
  * sees one stream. */
-AVX_KERNEL(attn_dense) {
-    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+static int attn_dense_body(const RadArgs* a, bool reference) {
+    if (!rad_args_have(a, reference ? 7 : 5)) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[3], *o = &a->t[4];
 
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
@@ -1023,6 +1027,29 @@ AVX_KERNEL(attn_dense) {
     if (numel(k) < total_q * kv_heads * head_dim) return RAD_E_SHAPE;
     if (numel(v) < total_q * kv_heads * head_dim) return RAD_E_SHAPE;
 
+    /* attn_dense_ref, libref's checks: `mode_cu` [3 S + 1] i32 holds each sequence's text,
+     * reference and target starts and the last sequence's end; `ref_log_bias` [S] f32 is added to
+     * a target query's score against that sequence's reference keys, finite in [-16, 16], or
+     * negative infinity, which instead keeps the reference rows to their own keys. */
+    const RadTensor* modes = reference ? &a->t[5] : nullptr;
+    const RadTensor* biases = reference ? &a->t[6] : nullptr;
+    if (reference) {
+        if (modes->dtype != RAD_I32 || modes->rank != 1 || numel(modes) != 3 * n_seq + 1 ||
+            !biases->data || biases->dtype != RAD_F32 || biases->rank != 1 ||
+            numel(biases) != n_seq || causal || cdiv != 1)
+            return RAD_E_SHAPE;
+        for (int64_t s = 0; s < n_seq; ++s) {
+            const int64_t begin = ldi(cu, offlin(cu, s)), end = ldi(cu, offlin(cu, s + 1));
+            const int64_t first = ldi(modes, offlin(modes, 3 * s + 1));
+            const int64_t last = ldi(modes, offlin(modes, 3 * s + 2));
+            const float bias = ldt(biases, s * biases->stride[0]);
+            if (begin < 0 || begin >= end || end > total_q || first < begin || first > last ||
+                last > end || (bias != -INFINITY &&
+                               (!std::isfinite(bias) || std::fabs(bias) > 16.0f)))
+                return RAD_E_SHAPE;
+        }
+    }
+
     /* All four read as libref does at any rank; a rank-2 operand is a column slice with its own
      * row stride (avx_common.h: row_stride). */
     const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
@@ -1040,7 +1067,9 @@ AVX_KERNEL(attn_dense) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
 #if AVX_LEVEL == 3
-    if (attn_dense_bf16(q, k, v, cu, o, head_dim, gqa, kv_heads, causal, window, wright, block,
+    /* The bf16 tile path has no score bias; the reference form takes the portable loop below. */
+    if (!reference &&
+        attn_dense_bf16(q, k, v, cu, o, head_dim, gqa, kv_heads, causal, window, wright, block,
                         cdiv, scale, q_rs,
                         q_hs, q_ds, k_rs, k_hs, k_ds, v_rs, v_hs, v_ds, o_rs, o_hs, o_ds))
         return RAD_OK;
@@ -1059,6 +1088,11 @@ AVX_KERNEL(attn_dense) {
         float* sbuf = frame + 4 * head_dim;
         int64_t vbase[AVX_KV_TILE];
 
+        const float bias = reference ? ldt(biases, s * biases->stride[0]) : 0.0f;
+        const bool isolate = bias == -INFINITY;
+        const int64_t ref_begin = reference ? ldi(modes, offlin(modes, 3 * s + 1)) : b1;
+        const int64_t ref_end = reference ? ldi(modes, offlin(modes, 3 * s + 2)) : b1;
+
         for (int64_t i = b0; i < b1; ++i) {
             const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
             int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
@@ -1071,6 +1105,13 @@ AVX_KERNEL(attn_dense) {
                 jbeg = std::max<int64_t>(jbeg, blk);
                 jend = std::min<int64_t>(jend, blk + block);
             }
+            /* A reference row under isolation sees only its own sequence's reference keys; a
+             * target row (at or after ref_end) adds the bias to its scores against them. */
+            if (isolate && i >= ref_begin && i < ref_end) {
+                jbeg = ref_begin;
+                jend = ref_end;
+            }
+            const bool biased = !isolate && bias != 0.0f && i >= ref_end;
             const float* qv = head_f32(q, qb, q_ds, head_dim, 1.0f, qbuf);
             for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
             float m = -INFINITY, l = 0.0f;
@@ -1110,7 +1151,8 @@ AVX_KERNEL(attn_dense) {
 
             for (int64_t j = jbeg; j < jend; ++j) {
                 const float* kvr = head_f32(k, j * k_rs + kh * k_hs, k_ds, head_dim, 1.0f, kbuf);
-                sbuf[ntile] = dotf(qv, kvr, head_dim) * scale;
+                sbuf[ntile] = dotf(qv, kvr, head_dim) * scale +
+                              (biased && j >= ref_begin && j < ref_end ? bias : 0.0f);
                 vbase[ntile] = j * v_rs + kh * v_hs;
                 if (++ntile == AVX_KV_TILE) flush();
             }
@@ -1135,6 +1177,12 @@ AVX_KERNEL(attn_dense) {
     }
     return RAD_OK;
 }
+
+AVX_KERNEL(attn_dense) { return attn_dense_body(a, false); }
+
+/* attn_dense with a logit bias from a sequence's target queries to its reference keys (Krea 2's
+ * edits), libref's attn_dense_ref: non-causal, cu_div 1. */
+AVX_KERNEL(attn_dense_ref) { return attn_dense_body(a, true); }
 
 /* ------------------------------------------------------------------ attn_local_rel */
 /* libref's local attention with a relative-position term (Gemma 4's audio). A query sees at most
@@ -1251,16 +1299,19 @@ static void kv_scatter(const RadTensor* k, const RadTensor* v, const RadTensor* 
         for (int64_t h = 0; h < kv_heads; ++h) {
             const int64_t cb = blk * kvv.sb + h * kvv.sh + off * kvv.so;
             if constexpr (I8) {
-                for (int64_t d = 0; d < head_dim; ++d) buf[d] = ldt(k, t * k_rs + h * k_hs + d * k_ds);
+                for (int64_t d = 0; d < head_dim; ++d)
+                    buf[d] = ldt(k, t * k_rs + h * k_hs + d * k_ds);
                 kv_i8_put(kv->data, cb, head_dim, 0, buf);
-                for (int64_t d = 0; d < head_dim; ++d) buf[d] = ldt(v, t * v_rs + h * v_hs + d * v_ds);
+                for (int64_t d = 0; d < head_dim; ++d)
+                    buf[d] = ldt(v, t * v_rs + h * v_hs + d * v_ds);
                 kv_i8_put(kv->data, cb, head_dim, 1, buf);
                 continue;
             }
             /* A whole head at a time through the row converter; strided operands go per
              * element. */
             if (k_ds == 1 && kvv.sd == 1) {
-                row_to_f32(k->dtype, byte_at(k->data, k->dtype, t * k_rs + h * k_hs), buf, head_dim);
+                row_to_f32(k->dtype, byte_at(k->data, k->dtype, t * k_rs + h * k_hs), buf,
+                           head_dim);
                 if constexpr (SCALED)
                     for (int64_t d = 0; d < head_dim; ++d) buf[d] *= ks;
                 out_row(kv, cb, head_dim, buf);
@@ -1271,7 +1322,8 @@ static void kv_scatter(const RadTensor* k, const RadTensor* v, const RadTensor* 
                 }
             }
             if (v_ds == 1 && kvv.sd == 1) {
-                row_to_f32(v->dtype, byte_at(v->data, v->dtype, t * v_rs + h * v_hs), buf, head_dim);
+                row_to_f32(v->dtype, byte_at(v->data, v->dtype, t * v_rs + h * v_hs), buf,
+                           head_dim);
                 if constexpr (SCALED)
                     for (int64_t d = 0; d < head_dim; ++d) buf[d] *= vs;
                 out_row(kv, cb + head_dim, head_dim, buf);
@@ -1922,6 +1974,54 @@ AVX_KERNEL(rope_table) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ rope_rows */
+/* rope from a rope_table plane over columns [off, off + rot) of each head_dim-wide head of x, in
+ * place (libref's rope_rows): gptj pairs adjacent columns, neox i with i + rot/2; (a, b)(c + is)
+ * in f32, rounded once; `inverse` conjugates. A negative or out-of-table position leaves its row.
+ * The row is widened once, every head rotated, then narrowed back. */
+AVX_KERNEL(rope_rows) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
+    const int64_t nh = p_int(a, "n_head", 0), hd = p_int(a, "head_dim", 0);
+    const int64_t rot = p_int(a, "rot", 0), off = p_int(a, "off", -1);
+    const int64_t inv = p_int(a, "inverse", -1);
+    const char* mode = p_str(a, "mode", "");
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return RAD_E_UNSUPPORTED;
+    if (nh < 1 || hd < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd ||
+        (inv != 0 && inv != 1))
+        return RAD_E_SHAPE;
+    if (!x.data || !cs.data || !pos.data || x.rank != 2 || x.shape[0] < 1 ||
+        x.shape[1] != nh * hd || cs.rank != 2 || cs.shape[1] != rot || numel(&pos) != x.shape[0])
+        return RAD_E_SHAPE;
+    const int64_t M = x.shape[0], rows = cs.shape[0], half = rot / 2, n = nh * hd;
+    const float sign = inv ? -1.0f : 1.0f;
+    AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t p = ldi(&pos, offlin(&pos, m));
+        if (p < 0 || p >= rows) continue;
+        float* buf = scratch_f32((size_t)(n + rot));
+        float* xv = buf;
+        float* cv = buf + n;
+        const int64_t xb = rowoff(&x, m, n);
+        const float* in = in_row(&x, xb, n, xv);
+        if (in != xv) std::memcpy(xv, in, (size_t)n * sizeof(float));
+        const float* c = in_row(&cs, rowoff(&cs, p, rot), rot, cv);
+        for (int64_t h = 0; h < nh; ++h) {
+            float* hx = xv + h * hd + off;
+            for (int64_t i = 0; i < half; ++i) {
+                const int64_t ia = gptj ? 2 * i : i, ib = gptj ? ia + 1 : ia + half;
+                const float co = c[i], si = sign * c[half + i];
+                const float va = hx[ia], vb = hx[ib];
+                hx[ia] = va * co - vb * si;
+                hx[ib] = va * si + vb * co;
+            }
+        }
+        out_row(&x, xb, n, xv);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_block_key */
 /* QSA's compressed key (docs/OPS.md): a block's `ratio` rows of k averaged in f32 and rounded to
  * k's dtype, RMS-normed with gain (wadd + w), then NeoX-rotated over `rotary_dim` at the block's
@@ -2045,7 +2145,8 @@ AVX_KERNEL(attn_cross) {
     if (n_seq <= 0 || numel(cuk) < n_seq + 1) return RAD_E_SHAPE;
     const int64_t total_q = numel(q) / (q_heads * head_dim);
     const int64_t total_k = numel(k) / (kv_heads * head_dim);
-    if (total_q <= 0 || ldi(cu, offlin(cu, n_seq)) <= ldi(cu, offlin(cu, 0))) return RAD_E_SHAPE;   /* zero rows */
+    if (total_q <= 0 || ldi(cu, offlin(cu, n_seq)) <= ldi(cu, offlin(cu, 0)))
+        return RAD_E_SHAPE;   /* zero rows */
     if (numel(o) < total_q * q_heads * head_dim) return RAD_E_SHAPE;
     for (int64_t s = 0; s < n_seq; ++s)
         if (ldi(cu, offlin(cu, s + 1)) < ldi(cu, offlin(cu, s)) ||
@@ -2143,9 +2244,12 @@ AVX_KERNEL(attn_na3d) {
         return RAD_E_SHAPE;
     const int64_t nt = std::min(kt, T), nh = std::min(kh, H), nw = std::min(kw, W);
     const int64_t q_ds = q->stride[1], q_rs = row_stride(q, heads * head_dim);
-    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1, k_rs = row_stride(k, heads * head_dim);
-    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1, v_rs = row_stride(v, heads * head_dim);
-    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1, o_rs = row_stride(o, heads * head_dim);
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1,
+        k_rs = row_stride(k, heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1,
+        v_rs = row_stride(v, heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1,
+        o_rs = row_stride(o, heads * head_dim);
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     auto start = [](int64_t c, int64_t n, int64_t L) {
         return std::min(std::max<int64_t>(c - n / 2, 0), L - n);
@@ -2190,7 +2294,8 @@ AVX_KERNEL(attn_na3d) {
             for (int64_t b1 = i0; b1 < i0 + nh; ++b1)
                 for (int64_t c1 = j0; c1 < j0 + nw; ++c1) {
                     const int64_t key = (a1 * H + b1) * W + c1;
-                    const float* kr = head_f32(k, key * k_rs + h * head_dim * k_ds, k_ds, head_dim, 1.0f, kbuf);
+                    const float* kr = head_f32(k, key * k_rs + h * head_dim * k_ds, k_ds, head_dim,
+                                               1.0f, kbuf);
                     sbuf[ntile] = dotf(qv, kr, head_dim) * scale;
                     vbase[ntile] = key * v_rs + h * head_dim * v_ds;
                     if (++ntile == AVX_KV_TILE) flush();

@@ -3,7 +3,6 @@
 #include "text/tokenizer_grapheme.h"
 #include "rad_internal.h"
 
-#include <algorithm>
 #include <cstring>
 
 namespace rad {

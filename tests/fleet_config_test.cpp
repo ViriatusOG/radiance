@@ -45,7 +45,7 @@ std::string yaml_of(std::vector<std::string> args) {
 TEST(one_model_is_an_engine_config) {
     fleet::FleetConfig fc;
     CHECK_EQ(yload("models:\n  qwen:\n    model: /m/q.rad\n    tp: 2\n    max-num-seqs: 8\n", &fc), RAD_OK);
-    CHECK_EQ(fc.models.size(), 1u);
+    REQUIRE_EQ(fc.models.size(), 1u);
     const fleet::ModelEntry& m = fc.models[0];
     CHECK_EQ(m.name, "qwen");
     CHECK_EQ(m.cfg.model, "/m/q.rad");
@@ -133,7 +133,7 @@ TEST(structured_values_are_spelled_for_their_flag) {
     CHECK(!c.deterministic);
     CHECK_EQ(c.chat_template_kwargs.at("enable_thinking"), "false");
     CHECK_EQ(c.chat_template_kwargs.at("style"), "\"terse\"");
-    CHECK_EQ(c.lora.adapters.size(), 2u);
+    REQUIRE_EQ(c.lora.adapters.size(), 2u);
     CHECK_EQ(c.lora.adapters[0].first, "sql");
     CHECK_EQ(c.reasoning_effort_map.at("minimal"), "low");
     CHECK(c.sample_temp > 0.69f && c.sample_temp < 0.71f);
@@ -241,6 +241,11 @@ TEST(a_model_loads_where_it_displaces_least) {
     CHECK(fleet::plan_room(cards, res, 1, 5 * G, 0, {}, {}, nullptr, &p, &why));
     CHECK(p.cards == std::vector<int>({ 0 }) && p.victims == std::vector<size_t>({ 7, 8 }));
     CHECK(!fleet::plan_room(cards, res, 1, 7 * G, 0, {}, {}, nullptr, &p, &why));
+    /* A unit is forced out when any member is, not only the one that names it. */
+    cards = { { 0, 30 * G }, { 1, 30 * G } };
+    CHECK(fleet::plan_room(cards, res, 1, G, 0, { 8 }, {}, nullptr, &p, &why));
+    CHECK(p.victims == std::vector<size_t>({ 7, 8 }));
+    cards = { { 0, 0 }, { 1, 0 } };
     /* Too few cards. */
     CHECK(!fleet::plan_room(cards, {}, 3, G, 0, {}, {}, nullptr, &p, &why));
     /* A returning model of two ranks, all out on card 1 and mostly still on card 0: card 0 needs
@@ -313,9 +318,9 @@ TEST(a_model_names_the_cards_it_may_use) {
     fleet::FleetConfig fc;
     CHECK_EQ(yload("models:\n  a: {model: /m/a.rad, cards: [1]}\n  b: {model: /m/b.rad, tp: 2, cards: [1, 0]}\n"
                   "  c: {model: /m/c.rad}\n  d: {model: /m/d.rad, cards: all}\n", &fc), RAD_OK);
-    CHECK_EQ(fc.models[0].cards.size(), 1u);
+    REQUIRE_EQ(fc.models[0].cards.size(), 1u);
     CHECK_EQ(fc.models[0].cards[0], 1);
-    CHECK_EQ(fc.models[1].cards.size(), 2u);
+    REQUIRE_EQ(fc.models[1].cards.size(), 2u);
     CHECK_EQ(fc.models[1].cards[0], 1);
     CHECK(fc.models[2].cards.empty());
     CHECK(fc.models[3].cards.empty());
@@ -344,7 +349,7 @@ TEST(scheduler_cards_and_groups) {
     CHECK_EQ(fc.keepalive_ms, 5000);
     CHECK_EQ(fc.stuck_exit_ms, 60000);   /* a minute unless the file says otherwise */
     CHECK(fc.warm_up);   /* on unless the file turns it off */
-    CHECK_EQ(fc.groups.size(), 2u);
+    REQUIRE_EQ(fc.groups.size(), 2u);
     CHECK(fc.groups[1].kind == fleet::Group::Kind::Exclusive);
     fleet::FleetConfig off;
     CHECK_EQ(yload("scheduler: {stuck-exit: 0}\nmodels:\n  a: {model: /m/a.rad}\n", &off), RAD_OK);
@@ -448,7 +453,7 @@ TEST(command_line_becomes_yaml) {
     const std::string y = yaml_of(args);
     fleet::FleetConfig fc;
     CHECK_EQ(yload(y, &fc), RAD_OK);
-    CHECK_EQ(fc.models.size(), 1u);
+    REQUIRE_EQ(fc.models.size(), 1u);
     const fleet::ModelEntry& m = fc.models[0];
     CHECK_EQ(m.name, "q38-27b");
     CHECK_EQ(m.cfg.model, "/models/q38-27b.rad");

@@ -58,7 +58,6 @@ const std::string& calib_dir() {
         TempDir t{ "rad_quant_algo" };
         std::string d, gram;
         Dir() {
-            if (t.path.empty()) return;
             d = t.path;
             gram = d + "/gram.r0.blk.2.attn_q.bin";
             write_gram(gram, kC, kT, H());
@@ -203,7 +202,6 @@ TEST(a_hessian_is_brought_into_the_domain_its_grid_quantises_in) {
         for (int64_t c = 0; c < kC; ++c) rot[(size_t)(r * kC + c)] = (float)t[(size_t)(c * kC + r)];
 
     const TempDir td("rad_quant_dom");
-    REQUIRE(!td.path.empty());
     const std::string dm = td.path;
     REQUIRE(write_gram(dm + "/gram.r0.blk.2.attn_q.bin", kC, kT, rot, 128));
 
@@ -242,7 +240,6 @@ TEST(an_expert_reads_its_own_hessian_before_its_layers) {
             own[(size_t)(i * kC + j)] = pool[(size_t)((kC - 1 - i) * kC + (kC - 1 - j))];
 
     const TempDir t1("rad_quant_exp"), t2("rad_quant_own"), t3("rad_quant_pool");
-    REQUIRE(!t1.path.empty() && !t2.path.empty() && !t3.path.empty());
     const std::string both = t1.path, only_own = t2.path, only_pool = t3.path;
     const std::vector<std::string> files = {
         both + "/gram.r0.blk.2.ffn_down_exps.bin", both + "/gram.r1.blk.2.ffn_down_exps.7.bin",
@@ -278,7 +275,6 @@ TEST(a_vocabulary_heads_width_class_reads_the_heads_hessian) {
      * a weight named `output` does. With no Gram at all GPTQ rounds to nearest, which differs. */
     NEED_LIBQUANT();
     const TempDir t("rad_quant_vhead"), e("rad_quant_novhead");
-    REQUIRE(!t.path.empty() && !e.path.empty());
     REQUIRE(write_gram(t.path + "/gram.r0.output.bin", kC, kT, H()));
     auto run = [&](const std::string& dir, const char* name) -> Quantised {
         Opts o;
@@ -299,7 +295,6 @@ TEST(gptq_through_lapack_matches_the_loops) {
      * the loops and agree trivially. */
     NEED_LIBQUANT();
     const TempDir fast_dir("rad_quant_lapack"), loop_dir("rad_quant_loops");
-    REQUIRE(!fast_dir.path.empty() && !loop_dir.path.empty());
     REQUIRE(write_gram(fast_dir.path + "/gram.r0.blk.2.attn_q.bin", kC, kT, H()));
     REQUIRE(write_gram(loop_dir.path + "/gram.r0.blk.2.attn_q.bin", kC, kT, H()));
     auto run = [&](const std::string& dir) {
@@ -338,7 +333,6 @@ TEST(a_column_split_hessian_is_assembled_from_its_rank_parts) {
         }
     const TempDir tp("rad_quant_parts"), tw("rad_quant_whole"), ts("rad_quant_short"),
                   tn("rad_quant_none");
-    REQUIRE(!tp.path.empty() && !tw.path.empty() && !ts.path.empty() && !tn.path.empty());
     REQUIRE(write_gram(tp.path + "/gram.r0.blk.2.ffn_down.part.bin", k2, kT, p0));
     REQUIRE(write_gram(tp.path + "/gram.r1.blk.2.ffn_down.part.bin", k2, kT, p1));
     REQUIRE(write_gram(tw.path + "/gram.r0.blk.2.ffn_down.bin", kC, kT, whole));
@@ -457,7 +451,6 @@ TEST(an_unusable_calibration_file_is_reported_and_gptq_rounds_to_nearest) {
     };
     for (const Bad& b : cases) {
         const TempDir dir("rad_quant_badcalib");
-        REQUIRE(!dir.path.empty());
         REQUIRE(b.write(dir.path));
         Opts go;
         go.s("codes", "i4").i("group", 32).s("scale", "bf16").s("calib", dir.path.c_str());

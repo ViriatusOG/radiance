@@ -9,6 +9,10 @@ int gpu_set_devices(const int*, int n) { return n > 0 ? RAD_E_UNSUPPORTED : RAD_
 
 bool gpu_enabled() { return false; }
 
+int gpu_device_count() { return 0; }
+
+int gpu_device(int index) { (void)index; return -1; }
+
 int gptq_tcq_gpu(const Grid&, float*, int32_t*, Scales&, int64_t, int64_t, const float*, bool,
                  std::string* why) {
     *why = "this libquant was built without a device path";

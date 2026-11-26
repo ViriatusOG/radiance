@@ -117,10 +117,10 @@ struct KVGroupPlan {
                    ? (runtime_tokens + block_size - 1) / block_size : 0;
     }
     /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot), after any
-     * linear state. Set for a trunk group, and for a drafter's group on a model without linear
-     * state where the engine saves the snapshot behind the drafter's context pass
-     * (set_drafter_window_snapshot). Elsewhere a drafter's window is recomputed by draft refill,
-     * so its snapshot would not be read. */
+     * linear state. Set for a trunk group, and for a drafter's group where the engine asks
+     * (set_drafter_window_snapshot: a model without linear state, or --checkpoint-draft-window) and
+     * saves the snapshot behind the drafter's context pass. Elsewhere a drafter's window is
+     * recomputed by draft refill, so its snapshot would not be read. */
     bool        win_snap = false;
     bool        drafter = false;           /* a drafter's group (KVGroupInfo::drafter) */
 
@@ -229,10 +229,11 @@ public:
      * would never be addressed. carve() spends the pool it is given. */
     int     plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg);
     /* Whether a drafter's WINDOW group rides in the window snapshot too (KVGroupPlan::win_snap).
-     * The engine sets it, before plan_groups, where the drafter stores its context right behind
-     * the trunk step and the snapshot is saved after that (a block drafter on the card's driver);
-     * a snapshot taken before would hold the window without the step's rows. Kept across
-     * forget(). */
+     * The engine owns the policy (including a model with linear state under
+     * --checkpoint-draft-window) and sets it, before plan_groups, where the drafter stores its
+     * context right behind the trunk step and the snapshot is saved after that (a block drafter
+     * on the card's driver); a snapshot taken before would hold the window without the step's
+     * rows. Kept across forget(). */
     void    set_drafter_window_snapshot(bool on) { snap_drafter_ = on; }
     /* Some drafter group rides in the window snapshot (after plan_groups). */
     bool    drafter_window_snapshot() const {
@@ -677,7 +678,10 @@ public:
      * [lo, P/B) a restore will fill, before the ensure that extends it. Other WINDOW groups start
      * at the floor ensure sets. */
     bool has_window_snapshot() const { return window_ck_bytes_ > 0; }
-    bool window_rows(uint64_t seq, int64_t pos, std::vector<int32_t>* out) const;
+    /* `bad_drafter`, when given, is set true when the range is missing in a drafter's group (the
+     * first group that fails) and false otherwise. */
+    bool window_rows(uint64_t seq, int64_t pos, std::vector<int32_t>* out,
+                     bool* bad_drafter = nullptr) const;
     int  seed_window(uint64_t seq, int64_t pos);
     /* The floor and end (block indices) of the window a query at `pos` reads in a group. */
     static int64_t window_lo(const KVGroupPlan& p, int64_t pos) {

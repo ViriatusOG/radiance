@@ -209,8 +209,10 @@ static const RadOperandSpec oQsaTailStore[] = { { "k", RAD_OPD_IN, 0 },
                                                 { "cu", RAD_OPD_IN, 0 },
                                                 { "state", RAD_OPD_INOUT, 0 },
                                                 { "sidx", RAD_OPD_IN, 0 } };
+/* gate_cap and up_cap are SiTU's (docs/OPS.md); the kernel refuses them when set. */
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                                 P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
+                                                 P_STR("dtype"), P_STRO("act"), P_INTO("mode"),
+                                                 P_F64O("gate_cap"), P_F64O("up_cap") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
                                                    { "b", RAD_OPD_IN, 1 },
                                                    { "q", RAD_OPD_OUT, 0 },

@@ -42,6 +42,7 @@ struct Case {
     int rpitch = 0;               /* r as a column slice: this many extra columns per row */
     float sink_shift = 0.f;       /* added to every sink logit */
     int sink_every = 0;           /* a sink this far above the scores in every such row */
+    bool use_scratch = true;      /* bind scratch buffer when requested by scratch hook */
 };
 
 static bool close(const char* what, const std::vector<double>& ref, const std::vector<float>& got, double tol) {
@@ -214,6 +215,17 @@ static int run(const Case& c) {
     pf_("scale", scale);
 
     RadArgs a{}; a.t = t; a.n_t = 11; a.p = p.data(); a.n_p = (int)p.size();
+    std::vector<uint8_t> scratch;
+    if (c.use_scratch) {
+        const int64_t sb = r4d_rad_attn_rel_scratch(&a);
+        if (sb > 0) {
+            scratch.assign((size_t)sb + 32, 0);
+            uintptr_t addr = (uintptr_t)scratch.data();
+            addr = (addr + 15u) & ~(uintptr_t)15u;
+            a.scratch = (void*)addr;
+            a.scratch_bytes = sb;
+        }
+    }
     const int rc = c.i8 ? r4d_rad_attn_rel_h128_i8kv(&a, nullptr) : r4d_rad_attn_rel_h128_bf16kv(&a, nullptr);
     if (rc != RAD_OK) { std::printf("  %-44s launch returned %d\n", c.name, rc); return 1; }
 
@@ -235,6 +247,10 @@ int main() {
         { "int8 cache, gqa 3, window 0", { 2, 1 }, { 900, 500 }, 1, 3, 0, 1, 1024, true },
         { "r as a column slice of a wider row, gqa 3", { 3 }, { 700 }, 1, 3, 0, 1, 1024, false, true, 5 },
         { "sink far above the scores", { 1, 1 }, { 300, 40 }, 1, 2, 0, 1, 1024, false, true, 0, 0.f, 1 },
+        { "decode 1500 keys unsplit fallback", { 1 }, { 1500 }, 1, 3, 0, 1, 1024, false, true, 0, 0.f, 0, false },
+        { "wmma prefill 70 rows, gqa 3, bf16", { 70 }, { 200 }, 1, 3, 0, 1, 1024, false, false },
+        { "wmma prefill 70 rows, gqa 3, i8, w1024", { 70 }, { 200 }, 1, 3, 1024, 1, 1024, true, true },
+        { "wmma prefill 70 rows, sink far above", { 70 }, { 120 }, 1, 3, 0, 1, 64, false, false, 0, 0.f, 3 },
     };
     int fails = 0;
     for (const Case& c : cases) fails += run(c);

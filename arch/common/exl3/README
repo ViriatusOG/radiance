@@ -1,0 +1,8 @@
+Copied, unmodified apart from one include path, from radiance-exl3 in this tree (exl3/, Apache-2.0,
+Copyright 2026 Dylan Johnston; see exl3/LICENSE and exl3/NOTICE):
+  exl3_abi.h       exl3/include/exl3_abi.h      (op schemas, operand positions, interface version)
+  exl3_encoding.h  exl3/include/exl3_encoding.h (the canonical exl3 encoding; "../common/" dropped)
+  exl3_decode.h    exl3/common/exl3_decode.h    (declarations; the block uses the inline helpers only)
+rad_block_moe_q.h reads a layer's EXL3 encoding and issues the extension's whole-expert ops
+(moe_exl3_gate_up, moe_exl3_down) by their positions here. arch/common is installed on its own, so
+it carries copies; ctest's exl3_vendor_check fails when they drift from exl3/.

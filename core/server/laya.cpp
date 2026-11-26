@@ -22,11 +22,9 @@ namespace server {
 
 namespace {
 
-std::string replace_all(std::string s, const std::string& from, const std::string& to) {
-    if (from.empty()) return s;
-    for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size()))
-        s.replace(at, from.size(), to);
-    return s;
+ApiError too_many_options(const std::string& path) {
+    return err_bad(path + ".criteria",
+                   "at most " + std::to_string(RAD_LAYA_MAX_OPTIONS) + " options a question");
 }
 
 /* render_criterion: a string as it is, anything else as JSON text. */
@@ -79,6 +77,11 @@ int question(const std::string& path, const json& src, LayaQuestion* q, std::str
         if (!(crit.is_object() || crit.is_array()) || crit.empty()) {
             *err = err_bad(path + ".criteria", "must be a non-empty object of label to description, "
                                                "or a non-empty array of labels");
+            return RAD_E_INVAL;
+        }
+        /* Checked before the labels are compared pairwise, which is quadratic in their number. */
+        if (crit.size() > (size_t)RAD_LAYA_MAX_OPTIONS) {
+            *err = too_many_options(path);
             return RAD_E_INVAL;
         }
         if (crit.is_object()) {
@@ -138,8 +141,7 @@ int question(const std::string& path, const json& src, LayaQuestion* q, std::str
             return RAD_E_INVAL;
         }
         for (const auto& kv : crit.items()) {
-            std::string k = kv.key();
-            for (char& ch : k) ch = (char)std::tolower((unsigned char)ch);
+            const std::string k = ascii_lower(kv.key());
             if (k == "true") t = kv.value();
             else if (k == "false") f = kv.value();
             else {
@@ -185,10 +187,7 @@ int parse_laya_request(const std::string& body, const OaiDeps& d, const OaiLimit
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     if (!only_keys(b, { "model", "state", "questions", "images" }, "", err)) return RAD_E_INVAL;
-    if (b.contains("model") && (!b["model"].is_string() || b["model"] != model_id)) {
-        *err = err_bad("model", "must name the loaded model, " + model_id);
-        return RAD_E_INVAL;
-    }
+    if (!names_loaded_model(b, model_id, err)) return RAD_E_INVAL;
     if (!b.contains("state") || b["state"].is_null() ||
         (b["state"].is_string() && b["state"].get<std::string>().empty())) {
         *err = err_bad("state", "required: a non-empty string or any JSON value");
@@ -227,8 +226,7 @@ int parse_laya_request(const std::string& body, const OaiDeps& d, const OaiLimit
         RAD_TRY(question(path, kv.value(), &q, &ins, &opts, err));
         const int64_t n = (int64_t)opts.size();
         if (n > RAD_LAYA_MAX_OPTIONS) {
-            *err = err_bad(path + ".criteria", "at most " + std::to_string(RAD_LAYA_MAX_OPTIONS) +
-                                               " options a question");
+            *err = too_many_options(path);
             return RAD_E_INVAL;
         }
 

@@ -3,7 +3,7 @@
  *
  * This is arch/qwen35_fp8/qwen35_fp8.cpp built again, as qwen35moe_fp8 is: the same gated
  * attention, gated delta net, MLP, layer schedule, rope, vocabulary edges, drafters and vision
- * tower. A linear's weight encoding makes it int8 (arch/common/rad_fp8.h: LinearFP8):
+ * tower. A linear's weight encoding makes it int8 (arch/common/rad_linear.h: LinearQ):
  * `i8*bf16[1x128]/fwht128` is gemm_nt_q at i8a8h behind had_quant_act_i8g, each linear quantising
  * its own input from the bf16 plane its producer already writes. The places this build differs are
  * behind `#if QWEN35_W8A8` in that file.

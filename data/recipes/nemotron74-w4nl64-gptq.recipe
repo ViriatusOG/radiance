@@ -26,7 +26,7 @@ blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf1
 # The LiLiCorr drafter, when merged (`--draft-model <nemotron-3.5-bolt lilicorr>`): ModelOpt NVFP4
 # for fc, the backbone's MLPs and six of the correlator's linears, bf16 elsewhere (rad-convert
 # reads the NVFP4 under the drafter's prefix). The backbone's seven linears block fp8, as
-# rad_block_dflash2.h's DenseFP8 reads them (Gemma's DFlash2 recipe); NVFP4 to E4M3 with a scale a
+# rad_block_dflash2.h's DenseQ reads them (Gemma's DFlash2 recipe); NVFP4 to E4M3 with a scale a
 # 128 x 128 block loses less than the NVFP4 grid already did. The correlator's NVFP4 linears are
 # decoded to bf16 for its plain GEMMs; its other weights stay as shipped.
 dflash.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16

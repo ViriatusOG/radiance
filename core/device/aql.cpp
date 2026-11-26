@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <linux/kfd_ioctl.h>
 #include <time.h>
@@ -339,16 +340,23 @@ hsa_status_t collect_gpu(hsa_agent_t a, void* data) {
     return HSA_STATUS_SUCCESS;
 }
 
-hsa_status_t find_vram(hsa_amd_memory_pool_t p, void* data) {
+/* Whether pool `p` is a global pool the runtime may allocate from, of the given grain
+ * (HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED or _FINE_GRAINED). */
+bool allocatable_global_pool(hsa_amd_memory_pool_t p, uint32_t grain) {
     hsa_amd_segment_t seg;
     uint32_t flags = 0;
     bool alloc = false;
     hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &seg);
-    if (seg != HSA_AMD_SEGMENT_GLOBAL) return HSA_STATUS_SUCCESS;
+    if (seg != HSA_AMD_SEGMENT_GLOBAL) return false;
     hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags);
     hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED, &alloc);
+    return alloc && (flags & grain);
+}
+
+hsa_status_t find_vram(hsa_amd_memory_pool_t p, void* data) {
     Dev* d = static_cast<Dev*>(data);
-    if (alloc && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED) && !d->has_vram) {
+    if (!d->has_vram &&
+        allocatable_global_pool(p, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)) {
         d->vram = p;
         d->has_vram = true;
     }
@@ -356,14 +364,8 @@ hsa_status_t find_vram(hsa_amd_memory_pool_t p, void* data) {
 }
 
 hsa_status_t find_host_fine(hsa_amd_memory_pool_t p, void*) {
-    hsa_amd_segment_t seg;
-    uint32_t flags = 0;
-    bool alloc = false;
-    hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &seg);
-    if (seg != HSA_AMD_SEGMENT_GLOBAL) return HSA_STATUS_SUCCESS;
-    hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags);
-    hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED, &alloc);
-    if (alloc && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED) && !G().has_host_fine) {
+    if (!G().has_host_fine &&
+        allocatable_global_pool(p, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED)) {
         G().host_fine = p;
         G().has_host_fine = true;
     }
@@ -988,8 +990,8 @@ void stuck_watch() {
         const int64_t limit = rad::dev_stuck_exit_ms.load(std::memory_order_relaxed);
         /* The load phase is exempt (device.h): a verdict standing before the first engine
          * finished bringup is a slow load, not a hang, and killing on it trades a patient
-         * start for a crash loop. The dumps and the log line still fire -- an operator
-         * watching a stuck load sees the queue state exactly as before. */
+         * start for a crash loop. The dumps and the log line still fire, so an operator
+         * watching a stuck load sees the queue state. */
         if (limit > 0 && ms >= limit && rad::dev_engine_ready.load(std::memory_order_acquire)) {
             dump_queues("the device");
             fatal("the device has advanced nothing for %lld s (the queue dumps above name the "
@@ -1125,21 +1127,18 @@ inline int reserve(Stream* s, uint64_t* out) {
  *
  * An argument slot in VRAM is written through the BAR: the bytes sit in the processor's
  * write-combining buffers until a store fence, and behind the link in the card's host data path,
- * which hands them on to memory in its own time unless it is told to flush. Nothing orders that
- * against the doorbell. A kernel the card starts soon enough after its packet was announced
- * reads the slot as the launch a lap of the ring before left it: first its chain record, which
- * it obeys (an old target, so no wait) or does not accept (so it counts nothing and the chained
- * launch behind it waits for good), then, behind its wait, its arguments.
+ * which hands them on in its own time unless told to flush. Nothing orders that against the
+ * doorbell, so a kernel the card starts soon enough after its packet was announced reads the slot
+ * as the launch a lap of the ring before left it: first its chain record (an old target, so no
+ * wait; or not accepted, so the chained launch behind it waits for good), then its arguments.
  *
  * On an R9700 "soon enough" is a microsecond or two. The packet processor's acquire holds a
- * launch 0.9 us and an ordered launch waits for the kernel in front, which is all that keeps
- * such a launch from it; a chained launch whose packet goes without the acquire starts that much
- * sooner behind its doorbell. Runs of fourteen 256 KiB card-side copies issued one by one that
- * way: back to back, six runs in nine of 300 000 ended with a unit moved by another launch's
- * arguments; with the host quiet for 50 us behind each doorbell the queue stalled in its first
- * lap, four runs in four, on either card. With the flush below neither happened (fourteen runs
- * and four), nor did it with the acquire on the packets, with plain launches, or with a 2 us
- * pause in front of each doorbell.
+ * launch 0.9 us, which is all that keeps an ordered launch from it; a chained launch whose
+ * packet goes without the acquire starts that much sooner behind its doorbell. Runs of fourteen
+ * 256 KiB card-side copies issued one by one that way: back to back, six runs in nine of 300 000
+ * ended with a unit moved by another launch's arguments, and with the host quiet for 50 us
+ * behind each doorbell the queue stalled in its first lap, four runs in four. With the flush
+ * below neither happened, nor with the acquire on the packets or with plain launches.
  *
  * The register is the driver's (HSA_AMD_AGENT_INFO_HDP_FLUSH, the remapped page it gives a
  * process for this), and the store travels the link behind the slot's bytes and in front of the
@@ -1267,44 +1266,35 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced, bool* asked) {
 
 /* The acquire of a chained launch.
  *
- * A packet's acquire runs when the packet processor launches the kernel. A chained kernel that has
- * lost its barrier bit is launched ahead and reads nothing then: it reads behind the wait in its
- * prologue, once the launches in front have written, and acquires there itself. The packet's
- * acquire guards nothing it reads, and the packet processor launches nothing else while it runs
- * one. Measured on an R9700, a chain of small dependent kernels issued behind a gate: 2.1 us a
- * launch with the agent-scope acquire, 1.2 us without (system scope costs what agent scope does;
- * the same hand-over inside one persistent kernel, with no launch between, 0.3 to 0.6 us). In a
- * pass that is time on the path only where a dependent launch reaches the card after the kernel
- * it waits for has ended: ~65 of a Qwen3.8-Flash-Next verify pass's 664 dependent launches, the
- * delta net's update behind its two overlapped launches first among them.
+ * A packet's acquire runs when the packet processor launches the kernel, and it launches nothing
+ * else meanwhile. A chained kernel that has lost its barrier bit is launched ahead and reads
+ * nothing then: it reads behind the wait in its prologue, and acquires there itself. Its packet's
+ * acquire therefore guards nothing it reads and costs launch time: on an R9700 a chain of small
+ * dependent kernels takes 2.1 us a launch with the agent-scope acquire, 1.2 us without (system
+ * scope costs the same as agent scope). That is time on the path only where a dependent launch
+ * reaches the card after the kernel it waits for has ended.
  *
- * The acquire did one thing by the way, for every kernel on the card: it emptied the scalar data
- * cache. No fence a compiler puts in a kernel does (an agent-scope acquire is a global_inv: the
- * vector caches), and a load whose address every lane shares is often a scalar one: a row's
- * scale, a routing count, the activation a head reads. A chained form that reads such a value
- * where the launch in front wrote it finds what an earlier launch read from that address, unless
- * a later packet's acquire happened to fall in between. With an acquire on every packet it nearly
- * always had (one launch in 1800 read stale in a probe of 1024-block readers); without, 1797 in
- * 1800 did, and the model's text changed. So the acquire goes only where every chained form the
- * engine can launch empties that cache itself behind its wait (RadKernelChainFn saying 2,
- * rad_dev_chain_unfenced; `s_dcache_inv` in r4d_chain.h and chain_kernel.h), which also closes
- * the window the fenced packets leave.
+ * The acquire also emptied the scalar data cache for every kernel on the card, which no
+ * compiler-placed fence does (an agent-scope acquire is a global_inv, the vector caches). A load
+ * whose address every lane shares is often a scalar one (a row's scale, a routing count), and a
+ * chained form that reads such a value where the launch in front wrote it can find an earlier
+ * launch's. With an acquire on every packet that nearly always did not happen (one launch in 1800
+ * read stale in a probe of 1024-block readers); without, 1797 in 1800 did, and the model's text
+ * changed. So the acquire is dropped only where every chained form the engine can launch empties
+ * that cache itself behind its wait (RadKernelChainFn saying 2, rad_dev_chain_unfenced;
+ * `s_dcache_inv` in r4d_chain.h and chain_kernel.h).
  *
- * Everything else keeps its acquire or release: the release (dropping it as well measured
- * nothing), a packet that keeps its bit, a plain kernel, every barrier packet, and every acquire
- * acquire_scope asks for: the argument ring's half lap, the first dispatch after a host wait, a
- * copy over the link. Those guard what the kernel reads of its own slot, its arguments and chain
- * record, which the host wrote where some launch read a lap ago and which the L2 would still
- * hold; they are kept at whichever scope they come. The prefetch stream keeps the acquire on
- * every packet: nothing waits for its launches, so there is nothing to gain.
+ * Everything else keeps its acquire and release: a packet that keeps its barrier bit, a plain
+ * kernel, every barrier packet, every acquire acquire_scope asks for (the argument ring's half
+ * lap, the first dispatch after a host wait, a copy over the link), and the whole prefetch stream
+ * (nothing waits for its launches, so there is nothing to gain). Those guard what a kernel reads
+ * of its own slot, which the host wrote and the L2 may still hold.
  *
- * The acquire did a second thing by the way: it held the launch until the slot the host had
- * just written was in VRAM, which nothing else saw to (host_writes_out). Without the flush
- * there, a bare chained launch stopped a server: a chained card-side copy on a card's second
- * queue never finished, and the queue stood on it with 14 packets written behind. So a
- * card whose arguments are in VRAM and that gives no flush register keeps the acquire on its
- * chained launches. RADIANCE_AQL_CHAIN_FENCE=1 keeps it on every chained launch, to rule this
- * out. */
+ * The acquire also held the launch until the slot the host had just written was in VRAM
+ * (host_writes_out). Without that flush a bare chained launch stopped a server: a chained
+ * card-side copy on a card's second queue never finished. So a card whose arguments are in VRAM
+ * and that gives no flush register keeps the acquire on its chained launches.
+ * RADIANCE_AQL_CHAIN_FENCE=1 keeps it on every chained launch, to rule this out. */
 inline bool chain_bare(const Stream* s) {
     static const bool keep = [] {
         const char* e = std::getenv("RADIANCE_AQL_CHAIN_FENCE");
@@ -3884,7 +3874,13 @@ std::string card_holders(int ord) {
  * back: 2.8 s over the fleet bench's sequential plan. A spare counts as free in the card's figure
  * (a_props); a commit or allocation the driver cannot give gives the card's spares back first
  * (card_has_room, create_handle). A recycled handle holds what its last mapping left; a commit
- * reports that, so a caller that needs zeros clears it. */
+ * reports that, so a caller that needs zeros clears it.
+ *
+ * A card that shares the host's memory (an APU) keeps no spares: there a spare is host memory, and
+ * MemAvailable -- which the fleet's host floor, the card's free figure (the HIP backend bounds an
+ * integrated card's by it) and every other process on the host go by -- does not count it until
+ * it is given back. A Strix Halo fleet that unloaded three models to make room for a fourth kept
+ * their 43 GB as spares and refused the load for want of host memory. */
 struct Spare { hsa_amd_vmem_alloc_handle_t h; int64_t bytes; };
 std::mutex                g_spare_mu;
 std::vector<Spare>        g_spares[kMaxDevices];
@@ -3903,7 +3899,24 @@ bool take_spare(int ord, int64_t bytes, hsa_amd_vmem_alloc_handle_t* h) {
     return false;
 }
 
+/* The HIP backend's integrated(device), for keeps_spares; set with the backend. */
+int (*g_hip_integrated)(int) = nullptr;
+bool keeps_spares(int ord) {
+    static std::atomic<int> known[kMaxDevices];   /* 0 not asked yet, 1 keeps them, 2 does not */
+    if (ord < 0 || ord >= kMaxDevices) return false;
+    int k = known[ord].load(std::memory_order_relaxed);
+    if (!k) {
+        k = g_hip_integrated && g_hip_integrated(ord) > 0 ? 2 : 1;
+        known[ord].store(k, std::memory_order_relaxed);
+    }
+    return k == 1;
+}
+
 void put_spare(int ord, hsa_amd_vmem_alloc_handle_t h, int64_t bytes) {
+    if (!keeps_spares(ord)) {
+        (void)hsa_amd_vmem_handle_release(h);
+        return;
+    }
     std::lock_guard<std::mutex> lk(g_spare_mu);
     g_spares[ord].push_back({ h, bytes });
     g_spare_bytes[ord].fetch_add(bytes, std::memory_order_relaxed);
@@ -4216,15 +4229,9 @@ hsa_amd_memory_pool_t* host_coarse_pool() {
     static std::once_flag once;
     std::call_once(once, [] {
         auto cb = [](hsa_amd_memory_pool_t p, void* data) -> hsa_status_t {
-            hsa_amd_segment_t seg;
-            uint32_t flags = 0;
-            bool alloc = false;
-            hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &seg);
-            if (seg != HSA_AMD_SEGMENT_GLOBAL) return HSA_STATUS_SUCCESS;
-            hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags);
-            hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED, &alloc);
             auto* out = static_cast<std::pair<hsa_amd_memory_pool_t*, bool*>*>(data);
-            if (alloc && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED) && !*out->second) {
+            if (!*out->second &&
+                allocatable_global_pool(p, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)) {
                 *out->first = p;
                 *out->second = true;
             }
@@ -4336,7 +4343,8 @@ int a_vmem_decommit(void* addr, int64_t bytes) {
         device_set_error("vmem: an unmap of %lld bytes at %p failed", (long long)bytes, addr);
         return RAD_E_DEVICE;
     }
-    /* Card memory is kept as spares (see "spare device memory"); host memory goes back. */
+    /* Card memory is kept as spares (see "spare device memory"), except on a card that shares
+     * the host's; host memory goes back. */
     const int dev = vres_ord(addr);
     for (const VMap& m : hs) {
         if (!m.host && dev >= 0 && dev < kMaxDevices) put_spare(dev, m.h, m.bytes);
@@ -4494,6 +4502,25 @@ void warn_if_no_huge_pages() {
              "ranges huge pages and nothing else.");
 }
 
+/* mlock2(MLOCK_ONFAULT) on a pinned range, so the kernel neither swaps nor migrates its pages
+ * (lock_to_pool mirrors them through HMM without pinning, and a reclaimed page makes the driver
+ * evict and restore every queue of the process). A refusal is the memlock limit, the same for
+ * every range, so it is warned once with the limit and how to raise it; the range is used all
+ * the same. */
+static void lock_against_swap(void* p, int64_t len, const char* what) {
+    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) == 0) return;
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) return;
+    const int e = errno;
+    struct rlimit rl{};
+    const bool lim = ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY;
+    RAD_WARN("device: %s %p (%s) could not be locked against swap (mlock2: %s)%s; pinned ranges "
+             "past the limit stay swappable, and this is not repeated for them. Docker: "
+             "--ulimit memlock=-1; systemd: LimitMEMLOCK=infinity", what, p, humanb(len).c_str(),
+             std::strerror(e),
+             lim ? fmt(", RLIMIT_MEMLOCK is %s", humanb((int64_t)rl.rlim_cur).c_str()).c_str() : "");
+}
+
 const char* hsa_why(hsa_status_t st) {
     const char* m = nullptr;
     return hsa_status_string(st, &m) == HSA_STATUS_SUCCESS && m ? m : "unknown HSA status";
@@ -4626,12 +4653,7 @@ void* pin_pieces(int64_t bytes) {
         warn_if_no_huge_pages();
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
-    /* lock_to_pool mirrors the pages through HMM and does not pin them: a swapped or reclaimed
-     * page makes the driver evict every queue of the process until it restores them.
-     * pin_pieces_file does the same; a refusal (the memlock limit) costs only that. */
-    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
-        RAD_WARN("device: the pinned range %p (%s) could not be locked against swap (mlock2: %s)",
-                 (void*)p, humanb(len).c_str(), std::strerror(errno));
+    lock_against_swap(p, len, "the pinned range");
     prefault(p, len);
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
@@ -4683,9 +4705,7 @@ void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
 
     if (len >= ((int64_t)2 << 20)) (void)::madvise(p, (size_t)len, MADV_HUGEPAGE);
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
-    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
-        RAD_WARN("device: the shared file range %p (%s) could not be locked against swap (mlock2: "
-                 "%s)", (void*)p, humanb(len).c_str(), std::strerror(errno));
+    lock_against_swap(p, len, "the shared file range");
     prefer_numa_node(p, len, pinned_host_numa_node());
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_map_file")) {
@@ -4878,6 +4898,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_hip_host_ptr = hip->host_ptr;
         g_hip_device_ptr = hip->device_ptr;
         g_hip_props = hip->props;
+        g_hip_integrated = hip->integrated;
         g_aql.props = a_props;
         g_aql.vmem_trim = a_vmem_trim;
         g_aql.stream_counts = a_stream_counts;

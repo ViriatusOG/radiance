@@ -16,7 +16,8 @@ extern "C" {
 
 /* ------------------------------------------------------------------ status */
 /* Zero is success. Negative is failure, and the value names its class so a caller can report it.
- * A kernel returning negative at issue is a selection bug, not a runtime condition (spec.md §17). */
+ * A kernel returning negative at issue is a selection bug, not a runtime condition (spec.md
+ * §17). */
 enum {
     RAD_OK              =  0,
     RAD_E_SHAPE         = -1,   /* geometry this instantiation does not serve */
@@ -277,7 +278,8 @@ typedef struct RadParam {
 #define RAD_INT(k, v)      ((RadParam){ (k), RAD_P_INT,   (long long)(v), 0, 0, 0.0 })
 #define RAD_STR(k, v)      ((RadParam){ (k), RAD_P_STR,   0, 0, (v), 0.0 })
 #define RAD_F64(k, v)      ((RadParam){ (k), RAD_P_F64,   0, 0, 0, (double)(v) })
-#define RAD_RANGE(k, lo, hi) ((RadParam){ (k), RAD_P_RANGE, (long long)(lo), (long long)(hi), 0, 0.0 })
+#define RAD_RANGE(k, lo, hi) \
+    ((RadParam){ (k), RAD_P_RANGE, (long long)(lo), (long long)(hi), 0, 0.0 })
 
 /* ------------------------------------------------------------------ constraints */
 /* A kernel's necessary condition on a geometry, deliberately not sufficient: strides,

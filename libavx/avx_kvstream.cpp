@@ -183,8 +183,8 @@ AVX_KERNEL(kv_resolve) {
     /* The counters are read and written as u64 inside an i32 block. */
     if (((uintptr_t)C & 7u) != 0) return RAD_E_STRIDE;
 
-    /* ---- everything that can refuse, before anything is written; the entry count summed here sizes
-     * the counter and the claim list ---- */
+    /* ---- everything that can refuse, before anything is written; the entry count summed here
+     * sizes the counter and the claim list ---- */
     int64_t lookups = 0;
     for (int64_t q = 0; q < M; ++q) {
         const int64_t n = NS[q];
@@ -246,8 +246,8 @@ AVX_KERNEL(kv_resolve) {
         if (SB[s] < 0 && ST[s * stp] != epoch) ++free_left;
     int64_t hand = C[1];
     int64_t placed = 0;
-    /* More claims than slots: some miss is unplaced by construction (the list is clipped at `slots`,
-     * so the sweep cannot find out by running dry), and libref latches exactly that. */
+    /* More claims than slots: some miss is unplaced by construction (the list is clipped at
+     * `slots`, so the sweep cannot find out by running dry), and libref latches exactly that. */
     bool overflow = nclaims > slots;
     for (int64_t k = 0; k < nmiss; ++k) {
         const int32_t b = miss_block[k];
@@ -308,8 +308,8 @@ AVX_KERNEL(kv_resolve) {
     for (int64_t q = 0; q < M; ++q) kv_rewrite_row(SE + q * pitch, NS[q], R);
 
     /* ---- the bookkeeping ---- */
-    /* Distinct blocks: the slots this call stamped, plus the misses it could not place. Entry counts
-     * would overcount, since rows share history. */
+    /* Distinct blocks: the slots this call stamped, plus the misses it could not place. Entry
+     * counts would overcount, since rows share history. */
     int64_t used = 0;
     for (int64_t s = 0; s < slots; ++s)
         if (ST[s * stp] == epoch) ++used;

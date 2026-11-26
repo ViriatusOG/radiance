@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -432,17 +433,13 @@ TEST(salt_makes_the_first_message_unique) {
 }
 
 namespace {
+/* A file of `text` of its own in the test's temporary directory. */
 struct TmpFile {
     std::string path;
-    explicit TmpFile(const std::string& text) {
-        char t[] = "/tmp/diag_test.XXXXXX";
-        const int fd = mkstemp(t);
-        path = t;
-        FILE* f = fdopen(fd, "wb");
-        fwrite(text.data(), 1, text.size(), f);
-        fclose(f);
+    explicit TmpFile(const std::string& text)
+        : path(radtest::make_tmp_dir("corpus") + "/corpus.jsonl") {
+        std::ofstream(path, std::ios::binary) << text;
     }
-    ~TmpFile() { std::remove(path.c_str()); }
 };
 }  /* namespace */
 

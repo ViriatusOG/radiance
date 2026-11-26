@@ -9,6 +9,7 @@
 
 #include "sample/accept.h"
 #include "sched/advance_impl.h"
+#include "rad_gdn_anchor.h"
 
 #include <algorithm>
 #include <cstring>
@@ -635,7 +636,8 @@ TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
         CHECK_EQ(s.used(0, 0), 104);        /* the committed positions and no more */
         CHECK_EQ(s.w[Slab::CTX], 103);
     }
-    /* Round 3: the old head two positions on, the cacheless one where it was. */
+    /* Round 3: the head with its own cache two positions on, the cacheless one at the committed
+     * position. */
     {
         Slab o(ADV_ROUND);
         slab(o, 1, 3, false, 0);
@@ -839,6 +841,108 @@ TEST(a_host_built_nine_row_verify_is_accepted_caught_up_and_followed_by_three_ro
         CHECK_EQ(N.tok[3], 7200);
         for (int j = 4; j <= RAD_SCHED_MAX_SPEC; ++j) CHECK_EQ(N.tok[j], (int32_t)0x7f7f7f7f);   /* untouched */
     }
+}
+
+/* ================================================================== ADV_COMPACT */
+
+/* After a tree verify the accepted path's nodes are moved to the front of every cache the next
+ * step reads as a prefix (AdvPoolKind): a paged group's K|V rows to the anchor's position + 1..,
+ * a conv group's window entries to hist + 1.., and an anchor state group's replay records (in the
+ * factor copy, abi/rad_gdn_anchor.h) to records 1... Entries the path does not name keep their
+ * bytes, the root (row 0, record 0, entry hist) stays, and a row that sampled nothing is left
+ * alone. Run as the host backend runs it (step_compact's loop), which is the kernel's body. */
+TEST(the_compaction_moves_the_accepted_path_in_paged_conv_and_anchor_pools) {
+    Slab s(0, /*n_groups=*/2, /*block=*/4);
+    /* Row 0: card 3, a verify of 1 + 5 rows at positions 20..25, accepted path nodes 2, 3, 5. */
+    s.row(0, true, 0, 6, 20, 3, 0, 0, 5);
+    StepSlot& S = s.st[3];
+    std::memset(&S, 0, sizeof S);
+    S.acc = 3; S.npath = 3; S.path[0] = 2; S.path[1] = 3; S.path[2] = 5;
+    S.head = 20 + 3;                    /* base = head - acc = 20, the anchor's position */
+    /* Row 1: card 4 sampled nothing this step (rout -1): untouched whatever its slot says. */
+    s.row(1, true, 6, 6, 40, 4, 6, -1, 5);
+    s.st[4] = S; s.st[4].head = 43;
+    for (int t = 0; t < 12; ++t) s.slot(1, t) = t < 6 ? 1 : 0;   /* state slots: row 0 -> 1 */
+
+    /* Pool 0: paged, 1 layer, 2 heads, 32-byte rows, blocks of 4 (slot == position). */
+    const int kRow = 32, kHeads = 2, kSlots = 64;
+    std::vector<uint8_t> paged((size_t)(kSlots / 4) * kHeads * 4 * kRow);
+    for (size_t i = 0; i < paged.size(); ++i) paged[i] = (uint8_t)(i * 7 + 1);
+    std::vector<uint8_t> paged0 = paged;
+    AdvPool& pp = s.a.pool[0];
+    pp.kind = ADV_POOL_PAGED; pp.base = reinterpret_cast<char*>(paged.data());
+    pp.layer_stride = (int64_t)paged.size(); pp.n_layers = 1; pp.n_head = kHeads;
+    pp.row_bytes = kRow; pp.grp = 0;
+    /* Pool 1: a conv window on group 1: 2 slots, 70 channels, width 4 (hist 2) + 5 rows. */
+    const int kChan = 70, kEnt = 2 + 5;
+    std::vector<uint16_t> conv((size_t)2 * kChan * kEnt);
+    for (size_t i = 0; i < conv.size(); ++i) conv[i] = (uint16_t)(i + 100);
+    std::vector<uint16_t> conv0 = conv;
+    AdvPool& pc = s.a.pool[1];
+    pc.kind = ADV_POOL_CONV; pc.base = reinterpret_cast<char*>(conv.data());
+    pc.layer_stride = (int64_t)conv.size() * 2; pc.n_layers = 1;
+    pc.n_head = (kChan + kAdvConvChunk - 1) / kAdvConvChunk; pc.row_bytes = 2; pc.grp = 1;
+    pc.hist = 2; pc.n_chan = kChan; pc.n_ent = kEnt;
+    /* Pool 2: an anchor state on group 1: 2 sequences x 2 copies, 2 heads of 32 x 32 (a record
+     * of 66 elements, 15 records a block), f32. */
+    const int H = 2, V = 32, K = 32, kSeqStates = 2;
+    const int64_t fstr = rad_gdn_anchor_fstr(K, V);
+    std::vector<float> st((size_t)kSeqStates * 2 * H * V * K);
+    for (size_t i = 0; i < st.size(); ++i) st[i] = (float)i;
+    std::vector<float> st0 = st;
+    AdvPool& pa = s.a.pool[2];
+    pa.kind = ADV_POOL_ANCHOR; pa.base = reinterpret_cast<char*>(st.data());
+    pa.layer_stride = (int64_t)st.size() * 4; pa.n_layers = 1; pa.n_head = H; pa.row_bytes = 4;
+    pa.grp = 1; pa.copy_off = kSeqStates; pa.rec_elems = (int32_t)fstr;
+    pa.head_elems = (int64_t)V * K; pa.slot_elems = (int64_t)H * V * K;
+    s.a.n_pool = 3;
+
+    const int items = adv_compact_items(s.a);
+    CHECK_EQ(items, kHeads + pc.n_head + H);
+    for (int i = 0; i < s.a.n_seq; ++i)
+        for (int w = 0; w < items; ++w) {
+            int p = 0, l = 0, h = 0;
+            if (adv_compact_item(s.a, w, &p, &l, &h)) adv_compact(s.a, i, p, l, h, 0, 1);
+        }
+
+    /* Paged: position 20 + path[t] -> 20 + t + 1 for both heads; everything else as it was. */
+    auto prow = [&](std::vector<uint8_t>& v, int pos, int h) {
+        return v.data() + (((size_t)(pos / 4) * kHeads + h) * 4 + pos % 4) * kRow;
+    };
+    for (int h = 0; h < kHeads; ++h)
+        for (int pos = 0; pos < kSlots; ++pos) {
+            int from = pos;
+            if (pos == 21) from = 22; else if (pos == 22) from = 23; else if (pos == 23) from = 25;
+            CHECK_EQ(std::memcmp(prow(paged, pos, h), prow(paged0, from, h), kRow), 0);
+        }
+    /* Conv: slot 1's entries hist + path[t] -> hist + t + 1 in every channel; slot 0 untouched. */
+    for (int sl = 0; sl < 2; ++sl)
+        for (int c = 0; c < kChan; ++c)
+            for (int e = 0; e < kEnt; ++e) {
+                int from = e;
+                if (sl == 1) { if (e == 3) from = 4; else if (e == 4) from = 5; else if (e == 5) from = 7 - 0; }
+                if (sl == 1 && e == 5) from = 2 + 5;   /* hist + path[2] = 7: past the window, kept */
+                const size_t at = ((size_t)sl * kChan + c) * kEnt + e;
+                const size_t src = ((size_t)sl * kChan + c) * kEnt + (size_t)from;
+                if (from >= kEnt) { CHECK_EQ(conv[at], conv0[at]); continue; }
+                CHECK_EQ(conv[at], conv0[src]);
+            }
+    /* Anchor: the factor copy of slot 1 (slot 1 + 2) in each head: record path[t] -> t + 1;
+     * record 0 and the rest of the block, and every other slot, as they were. */
+    for (int sl = 0; sl < kSeqStates * 2; ++sl)
+        for (int h = 0; h < H; ++h) {
+            const size_t blk = ((size_t)sl * H + h) * V * K;
+            for (int64_t e = 0; e < (int64_t)V * K; ++e) {
+                int64_t from = e;
+                if (sl == 3) {
+                    const int64_t r = e / fstr, o = e % fstr;
+                    if (r == 1) from = 2 * fstr + o;
+                    else if (r == 2) from = 3 * fstr + o;
+                    else if (r == 3) from = 5 * fstr + o;
+                }
+                CHECK_EQ(st[blk + (size_t)e], st0[blk + (size_t)from]);
+            }
+        }
 }
 
 RAD_TEST_MAIN()

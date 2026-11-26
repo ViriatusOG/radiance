@@ -254,6 +254,15 @@ std::string calib_stem(const char* name) {
             if (s[i] < '0' || s[i] > '9') { all_digits = false; break; }
         if (all_digits) s.resize(dot);
     }
+    /* An expert named by an `e<index>` component before its projection (Inkling 2's
+     * `blk.7.e12.dn`) pools to the name without it, `blk.7.dn`. */
+    const size_t leaf = s.rfind('.');
+    if (leaf != std::string::npos && leaf > 0) {
+        const size_t prev = s.rfind('.', leaf - 1);
+        if (prev != std::string::npos && leaf - prev > 2 && s[prev + 1] == 'e' &&
+            s.find_first_not_of("0123456789", prev + 2) == leaf)
+            s.erase(prev, leaf - prev);
+    }
     /* A vocabulary-weighted lm_head's width classes (output.k<B>) are rows of one weight: they
      * read the head's input Gram. */
     if (s.size() > 8 && s.compare(0, 8, "output.k") == 0 &&

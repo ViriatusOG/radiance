@@ -23,8 +23,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace lq {
@@ -588,6 +591,50 @@ int gpu_set_devices(const int* ids, int n) {
 
 bool gpu_enabled() { return !devices().empty(); }
 
+int gpu_device_count() { return (int)devices().size(); }
+
+int gpu_device(int index) {
+    return index >= 0 && index < (int)devices().size() ? devices()[(size_t)index] : -1;
+}
+
+/* A row window of a call's scales, so a card can quantise a chunk of a large tensor with buffers
+ * that fit its free VRAM. b's row 0 is the call's row ra; the first level's block rows start at
+ * ra / s.br, and s2's at ra / g.br2 (0 when the second level covers the whole call). */
+static Scales slice_scales(const Grid& g, const Scales& s, int64_t ra, int64_t nl) {
+    Scales o;
+    o.br = s.br;
+    o.bc = s.bc;
+    o.nc = s.nc;
+    o.r0 = ra;
+    const int64_t b0 = s.br > 0 ? ra / s.br : 0;
+    const int64_t b1 = s.br > 0 ? (ra + nl + s.br - 1) / s.br : 1;
+    o.nr = b1 - b0;
+    o.b.assign(s.b.begin() + (size_t)(b0 * s.nc), s.b.begin() + (size_t)(b1 * s.nc));
+    o.colf = s.colf;
+    if (!s.s2.empty()) {
+        const int64_t r2 = g.br2 > 0 ? ra / g.br2 : 0;
+        o.r2_0 = r2;
+        o.nc2 = s.nc2;
+        if (g.br2 > 0) {
+            const int64_t e2 = (ra + nl + g.br2 - 1) / g.br2;
+            o.nr2 = e2 - r2;
+            o.s2.assign(s.s2.begin() + (size_t)(r2 * s.nc2),
+                        s.s2.begin() + (size_t)(e2 * s.nc2));
+        } else {
+            o.nr2 = s.nr2;
+            o.s2 = s.s2;
+        }
+    }
+    return o;
+}
+
+/* Copy a chunk's first-level scales back into the call's row window. */
+static void merge_scales(Scales& full, const Scales& part, int64_t ra) {
+    if (full.b.empty() || part.b.empty() || full.br <= 0) return;
+    const int64_t b0 = ra / full.br;
+    std::copy(part.b.begin(), part.b.end(), full.b.begin() + (size_t)(b0 * full.nc));
+}
+
 int gptq_tcq_gpu(const Grid& g, float* w, int32_t* codes, Scales& scales, int64_t N, int64_t K,
                  const float* u, bool dynamic, std::string* why) {
     const Form* f = pick_form(g.tcq_L, g.tcq_k, g.tcq_wide);
@@ -635,15 +682,55 @@ int gptq_tcq_gpu(const Grid& g, float* w, int32_t* codes, Scales& scales, int64_
     }
     std::vector<int> st(part.size(), RAD_OK);
     std::vector<std::string> wy(part.size());
+    /* A stacked expert tensor may hold more rows than one card's free VRAM can buffer. Run each
+     * card's slice in chunks whose dw/dcodes/derr/du fit, with a row window of the scales; the
+     * chunk boundaries are multiples of tcq_rows, so each run's seam is unchanged. */
+    /* The chunk is sized from the card's free VRAM, not from a fixed estimate: a Hessian chunk
+     * carries du (K*K*4) once per chunk, so one-run chunks re-upload the factor thousands of times
+     * on an MoE tensor. Reserve a margin for the driver's own allocations and fit the chunk to
+     * what is actually free. A dense weight's own band is smaller than this and bounds the chunk
+     * too (N), so the rule serves both. */
+    const int64_t Qbytes = (int64_t)(1 << (g.tcq_L - g.tcq_k));
+    const int64_t nb = (K + 127) / 128;
+    const int64_t per_row = K * 8 + nb * 4 + ((int64_t)g.tcq_rb ? nb * 4 : 0) + Qbytes +
+                            (u ? 1024 : 0);
+    const int64_t du_bytes = u ? K * K * (int64_t)sizeof(float) : 0;
+    const int64_t kReserve = (int64_t)512 << 20;   /* the driver and its own work bulks */
+    auto chunk_for = [&](int dev, int64_t rows, int64_t T) -> int64_t {
+        size_t freev = 0, totalv = 0;
+        if (hipSetDevice(dev) != hipSuccess || hipMemGetInfo(&freev, &totalv) != hipSuccess)
+            return std::max<int64_t>(rows, T);
+        int64_t avail = (int64_t)freev - kReserve - du_bytes;
+        if (avail <= 0) return T;
+        int64_t n = avail / std::max<int64_t>(per_row, 1);
+        n = std::max<int64_t>(n / T * T, T);
+        return std::min<int64_t>(rows, n);
+    };
+    auto run_part = [&](size_t d) {
+        const int64_t chunk = chunk_for(on[d], part[d].second - part[d].first, T);
+        if (chunk != T) {
+            /* once per (card, K, Hessian) so a log gets the choice, not one line a band */
+            static std::mutex m;
+            static std::set<std::tuple<int, long long, int>> seen;
+            std::lock_guard<std::mutex> g(m);
+            if (seen.emplace(on[d], (long long)K, u ? 1 : 0).second)
+                std::fprintf(stderr, "libquant: card %d chunk %lld rows (K=%lld, Hessian=%d)\n",
+                             on[d], (long long)chunk, (long long)K, u ? 1 : 0);
+        }
+        std::fflush(stderr);
+        for (int64_t a = part[d].first; a < part[d].second; a += chunk) {
+            const int64_t b = std::min(part[d].second, a + chunk);
+            Scales sc = slice_scales(g, scales, a, b - a);
+            const int rc = run_rows(g, *f, w, codes, sc, a, b, K, u, dynamic, on[d], &wy[d]);
+            if (rc != RAD_OK) { st[d] = rc; return; }
+            merge_scales(scales, sc, a);
+        }
+    };
     if (part.size() == 1) {
-        st[0] = run_rows(g, *f, w, codes, scales, 0, N, K, u, dynamic, on[0], &wy[0]);
+        run_part(0);
     } else {
         std::vector<std::thread> th;
-        for (size_t d = 0; d < part.size(); ++d)
-            th.emplace_back([&, d] {
-                st[d] = run_rows(g, *f, w, codes, scales, part[d].first, part[d].second, K, u,
-                                 dynamic, on[d], &wy[d]);
-            });
+        for (size_t d = 0; d < part.size(); ++d) th.emplace_back([&, d] { run_part(d); });
         for (std::thread& t : th) t.join();
     }
     for (size_t d = 0; d < part.size(); ++d)

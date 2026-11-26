@@ -44,8 +44,7 @@ static inline void narrow_cols(const RadOperand& o, RadTensor* t) {
  * buffer read at 160 columns is legitimately T*16 rows of 160 (the PLE gather does this).
  *
  * An empty extent reaches nothing; the kernel's own bounds decide. `decl_numel` is the declared
- * tensor's element count, snapshotted at bind (Ctx::buf_numel_ / w_numel_) where this used to
- * recompute rad_tensor_numel(&decl) per operand per issue. */
+ * tensor's element count, snapshotted at bind (Ctx::buf_numel_ / w_numel_). */
 static inline bool operand_fits(const RadTensor& t, int64_t offset, int64_t decl_numel) {
     if (offset < 0) return false;
     int64_t span = offset;
@@ -321,13 +320,9 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
     auto it = ce.key == key ? wtab_of_.end() : wtab_of_.find(key);
     if (ce.key == key) {
         slot = ce.slot;
-        if (wtabs_[slot].first != first || wtabs_[slot].n != n)
-            return abort_step_msg(h, RAD_E_INVAL,
-                                  fmt("operand %d named weights [%u, +%lld) and now names "
-                                      "[%u, +%lld). A table's run is fixed by the declaration",
-                                      operand, wtabs_[slot].first, (long long)wtabs_[slot].n,
-                                      first, (long long)n));
-    } else if (it == wtab_of_.end()) {
+    } else if (it != wtab_of_.end()) {
+        slot = it->second;
+    } else {
         /* A plugin issued a table at an operand position its declaration did not name. Legal, but
          * it allocates on the step path. */
         RAD_DEBUG("op %u operand %d issued a weight table of %lld entries that the declaration did "
@@ -338,15 +333,13 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
                                   fmt("operand %d is a table of %lld weights and the %lld bytes it "
                                       "needs could not be allocated", operand, (long long)n,
                                       (long long)(n * 2 * (int64_t)sizeof(void*))));
-    } else {
-        slot = it->second;
-        if (wtabs_[slot].first != first || wtabs_[slot].n != n)
-            return abort_step_msg(h, RAD_E_INVAL,
-                                  fmt("operand %d named weights [%u, +%lld) and now names "
-                                      "[%u, +%lld). A table's run is fixed by the declaration",
-                                      operand, wtabs_[slot].first, (long long)wtabs_[slot].n,
-                                      first, (long long)n));
     }
+    if (wtabs_[slot].first != first || wtabs_[slot].n != n)
+        return abort_step_msg(h, RAD_E_INVAL,
+                              fmt("operand %d named weights [%u, +%lld) and now names "
+                                  "[%u, +%lld). A table's run is fixed by the declaration",
+                                  operand, wtabs_[slot].first, (long long)wtabs_[slot].n,
+                                  first, (long long)n));
     ce.key = key;
     ce.slot = slot;
     WeightTable& t = wtabs_[slot];
@@ -1089,6 +1082,26 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
     }
 
+    /* A host gather from the mapped tier: every page its rows cover is asked for now, so the
+     * kernel's faults wait on reads already in flight rather than issuing them one at a time
+     * (runtime/rowprefetch.h). After the join, since the ids may be a device op's output. Timed
+     * with the op when profiling: it is the op's own read. */
+    RowPrefetch rowpf{};
+    if (dom == RAD_DOMAIN_HOST && p.row_gather && row_prefetch_on_ &&
+        !(ip.row && ip.row->fetches_rows)) {
+        row_prefetch_plan(ip.args, opd, n_opd, t, &rowpf);
+        if (rowpf.n) {
+            if (profiling_) {
+                const auto r0 = std::chrono::steady_clock::now();
+                row_prefetch_run(rowpf, t, n);
+                prof_ms_[(size_t)h] += std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - r0).count();
+            } else {
+                row_prefetch_run(rowpf, t, n);
+            }
+        }
+    }
+
     /* A scratch region belongs to one stream. Kernels on a lane get consecutive slices
      * (scratch_take); a recorded pass orders any pair whose slices meet (haz_mark). Scratch users
      * on two unjoined lanes would overwrite each other's partials (e.g. split-K router GEMM on
@@ -1147,6 +1160,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         th.drain = host_join_drains(opd, n_opd);
         th.touch[0] = touch0[0];
         th.touch[1] = touch0[1];
+        th.rp = rowpf;
         for (int i = 0; i < n_opd; ++i) th.t[i] = t[i];
         TapeStep st;
         st.kind = kTapeHost;
@@ -1258,6 +1272,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         s = ip.launch(la, cur_stream());
     }
     if (peer) rad_dev_peer_launch(0);
+    /* A read-ahead beside a host gather stops with its kernel (runtime/rowprefetch.h). */
+    if (rowpf_beside_) row_prefetch_done();
     if (hold) {
         /* Always released, by a barrier unless the launch ended the hold itself
          * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
@@ -1305,9 +1321,8 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.op = (uint32_t)(&p - plans_.data());
     const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
     /* The operand counts issue_body accepts: trailing optional operands may be left out, and an
-     * absent one is a null tensor that reaches nothing (skipped below). Requiring the full schema
-     * count here made every issue that omits one opaque, which orders it behind its neighbours in
-     * a recorded pass (the routed MoE GEMMs without their prefill-only `split`, for example). */
+     * absent one is a null tensor that reaches nothing (skipped below). Requiring the full count
+     * would make every issue that omits one opaque, ordered behind its neighbours. */
     const bool count_ok = sc && n_opd <= sc->n_operands && n_opd >= p.n_opd_required;
     o.opaque = p.collective || !count_ok || !ip.row || !ip.row->concurrent;
     std::pair<uintptr_t, uintptr_t> rd[MAX_OPERANDS + 1], wr[MAX_OPERANDS + 1];
@@ -1357,6 +1372,63 @@ int Ctx::host_join(const RadOperand* opd, int n_opd) {
     return host_join_wait(host_join_drains(opd, n_opd));
 }
 
+/* The tables a row gather's issue reads from the mapped tier (runtime/rowprefetch.h):
+ * every weight operand, taken whole, that holds at least n_vocab rows -- the gathers' own shape
+ * rule, which leaves out a codebook or a scalar scale -- at its stored row pitch. Nothing when
+ * the ids (operand 0) are not a buffer or raw pointer, or no table is mapped. */
+void Ctx::row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd, const RadTensor* t,
+                            RowPrefetch* out) const {
+    out->n = 0;
+    if (n_opd < 2 || (opd[0].kind != RAD_OPK_BUF && opd[0].kind != RAD_OPK_RAW) || !t[0].data)
+        return;
+    long long vocab = 0, voff = 0;
+    if (!rad_args_geti(&a, "n_vocab", &vocab) || vocab <= 0) return;
+    rad_args_geti(&a, "vocab_offset", &voff);
+    for (int i = 1; i < n_opd && out->n < kRowTablesMax; ++i) {
+        const RadOperand& o = opd[i];
+        if (o.kind != RAD_OPK_WEIGHT || o.offset || o.rows > 0 || o.cols > 0) continue;
+        if (o.handle == RAD_NULL_HANDLE || (size_t)o.handle >= program_->weights.size()) continue;
+        const WeightInfo& w = program_->weights[o.handle];
+        if (w.tier != Tier::Mapped || !t[i].data) continue;
+        const int64_t rows = w.stored_rank ? w.stored_shape[0] : (w.decl.rank ? w.decl.shape[0] : 0);
+        const int64_t bytes = w.stored_bytes > 0 ? w.stored_bytes : w.logical_bytes;
+        if (rows < vocab || rows <= 0 || bytes <= 0 || bytes % rows) continue;
+        out->opd[out->n] = (int8_t)i;
+        out->row_bytes[out->n] = bytes / rows;
+        ++out->n;
+    }
+    out->rows = vocab;
+    out->voff = voff;
+}
+
+void Ctx::row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n) {
+    const int64_t have = rad_tensor_numel(&t[0]);
+    const int64_t m = have > 0 && have < n ? have : n;
+    if (m > 0 && rp.n > 0 && m * rp.n > kRowAheadInline && t[0].data &&
+        row_pages_resident(rp, t[0], m, t)) {
+        /* Long and its sampled rows resident: beside the kernel (rowprefetch.h);
+         * row_prefetch_done() after its launch. */
+        if (!rowpf_worker_) rowpf_worker_ = std::make_unique<RowPrefetchWorker>();
+        rowpf_worker_->start(rp, t[0], m, t);
+        rowpf_beside_ = true;
+        ++rowpf_calls_;
+        ++rowpf_beside_calls_;
+        return;
+    }
+    const int64_t pages = row_prefetch(rp, t[0], m, t, &rowpf_);
+    if (pages < 0) return;
+    ++rowpf_calls_;
+    rowpf_pages_ += pages;
+}
+
+/* The kernel a read-ahead ran beside has returned (or never launched): stop the helper and wait
+ * until it no longer reads the ids, before anything may write them. */
+void Ctx::row_prefetch_done() {
+    if (!rowpf_beside_) return;
+    rowpf_beside_ = false;
+    rowpf_pages_ += rowpf_worker_->finish();
+}
+
 /* Whether any operand is untracked by the host arena, so the join must drain the stream. */
 bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
     for (int i = 0; i < n_opd; ++i) {
@@ -1370,7 +1442,10 @@ bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
 
 int Ctx::host_join_wait(bool drain) {
     ++n_host_syncs_;
-    if (drain) return rad_stream_sync(cur_stream());
+    if (drain) {
+        ++n_host_drains_;
+        return rad_stream_sync(cur_stream());
+    }
     for (int l = 0; l < 2; ++l) {
         if (!host_touch_pending_[l]) continue;
         RAD_TRY(rad_event_sync(host_touch_ev_[l]));
@@ -1382,6 +1457,7 @@ int Ctx::host_join_wait(bool drain) {
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
+    row_prefetch_done();   /* no helper outlives the op that started it */
     /* What the op's tables gathered before the refusal still goes out (ctx.h, wtab_acc_). */
     wtab_gather_ = false;
     (void)wtab_flush();

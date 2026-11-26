@@ -76,16 +76,7 @@ inline bool write_text(const std::string& path, const std::string& body) {
     return std::fclose(f) == 0 && ok;
 }
 
-inline std::string read_text(const std::string& path) {
-    std::string out;
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return out;
-    char buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
-    std::fclose(f);
-    return out;
-}
+inline std::string read_text(const std::string& path) { return read_file(path); }
 
 /* ------------------------------------------------------------------ tensors */
 
@@ -500,6 +491,11 @@ struct Inkling2 {
     float    qk_clip = 3.0f, rel_clip = 2.0f, tau_alpha = 0.1f, route_scale = 2.5f;
     float    gate_cap = 4.0f, up_cap = 25.0f, final_cap = 30.0f;
     float    branch = 0.5f, head = 3.0f;        /* the residual gain; the head amplitude: logits about 3 apart */
+    /* Above 0, expert e's router bias is e times this instead of noise, so a spread larger than the
+     * sigmoid's range fixes every token's picks: a near tie in the routing then cannot flip under a
+     * rounding change (the random router has them, and a flipped pick moves the logits by nats). The
+     * draws are the same either way, so the other weights do not change. */
+    float    route_bias = 0.0f;
     uint64_t seed = 71;
     bool is_full(int64_t l) const { return l == 5 || l == 11 || l == 17 || l == 23; }
 };
@@ -605,6 +601,9 @@ inline bool write_inkling2(const std::string& dir, const Inkling2& s) {
         const std::string f = p + "mlp.";
         ts.push_back(linear(f + "gate.weight", s.experts, H, r));
         ts.push_back(noise(f + "gate.bias", { s.experts }, r, 0.1f));
+        if (s.route_bias > 0)
+            for (int64_t e = 0; e < s.experts; ++e)
+                rad_store_f32(ts.back().bytes.data(), RAD_BF16, e, s.route_bias * (float)e);
         ts.push_back(noise(f + "experts.w13_weight", { s.experts, 2 * s.ffn, H }, r,
                            std::sqrt(3.0f / (float)H)));
         ts.push_back(noise(f + "experts.w2_weight", { s.experts, H, s.ffn }, r,

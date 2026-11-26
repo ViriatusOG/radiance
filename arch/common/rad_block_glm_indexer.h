@@ -14,7 +14,7 @@
  * on this rank's run of rows only, since no other rank reads them. */
 #ifndef RAD_BLOCK_GLM_INDEXER_H
 #define RAD_BLOCK_GLM_INDEXER_H
-#include "rad_fp8.h"
+#include "rad_linear.h"
 #include "rad_glm_tp.h"
 
 namespace rad {
@@ -318,7 +318,7 @@ struct GlmIndexer {
     };
     Geom g{};
     Wire w{};
-    LinearFP8 query{}, key_gate{};
+    LinearQ query{}, key_gate{};
     DsaCache cache{};
     rad_weight gain = 0, bias = 0, head_weight = 0;
     rad_op op_norm = 0, op_query_copy = 0, op_gate_copy = 0, op_head = 0;
@@ -332,7 +332,7 @@ struct GlmIndexer {
         Geom bg = g;
         bg.w_bf16 = true;
         auto act = [](rad_buf x) {
-            ActFP8 a{};
+            ActQ a{};
             a.x = x;
             return a;
         };
@@ -360,18 +360,8 @@ struct GlmIndexer {
                                        RAD_F64("eps", 1e-6), RAD_STR("dtype", "bf16")),
                             RAD_WEIGHTS(gain, bias)),
                      { w.kg_raw }, { w.cache.kg });
-        op_query_copy = rw(b,
-                           RAD_OP(b, "cast",
-                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * 32), RAD_INT("n", 128),
-                                             RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                  RAD_NOWEIGHTS),
-                           { w.q_wide }, { w.cache.query });
-        op_gate_copy = rw(b,
-                          RAD_OP(b, "cast",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 128),
-                                            RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                 RAD_NOWEIGHTS),
-                          { w.kg_raw }, { w.cache.kg });
+        op_query_copy = cast_op(b, g.max_tok * 32, 128, "bf16", "bf16", w.q_wide, w.cache.query);
+        op_gate_copy = cast_op(b, g.max_tok, 128, "bf16", "bf16", w.kg_raw, w.cache.kg);
         op_head = rw(b,
                      RAD_OP(b, "gemm_nt_f32",
                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", 32),
@@ -385,7 +375,7 @@ struct GlmIndexer {
     void step(RadCtx* ctx, const RadBatch* batch) const {
         const int64_t T = batch->n_tok;
         auto act = [](rad_buf x) {
-            ActFP8 a{};
+            ActQ a{};
             a.x = x;
             return a;
         };

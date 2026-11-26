@@ -29,7 +29,6 @@
  */
 #include <arch/rad_arch.h>
 
-#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -424,11 +423,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                         RAD_STR("dtype", "bf16")),
                              RAD_NOWEIGHTS),
                    {m.b_x}, {m.b_mean});
-    m.op_cast = rw(b, RAD_OP(b, "cast",
-                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", E),
-                                        RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                             RAD_NOWEIGHTS),
-                   {m.b_mean}, {m.b_pooled});
+    m.op_cast = cast_op(b, g.max_seqs, E, "bf16", "f32", m.b_mean, m.b_pooled);
 
     int64_t n_routed = 0;
     for (const Layer& y : m.layers) n_routed += y.moe ? 1 : 0;

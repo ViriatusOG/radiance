@@ -41,11 +41,12 @@ bool pre_outputs(const RadTensor& h, const RadTensor& scale, const RadTensor& ba
            post.dtype == RAD_F32 && comb.dtype == RAD_F32;
 }
 
-/* Row r from its RMS-scaled coefficients: gates, Sinkhorn mixing and the collapse of h. */
+/* Row r from its RMS-scaled coefficients: gates, Sinkhorn mixing, and the collapse of h into `x`
+ * (mhc_pre) or the pre gates into `pre_out` (mhc_mix); either may be null. */
 void finish_row(const float* coeff, const RadTensor& h, const RadTensor& scale,
-                const RadTensor& base, const RadTensor& x, const RadTensor& post,
+                const RadTensor& base, const RadTensor* x, const RadTensor& post,
                 const RadTensor& comb, int64_t r, int64_t n, int64_t hc, int64_t iters,
-                float heps) {
+                float heps, const RadTensor* pre_out = nullptr) {
     float pre[8], c[64];
     const int64_t hb = rowoff(&h, r, hc * n), hs = laststride(&h);
     for (int64_t j = 0; j < hc; ++j) {
@@ -87,11 +88,15 @@ void finish_row(const float* coeff, const RadTensor& h, const RadTensor& scale,
     }
     const int64_t cb = rowoff(&comb, r, hc * hc), cs = laststride(&comb);
     for (int64_t j = 0; j < hc * hc; ++j) stt(&comb, cb + j * cs, c[j]);
-    const int64_t xb = rowoff(&x, r, n), xs = laststride(&x);
+    if (pre_out)
+        for (int64_t j = 0; j < hc; ++j)
+            stt(pre_out, rowoff(pre_out, r, hc) + j * laststride(pre_out), pre[j]);
+    if (!x) return;
+    const int64_t xb = rowoff(x, r, n), xs = laststride(x);
     for (int64_t i = 0; i < n; ++i) {
         float v = 0;
         for (int64_t j = 0; j < hc; ++j) v += pre[j] * ldt(&h, hb + (j * n + i) * hs);
-        stt(&x, xb + i * xs, v);
+        stt(x, xb + i * xs, v);
     }
 }
 }
@@ -125,7 +130,7 @@ int ref_mhc_pre(const RadArgs* a, RadStream) {
             for (int64_t i = 0; i < width; ++i) dot += ldt(&h, hb + i * hs) * ldt(&fn, fb + i * fs);
             coeff[j] = dot * inv;
         }
-        finish_row(coeff, h, scale, base, x, post, comb, r, n, hc, iters, heps);
+        finish_row(coeff, h, scale, base, &x, post, comb, r, n, hc, iters, heps);
     }
     return RAD_OK;
 }
@@ -196,7 +201,7 @@ int ref_mhc_pre_finish(const RadArgs* a, RadStream) {
             for (int64_t c = 0; c < chunks; ++c) dot += ldt(&part, pb + (c * S + j) * ps);
             coeff[j] = dot * inv;
         }
-        finish_row(coeff, h, scale, base, x, post, comb, r, n, hc, iters, heps);
+        finish_row(coeff, h, scale, base, &x, post, comb, r, n, hc, iters, heps);
     }
     return RAD_OK;
 }
@@ -245,6 +250,67 @@ int ref_mhc_contract(const RadArgs* a, RadStream) {
             for (int64_t j = 0; j < hc; ++j)
                 v += ldt(&h, rowoff(&h, r, hc * n) + (j * n + i) * laststride(&h));
             stt(&x, rowoff(&x, r, n) + i * laststride(&x), v / (float)hc);
+        }
+    return RAD_OK;
+}
+
+/* mhc_pre without the collapse: the gates and mixing of the stream h, with `pre` written out for a
+ * later collapse (mhc_collapse). DeepSeek-V4.1 collapses each sublayer's input with the pre gates
+ * the PREVIOUS sublayer computed, so the two halves are separate ops there. */
+int ref_mhc_mix(const RadArgs* a, RadStream) {
+    if (!have(a, 7)) return RAD_E_INVAL;
+    int64_t n, hc, iters;
+    float eps, heps;
+    if (!pre_params(a, &n, &hc, &iters, &eps, &heps)) return RAD_E_SHAPE;
+    const auto &h = a->t[0], &fn = a->t[1], &scale = a->t[2], &base = a->t[3];
+    const auto &pre = a->t[4], &post = a->t[5], &comb = a->t[6];
+    const int64_t width = hc * n, mix = hc * (hc + 2);
+    if (h.rank != 2) return RAD_E_SHAPE;
+    const int64_t rows = h.shape[0];
+    if (rows < 1 || !matrix(fn, mix, width) || fn.dtype != RAD_F32 || !matrix(pre, rows, hc) ||
+        pre.dtype != RAD_F32 || !matrix(h, rows, width) || scale.rank != 1 ||
+        scale.dtype != RAD_F32 || numel(&scale) != 3 || base.rank != 1 ||
+        base.dtype != RAD_F32 || numel(&base) != mix || !matrix(post, rows, hc) ||
+        !matrix(comb, rows, hc * hc) || post.dtype != RAD_F32 || comb.dtype != RAD_F32)
+        return RAD_E_SHAPE;
+#pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        float coeff[80];
+        const int64_t hb = rowoff(&h, r, width), hs = laststride(&h);
+        float sq = 0;
+        for (int64_t i = 0; i < width; ++i) {
+            const float v = ldt(&h, hb + i * hs);
+            sq += v * v;
+        }
+        const float inv = 1.0f / std::sqrt(sq / (float)width + eps);
+        for (int64_t j = 0; j < mix; ++j) {
+            float dot = 0;
+            const int64_t fb = rowoff(&fn, j, width), fs = laststride(&fn);
+            for (int64_t i = 0; i < width; ++i) dot += ldt(&h, hb + i * hs) * ldt(&fn, fb + i * fs);
+            coeff[j] = dot * inv;
+        }
+        finish_row(coeff, h, scale, base, nullptr, post, comb, r, n, hc, iters, heps, &pre);
+    }
+    return RAD_OK;
+}
+
+/* x[i] = sum over the hc streams of pre[s] * h[s, i], accumulated in f32 and rounded once. */
+int ref_mhc_collapse(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    if (n <= 0 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    const auto &h = a->t[0], &pre = a->t[1], &x = a->t[2];
+    if (h.rank != 2 || h.shape[0] < 1 || !matrix(h, h.shape[0], hc * n) ||
+        !matrix(pre, h.shape[0], hc) || pre.dtype != RAD_F32 || !matrix(x, h.shape[0], n))
+        return RAD_E_SHAPE;
+#pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < h.shape[0]; ++r)
+        for (int64_t i = 0; i < n; ++i) {
+            float v = 0;
+            for (int64_t j = 0; j < hc; ++j)
+                v += ldt(&pre, rowoff(&pre, r, hc) + j * laststride(&pre)) *
+                     ldt(&h, rowoff(&h, r, hc * n) + (j * n + i) * laststride(&h));
+            stt(&x, rowoff(&x, r, n) + i * laststride(&x), v);
         }
     return RAD_OK;
 }

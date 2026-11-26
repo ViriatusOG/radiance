@@ -144,6 +144,10 @@ int parse(const std::string& text, const std::string& origin, FleetConfig* out);
  * that is not an option is kept as a model key, so loading the result refuses it by name. */
 std::string yaml_from_args(int argc, char** argv);
 
+/* A name a request may give as `model` (a model id or alias): not empty, and no ':' (reserved for
+ * base:adapter), whitespace or control character. */
+bool valid_name(const std::string& n);
+
 /* The option keys a level holds ("server" or "memory"), without the fleet's own keys. */
 std::vector<std::string> level_keys(const std::string& level);
 

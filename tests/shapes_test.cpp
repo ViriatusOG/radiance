@@ -122,7 +122,7 @@ struct Shapes {
 
 /* A request that cannot be served is a 400 naming its field before anything is queued. */
 TEST(a_shape_request_that_cannot_be_served_names_its_field) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Shapes s;
     CHECK_EQ(s.refused(json::object()), std::string("image"));
     CHECK_EQ(s.refused({ { "image", "not base64 !" } }), std::string("image"));
@@ -146,7 +146,7 @@ TEST(a_shape_request_that_cannot_be_served_names_its_field) {
 /* The generator gets the prepared picture and the request's numbers; the answer is the mesh as
  * the file `type` names. */
 TEST(generate_answers_with_the_mesh_file) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Shapes s;
     HttpResponse r = s.generate(Shapes::body({ { "num_inference_steps", 30 },
                                                { "octree_resolution", 32 },
@@ -178,7 +178,7 @@ TEST(generate_answers_with_the_mesh_file) {
 
 /* A failed shape is the generator's reason, not a file. */
 TEST(a_failed_shape_reports_the_reason) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Shapes s;
     s.gen.finish_status = RAD_E_STATE;
     s.gen.finish_why = "the engine stopped";
@@ -190,7 +190,7 @@ TEST(a_failed_shape_reports_the_reason) {
 /* /send queues the shape and answers with its uid; /status reports it until the file is in
  * `model_base64`, and an unknown uid is a 404. */
 TEST(send_and_status_make_the_shape_in_the_background) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Shapes s;
     HttpResponse r = s.f->post("/send", Shapes::body({ { "type", "stl" } }).dump());
     REQUIRE_EQ(r.status, 200);

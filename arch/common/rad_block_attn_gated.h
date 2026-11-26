@@ -107,7 +107,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
     /* KV-head replication is not supported here. Above the KV head count geom_from gives each rank
      * one KV head and a `kv_off` row span, but this block declares k and v with the plain even
      * row shard, which would hand a rank part of one head and compute wrong values. The span is
-     * passed in rad_block_attn_gated_fp8.h. */
+     * passed in rad_block_attn_gated_q.h. */
     if (g.world > g.n_head_kv_all) {
         fprintf(stderr, "radiance: %s declares no KV row span and cannot serve world_size = %d "
                         "with n_head_kv = %lld; the KV-head replication in geom_from needs the "
@@ -256,13 +256,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
      * deployment that has not accepted a lossy wire gets the exact kernel. `hops` (one-shot vs
      * two-shot) is left to the kernel library, by message size. */
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h);
 
     if (add_out)
         op_add = rw(b, RAD_OP(b, "add",

@@ -87,7 +87,7 @@ TEST(each_question_is_its_own_sequence_with_the_state_after_its_options) {
         "level": {"type": "score", "instructions": {"ask": "How urgent?"}, "criteria": ["Low", {"x": 1}]},
         "refund": {"type": "noul", "instructions": "Refund?", "criteria": {"True": "asks for money"}}}})",
                    &r, &e), RAD_OK);
-    CHECK_EQ(r.questions.size(), (size_t)3);
+    REQUIRE_EQ(r.questions.size(), (size_t)3);
     CHECK_EQ(r.state_tokens, (int64_t)std::string("Charged   twice.").size());
     const LayaQuestion& t = r.questions[0];
     CHECK_EQ(text(t), std::string("<CLS>choice question: Which team?<SEP><MASK> billing: Charges"
@@ -106,7 +106,7 @@ TEST(each_question_is_its_own_sequence_with_the_state_after_its_options) {
     CHECK(n.keys == std::vector<std::string>({ "false", "true" }));
 
     const std::vector<int32_t> w = laya_words(t);
-    CHECK_EQ(w.size(), (size_t)RAD_LAYA_W_MARKERS + 3);
+    REQUIRE_EQ(w.size(), (size_t)RAD_LAYA_W_MARKERS + 3);
     CHECK_EQ(w[RAD_LAYA_W_N], (int32_t)t.tokens.size());
     CHECK_EQ(w[RAD_LAYA_W_TYPE], (int32_t)RAD_LAYA_CHOICE);
     CHECK_EQ(w[RAD_LAYA_W_K], 3);
@@ -128,7 +128,7 @@ TEST(a_long_state_is_cut_to_the_room_its_question_leaves_and_usage_says_so) {
     const std::string q = R"(, "questions": {"q": {"type": "noul", "instructions": "Ok?"}}})";
     CHECK_EQ(parse("{\"state\": \"" + state + "\"" + q, &r, &e, settings(128, 64)), RAD_OK);
     const LayaQuestion& a = r.questions[0];
-    CHECK_EQ(a.tokens.size(), (size_t)128);
+    REQUIRE_EQ(a.tokens.size(), (size_t)128);
     CHECK_EQ(a.tokens.back(), (int32_t)kSep);
     CHECK_EQ(a.tokens[a.tokens.size() - 2], (int32_t)'a');          /* the start is kept */
     const json u = laya_usage(r);

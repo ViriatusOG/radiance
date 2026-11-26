@@ -8,11 +8,13 @@ links nothing of radiance's:
 - a **quantiser** turns a checkpoint's weights into the planes of an encoding, for `rad-convert`.
 
 A plugin is compiled against the installed `abi/` headers alone, so a third party can ship one
-without building the engine. The in-tree plugins (libr4d, libref, libavx, libquant and every
-architecture) use the same interface: each is built with `rad_add_plugin`, builds on its own
-against an installed radiance, and is found and ranked by what it declares, never by its name.
-`ctest -L oot` (`tests/oot_plugins.sh`) rebuilds them out of tree against an installed prefix
-(libr4d only when given a HIP compiler) and requires the same result.
+without building the engine. The in-tree plugins (libr4d, libref, libavx, libquant, every
+architecture, and the plugins under `plugin/`: spechub, glm and the EXL3-V3 set exl3i, exl3quant,
+qwen35_exl3 and gemma4_exl3) use the same interface: each is built with `rad_add_plugin`, builds on
+its own against an installed radiance, and is found and ranked by what it declares, never by its
+name. `ctest -L oot` (`tests/oot_plugins.sh`) rebuilds them out of tree against an installed prefix
+(the device libraries, libr4d and exl3i, only when given a HIP compiler) and requires the
+same result.
 
 §1-§9 cover kernel libraries, §10 a library for a new card, §11 and §12 architectures and
 quantisers, and §13 building, installing and the search path.
@@ -59,7 +61,7 @@ exports both.
 `"gfx11-generic"`, several separated by spaces or commas), `"host"` for CPU kernels, or `""` for a
 portable plugin. The engine checks the code objects the library carries instead (§10).
 
-Five more exports are optional, each looked up by exactly this name:
+Seven more exports are optional, each looked up by exactly this name:
 
 | symbol | meaning |
 |---|---|
@@ -67,6 +69,7 @@ Five more exports are optional, each looked up by exactly this name:
 | `void rad_plugin_close(void)` | called once at shutdown |
 | `int rad_kernel_concurrent(int i)` | nonzero: kernel `i` touches nothing but its operands and scratch, so independent launches may overlap |
 | `int rad_kernel_collective(int i)` | nonzero: kernel `i` exchanges data with the other ranks' cards, so the engine keeps its own bulk link traffic away while it runs. 2: each launch ends that hold itself once the other ranks' bytes have landed, through the `link_gate` parameter (`rad_abi.h`). Without this export only the `all_reduce` op is a collective |
+| `int rad_kernel_fetches_rows(int i)` | nonzero: kernel `i`, gathering rows of a table read in place from the container (the mapped tier, e.g. `--ngram-placement disk`), reads them itself (direct reads, a row cache of its own). Without it the engine asks the page cache for every page a host gather's rows cover before the launch, so the faults wait on reads issued together (`core/runtime/rowprefetch.h`); for such a kernel that would read each row twice. libavx's `embed_lookup_q` says so |
 | `int rad_plugin_reference(void)` | nonzero: a **reference implementation**, ranked below every unnamed library, refused for serving unless `server.debug-accept-reference-kernels`, and what `rad-kbench` checks the others against. libref declares itself this way |
 | `int rad_kernel_reference(int i)` | per row: nonzero marks kernel `i` as a reference implementation and 0 as a production one, overriding `rad_plugin_reference` for that library. For a plugin that ships a device row and its host oracle side by side (`plugin/spechub`) |
 

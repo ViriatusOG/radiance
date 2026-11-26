@@ -45,7 +45,7 @@ TEST(every_fixture_prompt_is_micas_byte_for_byte) {
         if (rc != RAD_OK) fprintf(stderr, "    %s: refused: %s\n", c["name"].get<std::string>().c_str(), e.message.c_str());
         CHECK_EQ(rc, RAD_OK);
         if (rc != RAD_OK) continue;
-        CHECK_EQ(r.rows.size(), c["prompts"].size());
+        REQUIRE_EQ(r.rows.size(), c["prompts"].size());
         for (size_t i = 0; i < r.rows.size() && i < c["prompts"].size(); ++i) {
             const std::string got = mica_prompt(r.rows[i], r.state);
             if (got != c["prompts"][i].get<std::string>())
@@ -85,6 +85,19 @@ TEST(every_request_mica_refuses_is_a_400) {
     }
 }
 
+TEST(a_request_with_too_many_questions_is_refused_before_any_prompt_is_built) {
+    json qs = json::object();
+    for (size_t i = 0; i <= kMaxDecisionQuestions; ++i)
+        qs["q" + std::to_string(i)] = { { "type", "noul" }, { "instructions", "Is it so?" } };
+    MicaRequest r;
+    ApiError e;
+    CHECK(parse({ { "state", "x" }, { "questions", qs } }, &r, &e) != RAD_OK);
+    CHECK_EQ(e.status, 400);
+    CHECK(e.message.find(std::to_string(kMaxDecisionQuestions)) != std::string::npos);
+    qs.erase("q0");
+    CHECK_OK(parse({ { "state", "x" }, { "questions", qs } }, &r, &e));
+}
+
 TEST(the_labels_are_micas_codebook) {
     MicaRow noul;
     noul.kind = "noul";
@@ -93,7 +106,7 @@ TEST(the_labels_are_micas_codebook) {
     choice.kind = "choice";
     choice.candidates.resize(255);
     const std::vector<std::string> l = mica_labels(choice);
-    CHECK_EQ(l.size(), (size_t)255);
+    REQUIRE_EQ(l.size(), (size_t)255);
     CHECK_EQ(l[0], std::string("A"));
     CHECK_EQ(l[51], std::string("z"));
     CHECK_EQ(l[52], std::string("AA"));

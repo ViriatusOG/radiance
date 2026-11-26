@@ -524,6 +524,7 @@ int Registry::commit_(Staged& s, int order) {
     const auto concurrent = dl_fn<RadKernelConcurrentFn>(s.handle, "rad_kernel_concurrent");
     const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
     const auto chainable  = dl_fn<RadKernelChainFn>(s.handle, "rad_kernel_chain");
+    const auto fetches    = dl_fn<RadKernelFetchesRowsFn>(s.handle, "rad_kernel_fetches_rows");
     /* Per row when exported, else the library's own answer: a plugin that ships a device row and
      * its host oracle in one library must not have the oracle's status leak onto the device row. */
     const auto kern_ref = dl_fn<RadKernelReferenceFn>(s.handle, "rad_kernel_reference");
@@ -541,6 +542,8 @@ int Registry::commit_(Staged& s, int order) {
         const int chains = chainable ? chainable(sr.second) : 0;
         row.chain        = chains != 0;
         row.chain_fenced = chains == 2;
+        row.chain        = chainable && chainable(sr.second) != 0;
+        row.fetches_rows = fetches && fetches(sr.second) != 0;
         set_->rows.push_back(row);
     }
 

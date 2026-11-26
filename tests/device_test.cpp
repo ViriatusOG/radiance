@@ -307,8 +307,7 @@ TEST(a_claim_that_shares_a_card_returns_with_the_cards_queues_drained) {
     Stream st;
     Event done;
     DevBuf<uint8_t> fat(big, RAD_MEM_DEVICE);
-    CHECK(!!fat);
-    if (!fat) return;
+    REQUIRE(!!fat);
     CHECK_OK(rad_dev_cards_claim(&card, 1, 1));            /* the first engine: the card is its own */
     for (int k = 0; k < 24; ++k) CHECK_OK(rad_memset_async(fat, k, big, st.s));
     CHECK_OK(rad_event_record(done.e, st.s));
@@ -422,9 +421,8 @@ TEST(a_pinned_range_larger_than_one_pin_is_one_range_on_the_card) {
     Stream st;
     DevBuf<uint8_t> h(n, RAD_MEM_HOST_MAPPED);
     DevBuf<uint8_t> d(w, RAD_MEM_DEVICE);
-    CHECK(h != nullptr);
-    CHECK(d != nullptr);
-    if (!h || !d) return;
+    REQUIRE(h != nullptr);
+    REQUIRE(d != nullptr);
     /* The host backend resolves only an allocation's base; interior addresses are checked on a
      * card only. */
     CHECK_EQ(rad_dev_device_ptr(h), (void*)h);
@@ -499,8 +497,7 @@ TEST(memcpy_async_then_stream_sync) {
 
     DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> dst(n, RAD_MEM_HOST);
-    CHECK(src && dst);
-    if (!src || !dst) return;
+    REQUIRE(src && dst);
 
     fill(src, n, 0xC0FFEEu);
     std::memset(dst, 0, (size_t)n);
@@ -525,8 +522,7 @@ TEST(memcpy_list_async_copies_every_segment_and_nothing_else) {
     DevBuf<uint8_t> src(slab, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> dev(slab, RAD_MEM_DEVICE);
     DevBuf<uint8_t> back(slab, RAD_MEM_HOST_PINNED);
-    CHECK(src && dev && back);
-    if (!src || !dev || !back) return;
+    REQUIRE(src && dev && back);
     fill(src, slab, 0x5EC5u);
 
     std::vector<RadCopySeg> segs;
@@ -571,8 +567,7 @@ TEST(memcpy_list_async_survives_its_ring_wrapping) {
     DevBuf<uint8_t> src(total, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> dev(total, RAD_MEM_DEVICE);
     DevBuf<uint8_t> back(total, RAD_MEM_HOST_PINNED);
-    CHECK(src && dev && back);
-    if (!src || !dev || !back) return;
+    REQUIRE(src && dev && back);
     fill(src, total, 0x3A11u);
     CHECK_OK(rad_memset_async(dev, 0, total, st.s));
     std::vector<RadCopySeg> segs((size_t)per);
@@ -603,8 +598,7 @@ TEST(memcpy_list_async_is_ordered_against_the_l2_both_ways) {
     DevBuf<uint8_t> back(n, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> a(n, RAD_MEM_DEVICE);
     DevBuf<uint8_t> b(n, RAD_MEM_DEVICE);
-    CHECK(src && back && a && b);
-    if (!src || !back || !a || !b) return;
+    REQUIRE(src && back && a && b);
     int stale = 0, lost = 0;
     for (int r = 0; r < 12; ++r) {
         fill(src, n, 0x1000u + (uint32_t)r);
@@ -689,8 +683,7 @@ TEST(link_gate_word_ends_a_hold_from_the_work_it_covers) {
     DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> dst(n, RAD_MEM_DEVICE);
     DevBuf<uint8_t> back(n, RAD_MEM_HOST_PINNED);
-    CHECK(src && dst && back);
-    if (!src || !dst || !back) return;
+    REQUIRE(src && dst && back);
     fill(src, n, 0x9A7Eu);
     const RadCopySeg seg{src, dst, n};
     CHECK_OK(rad_memcpy_list_async(&seg, 1, RAD_COPY_YIELD, t.s));
@@ -706,8 +699,7 @@ TEST(memset_async) {
      * hipMemsetAsync refuses pageable memory. The host backend cannot reproduce that refusal, so a
      * pageable target here would pass code that fails on a card. See core/device/device.h. */
     DevBuf<uint8_t> p(n, RAD_MEM_HOST_PINNED);
-    CHECK(p != nullptr);
-    if (!p) return;
+    REQUIRE(p != nullptr);
 
     std::memset(p, 0, (size_t)n);
     CHECK_OK(rad_memset_async(p, 0x5A, n, st.s));
@@ -729,8 +721,7 @@ TEST(memset_of_pageable_host_memory_is_refused_on_a_card) {
      * memory, so nothing is refused. */
     Stream st;
     DevBuf<uint8_t> p(4096, RAD_MEM_HOST);
-    CHECK(p != nullptr);
-    if (!p) return;
+    REQUIRE(p != nullptr);
     int s = rad_memset_async(p, 0, 4096, st.s);
     if (rad::device_is_host()) {
         CHECK_OK(s);
@@ -748,8 +739,7 @@ TEST(memcpy_2d_respects_the_pitch) {
     Stream st;
     DevBuf<uint8_t> s(SP * H, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> d(DP * H, RAD_MEM_HOST_PINNED);
-    CHECK(s && d);
-    if (!s || !d) return;
+    REQUIRE(s && d);
 
     fill(s, SP * H, 0xBEEF);
     CHECK_OK(rad_memset_async(d, 0xCC, DP * H, st.s));
@@ -779,8 +769,7 @@ TEST(twelve_thousand_copies_each_land_where_their_own_arguments_say) {
     DevBuf<uint8_t> back(bytes, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> src(bytes, RAD_MEM_DEVICE);
     DevBuf<uint8_t> dst(bytes, RAD_MEM_DEVICE);
-    CHECK(host && back && src && dst);
-    if (!host || !back || !src || !dst) return;
+    REQUIRE(host && back && src && dst);
 
     fill(host, bytes, 0xA11CE);
     CHECK_OK(rad_memcpy_async(src, host, bytes, st.s));
@@ -814,8 +803,7 @@ TEST(event_on_one_stream_orders_work_on_another) {
     DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> mid(n, RAD_MEM_DEVICE);
     DevBuf<uint8_t> dst(n, RAD_MEM_HOST);
-    CHECK(src && mid && dst);
-    if (!src || !mid || !dst) return;
+    REQUIRE(src && mid && dst);
 
     for (int round = 0; round < rounds; ++round) {
         Event e_a, e_b;
@@ -868,8 +856,7 @@ TEST(two_streams_joining_each_other_hundreds_of_times_neither_deadlock_nor_reord
     DevBuf<uint8_t> d1(big, RAD_MEM_DEVICE);
     DevBuf<uint8_t> h(big, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> r(small, RAD_MEM_HOST_PINNED);
-    CHECK(d0 && d1 && h && r);
-    if (!d0 || !d1 || !h || !r) return;
+    REQUIRE(d0 && d1 && h && r);
     fill(h, big, 0x5EED);
     CHECK_OK(rad_memcpy_async(d0, h, big, a.s));
     for (int i = 0; i < joins; ++i) {
@@ -898,8 +885,7 @@ TEST(an_event_destroyed_while_queued_work_names_it_still_orders_that_work) {
     DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
     DevBuf<uint8_t> mid(n, RAD_MEM_DEVICE);
     DevBuf<uint8_t> dst(n, RAD_MEM_HOST);
-    CHECK(src && mid && dst);
-    if (!src || !mid || !dst) return;
+    REQUIRE(src && mid && dst);
 
     for (int round = 0; round < 4; ++round) {
         fill(src, n, 0xDE570000u + (uint32_t)round);
@@ -1055,6 +1041,23 @@ TEST(directfile_write_then_read_roundtrip) {
      * or fails, so callers on the step path need not check a byte count. */
     CHECK(f.read_at(t2, body, tail + 1) < 0);
     CHECK(f.read_at(r, body + tail + A, A) < 0);
+
+    /* An extent rounded out to the alignment past end of file (the container's last weight):
+     * succeeds when what was needed arrived, fails when the needed bytes run past the end. */
+    {
+        DevBuf<uint8_t> big(body + A, RAD_MEM_HOST_PINNED);
+        CHECK(big);
+        if (big) {
+            std::memset(big, 0, (size_t)(body + A));
+            CHECK_OK(f.read_covering(big, 0, body + A, body + tail));
+            CHECK_EQ(std::memcmp(big, w, (size_t)body), 0);
+            CHECK_EQ(std::memcmp(big + body, t, (size_t)tail), 0);
+            CHECK(f.read_covering(big, 0, body + A, body + tail + 1) < 0);
+            CHECK(f.read_covering(big, A, body, body) < 0);          /* needed past the end */
+            CHECK_OK(f.read_covering(big, A, body, body - A + tail));
+            CHECK(f.read_covering(big, 0, A, A + 1) < 0);            /* need > bytes: refused */
+        }
+    }
 
     /* Reopen without O_TRUNC: the bytes are on disk, not in this handle. */
     f.close();

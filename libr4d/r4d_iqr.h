@@ -218,7 +218,7 @@ R4D_IQR_HD constexpr bool built(uint32_t w) {
     X(kTable, 2, 0, 0, 0, kBf16, 1) X(kTable, 3, 0, 0, 0, kBf16, 1)                              \
     X(kTable, 4, 0, 0, 0, kBf16, 1) X(kTable, 5, 0, 0, 0, kBf16, 1)                              \
     X(kZero, 6, 0, 0, 0, kBf16, 0) X(kZero, 7, 0, 0, 0, kBf16, 0)                                \
-    X(kZero, 8, 0, 0, 0, kBf16, 0)                                                               \
+    X(kZero, 8, 0, 0, 0, kBf16, 0) X(kSigned, 8, 0, 0, 0, kBf16, 0)                              \
     X(kTrellis, 2, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 3, 0, 12, 0, kE4m3Tensor, 1)             \
     X(kTrellis, 4, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 5, 0, 12, 0, kE4m3Tensor, 1)             \
     X(kTrellis, 6, 0, 12, 0, kE4m3Tensor, 1) X(kTrellis, 7, 0, 12, 0, kE4m3Tensor, 1)
@@ -248,7 +248,7 @@ R4D_IQR_HD constexpr EmbedOff embed_off(const Form& f, int64_t rows, int64_t K) 
 
 /* ---- the lm_head ------------------------------------------------------------------------------
  *
- * logits_gemm's row form (r4d_fp8_lm.h) at B bits a code: each row its K codes packed as the
+ * logits_gemm's row form (r4d_lm_row.h) at B bits a code: each row its K codes packed as the
  * container stores them, then its bf16 scale per 128 columns, padded to 16 bytes; the table of
  * 2^B int8 entries after the last row, 256-aligned. Table forms of 2 to 6 bits, unrotated. */
 R4D_IQR_HD constexpr int64_t lm_row(const Form& f, int64_t K) {

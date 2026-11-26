@@ -73,7 +73,7 @@ the test for every change here (see "Checking").
 At or below the bound the selection does not depend on the scores: every complete block, in
 block order, then the partial page. So a step that is *entirely* at or below it scores and selects
 at most once for the whole pass, and where nothing reads a selection not at all. The attention
-block decides (`AttnGatedFP8::qsa_use`, `arch/common/rad_block_attn_gated_fp8.h`) and hands the
+block decides (`AttnGatedQ::qsa_use`, `arch/common/rad_block_attn_gated_q.h`) and hands the
 answer to the indexer, which runs first (`QsaIndexer::step`'s `use`):
 
 | the step, at or below the bound | attention (unchanged) | the indexer issues |
@@ -140,7 +140,7 @@ it from the resolved attention kernel, and the plugin asks for 4 through the att
 kernel compiled at 4 resolves at declare and fails at issue.
 
 `attn_paged` takes the block table and `seqused_k` as ordinary operands
-(`arch/common/rad_block_attn_gated_fp8.h`), so the sparse attention is issued with `sel` in place
+(`arch/common/rad_block_attn_gated_q.h`), so the sparse attention is issued with `sel` in place
 of the sequence's table and `qsa_select`'s `seqused` in place of its length. Nothing in `core/`
 knows about QSA.
 

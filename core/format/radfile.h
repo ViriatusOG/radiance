@@ -21,6 +21,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -212,8 +213,17 @@ public:
     RadWriter& operator=(const RadWriter&) = delete;
 
     int  begin(const char* path);
+    /* Resume a killed write: open the target and its spill without truncating, so planes the
+     * journal marked complete stay where they are. abort() keeps both files. */
+    int  begin_resume(const char* path);
+    /* After seal(): record that a weight's planes are already at their offsets, for finish()'s
+     * completeness check. A resumed large weight skipped by the journal is named this way. */
+    int  mark_weight_done(int64_t idx);
+    /* Keep the target and its spill: a deliberate checkpoint, for a resume test or a pause. */
+    void abort_keep();
     void abort();                       /* discard, unlink both the target and the spill -- or, in
-                                         * append mode, cut the file back to its old length */
+                                         * append mode, cut the file back to its old length, or in
+                                         * resume mode leave both for the next attempt */
 
     void set_arch(std::string_view s)       { arch_ = s; }
     void set_model_name(std::string_view s) { model_ = s; }
@@ -308,7 +318,8 @@ private:
      * rebase them. */
     int  finish_append();
     int  check_complete() const;
-    bool     append_ = false;
+    bool        append_ = false;
+    bool        resume_ = false;    /* begin_resume: abort keeps the file and its spill */
     int64_t  old_size_ = 0, append_base_ = 0;
     uint64_t old_data_off_ = 0;
     RadFileHeader old_hdr_{};

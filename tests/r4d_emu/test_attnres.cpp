@@ -153,6 +153,76 @@ static int run_situ(int64_t M, int64_t n, double gcap, double ucap, double sigma
     return close(name, ref, got, 5e-3) ? 0 : 1;
 }
 
+static int run_case_bf16w(int64_t M, int64_t n, int64_t nS, bool with_add, const char* name) {
+    const int64_t MB = nS + 2, MT = M + 2;
+    const double eps = 1e-6;
+    std::vector<float> stf, curf, addf, wf;
+    auto st = bfv((size_t)(MB * MT * n), 1.5f, &stf);
+    auto cur = bfv((size_t)(M * n), 1.0f, &curf);
+    auto add = bfv((size_t)(M * n), 0.3f, &addf);
+    auto wb = bfv((size_t)n, 0.8f, &wf);
+    for (size_t i = 0; i < (size_t)n; ++i) {
+        wb[i] = rad_f32_to_bf16(1.0f + 0.1f * nrm());
+        wf[i] = rad_bf16_to_f32(wb[i]);
+    }
+    std::vector<float> qv((size_t)n);
+    for (auto& x : qv) x = nrm() * 0.2f;
+    std::vector<uint16_t> yb((size_t)(M * n), 0);
+
+    std::vector<double> ref((size_t)(M * n));
+    for (int64_t t = 0; t < M; ++t) {
+        std::vector<std::vector<double>> v;
+        for (int64_t i = 0; i <= nS; ++i) {
+            std::vector<double> x((size_t)n);
+            for (int64_t c = 0; c < n; ++c)
+                x[(size_t)c] = i < nS ? stf[(size_t)(i * MT * n + t * n + c)]
+                                      : (double)curf[(size_t)(t * n + c)] +
+                                            (with_add ? (double)addf[(size_t)(t * n + c)] : 0.0);
+            double ms = 0;
+            for (double e : x) ms += e * e;
+            const double r = 1.0 / std::sqrt(ms / n + eps);
+            for (double& e : x) e *= r;
+            v.push_back(x);
+        }
+        std::vector<double> sc;
+        double mx = -1e300;
+        for (auto& x : v) {
+            double d = 0;
+            for (int64_t c = 0; c < n; ++c) d += x[(size_t)c] * qv[(size_t)c];
+            sc.push_back(d / std::sqrt((double)n));
+            mx = std::max(mx, sc.back());
+        }
+        double den = 0;
+        for (double& s : sc) { s = std::exp(s - mx); den += s; }
+        std::vector<double> m((size_t)n, 0.0);
+        for (size_t i = 0; i < v.size(); ++i)
+            for (int64_t c = 0; c < n; ++c) m[(size_t)c] += sc[i] / den * v[i][(size_t)c];
+        double ms = 0;
+        for (double e : m) ms += e * e;
+        const double r = 1.0 / std::sqrt(ms / n + eps);
+        for (int64_t c = 0; c < n; ++c)
+            ref[(size_t)(t * n + c)] = m[(size_t)c] * r * (double)wf[(size_t)c];
+    }
+
+    RadTensor t[6] = {
+        nS > 0 ? tens(st.data(), RAD_BF16, { MB, MT, n }) : RadTensor{},
+        tens(cur.data(), RAD_BF16, { M, n }),
+        with_add ? tens(add.data(), RAD_BF16, { M, n }) : RadTensor{},
+        tens(qv.data(), RAD_F32, { 1, n }),
+        tens(wb.data(), RAD_BF16, { n }),
+        tens(yb.data(), RAD_BF16, { M, n }),
+    };
+    Params P;
+    P.i("M", M); P.i("n", n); P.i("n_state", nS); P.i("n_query", 1); P.str("dtype", "bf16");
+    P.f("eps", eps);
+    RadArgs a{}; a.t = t; a.n_t = 6; a.p = P.p.data(); a.n_p = (int)P.p.size();
+    const int rc = r4d_rad_attn_res_mix(&a, nullptr);
+    if (rc != RAD_OK) { std::printf("  %s launch %d\n", name, rc); return 1; }
+    std::vector<float> got((size_t)(M * n));
+    for (size_t i = 0; i < got.size(); ++i) got[i] = rad_bf16_to_f32(yb[i]);
+    return close(name, ref, got, 5e-3) ? 0 : 1;
+}
+
 int main() {
     int fails = 0;
     fails += run_situ(3, 96, 4.0, 25.0, 3.0, "situ around both caps");
@@ -172,6 +242,8 @@ int main() {
     fails += run_case(2, 40, 2, 3, true, "a narrow row, depth 2, M 2");
     /* The rows are cur's when the launch sees M at its band's upper bound. */
     fails += run_case(13, 2304, 4, 1, true, "M at its band's bound 2048, cur 13 rows", 2048);
+    fails += run_case_bf16w(5, 2304, 4, true, "depth 4, 1 query, 1D bf16 gain, with add");
+    fails += run_case_bf16w(3, 96, 1, false, "depth 1, 1 query, 1D bf16 gain, no add");
     std::printf("attn_res: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }

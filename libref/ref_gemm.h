@@ -108,7 +108,8 @@ static inline Scales make_scales(const RadTensor* s, int64_t rows, int64_t K, bo
      * row per operand row, through the stream's row stride.
      *
      * A rank-1 or flattened stream states no grid. With a scale per row it is nel / rows groups per
-     * row; with fewer it is one scale per block of rows (reading it per row would run off the end). */
+     * row; with fewer it is one scale per block of rows (reading it per row would run off the
+     * end). */
     int64_t groups = 0;
     if (s->rank >= 2) {
         const int64_t srows = s->shape[s->rank - 2];

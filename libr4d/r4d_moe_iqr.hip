@@ -467,7 +467,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
                     f8v raw = __builtin_bit_cast(f8v, (i8v)(kRbBias));
 #pragma unroll
                     for (uint32_t ks = 0; ks < kBlock / kK; ++ks)
-                        raw = mma8<true>(frag_of(a8[ks / 4u], ks % 4u), bq[j & 1u][ks], raw);
+                        raw = mma_i8(frag_of(a8[ks / 4u], ks % 4u), bq[j & 1u][ks], raw);
                     float xsv;
                     if constexpr (XO) xsv = XS[(size_t)(xso[j] + (kb >> ash))];
                     else              xsv = xsr[j][kb >> ash];

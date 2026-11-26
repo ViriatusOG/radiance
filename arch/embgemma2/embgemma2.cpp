@@ -266,10 +266,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_INT("vocab_offset", 0), RAD_F64("mult", escale)),
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
-    /* The per-layer inputs: the embedding projected to n_layer x n_ple and RMS-normed per layer.
-     * The reference scales the projection by hidden^-0.5 before the norm; the RMS norm of s*x with
-     * eps equals the norm of x with eps / s^2, which is what is declared, avoiding the bf16
-     * rounding of s*x. */
     /* A media part's rows overwrite its placeholders' embeddings before anything reads them, so an
      * image token's per-layer inputs come from its image row (declared only with a tower). */
     if ((Gemma4Vision::present(meta) && ctx->max_enc_patches > 0) ||
@@ -279,6 +275,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", "bf16")),
                                RAD_NOWEIGHTS),
                      {m.b_x}, {m.b_x});
+    /* The per-layer inputs: the embedding projected to n_layer x n_ple and RMS-normed per layer.
+     * The reference scales the projection by hidden^-0.5 before the norm; the RMS norm of s*x with
+     * eps equals the norm of x with eps / s^2, which is what is declared, avoiding the bf16
+     * rounding of s*x. */
     m.op_ple = rw(b, gemm(T, P, E, m.w_ple_proj), {m.b_x}, {m.b_ple});
     m.op_ple_norm = rw(b, rmsnorm(T * g.n_layer, m.n_ple, (double)g.eps * (double)E, m.w_ple_norm),
                        {m.b_ple}, {m.b_ple});
@@ -382,11 +382,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_NOWEIGHTS),
                    {m.b_h}, {m.b_mean});
     m.op_out  = rw(b, gemm(g.max_seqs, m.n_out, E, m.w_out), {m.b_mean}, {m.b_proj});
-    m.op_cast = rw(b, RAD_OP(b, "cast",
-                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", m.n_out),
-                                        RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                             RAD_NOWEIGHTS),
-                   {m.b_proj}, {m.b_pooled});
+    m.op_cast = cast_op(b, g.max_seqs, m.n_out, "bf16", "f32", m.b_proj, m.b_pooled);
 
     RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, E, (int)g.n_layer, "", "embgemma2"));
     RAD_ARCH_TRY(m.aud.declare(b, meta, ctx, nm, E, (int)g.n_layer + (int)m.vis.L.size(), "",

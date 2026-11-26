@@ -40,8 +40,8 @@
  *
  * A request is a lane: its branches' last hidden states, its first codes so far (the penalty's
  * history), and every frame's sixteen codes, which the vocoder reads back. The depth decoder's
- * sequence is rebuilt every frame and recomputed whole at each of its fifteen steps (causal
- * attention keeps the positions not yet written out of every result it reads).
+ * sixteen positions are computed incrementally, each from the keys and values the earlier
+ * positions of its sequence stored (step_depth_inc).
  *
  * One card: the model is 3.6B parameters, and a speech in flight is bound by the step's latency,
  * which tensor parallelism would only lengthen.
@@ -52,6 +52,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -206,7 +207,6 @@ struct Model {
 
     /* ---- the backbone */
     rad_weight w_norm = 0, w_head = 0;
-    rad_op  op_norm = 0;
     rad_buf b_x = 0, b_h = 0, b_q = 0, b_k = 0, b_v = 0, b_attn = 0, b_h2 = 0, b_gu = 0, b_ff = 0;
     rad_buf b_last = 0;
     std::vector<LmLayer> lm;
@@ -232,6 +232,19 @@ struct Model {
     rad_buf b_dgu = 0, b_dff = 0, b_didx = 0, b_dpos = 0, b_dcu = 0, b_demb = 0, b_drow = 0;
     rad_buf b_dsel = 0, b_dplane = 0, b_dlog = 0;
     std::vector<LmLayer> dep;
+    /* The incremental form (step_depth_inc): each layer's keys and values at the frame's
+     * positions, [n_layer * R, kv width] (sequence s's position j at row l R + 16 s + j); the
+     * bounds {0, 1} of a one-row query run and {0, p + 1} of pass p's key run; the pass's
+     * positions. */
+    rad_buf b_dkc = 0, b_dvc = 0, b_dcuq = 0, b_dcuk = 0, b_dposi = 0;
+    rad_op  op_dcuq = 0, op_dcuk[16] = {}, op_dposi[16] = {}, op_dnorm_i = 0;
+    std::vector<rad_op> op_dsk, op_dsv, op_dxa;
+    /* Its first pass, positions 0 and 1 together (2 S rows, a sequence's pair adjacent): the
+     * pairs' rows {2 s} and {2 s + 1}, their positions {0, 1, 0, 1, ...}, a pair's store rows
+     * {0, 1}, the pair's query bounds {0, 2}, and the causal attention over a pair. */
+    rad_buf b_dev = 0, b_dodd = 0, b_dpos2 = 0, b_d01 = 0, b_dcuq2 = 0;
+    rad_op  op_dev = 0, op_dodd = 0, op_dpos2 = 0, op_d01 = 0, op_dcuq2 = 0;
+    std::vector<rad_op> op_dxa2;
 
     /* ---- the codec (VOCODE) */
     rad_weight w_cb0 = 0, w_cbr = 0, w_qo0 = 0, w_qor = 0;
@@ -248,7 +261,7 @@ struct Model {
     rad_op  op_fs = 0, op_fcast = 0, op_cnst = 0, op_ccu[8] = {};
     VConv   fin{};
     rad_buf b_rq0 = 0, b_rqr = 0, b_qz = 0, b_qt = 0, b_pre = 0, b_cx = 0, b_ch = 0, b_cqkv = 0;
-    rad_buf b_cattn = 0, b_co = 0, b_cgu = 0, b_cff = 0, b_cn = 0, b_cy = 0;
+    rad_buf b_cattn = 0, b_co = 0, b_cgu = 0, b_cff = 0, b_cy = 0;
     rad_buf b_cconst = 0, b_ccu[8] = {};
     rad_buf b_ux[3] = {}, b_ua = 0, b_ub = 0, b_uh = 0, b_ug = 0;
     rad_buf b_vs[5] = {}, b_vt[5] = {}, b_va[5] = {}, b_vb[5] = {};
@@ -265,57 +278,6 @@ static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_we
                                    RAD_STR("dtype", "bf16"), RAD_F64("wadd", wadd)),
                         RAD_WEIGHTS(w)),
               { x }, { y });
-}
-
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf a, rad_buf c, rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
-}
-
-static rad_op gemm_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w, rad_buf x,
-                      rad_buf y) {
-    return rw(b, RAD_OP(b, "gemm_nt",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w)),
-              { x }, { y });
-}
-
-static rad_op gemm_bias_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
-                           rad_weight bias, rad_buf x, rad_buf y) {
-    return rw(b, RAD_OP(b, "gemm_nt_bias",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w, bias)),
-              { x }, { y });
-}
-
-static rad_op rows_op(RadBuilder* b, const char* op, int64_t rows, int64_t n,
-                      std::initializer_list<rad_buf> in, std::initializer_list<rad_buf> out) {
-    return rw(b, RAD_OP(b, op,
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              in, out);
-}
-
-static rad_op mulw_op(RadBuilder* b, int64_t rows, int64_t n, rad_weight w, rad_buf x, rad_buf y) {
-    return rw(b, RAD_OP(b, "mul_weight",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w)),
-              { x }, { y });
-}
-
-static rad_op iota_op(RadBuilder* b, int64_t rows, int64_t start, int64_t step, rad_buf y) {
-    return rw(b, RAD_OP(b, "iota",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("start", start),
-                                   RAD_INT("step", step)),
-                        RAD_NOWEIGHTS),
-              {}, { y });
 }
 
 static rad_op cu_op(RadBuilder* b, int64_t mult, rad_buf len, rad_buf y) {
@@ -826,6 +788,74 @@ static int declare_frame(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* Each layer's attention also reads the frame's sequence offsets. */
     for (const LmLayer& L : m.dep) RAD_ARCH_TRY(rad_op_reads(b, L.op_attn, &m.b_dcu, 1));
 
+    /* The incremental form (step_depth_inc): pass p runs only position p, one row a sequence,
+     * through the stack's own ops, and its attention reads the keys and values the earlier passes
+     * stored. Its tables are PERSIST, so the planner never lays them over anything; the stack's
+     * buffers it uses in another order are carried through the read-out below. */
+    {
+        const int64_t kd = gd.n_head_kv * gd.head_dim, hd = gd.head_dim;
+        m.b_dkc = decl_b(b, nm.f("dep.kc"), RAD_BF16, { gd.n_layer * R, kd }, RAD_BUF_PERSIST);
+        m.b_dvc = decl_b(b, nm.f("dep.vc"), RAD_BF16, { gd.n_layer * R, kd }, RAD_BUF_PERSIST);
+        m.b_dcuq = decl_b(b, nm.f("dep.cuq"), RAD_I32, { 2 }, RAD_BUF_PERSIST);
+        m.b_dcuk = decl_b(b, nm.f("dep.cuk"), RAD_I32, { 2 * kCodes }, RAD_BUF_PERSIST);
+        m.b_dposi = decl_b(b, nm.f("dep.posi"), RAD_I32, { S }, RAD_BUF_PERSIST);
+        m.op_dcuq = iota_op(b, 2, 0, 1, m.b_dcuq);
+        for (int p = 0; p < kCodes; ++p) {
+            m.op_dcuk[p] = iota_op(b, 2, 0, p + 1, m.b_dcuk);
+            m.op_dposi[p] = iota_op(b, S, p, 0, m.b_dposi);
+        }
+        for (int64_t l = 0; l < gd.n_layer; ++l) {
+            auto scat = [&](rad_buf src, rad_buf cache) {
+                return rw(b, RAD_OP(b, "scatter_rows",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", kd),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_NOWEIGHTS),
+                          { src, m.b_didx }, { cache });
+            };
+            m.op_dsk.push_back(scat(m.b_dk, m.b_dkc));
+            m.op_dsv.push_back(scat(m.b_dv, m.b_dvc));
+            m.op_dxa.push_back(rw(b, RAD_OP(b, "attn_cross",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("head_dim", hd),
+                                                       RAD_INT("gqa", gd.n_head / gd.n_head_kv),
+                                                       RAD_INT("causal", 0), RAD_STR("dtype", "bf16"),
+                                                       RAD_F64("scale", 1.0 / std::sqrt((double)hd))),
+                                            RAD_NOWEIGHTS),
+                                  { m.b_dq, m.b_dkc, m.b_dvc, m.b_dcuq, m.b_dcuk }, { m.b_dattn }));
+            if (!m.op_dsk.back() || !m.op_dsv.back() || !m.op_dxa.back()) return RAD_E_INVAL;
+        }
+        m.b_dev = decl_b(b, nm.f("dep.ev"), RAD_I32, { S }, RAD_BUF_PERSIST);
+        m.b_dodd = decl_b(b, nm.f("dep.odd"), RAD_I32, { S }, RAD_BUF_PERSIST);
+        m.b_dpos2 = decl_b(b, nm.f("dep.pos2"), RAD_I32, { 2 * S }, RAD_BUF_PERSIST);
+        m.b_d01 = decl_b(b, nm.f("dep.01"), RAD_I32, { 2 }, RAD_BUF_PERSIST);
+        m.b_dcuq2 = decl_b(b, nm.f("dep.cuq2"), RAD_I32, { 2 }, RAD_BUF_PERSIST);
+        m.op_dev = iota_op(b, S, 0, 2, m.b_dev);
+        m.op_dodd = iota_op(b, S, 1, 2, m.b_dodd);
+        m.op_dpos2 = rw(b, RAD_OP(b, "iota",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, 2 * S), RAD_INT("start", 0),
+                                             RAD_INT("step", 1), RAD_INT("period", 2)),
+                                  RAD_NOWEIGHTS),
+                        {}, { m.b_dpos2 });
+        m.op_d01 = iota_op(b, 2, 0, 1, m.b_d01);
+        m.op_dcuq2 = iota_op(b, 2, 0, 2, m.b_dcuq2);
+        for (int64_t l = 0; l < gd.n_layer; ++l) {
+            m.op_dxa2.push_back(rw(b, RAD_OP(b, "attn_cross",
+                                             RAD_PARAMS(RAD_RANGE("M", 1, 2), RAD_INT("head_dim", hd),
+                                                        RAD_INT("gqa", gd.n_head / gd.n_head_kv),
+                                                        RAD_INT("causal", 1), RAD_STR("dtype", "bf16"),
+                                                        RAD_F64("scale", 1.0 / std::sqrt((double)hd))),
+                                             RAD_NOWEIGHTS),
+                                   { m.b_dq, m.b_dkc, m.b_dvc, m.b_dcuq2, m.b_dcuk }, { m.b_dattn }));
+            if (!m.op_dxa2.back()) return RAD_E_INVAL;
+        }
+        if (!m.b_dev || !m.b_dodd || !m.b_dpos2 || !m.b_d01 || !m.b_dcuq2 || !m.op_dev ||
+            !m.op_dodd || !m.op_dpos2 || !m.op_d01 || !m.op_dcuq2)
+            return RAD_E_INVAL;
+        m.op_dnorm_i = norm_op(b, S, Dd, gd.eps, m.w_dnorm, m.b_dx, m.b_dplane);
+        if (!m.b_dkc || !m.b_dvc || !m.b_dcuq || !m.b_dcuk || !m.b_dposi || !m.op_dcuq ||
+            !m.op_dnorm_i)
+            return RAD_E_INVAL;
+    }
+
     m.op_dgather = rows_op(b, "gather_rows", S, Dd, { m.b_dx, m.b_didx }, { m.b_dsel });
     m.op_dnorm = norm_op(b, S, Dd, gd.eps, m.w_dnorm, m.b_dsel, m.b_dplane);
     m.op_dhead = rw(b, RAD_OP(b, "logits_gemm",
@@ -843,10 +873,15 @@ static int declare_frame(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                                 RAD_INT("sup_hi", kSupHi)),
                                      RAD_NOWEIGHTS),
                            { m.b_dlog }, { m.b_codes });
-    /* The buffers the next run of the stack reads stay live through this one's read-out. */
+    /* The buffers the next run of the stack reads stay live through this one's read-out; the
+     * incremental form also reads the stack's row buffers in its own order (layer 0's residual is
+     * the projected row, the read-out reads the residual itself). */
     {
-        const rad_buf carried[] = { m.b_dseq, m.b_dpos, m.b_dcu, m.b_didx };
-        RAD_ARCH_TRY(rad_op_reads(b, m.op_dsamp[kCodes - 1], carried, 4));
+        const rad_buf carried[] = { m.b_dseq, m.b_dpos, m.b_dcu, m.b_didx, m.b_drow, m.b_demb,
+                                    m.b_dx, m.b_dh, m.b_dq, m.b_dk, m.b_dv, m.b_dattn, m.b_dh2,
+                                    m.b_dgu, m.b_dff };
+        RAD_ARCH_TRY(rad_op_reads(b, m.op_dsamp[kCodes - 1], carried,
+                                  (int)(sizeof carried / sizeof carried[0])));
     }
 
     /* ---- the frame's codes into the lane's history; the next input of the backbone */
@@ -1188,12 +1223,8 @@ static int declare_codec(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                        rows[4], m.b_vt[4], 0, m.b_vout, m.b_ccu[7]));
     m.b_audio = decl_b(b, nm.f("codec.audio"), RAD_F32, { kVocChunk * kSamplesPerFrame, 1 },
                        RAD_BUF_PERSIST);
-    m.op_fcast = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kVocChunk * kSamplesPerFrame),
-                                         RAD_INT("n", 1), RAD_STR("from", "bf16"),
-                                         RAD_STR("to", "f32")),
-                              RAD_NOWEIGHTS),
-                    { m.b_vout }, { m.b_audio });
+    m.op_fcast = cast_op(b, (int64_t)kVocChunk * kSamplesPerFrame, 1, "bf16", "f32", m.b_vout,
+                         m.b_audio);
     return m.w_cb0 && m.w_cbr && m.w_qo0 && m.w_qor && m.w_ip && m.b_ip && m.w_cn && m.w_op &&
                    m.b_op && m.op_fs && m.op_fcast && m.op_cnst
                ? RAD_OK
@@ -1406,10 +1437,107 @@ static void step_prompt(RadCtx* c, const RadBatch* batch, const Model& m) {
     if (any_last) store_hidden(c, m, A, batch->n_seq, A->last_row, T);
 }
 
+/* The depth decoder's sixteen positions of every sequence, one pass for positions 0 and 1 (each
+ * sequence's pair causal over itself) and one pass for each position p >= 2 alone (S rows). Each
+ * pass stores its keys and values in the per-layer store and attends over positions 0..p from it,
+ * one sequence at a time: the stack is causal, so a position's states never change once computed,
+ * and every GEMM runs at decode height instead of re-running the stack over all 16 S rows
+ * fifteen times a frame. On the 8060S that took a frame from 131 ms to 77. */
+static void step_depth_inc(RadCtx* c, const Model& m, int64_t S, const RadOperand& seed,
+                           const RadOperand& frame, const RadOperand& cfg,
+                           const std::function<RadOperand(int)>& codes,
+                           const std::function<RadOperand(int)>& idx) {
+    const Geom& g = m.gd;
+    const int64_t Rx = (int64_t)kCodes * m.S;       /* a layer's rows in the store */
+    const int64_t kd = g.n_head_kv * g.head_dim, qd = g.n_head * g.head_dim;
+    const RadOperand cuq = brows(m.b_dcuq, 2), cuq2 = brows(m.b_dcuq2, 2);
+    RAD_ISSUE_N(c, m.op_dcuq, 2, cuq);
+    RAD_ISSUE_N(c, m.op_dcuq2, 2, cuq2);
+    RAD_ISSUE_N(c, m.op_d01, 2, brows(m.b_d01, 2));
+    RAD_ISSUE_N(c, m.op_dev, S, brows(m.b_dev, S));
+    RAD_ISSUE_N(c, m.op_dodd, S, brows(m.b_dodd, S));
+    RAD_ISSUE_N(c, m.op_dpos2, 2 * S, brows(m.b_dpos2, 2 * S));
+    /* Pass 1 runs positions 0 and 1 (T = 2 S rows, sequence s's pair at rows 2 s and 2 s + 1, in
+     * b_dseq); pass p >= 2 position p alone (S rows, layer 0's input the projected row). */
+    for (int p = 1; p < kCodes; ++p) {
+        const bool pair = p == 1;
+        const int64_t T = pair ? 2 * S : S;
+        const RadOperand cuk = brow_slice(m.b_dcuk, p, 2, 2);
+        const RadOperand pos = pair ? brows(m.b_dpos2, T) : brows(m.b_dposi, S);
+        RAD_ISSUE_N(c, m.op_dcuk[p], 2, cuk);
+        if (pair) {
+            RAD_ISSUE_N(c, m.op_din[0], S, brows(m.b_plane, S), RAD_W(m.w_din), brows(m.b_drow, S));
+            RAD_ISSUE_N(c, m.op_dscat, S, brows(m.b_drow, S), brows(m.b_dev, S), brows(m.b_dseq, T));
+        } else {
+            RAD_ISSUE_N(c, m.op_dposi[p], S, pos);
+        }
+        RAD_ISSUE_N(c, m.op_demb[p], S, codes(p - 1), RAD_W(m.w_cb), RAD_W(m.w_cb),
+                    brows(m.b_demb, S));
+        RAD_ISSUE_N(c, m.op_din[p], S, brows(m.b_demb, S), RAD_W(m.w_din), brows(m.b_drow, S));
+        if (pair)
+            RAD_ISSUE_N(c, m.op_dscat, S, brows(m.b_drow, S), brows(m.b_dodd, S), brows(m.b_dseq, T));
+        for (size_t l = 0; l < m.dep.size(); ++l) {
+            const LmLayer& L = m.dep[l];
+            const rad_buf x_in = l > 0 ? m.b_dx : pair ? m.b_dseq : m.b_drow;
+            RAD_ISSUE(c, L.op_n1, brows(x_in, T), RAD_W(L.w_n1), brows(m.b_dh, T));
+            RAD_ISSUE(c, L.op_q, brows(m.b_dh, T), RAD_W(L.w_q), brows(m.b_dq, T));
+            RAD_ISSUE(c, L.op_k, brows(m.b_dh, T), RAD_W(L.w_k), brows(m.b_dk, T));
+            RAD_ISSUE(c, L.op_v, brows(m.b_dh, T), RAD_W(L.w_v), brows(m.b_dv, T));
+            RAD_ISSUE(c, L.op_rq, brows(m.b_dq, T), pos);
+            RAD_ISSUE(c, L.op_rk, brows(m.b_dk, T), pos);
+            const int64_t l0 = (int64_t)l * Rx;
+            if (pair) {
+                /* A pair's two rows into its sequence's first two store rows, then causal over
+                 * them. */
+                for (int64_t sq = 0; sq < S; ++sq) {
+                    const RadOperand kc = brow_slice(m.b_dkc, l0 + kCodes * sq, kCodes, kd);
+                    const RadOperand vc = brow_slice(m.b_dvc, l0 + kCodes * sq, kCodes, kd);
+                    RAD_ISSUE_N(c, m.op_dsk[l], 2, brow_slice(m.b_dk, 2 * sq, 2, kd),
+                                brows(m.b_d01, 2), kc);
+                    RAD_ISSUE_N(c, m.op_dsv[l], 2, brow_slice(m.b_dv, 2 * sq, 2, kd),
+                                brows(m.b_d01, 2), vc);
+                    RAD_ISSUE_N(c, m.op_dxa2[l], 2, brow_slice(m.b_dq, 2 * sq, 2, qd), kc, vc, cuq2,
+                                cuk, brow_slice(m.b_dattn, 2 * sq, 2, qd));
+                }
+            } else {
+                RAD_ISSUE_N(c, m.op_dsk[l], S, brows(m.b_dk, S), idx(p),
+                            brow_slice(m.b_dkc, l0, Rx, kd));
+                RAD_ISSUE_N(c, m.op_dsv[l], S, brows(m.b_dv, S), idx(p),
+                            brow_slice(m.b_dvc, l0, Rx, kd));
+                for (int64_t sq = 0; sq < S; ++sq)
+                    RAD_ISSUE_N(c, m.op_dxa[l], 1, brow_slice(m.b_dq, sq, 1, qd),
+                                brow_slice(m.b_dkc, l0 + kCodes * sq, kCodes, kd),
+                                brow_slice(m.b_dvc, l0 + kCodes * sq, kCodes, kd), cuq, cuk,
+                                brow_slice(m.b_dattn, sq, 1, qd));
+            }
+            RAD_ISSUE(c, L.op_o, brows(m.b_dattn, T), RAD_W(L.w_o), brows(m.b_dh2, T));
+            RAD_ISSUE(c, L.op_add1, brows(x_in, T), brows(m.b_dh2, T), brows(m.b_dx, T));
+            RAD_ISSUE(c, L.op_n2, brows(m.b_dx, T), RAD_W(L.w_n2), brows(m.b_dh, T));
+            RAD_ISSUE(c, L.op_gu, brows(m.b_dh, T), RAD_W(L.w_gu), brows(m.b_dgu, T));
+            RAD_ISSUE(c, L.op_act, brows(m.b_dgu, T), brows(m.b_dff, T));
+            RAD_ISSUE(c, L.op_down, brows(m.b_dff, T), RAD_W(L.w_down), brows(m.b_dh2, T));
+            RAD_ISSUE(c, L.op_add2, brows(m.b_dx, T), brows(m.b_dh2, T), brows(m.b_dx, T));
+        }
+        if (pair) {
+            /* Position 1's rows are the read-out's. */
+            RAD_ISSUE_N(c, m.op_dgather, S, brows(m.b_dx, T), brows(m.b_dodd, S), brows(m.b_dsel, S));
+            RAD_ISSUE_N(c, m.op_dnorm, S, brows(m.b_dsel, S), RAD_W(m.w_dnorm), brows(m.b_dplane, S));
+        } else {
+            RAD_ISSUE_N(c, m.op_dnorm_i, S, brows(m.b_dx, S), RAD_W(m.w_dnorm), brows(m.b_dplane, S));
+        }
+        RadOperand head = RAD_W(m.w_dheads);
+        head.offset = (int64_t)(p - 1) * kVocab * g.n_embd;
+        head.rows = kVocab;
+        RAD_ISSUE_N(c, m.op_dhead, S, brows(m.b_dplane, S), head, brows(m.b_dlog, S));
+        RAD_ISSUE_N(c, m.op_dsamp[p], S, brows(m.b_dlog, S), seed, frame, codes(p), cfg, RAD_NONE,
+                    RAD_NONE);
+    }
+}
+
 static void step_frame(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadAudioGenBatch* A = batch->agen_b;
-    const int64_t n = A->n_lane, S = 2 * n, R = (int64_t)kCodes * S, D = m.gl.n_embd;
-    const int64_t Dd = m.gd.n_embd, Sx = m.S;   /* Sx: the codes' and indices' row pitch */
+    const int64_t n = A->n_lane, S = 2 * n;
+    const int64_t Sx = m.S;   /* the codes' and indices' row pitch */
     const RadOperand seed = praw(A->seed, RAD_U32, 2 * n), frame = praw(A->frame, RAD_I32, n);
     const RadOperand lanes = praw(A->lane, RAD_I32, n), slot = praw(A->slot, RAD_I32, S);
     const RadOperand cfg = praw(A->cfg, RAD_F32, n);
@@ -1432,33 +1560,7 @@ static void step_frame(RadCtx* c, const RadBatch* batch, const Model& m) {
     /* 2. the depth decoder's sequences: 16 rows each, the hidden state's projection at position 0
      * and each code's from position 1 */
     for (int p = 0; p < kCodes; ++p) RAD_ISSUE_N(c, m.op_iota[p], S, idx(p));
-    RAD_ISSUE_N(c, m.op_dpos, R, brows(m.b_dpos, R));
-    RAD_ISSUE_N(c, m.op_dzero, R, brows(m.b_dseq, R));
-    RAD_ISSUE_N(c, m.op_dcu, S + 1, praw(batch->cu_seqlens + 1, RAD_I32, 1), brows(m.b_dcu, S + 1));
-    RAD_ISSUE_N(c, m.op_din[0], S, brows(m.b_plane, S), RAD_W(m.w_din), brows(m.b_drow, S));
-    RAD_ISSUE_N(c, m.op_dscat, S, brows(m.b_drow, S), idx(0), brows(m.b_dseq, R));
-    const RadOperand dpos_r = brows(m.b_dpos, R);
-    const RadOperand dcu = brows(m.b_dcu, S + 1);
-    for (int p = 1; p < kCodes; ++p) {
-        /* Code p - 1 into position p. */
-        RAD_ISSUE_N(c, m.op_demb[p], S, codes(p - 1), RAD_W(m.w_cb), RAD_W(m.w_cb),
-                    brows(m.b_demb, S));
-        RAD_ISSUE_N(c, m.op_din[p], S, brows(m.b_demb, S), RAD_W(m.w_din), brows(m.b_drow, S));
-        RAD_ISSUE_N(c, m.op_dscat, S, brows(m.b_drow, S), idx(p), brows(m.b_dseq, R));
-        int layer = 0;
-        for (const LmLayer& L : m.dep)
-            step_layer(c, m, m.gd, L, batch, R, m.b_dx, &L == &m.dep[0] ? m.b_dseq : m.b_dx, m.b_dh,
-                       m.b_dq, m.b_dk, m.b_dv, m.b_dattn, m.b_dh2, m.b_dgu, m.b_dff, dpos_r, dcu,
-                       layer++);
-        RAD_ISSUE_N(c, m.op_dgather, S, brows(m.b_dx, R), idx(p), brows(m.b_dsel, S));
-        RAD_ISSUE_N(c, m.op_dnorm, S, brows(m.b_dsel, S), RAD_W(m.w_dnorm), brows(m.b_dplane, S));
-        RadOperand head = RAD_W(m.w_dheads);
-        head.offset = (int64_t)(p - 1) * kVocab * Dd;
-        head.rows = kVocab;
-        RAD_ISSUE_N(c, m.op_dhead, S, brows(m.b_dplane, S), head, brows(m.b_dlog, S));
-        RAD_ISSUE_N(c, m.op_dsamp[p], S, brows(m.b_dlog, S), seed, frame, codes(p), cfg, RAD_NONE,
-                    RAD_NONE);
-    }
+    step_depth_inc(c, m, S, seed, frame, cfg, codes, idx);
 
     /* 3. the frame into its lane's history, and the backbone over the frame's embedding */
     RAD_ISSUE_N(c, m.op_store, n, brows(m.b_codes, kCodes), lanes, frame,

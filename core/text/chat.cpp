@@ -391,6 +391,51 @@ static std::string bad_arguments(const ojson& messages) {
     return "";
 }
 
+/* Inkling 2's template writes a block per content part, <|message_ROLE|><|content_KIND|>...
+ * <|end_message|>, and spells a picture as its own block. The chat layer joins a message's parts
+ * into one text with the media marker where each picture was, so the template wraps the marker
+ * inside a text block. Each such block is cut at its markers: the text on either side keeps a text
+ * block of its own (an empty side none) and the marker gets `<header>MARKER<|end_message|>`, whose
+ * <|content_image|> the processor's run supplies (llama.cpp's inkling_split_media, the same cut).
+ * The marker's spelling is the server's RAD_MEDIA_MARKER. Returns whether anything moved. */
+static bool split_inkling_media(std::string* prompt) {
+    static const std::string kText = "<|content_text|>", kEnd = "<|end_message|>",
+                             kHead = "<|message_", kMarker = "<__media__>";
+    bool moved = false;
+    size_t pos = 0;
+    for (;;) {
+        const size_t m = prompt->find(kMarker, pos);
+        if (m == std::string::npos) break;
+        const size_t t = prompt->rfind(kText, m);
+        const size_t e = prompt->find(kEnd, m);
+        const size_t h = t == std::string::npos ? t : prompt->rfind(kHead, t);
+        const size_t prev_end = prompt->rfind(kEnd, m);
+        /* Only a marker inside one text block: its header, its text opener, no close between. */
+        if (t == std::string::npos || e == std::string::npos || h == std::string::npos ||
+            (prev_end != std::string::npos && prev_end > h) ||
+            prompt->find(kEnd, h) < t) {
+            pos = m + kMarker.size();
+            continue;
+        }
+        const std::string header = prompt->substr(h, t - h);
+        const std::string body = prompt->substr(t + kText.size(), e - t - kText.size());
+        std::string out;
+        size_t b = 0;
+        for (;;) {
+            const size_t k = body.find(kMarker, b);
+            const std::string text = body.substr(b, k == std::string::npos ? std::string::npos : k - b);
+            if (!text.empty()) out += header + kText + text + kEnd;
+            if (k == std::string::npos) break;
+            out += header + kMarker + kEnd;
+            b = k + kMarker.size();
+        }
+        prompt->replace(h, e + kEnd.size() - h, out);
+        pos = h + out.size();
+        moved = true;
+    }
+    return moved;
+}
+
 int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOptions& opt,
                         ChatPrompt* out) const {
     if (!ready()) {
@@ -491,6 +536,9 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     }
 
     out->prompt            = std::move(p.prompt);
+    if (impl_->src.find("<|message_user|>") != std::string::npos &&
+        impl_->src.find("<|content_image|>") != std::string::npos)
+        split_inkling_media(&out->prompt);
     out->generation_prompt = std::move(p.generation_prompt);
     out->grammar           = std::move(p.grammar);
     out->grammar_lazy      = p.grammar_lazy;

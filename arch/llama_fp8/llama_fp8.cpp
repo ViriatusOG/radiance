@@ -34,7 +34,7 @@
  * ============================== AN INT8 TRUNK ==============================
  *
  * The dense build also serves a recipe that makes the linears rotated int8 (IQ8R:
- * data/recipes/minicpm5-2b-iq8r.recipe). Each is a LinearFP8, which reads what the container holds,
+ * data/recipes/minicpm5-2b-iq8r.recipe). Each is a LinearQ, which reads what the container holds,
  * and declare() learns the format from the first layer's q|k|v before it declares the activations:
  * they then carry int8 codes with one scale per (token, scale group) in place of the E4M3 pair,
  * written by the norms, the gated product and the attention output's quantiser. The DSpark
@@ -50,22 +50,21 @@
 #define LLAMA_QUANT "fp8_e4m3"
 #endif
 
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include <arch/rad_arch.h>
-#include <arch/rad_block_attn_fp8.h>
+#include <arch/rad_block_attn_q.h>
 #include <arch/rad_block_dspark.h>
-#include <arch/rad_block_mlp_fp8.h>
+#include <arch/rad_block_mlp_q.h>
 
 namespace LLAMA_NS {
 
 using namespace rad::arch;
 
 struct Layer {
-    AttnFP8 attn;
-    MlpFP8  mlp;
+    AttnQ attn;
+    MlpQ  mlp;
 };
 
 struct Model {
@@ -80,15 +79,15 @@ struct Model {
      * first layer's fused q|k|v: the activations then carry int8 code pairs at `trunk_g8` columns
      * a scale, written by the norms, the gated product and the attention output's quantiser. */
     bool    trunk_i8 = false;
-    int64_t trunk_g8 = RAD_FP8_BLOCK;
+    int64_t trunk_g8 = RAD_SCALE_GROUP;
 
     rad_buf b_x = 0, b_hout = 0, b_logits = 0;
-    ActFP8  a_h{};
+    ActQ  a_h{};
     rad_buf b_qkv = 0;
     rad_buf b_q   = 0;
-    ActFP8  a_attn{};
+    ActQ  a_attn{};
     rad_buf b_gate_up = 0;
-    ActFP8  a_ffn{};
+    ActQ  a_ffn{};
 
     /* Auxiliary hidden-state taps, declared only when the container carries a drafter that wants
      * them. A DSpark or DFlash drafter reads the residual stream at several intermediate layers
@@ -224,7 +223,7 @@ static int declare_dspark(RadBuilder* b, const RadModelMeta* meta, const RadBuil
     RAD_ARCH_TRY(Dspark::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
     dc.fc_mapped = true;
     const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
-    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_SCALE_GROUP;
     auto dqcols = [dqg](int64_t n) { return (n + dqg - 1) / dqg; };
 
     /* DSpark's published config sets `sliding_window: null`, so this is normally a full cache. */
@@ -374,11 +373,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     fd.n_head_kv = g.n_head_kv;
     fd.head_dim  = g.head_dim;
     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
+    if (!m.kv_full) return RAD_E_INVAL;
     g.kv_dtype = rad_dtype_name(fd.dtype);
 
     /* ---- the trunk's stored format, read from the first layer's fused q|k|v before any
      * activation is declared: only an int8 trunk's activations carry an int8 code pair. The probe
-     * maps the weight through the layer's own LinearFP8, which then does not map it again; the
+     * maps the weight through the layer's own LinearQ, which then does not map it again; the
      * resize before the layer loop keeps the layers sized here. */
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
     m.layers.resize((size_t)m.n_main);
@@ -437,7 +437,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * Two key spellings: a SpecForge DFlash config nests the wiring under `dflash_config`, while
      * the published DSpark configs (openbmb/MiniCPM5-2B-DSpark and siblings) put it at the top
      * level. The flat key is read first. */
-    if (ctx->max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         const char* da = rad_meta_gets(meta, "draft.architectures", "");
         if (da && (std::strstr(da, "DSpark") || std::strstr(da, "DFlash"))) {
             const char* ids = rad_meta_gets(meta, "draft.target_layer_ids", nullptr);
@@ -446,12 +446,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (m.n_taps > 0) {
                 m.b_dfsrc = decl_b(b, nm.f("draft_src"), g.act_dtype,
                                    {g.max_tok, (int64_t)m.n_taps * g.n_embd});
-                m.op_tap = rw(b, RAD_OP(b, "cast",
-                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
-                                             RAD_INT("n", g.n_embd),
-                                             RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                                  RAD_NOWEIGHTS),
-                              {m.b_x}, {m.b_dfsrc});
+                m.op_tap = cast_op(b, g.max_tok, g.n_embd, g.dtype, g.dtype, m.b_x, m.b_dfsrc);
             } else {
                 fprintf(stderr, "radiance: llama: the container carries a '%s' drafter but names "
                                 "no trunk layer this model has; it is paired with a different "
@@ -489,25 +484,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Always exact: each token's embedding comes from one rank and the others contribute zero, so
      * a lossy wire would only add error. */
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                               RAD_NOWEIGHTS),
-                           {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
 
-    AttnFP8::Wire aw{};
+    AttnQ::Wire aw{};
     aw.x = m.b_x; aw.h = m.a_h; aw.qkv = m.b_qkv; aw.q = m.b_q; aw.attn = m.a_attn;
-    MlpFP8::Wire mw{};
+    MlpQ::Wire mw{};
     mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
 
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
-        /* Residual fold and collective placement: rad_fp8.h, layer_fold. */
+        /* Residual fold and collective placement: rad_linear.h, layer_fold. */
         const LayerFold f = layer_fold(g, l, m.n_main, m.tap_layer, m.n_taps, m.op_embed_ar != 0);
 
         const char* pre = "model.layers";
-        AttnFP8::Src as{};
+        AttnQ::Src as{};
         as.norm = nm.ckpt("%s.%lld.input_layernorm.weight",  pre, (long long)l);
         as.q    = nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l);
         as.k    = nm.ckpt("%s.%lld.self_attn.k_proj.weight", pre, (long long)l);
@@ -517,7 +507,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
                                       f.mix_fold, false, f.mix_ar_in, f.mix_ar_out));
 
-        MlpFP8::Src ms{};
+        MlpQ::Src ms{};
         ms.norm = nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l);
         ms.gate = nm.ckpt("%s.%lld.mlp.gate_proj.weight",            pre, (long long)l);
         ms.up   = nm.ckpt("%s.%lld.mlp.up_proj.weight",              pre, (long long)l);
@@ -572,11 +562,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     else
     rad_note(b, "a dense bf16 checkpoint, every linear quantised by the recipe to E4M3 with a "
                 "bf16 [N/%d,K/%d] scale plane (scale = block amax / 448, rounded to bf16)",
-             RAD_FP8_BLOCK, RAD_FP8_BLOCK);
+             RAD_SCALE_GROUP, RAD_SCALE_GROUP);
 #else
     rad_note(b, "weights are block-scaled fp8: E4M3 [N,K] with a bf16 [N/%d,K/%d] scale plane, "
                 "one stored weight taken by gemm_nt_q as two operands",
-             RAD_FP8_BLOCK, RAD_FP8_BLOCK);
+             RAD_SCALE_GROUP, RAD_SCALE_GROUP);
 #endif
     rad_note(b, "bf16 in the checkpoint: every norm, the embedding and the lm_head, which is "
                 "declared at what the container holds");

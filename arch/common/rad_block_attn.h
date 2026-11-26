@@ -158,13 +158,7 @@ inline int AttnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, 
 
     op_o = rw(b, gemm(g.n_embd, q_dim, w_o), {w.attn}, {w.h});
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h);
     op_add = rw(b, RAD_OP(b, "add",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_STR("dtype", g.dtype)),

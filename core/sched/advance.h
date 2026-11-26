@@ -73,17 +73,44 @@ enum AdvMode : int32_t {
  * drafter's own, with room). */
 enum { kAdvMaxPools = 6 };
 
-/* One paged group's cache on one rank, as ADV_COMPACT addresses it: `n_layers` caches of
- * [n_blocks, n_head, block_size, row_bytes] bytes, `layer_stride` apart from `base`
- * (core/runtime/kvbind.cpp composes that shape). `grp` indexes the batch's AdvGroup array, whose
- * block table maps a position to a block. */
+/* What a pool holds, and so what ADV_COMPACT moves (advance_impl.h, adv_compact). */
+enum AdvPoolKind : int32_t {
+    /* A paged KV group: [n_blocks, n_head, block_size, row_bytes] bytes a layer. Node path[t]'s
+     * K|V row, stored at the anchor's position + path[t], moves to position + t + 1. */
+    ADV_POOL_PAGED  = 0,
+    /* A RAD_KV_CONV group's rolling window: [n_states, n_chan, n_ent] elements of `row_bytes` a
+     * layer; a sequence's window is its state slot. The step left slot `hist + j` holding row j's
+     * input (docs/OPS.md, gdn_conv_update), so entry hist + path[t] moves to hist + t + 1 in
+     * every channel, and the next step's read at num_accepted - 1 finds the accepted path. */
+    ADV_POOL_CONV   = 1,
+    /* A RAD_KV_LINEAR group under the gdn `anchor` state form (abi/rad_gdn_anchor.h):
+     * [n_states, n_head, head_v, head_k] elements a layer, the replay records in the factor copy
+     * at state slot + copy_off, record j at j * rec_elems of each head's block. Record path[t]
+     * moves to t + 1, so the next step replays the accepted path as its prefix. */
+    ADV_POOL_ANCHOR = 2,
+};
+
+/* One KV group's cache on one rank, as ADV_COMPACT addresses it: `n_layers` caches
+ * `layer_stride` apart from `base` (core/runtime/kvbind.cpp composes the shapes). `grp` indexes
+ * the batch's AdvGroup array, whose block table maps a paged position to a block and whose slot
+ * mapping names a state group's slot. `n_head` is the work items a layer splits into: heads for a
+ * paged or anchor pool, channel chunks of kConvChunk for a conv pool. */
+enum { kAdvConvChunk = 64 };
 struct AdvPool {
     char*   base;
     int64_t layer_stride;
     int32_t n_layers;
     int32_t n_head;
-    int32_t row_bytes;
+    int32_t row_bytes;     /* paged: a K|V row; conv and anchor: one element */
     int32_t grp;
+    int32_t kind;          /* AdvPoolKind */
+    int32_t hist;          /* conv: conv_width - 2, the entries before the step's rows */
+    int32_t n_chan;        /* conv: channels a layer */
+    int32_t n_ent;         /* conv: entries a channel (the window) */
+    int32_t copy_off;      /* anchor: slots from the committed state to the factor copy */
+    int32_t rec_elems;     /* anchor: elements a record (rad_gdn_anchor_fstr) */
+    int64_t slot_elems;    /* anchor: elements a slot (n_head * head_v * head_k) */
+    int64_t head_elems;    /* anchor: elements a head (head_v * head_k) */
 };
 
 /* One KV group, as the builder stages it for this build. Offsets are bytes into the rank's slab,
@@ -168,8 +195,10 @@ int step_advance(const AdvanceArgs& a, RadStream s);
 /* ADV_COMPACT, after ADV_ACCEPT on a tree verify and before anything reads the trunk's cache: for
  * every row whose StepSlot holds an accepted path, move the K and V each path node's verify row
  * stored (at the anchor's position + its row index) to its committed position (+ its depth), in
- * every pool of `a`, every layer and every head. A separate kernel from the advance because it
- * moves bytes across the whole cache rather than patching a row's few integers. */
+ * every pool of `a`, every layer and every head; and the same for a recurrent layer's conv window
+ * entries and anchor replay records, so the next step's rollback contract (num_accepted, a row
+ * prefix) holds over the path (AdvPoolKind). A separate kernel from the advance because it moves
+ * bytes across the whole cache rather than patching a row's few integers. */
 int step_compact(const AdvanceArgs& a, RadStream s);
 
 }  /* namespace rad */

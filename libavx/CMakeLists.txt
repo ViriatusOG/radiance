@@ -45,9 +45,12 @@ set(AVX_KERNEL_SRC
   avx_gemm_tile.cpp
   avx_planes.cpp
   avx_lora.cpp
+  avx_sparse_kv.cpp
+  avx_ggml.cpp
   avx_attn.cpp
   avx_kvstream.cpp
   avx_pixtral.cpp
+  avx_ds41.cpp
   avx_sam_attn.cpp
   avx_qsa.cpp
   avx_moe.cpp
@@ -58,6 +61,7 @@ set(AVX_KERNEL_SRC
   avx_gen.cpp
   avx_gen_attn.cpp
   avx_video.cpp
+  avx_wan.cpp
   avx_ltx.cpp
   avx_vsa.cpp
   avx_audio.cpp
@@ -100,13 +104,33 @@ foreach(lvl RANGE 0 3)
   endif()
 endforeach()
 
+# The GEMMs over llama.cpp's native blocks dequantise with libquant's one definition of them, its
+# sources compiled once into the plugin as libref compiles them (nothing is linked, so abi/ stays the
+# whole contract), and read by every level. Out of tree, where libquant's sources are not beside
+# libavx, the ops have no row.
+set(AVX_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+set(AVX_GGML_SRC)
+if(EXISTS ${AVX_GGML_DIR}/lq_ggml_planes.cpp)
+  set(AVX_GGML_SRC ${AVX_GGML_DIR}/lq_ggml_planes.cpp ${AVX_GGML_DIR}/lq_ggml_dequant.cpp
+                   ${AVX_GGML_DIR}/lq_ggml_tables.cpp)
+  set_source_files_properties(${AVX_GGML_SRC} PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  foreach(lvl RANGE 0 3)
+    target_compile_definitions(avx_lvl${lvl} PRIVATE AVX_HAVE_GGML=1)
+    target_include_directories(avx_lvl${lvl} PRIVATE ${AVX_GGML_DIR})
+  endforeach()
+endif()
+
 # ============================ the plugin ============================
 # Baseline sources. avx_ngram.cpp is also here because it holds the embedding gather's row cache
 # and reader thread, which must exist once per process, not once per level.
-set(AVX_BASELINE_SRC avx_dispatch.cpp avx_registry.cpp avx_ngram.cpp)
+set(AVX_BASELINE_SRC avx_dispatch.cpp avx_registry.cpp avx_ngram.cpp ${AVX_GGML_SRC})
 
 rad_add_plugin(libavx kernels SOURCES ${AVX_BASELINE_SRC} INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
 
+if(AVX_GGML_SRC)
+  target_compile_definitions(libavx PRIVATE AVX_HAVE_GGML=1)
+  target_include_directories(libavx PRIVATE ${AVX_GGML_DIR})
+endif()
 foreach(lvl RANGE 0 3)
   target_link_libraries(libavx PRIVATE avx_lvl${lvl})
 endforeach()

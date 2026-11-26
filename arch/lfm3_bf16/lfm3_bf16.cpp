@@ -35,7 +35,7 @@
  *
  * ============================== 8-BIT LINEARS ==============================
  *
- * Every linear but the gate is a LinearFP8 (rad_fp8.h), as lfm2_bf16's are, so the container's
+ * Every linear but the gate is a LinearQ (rad_linear.h), as lfm2_bf16's are, so the container's
  * encoding of each weight decides the GEMM: plain bf16 is `gemm_nt` over the bf16 activation,
  * exactly as a bf16 model runs; int8 (`codes=i8 group=128 scale=bf16`) is `gemm_nt_q` at i8a8, and
  * the rotated form (those codes under the 128-wide Hadamard, data/recipes/lfm3-1.7b-iq8r.recipe,
@@ -52,9 +52,8 @@
  * or a rotary other than the default type: each is refused by name.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
-#include <cmath>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -66,7 +65,7 @@ using namespace rad::arch;
 enum Kind { kConv = 0, kFull = 1, kSliding = 2 };
 
 /* One plain bf16 linear: its weight and the gemm_nt over it. The attention gate is the one linear
- * declared this way: its weight is gate_proj's rows repeated, which the shared LinearFP8 that
+ * declared this way: its weight is gate_proj's rows repeated, which the shared LinearQ that
  * serves every other linear does not map. */
 struct Linear {
     rad_weight w = 0;
@@ -86,17 +85,17 @@ struct Layer {
     rad_weight w_norm = 0, w_post_norm = 0, w_ffn_norm = 0, w_ffn_post_norm = 0;
     rad_op op_norm = 0, op_post_norm = 0, op_add = 0;
     /* conv */
-    LinearFP8 conv_in, conv_out;
+    LinearQ conv_in, conv_out;
     rad_weight w_conv = 0;
     rad_op op_gate_in = 0, op_conv = 0, op_gate_out = 0;
     /* attention */
-    LinearFP8 q, k, v, out;
+    LinearQ q, k, v, out;
     Linear gate;
     rad_weight w_q_norm = 0, w_k_norm = 0;
     rad_op op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op op_store = 0, op_attn = 0, op_sigmoid = 0, op_gate_mul = 0;
     /* the feed-forward: norm, gate|up (w1 | w3), SiLU(gate) * up, down (w2), norm, residual add */
-    LinearFP8 gate_up, down;
+    LinearQ gate_up, down;
     rad_op op_ffn_norm = 0, op_act = 0, op_ffn_post_norm = 0, op_ffn_add = 0;
     /* The sandwich joins, fused: op_join is post_norm + add + ffn_norm, and op_ffn_join is
      * ffn_post_norm + ffn_add + the next layer's norm, which that layer then does not declare. */
@@ -113,13 +112,13 @@ struct Model {
     rad_buf b_x = 0, b_h = 0, b_arm = 0, b_bcx = 0, b_conv_in = 0, b_conv_out = 0;
     rad_buf b_q = 0, b_k = 0, b_v = 0, b_attn = 0, b_gate = 0, b_gate_up = 0, b_ffn = 0;
     rad_buf b_hout = 0, b_logits = 0;
-    /* The four activations a linear reads, as LinearFP8 takes them: the bf16 plane is the buffer
+    /* The four activations a linear reads, as LinearQ takes them: the bf16 plane is the buffer
      * above. */
-    ActFP8 a_h{}, a_attn{}, a_conv{}, a_ffn{};
+    ActQ a_h{}, a_attn{}, a_conv{}, a_ffn{};
     /* An int8 trunk (i8a8, or IQ8R at i8a8h), and its scale group along K, which the activations'
-     * int8 pairs share (ActFP8::g8). */
+     * int8 pairs share (ActQ::g8). */
     bool    q_i8 = false;
-    int64_t g8 = RAD_FP8_BLOCK;
+    int64_t g8 = RAD_SCALE_GROUP;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_gather = 0, op_final_norm = 0, op_logits = 0;
@@ -318,7 +317,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     {
         Layer& L0 = m.layers[0];
         const bool at = L0.kind != kConv;
-        LinearFP8& first = at ? L0.q : L0.conv_in;
+        LinearQ& first = at ? L0.q : L0.conv_in;
         const char* base0 = nm.f(at ? "blk.%d.attn_q" : "blk.%d.conv_in", 0);
         RAD_ARCH_TRY(first.probe(b, nm, g, base0,
                                  { nm.ckpt(at ? "%s.layers.%d.self_attn.%s" : "%s.layers.%d.conv.%s",
@@ -431,13 +430,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     };
     /* One linear: `base` is the declared name without `.weight`, `src` its checkpoint tensor (or
      * the tensors stacked along its rows, `parts` their row counts), `a` the activation it reads. */
-    auto linear = [&](LinearFP8& lin, int l, const char* base_fmt, int64_t N, int64_t K,
-                      std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
+    auto linear = [&](LinearQ& lin, int l, const char* base_fmt, int64_t N, int64_t K,
+                      std::initializer_list<const char*> src, const ActQ& a, rad_buf y,
                       std::initializer_list<int64_t> parts) -> int {
         const char* base = nm.f(base_fmt, l);
         RAD_ARCH_TRY(lin.declare(b, nm, g, base, N, K, RAD_SHARD_NONE, grp_layer(l), src, a, y, 0,
                                  parts));
-        /* Every linear has the trunk's format. LinearFP8 refuses a quantised weight in a bf16
+        /* Every linear has the trunk's format. LinearQ refuses a quantised weight in a bf16
          * trunk; this refuses a bf16 or narrower one in an int8 trunk. */
         if (g.w_bf16 ? !lin.bf16 : !(lin.i8 && !lin.iqr)) {
             fprintf(stderr, "radiance: lfm3: '%s.weight' is not in the trunk's format (%s); "

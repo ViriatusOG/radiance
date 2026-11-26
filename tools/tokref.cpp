@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <cstring>
 #include <queue>
 #include <regex>
 
@@ -107,9 +106,15 @@ bool pattern_is_structural(const std::string& raw) {
     const std::string p = canonicalise_pattern(raw);
     static const char* k_structural[] = {
         "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
-        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
-        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
-        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
+        "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|"
+        "\\s+(?!\\S)|\\s+",
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
+        "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|"
+        "\\s+(?!\\S)|\\s+",
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
+        "[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|"
+        "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         "\\p{Han}+",
         "\\p{AFMoE_digits}",
         "[^\\n]+|[\\n]+",
@@ -159,7 +164,8 @@ void apply_norm(std::string& text, const VocabStep& s) {
             std::vector<uint32_t> cpts = unicode_cpts_from_utf8(text);
             size_t a = 0, b = cpts.size();
             if (s.flags & 1) while (a < b && unicode_cpt_flags_from_cpt(cpts[a]).is_whitespace) ++a;
-            if (s.flags & 2) while (b > a && unicode_cpt_flags_from_cpt(cpts[b-1]).is_whitespace) --b;
+            if (s.flags & 2)
+                while (b > a && unicode_cpt_flags_from_cpt(cpts[b-1]).is_whitespace) --b;
             std::string out;
             for (size_t i = a; i < b; ++i) out += unicode_cpt_to_utf8(cpts[i]);
             text.swap(out);
@@ -213,7 +219,8 @@ void apply_bytelevel(std::vector<std::string>& words, const VocabStep& s) {
          * it as an explicit Split step, but the inline form must still work. */
         VocabStep split;
         split.kind = RAD_PRE_SPLIT;
-        split.arg0 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)";
+        split.arg0 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|"
+                     "\\s+(?!\\S)";
         split.iarg = SPLIT_ISOLATED;
         apply_split(words, split);
     }
@@ -295,7 +302,8 @@ void split_chars(std::vector<std::string>& words, Pred is_delim, int behavior) {
         std::vector<std::pair<std::string, bool>> parts;
         for (uint32_t c : unicode_cpts_from_utf8(w)) {
             const bool d = is_delim(c);
-            if (!d && !parts.empty() && !parts.back().second) parts.back().first += unicode_cpt_to_utf8(c);
+            if (!d && !parts.empty() && !parts.back().second)
+                parts.back().first += unicode_cpt_to_utf8(c);
             else parts.push_back({ unicode_cpt_to_utf8(c), d });
         }
         std::vector<std::string> kept;
@@ -313,7 +321,8 @@ void split_chars(std::vector<std::string>& words, Pred is_delim, int behavior) {
                 break;
             case SPLIT_MERGED_NEXT:
                 for (size_t k = parts.size(); k-- > 0; ) {
-                    if (parts[k].second && !prev && !kept.empty()) kept.back() = parts[k].first + kept.back();
+                    if (parts[k].second && !prev && !kept.empty())
+                        kept.back() = parts[k].first + kept.back();
                     else kept.push_back(parts[k].first);
                     prev = parts[k].second;
                 }
@@ -561,7 +570,8 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
 }
 
 /* Unigram by Viterbi (SentencePiece's algorithm), after llama.cpp's llm_tokenizer_ugm_session.
- * Scores are summed in double, as the reference does; in float the argmax differs on long inputs. */
+ * Scores are summed in double, as the reference does; in float the argmax differs on long
+ * inputs. */
 void unigram(const Vocab& v, const std::string& text, std::vector<int32_t>& out) {
     if (text.empty()) return;
     const size_t n = text.size();

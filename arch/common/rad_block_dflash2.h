@@ -1,7 +1,7 @@
 /* rad_block_dflash2.h -- the DFlash2 block-diffusion drafter, bf16.
  *
  * A small transformer that proposes a whole block of tokens in one forward pass. Compared with
- * the MTP head (rad_block_mtp_fp8.h):
+ * the MTP head (rad_block_mtp_q.h):
  *
  *     MTP        depth d costs d chained forwards; round i+1 embeds round i's token.
  *     DFlash2    depth d costs one forward over d+1 positions: the anchor token plus d mask
@@ -58,12 +58,16 @@
  *
  * The embedding table and lm_head. The checkpoint (81 tensors) ships neither, and
  * `mask_token_id` is an ordinary id in the target's vocabulary (248070 here), so there is no
- * separate mask embedding.
+ * separate mask embedding. A table embed_lookup cannot read (qwen35_exl3's exl3i trellis) is
+ * gathered by the plugin's own op (op_embed_ext), the rows the target's own embedding gives.
  *
- * The head reads the 2-bit copy of the lm_head, as the MTP head does (rad_block_mtp_fp8.h,
+ * The head reads the 2-bit copy of the lm_head, as the MTP head does (rad_block_mtp_q.h,
  * op_dlogits): the target verifies every draft with its own head, so a coarser draft costs only
  * acceptance, never an emitted token. Candidates are rescored against the target's head when it
- * is fp8 or int8 (op_drerank), so coarseness affects only which candidates are proposed.
+ * is fp8 or int8 (op_drerank), or by a plugin's own op over a head logit_rerank cannot read
+ * (op_rr_ext), so coarseness affects only which candidates are proposed. Where the target's head
+ * is already narrow (Inkling 2's int8 head) the block reads that head itself (w_thead) and keeps
+ * no copy.
  *
  * ============================== PLAIN NORMS ==============================
  *
@@ -84,7 +88,7 @@
  *                   (n_embd / world) and computes the fewest whole 128-row scale blocks that cover
  *                   it (the 31B at tp 4: 1344 columns a rank inside 11 blocks, 1408 rows, against
  *                   42 blocks whole), a row span of the one stored weight
- *                   (DenseFP8::declare_slice), so no reconvert. The GEMM takes its K split from
+ *                   (DenseQ::declare_slice), so no reconvert. The GEMM takes its K split from
  *                   the whole width (OPS.md's `split_n`), so each output is summed as the unsplit
  *                   fc sums it, and the all-gather reads each rank's window out of its wider rows
  *                   (an input pitch) and writes c whole. A GEMM cannot write a column slice (the
@@ -106,7 +110,7 @@
 #define RAD_BLOCK_DFLASH2_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"
+#include "rad_linear.h"
 #include "rad_spechub.h"   /* RAD_MTP_COUPLE_*: the coupling wire (--draft-coupling) */
 
 namespace rad {
@@ -151,6 +155,15 @@ struct Dflash2 {
          * a tanh soft cap on the draft logits. 1 and 0 leave the logits as the head gives them. */
         double  omul     = 1.0;
         double  scap     = 0.0;
+        /* `scap` taken after the selector adds its edge score to the unary logit rather than over
+         * the draft logits (dflash_config.selector_softcap_mode "after_correction"). The greedy
+         * walk takes each position's argmax of that sum, which an increasing cap leaves where it
+         * is, so the unary logits stay uncapped and no cap op is declared; a tree and the coupled
+         * walk weigh the scores themselves and are refused. */
+        bool    cap_after = false;
+        /* Candidates only from ids below this (the target's unpadded vocabulary): the head's rows
+         * past it are filled with -1e30 before the top-K. 0: every row of the head. */
+        int64_t vocab_real = 0;
         /* Bytes of the next GEMM's weight read into the cache beside each all-reduce of the query
          * pass (prefetch_beside, rad_arch.h); 0 reads none. */
         int64_t prefetch = 0;
@@ -165,13 +178,13 @@ struct Dflash2 {
          * acceptance, sum min(P, Q). */
         double  q_temp = 1.0;
         int64_t short_rows  = 0;
-        /* The drafter's linears are served at i8a8h (DenseFP8::w8h: IQ8R, or a rotated int8 or
+        /* The drafter's linears are served at i8a8h (DenseQ::w8h: IQ8R, or a rotated int8 or
          * narrower form at group 128), learned by the plugin from `probe_i8` before it declares the
          * activation pairs: they are then int8 codes with one f32 scale per (row, act_g8), written
          * by had_quant_act_i8g. Every linear must agree. `fc_mapped`: probe_i8 made
          * `dflash.fc.weight`'s name map. */
         bool    act_i8    = false;
-        int64_t act_g8    = RAD_FP8_BLOCK;
+        int64_t act_g8    = RAD_SCALE_GROUP;
         bool    fc_mapped = false;
         /* LiLiCorr's backbone (the LILICORR section above): sinks, and the head left to the
          * plugin. sel_rank and sel_topk are then unused. */
@@ -226,7 +239,7 @@ struct Dflash2 {
         rad_buf dq    = 0;  /* [srows, n_embd]  i8   the 2-bit head's quantised activation */
         rad_buf ds    = 0;  /* [srows, 1]       f32  one scale a row */
         rad_buf dsum  = 0;  /* [n_embd/128, pad] f32 GROUP-major, quant_act_i8's asum plane */
-        rad_buf dlog  = 0;  /* [srows, head_rows(g)] bf16  the coarse logits */
+        rad_buf dlog  = 0;  /* [srows, head_rows(g)] bf16  the coarse logits; f32 from w_thead */
         rad_buf cand  = 0;  /* [srows, sel_topk] i32  candidate token ids, global */
         rad_buf unary = 0;  /* [srows, sel_topk] f32  and their logits */
         /* Vocab-parallel pairs, declared only when head_sharded(g): (int32 id, f32 value) pairs
@@ -258,11 +271,11 @@ struct Dflash2 {
 
     /* model-scope weights.
      *
-     * The linears are block fp8 or OCP-MXFP4 (rad_fp8.h: DenseFP8, per the recipe) although the
+     * The linears are block fp8 or OCP-MXFP4 (rad_linear.h: DenseQ, per the recipe) although the
      * checkpoint is bf16: the drafter is read whole every decode step. On Qwen3.8-27B at depth 7,
      * MXFP4 accepts ~1% fewer tokens per step than fp8 and saves ~1.5 ms of a ~34 ms step.
      * Quantisation can only change acceptance, since every draft is verified. */
-    DenseFP8   w_fc{};
+    DenseQ   w_fc{};
     /* fc split by rows (see SHARDING): w_fc is this rank's fc_rows block-aligned rows, holding its
      * fc_share output columns at row fc_off. fc_rows 0: w_fc is the whole fc, replicated. */
     int64_t    fc_share = 0, fc_rows = 0, fc_off = 0;
@@ -284,9 +297,9 @@ struct Dflash2 {
     /* K and V are separate weights: a block-scaled operand's layout follows the op's N, so a fused
      * [2*kv_dim, n_embd] weight issued one half at a time would hand the layout hook a
      * [2*kv_dim/128][K/128] plane for a [kv_dim, K] op, which it refuses. */
-    DenseFP8   w_q[MAX_LAYERS]{},  w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
+    DenseQ   w_q[MAX_LAYERS]{},  w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
     rad_weight w_qn[MAX_LAYERS] = {}, w_kn[MAX_LAYERS] = {};
-    DenseFP8   w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
+    DenseQ   w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
     rad_weight w_acp[MAX_LAYERS] = {}, w_acb[MAX_LAYERS] = {};
     rad_weight w_fcp[MAX_LAYERS] = {}, w_fcb[MAX_LAYERS] = {};
 
@@ -348,6 +361,37 @@ struct Dflash2 {
     /* The target's lm_head, set by the plugin before declare when logit_rerank can read it (fp8 or
      * int8 rows); 0 keeps the coarse head's scores. */
     rad_weight w_lm = 0;
+    /* A rescoring op the plugin declares itself, for a head logit_rerank cannot read (qwen35_exl3's exl3i trellis head:
+     * exl3i_rerank). Its operands are logit_rerank's with the head as up to three weights, rr_w[0..]: x, head..., idx_in,
+     * idx, val, pairs. The plugin declares it over this block's buffers (sel_h, cand -> cand, unary[, dpair]) with its
+     * reads and writes, leaves w_lm 0 and sets op_rr_ext before declare; the block issues it where it would issue
+     * logit_rerank. 0: none. */
+    rad_op     op_rr_ext = 0;
+    rad_weight rr_w[3] = {};
+    /* An embedding op the plugin declares itself, for a token table embed_lookup cannot read (qwen35_exl3's exl3i trellis
+     * table: embed_exl3i). Its operands are embed_lookup's with the table as up to three weights, emb_w[0..]: token ids,
+     * table..., x. The plugin declares it over this block's x (M up to the query rows) with its writes, reading whole rows
+     * on every rank (no all-reduce), for an unscaled embedding, and sets op_embed_ext before declare; the block issues it
+     * where it would issue embed_lookup. 0: embed_lookup on w_tok. */
+    rad_op     op_embed_ext = 0;
+    rad_weight emb_w[3] = {};
+    /* An op the plugin declares itself over x in place (M up to the query rows), issued after the
+     * embedding and its all-reduce, with `post_embed_w` its one weight: operands x, the weight, x.
+     * For a target whose input embedding is more than the table lookup (Inkling 2 norms the
+     * looked-up row, embed_norm), so the query block embeds as the target embeds its own tokens.
+     * 0: none. */
+    rad_op     op_post_embed = 0;
+    rad_weight post_embed_w = 0;
+    /* The target's own head, set by the plugin before declare: logits_gemm reads it over `sel_h`
+     * into an f32 `dlog` (the plugin declares it so), in place of a draft-head copy, so there is
+     * no `dflash.draft_head` tensor and no rerank (the scores are already the target head's). Its
+     * rows are this rank's vocabulary slice, so above one rank the head must be vocab-sharded
+     * (head_sharded). 0: the copy. */
+    rad_weight w_thead = 0;
+    /* Config::vocab_real's fill over this rank's padded columns of `dlog`, [pad_lo, pad_lo +
+     * pad_n); 0 when this rank holds none. */
+    rad_op     op_dpad = 0;
+    int64_t    pad_lo = 0, pad_n = 0;
     /* Candidates the coarse head proposes for the rerank (logit_rerank's and row_topk's ceiling).
      * Rescoring is exact, so a wider set can only find more of the exact top sel_topk. */
     static constexpr int64_t kRerankR = 32;
@@ -368,7 +412,7 @@ struct Dflash2 {
         RAD_ARCH_TRY(map_linear(b, fwn, { nm.ckpt("%s.fc.weight", ck) }));
         RadEncoding fe{};
         *i8 = weight_enc(b, fwn, &fe) && linear_is_w8h(fe);
-        *g8 = *i8 ? linear_w8h_group(fe) : (int64_t)RAD_FP8_BLOCK;
+        *g8 = *i8 ? linear_w8h_group(fe) : (int64_t)RAD_SCALE_GROUP;
         return RAD_OK;
     }
 
@@ -392,7 +436,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                             int base_layer, rad_kvgroup group, rad_weight tok_embd,
                             const char* ck, const char* ck_lm, const Wire& wire) {
     g = geom; cfg = c; w = wire; first_layer = base_layer; kv = group; w_tok = tok_embd;
-    if (!ck || !ck_lm || !w_tok) return RAD_E_INVAL;
+    if (!ck || (!ck_lm && !w_thead) || !w_tok) return RAD_E_INVAL;
     if (g.n_layer <= 0 || g.n_layer > MAX_LAYERS) {
         fprintf(stderr, "radiance: dflash2 has %lld layers; this block carries at most %d\n",
                 (long long)g.n_layer, MAX_LAYERS);
@@ -400,6 +444,18 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     }
     if (cfg.block < 2 || cfg.n_taps <= 0 || (!cfg.lili && (cfg.sel_rank <= 0 || cfg.sel_topk <= 0)))
         return RAD_E_INVAL;
+    if (cfg.cap_after && (cfg.tree || wire.couple_draws || wire.couple_state)) {
+        fprintf(stderr, "radiance: dflash2: this drafter's softcap is taken after the selector's "
+                        "edge score, which only the greedy walk serves (no draft tree, no "
+                        "--draft-coupling)\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    if (w_thead && g.world > 1 && !head_sharded(g)) {
+        fprintf(stderr, "radiance: dflash2: the target's head is read in place of a draft-head "
+                        "copy, and at %d ranks its %lld rows do not shard evenly by vocabulary\n",
+                g.world, (long long)g.n_vocab_all);
+        return RAD_E_UNSUPPORTED;
+    }
 
     const int64_t NG   = cfg.ng(g.n_embd);
     const int64_t CD   = cfg.coef_dim(g.n_embd);
@@ -429,13 +485,13 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
         const RadEncPlane* fsc = nullptr;
         const bool fp8 = weight_enc(b, fwn, &fe) && rad_enc_is(&fe, "affine") && fe.n_planes == 2 &&
                          !fe.transform[0] && fe.plane[0].dtype == RAD_F8E4M3 &&
-                         (fsc = rad_enc_plane(&fe, "scale")) && fsc->block[0] == RAD_FP8_BLOCK &&
-                         fsc->block[1] == RAD_FP8_BLOCK;
-        const int64_t share = (g.world > 1 && g.n_embd % RAD_FP8_BLOCK == 0 &&
+                         (fsc = rad_enc_plane(&fe, "scale")) && fsc->block[0] == RAD_SCALE_GROUP &&
+                         fsc->block[1] == RAD_SCALE_GROUP;
+        const int64_t share = (g.world > 1 && g.n_embd % RAD_SCALE_GROUP == 0 &&
                                g.n_embd % g.world == 0 && (g.n_embd / g.world) % 8 == 0)
                                   ? g.n_embd / g.world : 0;
         if (fp8 && share > 0) {
-            const int64_t B  = RAD_FP8_BLOCK;
+            const int64_t B  = RAD_SCALE_GROUP;
             const int64_t lo = share * g.rank / B * B;
             const int64_t hi = (share * (g.rank + 1) + B - 1) / B * B;
             fc_share = share;
@@ -458,7 +514,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     w_norm  = decl_w(b, nm.f("dflash.norm.weight"), RAD_F32, {g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
 
-    /* The 2-bit draft head, declared as the MTP head's is (rad_block_mtp_fp8.h):
+    /* The 2-bit draft head, declared as the MTP head's is (rad_block_mtp_q.h):
      * `dflash.draft_head.weight` is the target's lm_head under its own name, quantised by the
      * recipe to u2 codes with an f16 scale and u8 zero per group of 128. One checkpoint tensor,
      * two views: codes, and the scale|zero planes the GEMM's relayout interleaves.
@@ -485,7 +541,9 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                          RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
         w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
                          RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
-
+    }
+    /* The target's own head (w_thead) is declared by the plugin; the copy is this block's. */
+    if (!cfg.lili && !w_thead) {
         const char* dhn = nm.f("dflash.draft_head.weight");
         RAD_ARCH_TRY(map_copy(b, dhn, ck_lm));
         /* The 8-bit form: int8 codes, one f16 scale per (row, 128 of K), symmetric, which
@@ -638,7 +696,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     }
 
     /* ---------------------------------------------------------------- the context pass */
-    /* Every linear is `fp8a8` (or `mxfp4a8` for a 4-bit recipe; DenseFP8 reads which from the
+    /* Every linear is `fp8a8` (or `mxfp4a8` for a 4-bit recipe; DenseQ reads which from the
      * container and declares the GEMM), reading an E4M3 activation pair from a `quant_act_fp8`.
      * There is no `fp8a16` band: that kernel is M <= 1, and neither pass runs at one row.
      *
@@ -649,9 +707,9 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      * scale group, and no fp8a8 fold. Its linears read one activation pair, so they are all
      * i8a8h forms at one group or none is. */
     const char* const qop = cfg.act_i8 ? "had_quant_act_i8g" : "quant_act_fp8";
-    const int64_t     qgr = cfg.act_i8 ? cfg.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    const int64_t     qgr = cfg.act_i8 ? cfg.act_g8 : (int64_t)RAD_SCALE_GROUP;
     {
-        auto fits = [&](const DenseFP8& d) {
+        auto fits = [&](const DenseQ& d) {
             return d.w8h == cfg.act_i8 && (!d.w8h || d.g8 == cfg.act_g8);
         };
         bool same = fits(w_fc);
@@ -738,7 +796,13 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     /* ---------------------------------------------------------------- the query pass */
     /* An unscaled lookup is declared exactly as before the scale existed, so a Qwen container
      * resolves the same op. */
-    if (cfg.escale != 1.0)
+    if (op_embed_ext) {
+        if (cfg.escale != 1.0) {
+            fprintf(stderr, "radiance: dflash2: a plugin embedding op takes no input_embedding_scale\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        op_embed = op_embed_ext;
+    } else if (cfg.escale != 1.0)
         op_embed = rw(b, RAD_OP(b, "embed_lookup",
                          RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
                                     RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
@@ -754,13 +818,8 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                      {}, {w.x});
     /* The trunk's embedding is vocab-sharded, so the lookup is partial and needs an exact
      * all-reduce. */
-    if (g.world > 1)
-        op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                            RAD_PARAMS(RAD_INT("world_size", g.world),
-                                       RAD_RANGE("numel", g.n_embd, qrows * g.n_embd),
-                                       RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                            RAD_NOWEIGHTS),
-                        {w.x}, {w.x});
+    if (g.world > 1 && !op_embed_ext)
+        op_embed_ar = decl_all_reduce_exact(b, g, w.x, g.n_embd, qrows, g.dtype);
     /* The query pass's quantisers, issued per layer: h2 twice (the convolution rewrites it between
      * the halves), attn and ffn once each. */
     op_qh2 = rw(b, RAD_OP(b, qop,
@@ -821,8 +880,8 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                         {w.h}, {w.coef});
         op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.h2q, w.h2s}, {w.gate_up});
         /* The fold saves two launches and the bf16 round trip of the [T, n_ff] product; it is an
-         * fp8a8 tile, so an MXFP4 or M2XFP4 gate_up takes the pair. */
-        if (!w_gu[i].mx && !w_gu[i].m2x && !w_gu[i].w8h)
+         * fp8a8 tile, so an MXFP4 gate_up takes the pair. */
+        if (!w_gu[i].mx && !w_gu[i].w8h)
             op_gug[i] = decl_gated_fold(b, qrows, 2 * g.n_ff, g.n_embd, w_gu[i].w, w_gu[i].s,
                                         {w.h2q, w.h2s}, {w.ffq, w.ffs}, &gated_rows);
         op_dn[i] = w_dn[i].gemm(b, qrows, g.n_embd, g.n_ff, {w.ffq, w.ffs}, {w.h});
@@ -947,13 +1006,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                    RAD_NOWEIGHTS),
                {w.gate_up}, {w.ffn});
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                      RAD_PARAMS(RAD_INT("world_size", g.world),
-                                 RAD_RANGE("numel", g.n_embd, qrows * g.n_embd),
-                                 RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                 RAD_INT("min_bytes", g.wire_min_bytes)),
-                      RAD_NOWEIGHTS),
-                  {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h, g.n_embd, qrows, g.dtype);
     op_add = rw(b, RAD_OP(b, "add",
                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
                               RAD_STR("dtype", g.dtype)),
@@ -1015,32 +1068,48 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                   {w.h}, {w.sel_h});
     /* LiLiCorr's head is the plugin's (rad_block_lilicorr.h), over sel_h. */
     if (cfg.lili) return RAD_OK;
-    if (!head_bf16)
+    if (!head_bf16 && !w_thead)
         op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
                           RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
                                      RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
                       {w.sel_h}, {w.dq, w.ds, w.dsum});
-    op_dlogits = head_bf16
+    /* The target's head writes f32 logits (logits_gemm); the copies write the activation dtype. */
+    const char* const dlt = w_thead ? "f32" : g.dtype;
+    op_dlogits = w_thead
+        ? rw(b, RAD_OP(b, "logits_gemm",
+                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n_vocab", head_rows(g)),
+                           RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
+                RAD_WEIGHTS(w_thead)),
+             {w.sel_h}, {w.dlog})
+        : head_bf16
         ? rw(b, RAD_OP(b, "gemm_nt",
                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
                            RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                 RAD_WEIGHTS(w_dh)),
              {w.sel_h}, {w.dlog})
         : head_i8
-        ? rw(b, RAD_OP(b, "gemm_nt_q",
-                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                           RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
-                           RAD_STR("dtype", "w8a8")),
-                RAD_WEIGHTS(w_dh, w_dhs)),
-             {w.dq, w.ds}, {w.dlog})
-        : rw(b, RAD_OP(b, "gemm_nt_q",
-                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                           RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
-                           RAD_STR("dtype", "w2a8")),
-                RAD_WEIGHTS(w_dh, w_dhs)),
-             {w.dq, w.ds, w.dsum}, {w.dlog});
-    if (cfg.scap > 0.0) {
+        ? decl_gemm_q(b, srows, head_rows(g), g.n_embd, DF_W2_GROUP, "w8a8", w_dh, w_dhs,
+                      { w.dq, w.ds }, w.dlog)
+        : decl_gemm_q(b, srows, head_rows(g), g.n_embd, DF_W2_GROUP, "w2a8", w_dh, w_dhs,
+                      { w.dq, w.ds, w.dsum }, w.dlog);
+    if (w_thead && !op_dlogits) return RAD_E_INVAL;
+    if (cfg.vocab_real > 0) {
+        const int64_t off = head_sharded(g) ? g.vocab_off : 0;
+        const int64_t lo  = std::max<int64_t>(cfg.vocab_real, off);
+        const int64_t hi  = std::min<int64_t>(g.n_vocab_all, off + head_rows(g));
+        pad_lo = hi > lo ? lo - off : 0;
+        pad_n  = hi > lo ? hi - lo : 0;
+        if (pad_n > 0) {
+            op_dpad = rw(b, RAD_OP(b, "fill",
+                            RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", pad_n),
+                                       RAD_STR("dtype", dlt), RAD_F64("value", -1e30)),
+                            RAD_NOWEIGHTS),
+                        {}, {w.dlog});
+            if (!op_dpad) return RAD_E_INVAL;
+        }
+    }
+    if (cfg.scap > 0.0 && !cfg.cap_after) {
         op_dcap = rw(b, RAD_OP(b, "logit_softcap",
                         RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", head_rows(g)),
                                    RAD_F64("cap", cfg.scap), RAD_STR("dtype", g.dtype)),
@@ -1051,18 +1120,18 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     /* Sharded, the top-R runs over this rank's plane, reports global ids and also writes the pair
      * plane the gather moves. Replicated, `vocab_off` is omitted: an optional parameter present
      * with value 0 is a different declaration from an absent one. */
-    const bool rerank = w_lm && (dh_shard || g.world <= 1);   /* see op_drerank below */
+    const bool rerank = (w_lm || op_rr_ext) && (dh_shard || g.world <= 1);   /* see op_drerank below */
     if (!rerank) top_w = cfg.sel_topk;
     op_dtopk = dh_shard
         ? rw(b, RAD_OP(b, "row_topk",
                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
                            RAD_INT("R", top_w), RAD_INT("vocab_off", g.vocab_off),
-                           RAD_STR("dtype", g.dtype)),
+                           RAD_STR("dtype", dlt)),
                 RAD_NOWEIGHTS),
              {w.dlog}, {w.cand, w.unary, w.dpair})
         : rw(b, RAD_OP(b, "row_topk",
                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                           RAD_INT("R", top_w), RAD_STR("dtype", g.dtype)),
+                           RAD_INT("R", top_w), RAD_STR("dtype", dlt)),
                 RAD_NOWEIGHTS),
              {w.dlog}, {w.cand, w.unary});
     /* Exact rescoring when the target's head can be read row by row: the coarse head proposes its
@@ -1073,7 +1142,9 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      *
      * Sharded, each rank rescores only ids it owns and the merge below ranks exact values. A
      * replicated head above one rank proposes ids other ranks own, so it keeps its own scores. */
-    if (rerank) {
+    if (rerank && op_rr_ext) {
+        op_drerank = op_rr_ext;   /* the plugin's own (op_rr_ext above), declared with its reads and writes */
+    } else if (rerank) {
         op_drerank = RAD_OP(b, "logit_rerank",
                         RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("R", top_w),
                                    RAD_INT("n_vocab", head_rows(g)), RAD_INT("n_embd", g.n_embd),
@@ -1210,7 +1281,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
             const int i = (int)l;
             pfa_w[i][0] = w_fcp[i];
             pfa_w[i][1] = w_gu[i].w;
-            pff_w[i][0] = l + 1 < g.n_layer ? w_acp[i + 1] : w_dh;
+            pff_w[i][0] = l + 1 < g.n_layer ? w_acp[i + 1] : w_thead ? w_thead : w_dh;
             pff_w[i][1] = l + 1 < g.n_layer ? w_q[i + 1].w : 0;
             for (int j = 0; j < 2; ++j) {
                 op_pfa[i][j] = decl_prefetch(b, pfa_w[i][j], cfg.prefetch);
@@ -1289,9 +1360,15 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     const rad_op* aconv = lo ? op_aconv_lo : op_aconv;
     const rad_op* fconv = lo ? op_fconv_lo : op_fconv;
 
-    RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.x, T));
+    if (op_embed_ext)
+        RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(emb_w[0]), RAD_W(emb_w[1]),
+                    RAD_W(emb_w[2]), brows(w.x, T));
+    else
+        RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.x, T));
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.x, T), RAD_NONE);
+    if (op_post_embed)
+        RAD_ISSUE_N(c, op_post_embed, T, brows(w.x, T), RAD_W(post_embed_w), brows(w.x, T));
 
     /* x += h2 waits for the norm after it, which takes it in (add_rmsnorm) where declared */
     bool add_pending = false;
@@ -1398,7 +1475,9 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
 
     /* `dsum` is group-major, [n_embd/group][ceil(M/16)*16], so it has no row slice; pass it
      * whole. */
-    if (head_bf16) {
+    if (w_thead) {
+        RAD_ISSUE_N(c, op_dlogits, S, brows(w.sel_h, S), RAD_W(w_thead), brows(w.dlog, S));
+    } else if (head_bf16) {
         RAD_ISSUE_N(c, op_dlogits, S, brows(w.sel_h, S), RAD_W(w_dh), brows(w.dlog, S));
     } else {
         RAD_ISSUE_N(c, op_dquant, S, brows(w.sel_h, S), brows(w.dq, S), brows(w.ds, S), RAD_B(w.dsum));
@@ -1408,13 +1487,17 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_dlogits, S, brows(w.dq, S), brows(w.ds, S), RAD_W(w_dh), RAD_W(w_dhs),
                     brows(w.dlog, S), head_i8 ? RAD_NONE : RAD_B(w.dsum), RAD_NONE);
     }
+    if (op_dpad) RAD_ISSUE_N(c, op_dpad, S, bcol(w.dlog, pad_lo, pad_n, S));
     if (op_dcap) RAD_ISSUE_N(c, op_dcap, S, brows(w.dlog, S), brows(w.dlog, S));
     /* RAD_NONE fills the unused `pairs` slot. Sharded, this rank's top-R are only candidates and
      * the merge overwrites `cand`/`unary`. */
     if (op_dmerge) {
         RAD_ISSUE_N(c, op_dtopk, S, brows(w.dlog, S), brows(w.cand, S), brows(w.unary, S),
                     brows(w.dpair, S));
-        if (op_drerank)
+        if (op_drerank && op_rr_ext)
+            RAD_ISSUE_N(c, op_drerank, S, brows(w.sel_h, S), RAD_W(rr_w[0]), RAD_W(rr_w[1]), RAD_W(rr_w[2]),
+                        brows(w.cand, S), brows(w.cand, S), brows(w.unary, S), brows(w.dpair, S));
+        else if (op_drerank)
             RAD_ISSUE_N(c, op_drerank, S, brows(w.sel_h, S), RAD_W(w_lm), brows(w.cand, S),
                         brows(w.cand, S), brows(w.unary, S), brows(w.dpair, S));
         RAD_ISSUE(c, op_dgather, brows(w.dpair, S), brows(w.dgath, S));
@@ -1422,7 +1505,10 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     } else {
         RAD_ISSUE_N(c, op_dtopk, S, brows(w.dlog, S), brows(w.cand, S), brows(w.unary, S),
                     RAD_NONE);
-        if (op_drerank)
+        if (op_drerank && op_rr_ext)
+            RAD_ISSUE_N(c, op_drerank, S, brows(w.sel_h, S), RAD_W(rr_w[0]), RAD_W(rr_w[1]), RAD_W(rr_w[2]),
+                        brows(w.cand, S), brows(w.cand, S), brows(w.unary, S), RAD_NONE);
+        else if (op_drerank)
             RAD_ISSUE_N(c, op_drerank, S, brows(w.sel_h, S), RAD_W(w_lm), brows(w.cand, S),
                         brows(w.cand, S), brows(w.unary, S), RAD_NONE);
     }

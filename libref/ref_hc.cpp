@@ -313,7 +313,7 @@ int ref_hc_project(const RadArgs* a, RadStream) {
  * The multi-token-prediction head's entry for a model whose residual stream is `hc` wide.
  *
  * A pre-norm MTP head (Qwen3.5, Qwen3-Next, DeepSeek-V3) joins the trunk's hidden state and the
- * next token's embedding with one `fc` over their concatenation (arch/common/rad_block_mtp_fp8.h:
+ * next token's embedding with one `fc` over their concatenation (the architecture's MTP block:
  * two rmsnorms into one buffer, one gemm_nt). Qwen4-Exp's hidden state is the wide stream and the
  * checkpoint carries two square matrices,
  *

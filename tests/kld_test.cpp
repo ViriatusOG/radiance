@@ -34,10 +34,7 @@ constexpr int64_t W = V / 2;
  * recorded once into a path, and a second recording into it is refused. */
 struct TmpDir {
     std::string path;
-    TmpDir() {
-        std::string t = radtest::tmp_path("case.XXXXXX");
-        path = mkdtemp(t.data()) ? t : "";
-    }
+    TmpDir() : path(radtest::make_tmp_dir("case")) {}
 };
 
 /* Logits with a confident head: one token a few nats above a normal spread, the shape where an
@@ -138,7 +135,6 @@ void record(const std::string& dir, const std::vector<float>& la, const std::vec
  * outside each document's scored range are left out. */
 TEST(a_candidate_scores_what_a_direct_computation_gives) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     const std::vector<float> ra = make_logits(40, 1), rb = make_logits(25, 2);
     record(t.path + "/ref", ra, rb);
 
@@ -182,7 +178,6 @@ TEST(a_candidate_scores_what_a_direct_computation_gives) {
  * second-order residue, and every argmax agrees. */
 TEST(the_reference_against_itself_scores_zero) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     const std::vector<float> ra = make_logits(40, 3), rb = make_logits(25, 4);
     record(t.path + "/ref", ra, rb);
     Kld k;
@@ -202,7 +197,6 @@ TEST(the_reference_against_itself_scores_zero) {
 /* A reference is never overwritten, and one whose recording did not finish is never read. */
 TEST(a_reference_is_written_once_and_read_only_when_complete) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     const std::vector<float> ra = make_logits(40, 5), rb = make_logits(25, 6);
     record(t.path + "/ref", ra, rb);
     {
@@ -242,7 +236,6 @@ TEST(a_document_must_leave_a_position_to_score) {
  * is still missing. Counted twice, a repeated document would cover for one the engine dropped. */
 TEST(a_position_fed_twice_is_counted_once_and_scored_from_the_second_feed) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     const std::vector<float> ra = make_logits(40, 11), rb = make_logits(25, 12);
     record(t.path + "/ref", ra, rb);
     std::vector<float> stale = ra;
@@ -271,7 +264,6 @@ TEST(a_position_fed_twice_is_counted_once_and_scored_from_the_second_feed) {
  * positions [score_from, n - 1) of a known document are rows. */
 TEST(spans_outside_a_documents_scored_range_are_skipped) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     const std::vector<float> ra = make_logits(40, 13), rb = make_logits(25, 14);
     record(t.path + "/ref", ra, rb);
     Kld k;
@@ -306,7 +298,6 @@ TEST(spans_outside_a_documents_scored_range_are_skipped) {
  * instrument is used for. */
 TEST(the_reports_statistics_are_those_of_its_rows) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     const std::vector<float> ra = make_logits(40, 15), rb = make_logits(25, 16);
     record(t.path + "/ref", ra, rb);
     std::vector<float> ca = ra, cb = rb;
@@ -393,7 +384,6 @@ double kl_coarse(const float* p, const float* q, int top) {
  * confident head, close to it. The manifest names the form, and the files hold no f16 rows. */
 TEST(a_sparse_reference_scores_the_coarsened_kl) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     constexpr int kTop = 64;
     const std::vector<float> ra = make_logits(40, 21), rb = make_logits(25, 22);
     record_top(t.path + "/ref", ra, rb, kTop);
@@ -454,7 +444,6 @@ TEST(a_sparse_reference_scores_the_coarsened_kl) {
 TEST(the_reference_against_its_sparse_self_scores_zero) {
     for (int top : { 64, (int)V }) {
         TmpDir t;
-        REQUIRE(!t.path.empty());
         const std::vector<float> ra = make_logits(40, 24), rb = make_logits(25, 25);
         record_top(t.path + "/ref", ra, rb, top);
         Kld k;
@@ -475,7 +464,6 @@ TEST(the_reference_against_its_sparse_self_scores_zero) {
  * tail is its true small value, not the noise one minus the head would leave. */
 TEST(a_sparse_reference_records_the_tail_mass_from_the_row) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     constexpr int kTop = 16;
     std::vector<float> ra = make_logits(40, 26), rb = make_logits(25, 27);
     for (int64_t r = 0; r < 25; ++r) rb[(size_t)(r * V + 3)] += 40.0f;   /* p_tail ~ e^-40 */
@@ -505,7 +493,6 @@ TEST(a_sparse_reference_records_the_tail_mass_from_the_row) {
 /* A head larger than the vocabulary, or past the cap, is refused when the recording opens. */
 TEST(a_sparse_head_must_fit_the_vocabulary) {
     TmpDir t;
-    REQUIRE(!t.path.empty());
     Kld k;
     CHECK_OK(k.add_doc("a", kDocA, 8));
     CHECK_EQ(k.record_into(t.path + "/a", V, "x", (int)V + 1), RAD_E_INVAL);

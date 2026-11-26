@@ -318,8 +318,8 @@ void table_pointers(const std::vector<uint64_t>& bases, int64_t n, int64_t entry
                     int64_t l, std::vector<uint64_t>* out);
 
 /* Rows of each of `buckets` experts out of `total`, skewed as real routing is: Zipf weights with
- * exponent 0.5 over the experts in a seeded order (the hottest of 128 takes about six times the mean
- * share), at most `cap` each (a token visits an expert once: the op's M), every row placed. */
+ * exponent 0.5 over the experts in a seeded order (the hottest of 128 takes about six times the
+ * mean share), at most `cap` each (a token visits an expert once: the op's M), every row placed. */
 std::vector<int64_t> skewed_counts(int64_t buckets, int64_t total, int64_t cap, uint64_t seed);
 
 /* An input drawn again for the timing pass, where the correctness draw gives the kernel less (or

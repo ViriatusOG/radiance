@@ -69,6 +69,7 @@ struct Site {
     std::string op;                  /* the gemm's op name */
     int32_t     n_modules = 0;       /* targeted sources */
     int32_t     max_rank = 0;
+    bool        fwht128_input = false;          /* shrink reads row-major H128(x) int8 codes */
     bool        parts_resolved = true;   /* false: the fused layout is decided by B rows at load */
     std::vector<SiteSource> sources;
     /* Per row part g of the weight (P = max(1, n_row_parts) entries): the part's rows in the
@@ -146,8 +147,10 @@ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets
 bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src);
 
 /* Is this op a LoRA-capable GEMM over weight handle `w` (as its `b` operand)? `why` says why not.
- * gemm_nt; gemm_nt_bias without `act`; gemm_nt_q without `pb1`/`pb2`, with K == the weight's K,
- * over a weight whose known encoding has no `transform`; gemm_nt_q_bias (same encoding rule). */
+ * gemm_nt and gemm_nt_bias without `act` read plain activations, including when the kernel's
+ * layout presents transformed stored weights in the plain basis. gemm_nt_q without pb1/pb2,
+ * with K == the weight's K, and gemm_nt_q_bias require an untransformed weight, except that a
+ * generator's supported fwht128 INT8/asymmetric U4 path adapts in the rotated input basis. */
 bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why);
 
 /* Every op that reads a targeted weight (any view of it) and is not a capable site over it. */
@@ -187,6 +190,19 @@ struct AdModule {
 int pack_modules(const std::vector<Site>& sites, int max_rank,
                  const std::map<std::string, AdModule>& mods, AdapterInfo* info,
                  std::vector<PackedSite>* packed, std::string* err, bool compact = false);
+
+/* Capture every resolved original reader once, at the end of declaration. A missing reader on
+ * a TP rank imposes no requirement; an existing reader without adapter wiring does. */
+std::map<std::string, std::string> generator_placement_issues(
+    const Program& prog, const TargetSet& targets, const std::set<uint32_t>& resolved);
+
+/* Require each requested matrix to reach all its resolved readers and at least one packed pool.
+ * Row mixers use replacement buffers instead of pools; `row_mixers` lists those eligible on all
+ * ranks after host-reader pruning. Legitimate rank-local omissions are allowed. */
+int check_generator_placement(const std::vector<AdapterInfo>& per_rank,
+    const std::vector<std::map<std::string, std::string>>& issues,
+    const std::set<std::string>& row_mixers, std::string* err,
+    const std::vector<std::set<std::string>>& required_slices = {});
 
 /* After load_adapter on every rank: refuse a module that no rank placed. With `prog`/`targets`
  * (any one rank's) the message says why it is not a site (base lacks it, scope, target list, op). */

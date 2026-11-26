@@ -105,7 +105,7 @@ TEST(softmax_normalises) {
 TEST(top_k_keeps_k_highest) {
     auto s = set_of({ 5.0f, 1.0f, 4.0f, 2.0f, 3.0f });
     host_top_k(s, 2);
-    CHECK_EQ(s.c.size(), (size_t)2);
+    REQUIRE_EQ(s.c.size(), (size_t)2);
     CHECK_EQ(s.c[0].id, 0);
     CHECK_EQ(s.c[1].id, 2);
 }
@@ -121,7 +121,7 @@ TEST(top_k_ties_break_on_lowest_id) {
      * or the device kernel cannot reproduce it. */
     auto s = set_of({ 2.0f, 2.0f, 2.0f, 1.0f });
     host_top_k(s, 2);
-    CHECK_EQ(s.c.size(), (size_t)2);
+    REQUIRE_EQ(s.c.size(), (size_t)2);
     CHECK_EQ(s.c[0].id, 0);
     CHECK_EQ(s.c[1].id, 1);
 }
@@ -166,7 +166,7 @@ TEST(top_p_boundary_is_the_float_sum) {
 TEST(top_p_single_dominant_token) {
     auto s = set_of(logits_for({ 0.99, 0.005, 0.005 }));
     host_top_p(s, 0.9f, 1);
-    CHECK_EQ(s.c.size(), (size_t)1);
+    REQUIRE_EQ(s.c.size(), (size_t)1);
     CHECK_EQ(s.c[0].id, 0);
 }
 
@@ -175,7 +175,7 @@ TEST(top_p_flat_distribution_and_ties) {
      * the answer is the two lowest ids, the only answer a device kernel can also produce. */
     auto s = set_of({ 1.0f, 1.0f, 1.0f, 1.0f });
     host_top_p(s, 0.5f, 1);
-    CHECK_EQ(s.c.size(), (size_t)2);
+    REQUIRE_EQ(s.c.size(), (size_t)2);
     CHECK_EQ(s.c[0].id, 0);
     CHECK_EQ(s.c[1].id, 1);
 }
@@ -203,7 +203,7 @@ TEST(min_p_single_dominant_token) {
     /* The mode always survives, even when the floor would exclude everything. */
     auto s = set_of(logits_for({ 0.99, 0.005, 0.005 }));
     host_min_p(s, 0.5f, 1);
-    CHECK_EQ(s.c.size(), (size_t)1);
+    REQUIRE_EQ(s.c.size(), (size_t)1);
     CHECK_EQ(s.c[0].id, 0);
 }
 
@@ -259,7 +259,7 @@ TEST(typical_prefers_the_expected_surprisal) {
      * most typical, not the first. This is what separates typical sampling from top-p. */
     auto s = set_of(logits_for({ 0.6, 0.2, 0.15, 0.05 }));
     host_typical(s, 0.1f, 1);
-    CHECK_EQ(s.c.size(), (size_t)1);
+    REQUIRE_EQ(s.c.size(), (size_t)1);
     CHECK_EQ(s.c[0].id, 1);
 }
 
@@ -369,7 +369,7 @@ TEST(xtc_drops_the_obvious_continuations) {
      * of the test. */
     auto s = set_of(logits_for({ 0.5, 0.3, 0.15, 0.05 }));
     host_xtc(s, 1.0f, 0.1f, 1, /*seed*/ 7, /*pos*/ 0);
-    CHECK_EQ(s.c.size(), (size_t)2);
+    REQUIRE_EQ(s.c.size(), (size_t)2);
     CHECK_EQ(s.c[0].id, 2);
     CHECK_EQ(s.c[1].id, 3);
 }
@@ -623,7 +623,7 @@ TEST(gbnf_admits_exactly_the_right_tokens_at_each_position) {
     /* Position 0: "a" (a prefix of ab), "ab" (the whole alternative) and "c". Not "b", not "d",
      * and not end-of-generation, since no parse has completed. */
     auto p0 = admitted(*g, v.n_tokens());
-    CHECK_EQ(p0.size(), (size_t)3);
+    REQUIRE_EQ(p0.size(), (size_t)3);
     CHECK_EQ(p0[0], 0);
     CHECK_EQ(p0[1], 2);
     CHECK_EQ(p0[2], 3);
@@ -631,7 +631,7 @@ TEST(gbnf_admits_exactly_the_right_tokens_at_each_position) {
     /* After "a" only "b" continues the parse. */
     CHECK_OK(g->accept_token(0));
     auto p1 = admitted(*g, v.n_tokens());
-    CHECK_EQ(p1.size(), (size_t)1);
+    REQUIRE_EQ(p1.size(), (size_t)1);
     CHECK_EQ(p1[0], 1);
 
     /* After "b" the parse is complete, so only end-of-generation is admissible; admitting text
@@ -639,7 +639,7 @@ TEST(gbnf_admits_exactly_the_right_tokens_at_each_position) {
     CHECK_OK(g->accept_token(1));
     CHECK(g->complete());
     auto p2 = admitted(*g, v.n_tokens());
-    CHECK_EQ(p2.size(), (size_t)1);
+    REQUIRE_EQ(p2.size(), (size_t)1);
     CHECK_EQ(p2[0], 5);
 }
 
@@ -652,7 +652,7 @@ TEST(gbnf_multi_character_token_is_admitted_whole) {
     CHECK_OK(g->accept_token(3));       /* "ab" in one token */
     CHECK(g->complete());
     auto p = admitted(*g, v.n_tokens());
-    CHECK_EQ(p.size(), (size_t)1);
+    REQUIRE_EQ(p.size(), (size_t)1);
     CHECK_EQ(p[0], 5);
 }
 
@@ -664,7 +664,7 @@ TEST(gbnf_char_class_and_repetition) {
     CHECK_OK(GbnfGrammar::create("root ::= [01]+\n", "root", &v, false, {}, {}, &g, &err));
 
     auto p0 = admitted(*g, v.n_tokens());
-    CHECK_EQ(p0.size(), (size_t)3);      /* "0", "1", "01" -- not "x", not eog */
+    REQUIRE_EQ(p0.size(), (size_t)3);      /* "0", "1", "01" -- not "x", not eog */
     CHECK_EQ(p0[0], 0);
     CHECK_EQ(p0[1], 1);
     CHECK_EQ(p0[2], 3);
@@ -673,7 +673,7 @@ TEST(gbnf_char_class_and_repetition) {
     /* One digit is a complete match and more digits are still admissible, so eog joins the set
      * rather than replacing it. */
     auto p1 = admitted(*g, v.n_tokens());
-    CHECK_EQ(p1.size(), (size_t)4);
+    REQUIRE_EQ(p1.size(), (size_t)4);
     CHECK_EQ(p1[3], 4);
 }
 
@@ -859,7 +859,7 @@ TEST(gbnf_refuses_parentheses_nested_past_the_limit) {
                            std::string(200, ')') + "\n";
     CHECK_OK(gbnf_create(ok, v, &g, &err));
     const auto ids = admitted(*g, v.n_tokens());
-    CHECK_EQ(ids.size(), (size_t)1);
+    REQUIRE_EQ(ids.size(), (size_t)1);
     CHECK_EQ(ids[0], 0);
 }
 
@@ -875,7 +875,7 @@ TEST(gbnf_left_recursion_check_does_not_recurse_per_rule) {
     chain += "r100000 ::= \"a\"\n";
     CHECK_OK(gbnf_create(chain, v, &g, &err));
     const auto ids = admitted(*g, v.n_tokens());
-    CHECK_EQ(ids.size(), (size_t)1);
+    REQUIRE_EQ(ids.size(), (size_t)1);
     CHECK_EQ(ids[0], 0);
 
     /* Every rule reaches the next twice, so a check that revisits cleared rules takes 2^60 steps.
@@ -916,7 +916,7 @@ TEST(gbnf_a_cycle_in_tail_position_is_not_left_recursion) {
     CHECK_OK(gbnf_create("root ::= (\"a\"?)*\n", v, &g, &err));
     for (int i = 0; i < 4; ++i) {
         const auto ids = admitted(*g, v.n_tokens());
-        CHECK_EQ(ids.size(), (size_t)2);     /* "a", and the end: the star is always complete */
+        REQUIRE_EQ(ids.size(), (size_t)2);     /* "a", and the end: the star is always complete */
         CHECK_EQ(ids[0], 0);
         CHECK_EQ(ids[1], 5);
         CHECK_OK(g->accept_token(0));
@@ -1517,7 +1517,8 @@ struct HostChain {
     Sampler  s;
     rad_buf  logits = RAD_NULL_HANDLE, tokens = RAD_NULL_HANDLE;
     int64_t  nv = 0;
-    bool     ok = false;
+    bool     loaded = false;   /* libref and the second plugin, when asked for, are in */
+    bool     ok = false;       /* and the chain was declared, built and its context made */
     int      st = RAD_OK;
     int64_t  step_no = 0;   /* the engine step the next step() stages for */
 
@@ -1536,6 +1537,7 @@ struct HostChain {
         /* A second library by name, for an op libref does not carry (the coupling's verify op is
          * the spechub plugin's, host row included). */
         if (second_plugin && reg.load_plugin(home() + "/kernels/" + second_plugin, 0) < 0) return;
+        loaded = true;
         RadModelMeta meta{};
         meta.arch_id = "sampler_chain";
         meta.name    = "sampler_chain";
@@ -1626,11 +1628,13 @@ struct HostChain {
     }
 };
 
+/* A chain whose libraries are not in the build leaves the case as a missing artifact; one that
+ * loaded but did not build is a failure. */
 #define NEED_CHAIN(ch)                                                                \
-    if (!(ch).ok) {                                                                   \
-        fprintf(stderr, "  SKIP %s: libref did not load from %s/kernels\n",           \
-                ::radtest::current(), home().c_str());                          \
-        return;                                                                       \
+    {                                                                                 \
+        if (!(ch).loaded)                                                             \
+            ARTIFACT_MISSING(home() + "/kernels: libref or the second plugin");       \
+        REQUIRE((ch).ok);                                                             \
     }
 
 Request make_req(uint64_t id, std::vector<int32_t> prompt, const SamplingParams& sp) {
@@ -2375,6 +2379,19 @@ TEST(reasoning_count_follows_the_parser_s_reading_of_the_block) {
     c.start(s);
     for (int32_t t : { 1, 4, 1 }) c.push(s, t);
     CHECK_EQ(c.tokens, (int64_t)0);        /* a block opened mid-reply is not one */
+
+    /* A reply whose every message opens with a header (Inkling 2's <|message_model|>) writes it
+     * before the opener: passed over, not counted, and only ahead of the opener. */
+    s.frame = 9;
+    c.start(s);
+    for (int32_t t : { 9, 4, 1, 1, 5, 9, 1 }) c.push(s, t);
+    CHECK_EQ(c.tokens, (int64_t)4);
+    CHECK_EQ(c.body, (int64_t)2);
+    CHECK(!c.inside());
+    c.start(s);
+    for (int32_t t : { 9, 1, 4, 1 }) c.push(s, t);
+    CHECK_EQ(c.tokens, (int64_t)0);        /* a header then text: no block */
+    s.frame = -1;
 
     c.start(ReasoningSpan{});
     c.push(ReasoningSpan{}, 1);
@@ -3316,10 +3333,8 @@ RadParam iparam(const char* k, long long v) {
  * the candidate width, which leaves holes the merge must step over. */
 TEST(the_split_vocabulary_merge_equals_top_k_over_the_whole_row) {
     Registry reg;
-    if (reg.load_plugin(home() + "/kernels/libref.so", 0) < 0) {
-        fprintf(stderr, "  SKIP: libref did not load from %s/kernels\n", home().c_str());
-        return;
-    }
+    const std::string libref = home() + "/kernels/libref.so";
+    if (reg.load_plugin(libref, 0) < 0) ARTIFACT_MISSING(libref);
     struct Shape { int64_t V, C; std::vector<int64_t> splits; };
     const Shape shapes[] = { { 37, 8, { 16, 20 } }, { 10, 16, { 4 } } };
     constexpr int64_t M = 6;
@@ -3460,11 +3475,7 @@ TEST(a_dry_row_with_breakers_has_its_raw_logprob) {
  * makes the declaration succeed here; build_step alone is driven, so the op never runs. */
 TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
     HostChain ch(64, 2, 3, nullptr, 8, "spechub.so", true);
-    if (!ch.ok) {
-        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
-                ::radtest::current(), home().c_str());
-        return;
-    }
+    NEED_CHAIN(ch)
 
     SamplingParams sp;
     sp.temp = 1.0f;
@@ -3531,11 +3542,7 @@ TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
  * step's snapshot, and a host row. */
 TEST(the_coupled_evidence_survives_the_drafters_greedy_build) {
     HostChain ch(64, 2, 3, nullptr, 8, "spechub.so", true);
-    if (!ch.ok) {
-        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
-                ::radtest::current(), home().c_str());
-        return;
-    }
+    NEED_CHAIN(ch)
 
     SamplingParams sp;
     sp.temp = 1.0f;
@@ -3604,11 +3611,7 @@ TEST(the_coupled_evidence_survives_the_drafters_greedy_build) {
  * gap do not, and without the flag nothing is marked. */
 TEST(block_verification_marks_the_consecutive_bound_rows_of_a_chain) {
     HostChain ch(64, 2, 3, nullptr, 8, "spechub.so", true, true);
-    if (!ch.ok) {
-        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
-                ::radtest::current(), home().c_str());
-        return;
-    }
+    NEED_CHAIN(ch)
     SamplingParams sp;
     sp.temp = 1.0f;
     const int32_t draft[3] = { 21, 22, 23 };
@@ -3637,7 +3640,7 @@ TEST(block_verification_marks_the_consecutive_bound_rows_of_a_chain) {
 
     /* the same chain without the flag is not marked */
     HostChain plain(64, 2, 3, nullptr, 8, "spechub.so", true, false);
-    CHECK(plain.ok);
+    REQUIRE(plain.ok);
     CHECK_OK(plain.s.begin_request(r.id, r.sp, &err));
     couple_states(r.id, r.sp.seed, draft, 3, rad_mtp_couple_verify_pos(n_out, 1), bound);
     CHECK_OK(plain.s.set_mtp_couple(r.id, bound, 3));
@@ -3655,11 +3658,7 @@ TEST(block_verification_marks_the_consecutive_bound_rows_of_a_chain) {
  * own pick. */
 TEST(traversal_verification_walks_the_staged_chain_through_the_sampler) {
     HostChain ch(64, 2, 3, nullptr, 8, "spechub.so", true, false, true);
-    if (!ch.ok) {
-        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
-                ::radtest::current(), home().c_str());
-        return;
-    }
+    NEED_CHAIN(ch)
     CHECK(ch.s.staged_couple_op() != RAD_NULL_HANDLE);
     SamplingParams sp;
     sp.temp = 1.0f;

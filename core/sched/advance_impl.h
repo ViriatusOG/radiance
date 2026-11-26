@@ -320,13 +320,15 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
 }
 
 /* ADV_COMPACT for one (batch row, pool, layer, head): the moves the row's accepted path asks
- * for, `c0` and every `cstep`-th 16-byte chunk of each K|V row. A row is whole 32-bit words; the
- * words past its last whole chunk (an int8 cache's two f16 scales) go with the caller whose chunk
- * set the next chunk would be in. Node path[t] stored at
- * base + path[t] and belongs at base + t + 1. path[] increases (a parent's index is below its
- * child's) and path[t] >= t + 1, so in t order no move overwrites a node a later move still reads:
- * a destination base + t + 1 is either the node's own place or a place a node already moved out
- * of. Each caller keeps one chunk set across every t, so its reads and writes stay in order. */
+ * for. Node path[t] is stored at index path[t] (a paged pool: the anchor's position + path[t];
+ * a conv or anchor pool: entry or record path[t]) and belongs at index t + 1. path[] increases
+ * (a parent's index is below its child's) and path[t] >= t + 1, so in t order no move overwrites
+ * a node a later move still reads: a destination t + 1 is either the node's own place or a place
+ * a node already moved out of. The threads of a work item split the bytes of each move: `c0` and
+ * every `cstep`-th unit, one unit a 16-byte chunk of a K|V row, an element of a record, or a
+ * channel of a conv window. A K|V row is whole 32-bit words; the words past its last whole chunk
+ * (an int8 cache's two f16 scales) go with the caller whose chunk set the next chunk would be in.
+ * Each caller keeps one unit set across every t, so its reads and writes stay in order. */
 RAD_ADV_FN void adv_compact(const AdvanceArgs& a, int i, int p, int l, int h, int c0, int cstep) {
     /* Only a row that sampled in this step: ADV_ACCEPT just wrote its slot. Any other row's slot
      * may hold a path from an earlier request that used the same slot. */
@@ -338,28 +340,82 @@ RAD_ADV_FN void adv_compact(const AdvanceArgs& a, int i, int p, int l, int h, in
     const AdvPool& P = a.pool[p];
     if (!P.base || l >= P.n_layers || h >= P.n_head) return;
     const AdvGroup& e = reinterpret_cast<const AdvGroup*>(a.slab + a.grp_off)[P.grp];
-    if (!e.paged) return;
-    const int32_t base = S.head - S.acc;
-    const int32_t bs = e.block_size;
     char* lay = P.base + (int64_t)l * P.layer_stride;
-    const int32_t chunks = P.row_bytes / 16, tail = P.row_bytes % 16 / 4;
-    const bool tails = tail > 0 && chunks % cstep == c0;
-    for (int32_t t = 0; t < np; ++t) {
-        const int32_t src = base + S.path[t], dst = base + t + 1;
-        if (src == dst) continue;
-        const int32_t ss = adv_slot(a, e, i, src), ds = adv_slot(a, e, i, dst);
-        if (ss < 0 || ds < 0) continue;
-        const uint32_t* from = reinterpret_cast<const uint32_t*>(
-            lay + (((int64_t)(ss / bs) * P.n_head + h) * bs + ss % bs) * P.row_bytes);
-        uint32_t* to = reinterpret_cast<uint32_t*>(
-            lay + (((int64_t)(ds / bs) * P.n_head + h) * bs + ds % bs) * P.row_bytes);
-        for (int32_t c = c0; c < chunks; c += cstep) {
-            const uint32_t v0 = from[4 * c], v1 = from[4 * c + 1], v2 = from[4 * c + 2],
-                           v3 = from[4 * c + 3];
-            to[4 * c] = v0; to[4 * c + 1] = v1; to[4 * c + 2] = v2; to[4 * c + 3] = v3;
+
+    if (P.kind == ADV_POOL_PAGED) {
+        if (!e.paged) return;
+        const int32_t base = S.head - S.acc;
+        const int32_t bs = e.block_size;
+        const int32_t chunks = P.row_bytes / 16, tail = P.row_bytes % 16 / 4;
+        const bool tails = tail > 0 && chunks % cstep == c0;
+        for (int32_t t = 0; t < np; ++t) {
+            const int32_t src = base + S.path[t], dst = base + t + 1;
+            if (src == dst) continue;
+            const int32_t ss = adv_slot(a, e, i, src), ds = adv_slot(a, e, i, dst);
+            if (ss < 0 || ds < 0) continue;
+            const uint32_t* from = reinterpret_cast<const uint32_t*>(
+                lay + (((int64_t)(ss / bs) * P.n_head + h) * bs + ss % bs) * P.row_bytes);
+            uint32_t* to = reinterpret_cast<uint32_t*>(
+                lay + (((int64_t)(ds / bs) * P.n_head + h) * bs + ds % bs) * P.row_bytes);
+            for (int32_t c = c0; c < chunks; c += cstep) {
+                const uint32_t v0 = from[4 * c], v1 = from[4 * c + 1], v2 = from[4 * c + 2],
+                               v3 = from[4 * c + 3];
+                to[4 * c] = v0; to[4 * c + 1] = v1; to[4 * c + 2] = v2; to[4 * c + 3] = v3;
+            }
+            if (tails)
+                for (int32_t j = 0; j < tail; ++j) to[4 * chunks + j] = from[4 * chunks + j];
         }
-        if (tails)
-            for (int32_t j = 0; j < tail; ++j) to[4 * chunks + j] = from[4 * chunks + j];
+        return;
+    }
+
+    /* A state group: the row's slot is every token's slot mapping (BatchBuilder stages one per
+     * sequence; ADV_TRUNK rewrites paged groups' only). */
+    if (e.paged) return;
+    const int32_t k = adv_i32(a, a.cu_off)[i];
+    const int32_t slot = adv_i32(a, e.slot_off)[k];
+    if (slot < 0) return;
+
+    if (P.kind == ADV_POOL_CONV) {
+        /* Work item h: channels [h * kAdvConvChunk, +kAdvConvChunk), a thread per channel. */
+        const int32_t ch0 = h * kAdvConvChunk;
+        for (int32_t c = ch0 + c0; c < ch0 + kAdvConvChunk && c < P.n_chan; c += cstep) {
+            char* chan = lay + ((int64_t)slot * P.n_chan + c) * P.n_ent * P.row_bytes;
+            for (int32_t t = 0; t < np; ++t) {
+                const int32_t src = P.hist + S.path[t], dst = P.hist + t + 1;
+                if (src == dst || src >= P.n_ent || dst >= P.n_ent) continue;
+                if (P.row_bytes == 2)
+                    reinterpret_cast<uint16_t*>(chan)[dst] = reinterpret_cast<const uint16_t*>(chan)[src];
+                else if (P.row_bytes == 4)
+                    reinterpret_cast<uint32_t*>(chan)[dst] = reinterpret_cast<const uint32_t*>(chan)[src];
+                else
+                    for (int32_t b = 0; b < P.row_bytes; ++b)
+                        chan[dst * P.row_bytes + b] = chan[src * P.row_bytes + b];
+            }
+        }
+        return;
+    }
+
+    if (P.kind == ADV_POOL_ANCHOR) {
+        /* Head h's block of the factor copy; a record is rec_elems elements, a thread per
+         * element. Records past the block's capacity are the kernel's to refuse; the move is
+         * bounded by the head's block. */
+        char* blk = lay + (((int64_t)(slot + P.copy_off) * P.slot_elems + (int64_t)h * P.head_elems)
+                           * P.row_bytes);
+        for (int32_t t = 0; t < np; ++t) {
+            const int64_t src = (int64_t)S.path[t] * P.rec_elems, dst = (int64_t)(t + 1) * P.rec_elems;
+            if (src == dst || src + P.rec_elems > P.head_elems || dst + P.rec_elems > P.head_elems)
+                continue;
+            if (P.row_bytes == 4) {
+                const uint32_t* from = reinterpret_cast<const uint32_t*>(blk) + src;
+                uint32_t* to = reinterpret_cast<uint32_t*>(blk) + dst;
+                for (int32_t c = c0; c < P.rec_elems; c += cstep) to[c] = from[c];
+            } else if (P.row_bytes == 2) {
+                const uint16_t* from = reinterpret_cast<const uint16_t*>(blk) + src;
+                uint16_t* to = reinterpret_cast<uint16_t*>(blk) + dst;
+                for (int32_t c = c0; c < P.rec_elems; c += cstep) to[c] = from[c];
+            }
+        }
+        return;
     }
 }
 

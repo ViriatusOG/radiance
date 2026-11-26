@@ -154,3 +154,8 @@ __device__ __forceinline__ void r4d_chain_done() {
         __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 #endif  /* __HIP__ */
+
+/* A chained launch only at steps of up to 32 token rows: above that the waiting blocks hold room
+ * a wide predecessor needs. */
+constexpr long long kR4dChainMaxRows = 32;
+inline bool r4d_chain_rows_ok(long long rows) { return rows <= kR4dChainMaxRows; }

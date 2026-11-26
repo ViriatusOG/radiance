@@ -36,6 +36,11 @@
  * Object family (ChatArgs::Object): a call is its name and one object holding the arguments.
  *
  *   Gemma 4              <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>
+ *   Inkling 2            <|message_model|>NAME<|content_invoke_tool_json|>
+ *                        {"name":"NAME","args":{"key":"text"}}<|end_message|>
+ *
+ * Inkling 2's object is an envelope around the arguments (object_args_key), and its call is a
+ * message opening with the header every message of the reply opens with (message_open).
  *
  * The object is JSON or a dialect of it (strings verbatim between two declared delimiters, bare
  * keys), and the client receives it as JSON. Values carry their own types, so no schema is
@@ -103,6 +108,10 @@ struct ChatFormat {
     /* A header the model writes first when it answers without reasoning; dropped when the reply
      * starts with it. Empty: none. */
     std::string content_open;
+    /* A header every message of the reply starts with. Before reasoning_open or content_open it
+     * is punctuation and dropped; anywhere else it is read as written, and with tool calls it is
+     * the call's name_prefix. Empty: none. */
+    std::string message_open;
 
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the
@@ -128,6 +137,9 @@ struct ChatFormat {
     ChatArgs    args_form = ChatArgs::Tagged;
     std::string object_string_open, object_string_close;
     bool        object_bare_keys = false;
+    /* Object family: the object is an envelope `{"name":NAME,"KEY":ARGS}` and the arguments are
+     * KEY's value (Inkling 2: "args"). Empty: the object is the arguments. */
+    std::string object_args_key;
 
     std::string arg_prefix;                   /* "<parameter=" */
     /* What ends a name and opens its value. Both may be set (GLM: "</arg_key>", "<arg_value>"):
@@ -156,6 +168,7 @@ struct ChatFormat {
     bool typed_tags() const { return !arg_json_value_prefix.empty(); }
     bool has_tools() const { return !name_prefix.empty(); }
     bool object_args() const { return args_form == ChatArgs::Object; }
+    bool args_envelope() const { return object_args() && !object_args_key.empty(); }
 };
 
 /* Can the streaming parser run this format? RAD_OK, or RAD_E_UNSUPPORTED with *why naming the
@@ -220,5 +233,9 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
  * non-empty delimiter, whitespace-trimmed and deduplicated, in the vendored analyser's order. A
  * multi-token marker is fine: the decoder only compares markers with control-token spellings. */
 std::vector<std::string> chat_format_markers(const ChatFormat& f);
+
+/* The whitespace set std::isspace accepts in the C locale, which is the set the format's grammar
+ * skips between tags. */
+inline bool is_ws(unsigned char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
 
 }  /* namespace rad */

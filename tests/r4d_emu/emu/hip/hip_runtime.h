@@ -11,13 +11,19 @@
 #include <tuple>
 #include <vector>
 
+/* a unit that names its dynamic LDS at file scope (extern __shared__, which the host lacks) reads
+ * the launch's instead when this is defined (r4d_ds41_ggml.hip, r4d_ds41_ggml_mr.hip) */
+#define R4D_EMU_HOST 1
 #define __global__
 #define __device__
 #define __host__
 #define __shared__ static
 #define __constant__
 #define __forceinline__ inline
-#define __launch_bounds__(n)
+/* Empty: libstdc++ spells its own attribute __attribute__((__noinline__)), which an expansion to
+ * another attribute would break; inlining does not change what the emulation computes. */
+#define __noinline__
+#define __launch_bounds__(...)
 /* R4D_WAVES (r4d_common.h) names a kernel attribute; on the host it becomes an empty attribute */
 #define amdgpu_waves_per_eu(lo, hi)
 #define __align__(n) __attribute__((aligned(n)))

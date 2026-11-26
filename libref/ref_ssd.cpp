@@ -2,16 +2,16 @@
  *
  * ============================== The algorithm ==============================
  *
- * Per token, per head h of `heads`, with the state S shaped [head_dim, d_state] and g = h / (heads /
- * groups) the head's B/C group:
+ * Per token, per head h of `heads`, with the state S shaped [head_dim, d_state] and
+ * g = h / (heads / groups) the head's B/C group:
  *
  *     dt'  = softplus(dt[h] + dt_bias[h])            A = -exp(A_log[h])
  *     S   *= e^{dt' A}
  *     S   += dt' . x[h] B[g]^T                        o[h] = S C[g] + D[h] . x[h]
  *
  * A Mamba-2 head is a gated delta net head without the delta: one scalar decay per head and token,
- * no beta, no l2 norm on B or C, and the skip term D. The gdn ops cannot run it (their rank-1 update
- * subtracts S k and their keys are normalised), so it is an op of its own.
+ * no beta, no l2 norm on B or C, and the skip term D. The gdn ops cannot run it (their rank-1
+ * update subtracts S k and their keys are normalised), so it is an op of its own.
  *
  * dt is not clamped. The checkpoint's `time_step_limit` is (0, inf), which is what mamba_ssm's
  * kernels and vLLM pass; transformers' CPU fallback clamps dt at `time_step_min` and is not what
@@ -174,7 +174,8 @@ int ref_ssd_update(const RadArgs* a, RadStream) {
             for (int64_t t = 0; t < (replay ? na : 0); ++t) {
                 const int64_t f = 1 + t * rec;
                 const float decay = ldt(&state, factor_at(f));
-                for (int64_t d = 0; d < Nst; ++d) b[(size_t)d] = ldt(&state, factor_at(f + 1 + P + d));
+                for (int64_t d = 0; d < Nst; ++d)
+                    b[(size_t)d] = ldt(&state, factor_at(f + 1 + P + d));
                 for (int64_t e = 0; e < P; ++e) {
                     const float u = ldt(&state, factor_at(f + 1 + e));
                     for (int64_t d = 0; d < Nst; ++d) {

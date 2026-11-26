@@ -369,10 +369,11 @@ void gptq_tcq_dyn_scales(const Grid& g, const float* w, int64_t K, Scales& scale
     for (int64_t r = r0; r < r1; ++r) {
         BlockScale b = grid_block_scale(g, w, K, r, r + 1, b0, b1, nullptr);
         if (g.lv2) {
-            const int64_t i2 = g.br2 > 0 ? r / g.br2 : 0, j2 = g.bc2 > 0 ? b0 / g.bc2 : 0;
+            const int64_t i2 = (g.br2 > 0 ? r / g.br2 : 0) - scales.r2_0;
+            const int64_t j2 = g.bc2 > 0 ? b0 / g.bc2 : 0;
             b = grid_tcq_block_lv2(g, b.s, scales.s2[(size_t)(i2 * scales.nc2 + j2)]);
         }
-        scales.b[(size_t)(r * scales.nc + b0 / 128)] = b;
+        scales.b[(size_t)((r - scales.r0) * scales.nc + b0 / 128)] = b;
     }
 }
 
@@ -528,7 +529,7 @@ int gptq_quantise(const Grid& g, float* w, int32_t* codes, Scales& scales, int64
                             "), shorter than the " + std::to_string(c) + " a seam state needs";
             return RAD_E_SHAPE;
         }
-        if (gpu_enabled()) {
+        if (g.gpu && gpu_enabled()) {
             std::string w1;
             const int st = gptq_tcq_gpu(g, w, codes, scales, N, K, u, dynamic, &w1);
             if (st != RAD_OK && why) *why = w1;

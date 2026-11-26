@@ -42,4 +42,25 @@ bool rad_parse_int(const char* text, int64_t lo, int64_t hi, int64_t* out, std::
  * and exit status 2. */
 int64_t rad_flag_int(const char* tool, const char* flag, const char* text, int64_t lo, int64_t hi);
 
+/* Loads the quantizer plugins into `reg` from the `quantizers/` directory of each directory of
+ * `home` that has one, or of the first when none does. Negative when a plugin fails to load. */
+int rad_load_quantizers(Registry& reg, const std::string& home);
+
+/* A container's RadModelMeta, as the declare phase takes it. The meta's key/value arrays point
+ * into this object, so it stays where it is while the meta is in use. */
+struct ContainerMeta {
+    RadModelMeta meta{};
+    explicit ContainerMeta(const RadFile& f);
+    ContainerMeta(const ContainerMeta&) = delete;
+    ContainerMeta& operator=(const ContainerMeta&) = delete;
+
+private:
+    std::vector<std::string> keys_, vals_;
+    std::vector<const char*> key_ptrs_, val_ptrs_;
+};
+
+/* The value after the flag at argv[*i], advancing *i past it; a message naming `tool` and `flag`
+ * on stderr and exit status 2 when the command line ends there. */
+const char* rad_flag_value(const char* tool, int argc, char** argv, int* i, const char* flag);
+
 }  /* namespace rad */

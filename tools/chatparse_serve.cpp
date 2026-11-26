@@ -28,7 +28,8 @@
  * through the vendored jinja engine alone, for message shapes the OpenAI API cannot carry.
  *
  * Output is one JSON object on stdout. Exit status: 0, or 1 when the request is refused, a reply
- * cannot be read, the streamed and non-streamed answers disagree, or the grammar refuses a token. */
+ * cannot be read, the streamed and non-streamed answers disagree, or the grammar refuses a
+ * token. */
 #include "build/startup.h"
 #include "format/radfile.h"
 #include "iface.h"
@@ -46,10 +47,7 @@
 #include "util/json.h"
 
 #include <cstdio>
-#include <cstring>
-#include <fstream>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -58,19 +56,12 @@ using ojson = Json;
 
 namespace {
 
-bool read_file(const std::string& p, std::string* out) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return false;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    *out = ss.str();
-    return true;
-}
-
 int usage() {
     std::fprintf(stderr,
-                 "usage: rad-chatparse --request REQ.json --rad MODEL.rad [--override-chat-template T]\n"
-                 "                     [--chat-template-kwargs JSON] [--reasoning-format auto|none]\n"
+                 "usage: rad-chatparse --request REQ.json --rad MODEL.rad "
+                 "[--override-chat-template T]\n"
+                 "                     [--chat-template-kwargs JSON] "
+                 "[--reasoning-format auto|none]\n"
                  "                     [--home DIRS] [--no-plugin] [--reply FILE ...]\n"
                  "       rad-chatparse --render-raw T.jinja --context CTX.json\n");
     return 2;
@@ -89,7 +80,7 @@ ojson reassemble(const std::string& sse, std::string* finish, int* chunks) {
         if (nl == std::string::npos) nl = sse.size();
         const std::string line = sse.substr(at, nl - at);
         at = nl + 1;
-        if (line.rfind("data: ", 0) != 0) continue;
+        if (!line.starts_with("data: ")) continue;
         const std::string body = line.substr(6);
         if (body == "[DONE]") continue;
         const ojson j = ojson::parse(body, nullptr, false);
@@ -101,7 +92,8 @@ ojson reassemble(const std::string& sse, std::string* finish, int* chunks) {
             if (!c.contains("delta")) continue;
             const ojson& d = c.at("delta");
             if (d.contains("content") && d.at("content").is_string()) {
-                msg["content"] = msg["content"].get<std::string>() + d.at("content").get<std::string>();
+                msg["content"] =
+                    msg["content"].get<std::string>() + d.at("content").get<std::string>();
                 any_content = true;
             }
             if (d.contains("reasoning_content") && d.at("reasoning_content").is_string())
@@ -110,14 +102,16 @@ ojson reassemble(const std::string& sse, std::string* finish, int* chunks) {
                 for (const ojson& tc : d.at("tool_calls")) {
                     const size_t i = tc.value("index", (size_t)0);
                     while (calls.size() <= i)
-                        calls.push_back({ { "type", "function" },
-                                          { "function", { { "name", "" }, { "arguments", "" } } } });
+                        calls.push_back(
+                            { { "type", "function" },
+                              { "function", { { "name", "" }, { "arguments", "" } } } });
                     if (tc.contains("id")) calls[i]["id"] = tc.at("id");
                     if (tc.contains("function")) {
                         const ojson& f = tc.at("function");
                         if (f.contains("name") && f.at("name").is_string())
-                            calls[i]["function"]["name"] = calls[i]["function"]["name"].get<std::string>() +
-                                                           f.at("name").get<std::string>();
+                            calls[i]["function"]["name"] =
+                                calls[i]["function"]["name"].get<std::string>() +
+                                f.at("name").get<std::string>();
                         if (f.contains("arguments") && f.at("arguments").is_string())
                             calls[i]["function"]["arguments"] =
                                 calls[i]["function"]["arguments"].get<std::string>() +
@@ -136,7 +130,8 @@ ojson reassemble(const std::string& sse, std::string* finish, int* chunks) {
  * name and arguments. Call ids are random per answer. */
 ojson comparable(const ojson& m) {
     ojson o;
-    o["content"] = m.contains("content") && m.at("content").is_string() ? m.at("content") : ojson("");
+    o["content"] = m.contains("content") && m.at("content").is_string() ? m.at("content")
+                                                                        : ojson("");
     o["reasoning_content"] = m.value("reasoning_content", std::string());
     ojson calls = ojson::array();
     if (m.contains("tool_calls"))
@@ -148,7 +143,7 @@ ojson comparable(const ojson& m) {
 
 int render_raw(const std::string& tpath, const std::string& cpath) {
     std::string src, ctxs;
-    if (!read_file(tpath, &src) || !read_file(cpath, &ctxs)) {
+    if (!read_file_bytes(tpath, &src) || !read_file_bytes(cpath, &ctxs)) {
         std::fprintf(stderr, "rad-chatparse: cannot read %s or %s\n", tpath.c_str(), cpath.c_str());
         return 2;
     }
@@ -209,12 +204,15 @@ int serve_main(int argc, char** argv) {
     RadFile f;
     if (f.open(rad_path.c_str()) < 0) return 1;
     VocabSection vs = f.vocab();
-    if (!vs) { std::fprintf(stderr, "rad-chatparse: %s has no vocabulary\n", rad_path.c_str()); return 1; }
+    if (!vs) {
+        std::fprintf(stderr, "rad-chatparse: %s has no vocabulary\n", rad_path.c_str());
+        return 1;
+    }
     VocabBuild vb;
     if (vocab_deserialize(f.base(), (uint64_t)f.size(), vs.h, vb) < 0) return 1;
     if (!tmpl_path.empty()) {
         std::string t;
-        if (!read_file(tmpl_path, &t)) {
+        if (!read_file_bytes(tmpl_path, &t)) {
             std::fprintf(stderr, "rad-chatparse: cannot read %s\n", tmpl_path.c_str());
             return 1;
         }
@@ -282,9 +280,11 @@ int serve_main(int argc, char** argv) {
         } else {
             derived["describe"] = chat_format_describe(tf);
             derived["tools_refused"] = refused;
-            derived["fields"] = { { "section_open", tf.section_open }, { "section_close", tf.section_close },
+            derived["fields"] = { { "section_open", tf.section_open },
+                                  { "section_close", tf.section_close },
                                   { "call_open", tf.call_open }, { "call_close", tf.call_close },
-                                  { "name_prefix", tf.name_prefix }, { "name_suffix", tf.name_suffix },
+                                  { "name_prefix", tf.name_prefix },
+                                  { "name_suffix", tf.name_suffix },
                                   { "call_end", tf.call_end }, { "arg_prefix", tf.arg_prefix },
                                   { "arg_name_suffix", tf.arg_name_suffix },
                                   { "arg_value_prefix", tf.arg_value_prefix },
@@ -295,7 +295,7 @@ int serve_main(int argc, char** argv) {
     }
 
     std::string body;
-    if (!read_file(req_path, &body)) {
+    if (!read_file_bytes(req_path, &body)) {
         std::fprintf(stderr, "rad-chatparse: cannot read %s\n", req_path.c_str());
         return 1;
     }
@@ -307,7 +307,8 @@ int serve_main(int argc, char** argv) {
     out["tool_refusal"] = chat.tool_refusal();
     out["template_analysis"] = derived;
     if (server::parse_chat_request(body, d, lim, &r, &err) < 0) {
-        out["error"] = { { "status", err.status }, { "message", err.message }, { "param", err.param } };
+        out["error"] = { { "status", err.status }, { "message", err.message },
+                         { "param", err.param } };
         std::printf("%s\n", out.dump(-1, ' ', false, ojson::error_handler_t::replace).c_str());
         return 1;
     }
@@ -330,7 +331,7 @@ int serve_main(int argc, char** argv) {
         ojson one;
         one["file"] = rp;
         std::string text;
-        if (!read_file(rp, &text)) {
+        if (!read_file_bytes(rp, &text)) {
             one["error"] = "cannot read the file";
             out["replies"].push_back(one);
             ++bad;

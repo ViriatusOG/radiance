@@ -127,8 +127,7 @@ TEST(loading_reads_identity_and_calls_open) {
     CHECK_EQ(r.plugins().size(), (size_t)2);
 
     const Plugin* base = r.plugin("radtest_base");
-    CHECK(base != nullptr);
-    if (!base) return;
+    REQUIRE(base != nullptr);
     CHECK_EQ((int)base->kind, RAD_PLUGIN_KERNEL);
     CHECK_EQ(base->version, "0.1");
     CHECK_EQ(base->n_kernels, 17);
@@ -146,8 +145,7 @@ TEST(hierarchy_order_is_configured) {
     Registry r;
     CHECK_OK(r.load_dir(kernels_dir(), { "radtest_base" }));
     const Plugin* base = r.plugin("radtest_base");
-    CHECK(base != nullptr);
-    if (!base) return;
+    REQUIRE(base != nullptr);
     CHECK_EQ(base->order, 0);
     CHECK(r.plugin("radtest_over") == nullptr);   /* unnamed, so not loaded */
     for (const KernelRow& row : r.rows()) CHECK(row.plugin != "radtest_over");
@@ -177,8 +175,7 @@ TEST(the_reference_library_sorts_last_with_no_hierarchy) {
     CHECK_OK(st);
     const Plugin* ref   = r.plugin("radtest_reference");
     const Plugin* other = r.plugin("radtest_base");
-    CHECK(ref && other);
-    if (!ref || !other) return;
+    REQUIRE(ref && other);
     CHECK(ref->reference);
     CHECK(!other->reference);
     CHECK(other->order < ref->order);
@@ -253,8 +250,7 @@ TEST(architecture_plugins_are_identified_and_deduplicated) {
     CHECK_EQ(r.plugins().size(), (size_t)1);
 
     const Plugin* a = r.plugin("radtest_arch");
-    CHECK(a != nullptr);
-    if (!a) return;
+    REQUIRE(a != nullptr);
     CHECK_EQ((int)a->kind, RAD_PLUGIN_ARCH);
     CHECK_EQ(a->arch_id, "radtest.v1");
     CHECK(a->arch_declare != nullptr);
@@ -273,8 +269,7 @@ TEST(an_architecture_plugin_may_declare_its_reply_format) {
     Registry r;
     (void)r.load_dir(arch_dir(), {});
     const Plugin* a = r.plugin("radtest_arch");
-    CHECK(a != nullptr);
-    if (!a) return;
+    REQUIRE(a != nullptr);
     CHECK(a->arch_probe == nullptr);
     REQUIRE(a->arch_chat_format != nullptr);
     const RadChatFormat* d = a->arch_chat_format(nullptr);
@@ -314,7 +309,7 @@ TEST(every_row_s_op_has_a_schema) {
     CHECK_OK(load(r));
     CHECK_OK(r.check_complete());
     const auto ops = r.op_names();
-    CHECK_EQ(ops.size(), (size_t)10);
+    REQUIRE_EQ(ops.size(), (size_t)10);
     CHECK_EQ(ops[0], "t_attn");
 }
 
@@ -324,8 +319,7 @@ TEST(schema_validation_accepts_the_declared_shape) {
     Registry r;
     CHECK_OK(load(r));
     const RadOpSchema* s = r.schema("t_gemm");
-    CHECK(s != nullptr);
-    if (!s) return;
+    REQUIRE(s != nullptr);
     CHECK_EQ(s->n_params, 4);
 
     std::string err;
@@ -610,8 +604,7 @@ TEST(bands_carry_the_derived_value_into_every_band) {
     std::vector<Band> b = r.build_bands("t_attn", "q_len", 1, 64, attn_geom());
     /* q_len <= 16 is the only boundary the rows place on it, so (0,16] resolves and (16,64] does
      * not, and the resolved band carries the kernel's block size. */
-    CHECK_EQ(b.size(), (size_t)2);
-    if (b.size() != 2) return;
+    REQUIRE_EQ(b.size(), (size_t)2);
     CHECK_EQ(b[0].hi, 16);
     CHECK_EQ(picked(b[0].dom[RAD_DOMAIN_DEVICE].row), "t_attn_paged");
     long long bs = 0;
@@ -626,8 +619,7 @@ TEST(a_resolved_kernel_s_constraints_are_readable) {
     Registry r;
     CHECK_OK(load(r));
     const KernelRow* k = r.select("t_attn", attn_geom(), RAD_DOMAIN_DEVICE);
-    CHECK(k != nullptr);
-    if (!k) return;
+    REQUIRE(k != nullptr);
     long long v = 0;
     CHECK(kernel_constraint(*k, "block_size", RAD_C_EQ, &v));
     CHECK_EQ(v, 16);
@@ -652,8 +644,7 @@ TEST(band_table_is_the_worked_example) {
     base.set_s("dtype", "bf16");
 
     std::vector<Band> b = r.build_bands("t_gemm", "M", 1, 8192, base);
-    CHECK_EQ(b.size(), (size_t)3);
-    if (b.size() != 3) return;
+    REQUIRE_EQ(b.size(), (size_t)3);
 
     CHECK_EQ(b[0].hi, 16);
     CHECK_EQ(b[1].hi, 64);
@@ -687,8 +678,7 @@ TEST(band_boundaries_come_from_the_constraints) {
     base.set_s("dtype", "bf16");
 
     std::vector<Band> b = r.build_bands("t_skinny", "M", 1, 8192, base);
-    CHECK_EQ(b.size(), (size_t)3);
-    if (b.size() != 3) return;
+    REQUIRE_EQ(b.size(), (size_t)3);
     CHECK_EQ(b[0].hi, 64);
     CHECK_EQ(b[1].hi, 4095);
     CHECK_EQ(b[2].hi, 8192);
@@ -713,8 +703,7 @@ TEST(an_eq_constraint_cuts_both_edges) {
     base.set_i("n", 1);
 
     std::vector<Band> b = r.build_bands("t_eq", "M", 1, 64, base);
-    CHECK_EQ(b.size(), (size_t)3);
-    if (b.size() != 3) return;
+    REQUIRE_EQ(b.size(), (size_t)3);
     CHECK_EQ(b[0].hi, 31);
     CHECK_EQ(b[1].hi, 32);
     CHECK_EQ(b[2].hi, 64);
@@ -733,12 +722,12 @@ TEST(bands_clamp_to_the_declared_range) {
 
     /* 16 is below the range and 64 is at or above its top: neither cuts anything. */
     std::vector<Band> narrow = r.build_bands("t_gemm", "M", 32, 48, base);
-    CHECK_EQ(narrow.size(), (size_t)1);
+    REQUIRE_EQ(narrow.size(), (size_t)1);
     CHECK_EQ(narrow[0].hi, 48);
     CHECK_EQ(picked(narrow[0].dom[RAD_DOMAIN_DEVICE].row), "t_gemm_m64");
 
     std::vector<Band> tiny = r.build_bands("t_gemm", "M", 1, 16, base);
-    CHECK_EQ(tiny.size(), (size_t)1);
+    REQUIRE_EQ(tiny.size(), (size_t)1);
     CHECK_EQ(tiny[0].hi, 16);
     CHECK_EQ(picked(tiny[0].dom[RAD_DOMAIN_DEVICE].row), "t_gemm_m16");
 }
@@ -747,8 +736,7 @@ TEST(an_op_with_no_range_gets_one_band) {
     Registry r;
     CHECK_OK(load(r));
     std::vector<Band> b = r.build_bands("t_attn", "", 0, 0, attn_geom());
-    CHECK_EQ(b.size(), (size_t)1);
-    if (b.empty()) return;
+    REQUIRE_EQ(b.size(), (size_t)1);
     CHECK_EQ(b[0].hi, INT64_MAX);
     CHECK_EQ(picked(b[0].dom[RAD_DOMAIN_DEVICE].row), "t_attn_paged");
     CHECK(!b[0].dom[RAD_DOMAIN_HOST]);
@@ -760,13 +748,11 @@ TEST(init_runs_once_per_resolved_instance) {
     Registry r;
     CHECK_OK(load(r));
     const Plugin* base = r.plugin("radtest_base");
-    CHECK(base != nullptr);
-    if (!base) return;
+    REQUIRE(base != nullptr);
     auto n_init = reinterpret_cast<int (*)(void)>(dlsym(base->handle, "radtest_init_calls"));
     auto n_fini = reinterpret_cast<int (*)(void)>(dlsym(base->handle, "radtest_fini_calls"));
     auto inst_m = reinterpret_cast<long long (*)(void*)>(dlsym(base->handle, "radtest_instance_m"));
-    CHECK(n_init && n_fini && inst_m);
-    if (!n_init || !n_fini || !inst_m) return;
+    REQUIRE(n_init && n_fini && inst_m);
     const int init0 = n_init(), fini0 = n_fini();
 
     Geometry g;
@@ -774,8 +760,7 @@ TEST(init_runs_once_per_resolved_instance) {
     g.set_i("K", 4096);
     g.set_s("dtype", "bf16");
     std::vector<Band> b = r.build_bands("t_gemm", "M", 1, 8192, g);
-    CHECK_EQ(b.size(), (size_t)3);
-    if (b.size() != 3) return;
+    REQUIRE_EQ(b.size(), (size_t)3);
 
     for (Band& band : b) CHECK_OK(r.init_instance(band.dom[RAD_DOMAIN_DEVICE], 0, 1));
     CHECK_EQ(n_init() - init0, 3);
@@ -801,8 +786,7 @@ TEST(a_negative_init_is_a_value_not_a_crash) {
     Geometry base;
     base.set_i("n", 1);
     std::vector<Band> b = r.build_bands("t_eq", "M", 32, 32, base);
-    CHECK_EQ(b.size(), (size_t)1);
-    if (b.empty()) return;
+    REQUIRE_EQ(b.size(), (size_t)1);
     CHECK_EQ(picked(b[0].dom[RAD_DOMAIN_DEVICE].row), "t_eq_m32");
     CHECK_EQ(r.init_instance(b[0].dom[RAD_DOMAIN_DEVICE], 0, 1), RAD_E_NOMEM);
     CHECK_EQ(r.n_instances(), (size_t)0);
@@ -882,8 +866,7 @@ TEST(an_engine_with_no_card_leaves_a_gpu_librarys_device_rows_out) {
     r.set_no_device_code(true);
     CHECK(r.load_plugin(so, 0) >= 0);
     const Plugin* p = r.plugin("libr4d");
-    CHECK(p != nullptr);
-    if (!p) return;
+    REQUIRE(p != nullptr);
     CHECK(p->device_code_absent);
     for (const KernelRow& row : r.rows()) CHECK(row.info->domain != RAD_DOMAIN_DEVICE);
 }
@@ -1168,12 +1151,17 @@ TEST(glm_i8_latent_selection_obeys_the_real_plugin_hierarchy) {
     }
 }
 
+/* Why the cases written against GLM-5.3's own container skip. */
+static const char* const kGlmContainerUnserved =
+    "GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; "
+    "the case returns with an int8 container";
+
 /* GLM-5.3-Flash's MLA split by rows at eight ranks (arch/common/rad_block_glm_mla.h), with the
  * parameters its ops declare against the container's encodings (block fp8 at f32 scales): every
  * band of every op the row form adds resolves on the device, up to a 4096-token step's run of
  * 512 rows. A form libr4d does not serve would stop a TP8 start at "resolved to no kernel". */
 TEST(libr4d_resolves_every_band_of_glm_mla_split_by_rows) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const std::string so = libr4d();
     if (so.empty()) return;
     Registry r;
@@ -1270,15 +1258,7 @@ const Band* band_at(const std::vector<Band>& b, int64_t v) {
 /* An empty directory of its own under the test's temporary directory. */
 struct TempDir {
     std::string path;
-    TempDir() {
-        std::string tmpl = radtest::tmp_path("dir.XXXXXX");
-        if (mkdtemp(tmpl.data())) path = tmpl;
-    }
-    std::string sub(const std::string& rel) const {
-        const std::string p = path + "/" + rel;
-        mkdir(p.c_str(), 0755);
-        return p;
-    }
+    TempDir() : path(radtest::make_tmp_dir("dir")) {}
 };
 }  /* namespace */
 
@@ -1337,7 +1317,6 @@ TEST(no_band_issues_a_row_at_a_value_its_constraints_reject) {
  * which the kernel must always run. */
 TEST(a_tuning_cache_row_moves_its_shape_off_the_defaults_and_only_within_the_axis) {
     TempDir home_dir;
-    REQUIRE(!home_dir.path.empty());
     const std::string machine = "radtest-machine";
     Geometry wide;
     wide.set_i("M", 64);
@@ -1442,7 +1421,6 @@ TEST(a_kernel_library_is_named_by_any_spelling_of_its_file) {
  * continues the order from the first. */
 TEST(an_earlier_directory_shadows_a_later_one_and_orders_continue) {
     TempDir own;
-    REQUIRE(!own.path.empty());
     const std::string link = own.path + "/radtest_over.so";
     REQUIRE_EQ(symlink((kernels_dir() + "/radtest_over.so").c_str(), link.c_str()), 0);
     Registry r;

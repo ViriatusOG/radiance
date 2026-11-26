@@ -176,7 +176,8 @@ void softmax_tile(float* S, int64_t R, float* m, float* l, float* acc, int64_t l
                 float* ar = acc + r * ld;
                 const vf va = vf_set1(alpha);
                 int64_t d = 0;
-                for (; d + VF_N <= width; d += VF_N) vf_storeu(ar + d, vf_mul(vf_loadu(ar + d), va));
+                for (; d + VF_N <= width; d += VF_N)
+                    vf_storeu(ar + d, vf_mul(vf_loadu(ar + d), va));
                 for (; d < width; ++d) ar[d] *= alpha;
                 l[r] *= alpha;
             }
@@ -479,7 +480,8 @@ PS_BF16 inline void pv_bf16(float* acc, int64_t hd, const uint32_t* pp, const ui
 /* A row of 64 probabilities to 32 bf16 key pairs, round to nearest even. */
 PS_BF16 inline void p_pairs(const float* sr, uint32_t* pr) {
     _mm512_storeu_si512((void*)pr,
-                        (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 16), _mm512_loadu_ps(sr)));
+                        (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 16),
+                                                     _mm512_loadu_ps(sr)));
     _mm512_storeu_si512((void*)(pr + 16), (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 48),
                                                                       _mm512_loadu_ps(sr + 32)));
 }
@@ -701,7 +703,8 @@ AVX_KERNEL(attn_prefix_self) {
             /* Whole kv heads: an entry's tasks of one head share nothing with another head's. */
             const int64_t kh = seqs[i1].kh;
             size_t hb = 0, j = i1;
-            for (; j < seqs.size() && seqs[j].kh == kh; ++j) hb += (size_t)seqs[j].ntile * tile_bytes;
+            for (; j < seqs.size() && seqs[j].kh == kh; ++j)
+                hb += (size_t)seqs[j].ntile * tile_bytes;
             if (i1 > i0 && bytes + hb > (size_t)kPackBudget) break;
             for (; i1 < j; ++i1) {
                 seqs[i1].off = bytes;

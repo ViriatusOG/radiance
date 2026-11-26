@@ -1872,6 +1872,8 @@ static const RadParamSpec pGatedHadQuant[] = {
     P_STR("dtype"),
     P_STRO("act"),
     P_INTO("mode"),                         /* 0 = silu(a)*b, 1 = sigmoid(a)*b */
+    P_F64O("gate_cap"),                     /* SiTU's caps (docs/OPS.md); refused here when set */
+    P_F64O("up_cap"),
 };
 static const RadOperandSpec oGatedHadQuant[] = {
     { "a",     RAD_OPD_IN,  0 },

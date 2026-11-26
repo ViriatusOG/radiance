@@ -44,6 +44,10 @@ inline bool log_once(std::atomic<bool>& flag) {
     return flag.compare_exchange_strong(expected, true);
 }
 
+/* The bytes of a file into `*out`; false when it cannot be opened. No size limit: for files a
+ * container supplies use read_text_file. */
+bool read_file_bytes(const std::string& path, std::string* out);
+
 /* The whole text of a file, refused before it is read when it is bigger than `cap`. Files a
  * container supplies are screened by size as well as by JSON budget: the bounded parse counts
  * values, not bytes, so without the size screen a multi-gigabyte tokenizer.json would be read
@@ -131,6 +135,13 @@ uint64_t rad_mono_ns();
 
 /* Split on spaces, tabs and commas: the encoding of RAD_C_IN's set. */
 std::vector<std::string_view> split_ws(std::string_view s);
+
+/* `s` with A-Z lowered; every other byte is kept. */
+inline std::string ascii_lower(std::string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+    return s;
+}
 
 /* The strings joined with `sep` between them. */
 inline std::string join(const std::vector<std::string>& v, const char* sep = ", ") {

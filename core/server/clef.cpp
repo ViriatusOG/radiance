@@ -89,10 +89,7 @@ int parse_clef_request(const std::string& body, const OaiDeps& d, const OaiLimit
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     if (!only_keys(b, { "model", "state", "questions", "images" }, "", err)) return RAD_E_INVAL;
-    if (b.contains("model") && (!b["model"].is_string() || b["model"] != model_id)) {
-        *err = err_bad("model", "must name the loaded model, " + model_id);
-        return RAD_E_INVAL;
-    }
+    if (!names_loaded_model(b, model_id, err)) return RAD_E_INVAL;
     if (!b.contains("state") || (b["state"].is_string() && b["state"].get<std::string>().empty())) {
         *err = err_bad("state", "required: a non-empty string or any JSON value");
         return RAD_E_INVAL;

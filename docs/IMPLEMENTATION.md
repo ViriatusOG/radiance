@@ -46,6 +46,13 @@ libquant/         the built-in quantisers rad-convert's recipes name: grids, tra
 plugin/spechub/   the draft-coupling ops (`mtp_couple_propose`, `mtp_couple_verify`, `mtp_trav_verify`,
                   `dflash_couple_propose`, `draft-coupling: on`): schemas and shapes on the host,
                   launches on the card and in a host reference
+plugin/glm/       GLM-5.3-Flash's fused kernels, ops only glm5next issues
+plugin/exl3i/     EXL3-V3 on gfx1201: `exl3i_dense` (trellis linears at any rate in 1/8 steps), the
+                  A8 path's quantiser, the head's rerank and the trellis and fwht128 token tables
+plugin/exl3quant/ the `exl3i` quantiser: imports EXL3-V3 levels into the exl3i encoding
+plugin/qwen35_exl3/, plugin/gemma4_exl3/
+                  the architectures (`qwen35`, `exl3`) and (`gemma4`, `exl3`) over those linears
+plugin/exl3import/ the EXL3-V3 decode (the oracle) and interface headers the four share
 arch/<id>/        one architecture plugin per directory
 tools/            rad-info, rad-convert, rad-export, rad-kbench, rad-tune, rad-schemas,
                   rad-tokcheck, rad-yaml, rad-chatparse, rad-gbnf-check

@@ -138,7 +138,11 @@ struct FakeKV : IKVManager {
 
     int64_t rows_for(int gi, int64_t n) const {
         const KVGeom::G& e = geom.g[(size_t)gi];
-        return e.paged ? (n + e.block_size - 1) / e.block_size : 1;
+        if (!e.paged) return 1;
+        /* WINDOW/RING recycle past their window; the real manager's blocks_for caps the same way. */
+        if ((e.kind == RAD_KV_WINDOW || e.kind == RAD_KV_RING) && e.window > 0 && n > e.window)
+            n = e.window;
+        return (n + e.block_size - 1) / e.block_size;
     }
 
     int add_sequence(uint64_t id) override {
@@ -456,6 +460,9 @@ struct FakePC : IPrefixCache {
     }
 
     mutable int64_t lookups = 0;
+    /* Lookups that only probe (no blocks asked for) and carried a cap: the preempted-prefill gate's
+     * credit under a drafter refill. */
+    mutable int64_t capped_probes = 0;
     /* A cap (HitCap) as prefix.cpp applies one: attention ends at a block at or below it, the
      * linear state at the deepest checkpoint under that (checkpoints at multiples of `interval`,
      * none below `ckpt_lo`), and the whole hit stands if that gives back too much. */
@@ -463,6 +470,7 @@ struct FakePC : IPrefixCache {
     CacheHit lookup(const Request&, std::vector<std::vector<int32_t>>* out,
                     const HitCap* cap) const override {
         ++lookups;
+        if (!out && cap) ++capped_probes;
         if (out) {
             out->resize(groups.size());
             for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)

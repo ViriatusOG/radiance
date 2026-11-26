@@ -18,7 +18,7 @@
 #include "server/loras.h"
 
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
 #include "util/json.h"
 
@@ -141,7 +141,7 @@ OpInfo gemm_op(const char* name, int64_t N, int64_t K, const char* dtype, int64_
     o.op = name;
     o.base.set_i("N", N);
     o.base.set_i("K", K);
-    o.base.set_i("group", AR::RAD_FP8_BLOCK);
+    o.base.set_i("group", AR::RAD_SCALE_GROUP);
     o.base.set_s("dtype", dtype);
     o.ranged_key = "M";
     o.range_lo = 1;
@@ -159,8 +159,8 @@ int linear(Builder& b, AR::Names& nm, const AR::Geom& g, const char* base, int64
            int shard, int layer, std::initializer_list<const char*> src,
            std::initializer_list<int64_t> parts = {}, bool mapped = false,
            const char* op = "gemm_nt_q") {
-    AR::LinearFP8 lin{};
-    AR::ActFP8 act{};
+    AR::LinearQ lin{};
+    AR::ActQ act{};
     lin.mapped = mapped;
     const int st = lin.declare((RadBuilder*)&b, nm, g, base, N, K, shard, AR::grp_layer(layer), src,
                                act, 0, 0, parts);
@@ -896,6 +896,177 @@ TEST(composing_biases_still_rejects_a_known_full_source_size_mismatch) {
     std::vector<std::string> skipped;
     CHECK_EQ(lora::compose_biases(keys, {{"wrong", file, 1.0}}, {module},
                                   &skipped, &biases, &why), RAD_E_SHAPE);
+}
+
+TEST(rotated_generators_pack_lora_in_the_activation_basis) {
+    const std::string path = new_dir("genlora-fwht128") + "/one.safetensors";
+    const std::string block = "transformer.transformer_blocks.0.";
+    const TW q = tensor(block + "attn.to_q.lora_A.weight", "F32", {1, kD}, 71);
+    const TW down = tensor(block + "ff.net.2.lora_A.weight", "F32", {1, kF}, 72);
+    write_st(path, {q, down,
+        tensor(block + "attn.to_q.lora_B.weight", "BF16", {kQ, 1}, 73),
+        tensor(block + "ff.net.2.lora_B.weight", "BF16", {kD, 1}, 74)});
+    auto adapter = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(adapter->open(path, &err), RAD_OK);
+    for (int rank : {0, 1}) {
+        Program program;
+        std::map<std::string, Truth> truth;
+        REQUIRE_EQ(build_gen(rank, 2, &program, &truth), RAD_OK);
+        for (OpInfo& op : program.ops) {
+            if (op.op != "gemm_nt_q") continue;
+            WeightInfo& w = program.weights[op.weights[0]];
+            if (w.name != "dit.0.qkv.weight" && w.name != "dit.0.down.weight") continue;
+            const bool u4 = w.name == "dit.0.down.weight";
+            w.enc_known = true;
+            rad_enc_clear(&w.enc);
+            rad_enc_copy_str(w.enc.scheme, "affine");
+            rad_enc_copy_str(w.enc.transform, "fwht128");
+            rad_enc_add_plane(&w.enc, "codes", u4 ? RAD_U4 : RAD_I8, 1, 1);
+            if (u4) {
+                rad_enc_add_plane(&w.enc, "scale", RAD_F16, 1, 128);
+                rad_enc_add_plane(&w.enc, "zero", RAD_U8, 1, 128);
+            }
+            op.base.set_s("dtype", u4 ? "w4a8i8_asym" : "i8a8h");
+            op.base.set_i("group", 256);
+            CHECK_EQ(lora::op_is_site(program, op, nullptr, nullptr), !u4);
+            op.base.set_i("group", 128);
+            CHECK(lora::op_is_site(program, op, nullptr, nullptr));
+            if (u4) {
+                w.enc.plane[1].block[1] = 64;
+                CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+                w.enc.plane[1].block[1] = 128;
+            }
+            op.base.set_i("pb1", 16);
+            CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+            op.base.set_i("pb1", 0);
+            std::strcpy(w.enc.transform, "fwht64");
+            CHECK(!lora::op_is_site(program, op, nullptr, nullptr));
+            std::strcpy(w.enc.transform, "fwht128");
+        }
+        std::vector<lora::Site> sites;
+        REQUIRE_EQ(lora::build_sites(program, {"*"}, 16, &sites, &err), RAD_OK);
+        const lora::KeyMap keys(program, sites);
+        std::map<std::string, lora::Composite> modules;
+        lora::ComposeReport report;
+        REQUIRE_EQ(lora::compose(keys, {{"one", adapter, 1.0}}, 16, &modules, &report, &err),
+                   RAD_OK);
+        CHECK_EQ(report.exact, 2);
+        CHECK(report.unplaced.empty());
+        lora::AdapterInfo info;
+        std::vector<lora::PackedSite> packed;
+        REQUIRE_EQ(lora::pack_modules(sites, 16, lora::as_modules(modules, keys), &info,
+                                      &packed, &err, /*compact=*/true), RAD_OK);
+        int rotated_sites = 0;
+        for (const lora::Site& site : sites) {
+            if (!site.fwht128_input) continue;
+            ++rotated_sites;
+            const auto& slot = packed[(size_t)site.pool];
+            CHECK(!slot.empty);
+            CHECK_EQ(slot.r_used, 1);
+            const auto& original = site.weight == "dit.0.qkv.weight" ? q.v : down.v;
+            const auto& columns = truth.at(site.weight).cols;
+            for (int64_t i = 0; i < site.K_r; ++i) {
+                const int64_t start = (i / 128) * 128;
+                double value = 0;
+                for (uint32_t j = 0; j < 128; ++j) {
+                    const double coefficient = rad_bf16_to_f32(slot.a[(size_t)(start + j)]);
+                    const auto parity = std::popcount(uint32_t(i % 128) & j) % 2;
+                    value += parity ? -coefficient : coefficient;
+                }
+                CHECK_NEAR(value, original[(size_t)columns[(size_t)i]], 0.002);
+            }
+        }
+        CHECK_EQ(rotated_sites, 2);
+    }
+}
+
+TEST(validation_detects_a_small_discarded_rank_even_when_retained_energy_rounds_to_exact) {
+    const auto path = new_dir("genlora_rank") + "/two.safetensors";
+    const std::string module = "transformer.transformer_blocks.0.attn.to_out.0";
+    TW a{module + ".lora_A.weight", "F32", {2, kQ}, std::vector<float>(2 * kQ)};
+    TW b{module + ".lora_B.weight", "F32", {kD, 2}, std::vector<float>(2 * kD)};
+    a.v[0] = a.v[kQ + 1] = b.v[0] = 1;
+    b.v[3] = 0.001f;
+    write_st(path, {a, b});
+    auto file = std::make_shared<lora::AdapterFile>();
+    std::string err;
+    REQUIRE_EQ(file->open(path, &err), RAD_OK);
+    Program program;
+    std::map<std::string, Truth> truth;
+    REQUIRE_EQ(build_gen(0, 1, &program, &truth), RAD_OK);
+    std::vector<lora::Site> sites;
+    REQUIRE_EQ(lora::build_sites(program, {"*"}, 1, &sites, &err), RAD_OK);
+    lora::KeyMap keys(program, sites);
+    std::map<std::string, lora::Composite> matrices;
+    lora::ComposeReport report;
+    REQUIRE_EQ(lora::compose(keys, {{"two", file, 1.0}}, 1, &matrices, &report, &err), RAD_OK);
+    CHECK_EQ(report.exact, 1);
+    CHECK_EQ(report.over_rank, module);
+}
+
+
+TEST(strict_validation_rejects_an_unwired_resolved_reader_even_when_a_pool_was_packed) {
+    Program program;
+    program.weights.resize(3);
+    auto& weight = program.weights[1];
+    weight.name = weight.source = "dit.weight";
+    weight.decl.rank = 2;
+    weight.decl.shape[0] = weight.decl.shape[1] = 128;
+    program.weights[2] = weight;
+    program.weights[2].name = "dit.scale";
+    program.lora_roots.push_back({"transformer.", {""}});
+    RadNameMap map{};
+    map.declared = "dit.weight";
+    map.mode = RAD_MAP_COPY;
+    map.n_src = 1;
+    map.src[0] = "transformer.test.weight";
+    map.src_index[0] = -1;
+    program.name_map.push_back(map);
+    program.ops.resize(3);
+    for (size_t i = 1; i < program.ops.size(); ++i) {
+        program.ops[i].op = "gemm_nt";
+        program.ops[i].weights = {1,2};
+    }
+    program.ops[1].lora_site = 0;
+    program.lora_sites.resize(1);
+    program.lora_sites[0].gemm = 1;
+    program.lora_sites[0].pool = 0;
+    program.lora_pools.resize(1);
+    program.lora_pools[0].weight = "dit.weight";
+    lora::AdapterInfo packed;
+    lora::AdapterInfo::Module module;
+    module.name = "transformer.test";
+    module.pool = 0;
+    module.base = module.name;
+    packed.modules.push_back(module);
+    std::string why;
+    const auto missing = lora::generator_placement_issues(program, {"*"}, {1,2});
+    REQUIRE_EQ(missing.size(), (size_t)1);
+    CHECK_EQ(lora::check_generator_placement({packed}, {missing}, {}, &why), RAD_E_INVAL);
+    CHECK(why.find("resolved op 2") != std::string::npos);
+    // The unwired alternative is not resolved. Its wired fallback is sufficient.
+    const auto complete = lora::generator_placement_issues(program, {"*"}, {1});
+    CHECK(complete.empty());
+    CHECK_EQ(lora::check_generator_placement({packed}, {complete}, {}, &why), RAD_OK);
+    // A second TP rank with no local reader legitimately packs no slice.
+    auto absent = packed;
+    absent.modules[0].pool = -1;
+    Program no_reader;
+    const auto no_requirement = lora::generator_placement_issues(no_reader, {"*"}, {});
+    CHECK_EQ(lora::check_generator_placement({packed, absent}, {complete,no_requirement}, {}, &why), RAD_OK);
+    CHECK_EQ(lora::check_generator_placement({absent, absent}, {complete,no_requirement}, {}, &why), RAD_E_INVAL);
+    // Rank-specific row pieces must be packed on the rank that actually reads them.
+    auto piece0 = packed, piece1 = packed;
+    piece0.modules[0].name = piece0.modules[0].base = "transformer.test@0+2";
+    piece1.modules[0].name = piece1.modules[0].base = "transformer.test@2+2";
+    const std::vector<std::set<std::string>> pieces = {{"transformer.test@0+2"}, {"transformer.test@2+2"}};
+    CHECK_EQ(lora::check_generator_placement({piece0, absent}, {complete,no_requirement}, {}, &why, pieces), RAD_E_INVAL);
+    CHECK(why.find("required matrix slice") != std::string::npos);
+    CHECK_EQ(lora::check_generator_placement({piece0, piece1}, {complete,no_requirement}, {}, &why, pieces), RAD_OK);
+    // A row mixer has no GEMM pool: only an eligible all-rank replacement can satisfy it.
+    CHECK_EQ(lora::check_generator_placement({absent, absent}, {complete,no_requirement},
+                                            {"transformer.test"}, &why), RAD_OK);
 }
 
 RAD_TEST_MAIN()

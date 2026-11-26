@@ -9,6 +9,7 @@
  * and skip without it.
  */
 #include "server_fakes.h"
+#include "server/front.h"
 
 #include "mm/media.h"
 
@@ -117,7 +118,7 @@ TEST(an_image_model_names_the_images_endpoints_and_its_capabilities) {
  * one under 2^53 (returned for reuse, and JavaScript reads JSON numbers as doubles), and each
  * image's seed counting up from it. */
 TEST(the_generator_gets_rounded_sizes_quality_steps_and_a_readable_seed) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const json a = s.gen({ { "prompt", "x" }, { "size", "300x200" }, { "quality", "low" },
                            { "seed", 5 }, { "n", 2 } });
@@ -151,7 +152,7 @@ TEST(the_generator_gets_rounded_sizes_quality_steps_and_a_readable_seed) {
  * twice with guidance (the negative prompt is a second conditioning). An edit's pictures are
  * resized to the model's reference area at their own aspect before the encoder sees them. */
 TEST(usage_counts_each_pictures_tokens_in_every_branch) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const std::string pic = png(40, 20, 255, 255);
     REQUIRE(!pic.empty());
@@ -347,7 +348,7 @@ TEST(guidance_follows_the_model_cards_terms_and_its_default_negative) {
 }
 
 TEST(an_auto_background_follows_the_pictures_alpha) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const std::string opaque = png(40, 20, 255, 255), half = png(40, 20, 0, 255);
     REQUIRE(!opaque.empty() && !half.empty());
@@ -370,7 +371,7 @@ TEST(an_auto_background_follows_the_pictures_alpha) {
  * same type. A prompt the model's template does not open with its fixed turn is the server's
  * failure, a 500 typed as one. */
 TEST(a_generators_failure_is_a_400_or_a_500_streamed_or_not) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.submit_status = RAD_E_INVAL;
     s.img.submit_why = "too long for the cache";
@@ -407,7 +408,7 @@ TEST(a_generators_failure_is_a_400_or_a_500_streamed_or_not) {
 /* An upload as multipart form-data: fields arrive as text (n as "2") and pictures as `image[]`
  * parts. */
 TEST(a_multipart_edit_reads_text_fields_and_picture_parts) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const std::string pic = png(40, 20, 255, 255);
     HttpRequest q;
@@ -428,7 +429,7 @@ TEST(a_multipart_edit_reads_text_fields_and_picture_parts) {
 /* A stream sends each preview as a partial_image event numbered from 0, then the image as
  * `completed` with its usage, per image. */
 TEST(a_streamed_generation_sends_previews_then_the_image) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     HttpResponse r = s.post("/v1/images/generations",
                             { { "prompt", "x" }, { "stream", true }, { "partial_images", 2 } });
@@ -445,7 +446,7 @@ TEST(a_streamed_generation_sends_previews_then_the_image) {
 }
 
 TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.inf.default_width = s.img.inf.default_height = 1024;
     s.img.inf.max_tokens = 4096;
@@ -464,7 +465,7 @@ TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
  * grid (near-matched aspects fill it, others fit inside it), and the grounding picture is cut
  * to 768 px on its long side. */
 TEST(a_reference_fitting_edit_bounds_ref_boost_refuses_masks_and_resizes_references) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.inf.refs_fit_output = true;
     const std::string pic = png(100, 100, 255, 255);
@@ -725,9 +726,62 @@ TEST(stopping_the_server_releases_all_image_adapter_waiters) {
     CHECK_EQ(second.get(), 429);
     CHECK_EQ(f.srv->in_flight(), 0);
 }
+TEST(adapter_validation_uses_the_selected_model_without_generating_or_holding_a_slot) {
+    int validations = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
+        o.api_key = "fixture";
+        o.gen_lora_validate = [&](const auto& choices, std::string* why) {
+            ++validations;
+            if (choices.front().first != "turbo") {
+                *why = "unmatched adapter";
+                return RAD_E_NOTFOUND;
+            }
+            CHECK_EQ(choices.front().second, 0.6);
+            return RAD_OK;
+        };
+    }});
+    auto validate = [&](const char* model, const json& adapters) {
+        return f.post("/v1/loras/validate", json{{"model", model}, {"loras", adapters}}.dump());
+    };
+    CHECK_EQ(validate("missing", {"turbo"}).status, 404);
+    CHECK_EQ(validate("test-model", json::array()).status, 400);
+    CHECK_EQ(validations, 0);
+    const auto answer = validate("test-model", {{"turbo", 0.6}});
+    REQUIRE_EQ(answer.status, 200);
+    CHECK_EQ(json::parse(answer.body)["compatibility"].get<std::string>(), std::string("compatible"));
+    CHECK_EQ(validate("test-model", {"unknown"}).status, 404);
+    CHECK_EQ(f.srv->in_flight(), 0);
+    CHECK_EQ(validations, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+TEST(fleet_validation_targets_the_parsed_model_or_alias_without_waking_a_cold_model) {
+    Front front(TransportOptions{}, 0);
+    Fixture image(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        o.model_id = "image";
+        o.api_key = "fixture";
+        d.front = &front;
+        o.gen_lora_validate = [](const auto&, std::string*) { return RAD_OK; };
+    }});
+    front.add("cold", {"default"}, 0, false);
+    front.attach("image", {"edit"}, image.srv.get());
+    auto validate = [&](std::string body) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/loras/validate";
+        q.body = std::move(body);
+        return front.forward(std::move(q)).status;
+    };
+    CHECK_EQ(validate(R"({"mod\u0065l":"edit","loras":["style"]})"), 200);
+    CHECK_EQ(validate(R"({"model":"cold","model":"image","loras":["style"]})"), 200);
+    CHECK_EQ(validate(R"({"model":"cold","loras":["style"]})"), 409);
+    CHECK_EQ(validate(R"({"model":"image:missing","loras":["style"]})"), 404);
+    CHECK_EQ(front.activity("image").uses, 0);
+}
+
 
 TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.inf.refs_fit_output = true;
     s.img.inf.size_multiple = 16;
@@ -767,7 +821,7 @@ TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
 /* Only sides that border generated area fade into the model's output; a source side on the canvas
  * boundary keeps its pixels bit-identical to the scaled source. */
 TEST(krea_outfill_keeps_source_pixels_on_canvas_edge_sides) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.inf.refs_fit_output = true;
     s.img.inf.size_multiple = 16;
@@ -809,7 +863,7 @@ TEST(krea_outfill_keeps_source_pixels_on_canvas_edge_sides) {
 
 /* Malformed outfill input is a 400 under the field at fault, before anything is queued. */
 TEST(krea_outfill_refuses_malformed_input_before_the_generator) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.inf.refs_fit_output = true;
     s.img.inf.size_multiple = 16;

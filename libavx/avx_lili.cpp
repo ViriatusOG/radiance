@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <vector>
 
 using namespace avx;

@@ -287,7 +287,7 @@ TEST(planner_stages_when_no_host_kernel_resolved) {
 
     /* Every staged unit has an exact deadline from the declared op order, and the prefetch
      * schedule is sorted by it. */
-    CHECK_EQ((int)p.prefetch.size(), 7);
+    REQUIRE_EQ((int)p.prefetch.size(), 7);
     for (size_t i = 1; i < p.prefetch.size(); ++i)
         CHECK(p.prefetch[i - 1].at_op <= p.prefetch[i].at_op);
     CHECK(p.prefetch[0].at_op > 0);
@@ -1330,6 +1330,12 @@ bool published_matches(Mover& m, const Program& prog, rad_weight w,
 }
 }  /* namespace */
 
+/* A container file of this process's own in the working directory (which, unlike a tmpfs /tmp,
+ * takes O_DIRECT): place_test and place_test_card run side by side from one build directory. */
+static std::string own_file(const char* leaf) {
+    return std::string(leaf) + "." + std::to_string((long long)getpid());
+}
+
 TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
     /* Three routed layers of four 20 MiB experts; 0 and 2 are popular and stay resident, so 1
      * and 3 of each layer are read from the container. This places resident bytes between
@@ -1354,20 +1360,18 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
     }
     std::vector<uint8_t> img((size_t)off);
     for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
-    const std::string path = "place_test_file_tier.rad";
+    const std::string path = own_file("place_test_file_tier.rad");
     {
         FILE* fp = std::fopen(path.c_str(), "wb");
-        CHECK(fp != nullptr);
-        if (!fp) return;
+        REQUIRE(fp != nullptr);
         CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
         std::fclose(fp);
     }
     {
         DirectFile probe;
         if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
-            std::printf("  SKIP the working directory has no O_DIRECT\n");
             std::remove(path.c_str());
-            return;
+            SKIP("the working directory has no O_DIRECT");
         }
     }
 
@@ -1556,12 +1560,9 @@ TEST(the_file_stager_reads_a_layer_with_the_counts_its_own_router_wrote) {
     const int L = 3;
     build_moe_layers(f, L, 4, 2 * MiB + 1000, MiB + 24);
     f.prog.meta.n_expert = 4;
-    const std::string path = "place_test_counts.rad";
+    const std::string path = own_file("place_test_counts.rad");
     const std::vector<uint8_t> img = write_container(f, path);
-    if (img.empty()) {
-        std::printf("  SKIP the working directory has no O_DIRECT\n");
-        return;
-    }
+    if (img.empty()) SKIP("the working directory has no O_DIRECT");
     std::vector<RadFileProfile> prof;
     for (int l = 0; l < L; ++l)
         for (int e = 0; e < 4; ++e)
@@ -1750,12 +1751,9 @@ TEST(a_full_pool_gives_back_its_coldest_unit_and_the_stager_reads_it_again) {
     const int L = 3;
     build_moe_layers(f, L, 4, MiB + 1000, MiB / 2 + 24);
     f.prog.meta.n_expert = 4;
-    const std::string path = "place_test_cache.rad";
+    const std::string path = own_file("place_test_cache.rad");
     const std::vector<uint8_t> img = write_container(f, path);
-    if (img.empty()) {
-        std::printf("  SKIP the working directory has no O_DIRECT\n");
-        return;
-    }
+    if (img.empty()) SKIP("the working directory has no O_DIRECT");
     /* Rank order: layer 0's experts, then layer 1's, then layer 2's. Layer 0's four fill the
      * pool and the rest go to the file tier, so layer 0 has nothing there. The card holds the
      * embedding and the two file buffers; a resident would also need a hot-cache shadow slot,
@@ -1882,11 +1880,9 @@ TEST(a_read_ahead_never_takes_a_pooled_unit_of_the_layer_about_to_run) {
     const int L = 3;
     build_moe_layers(f, L, 4, MiB + 1000, MiB / 2 + 24);
     f.prog.meta.n_expert = 4;
-    const std::string path = "place_test_cache2.rad";
+    const std::string path = own_file("place_test_cache2.rad");
     const std::vector<uint8_t> img = write_container(f, path);
-    if (img.empty()) {
-        SKIP("the working directory has no O_DIRECT");
-    }
+    if (img.empty()) SKIP("the working directory has no O_DIRECT");
     /* Rank order: layer 0's experts, then layer 1's, then layer 2's. Layer 0's four fill the
      * pool and the rest go to the file tier, so layer 0 has nothing there. The card holds the
      * embedding and the two file buffers; a resident would also need a hot-cache shadow slot,
@@ -2211,7 +2207,7 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
             if (p >= st.top - st.bytes && p < st.top)
                 CHECK(p + r.hf.plan.classes[0].stride <= st.top - (int64_t)RAD_ALIGN_UNIT);
     }
-    CHECK_EQ((int64_t)at.size(), expect);
+    REQUIRE_EQ((int64_t)at.size(), expect);
     std::sort(at.begin(), at.end());
     for (size_t k = 1; k < at.size(); ++k)
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
@@ -2472,8 +2468,7 @@ TEST(a_recall_moves_a_donor_whose_slots_are_still_in_quarantine) {
         if (hot < 0 && r.h.tier(u) != Tier::VRAM) hot = u;
         if (cold < 0 && r.h.tier(u) == Tier::VRAM && !r.loan.inside(r.addr(u))) cold = u;
     }
-    CHECK(hot >= 0 && cold >= 0);
-    if (hot < 0 || cold < 0) return;
+    REQUIRE(hot >= 0 && cold >= 0);
 
     CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
     r.work.run(r.compute);
@@ -2525,8 +2520,7 @@ TEST(a_demotion_with_no_slab_slot_takes_no_host_copy) {
     int32_t pooled = -1;
     for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size() && pooled < 0; ++u)
         if (r.hf.plan.units[(size_t)u].movable && r.h.tier(u) != Tier::VRAM) pooled = u;
-    CHECK(pooled >= 0);
-    if (pooled < 0) return;
+    REQUIRE(pooled >= 0);
 
     CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
     r.work.run(r.compute);
@@ -3736,6 +3730,95 @@ TEST(embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram) {
     CHECK_OK(Planner(in).plan(&plan2));
     CHECK(plan2.weight[emb].tier == Tier::VRAM);
     CHECK_EQ(plan2.embedding_host_bytes, 0ll);
+}
+
+/* A quantised token table as plugin/exl3i serves it: several model-level weights, each read only by
+ * its gather (embed_tq: the codes, a scale per 128 columns and a codebook; embed_exl3i: the record,
+ * suh and svh). Each is a table, and with the embedding in RAM all of them leave the statics for the
+ * host pool. The layers and the head are build_dense_lookup's, without its plain table. */
+std::vector<rad_weight> build_dense_quantised(Fixture& f, const char* gather) {
+    const std::vector<rad_weight> t = {
+        f.weight("token_embd.codes", 3 * MiB, RAD_ACCESS_VOCAB, -1, -1),
+        f.weight("token_embd.scale", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1),
+        f.weight("token_embd.table", 1 * MiB, RAD_ACCESS_PER_TOKEN, -1, -1),
+    };
+    f.op(gather, t, true);
+    for (int l = 0; l < 2; ++l) {
+        const rad_weight w = f.weight("blk." + std::to_string(l) + ".ffn_down.weight", 4 * MiB,
+                                      RAD_ACCESS_PER_TOKEN, l, -1);
+        f.op("gemm", {w}, false);
+    }
+    const rad_weight o = f.weight("output.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("logits_gemm", {o}, false);
+    return t;
+}
+
+TEST(a_quantised_token_table_s_planes_are_tables_by_their_gather) {
+    for (const char* gather : { "embed_tq", "embed_exl3i" }) {
+        Fixture f;
+        const std::vector<rad_weight> t = build_dense_quantised(f, gather);
+        for (rad_weight w : t) CHECK(is_embedding_table(f.prog, w));
+        CHECK(!is_embedding_table(f.prog, (rad_weight)(f.prog.weights.size() - 1)));   /* the head */
+
+        WeightFootprint fp;
+        weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
+        CHECK_EQ(fp.embedding, 5 * MiB);
+        CHECK_EQ(fp.hosted, 0ll);
+        CHECK_EQ(fp.statics, 2 * 4 * MiB + 1 * MiB + 5 * MiB);
+        weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+        CHECK_EQ(fp.embedding, 5 * MiB);
+        CHECK_EQ(fp.hosted, 5 * MiB);
+        CHECK_EQ(fp.statics, 2 * 4 * MiB + 1 * MiB);
+    }
+}
+
+/* The reader test stays strict: a plane another op reads too is not a table and stays with the
+ * statics (as a tied head keeps the plain table on the card), while its sibling planes still are;
+ * and a weight two different gathers read is no table either. */
+TEST(a_quantised_table_s_plane_another_op_reads_stays_on_the_card) {
+    Fixture f;
+    const rad_weight c = f.weight("token_embd.codes", 3 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    const rad_weight s = f.weight("token_embd.scale", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    const rad_weight m = f.weight("mixed.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_tq", {c, s}, true);
+    f.op("logits_gemm", {c}, false);
+    f.op("embed_lookup", {m}, false);
+    f.op("embed_exl3i", {m}, true);
+    CHECK(!is_embedding_table(f.prog, c));
+    CHECK(is_embedding_table(f.prog, s));
+    CHECK(!is_embedding_table(f.prog, m));
+
+    WeightFootprint fp;
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.embedding, 1 * MiB);
+    CHECK_EQ(fp.hosted, 1 * MiB);
+    CHECK_EQ(fp.statics, 3 * MiB + 1 * MiB);
+}
+
+/* Planned with the embedding in RAM, every plane of a quantised table goes to the pinned pool and
+ * is read in place, as the plain table is; the layers and the head stay on the card. */
+TEST(a_quantised_token_table_goes_to_the_pinned_pool_read_in_place) {
+    for (const char* gather : { "embed_tq", "embed_exl3i" }) {
+        Fixture f;
+        const std::vector<rad_weight> t = build_dense_quantised(f, gather);
+        Config cfg = base_config();
+        cfg.placement = "all_vram";
+        cfg.vram_weights_mib = 9;           /* exactly the layers and the head */
+        cfg.host_pool_mib = 8;
+        cfg.embedding_placement = TablePlacement::Ram;
+        cfg.embedding_resolved = TablePlacement::Ram;
+        Plan plan;
+        PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+        CHECK_OK(Planner(in).plan(&plan));
+        for (rad_weight w : t) {
+            CHECK(plan.weight[w].tier == Tier::HostPinned);
+            CHECK(plan.weight[w].site == Site::DeviceZeroCopy);
+            CHECK(!plan.units[(size_t)plan.weight[w].unit].movable);
+        }
+        CHECK_EQ(plan.embedding_host_bytes, 5 * MiB);
+        for (rad_weight w = t.back() + 1; (size_t)w < f.prog.weights.size(); ++w)
+            CHECK(plan.weight[w].tier == Tier::VRAM);
+    }
 }
 
 /* The embedding gets its own room: the resolver sizes Config::embedding_host_mib on top of

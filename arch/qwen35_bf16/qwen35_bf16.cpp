@@ -63,37 +63,28 @@ namespace qwen35_bf16 {
 
 using namespace rad::arch;
 
-/* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h), at more than one
- * rank. A decode-height all-reduce leaves the card's memory idle for its round trip, so the next
- * GEMM's leading weight bytes are read into the on-die cache then, as qwen35_fp8 and gemma4_bf16
- * do. Each read is issued inside its block, after the block's last GEMM and before its own
- * all-reduce, so it is beside the reduction whether the block or the next norm (ar_rmsnorm) runs
- * it:
+/* Weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h), at more than one rank.
+ * A decode-height all-reduce leaves the card's memory idle for its round trip, so the leading
+ * bytes of the next GEMM's weight are read into the on-die cache then (as qwen35_fp8 and
+ * gemma4_bf16 do). Each read is issued inside its block, after the block's last GEMM and before
+ * its own all-reduce, so it runs beside the reduction whether the block or the next norm
+ * (ar_rmsnorm) issues it:
  *   kPfGateUpBytes  of gate_up, after the mixer's o or out
  *   kPfNextBytes    of the next layer's first GEMM (q|gate, or the delta net's in; the lm_head
  *                   after the last layer), after down
- *   kPfOutBytes     of the delta net's out-projection, beside its decode recurrent update, which
- *                   runs one workgroup per (sequence, head) and leaves the memory mostly idle; in a
- *                   pure decode step of at most kPfOutSeqs sequences (qwen35_fp8's bound); only
- *                   where launches do not chain (below)
- *   kPfDraftBytes  of each GEMM the DFlash2 drafter's reads name (Dflash2::Config::prefetch),
- *                   qwen35_fp8's size
- * Decode steps only, up to kPrefetchRows rows: one or two sequences' verify. Qwen3.8-27B bf16x12 +
- * DFlash2 at depth 7, TP2 on two R9700s, one stream, seven greedy prompts, two interleaved server
- * starts each: 43.95 ms a step without the reads, 41.76 with these sizes (-5.0 %), the text
- * byte-identical. A verify pass's packed GEMMs took 2.2 ms less and its all-reduces 0.66 ms more
- * (ar_rmsnorm 17.4 -> 22.7 us beside a read); each read starts ~6 us after its GEMM and reads at
- * ~330 GB/s beside the reduction; the drafter's pass took 2.51 -> 2.38 ms. Of the other (gate_up,
- * next, out) sizes in MiB, (12, 12, 8) was within 0.1 ms at more bytes a pass and (12, 6, 15)
- * 0.12 ms slower; in an earlier round (8, 16, 8) and (16, 20, 12) ran 0.44 and 0.34 ms slower than
- * (12, 12, 8): a next read longer than the reduction runs on into the GEMM it feeds.
+ *   kPfOutBytes     of the delta net's out-projection, beside its decode recurrent update (one
+ *                   workgroup per (sequence, head), which leaves the memory mostly idle); only in
+ *                   a pure decode step of at most kPfOutSeqs sequences, and only where launches
+ *                   do not chain
+ *   kPfDraftBytes   of each GEMM the DFlash2 drafter's reads name (Dflash2::Config::prefetch)
+ * Decode steps only, up to kPrefetchRows rows: one or two sequences' verify. On Qwen3.8-27B
+ * bf16x12 + DFlash2 at depth 7, TP2, these sizes cut a step from 43.95 to 41.76 ms with the text
+ * byte-identical; a next read longer than the reduction runs on into the GEMM it feeds and loses.
  *
  * Where launches chain (rad_chain_on) every read goes on lane 0 as the chained form right behind
- * its GEMM (prefetch_beside). There the out read would sit in front of the recurrent update, a
- * plain launch, which waits for it, so the read runs in series with the update instead of beside
- * it; none is declared. The same bf16x12 + DFlash2 deployment, chained, three interleaved server
- * starts each: 41.10 ms a step with the out read, 40.72 without it (-0.38 ms, faster in each of
- * the three rounds), the text byte-identical. */
+ * its GEMM. The out read would then sit in front of the recurrent update, a plain launch that
+ * waits for it, so the two run in series instead of beside each other; none is declared (41.10
+ * ms a step with it, 40.72 without). */
 constexpr int64_t kPfGateUpBytes = (int64_t)12 << 20;
 constexpr int64_t kPfNextBytes   = (int64_t)8 << 20;
 constexpr int64_t kPfOutBytes    = (int64_t)12 << 20;
@@ -270,15 +261,15 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
     dw.ffn     = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
     /* The codes the drafter's six linears read: every activation feeding one has an 8-bit copy
-     * and an f32 scale plane. E4M3 with a scale per 128 for block fp8 or MXFP4 linears (rad_fp8.h's
-     * DenseFP8), int8 with a scale per 128 or IQ8R's 256 for rotated int8 ones, which the drafter's
+     * and an f32 scale plane. E4M3 with a scale per 128 for block fp8 or MXFP4 linears
+     * (rad_linear.h's DenseQ), int8 with a scale per 128 or IQ8R's 256 for rotated int8 ones, which the drafter's
      * `fc` tells apart.
      * `srcq` is the largest (50 MiB at a 2048-token chunk and five taps) and halves the bytes of
      * the context pass's dominant GEMM. */
     RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
     dc.fc_mapped = true;
     const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
-    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_SCALE_GROUP;
     if (dc.act_i8 && ((dc.n_taps * dg.n_embd) % dqg || dg.n_embd % dqg || qd % dqg ||
                       dg.n_ff % dqg)) {
         fprintf(stderr, "radiance: a rotated int8 drafter takes widths in whole %lld-column scale groups; "
@@ -545,6 +536,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     cd.head_dim   = gc.head_k;
     cd.conv_width = gc.conv_width;
     m.kv_conv = rad_decl_kv_group(b, nm.f("kv_gdn_conv"), &cd);
+    if (!m.kv_full || !m.kv_state || !m.kv_conv) return RAD_E_INVAL;
 
     /* ---- activation buffers, sized at max_tok (the worst step) and shared by every layer of a
      * kind; liveness analysis over the declared read and write sets fits them in one arena
@@ -597,12 +589,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (m.n_taps > 0) {
                 m.b_dfsrc = decl_b(b, nm.f("dflash_src"), g.act_dtype,
                                    {g.max_tok, (int64_t)m.n_taps * g.n_embd});
-                m.op_tap = rw(b, RAD_OP(b, "cast",
-                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
-                                             RAD_INT("n", g.n_embd),
-                                             RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                                  RAD_NOWEIGHTS),
-                              {m.b_x}, {m.b_dfsrc});
+                m.op_tap = cast_op(b, g.max_tok, g.n_embd, g.dtype, g.dtype, m.b_x, m.b_dfsrc);
             }
         }
     }
@@ -646,12 +633,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Always exact, not g.wire_exact: this sums disjoint rows (each token from one rank, zeros
      * from the others), so a lossy wire would only add error. */
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                               RAD_NOWEIGHTS),
-                           {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
 
     /* ---- the layers. */
     AttnGatedBF16::Wire aw{};

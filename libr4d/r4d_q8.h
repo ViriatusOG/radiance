@@ -1,6 +1,6 @@
 // r4d_q8.h -- the 8-bit activation codes the trunk GEMMs read, written by every quantising producer:
-// E4M3 for the fp8a8 GEMMs, int8 for their int8 twins (gemm_i8a8_*). One scale per (row, 128
-// columns); only the largest code and the conversion differ.
+// E4M3 (dtype fp8a8) or int8 (gemm_i8a8_*). One scale per (row, 128 columns); only the largest
+// code and the conversion differ.
 //
 // E4M3: scale `amax * (1 / 448)`, clamp to +-448, two packed conversions. The clamp is required:
 // v_cvt_pk_fp8_f32 returns NaN for out-of-range input instead of saturating, and

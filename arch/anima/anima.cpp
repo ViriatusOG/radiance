@@ -44,7 +44,7 @@
  * ============================== WHAT IS QUANTISED ==============================
  *
  * One plugin serves bf16 and block-fp8 containers: the text encoder's linears and the DiT blocks'
- * attention and MLP linears are LinearFP8s (rad_fp8.h), bf16 throughout when the first DiT
+ * attention and MLP linears are LinearQs (rad_linear.h), bf16 throughout when the first DiT
  * projection is plain. The adapter, the modulation and embedding linears, the final layer and the
  * VAE stay bf16. Every linear a LoRA for Anima names is a plain capable GEMM (gemm_nt or gemm_nt_q
  * without rotation), its activation applied by a separate op.
@@ -52,13 +52,12 @@
  * One card: tensor parallelism is refused.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 #include <arch/rad_vae2d.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -95,9 +94,9 @@ static const double kLatStd[16] = { 2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.77
 /* ================================================================== the model */
 struct TeLayer {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0, op_add1 = 0, op_n2 = 0, op_add2 = 0;
 };
 
@@ -119,8 +118,8 @@ struct DitLayer {
     rad_weight w_qn = 0, w_kn = 0, w_cqn = 0, w_ckn = 0;
     rad_weight w_mod1[3] = { 0, 0, 0 }, w_mod2[3] = { 0, 0, 0 };
     rad_op     op_mod1[3] = { 0, 0, 0 }, op_mod2[3] = { 0, 0, 0 }, op_modadd[3] = { 0, 0, 0 };
-    LinearFP8  qkv{}, o{}, cq{}, ck{}, cv{}, co{}, l1{}, l2{};
-    QuantFP8   q_attn{}, q_cattn{}, q_ffn{};
+    LinearQ  qkv{}, o{}, cq{}, ck{}, cv{}, co{}, l1{}, l2{};
+    QuantAct   q_attn{}, q_cattn{}, q_ffn{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0;
     rad_op     op_n2 = 0, op_cqn = 0, op_ckn = 0, op_cattn = 0;
     rad_op     op_n3 = 0, op_gelu = 0;
@@ -143,7 +142,7 @@ struct Model {
     rad_weight w_tok = 0, w_tnorm = 0;
     rad_op  op_embed = 0, op_tnorm = 0;
     rad_buf b_tx = 0, b_tkv = 0, b_th2 = 0, b_tgu = 0, b_src = 0;
-    ActFP8  a_th{}, a_tattn{}, a_tffn{};
+    ActQ  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
 
     /* ---- the adapter */
@@ -168,10 +167,10 @@ struct Model {
     rad_op  op_g3 = 0, op_fn = 0, op_final = 0, op_euler = 0;
     rad_buf b_lat = 0, b_h = 0, b_qkv = 0, b_cq = 0, b_ck = 0, b_cv = 0, b_ao = 0, b_l1 = 0;
     rad_buf b_fz = 0, b_v = 0;
-    ActFP8  a_hm{}, a_attn{}, a_ffn{}, a_ctx{};
+    ActQ  a_hm{}, a_attn{}, a_ffn{}, a_ctx{};
     std::vector<DitLayer> dit;
-    LinearFP8 qkv0{};
-    QuantFP8  q_ctx{};
+    LinearQ qkv0{};
+    QuantAct  q_ctx{};
 
     /* ---- the per-image state and the conditioning store (PERSIST) */
     rad_buf b_state = 0, b_prev = 0, b_store = 0;
@@ -186,12 +185,6 @@ struct Model {
 
 static Model g_model[MAX_SLOTS];
 
-static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
-                        std::initializer_list<int64_t> shape, int access, int group) {
-    if (map_copy(b, dn, src) < 0) return 0;
-    return decl_w(b, dn, dtype, shape, access, RAD_SHARD_NONE, grp_layer(group));
-}
-
 /* A plain bf16 linear without a bias: gemm_nt, the activation a separate op. `src` is one
  * checkpoint name, or several stacked along dim 0. */
 static rad_op dense(RadBuilder* b, const char* dn, std::initializer_list<const char*> src,
@@ -200,11 +193,7 @@ static rad_op dense(RadBuilder* b, const char* dn, std::initializer_list<const c
     if (map_linear(b, dn, src) < 0) return 0;
     *w = decl_w(b, dn, RAD_BF16, { N, K }, access, RAD_SHARD_NONE, grp_layer(group), 0, parts);
     if (!*w) return 0;
-    return rw(b, RAD_OP(b, "gemm_nt",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(*w)),
-              { in }, { out });
+    return gemm_op(b, rows, N, K, *w, in, out);
 }
 
 /* A bf16 linear with a bias. */
@@ -215,27 +204,7 @@ static rad_op dense_bias(RadBuilder* b, Names& nm, const char* dn, const char* s
                group);
     *bias = wcopy(b, nm.f("%s.bias", dn), nm.ckpt("%s.bias", src), RAD_BF16, { N }, access, group);
     if (!*w || !*bias) return 0;
-    return rw(b, RAD_OP(b, "gemm_nt_bias",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(*w, *bias)),
-              { in }, { out });
-}
-
-static rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, rad_buf in,
-                    rad_buf out) {
-    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                          RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { in }, { out });
-}
-
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf a, rad_buf c, rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
+    return gemm_bias_op(b, rows, N, K, *w, *bias, in, out);
 }
 
 /* An RMS norm with a gain, `rows` rows of `n`. */
@@ -702,7 +671,7 @@ static int declare_dit(RadBuilder* b, Model& m) {
         const bool q = !g.w_bf16;
         rad_op op = q ? RAD_OP(b, "rms_mod_quant_fp8",
                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
-                                          RAD_INT("group", RAD_FP8_BLOCK),
+                                          RAD_INT("group", RAD_SCALE_GROUP),
                                           RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16"),
                                           RAD_STR("norm", "layer")),
                                RAD_NOWEIGHTS)
@@ -1015,9 +984,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     gd.eps = 1e-6f;
 
     /* ---- bf16 or block fp8: what the container holds for the first DiT projection decides it
-     * for every LinearFP8 of the text encoder and the DiT (rad_fp8.h, Geom::w_bf16). */
+     * for every LinearQ of the text encoder and the DiT (rad_linear.h, Geom::w_bf16). */
     {
-        LinearFP8& probe = m.qkv0;
+        LinearQ& probe = m.qkv0;
         RAD_ARCH_TRY(probe.probe(b, nm, gd, nm.f("dit.blk.0.attn_qkv"),
                                  { nm.ckpt("%sblocks.0.self_attn.q_proj.weight", m.pre.c_str()),
                                    nm.ckpt("%sblocks.0.self_attn.k_proj.weight", m.pre.c_str()),

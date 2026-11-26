@@ -49,9 +49,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -65,14 +63,6 @@ namespace {
 
 /* ================================================================== the vocabulary */
 
-
-std::string slurp(const std::string& p, bool* ok) {
-    std::ifstream f(p, std::ios::binary);
-    *ok = (bool)f;
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
 
 double ms_since(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -665,17 +655,15 @@ int main(int argc, char** argv) {
     }
 
     /* The chat template's tool-call grammar, with parallel tool calls off and on. */
-    bool ok = false;
-    const std::string tpl = slurp(tpl_path, &ok);
-    if (!ok) {
+    std::string tpl;
+    if (!read_file_bytes(tpl_path, &tpl)) {
         std::fprintf(stderr, "rad-gbnf-check: cannot read %s\n", tpl_path.c_str());
         return 2;
     }
     std::string bos, eos;
     {
-        bool cok = false;
-        const std::string cfg = slurp(cfg_path, &cok);
-        if (cok) {
+        std::string cfg;
+        if (read_file_bytes(cfg_path, &cfg)) {
             try {
                 const ojson c = ojson::parse(cfg);
                 auto tokstr = [&](const char* k) -> std::string {
@@ -731,17 +719,16 @@ int main(int argc, char** argv) {
     for (const SchemaCase& sc : schema_cases())
         run_schema(std::string("json schema ") + sc.name, sc.schema, sc.docs);
     for (const std::string& f : schema_files) {
-        bool fok = false;
-        const std::string s = slurp(f, &fok);
-        if (fok) run_schema("json schema " + f, s, {});
+        std::string s;
+        if (read_file_bytes(f, &s)) run_schema("json schema " + f, s, {});
     }
 
     for (const GbnfCase& gc : gbnf_cases())
         run_grammar(base, tot, "gbnf " + gc.name, gc.text, gc.docs, passes, n_walks, n_steps, seed);
     for (const std::string& f : gbnf_files) {
-        bool fok = false;
-        const std::string s = slurp(f, &fok);
-        if (fok) run_grammar(base, tot, "gbnf " + f, s, {}, passes, n_walks, n_steps, seed);
+        std::string s;
+        if (read_file_bytes(f, &s))
+            run_grammar(base, tot, "gbnf " + f, s, {}, passes, n_walks, n_steps, seed);
     }
 
     std::printf("\n== all grammars\n");

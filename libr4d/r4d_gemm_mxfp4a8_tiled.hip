@@ -352,8 +352,6 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_part_kern
                                                              ldws, ldc, sW, sMag, sR);
 }
 
-extern "C" int r4d_gemm_mxfp4a8_tiled_group(void) { return R4D_MXFP4_GROUP; }
-
 extern "C" long r4d_mxfp4a8_tile_a_bytes(int M, int K) {
   return M < 1 || K < 16 ? 0 : (long)((M + 15) / 16) * 16 * K;
 }

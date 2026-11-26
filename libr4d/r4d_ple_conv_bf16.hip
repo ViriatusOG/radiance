@@ -38,6 +38,7 @@ namespace {
 
 enum {
     kPcThreads = 256,
+    kPcW4Thr   = 64,   /* 2 waves, 8 channels/thread -> 512 ch = 1 blk, 2304 ch = 5 blks */
     kPcBT      = 32,   /* tokens a thread walks; the tile's working set is (BT + hist) * 512 B */
     kPcMaxW    = 8,    /* taps held in registers, so the weight loop unrolls to a static bound */
     kPcMaxHist = 16,   /* (width-1)*dilation, the write-back's register window; see cPleConv */
@@ -115,7 +116,11 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
         }
         if (SCONV) {
             const float xr = bf16_to_f32(xc[(size_t)t * xld]);
-            yc[(size_t)t * yld] = f32_to_bf16((xr + acc) / sdiv);
+            const uint16_t zb = f32_to_bf16((xr + acc) / sdiv);
+            if (rc)
+                yc[(size_t)t * yld] = f32_to_bf16(bf16_to_f32(rc[(size_t)t * rld]) + bf16_to_f32(zb));
+            else
+                yc[(size_t)t * yld] = zb;
             continue;
         }
         const float r = rc ? bf16_to_f32(rc[(size_t)t * rld]) : 0.0f;
@@ -162,6 +167,198 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 #pragma unroll
     for (uint32_t i = 0; i < kPcMaxHist; ++i)
         if (i < hist) dst[(size_t)i * cs_tok] = keep[i];
+}
+
+/* Vectorized width=4 dilation=1 sconv_res / sconv_res_add: 8 contiguous channels per thread,
+ * keeping a 4-slot bf16 shift register in registers so each token reads 1 uint4 from x and writes
+ * 1 uint4 to y (plus 1 uint4 read from resid if HAS_RESID), bit-identical to ple_conv_body. */
+template <bool HAS_DYN, bool HAS_RESID>
+__device__ __forceinline__ void sconv_res_w4_vec8_body(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+    uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,
+    const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,
+    const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,
+    uint16_t* __restrict__ y, uint32_t n,
+    uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,
+    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len,
+    const uint16_t* __restrict__ dyn, uint32_t dld, uint32_t hch, float sdiv) {
+    const uint32_t c8 = (blockIdx.x * kPcW4Thr + threadIdx.x) * 8u;
+    if (c8 >= n) return;
+    const uint32_t s = blockIdx.z;
+    const int32_t bos = cu[s];
+    const int32_t slen = cu[s + 1] - bos;
+    if (slen <= 0) return;
+    const int32_t t0 = (int32_t)(blockIdx.y * kPcBT);
+    if (t0 >= slen) return;
+    const int32_t t1 = min(t0 + (int32_t)kPcBT, slen);
+
+    const int32_t slot = sidx ? sidx[s] : (int32_t)s;
+    if (slot < 0) return;
+    const bool warm = cs && (!hini || hini[s] != 0);
+    const long long off = nacc ? (long long)nacc[s] - 1 : 0;
+
+    float wt[8][4];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const uint2 wv = *(const uint2*)(w + (size_t)(c8 + k) * wld);
+        wt[k][0] = bf16_to_f32((uint16_t)(wv.x & 0xffffu));
+        wt[k][1] = bf16_to_f32((uint16_t)(wv.x >> 16));
+        wt[k][2] = bf16_to_f32((uint16_t)(wv.y & 0xffffu));
+        wt[k][3] = bf16_to_f32((uint16_t)(wv.y >> 16));
+    }
+
+    const uint16_t* __restrict__ xc = x + (size_t)bos * xld + c8;
+    const uint16_t* __restrict__ rc = HAS_RESID ? resid + (size_t)bos * rld + c8 : nullptr;
+    uint16_t* __restrict__ dst = cs ? cs + (size_t)slot * cs_slot + (size_t)c8 * cs_ch : nullptr;
+    const uint16_t* __restrict__ hc = warm ? dst + off * cs_tok : nullptr;
+    uint16_t* __restrict__ yc = y + (size_t)bos * yld + c8;
+    const uint16_t* __restrict__ dc = HAS_DYN ? dyn + (size_t)bos * dld + (c8 / hch) * 4u : nullptr;
+
+    auto ld_u4 = [](const void* p) -> uint4 {
+#ifdef __HIP__
+        return *(const uint4*)p;
+#else
+        uint4 v;
+        __builtin_memcpy(&v, p, sizeof v);
+        return v;
+#endif
+    };
+    auto st_u4 = [](void* p, uint4 v) {
+#ifdef __HIP__
+        *(uint4*)p = v;
+#else
+        __builtin_memcpy(p, &v, sizeof v);
+#endif
+    };
+    auto ld_hist = [&](int32_t src) -> uint4 {
+        if (src >= 0) return ld_u4(xc + (size_t)src * xld);
+        if (!hc) return make_uint4(0u, 0u, 0u, 0u);
+        uint16_t h[8];
+        const size_t ho = (size_t)(src + 3) * (size_t)cs_tok;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) h[k] = hc[(size_t)k * (size_t)cs_ch + ho];
+        return make_uint4((uint32_t)h[0] | ((uint32_t)h[1] << 16),
+                          (uint32_t)h[2] | ((uint32_t)h[3] << 16),
+                          (uint32_t)h[4] | ((uint32_t)h[5] << 16),
+                          (uint32_t)h[6] | ((uint32_t)h[7] << 16));
+    };
+
+    uint4 s0 = ld_hist(t0 - 3);
+    uint4 s1 = ld_hist(t0 - 2);
+    uint4 s2 = ld_hist(t0 - 1);
+    const float inv_sdiv = 1.0f / sdiv;
+    (void)inv_sdiv;
+
+    for (int32_t t = t0; t < t1; ++t) {
+        const uint4 s3 = ld_u4(xc + (size_t)t * xld);
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        if constexpr (HAS_DYN) {
+            const uint2 dv = *(const uint2*)(dc + (size_t)t * dld);
+            d0 = bf16_to_f32((uint16_t)(dv.x & 0xffffu));
+            d1 = bf16_to_f32((uint16_t)(dv.x >> 16));
+            d2 = bf16_to_f32((uint16_t)(dv.y & 0xffffu));
+            d3 = bf16_to_f32((uint16_t)(dv.y >> 16));
+        }
+        const uint32_t p0[4] = { s0.x, s0.y, s0.z, s0.w };
+        const uint32_t p1[4] = { s1.x, s1.y, s1.z, s1.w };
+        const uint32_t p2[4] = { s2.x, s2.y, s2.z, s2.w };
+        const uint32_t p3[4] = { s3.x, s3.y, s3.z, s3.w };
+        uint32_t rv_arr[4];
+        if constexpr (HAS_RESID) {
+            const uint4 rv = ld_u4(rc + (size_t)t * rld);
+            rv_arr[0] = rv.x; rv_arr[1] = rv.y; rv_arr[2] = rv.z; rv_arr[3] = rv.w;
+        }
+        uint32_t out[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int k0 = 2 * p, k1 = 2 * p + 1;
+            const float x0_a = bf16w_lo(p0[p]), x1_a = bf16w_lo(p1[p]),
+                        x2_a = bf16w_lo(p2[p]), x3_a = bf16w_lo(p3[p]);
+            const float x0_b = bf16w_hi(p0[p]), x1_b = bf16w_hi(p1[p]),
+                        x2_b = bf16w_hi(p2[p]), x3_b = bf16w_hi(p3[p]);
+            float acc_a = 0.0f, acc_b = 0.0f;
+            if constexpr (HAS_DYN) {
+                acc_a += x0_a * (wt[k0][0] + d3) + x1_a * (wt[k0][1] + d2) +
+                         x2_a * (wt[k0][2] + d1) + x3_a * (wt[k0][3] + d0);
+                acc_b += x0_b * (wt[k1][0] + d3) + x1_b * (wt[k1][1] + d2) +
+                         x2_b * (wt[k1][2] + d1) + x3_b * (wt[k1][3] + d0);
+            } else {
+                acc_a += x0_a * wt[k0][0] + x1_a * wt[k0][1] +
+                         x2_a * wt[k0][2] + x3_a * wt[k0][3];
+                acc_b += x0_b * wt[k1][0] + x1_b * wt[k1][1] +
+                         x2_b * wt[k1][2] + x3_b * wt[k1][3];
+            }
+            const uint16_t za = f32_to_bf16((x3_a + acc_a) / sdiv);
+            const uint16_t zb = f32_to_bf16((x3_b + acc_b) / sdiv);
+            if constexpr (HAS_RESID) {
+                const uint16_t ya = f32_to_bf16(bf16w_lo(rv_arr[p]) + bf16_to_f32(za));
+                const uint16_t yb = f32_to_bf16(bf16w_hi(rv_arr[p]) + bf16_to_f32(zb));
+                out[p] = (uint32_t)ya | ((uint32_t)yb << 16);
+            } else {
+                out[p] = (uint32_t)za | ((uint32_t)zb << 16);
+            }
+        }
+        st_u4(yc + (size_t)t * yld, make_uint4(out[0], out[1], out[2], out[3]));
+        s0 = s1; s1 = s2; s2 = s3;
+    }
+
+    if (!dst || blockIdx.y != 0) return;
+    if (nacc) {
+        uint16_t keep[8][2];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            keep[k][0] = hc ? hc[(size_t)k * (size_t)cs_ch + 1u * (size_t)cs_tok] : (uint16_t)0;
+            keep[k][1] = hc ? hc[(size_t)k * (size_t)cs_ch + 2u * (size_t)cs_tok] : (uint16_t)0;
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            dst[(size_t)k * (size_t)cs_ch + 0u]              = keep[k][0];
+            dst[(size_t)k * (size_t)cs_ch + (size_t)cs_tok]  = keep[k][1];
+        }
+        for (int32_t t = 0; t < slen && 2LL + t < state_len; ++t) {
+            const uint4 xv = ld_u4(xc + (size_t)t * xld);
+            const uint32_t xw[4] = { xv.x, xv.y, xv.z, xv.w };
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                dst[(size_t)(2 * p)     * (size_t)cs_ch + (size_t)(2 + t) * (size_t)cs_tok] = (uint16_t)(xw[p] & 0xffffu);
+                dst[(size_t)(2 * p + 1) * (size_t)cs_ch + (size_t)(2 + t) * (size_t)cs_tok] = (uint16_t)(xw[p] >> 16);
+            }
+        }
+        return;
+    }
+    uint4 k0v = ld_hist(slen - 3);
+    uint4 k1v = ld_hist(slen - 2);
+    uint4 k2v = ld_hist(slen - 1);
+    const uint32_t kv0[4] = { k0v.x, k0v.y, k0v.z, k0v.w };
+    const uint32_t kv1[4] = { k1v.x, k1v.y, k1v.z, k1v.w };
+    const uint32_t kv2[4] = { k2v.x, k2v.y, k2v.z, k2v.w };
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        dst[(size_t)(2 * p)     * (size_t)cs_ch + 0u * (size_t)cs_tok] = (uint16_t)(kv0[p] & 0xffffu);
+        dst[(size_t)(2 * p + 1) * (size_t)cs_ch + 0u * (size_t)cs_tok] = (uint16_t)(kv0[p] >> 16);
+        dst[(size_t)(2 * p)     * (size_t)cs_ch + 1u * (size_t)cs_tok] = (uint16_t)(kv1[p] & 0xffffu);
+        dst[(size_t)(2 * p + 1) * (size_t)cs_ch + 1u * (size_t)cs_tok] = (uint16_t)(kv1[p] >> 16);
+        dst[(size_t)(2 * p)     * (size_t)cs_ch + 2u * (size_t)cs_tok] = (uint16_t)(kv2[p] & 0xffffu);
+        dst[(size_t)(2 * p + 1) * (size_t)cs_ch + 2u * (size_t)cs_tok] = (uint16_t)(kv2[p] >> 16);
+    }
+}
+
+template <bool HAS_DYN, bool HAS_RESID, class CH>
+__global__ __launch_bounds__(kPcW4Thr)
+void sconv_res_w4_vec8_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+    uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,
+    const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,
+    const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,
+    uint16_t* __restrict__ y, uint32_t n,
+    uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,
+    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len,
+    const uint16_t* __restrict__ dyn, uint32_t dld, uint32_t hch, float sdiv) {
+    if (CH::on) r4d_chain_wait();
+    sconv_res_w4_vec8_body<HAS_DYN, HAS_RESID>(
+        x, w, cs, cu, resid, sidx, hini, nacc, y, n,
+        xld, rld, yld, wld, cs_slot, cs_ch, cs_tok, state_len, dyn, dld, hch, sdiv);
+    if (CH::on) r4d_chain_done();
 }
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
@@ -259,6 +456,37 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
     const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && T <= 64;
+    const bool sconv_w4_vec8 = sconv && wid == 4 && dil == 1 && !b && (n % 8) == 0 &&
+                               (!dyn || ((hch % 8) == 0 && rad_ptr_aligned(dyn->data, 8) && (dld % 4) == 0)) &&
+                               rad_ptr_aligned(x->data, 16) && (xld % 8) == 0 &&
+                               rad_ptr_aligned(y->data, 16) && (yld % 8) == 0 &&
+                               (!resid || (rad_ptr_aligned(resid->data, 16) && (rld % 8) == 0));
+    if (sconv_w4_vec8) {
+        const uint32_t wcb = (uint32_t)(((n / 8) + kPcW4Thr - 1) / kPcW4Thr);
+#define R4D_SC_V8(HD_, HR_, CH_)                                                                \
+        hipLaunchKernelGGL((sconv_res_w4_vec8_kernel<HD_, HR_, CH_>), dim3(wcb, tb, (uint32_t)N), \
+                           dim3(kPcW4Thr), 0, (hipStream_t)s,                                   \
+                           (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),           \
+                           have_cs ? (uint16_t*)r4d_addr(cs) : nullptr,                          \
+                           (const int32_t*)r4d_addr(cu),                                         \
+                           resid ? (const uint16_t*)r4d_addr(resid) : nullptr,                   \
+                           cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,                      \
+                           hini ? (const int32_t*)r4d_addr(hini) : nullptr,                      \
+                           nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,                      \
+                           (uint16_t*)r4d_addr(y), (uint32_t)n,                                  \
+                           (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld,           \
+                           cs_slot, cs_ch, cs_tok, state_len,                                    \
+                           dyn ? (const uint16_t*)r4d_addr(dyn) : nullptr, (uint32_t)dld, hch, sdiv)
+        if (dyn) {
+            if (resid) { if (chain) R4D_SC_V8(true, true, r4dchain); else R4D_SC_V8(true, true, R4dUnchained); }
+            else       { if (chain) R4D_SC_V8(true, false, r4dchain); else R4D_SC_V8(true, false, R4dUnchained); }
+        } else {
+            if (resid) { if (chain) R4D_SC_V8(false, true, r4dchain); else R4D_SC_V8(false, true, R4dUnchained); }
+            else       { if (chain) R4D_SC_V8(false, false, r4dchain); else R4D_SC_V8(false, false, R4dUnchained); }
+        }
+#undef R4D_SC_V8
+        return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+    }
 #define R4D_PC(S_, SC_, CH_)                                                                    \
     hipLaunchKernelGGL((ple_conv_kernel<S_, SC_, CH_>), dim3(cb, tb, (uint32_t)N),              \
                        dim3(kPcThreads), 0, (hipStream_t)s,                                      \
@@ -313,5 +541,18 @@ extern "C" int r4d_rad_sconv_res(const RadArgs* a, RadStream s) {
     if (heads > 0 && dyn == nullptr) return R4D_NO(RAD_E_INVAL);
     return conv_launch(a, s, false, r4d_opt(a, SC_X), r4d_opt(a, SC_W), r4d_opt(a, SC_CS),
                        r4d_opt(a, SC_CU), nullptr, r4d_opt(a, SC_CIDX), r4d_opt(a, SC_HINIT),
+                       r4d_opt(a, SC_NACC), r4d_opt(a, SC_Y), nullptr, dyn, heads, true);
+}
+
+/* Device-only: sconv_res with a stream residual add (`y = add_resid + sconv_res(x)`). */
+enum { SCA_ADD_RESID = 9 };
+extern "C" int r4d_rad_sconv_res_add(const RadArgs* a, RadStream s) {
+    const long long heads = r4d_geti_or(a, "heads", 0);
+    const RadTensor* dyn = heads > 0 ? r4d_opt(a, SC_DYN) : nullptr;
+    if (heads > 0 && dyn == nullptr) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* add_r = r4d_opt(a, SCA_ADD_RESID);
+    if (!add_r) return R4D_NO(RAD_E_INVAL);
+    return conv_launch(a, s, false, r4d_opt(a, SC_X), r4d_opt(a, SC_W), r4d_opt(a, SC_CS),
+                       r4d_opt(a, SC_CU), add_r, r4d_opt(a, SC_CIDX), r4d_opt(a, SC_HINIT),
                        r4d_opt(a, SC_NACC), r4d_opt(a, SC_Y), nullptr, dyn, heads, true);
 }

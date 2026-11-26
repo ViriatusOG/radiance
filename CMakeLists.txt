@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 # VERSION is the server release that /version reports. The plugin ABI version is separate and is
 # read from abi/rad_abi.h below.
-project(radiance VERSION 2.2.0 LANGUAGES C CXX)
+project(radiance VERSION 2.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -321,12 +321,27 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   add_subdirectory(libavx)
 endif()
+# exl3: radiance-exl3, EXL3 trellis experts (exllamav3's format) -- the gfx1201 kernel library
+# exl3r4d (built when RAD_GPU_TARGETS names gfx1201), the host reference exl3ref and the `exl3`
+# quantiser. See exl3/README.md.
+add_subdirectory(exl3)
 add_subdirectory(arch)
 # spechub: the linear-MTP coupling kernels (--draft-coupling). Built by default; without the flag
 # no op resolves to its rows.
 add_subdirectory(plugin/spechub)
 # glm: GLM-5.3-Flash's own fused kernels, ops only glm5next issues where a library declares them.
 add_subdirectory(plugin/glm)
+# EXL3-V3: exl3i, the gfx1201 kernel library for the trellis linears and token tables (left out
+# without a gfx1201 target; its host tests build either way), exl3quant, the `exl3i` quantiser that
+# imports EXL3-V3 levels, and the architectures qwen35_exl3 and gemma4_exl3. plugin/exl3import is
+# their shared decode and headers, not a plugin. Their tests compile against RADIANCE_INCLUDE_DIR,
+# the include root find_package(radiance) names; in the tree that root is abi/ and the rad_include/
+# that holds arch/common/ as arch/ (arch/CMakeLists.txt).
+set(RADIANCE_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/abi ${CMAKE_BINARY_DIR}/rad_include)
+add_subdirectory(plugin/exl3i)
+add_subdirectory(plugin/exl3quant)
+add_subdirectory(plugin/qwen35_exl3)
+add_subdirectory(plugin/gemma4_exl3)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()

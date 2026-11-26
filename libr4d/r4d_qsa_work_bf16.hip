@@ -16,7 +16,7 @@
 // one straddling block per sequence). Work items past the real count get page = -1, which
 // qsa_block_key skips.
 //
-// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"
@@ -33,14 +33,17 @@ constexpr int kThreads = 128;
  * row constraint on the declared seqs (rad-convert declares 256, which must still resolve). */
 constexpr int kMaxSeq  = 256;
 
+/* A gather that moves element bits and computes nothing, so one body serves any element width: E is
+ * uint16_t for bf16 and uint32_t for f32 (the plane the staging copy feeds decides). */
 #define QSA_WORK_PARAMS                                                                         \
-    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,                            \
-    const int32_t* __restrict__ cu, const uint16_t* __restrict__ state,                         \
+    const E* __restrict__ k, const int32_t* __restrict__ pos,                                   \
+    const int32_t* __restrict__ cu, const E* __restrict__ state,                                \
     const int32_t* __restrict__ sidx, const int32_t* __restrict__ bt,                           \
-    uint16_t* __restrict__ stage, int32_t* __restrict__ page, int32_t* __restrict__ bpos,       \
+    E* __restrict__ stage, int32_t* __restrict__ page, int32_t* __restrict__ bpos,              \
     int32_t* __restrict__ nc, int n, int ratio, int ring, int seqs, int max_work, int k_ld,     \
     int s_slot, int s_row, int sidx_ld, int bt_ld, int g_ld,                                    \
     const int32_t* __restrict__ rope, int rplane, int bstep
+template <typename E>
 __device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
 
     const int w = (int)blockIdx.x;
@@ -106,22 +109,22 @@ __device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
     /* The block's raw keys, each from this step or from the tail. */
     for (int i = 0; i < ratio; ++i) {
         const int q = b * ratio + i;                 /* this key's position */
-        const uint16_t* src;
+        const E* src;
         if (q >= p0) src = k + (size_t)(t0 + (q - p0)) * k_ld;
         else         src = state + (size_t)si * s_slot + (size_t)(q % ring) * s_row;
-        uint16_t* dst = stage + (size_t)(w * ratio + i) * g_ld;
+        E* dst = stage + (size_t)(w * ratio + i) * g_ld;
         for (int d = (int)threadIdx.x; d < n; d += kThreads) dst[d] = src[d];
     }
 }
 
 /* The kernel around the body, whose blocks and threads return where their work ends: CH `r4dchain`
  * is the chained form (r4d_chain.h). */
-template <class CH>
+template <class CH, typename E>
 __global__ __launch_bounds__(kThreads)
 void qsa_work_kernel(QSA_WORK_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    qsa_work_body(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring, seqs,
-                  max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep);
+    qsa_work_body<E>(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring, seqs,
+                     max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_WORK_PARAMS
@@ -144,7 +147,7 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
                                  long stage, long page, long bpos, long nc, int n, int ratio,
                                  int ring, int seqs, int max_work, int k_ld, int s_slot,
                                  int s_row, int sidx_ld, int bt_ld, int g_ld, long rope,
-                                 int rplane, int bstep, RadStream stream, bool chain) {
+                                 int rplane, int bstep, bool wide, RadStream stream, bool chain) {
     if (!k || !pos || !cu || !state || !sidx || !bt || !stage || !page || !bpos || !nc)
         return R4D_NO(RAD_E_INVAL);
     if (n <= 0 || ratio <= 0 || ring < ratio || seqs <= 0 || max_work <= 0 || seqs > kMaxSeq)
@@ -154,14 +157,15 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
     if (!g_ld) g_ld = n;
     if (!sidx_ld) sidx_ld = 1;
     /* Each form named at its own launch: a test reads the kernel a launch site names. */
-#define R4D_QWORK(CH_)                                                                        \
-    R4D_EMIT(stream, qsa_work_kernel<CH_>, dim3((unsigned)max_work), dim3(kThreads), 0,       \
-             (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,                     \
-             (const uint16_t*)state, (const int32_t*)sidx, (const int32_t*)bt,                \
-             (uint16_t*)stage, (int32_t*)page, (int32_t*)bpos, (int32_t*)nc, n, ratio, ring,  \
+#define R4D_QWORK(CH_, E_)                                                                    \
+    R4D_EMIT(stream, (qsa_work_kernel<CH_, E_>), dim3((unsigned)max_work), dim3(kThreads), 0, \
+             (const E_*)k, (const int32_t*)pos, (const int32_t*)cu,                           \
+             (const E_*)state, (const int32_t*)sidx, (const int32_t*)bt,                      \
+             (E_*)stage, (int32_t*)page, (int32_t*)bpos, (int32_t*)nc, n, ratio, ring,        \
              seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, (const int32_t*)rope, \
              rplane, bstep)
-    const int rc = chain ? R4D_QWORK(r4dchain) : R4D_QWORK(R4dUnchained);
+    const int rc = wide ? (chain ? R4D_QWORK(r4dchain, uint32_t) : R4D_QWORK(R4dUnchained, uint32_t))
+                        : (chain ? R4D_QWORK(r4dchain, uint16_t) : R4D_QWORK(R4dUnchained, uint16_t));
 #undef R4D_QWORK
     return rc;
 }
@@ -228,13 +232,17 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
     const long long kp = r4d_row_pitch(k);
     const long long bp2 = r4d_row_pitch(bt), sp = r4d_row_pitch(st);
     if (kp < 0 || bp2 < 0 || sp < 0) return R4D_NO(RAD_E_STRIDE);
-    if (k->dtype != RAD_BF16 || tl->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    /* Keys, tail and staging plane share one element type: bf16, or f32 (a compressor that stages
+     * its windows at full precision). */
+    if ((k->dtype != RAD_BF16 && k->dtype != RAD_F32) || tl->dtype != k->dtype ||
+        st->dtype != k->dtype)
+        return R4D_NO(RAD_E_DTYPE);
     return r4d_qsa_work_bf16_emit(r4d_addr(k), r4d_addr(po), r4d_addr(cu), r4d_addr(tl),
                                   r4d_addr(sx), r4d_addr(bt), r4d_addr(st), r4d_addr(pg),
                                   r4d_addr(bp), r4d_addr(nc), (int)n, (int)ratio, (int)ring,
                                   (int)seqs, (int)mw, (int)kp, (int)tl->stride[0],
                                   (int)tl->stride[2], (int)sxp, (int)bp2, (int)sp,
-                                  r4d_addr(rp), rp ? (int)rp->shape[1] : 0, (int)bstep, stream,
-                                  r4d_geti_or(a, "chain", 0) != 0);
+                                  r4d_addr(rp), rp ? (int)rp->shape[1] : 0, (int)bstep,
+                                  k->dtype == RAD_F32, stream, r4d_geti_or(a, "chain", 0) != 0);
 }
 

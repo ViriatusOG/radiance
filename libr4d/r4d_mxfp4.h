@@ -56,15 +56,6 @@ static __device__ __forceinline__ void r4d_mxfp4_unpack8(unsigned int wv, int d,
                                                          unsigned int* lo, unsigned int* hi) {
   r4d_mxfp4_unpack8_t(wv, kMxfp4Mag[d][0], kMxfp4Mag[d][1], lo, hi);
 }
-// Row d = 0 as immediates, for kernels that fold the E8M0 scale in F32 and need the exact e2m1
-// values: no table load, v_perm_b32 takes the two words as literals. tests/r4d_emu/test_moemx
-// holds them to row 0 of the table.
-#define R4D_MXFP4_MAG0_LO 0x3c383000u
-#define R4D_MXFP4_MAG0_HI 0x4c484440u
-static __device__ __forceinline__ void r4d_mxfp4_unpack8_exact(unsigned int wv, unsigned int* lo,
-                                                               unsigned int* hi) {
-  r4d_mxfp4_unpack8_t(wv, R4D_MXFP4_MAG0_LO, R4D_MXFP4_MAG0_HI, lo, hi);
-}
 
 // The activation scale a row's accumulator is carried in, for the per-(row, 128 of K) grid: the
 // last non-zero entry of `row` at or before block `kb`, or 1 if none. A zero-scale block has zero

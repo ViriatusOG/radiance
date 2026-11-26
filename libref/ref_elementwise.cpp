@@ -251,9 +251,10 @@ int ref_grid_embed_aa(const RadArgs* a, RadStream) {
 
 /* grid_embed_cpe: RADIO's cropped position embedding (CPE). The table resampled as torch's
  * F.interpolate(mode="bilinear", align_corners=False) -- without antialias -- onto a square of side
- * d = max(grid height, grid width), of which the grid keeps the top-left h x w. Per axis two taps at
- * src = (i + 0.5) * side / d - 0.5, clamped at 0, the upper tap clamped into the table, and blended
- * along the row first as torch's bilinear kernel does. f32, rounded once before the add. */
+ * d = max(grid height, grid width), of which the grid keeps the top-left h x w. Per axis two
+ * taps at src = (i + 0.5) * side / d - 0.5, clamped at 0, the upper tap clamped into the table,
+ * and blended along the row first as torch's bilinear kernel does. f32, rounded once before the
+ * add. */
 static void cpe_taps(int64_t at, int64_t d, int64_t side, int64_t t[2], float w[2]) {
     if (d < 1) d = 1;
     at = at < 0 ? 0 : (at >= d ? d - 1 : at);
@@ -267,7 +268,9 @@ static void cpe_taps(int64_t at, int64_t d, int64_t side, int64_t t[2], float w[
     w[0] = 1.0f - w[1];
 }
 
-int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
+/* grid_embed_cpe and grid_embed_hw differ only in the target an axis is resampled onto: the
+ * square of the grid's larger side (cropped), or the grid's own height and width. */
+static int grid_embed_bilinear(const RadArgs* a, bool square) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
     const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
@@ -292,7 +295,8 @@ int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
             /* A row ahead of its segment's patches: the learned row its column names. */
             const int64_t k = g[1] < 0 ? 0 : (g[1] >= npre ? npre - 1 : g[1]);
             for (int64_t i = 0; npre > 0 && i < n; ++i) {
-                const float pe = round_dt(x->dtype, ldt(pre, rowoff(pre, k, n) + i * laststride(pre)));
+                const float pe = round_dt(x->dtype,
+                                          ldt(pre, rowoff(pre, k, n) + i * laststride(pre)));
                 stt(x, xb0 + i * xs0, ldt(x, xb0 + i * xs0) + pe);
             }
             continue;
@@ -300,8 +304,8 @@ int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
         const int64_t d = g[2] > g[3] ? g[2] : g[3];
         int64_t th[2], tw[2];
         float wh[2], ww[2];
-        cpe_taps(g[0], d, side, th, wh);
-        cpe_taps(g[1], d, side, tw, ww);
+        cpe_taps(g[0], square ? d : g[2], side, th, wh);
+        cpe_taps(g[1], square ? d : g[3], side, tw, ww);
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
         auto at = [&](int64_t y, int64_t c, int64_t i) {
             return ldt(tab, rowoff(tab, y * side + c, n) + i * ts);
@@ -315,6 +319,13 @@ int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+int ref_grid_embed_cpe(const RadArgs* a, RadStream) { return grid_embed_bilinear(a, true); }
+
+/* grid_embed_hw: the same resample onto the grid itself, height and width each their own target
+ * (torch's F.interpolate(size=(h, w), bilinear, align_corners=False), no antialias) -- Inkling 2's
+ * position embedding, vLLM's inkling2 kernel. Prefix rows as grid_embed_cpe's. */
+int ref_grid_embed_hw(const RadArgs* a, RadStream) { return grid_embed_bilinear(a, false); }
 
 /* ------------------------------------------------------------------ grid_embed_pad */
 /* The same learned table and operands as grid_embed's, resampled in the half-pixel-centre form
@@ -369,6 +380,54 @@ int ref_grid_embed_pad(const RadArgs* a, RadStream) {
                            (wh[ki] * ww[kj]);
             const float pe = round_dt(x->dtype, acc);
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ posemb_resample */
+/* A learned S_h x S_w position table resampled to a T_h x T_w grid and written out as a table of
+ * its own, not added into rows: the vision tower adds it once per image, and a grid other than the
+ * checkpoint's needs it first. Per axis, for target index i of T over a source of size S, the
+ * coordinate is S * (i + 0.5) / T - 0.5 clamped to [0, S - 1]; the taps are floor(coord) and the
+ * next one clamped at S - 1, weighted by the fraction and its complement. That is align_corners =
+ * False with the edge taps clamped (torch's bilinear, vLLM's kernel). The four taps are summed in
+ * f32 in the order top-left, top-right, bottom-left, bottom-right, each weighted by the product of
+ * its row and column weights, and y is rounded once to its dtype. */
+static void posemb_taps(int64_t i, int64_t S, int64_t T, int64_t* lo, int64_t* hi, float* frac) {
+    const float c = (float)S * ((float)i + 0.5f) / (float)T - 0.5f;
+    const float cc = c < 0.0f ? 0.0f : (c > (float)(S - 1) ? (float)(S - 1) : c);
+    const int64_t f = (int64_t)std::floor(cc);
+    *lo = f;
+    *hi = f + 1 < S ? f + 1 : S - 1;
+    *frac = cc - (float)f;
+}
+
+int ref_posemb_resample(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *tab = &a->t[0], *y = &a->t[1];
+    const int64_t Sh = p_int(a, "S_h", 0), Sw = p_int(a, "S_w", 0);
+    const int64_t Th = p_int(a, "T_h", 0), Tw = p_int(a, "T_w", 0);
+    const int64_t n = p_int(a, "n", 0);
+    if (Sh <= 0 || Sw <= 0 || Th < 1 || Tw < 1 || n <= 0) return RAD_E_SHAPE;
+    if (tab->rank != 2 || tab->shape[0] != Sh * Sw || tab->shape[1] != n) return RAD_E_SHAPE;
+    if (numel(y) < Th * Tw * n) return RAD_E_SHAPE;
+    const int64_t ts = laststride(tab), ys = laststride(y), rows = Th * Tw;
+
+    REF_PAR_FOR(rows * n * 4)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t h[2], w[2];
+        float fh, fw;
+        posemb_taps(r / Tw, Sh, Th, &h[0], &h[1], &fh);
+        posemb_taps(r % Tw, Sw, Tw, &w[0], &w[1], &fw);
+        const float wh[2] = { 1.0f - fh, fh }, ww[2] = { 1.0f - fw, fw };
+        const int64_t yb = rowoff(y, r, n);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int p = 0; p < 2; ++p)
+                for (int q = 0; q < 2; ++q)
+                    acc += ldt(tab, rowoff(tab, h[p] * Sw + w[q], n) + i * ts) * (wh[p] * ww[q]);
+            stt(y, yb + i * ys, acc);
         }
     }
     return RAD_OK;
@@ -993,7 +1052,8 @@ int ref_conv2d(const RadArgs* a, RadStream) {
                             const int64_t wi = wo * st - pad + j;
                             if (wi < 0 || wi >= W) continue;
                             for (int64_t ci = 0; ci < cin; ++ci)
-                                acc += ldt(X, xb + (wi * cin + ci) * xs) * ldt(Wt, widx(co, ci, i, j));
+                                acc += ldt(X, xb + (wi * cin + ci) * xs) * ldt(Wt,
+                                    widx(co, ci, i, j));
                         }
                     }
                     if (B) acc += ldt(B, offlin(B, co));
@@ -1056,7 +1116,8 @@ int ref_conv2d_unfold(const RadArgs* a, RadStream) {
                         const int64_t wi = wo * st - pad + j;
                         const bool ok = row_ok && wi >= 0 && wi < W;
                         for (int64_t ci = 0; ci < cin; ++ci) {
-                            const int64_t k = tlast ? (ci * kw + j) * kh + i : (ci * kh + i) * kw + j;
+                            const int64_t k = tlast ? (ci * kw + j) * kh + i
+                                : (ci * kh + i) * kw + j;
                             const float v = ok ? ldt(X, rowoff(X, tg, rin) + (wi * cin + ci) * xs)
                                                : 0.0f;
                             stt(Y, yb + k * ys, v);
@@ -1171,7 +1232,8 @@ int ref_gelu_mul(const RadArgs* a, RadStream) {
 int ref_seg_sinusoid(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *cu = &a->t[0], *Y = &a->t[1];
-    const int64_t n = p_int(a, "n", 0), period = p_int(a, "period", 0), cdiv = p_int(a, "cu_div", 1);
+    const int64_t n = p_int(a, "n", 0), period = p_int(a, "period", 0),
+        cdiv = p_int(a, "cu_div", 1);
     if (n <= 0 || n % 2 || period <= 0 || cdiv <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n), S = numel(cu) - 1;
     if (rows <= 0 || S <= 0 || cu_at(cu, S) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
@@ -1262,8 +1324,8 @@ int ref_logit_softcap(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ scale */
 /* y = x * s, s a [1] weight broadcast over all of x: Gemma 4's per-layer residual scalar (llama.cpp
  * `out_scale`). `mul` broadcasts a row and `scale_rows` one scalar per row; this is one scalar per
- * tensor, kept separate so the broadcasts are never ambiguous. `s` is a per-layer checkpoint weight,
- * not a call constant. */
+ * tensor, kept separate so the broadcasts are never ambiguous. `s` is a per-layer checkpoint
+ * weight, not a call constant. */
 int ref_scale(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *s = &a->t[1], *y = &a->t[2];
@@ -1361,7 +1423,8 @@ int ref_cast(const RadArgs* a, RadStream) {
                            y->dtype == RAD_I16);
     REF_PAR_FOR(nel)
     for (int64_t i = 0; i < nel; ++i) {
-        if (int_pair) st_int(y->dtype, y->data, offlin(y, i), ld_int(x->dtype, x->data, offlin(x, i)));
+        if (int_pair)
+            st_int(y->dtype, y->data, offlin(y, i), ld_int(x->dtype, x->data, offlin(x, i)));
         else          stt(y, offlin(y, i), ldt(x, offlin(x, i)));
     }
     return RAD_OK;

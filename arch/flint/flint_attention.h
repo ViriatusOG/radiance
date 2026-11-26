@@ -16,11 +16,9 @@
 #ifndef FLINT_ATTENTION_H
 #define FLINT_ATTENTION_H
 
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
-#include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace rad {
@@ -29,11 +27,11 @@ namespace arch {
 struct FlintAttn {
     struct Wire {
         rad_buf x = 0;       /* [max_tok, n_embd] residual stream */
-        ActFP8 h{};          /* [max_tok, n_embd] normed input, then o output */
+        ActQ h{};          /* [max_tok, n_embd] normed input, then o output */
         rad_buf q = 0;       /* [max_tok, q_dim], projected, normed and rotated */
         rad_buf k = 0;       /* [max_tok, kv_dim] */
         rad_buf v = 0;       /* [max_tok, kv_dim] */
-        ActFP8 attn{};       /* [max_tok, q_dim] attention output */
+        ActQ attn{};       /* [max_tok, q_dim] attention output */
     };
 
     struct Src {
@@ -56,15 +54,15 @@ struct FlintAttn {
     rad_kvgroup kv = 0;
 
     rad_weight w_norm = 0, w_q_norm = 0, w_k_norm = 0, w_sink = 0;
-    LinearFP8 q{}, k{}, v{}, o{};
-    NormQuantFP8 nq_h{};
-    QuantFP8 q_attn{};
+    LinearQ q{}, k{}, v{}, o{};
+    NormQuant nq_h{};
+    QuantAct q_attn{};
     rad_op op_q_norm = 0, op_k_norm = 0;
     rad_op op_rope_q = 0, op_rope_k = 0, op_attn = 0, op_kv_store = 0;
     rad_op op_qkr_store = 0; /* Q/K norms, NeoX rotary (or none) and cache store, decode band */
     int64_t qkr_rows = 0;
     rad_op op_ar = 0, op_add = 0;
-    /* The next block's norm absorbs this block's closing all-reduce (NormQuantFP8::fuse_ar), so
+    /* The next block's norm absorbs this block's closing all-reduce (NormQuant::fuse_ar), so
      * this one must not issue it. Counterpart of `ar_in`; both sides ask ar_taken(g, T, ...) on
      * the same facts, so they agree. */
     bool ar_out = false;
@@ -196,20 +194,14 @@ inline int FlintAttn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
 
     /* The out projection's input codes: where the model feeds them (a rotated int8 trunk,
-     * ActFP8::q8_fed), q_attn writes had_quant_act_i8g's pair and the projection declares no
+     * ActQ::q8_fed), q_attn writes had_quant_act_i8g's pair and the projection declares no
      * quantiser. Otherwise every form the out projection can take reads the bf16 plane or
-     * quantises it itself (LinearFP8 refuses the E4M3-pair formats), so no quantiser runs here. */
+     * quantises it itself (LinearQ refuses the E4M3-pair formats), so no quantiser runs here. */
     if (w.attn.q8_fed) RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), {src.o}, w.attn, w.h.x));
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h.x}, {w.h.x});
+        op_ar = decl_all_reduce(b, g, w.h.x);
     if (add_out) op_add = rw(b, RAD_OP(b, "add",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_STR("dtype", g.dtype)),

@@ -1,8 +1,9 @@
 # deepseek41-ud-iq1s.recipe -- DeepSeek-V4.1-Flash-1017 from the official release at Unsloth's UD-IQ1_S per-tensor mix:
 # routed experts iq1_s / iq2_xxs (gate_up iq1_s in 34 layers and iq2_xxs in 6, down iq1_s in 20 and iq2_xxs in 20),
 # attention and shared expert q6_K / q5_K / q8_0, the Engram table iq4_nl, norms and small tensors cast to their stored
-# float type, the DSpark drafter's experts kept as the release's MXFP4 (no rule). The `ggml` quantiser runs its
-# own searches (llama.cpp's iq1_s/iq2_xxs procedure, ported in Radiance); iq1_s and iq2_xxs need --imatrix. 251.07 GiB.
+# float type, the DSpark drafter's experts kept as the release's MXFP4 (no rule; MXFP4 is not served, so the container
+# serves with num-speculative-tokens: 0). The `ggml` quantiser runs llama.cpp's own searches, so the encodings are the
+# ones the GGUF gives; iq1_s and iq2_xxs need --imatrix. 251.07 GiB.
 #
 #   data/engram_tables.py <DeepSeek-V4.1-Flash-1017 dir> engram-tables.safetensors   (the release ships none)
 #   data/imatrix_merge.py imatrix_unsloth.gguf_file imatrix-merged.gguf

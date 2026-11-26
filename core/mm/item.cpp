@@ -35,7 +35,7 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
         if (within < seg_prefix) {
             /* A row the tower fills itself: row -1, the column naming which. */
             planes[k]             = -1;
-            planes[count + k]     = (int32_t)within;
+            planes[count + k]     = prefix_at_origin ? -1 : (int32_t)within;
             planes[2 * count + k] = seg_h(s);
             planes[3 * count + k] = seg_w(s);
             continue;

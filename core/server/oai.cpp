@@ -11,8 +11,6 @@
 
 #include <algorithm>
 #include <array>
-#include <charconv>
-#include <cmath>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +38,13 @@ std::string random_id(const char* prefix) {
     std::string s = prefix;
     for (int i = 0; i < 16; ++i) s.push_back(hex[(a >> (i * 4)) & 0xF]);
     for (int i = 0; i < 8; ++i)  s.push_back(hex[(b >> (i * 4)) & 0xF]);
+    return s;
+}
+
+std::string replace_all(std::string s, const std::string& from, const std::string& to) {
+    if (from.empty()) return s;
+    for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size()))
+        s.replace(at, from.size(), to);
     return s;
 }
 
@@ -224,6 +229,13 @@ std::vector<std::string> dry_breakers(const std::vector<std::string>& deployment
     return { "\n", ":", "\"", "*" };
 }
 
+ApiError err_lora_acquire(int status, const std::string& why) {
+    ApiError e = err_bad("loras", why);
+    if (status == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
+    else if (status != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
+    return e;
+}
+
 ApiError err_internal(const std::string& why) {
     ApiError e;
     e.status = 500;
@@ -352,7 +364,6 @@ const Guarded kGuarded[] = {
     { "audio", empty_value, "null", "audio output is not implemented" },
     { "n_indent", is_zero, "0", "indentation-limited infill is not implemented" },
     { "t_max_predict_ms", non_positive, "0", "a generation time limit is not implemented" },
-    { "return_tokens", falsy, "false", "token ids are not returned beside the text" },
     { "grammar_lazy", falsy, "false",
       "a caller's grammar applies from the first token; the lazy form is the chat format's own" },
     { "grammar_triggers", empty_value, "an empty list",
@@ -382,7 +393,7 @@ int vet_keys(const json& body, Endpoint ep, ApiError* err, bool native = false) 
         const std::string& k = it.key();
         if (in_list(kInert, k)) continue;
         bool prefixed = false;
-        for (const char* p : kInertPrefixes) prefixed = prefixed || k.rfind(p, 0) == 0;
+        for (const char* p : kInertPrefixes) prefixed = prefixed || k.starts_with(p);
         if (prefixed) continue;
         if (ep == Endpoint::Embedding) {
             if (in_list(kAcceptedEmbedding, k)) continue;
@@ -391,8 +402,10 @@ int vet_keys(const json& body, Endpoint ep, ApiError* err, bool native = false) 
             if (ep == Endpoint::Chat && in_list(kAcceptedChat, k)) continue;
             if (ep == Endpoint::Completion && in_list(kAcceptedCompletion, k)) continue;
         }
-        /* llama-server's native completion returns the token ids, so the field is served there. */
-        if (native && k == "return_tokens") continue;
+        /* The generated token ids beside the text: llama-server's name, and vLLM's on the OpenAI
+         * endpoints (read_return_tokens). */
+        if (ep != Endpoint::Embedding && (k == "return_tokens" || (!native && k == "return_token_ids")))
+            continue;
         bool guarded = false;
         for (const Guarded& g : kGuarded) {
             if (k != g.key) continue;
@@ -442,6 +455,16 @@ bool get_bool(const json& b, const char* k, bool* out, ApiError* err) {
     *out = it->get<bool>();
     return true;
 }
+
+/* `return_tokens` (llama-server) or `return_token_ids` (vLLM): either asks for the ids. */
+bool read_return_tokens(const json& b, bool native, OaiRequest* out, ApiError* err) {
+    bool a = false, v = false;
+    if (!get_bool(b, "return_tokens", &a, err)) return false;
+    if (!native && !get_bool(b, "return_token_ids", &v, err)) return false;
+    out->return_tokens = a || v;
+    return true;
+}
+
 bool get_str(const json& b, const char* k, std::string* out, ApiError* err) {
     auto it = b.find(k);
     if (it == b.end() || it->is_null()) return true;
@@ -459,12 +482,6 @@ bool member_str(const json& o, const char* k, const char* param, std::string* ou
     *out = it->get<std::string>();
     return true;
 }
-/* The same read where later validation checks the type: a non-string member reads as `def`. */
-std::string str_or(const json& o, const char* k, const std::string& def = std::string()) {
-    auto it = o.find(k);
-    return it != o.end() && it->is_string() ? it->get<std::string>() : def;
-}
-
 /* A conversation's label for /sessions: at most 128 bytes, cut at a UTF-8 character boundary
  * because the label is serialised into JSON. Control bytes are dropped at the door: the label
  * is logged on release and shown on the dashboard, and an embedded ESC sequence would drive
@@ -503,6 +520,38 @@ bool get_any(const json& b, std::initializer_list<const char*> keys, T* out, boo
     }
     *out = v;
     if (present) *present = named != nullptr;
+    return true;
+}
+
+}  /* namespace */
+
+std::string str_or(const json& o, const char* k, const std::string& def) {
+    auto it = o.find(k);
+    return it != o.end() && it->is_string() ? it->get<std::string>() : def;
+}
+
+bool names_loaded_model(const json& b, const std::string& model_id, ApiError* err) {
+    auto it = b.find("model");
+    if (it == b.end() || (it->is_string() && it->get<std::string>() == model_id)) return true;
+    *err = err_bad("model", "must name the loaded model, " + model_id);
+    return false;
+}
+
+namespace {
+
+/* The identity every response carries: endpoint, a fresh id, the creation time, the served
+ * model's name (replaced by the request's own, see read_model). */
+void begin_request(OaiRequest* out, Endpoint ep, const char* id_prefix, const OaiLimits& lim) {
+    out->endpoint = ep;
+    out->id = random_id(id_prefix);
+    out->created = unix_now();
+    out->model = lim.model_id;
+}
+
+/* The request's `model` when it names one; the served model's name otherwise. */
+bool read_model(const json& b, const OaiLimits& lim, OaiRequest* out, ApiError* err) {
+    if (!get_str(b, "model", &out->model, err)) return false;
+    if (out->model.empty()) out->model = lim.model_id;
     return true;
 }
 
@@ -1070,6 +1119,10 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
  * `enable_thinking` (a common shorthand), and OpenAI's `reasoning_effort`, whose "none" and
  * "minimal" turn thinking off.
  *
+ * "Off" is enable_thinking = false for a template that reads it. One that does not, and has the
+ * two words on its own effort ladder, gets the word as its `reasoning_effort` instead
+ * (probe_off_efforts, apply_off_effort).
+ *
  * The kwarg alone is not enough: the vendored llama.cpp chat layer copies chat_template_kwargs
  * into the template context and then overwrites `enable_thinking` with its own boolean field
  * (chat-auto-parser-helpers.cpp). The kwarg is therefore lifted into that field.
@@ -1128,11 +1181,69 @@ void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
     auto m = lim.reasoning_effort_map.find(v.get<std::string>());
     if (m == lim.reasoning_effort_map.end()) return;
     if (m->second == "none" || m->second == "minimal") {
-        opt->enable_thinking = false;
+        /* By value: the entry is erased or rewritten under it. */
+        const std::string word = m->second;
         opt->template_kwargs.erase(it);
+        apply_off_effort(lim.template_off_efforts, word, /*replace=*/true, opt);
     } else {
         it->second = json(m->second).dump();
     }
+}
+
+std::vector<std::string> probe_off_efforts(const IChatTemplate& chat) {
+    const json messages = json::array({ json{ { "role", "user" }, { "content", "Hello" } } });
+    auto render = [&](bool think, const char* effort, ChatRender* out) {
+        ChatRenderOptions opt;
+        opt.quiet = true;
+        opt.enable_thinking = think;
+        if (effort) opt.template_kwargs["reasoning_effort"] = json(effort).dump();
+        std::string why;
+        return chat.apply(messages, json::array(), opt, out, &why) >= 0;
+    };
+    /* The prompt, and the reasoning block the reply is read with: the chat layer may act on the
+     * switch there for a template whose text never names it, and that template reads it too. */
+    auto same = [](const ChatRender& a, const ChatRender& b) {
+        return a.prompt == b.prompt && a.think_starts_open == b.think_starts_open &&
+               a.think_open == b.think_open && a.think_close == b.think_close;
+    };
+    ChatRender plain, off;
+    if (!render(true, nullptr, &plain) || !render(false, nullptr, &off) || !same(plain, off))
+        return {};
+    std::vector<std::string> out;
+    for (const char* w : { "none", "minimal" }) {
+        ChatRender r;
+        /* A word that renders as no word does is not shown to mean anything to the template. */
+        if (render(true, w, &r) && r.prompt != plain.prompt) out.push_back(w);
+    }
+    return out;
+}
+
+void apply_off_effort(const std::vector<std::string>& template_off, const std::string& word,
+                      bool replace, ChatRenderOptions* opt) {
+    if (std::find(template_off.begin(), template_off.end(), word) == template_off.end()) {
+        opt->enable_thinking = false;
+        return;
+    }
+    /* enable_thinking is left alone: the template does not read it, and a level such as
+     * "minimal" may still reason, which the reply parser must go on expecting. */
+    if (replace) opt->template_kwargs["reasoning_effort"] = json(word).dump();
+    else opt->template_kwargs.emplace("reasoning_effort", json(word).dump());
+}
+
+std::string off_efforts_note(const std::vector<std::string>& template_off) {
+    auto has = [&](const char* w) {
+        return std::find(template_off.begin(), template_off.end(), w) != template_off.end();
+    };
+    const bool none = has("none"), minimal = has("minimal");
+    if (none && minimal) return "'none' and 'minimal' are passed to it as levels of its own";
+    if (!none && !minimal) return "'none' and 'minimal' turn thinking off";
+    /* One word on the template's ladder and one not: the other can only set enable_thinking,
+     * which this template was probed not to read. Say so instead of promising it turns thinking
+     * off. */
+    const char* in = none ? "none" : "minimal";
+    const char* outw = none ? "minimal" : "none";
+    return std::string("'") + in + "' is passed to it as a level of its own; '" + outw +
+           "' sets enable_thinking false, which this template does not read";
 }
 
 ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, int rs,
@@ -1144,15 +1255,19 @@ ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, in
         bool over = false, deep = false;
         const json v = parse_json_bounded(it->second, 0, &over, &deep);
         const std::vector<std::string>& set = lim.reasoning_efforts;
+        /* An off word the template was probed to take is in the render as a level and is not
+         * the reason either, though the probed set never lists it. */
+        const std::vector<std::string>& off = lim.template_off_efforts;
         if (!over && !deep && v.is_string() &&
-            std::find(set.begin(), set.end(), v.get<std::string>()) == set.end()) {
+            std::find(set.begin(), set.end(), v.get<std::string>()) == set.end() &&
+            std::find(off.begin(), off.end(), v.get<std::string>()) == off.end()) {
             std::string list;
             for (size_t i = 0; i < set.size(); ++i)
                 list += (i ? (i + 1 == set.size() ? " and " : ", ") : "") + ("'" + set[i] + "'");
             ApiError e = err_bad("reasoning_effort",
                                  "'" + v.get<std::string>() + "' is not a level this model's chat "
-                                 "template takes. It takes " + list + "; 'none' and 'minimal' "
-                                 "turn thinking off");
+                                 "template takes. It takes " + list + "; " +
+                                 off_efforts_note(lim.template_off_efforts));
             e.code = "unsupported_value";
             e.supported = { "none", "minimal" };
             e.supported.insert(e.supported.end(), set.begin(), set.end());
@@ -1256,10 +1371,12 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
      * none/minimal/low/medium/high, while e.g. Qwen3.8's template takes xhigh/medium/low and
      * raises on anything else.
      *
-     * The server owns one mapping: "none" and "minimal" mean enable_thinking = false. Every other
-     * word is passed as template context; a template that refuses it says so through
-     * ChatPrompt::error (core/text/chat.h). An explicit chat_template_kwargs entry wins, since
-     * emplace does not overwrite. */
+     * The server owns one mapping: "none" and "minimal" mean enable_thinking = false, except on
+     * a template probed to take the word as a level of its own and to ignore enable_thinking
+     * (OaiLimits::template_off_efforts), which gets the word. Every other word is passed as
+     * template context; a template that refuses it says so through ChatPrompt::error
+     * (core/text/chat.h). An explicit chat_template_kwargs entry wins, since emplace does not
+     * overwrite. */
     std::string effort;
     if (!get_str(b, "reasoning_effort", &effort, err)) return RAD_E_INVAL;
     if (effort.empty()) effort = grouped_effort;
@@ -1269,14 +1386,17 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
         effort = m->second;
     /* The deployment's default, where the request is silent. "none" and "minimal" act as an
      * enable_thinking default, dropped by any word about thinking; a level is an effort default,
-     * dropped by an effort. */
+     * dropped by an effort. The two words keep that rule on a template that takes them as
+     * levels: they still mean "off", and a caller asking for thinking in any spelling must not
+     * be answered with the deployment's none. */
     if (effort.empty()) {
         const std::string& def = lim.default_reasoning_effort;
         const bool off = def == "none" || def == "minimal";
         if (off ? !says.thinking : !says.effort) effort = def;
     }
     if (!effort.empty()) {
-        if (effort == "none" || effort == "minimal") opt->enable_thinking = false;
+        if (effort == "none" || effort == "minimal")
+            apply_off_effort(lim.template_off_efforts, effort, /*replace=*/false, opt);
         else opt->template_kwargs.emplace("reasoning_effort", json(effort).dump());
     }
     return RAD_OK;
@@ -1396,7 +1516,7 @@ static int compile_grammar(const OaiDeps& d, OaiRequest* r, const char* param, A
  * proxy into everything the deployment can reach. */
 int decode_media_url(const std::string& url, const std::string& field,
                      std::vector<uint8_t>* out, ApiError* err) {
-    if (url.rfind("data:", 0) != 0) {
+    if (!url.starts_with("data:")) {
         *err = err_bad(field, "only data: URLs are accepted; the server does not fetch remote URLs "
                               "on a request's behalf");
         return RAD_E_INVAL;
@@ -1537,9 +1657,7 @@ static int read_media_part(const json& part, const std::string& type, const std:
             *err = err_bad(field + ".input_audio", "expected {\"data\": ..., \"format\": ...}");
             return RAD_E_INVAL;
         }
-        auto fit = ia->find("format");
-        const std::string fmt =
-            fit != ia->end() && fit->is_string() ? fit->get<std::string>() : std::string();
+        const std::string fmt = str_or(*ia, "format");
         /* The decoder detects the container from its bytes; the format is checked anyway so a
          * typo is reported as such rather than as an undecodable clip. */
         static const char* const kAudioFormats[] = { "wav", "mp3", "flac", "ogg", "opus",
@@ -1843,6 +1961,11 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
             span.close       = c[0];
             span.open        = (o.size() == 1 || open_first) ? o[0] : -1;
             span.starts_open = render.think_starts_open;
+            /* A one-token message header the reply opens with, ahead of the opener. */
+            if (span.open >= 0 && !render.think_frame.empty()) {
+                const std::vector<int32_t> f = d.tok->encode(render.think_frame, false, true);
+                if (f.size() == 1 && f[0] != span.open && f[0] != span.close) span.frame = f[0];
+            }
         }
     }
     sp->reasoning = span;
@@ -1977,14 +2100,11 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     RAD_TRY(vet_keys(b, Endpoint::Chat, err));
+    if (!read_return_tokens(b, false, out, err)) return RAD_E_INVAL;
 
-    out->endpoint = Endpoint::Chat;
-    out->id = random_id("chatcmpl-");
-    out->created = unix_now();
-    out->model = lim.model_id;
+    begin_request(out, Endpoint::Chat, "chatcmpl-", lim);
     if (!lim.version.empty()) out->system_fingerprint = "radiance-" + lim.version;
-    if (!get_str(b, "model", &out->model, err)) return RAD_E_INVAL;
-    if (out->model.empty()) out->model = lim.model_id;
+    if (!read_model(b, lim, out, err)) return RAD_E_INVAL;
 
     RAD_TRY(parse_sampling(b, lim, out, err));
     std::string schema_json;
@@ -2374,20 +2494,29 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
 
 /* ================================================================== completions */
 
+int precheck_request(const std::string& body, Endpoint ep, bool native, ApiError* err) {
+    OaiLimits lim;
+    lim.max_n = INT_MAX;
+    lim.max_stops = INT64_MAX;
+    lim.max_stop_bytes = INT64_MAX;
+    json b;
+    RAD_TRY(parse_request_object(body, lim, &b, err));
+    RAD_TRY(vet_keys(b, ep, err, native));
+    OaiRequest r;
+    if (!read_return_tokens(b, native, &r, err)) return RAD_E_INVAL;
+    return parse_sampling(b, lim, &r, err);
+}
+
 int parse_completion_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err, bool native) {
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     RAD_TRY(vet_keys(b, Endpoint::Completion, err, native));
-    if (native && !get_bool(b, "return_tokens", &out->return_tokens, err)) return RAD_E_INVAL;
+    if (!read_return_tokens(b, native, out, err)) return RAD_E_INVAL;
 
-    out->endpoint = Endpoint::Completion;
-    out->id = random_id("cmpl-");
-    out->created = unix_now();
-    out->model = lim.model_id;
+    begin_request(out, Endpoint::Completion, "cmpl-", lim);
     if (!lim.version.empty()) out->system_fingerprint = "radiance-" + lim.version;
-    if (!get_str(b, "model", &out->model, err)) return RAD_E_INVAL;
-    if (out->model.empty()) out->model = lim.model_id;
+    if (!read_model(b, lim, out, err)) return RAD_E_INVAL;
 
     RAD_TRY(parse_sampling(b, lim, out, err));
     RAD_TRY(parse_output_format(b, d, out, err));
@@ -2636,12 +2765,8 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
     RAD_TRY(parse_request_object(body, lim, &b, err));
     RAD_TRY(vet_keys(b, Endpoint::Embedding, err));
 
-    out->endpoint = Endpoint::Embedding;
-    out->id = random_id("embd-");
-    out->created = unix_now();
-    out->model = lim.model_id;
-    if (!get_str(b, "model", &out->model, err)) return RAD_E_INVAL;
-    if (out->model.empty()) out->model = lim.model_id;
+    begin_request(out, Endpoint::Embedding, "embd-", lim);
+    if (!read_model(b, lim, out, err)) return RAD_E_INVAL;
 
     std::string enc = "float";
     if (!get_str(b, "encoding_format", &enc, err)) return RAD_E_INVAL;
@@ -2889,17 +3014,12 @@ int parse_rerank_request(const std::string& body, const OaiDeps& d, const OaiLim
                                              "without truncation, instructions or activation");
             return RAD_E_UNSUPPORTED;
         }
-    out->endpoint = Endpoint::Rerank;
-    out->id = random_id("rerank-");
-    out->created = unix_now();
-    out->model = lim.model_id;
+    begin_request(out, Endpoint::Rerank, "rerank-", lim);
     bool activation = false;
-    if (!get_str(b, "model", &out->model, err) || !get_int(b, "top_n", &out->top_n, err) ||
+    if (!read_model(b, lim, out, err) || !get_int(b, "top_n", &out->top_n, err) ||
         !get_bool(b, "return_documents", &out->return_documents, err) ||
         !get_bool(b, "use_activation", &activation, err))
         return RAD_E_INVAL;
-    if (out->model.empty())
-        out->model = lim.model_id;
     if (activation) {
         *err = err_unsupported("use_activation", "this model returns raw relevance logits");
         return RAD_E_UNSUPPORTED;
@@ -3133,6 +3253,7 @@ std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
         ch["message"] = std::move(m);
         if (r.want_logprobs) ch["logprobs"] = chat_logprobs_json(c.logprobs);
         else ch["logprobs"] = nullptr;
+        if (r.return_tokens) ch["token_ids"] = c.tokens;
         ch["finish_reason"] = r.legacy_functions && c.finish == Finish::ToolCalls
                                   ? "function_call" : finish_reason_oai(c.finish);
         arr.push_back(std::move(ch));
@@ -3152,17 +3273,12 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
         } else {
             ch["logprobs"] = nullptr;
         }
+        if (r.return_tokens) ch["token_ids"] = c.tokens;
         ch["finish_reason"] = finish_reason_oai(c.finish);
         arr.push_back(std::move(ch));
     }
     return completion_object(r, "text_completion", std::move(arr), u, t);
 }
-
-/* One embedding value, as JSON: the shortest digits that read back as the float, so a reader
- * narrowing to float gets the engine's value exactly and one parsing a double gets its nearest
- * decimal (OpenAI's spelling of the same values). A non-finite value is null, as the DOM writes
- * it. */
-static void append_json_f32(std::string& out, float v) { json_append_float(out, v); }
 
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
                             const UsageOut& u) {
@@ -3177,11 +3293,13 @@ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<f
         floats += (int64_t)v.size();
     }
     out.reserve(est);
+    /* Each value is the shortest digits that read back as the float, so a reader narrowing to
+     * float gets the engine's value exactly (OpenAI's spelling); a non-finite value is null. */
     auto spell = [](std::string& o, const std::vector<float>& v) {
         o += '[';
         for (size_t j = 0; j < v.size(); ++j) {
             if (j) o += ',';
-            append_json_f32(o, v[j]);
+            json_append_float(o, v[j]);
         }
         o += ']';
     };
@@ -3387,6 +3505,10 @@ std::string ChatDeltaStream::chunk(json delta, const char* finish_reason, const 
         ch["logprobs"] = json{ { "content", json::parse("[" + lp_ + "]") } };
         lp_.clear();
     }
+    if (!ids_.empty()) {
+        ch["token_ids"] = json::parse("[" + ids_ + "]");
+        ids_.clear();
+    }
     if (finish_reason) ch["finish_reason"] = finish_reason;
     else ch["finish_reason"] = nullptr;
     json o;
@@ -3420,12 +3542,25 @@ void ChatDeltaStream::add_logprobs(const std::string& elems) {
     lp_ += elems;
 }
 
+void ChatDeltaStream::add_token_ids(const int32_t* ids, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!ids_.empty()) ids_ += ',';
+        ids_ += std::to_string(ids[i]);
+    }
+}
+
 void ChatDeltaStream::delta_close(std::string& out) {
     if (!lp_.empty()) {
         out += ",\"logprobs\":{\"content\":[";
         out += lp_;
         out += "]}";
         lp_.clear();
+    }
+    if (!ids_.empty()) {
+        out += ",\"token_ids\":[";
+        out += ids_;
+        out += "]";
+        ids_.clear();
     }
     if (timings_.empty()) { out += ",\"finish_reason\":null}]}\n\n"; return; }
     out += ",\"finish_reason\":null}],";
@@ -3544,7 +3679,7 @@ namespace {
  * a billing stamp meaningless to the model, held constant as in llama-server. */
 void hold_billing_stamp(std::string& s) {
     static const char kHead[] = "x-anthropic-billing-header:";
-    if (s.rfind(kHead, 0) != 0) return;
+    if (!s.starts_with(kHead)) return;
     const size_t at = s.find("cch=", sizeof kHead - 1);
     if (at == std::string::npos) return;
     const size_t end = s.find(';', at + 4);
@@ -4204,7 +4339,7 @@ std::string anthropic_message_body(const OaiRequest& r, const ChoiceOut& c, cons
         blocks.push_back(json{ { "type", "thinking" }, { "thinking", c.msg.reasoning },
                                { "signature", "" } });
     std::string text = c.msg.content;
-    if (!r.continued.empty() && text.rfind(r.continued, 0) == 0) text.erase(0, r.continued.size());
+    if (!r.continued.empty() && text.starts_with(r.continued)) text.erase(0, r.continued.size());
     if (!text.empty()) blocks.push_back(json{ { "type", "text" }, { "text", text } });
     for (const ToolCall& tc : c.msg.tool_calls) {
         /* The same bound the streaming path applies: `arguments` is model output, and
@@ -4429,7 +4564,7 @@ int responses_part(const json& p, json* out, ApiError* err) {
 
 /* The id a response item carries for a call, from the call id this server minted ("call_..."). */
 std::string fc_id(const std::string& call_id) {
-    return "fc_" + (call_id.rfind("call_", 0) == 0 ? call_id.substr(5) : call_id);
+    return "fc_" + (call_id.starts_with("call_") ? call_id.substr(5) : call_id);
 }
 
 json response_usage(const UsageOut& u) {

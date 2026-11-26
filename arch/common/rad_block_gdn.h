@@ -117,7 +117,7 @@ struct GdnBF16 {
      *                 block's own all-reduce where it issues one, so it is beside the reduction
      *                 whether this block or the next norm runs it (prefetch_beside);
      *   op_pf_out     of the out-projection's leading bytes beside the decode recurrent update (as
-     *                 GdnFP8::op_pf_out), issued right before it in a pure decode step of at most
+     *                 GdnQ::op_pf_out), issued right before it in a pure decode step of at most
      *                 pf_out_seqs sequences. */
     rad_op     op_pf = 0;
     rad_weight pf_w  = 0;
@@ -272,13 +272,7 @@ inline int GdnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                     RAD_WEIGHTS(w_out)),
                 {w.o}, {w.h});
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h);
     if (add_out)
         op_add = rw(b, RAD_OP(b, "add",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -302,7 +296,7 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t conv_dim = cfg.conv_dim();
     const int64_t H        = cfg.n_head_v;
 
-    /* Each path runs over its own run of sequences (details in rad_block_gdn_fp8.h's step()). The
+    /* Each path runs over its own run of sequences (details in rad_block_gdn_q.h's step()). The
      * step is sorted decode-first and every kernel derives grid and rows from cu_seqlens, which
      * holds absolute offsets: the prefill half gets `cu + D` with token operands at their base,
      * the decode half has both narrowed to DT. The gated norm is per token, so it takes a row

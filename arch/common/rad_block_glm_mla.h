@@ -15,7 +15,7 @@
  * unset declares neither them nor the form. */
 #ifndef RAD_BLOCK_GLM_MLA_H
 #define RAD_BLOCK_GLM_MLA_H
-#include "rad_fp8.h"
+#include "rad_linear.h"
 #include "rad_glm_tp.h"
 #include <algorithm>
 #include <cmath>
@@ -123,10 +123,10 @@ struct GlmMla {
      * world * rows_for(T) rows, since every rank's run is gathered at full length. */
     struct RowsWire {
         rad_buf q = 0, q_latent = 0, attn_latent = 0, out = 0;
-        ActFP8 attn{};
+        ActQ attn{};
     };
     struct Wire {
-        ActFP8 input{}, q_low{}, attn{};
+        ActQ input{}, q_low{}, attn{};
         rad_buf q_raw = 0, kv_raw = 0, latent = 0, out = 0;
         MlaLatent::Wire core{};
         RowsWire rows{};
@@ -140,14 +140,14 @@ struct GlmMla {
     Wire w{};
     int layer = 0;
     rad_kvgroup kv = 0;
-    LinearFP8 q_a{}, kv_a{}, q_b{}, output{};
-    NormQuantFP8 q_norm{};
-    QuantFP8 attn_quant{};
+    LinearQ q_a{}, kv_a{}, q_b{}, output{};
+    NormQuant q_norm{};
+    QuantAct attn_quant{};
     MlaLatent core{};
     rad_weight q_gain = 0, kv_gain = 0;
     rad_op op_kv_norm = 0, op_store = 0, op_store_stream = 0, op_resolve = 0, op_ar = 0;
-    LinearFP8 rows_q_b{}, rows_output{};
-    QuantFP8 rows_quant{};
+    LinearQ rows_q_b{}, rows_output{};
+    QuantAct rows_quant{};
     rad_weight rows_kv_b = 0;
     rad_op op_rows_absorb = 0, op_rows_attn = 0, op_rows_expand = 0, op_rows_gather = 0;
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,

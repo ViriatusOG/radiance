@@ -956,7 +956,8 @@ int ref_wan_mod_norm(const RadArgs* a, RadStream) {
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const auto* row = static_cast<const float*>(x->data) + r * x->stride[0];
-        const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+        const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0]
+            : 0);
         float mean = 0.0f, variance = 0.0f;
         for (int64_t c = 0; c < n; ++c) mean += row[c];
         mean /= static_cast<float>(n);
@@ -997,7 +998,8 @@ int ref_wan_gated_add(const RadArgs* a, RadStream) {
             float value = ldt(update, r * update->stride[0] + c);
             if (gated) {
                 const int64_t off = gate * n + c;
-                const auto* mod = static_cast<const float*>(time->data) + (r >= first ? time->stride[0] : 0);
+                const auto* mod = static_cast<const float*>(time->data) + (r >= first
+                    ? time->stride[0] : 0);
                 value *= static_cast<const float*>(table->data)[off] + mod[off];
             }
             state[r * x->stride[0] + c] += value;
@@ -1062,10 +1064,12 @@ int ref_wan_vae_history(const RadArgs* a, RadStream) {
         const int64_t pixel = i / channels, c = i % channels;
         if (mode)
             rad_wan_vae::history_cell<true>(src, cache, dest, pixel, c, plane, frames,
-                                            x->stride[0], history->stride[0], out->stride[0], reset != 0);
+                                            x->stride[0], history->stride[0], out->stride[0],
+                                                reset != 0);
         else
             rad_wan_vae::history_cell<false>(src, cache, dest, pixel, c, plane, frames,
-                                             x->stride[0], history->stride[0], out->stride[0], reset != 0);
+                                             x->stride[0], history->stride[0], out->stride[0],
+                                                 reset != 0);
     }
     return RAD_OK;
 }

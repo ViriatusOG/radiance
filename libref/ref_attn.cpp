@@ -111,7 +111,8 @@ static inline void kv_i8_put(void* cache, int64_t row, int64_t head_dim, int hal
  * root, the block's first row). Inside the block such a row sees itself and its ancestors only,
  * and its window is measured from the block's first position plus its depth -- the position its
  * token has if its path is committed -- rather than from its row. */
-static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, bool shared_anchor_window) {
+static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi,
+                           bool shared_anchor_window) {
     if (a->n_t < oi + 1) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[oi];
     const RadTensor* kdes = t_in(a, 4);
@@ -177,12 +178,12 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
     const int64_t jcap = max_blocks * block_size;
 
     /* Every (query row, head) is one output row, computed as below in a fixed order: per visible
-     * key, dot = sum over d of q[d] * (k[d] * k_descale), score = dot * scale; then the max over the
-     * scores in key order; then sum and acc[d] accumulate exp(score - max) and
-     * exp(...) * (v[d] * v_descale) in key order. At the int8 cache k[d] and v[d] are codes and
-     * the key's own K and V scales stand where the descales do. The query row is widened once, each score is kept
-     * for the second pass instead of recomputed, and four keys' dot chains run side by side; none
-     * of that changes a value. */
+     * key, dot = sum over d of q[d] * (k[d] * k_descale), score = dot * scale; then the max over
+     * the scores in key order; then sum and acc[d] accumulate exp(score - max) and exp(...) *
+     * (v[d] * v_descale) in key order. At the int8 cache k[d] and v[d] are codes and the key's
+     * own K and V scales stand where the descales do. The query row is widened once, each score
+     * is kept for the second pass instead of recomputed, and four keys' dot chains run side by
+     * side; none of that changes a value. */
     REF_PAR_REGION(total * head_dim * 64)
     {
         float* const sc = ws_get((size_t)std::max<int64_t>(jcap, 1));
@@ -468,7 +469,8 @@ int ref_attn_paged_rel(const RadArgs* a, RadStream) {
                     const int64_t d = pos - j;
                     if (causal ? d >= window : (d >= window || d <= -window)) return -1;
                 }
-                const int64_t blk = ld_int(bt->dtype, bt->data, s * bt_rs + (j / block_size) * bt_cs);
+                const int64_t blk = ld_int(bt->dtype, bt->data,
+                                           s * bt_rs + (j / block_size) * bt_cs);
                 return blk < 0 ? -1 : blk * kvv.sb + kh * kvv.sh + (j % block_size) * kvv.so;
             };
 
@@ -673,8 +675,8 @@ static int attn_dense(const RadArgs* a, bool reference_bias) {
 /* attn_dense with each entry's keys a run of their own: entry `s`'s queries are rows
  * [cu[s], cu[s+1]) of `q` and its keys and values rows [cu_k[s], cu_k[s+1]) of `k` and `v`. With
  * `causal` a query sees key j of its run when j <= its own index in its entry, both counted from
- * the start: a video's rows reading its prompt (cross attention), or a padded prompt's rows of which
- * the padding sees only the prompt. A query that sees no key is zero. */
+ * the start: a video's rows reading its prompt (cross attention), or a padded prompt's rows of
+ * which the padding sees only the prompt. A query that sees no key is zero. */
 int ref_attn_dense(const RadArgs* a, RadStream) {
     return attn_dense(a, false);
 }
@@ -787,9 +789,12 @@ int ref_attn_na3d(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     const int64_t nt = std::min(kt, T), nh = std::min(kh, H), nw = std::min(kw, W);
     const int64_t q_ds = q->stride[1], q_rs = row_stride(q, heads * head_dim);
-    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1, k_rs = row_stride(k, heads * head_dim);
-    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1, v_rs = row_stride(v, heads * head_dim);
-    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1, o_rs = row_stride(o, heads * head_dim);
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1,
+        k_rs = row_stride(k, heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1,
+        v_rs = row_stride(v, heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1,
+        o_rs = row_stride(o, heads * head_dim);
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     auto start = [](int64_t c, int64_t n, int64_t L) {
         return std::min(std::max<int64_t>(c - n / 2, 0), L - n);
@@ -803,13 +808,15 @@ int ref_attn_na3d(const RadArgs* a, RadStream) {
         auto score = [&](int64_t key) {
             const int64_t kb = key * k_rs + h * head_dim * k_ds;
             float dot = 0.0f;
-            for (int64_t d = 0; d < head_dim; ++d) dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
+            for (int64_t d = 0; d < head_dim; ++d)
+                dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
             return dot * scale;
         };
         float mx = -INFINITY;
         for (int64_t a1 = t0; a1 < t0 + nt; ++a1)
             for (int64_t b1 = i0; b1 < i0 + nh; ++b1)
-                for (int64_t c1 = j0; c1 < j0 + nw; ++c1) mx = std::max(mx, score((a1 * H + b1) * W + c1));
+                for (int64_t c1 = j0; c1 < j0 + nw; ++c1)
+                    mx = std::max(mx, score((a1 * H + b1) * W + c1));
         float acc[REF_HD_MAX];
         for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
         float sum = 0.0f;
@@ -1040,7 +1047,8 @@ static int rope_freqs(int mode, int64_t rot, int64_t den, float theta, const int
     if (half > REF_HD_MAX / 2) return RAD_E_UNSUPPORTED;
     int64_t start[8] = {}, total = 0;
     for (int c = 0; c < n_sec; ++c) { start[c] = total; total += sec[c]; }
-    if ((mode == ROPE_MROPE || mode == ROPE_AXIAL) && n_sec > 0 && total != half) return RAD_E_SHAPE;
+    if ((mode == ROPE_MROPE || mode == ROPE_AXIAL) && n_sec > 0 && total != half)
+        return RAD_E_SHAPE;
     for (int64_t i = 0; i < half; ++i) {
         int c = 0;
         float inv = 1.0f / ref_pow(theta, (float)(2 * i) / (float)den);
@@ -1481,11 +1489,57 @@ int ref_rope_table(const RadArgs* a, RadStream) {
         if (pp < 0 || pp >= rows) continue;
         const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
         for (int64_t i = 0; i < half; ++i) {
-            const float inv = yarn.frequency(1.0f / ref_pow(theta, (float)(2 * i) / (float)den), (int)i);
+            const float inv = yarn.frequency(1.0f / ref_pow(theta, (float)(2 * i) / (float)den),
+                                             (int)i);
             const float ang = p * inv;
             stt(cs, offlin(cs, pp * rot + i),        ref_cos(ang) * yarn.magnitude);
             stt(cs, offlin(cs, pp * rot + half + i), ref_sin(ang) * yarn.magnitude);
         }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ rope_rows */
+/* Rotary embedding from a rope_table plane over a window of each head: columns [off, off+rot) of
+ * every head_dim-wide head of x [M, n_head*head_dim], in place. "gptj" pairs adjacent columns,
+ * "neox" pairs i with i + rot/2. The pair (a, b) times (c + i s) is (a c - b s, a s + b c) in f32,
+ * rounded once to x's dtype; `inverse` 1 conjugates (s -> -s), which undoes the rotation. A row
+ * whose position is negative or past the table is left as it is. DeepSeek-V4 rotates the last 64
+ * of each 512-wide head and un-rotates the attention output the same way. */
+int ref_rope_rows(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
+    const int64_t nh = p_int(a, "n_head", 0), hd = p_int(a, "head_dim", 0);
+    const int64_t rot = p_int(a, "rot", 0), off = p_int(a, "off", -1);
+    const int64_t inv = p_int(a, "inverse", -1);
+    const char* mode = p_str(a, "mode", "");
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return RAD_E_UNSUPPORTED;
+    if (nh < 1 || hd < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd ||
+        (inv != 0 && inv != 1))
+        return RAD_E_SHAPE;
+    if (!x.data || !cs.data || !pos.data || x.rank != 2 || x.shape[0] < 1 ||
+        x.shape[1] != nh * hd ||
+        cs.rank != 2 ||
+        cs.shape[1] != rot || numel(&pos) != x.shape[0])
+        return RAD_E_SHAPE;
+    const int64_t M = x.shape[0], rows = cs.shape[0], half = rot / 2;
+    const float sign = inv ? -1.0f : 1.0f;
+#pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t p = ld_int(pos.dtype, pos.data, offlin(&pos, m));
+        if (p < 0 || p >= rows) continue;
+        const int64_t cb = rowoff(&cs, p, rot), css = laststride(&cs);
+        const int64_t xb = rowoff(&x, m, nh * hd), xs = laststride(&x);
+        for (int64_t h = 0; h < nh; ++h)
+            for (int64_t i = 0; i < half; ++i) {
+                const int64_t ia = h * hd + off + (gptj ? 2 * i : i);
+                const int64_t ib = gptj ? ia + 1 : ia + half;
+                const float c = ldt(&cs, cb + i * css), s = sign * ldt(&cs, cb + (half + i) * css);
+                const float va = ldt(&x, xb + ia * xs), vb = ldt(&x, xb + ib * xs);
+                stt(&x, xb + ia * xs, va * c - vb * s);
+                stt(&x, xb + ib * xs, va * s + vb * c);
+            }
     }
     return RAD_OK;
 }

@@ -189,7 +189,7 @@ TEST(museglimmer_declares_the_trunk_graph) {
                                                 }) - b.ops.begin());
         REQUIRE(at + 9 < b.ops.size());
         const RecOp* norm = &b.ops[at];
-        CHECK_EQ(norm->w.size(), (size_t)1);
+        REQUIRE_EQ(norm->w.size(), (size_t)1);
         CHECK_EQ(norm->w[0], w_h(b, "blk.0.attn_norm.weight"));
         CHECK(near(pflt(norm, "wadd"), 1.0, 1e-12));
         CHECK(near(pflt(norm, "eps"), 1e-5, 1e-12));
@@ -747,13 +747,15 @@ MetaKV muse_meta_quant() {
 /* The asymmetric int4/int5 affine grid the compressed-tensors recipes write: codes u4 or u5, a
  * u8 zero point and an f16 scale per [1 x 128] (libquant `codes=u4 zero=u8 group=128 scale=f16`). */
 RadEncoding muse_a4_enc(uint32_t codes) {
-    RadEncoding e = rad_enc_affine(codes, RAD_F16, 1, rad::arch::RAD_FP8_BLOCK);
-    rad_enc_add_plane(&e, "zero", RAD_U8, 1, rad::arch::RAD_FP8_BLOCK);
+    RadEncoding e = rad_enc_affine(codes, RAD_F16, 1, rad::arch::RAD_SCALE_GROUP);
+    rad_enc_add_plane(&e, "zero", RAD_U8, 1, rad::arch::RAD_SCALE_GROUP);
     return e;
 }
 
 /* The int8-a-128 grid: i8 codes, a bf16 scale per [1 x 128] (linear_is_w8). */
-RadEncoding muse_i8g_enc() { return rad_enc_affine(RAD_I8, RAD_BF16, 1, rad::arch::RAD_FP8_BLOCK); }
+RadEncoding muse_i8g_enc() {
+    return rad_enc_affine(RAD_I8, RAD_BF16, 1, rad::arch::RAD_SCALE_GROUP);
+}
 
 /* The symmetric grid data/recipes/museglimmer-30b-w4a8.recipe writes: `codes=i4 group=128
  * scale=f16` (the int8 variant `codes=i8 group=128 scale=f16` for the rows int4 hurts). */
@@ -811,7 +813,7 @@ TEST(museglimmer_ct_declares_the_asymmetric_int4_form) {
             const std::string dt = pstr(&o, "dtype");
             if (dt == "w4a8i8_asym") {
                 ++a8;
-                CHECK_EQ(pint(&o, "group"), (int)rad::arch::RAD_FP8_BLOCK);
+                CHECK_EQ(pint(&o, "group"), (int)rad::arch::RAD_SCALE_GROUP);
             } else if (dt == "w4a16_asym") {
                 ++a16;
                 const RecParam* m = param(&o, "M");
@@ -929,7 +931,7 @@ TEST(museglimmer_ct_shares_one_activation_pair_between_q_gate_k_and_v_on_i8g) {
             if (o.op == "gemm_nt_q") {
                 ++i8;
                 CHECK_EQ(pstr(&o, "dtype"), std::string("i8a8"));
-                CHECK_EQ(pint(&o, "group"), (int)rad::arch::RAD_FP8_BLOCK);
+                CHECK_EQ(pint(&o, "group"), (int)rad::arch::RAD_SCALE_GROUP);
             }
         CHECK_EQ(i8, 56);
 
@@ -942,7 +944,7 @@ TEST(museglimmer_ct_shares_one_activation_pair_between_q_gate_k_and_v_on_i8g) {
         REQUIRE(qs != nullptr);
         CHECK_EQ(std::string(qs->d.planes), std::string("scale"));
         CHECK_EQ(qs->d.dtype, (uint32_t)RAD_BF16);
-        CHECK_EQ(qs->d.shape[1], 128 / (int64_t)rad::arch::RAD_FP8_BLOCK);
+        CHECK_EQ(qs->d.shape[1], 128 / (int64_t)rad::arch::RAD_SCALE_GROUP);
 
         /* k after q: k's GEMM reads the pair q's quantiser writes. */
         const RecOp* qdec = q_gemm_of(b, "blk.0.attn_q");
@@ -1028,11 +1030,13 @@ TEST(museglimmer_ct_declares_the_asymmetric_int5_form) {
 }
 
 /* Block fp8 (at a bf16 or an f32 scale) and MXFP4 are forms no plugin of this build serves: a
- * linear stored in one is refused by name at declare, as LinearFP8 refuses it elsewhere. */
+ * linear stored in one is refused by name at declare, as LinearQ refuses it elsewhere. */
 TEST(museglimmer_ct_refuses_block_fp8_and_mxfp4_by_name) {
     const RadEncoding retired[] = {
-        rad_enc_affine(RAD_F8E4M3, RAD_BF16, rad::arch::RAD_FP8_BLOCK, rad::arch::RAD_FP8_BLOCK),
-        rad_enc_affine(RAD_F8E4M3, RAD_F32, rad::arch::RAD_FP8_BLOCK, rad::arch::RAD_FP8_BLOCK),
+        rad_enc_affine(RAD_F8E4M3, RAD_BF16, rad::arch::RAD_SCALE_GROUP,
+                       rad::arch::RAD_SCALE_GROUP),
+        rad_enc_affine(RAD_F8E4M3, RAD_F32, rad::arch::RAD_SCALE_GROUP,
+                       rad::arch::RAD_SCALE_GROUP),
         rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32),
     };
     for (const RadEncoding& e : retired) {
@@ -1320,7 +1324,8 @@ RadEncoding muse_iq8r_enc() {
  * `output.weight` is in `attn_output.weight`. */
 std::vector<std::pair<std::string, RadEncoding>> muse_iq8r_encs() {
     std::vector<std::pair<std::string, RadEncoding>> v = muse_linears(muse_iq8r_enc());
-    v.push_back({ "output.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, rad::arch::RAD_FP8_BLOCK) });
+    v.push_back({ "output.weight",
+                  rad_enc_affine(RAD_I8, RAD_BF16, 1, rad::arch::RAD_SCALE_GROUP) });
     return v;
 }
 
@@ -1734,7 +1739,7 @@ TEST(museglimmer_ct_refuses_a_mixed_or_malformed_iq8r_trunk) {
         CHECK_EQ(declare_rc(e, mk.meta()), RAD_E_DTYPE);
     }
     {
-        RadEncoding bad = rad_enc_affine(RAD_I8, RAD_U8, 1, rad::arch::RAD_FP8_BLOCK);
+        RadEncoding bad = rad_enc_affine(RAD_I8, RAD_U8, 1, rad::arch::RAD_SCALE_GROUP);
         rad_enc_add_plane(&bad, "scale.1", RAD_BF16, 1, 0);
         rad_enc_copy_str(bad.transform, "fwht128");
         CHECK_EQ(declare_rc(muse_linears(bad), mk.meta()), RAD_E_DTYPE);
@@ -1768,8 +1773,8 @@ MetaKV muse_draft_meta() {
  * shipped `*-dflash-fp4.rad` carries): attention at block fp8 e4m3*bf16[128x128], fc and the
  * MLPs at MXFP4 e2m1*e8m0[1x32], the head the trunk's own. */
 std::vector<std::pair<std::string, RadEncoding>> muse_draft_encs() {
-    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, rad::arch::RAD_FP8_BLOCK,
-                                           rad::arch::RAD_FP8_BLOCK);
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, rad::arch::RAD_SCALE_GROUP,
+                                           rad::arch::RAD_SCALE_GROUP);
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
     return { { "dspark.fc.", mx },    { "attn_q.", fp8 },      { "attn_k.", fp8 },
              { "attn_v.", fp8 },      { "attn_output.", fp8 }, { "ffn_gate_up.", mx },

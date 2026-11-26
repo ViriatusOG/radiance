@@ -8,6 +8,7 @@
 # (RADIANCE_PROFILE_EVERY) into the log; difference two dumps taken after prefill ended to get a
 # decode-only table.
 P=8129
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/dprofd.XXXXXX"); trap 'rm -rf "$WORK"' EXIT INT TERM
 C="${C:-8}"
 EVERY="${EVERY:-20}"
 MT="${MT:-400}"
@@ -28,14 +29,16 @@ for i in $(seq 1 150); do
   pgrep -f "bin/radianc[e]" >/dev/null || { echo "DIED"; grep -iE "^E " "$HOME/dprofd.log" | tail -5; exit 1; }
   sleep 5
 done
-jq -Rs "{model:\"m\",prompt:.,max_tokens:$MT,temperature:0}" < "${PROMPT:-$HOME/lpcode16k.txt}" > /tmp/dpd.json
+PROMPT="${PROMPT:-$HOME/lpcode16k.txt}"
+[ -s "$PROMPT" ] || { echo "no prompt file at $PROMPT"; exit 1; }
+jq -Rs "{model:\"m\",prompt:.,max_tokens:$MT,temperature:0}" < "$PROMPT" > "$WORK/dpd.json"
 PIDS=; i=0
 while [ $i -lt $C ]; do
-  curl -s -m 1800 http://localhost:$P/v1/completions -H "Content-Type: application/json" -d @/tmp/dpd.json -o /tmp/dpd_$i.out &
+  curl -s -m 1800 http://localhost:$P/v1/completions -H "Content-Type: application/json" -d @"$WORK/dpd.json" -o "$WORK/dpd_$i.out" &
   PIDS="$PIDS $!"; i=$((i+1))
 done
 wait $PIDS
-echo "C=$C completion_tokens $(jq -r '.usage.completion_tokens' /tmp/dpd_0.out)"
+echo "C=$C completion_tokens $(jq -r '.usage.completion_tokens' "$WORK/dpd_0.out")"
 sleep 2
 pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 1; done
 grep -c "per-op device timing, rank 0" "$HOME/dprofd.log" | sed 's/^/dumps: /'

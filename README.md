@@ -7,7 +7,9 @@ unchanged. Model architectures, kernel libraries and quantisers are `.so` plugin
 tree are built and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
 
 The bundled device kernels target AMD RDNA4 (`libr4d`: `gfx1200`, `gfx1201`), RDNA3 (`libr3d`:
-`gfx11xx`) and Strix Halo (`libhalo`: `gfx1151`). The serve settings
+`gfx11xx`) and Strix Halo (`libhalo`: `gfx1151`); EXL3-V3 trellis linears, for the Qwen3.5-3.8
+dense and Gemma 4 dense architectures under `plugin/`, have a `gfx1201` library of their own
+(`plugin/exl3i`). The serve settings
 below are for two 32 GB cards (Radeon AI PRO R9700). The engine starts on any AMD GPU family;
 another card needs a kernel library for it. A machine with no GPU builds the host backend, whose
 AVX-512/AVX2 kernels (`libavx`) serve every model here: the small ones (EmbeddingGemma 2,
@@ -22,6 +24,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 |---|---|---|---|
 | Qwen3.8-Flash-Next: IQR-V4 experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | `tp1.yaml`, `tp2.yaml` |
 | GLM-5.3-Flash: IQR-V4 experts, IQ8R trunk, int8 latent cache, four cards with the experts tiered to host memory | `glm53-flash-iqr-v4.rad` (159 GiB) | [download](https://huggingface.co/animusnull/glm-5.3-flash-iqr-v4) | `tp4.yaml` |
+| DeepSeek-V4.1-Flash 1017 uncensored (refusals removed): llama.cpp's blocks at 2.83 bits a weight (its DSpark drafter's MXFP4 experts are not served), exact fp8 cache, two or four cards with the experts tiered to host memory ([docs/ARCHITECTURES.md](docs/ARCHITECTURES.md#deepseek41-deepseek-v41-flash)) | `deepseek-v4.1-flash-1017-uncensored.rad` (134 GiB of experts) | [download](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad) | — |
 | Qwen3.8-Flash-Next abliterated (refusals removed): IQR-V4 trunk (GPTQ), codebook experts (round to nearest), MTP, vision | `qwen3.8-flash-next-uncensored-iqr-v4.rad` (113 GiB) | [download](https://huggingface.co/davetha/qwen3.8-flash-next-uncensored-iqr-v4) | — |
 | Qwen3.8-Flash-Next: calibrated Q5 expert down (w5nl, group 64), BF16 PLE, vision | `qwen4exp-w5dn64-bf16ple-gptq.rad` (166 GiB) | [download](https://huggingface.co/gostar77/qwen3.8-flash-next-radiance-q5-w5dn64-bf16ple) | — |
 | Qwen3.8-Flash-Next IQ5R-V4: U5 trunk, W5NL expert down, BF16 PLE and vision | `qwen3.8-flash-next-iq5r.rad` (175 GiB) | [download](https://huggingface.co/gostar77/qwen3.8-flash-next-iq5r-v4-u5-w5-bf16ple) | — |
@@ -57,6 +60,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `tp1.yaml`, `tp2.yaml` |
 | Unlimited-OCR bf16: document parsing with the DeepEncoder tower | `unlimited-ocr-bf16.rad` (6.2 GiB) | [download](https://huggingface.co/Aijuus/unlimited-ocr-bf16) | — |
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `tp1.yaml`, `tp2.yaml` |
+| Fish Audio drama-3: speech with speaker tags and directions, two cards | `drama3-i8.rad` (37 GiB) | [convert](data/recipes/drama3-i8.recipe) | — |
 | TranslateGemma 27B, int8 trunk: translation | `translategemma-27b-i8.rad` (28 GiB) | [download](https://huggingface.co/StillDeadcode/translategemma-27b-i8) | — |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | — |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | — |
@@ -73,21 +77,22 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Meta Muse Glimmer 30B IQ4R-S-V4, int8 vision (needs [#564](https://codeberg.org/StillDeadcode/radiance/pulls/564)) | `muse-glimmer-30b-iq4r-s-v4-df2-i8vision.rad` (17.8 GiB) | [download](https://huggingface.co/gostar77/muse-glimmer-30b-iq4r-s-v4-radiance) | — |
 | Recursive Flint (39.8B, about 2.5B active) IQ8R: rotated int8 trunk and experts, two cards | `flint-iq8r.rad` (38 GiB) | [download](https://huggingface.co/StillDeadcode/flint-iq8r) | — |
 | Ling-3.0-tiny IQ8R: rotated int8 trunk and experts, one card | `ling-3.0-tiny-iq8r.rad` (7.9 GiB) | [download](https://huggingface.co/StillDeadcode/ling-3.0-tiny-iq8r) | — |
+| NVIDIA Nemotron-3.5-Bolt-74B-A9B 2-bit: NVIDIA's IQ2_XXS experts and Q8_0 linears as stored, IQ8R Mamba projections, LiLiCorr drafter, one card | `nemotron74-2bit.rad` (26.66 GiB of weights) | [convert](data/recipes/nemotron74-nvidia-24gb-iq8r.recipe) | — |
 | Nemotron 3.5 Embed 1B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | — |
 | Nemotron 3.5 Embed 8B BF16: text and image embeddings, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | — |
 | Nemotron 3.5 Rerank 8B BF16: text/image document relevance, one card | the checkpoint as it ships | [NVIDIA checkpoint](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16) | `tp1.yaml`, `tp2.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | `tp1.yaml`, `tp2.yaml` |
-| Inkling 2 Mini: NVFP4 experts as stored, MXFP8 experts as rotated int8; text, one card ([geometry](docs/ARCHITECTURES.md#inkling2-inkling-2-mini)) | `inkling2-mini.rad` (17.6 GiB) | [convert](#convert-a-checkpoint) with `data/recipes/inkling2-mini.recipe` | — |
+| Inkling 2 Mini IQ4R-V4 + DFlash2: the experts IQR-V4's four-bit computed trellis (GPTQ against recorded Hessians), the attention and the head rotated int8, the embedding int8, incoai's DFlash2 drafter (four-bit computed trellis, down int8), the vision tower bf16; text and images, one or two cards (`draft-window: adaptive`) ([geometry](docs/ARCHITECTURES.md#inkling2-inkling-2-mini)) | `inkling-2-mini-iq4r-v4.rad` (14.43 GiB) | [download](https://huggingface.co/StillDeadcode/inkling-2-mini-iq4r-v4) · [convert](data/recipes/inkling2-mini-iq4r-v4.recipe) | — |
 
 **Not served by this version.** A container whose weights are block FP8, MXFP4, M2XFP4 or
 ParoQuant, or whose experts read E4M3 activations, is refused at startup by the name of the first
 such weight. That is every FP8 and MXFP4 container of the models above, and the models that have
-no int8 container yet: Ornith-1.5 (35B-A3B and 122B), Sage-A1.5,
-NVIDIA-Nemotron-3.5-Bolt-74B-A9B, Ling-3.0-flash-Sante, Fish Audio drama-3 and
+no int8 container yet: Ornith-1.5 (35B-A3B and 122B), Sage-A1.5, Ling-3.0-flash-Sante and
 Anima's FP8 container (Anima converted to bf16 is served). Each returns with an int8 container.
 A container with an int8 or bf16 trunk and a block-FP8 drafter (NVIDIA-Nemotron-3.5-Bolt-E4B,
-the Gemma 4 31B DFlash and DFlash2 containers, MiniCPM5-2B bf16) serves without the drafter
-under `num-speculative-tokens: 0`.
+the Gemma 4 31B DFlash and DFlash2 containers, MiniCPM5-2B bf16), or with GGUF blocks and an
+MXFP4 drafter (the DeepSeek-V4.1-Flash container's DSpark), serves without the drafter under
+`num-speculative-tokens: 0`.
 
 A container holds everything the server needs: the weights, the tokeniser, the chat template and
 any drafter. Each download link's repository has the recipe and the exact command that made the
@@ -254,6 +259,7 @@ here.
 | Qwen3.8-Flash-Next, four ranks | `tp: 4, max-num-seqs: 8, max-model-len: 200000, placement: expert_tiered, host-pool-mib: 49152, gpu-headroom-mib: 96, kv-cache-dtype: i8, num-speculative-tokens: 3, max-num-batched-tokens: 2048` |
 | Qwen3.8-Flash-Next, three ranks (the shipped container as it is, [`docs/TP3.md`](docs/TP3.md)) | `tp: 3, max-num-seqs: 8, max-model-len: 200000, placement: expert_tiered, host-pool-mib: 24576, gpu-headroom-mib: 96, kv-cache-dtype: i8, num-speculative-tokens: 3, max-num-batched-tokens: 2048` |
 | GLM-5.3-Flash | `tp: 4, placement: expert_tiered, host-pool-mib: 65536, max-num-seqs: 4, max-model-len: 262144, max-num-batched-tokens: 2048, kv-cache-dtype: i8, num-speculative-tokens: 0, prefill-interleave: 4, prefix-cache-mib: 32768, gpu-headroom-mib: 96`, and `server.kernels: glm,libr4d,libavx,libref` |
+| DeepSeek-V4.1-Flash | `tp: 2, max-num-seqs: 4, max-model-len: 262144, placement: expert_tiered, host-pool-mib: 73728, gpu-headroom-mib: 96, kv-cache-dtype: fp8, ngram-placement: disk, prefix-resume: nearest, num-speculative-tokens: 16, spec-ngram: 16, spec-ngram-max: 8, draft-window: adaptive, max-num-batched-tokens: 2048, expert-profile: data/deepseek41-expert-profile.json, chat-template-kwargs: {"enable_thinking":false}`; four cards: `tp: 4, host-pool-mib: 16384`, and on cards with unequal links `expert-split` ([docs/ARCHITECTURES.md](docs/ARCHITECTURES.md#deepseek41-deepseek-v41-flash)) |
 | Qwen3.8-27B IQ8R and IQR-V4, Qwen3.6-35B-A3B | `tp: 2, max-num-seqs: 32, max-model-len: 200000, kv-cache-dtype: i8` |
 | Qwen3.8-27B bf16 | `tp: 2, max-num-seqs: 8, max-model-len: 200000, kv-cache-dtype: i8` |
 | MiniCPM5-2B IQ8R and bf16 | `tp: 2, max-num-seqs: 32, max-model-len: 131072, kv-cache-dtype: i8, gpu-headroom-mib: 160, max-num-batched-tokens: 512` |

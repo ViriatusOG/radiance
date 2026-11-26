@@ -29,7 +29,7 @@
  *     norm_topk_prob False, routed_scaling_factor 1.0 -- an ordinary softmax gate,
  *     2 shared experts packed as ONE dense MLP 2x896 = 1792 wide, summed ungated
  *
- * The MoE block is arch/common/rad_block_moe_fp8.h in its plain-bf16 expert mode (probe() reads
+ * The MoE block is arch/common/rad_block_moe_q.h in its plain-bf16 expert mode (probe() reads
  * format 3 off the first expert's encoding), declared EXTERNAL-INPUT (src.norm null): its
  * post-attention norm is declared by this plugin because the shared expert reads the SAME normed
  * input and the block's gather overwrites that input with the routed delta (`h.x` is the
@@ -41,7 +41,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_mlp.h>
-#include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_moe_q.h>
 #include <arch/rad_block_sam.h>
 
 #include "attn_llama.h"
@@ -56,7 +56,7 @@ struct Layer {
     int      dense = 0;        /* 1 = the first_k_dense layer, plain SwiGLU */
     AttnLlamaBF16 attn;
     MlpBF16  mlp;              /* dense layers */
-    MoeFP8   moe;              /* routed layers */
+    MoeQ   moe;              /* routed layers */
     /* The routed layer's external norm and the plugin-owned shared arm: the gain, the two dense
      * linears' weights, and the ops. Per layer -- the ACTIVATION buffers are shared across the
      * layers (spec §8) and the ops are declared per layer, as every block here does. */
@@ -83,12 +83,12 @@ struct Model {
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_eoff = 0, b_ecnt = 0;
     /* expert planes -- one row per (token, slot), a pass tall */
     rad_buf b_sorted = 0, b_egu = 0, b_edn = 0;
-    ActFP8  a_eff{};
+    ActQ  a_eff{};
     /* the shared arm reads the block's prepared input (h) before the gather overwrites it, then
      * the dense linear's planes */
     rad_buf b_sgu = 0, b_sff = 0, b_sout = 0;
 
-    MoeFP8::Config moecfg{};
+    MoeQ::Config moecfg{};
     /* The DeepEncoder vision tower (arch/common/rad_block_sam.h). Its weights are mapped always;
      * its ops and the encoder pass only when SAM's attention op resolves. */
     DeepEncoder enc;
@@ -161,13 +161,7 @@ static int declare_moe_norm_and_shared(RadBuilder* b, Model& m, int l) {
     /* Column-sharded like the dense MLP's down_proj: every rank holds a partial sum, reduced
      * once per step before the residual add. */
     if (g.world > 1)
-        lay.op_sh_ar = rw(b, RAD_OP(b, "all_reduce",
-                         RAD_PARAMS(RAD_INT("world_size", g.world),
-                                    RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                    RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                    RAD_INT("min_bytes", g.wire_min_bytes)),
-                         RAD_NOWEIGHTS),
-                     {m.b_sout}, {m.b_sout});
+        lay.op_sh_ar = decl_all_reduce(b, g, m.b_sout);
     lay.op_sh_add = rw(b, RAD_OP(b, "add",
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                       RAD_STR("dtype", g.dtype)),
@@ -191,7 +185,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Plain RMSNorm (DeepseekV2RMSNorm is x_hat * w), not the GemmaRMSNorm `1 + w`. */
     g.wadd = 0.0f;
     /* The linears are the checkpoint's own bf16: no scale planes, no quantised activations. The
-     * MoeFP8 block in particular requires it (its external-input check reads it). */
+     * MoeQ block in particular requires it (its external-input check reads it). */
     g.w_bf16 = true;
 
     /* ---- geometry RadModelMeta does not name. */
@@ -220,7 +214,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
     const double rsf = rad_meta_getf(meta, "routed_scaling_factor", 1.0);
-    if (!(rsf > 0.0) || rsf != 1.0) {
+    if (rsf != 1.0) {
         fprintf(stderr, "radiance: unlimitedocr: routed_scaling_factor %g is not 1.0 and this "
                         "plugin declares no router output scale\n", rsf);
         return RAD_E_UNSUPPORTED;
@@ -245,7 +239,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the routed geometry. n_expert is NOT divided (every rank holds every expert and routes
      * identically); the intermediate width is. */
-    MoeFP8::Config& mc = m.moecfg;
+    MoeQ::Config& mc = m.moecfg;
     mc.n_expert     = n_expert_all;
     mc.n_expert_all = n_expert_all;
     mc.top_k        = top_k;
@@ -254,7 +248,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return s;
     /* The shared experts are packed as ONE dense MLP n_shared x moe_ff wide (DeepseekV2Model:
      * `intermediate_size = moe_intermediate_size * n_shared_experts`), summed ungated. The
-     * MoeFP8 shared arm is the SIGMOID-gated family's shape; this model's arm is declared by the
+     * MoeQ shared arm is the SIGMOID-gated family's shape; this model's arm is declared by the
      * plugin (declare_moe_norm_and_shared) and the block declares none. */
     const int64_t sh_all = n_shared * moe_ff;
     mc.n_ff_shared = 0;
@@ -350,20 +344,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                               RAD_NOWEIGHTS),
-                           {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
 
     /* ---- the expert format: the checkpoint's plain bf16, read off the first routed layer's
      * first expert. A quantised container would be a sibling plugin's. */
     {
-        MoeFP8::Src probe_src{};
+        MoeQ::Src probe_src{};
         probe_src.experts = nm.ckpt("model.layers.%lld.mlp.experts",
                                     (long long)m.first_dense);
-        RAD_ARCH_TRY(MoeFP8::probe(b, nm, (int)m.first_dense, probe_src, &mc));
+        RAD_ARCH_TRY(MoeQ::probe(b, nm, (int)m.first_dense, probe_src, &mc));
         if (!mc.expert_bf16) {
             fprintf(stderr, "radiance: unlimitedocr_bf16 serves plain bf16 experts; layer %lld's "
                             "expert 0 is quantised. Serve that container with its quantised "
@@ -394,7 +383,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     MlpBF16::Wire mw{};
     mw.x = m.b_x; mw.h = m.b_h; mw.gate_up = m.b_gate_up; mw.ffn = m.b_ffn;
 
-    MoeFP8::Wire fw{};
+    MoeQ::Wire fw{};
     fw.x = m.b_x;
     fw.h.x = m.b_h;                    /* external input: the plugin's own rmsnorm writes it */
     fw.logits = m.b_rlogits; fw.ids = m.b_eids; fw.ew = m.b_ew;
@@ -430,7 +419,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * delta into h.x, and the shared arm reads its own copy of the normed row. */
             RAD_ARCH_TRY(declare_moe_norm_and_shared(b, m, (int)l));
 
-            MoeFP8::Src fs{};
+            MoeQ::Src fs{};
             fs.cfg     = mc;
             fs.norm    = nullptr;   /* external: declared above */
             fs.router  = nm.ckpt("model.layers.%lld.mlp.gate.weight", (long long)l);
@@ -472,7 +461,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (win > 0)
         rad_note(b, "R-SWA: the KV group is a runtime ring (RAD_KV_RING), window %lld tokens from "
                     "the prefill's end (the reference's SlidingWindowLlamaAttention); prefill is "
-                    "fully causal, and prefix cache and speculation are off for it", (long long)win);
+                    "fully causal, and prefix cache and speculation are off for it",
+                 (long long)win);
     else
         rad_note(b, "R-SWA: the checkpoint states no sliding_window_size, so the KV group is a "
                     "plain full cache");
@@ -482,7 +472,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (ng_n > 0)
         rad_note(b, "generation_config asks for SlidingWindowNoRepeatNgramProcessor n=%lld over "
                     "the last %lld tokens -- served by the sample_ngram_ban stage, overridable "
-                    "per request (ngram_ban_n / ngram_window); temp-0 parity checks run with it off",
+                    "per request (ngram_ban_n / ngram_window); temp-0 parity checks run with it "
+                    "off",
                  (long long)ng_n,
                  (long long)rad_meta_geti(meta, "generation.no_repeat_ngram_window_size", 0));
     return RAD_OK;

@@ -185,7 +185,8 @@ static bool intact(const Prepared& pr, bool side_a, const char* who, const Case&
         const GBuf& g = side_a ? o.a : o.b;
         if (const int hit = g.guard_hit()) {
             std::printf("  FAIL %-20s %s\n       %s wrote %s operand %d (%s)\n", c.op,
-                        case_str(c).c_str(), who, hit < 0 ? "before the start of" : "past the end of",
+                        case_str(c).c_str(), who, hit < 0 ? "before the start of"
+                            : "past the end of",
                         (int)i, name(i));
             ok = false;
         }
@@ -796,7 +797,8 @@ int main(int argc, char** argv) {
         if (st.unselected) std::printf("  %d admitted by no row's constraints.", st.unselected);
         std::printf("  worst rel_l2 = %.3e", st.worst);
         if (!st.worst_where.empty()) std::printf("\n  worst case: %s", st.worst_where.c_str());
-        if (st.rerun) std::printf("\n  %d rerun on %d threads, byte for byte", st.rerun, ck.threads);
+        if (st.rerun)
+            std::printf("\n  %d rerun on %d threads, byte for byte", st.rerun, ck.threads);
         std::printf("\n");
         if (st.failed || st.declined || st.skipped || (ck.own && st.missing)) rc = 1;
         if (!hand_cases(ck)) rc = 1;

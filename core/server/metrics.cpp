@@ -64,7 +64,7 @@ std::vector<double> buckets_1_2_5(int64_t max_value) {
 
 /* ------------------------------------------------------------------ registry */
 
-static std::string esc_label(const std::string& s) {
+std::string esc_label(const std::string& s) {
     std::string o;
     for (char c : s) {
         if (c == '\\' || c == '"') { o.push_back('\\'); o.push_back(c); }
@@ -196,6 +196,12 @@ void Metrics::sample(const SchedMetrics& m) {
     c_draft_accepted_.advance_to(m.draft_accepted);
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
+    c_window_seed_failures_.advance_to(m.window_seed_failures);
+    c_draft_window_stale_ckpts_.advance_to(m.draft_window_stale_ckpts);
+    c_draft_gated_steps_.advance_to(m.draft_gated_steps);
+    c_draft_acc_gated_steps_.advance_to(m.draft_acc_gated_steps);
+    c_draft_reach_declined_steps_.advance_to(m.draft_reach_declined_steps);
+    g_draft_spec_off_seqs_.set((double)m.draft_spec_off_seqs);
     c_lookup_proposals_.advance_to(m.lookup_proposals);
     c_lookup_held_.advance_to(m.lookup_held);
     c_lookup_held_drafts_.advance_to(m.lookup_held_drafts);
@@ -204,6 +210,12 @@ void Metrics::sample(const SchedMetrics& m) {
     c_suffix_rows_.advance_to(m.suffix_rows);
     c_suffix_accepted_.advance_to(m.suffix_accepted);
     c_suffix_held_ahead_.advance_to(m.suffix_held_ahead);
+    c_draft_zero_cycles_.advance_to(m.draft_zero_cycles);
+    c_draft_probe_cycles_.advance_to(m.draft_probe_cycles);
+    c_draft_zero_moves_.advance_to(m.draft_zero_moves);
+    c_hybrid_lookup_.advance_to(m.hybrid_lookup);
+    c_hybrid_head_.advance_to(m.hybrid_head);
+    c_hybrid_unahead_.advance_to(m.hybrid_unahead);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_prefix_queries_.advance_to(m.prefix_queries);
@@ -466,6 +478,24 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_refill_tokens_total",
               "Cached prompt tokens those hits gave back to be recomputed.",
               L, c_draft_refill_tokens_.get());
+    w.counter("radiance:prefix_window_seed_failures_total",
+              "Prefix hits dropped because the window blocks a checkpoint restore needs were not free.",
+              L, c_window_seed_failures_.get());
+    w.counter("radiance:draft_window_stale_ckpt_total",
+              "Checkpoints not committed because the drafter's window could not be saved in them (no drafter context pass behind the step, or its window rows were not held); a later request recomputes instead of resuming there.",
+              L, c_draft_window_stale_ckpts_.get());
+    w.counter("radiance:draft_gated_steps_total",
+              "Steps the block drafter did not draft because more sequences decoded than --draft-max-lanes.",
+              L, c_draft_gated_steps_.get());
+    w.counter("radiance:draft_acc_gated_steps_total",
+              "Sequence-steps the block drafter did not propose for a sequence whose acceptance fell below --draft-min-accept.",
+              L, c_draft_acc_gated_steps_.get());
+    w.counter("radiance:draft_reach_declined_steps_total",
+              "Sequence-steps the block drafter did not propose because the sequence's draft cache has a hole a prefix-cache hit left and the drafter's window has not yet slid past it.",
+              L, c_draft_reach_declined_steps_.get());
+    w.gauge("radiance:draft_spec_off_sequences",
+            "Running sequences the block drafter is stopped for under --draft-min-accept right now.",
+            L, g_draft_spec_off_seqs_.get());
     w.counter("radiance:lookup_proposals_total",
               "Prompt-lookup proposals made, with prompt lookup the only drafter.",
               L, c_lookup_proposals_.get());
@@ -488,6 +518,28 @@ std::string Metrics::render() const {
     w.counter("radiance:suffix_held_ahead_total",
               "Decode steps not issued ahead of the previous commit because the sequence's "
               "history ended in a recurring pattern (--draft-suffix).", L, c_suffix_held_ahead_.get());
+    /* Depth 0 and the hybrid (--draft-depth0 / --draft-hybrid), once either acted. */
+    if (c_draft_zero_cycles_.get() > 0 || c_draft_probe_cycles_.get() > 0 ||
+        c_draft_zero_moves_.get() > 0) {
+        w.counter("radiance:draft_zero_cycles_total",
+                  "Cycles the adaptive window ran at depth 0: no head pass, no verify row.",
+                  L, c_draft_zero_cycles_.get());
+        w.counter("radiance:draft_probe_cycles_total",
+                  "Probe cycles of depth 0: the drafting depth from 0, or plain steps measured "
+                  "while drafting.", L, c_draft_probe_cycles_.get());
+        w.counter("radiance:draft_zero_moves_total",
+                  "Moves between depth 0 and the drafting depth.", L, c_draft_zero_moves_.get());
+    }
+    if (c_hybrid_lookup_.get() > 0 || c_hybrid_head_.get() > 0 || c_hybrid_unahead_.get() > 0) {
+        w.counter("radiance:draft_hybrid_lookup_total",
+                  "Proposals the hybrid took from prompt lookup over the head's (a long match).",
+                  L, c_hybrid_lookup_.get());
+        w.counter("radiance:draft_hybrid_head_total",
+                  "Proposals the hybrid left to the head.", L, c_hybrid_head_.get());
+        w.counter("radiance:draft_hybrid_unahead_total",
+                  "Steps the hybrid kept from issuing ahead: a running sequence matched long.",
+                  L, c_hybrid_unahead_.get());
+    }
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

@@ -24,7 +24,7 @@
 // from that kernel's table, which holds only this step's positions (a block completing at decode
 // starts three positions back).
 //
-// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"

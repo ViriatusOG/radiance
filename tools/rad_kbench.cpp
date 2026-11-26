@@ -34,7 +34,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
@@ -73,7 +72,7 @@ struct Row {
     bool        gated = false;  /* a device row timed behind the gate */
     std::string tnote;          /* why a time is missing or worth less */
     int64_t     timing_id = -1; /* the device timer's id until its pass has run */
-    int64_t     bytes = 0;      /* operand bytes touched once, for a GB/s that names its own basis */
+    int64_t     bytes = 0;      /* operand bytes touched once: the basis of a GB/s figure */
     bool        synthesised = false;
 };
 
@@ -693,7 +692,8 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
     if (!diverged.empty()) {
         s += "\n## Divergences\n\n";
         s += "Two libraries implement the same op name but describe an output differently. These "
-             "cases are\ncounted apart from passes and failures, since comparing them would compare "
+             "cases are\ncounted apart from passes and failures, since comparing "
+             "them would compare "
              "two different\ntensors. One of the two libraries needs a different op name.\n\n";
         s += "| what | cases |\n|---|---|\n";
         for (const auto& [what, n] : diverged)
@@ -729,8 +729,11 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
 
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) { RAD_ERR("--report %s: %s", path.c_str(), std::strerror(errno)); return RAD_E_IO; }
-    std::fwrite(s.data(), 1, s.size(), f);
-    std::fclose(f);
+    const bool wrote = std::fwrite(s.data(), 1, s.size(), f) == s.size();
+    if (std::fclose(f) != 0 || !wrote) {
+        RAD_ERR("--report %s: write failed", path.c_str());
+        return RAD_E_IO;
+    }
     return RAD_OK;
 }
 /* A guarded device allocation: the real base, the pointer handed to the kernel (past the red
@@ -827,8 +830,10 @@ RadTensor host_tensor(const KfOperand& d, const void* data) {
 }
 
 /* The library the others are checked against: the one --ref names (it must be loaded, see
- * --kernels), else the first kernel library that declares itself a reference implementation
- * (RadPluginReferenceFn). Found by declaration, never by name. */
+ * --kernels), else, of the kernel libraries that declare themselves a reference implementation
+ * (RadPluginReferenceFn), the one declaring the most op schemas, so a plugin's own small oracle
+ * (exl3ref beside libref in one kernels directory) does not leave every core op without one.
+ * Found by declaration, never by name; a plugin's oracle is named with --ref. */
 std::string resolve_reference(const Registry& reg, const std::string& named) {
     if (!named.empty()) {
         const Plugin* p = reg.plugin(named);
@@ -837,8 +842,11 @@ std::string resolve_reference(const Registry& reg, const std::string& named) {
                 "too when that lists the libraries to load", named.c_str());
         return std::string();
     }
+    const Plugin* best = nullptr;
     for (const Plugin& p : reg.plugins())
-        if (p.kind == RAD_PLUGIN_KERNEL && p.reference) return p.name;
+        if (p.kind == RAD_PLUGIN_KERNEL && p.reference && (!best || p.n_schemas > best->n_schemas))
+            best = &p;
+    if (best) return best->name;
     RAD_ERR("no kernel library loaded declares itself a reference implementation, so there is "
             "nothing to check against: name one with --ref, and in --kernels when that lists the "
             "libraries to load (libref is the one radiance ships)");
@@ -1106,7 +1114,7 @@ void Replay::replay_fixture(size_t fi) {
         if (!o_.op_filters.empty()) {
             bool hit = false;
             for (const std::string& f : o_.op_filters)
-                if (c.op.rfind(f, 0) == 0) { hit = true; break; }
+                if (c.op.starts_with(f)) { hit = true; break; }
             if (!hit) continue;
         }
         replay_case(fi, c);
@@ -1470,7 +1478,9 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
      * planes where the recording read their decoded tensor (lays_out_weight). */
     const bool exact = lib == oracle_name(fx_[fi]) && !lays_out_weight(row, g, c);
     auto role_of = [&](size_t k) { return schema->operands[k].role; };
-    auto written = [&](size_t k) { return role_of(k) == RAD_OPD_OUT || role_of(k) == RAD_OPD_INOUT; };
+    auto written = [&](size_t k) {
+        return role_of(k) == RAD_OPD_OUT || role_of(k) == RAD_OPD_INOUT;
+    };
     auto name_of = [&](size_t k) {
         return schema->operands[k].name ? schema->operands[k].name : "?";
     };
@@ -1715,8 +1725,8 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                 tv.in_dtype = id.dtype;
                 tv.in_rows = id.shape[0];
                 tv.in_width = rad_numel(id.shape) / id.shape[0];
-                tv.out_width = d.shape.empty() || d.shape[0] <= 0 ? 1
-                                                                   : rad_numel(d.shape) / d.shape[0];
+                tv.out_width = d.shape.empty() || d.shape[0] <= 0
+                                   ? 1 : rad_numel(d.shape) / d.shape[0];
                 tv.lane_stride = rule->lane_stride;
                 long long off = 0;
                 if (g.get_i("vocab_off", &off)) tv.id_base = off;
@@ -1844,7 +1854,8 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                     worst_rel, worst_abs, worst_max_rel, tol,
                     ok ? (vacuous ? "vacuous" : "ok") : "FAIL", exact ? " (exact)" : "",
                     from_cache ? " (cached)" : "");
-    if (!o_.timing_only && !ok && n_out > 1) std::printf("      per operand: %s\n", per_opd.c_str());
+    if (!o_.timing_only && !ok && n_out > 1)
+        std::printf("      per operand: %s\n", per_opd.c_str());
     if (!o_.timing_only && !ok && nonfinite_gap)
         std::printf("      %lld element(s) are finite on one side and not the other (a failure "
                     "at any tolerance)\n", (long long)nonfinite_gap);
@@ -1959,7 +1970,7 @@ int Replay::rerecord() {
             if (!o_.op_filters.empty()) {
                 bool hit = false;
                 for (const std::string& f : o_.op_filters)
-                    if (c.op.rfind(f, 0) == 0) { hit = true; break; }
+                    if (c.op.starts_with(f)) { hit = true; break; }
                 if (!hit) continue;
             }
             KfCase rc;
@@ -2011,7 +2022,7 @@ int Replay::record_rows() {
         if (!o_.op_filters.empty()) {
             bool hit = false;
             for (const std::string& f : o_.op_filters)
-                if (std::string(r.info->op).rfind(f, 0) == 0) { hit = true; break; }
+                if (std::string_view(r.info->op).starts_with(f)) { hit = true; break; }
             if (!hit) continue;
         }
         const RadOpSchema* schema = reg_->schema(r.info->op);
@@ -2123,7 +2134,8 @@ int Replay::record_rows() {
 int Replay::finish() {
     /* The timing pass, before the weight cache it borrows from is freed. */
     BenchInfo bench;
-    if (o_.bench) bench = finish_timing(timer_.get(), rows_, host_footprint_, o_.timer.footprint >= 0);
+    if (o_.bench)
+        bench = finish_timing(timer_.get(), rows_, host_footprint_, o_.timer.footprint >= 0);
     timer_.reset();
     for (auto& [k2, d] : dcache_) if (d.base) rad_dev_free(d.base, RAD_MEM_DEVICE);
     dcache_.clear();
@@ -2209,26 +2221,34 @@ void usage() {
         "usage: rad-kbench [options]                     replay the recorded fixture (no model)\n"
         "       rad-kbench -m <model.rad> [options]      check against a real container\n"
         "       rad-kbench -m <model.rad> --record FILE  record a new fixture\n"
-        "       rad-kbench -m <model.rad> --skeleton FILE  write a metadata-only copy to record from\n"
+        "       rad-kbench -m <model.rad> --skeleton FILE  write a metadata-only copy "
+        "to record from\n"
         "\n"
         "  With no -m it replays every kernel every loaded library supplies against the reference\n"
-        "  library's recorded answers on seeded inputs, inside guarded allocations. No model and no\n"
+        "  library's recorded answers on seeded inputs, inside guarded allocations. "
+        "No model and no\n"
         "  card. With -m it checks the same kernels against a real container's weights in the\n"
-        "  layout the resolved kernel asked for, which also tests the artifact and the layout hooks.\n"
+        "  layout the resolved kernel asked for, which also tests the artifact and the "
+        "layout hooks.\n"
         "\n"
         "      --fixture FILE the recording to replay (default $RADIANCE_HOME/kernels.rkb);\n"
         "                     repeatable, and the report covers the union\n"
-        "      --record FILE  with -m: write a fixture of the reference's answer at every point of\n"
+        "      --record FILE  with -m: write a fixture of the reference's answer at "
+        "every point of\n"
         "                     every declared op the reference serves, whichever library resolved\n"
-        "                     it. Weights are drawn from seeds, not read from the container, so any\n"
+        "                     it. Weights are drawn from seeds, not read from the "
+        "container, so any\n"
         "                     machine can reproduce the reference, and no card is needed.\n"
-        "      --skeleton FILE  with -m: write a sparse copy of the container, its tables intact and\n"
-        "                     its data a hole. Recording reads only the tables, so a skeleton of a\n"
+        "      --skeleton FILE  with -m: write a sparse copy of the container, its "
+        "tables intact and\n"
+        "                     its data a hole. Recording reads only the tables, so a "
+        "skeleton of a\n"
         "                     30 GB model records the same fixture in a few megabytes.\n"
         "      --rerecord FILE  replay mode: write the fixtures' cases again with the reference's\n"
         "                     answers, in the current format\n"
         "      --record-rows FILE  replay mode: move the fixtures' cases into the constraints of\n"
-        "                     every row of the libraries under test and record the reference there,\n"
+        "                     every row of the libraries under test and record the "
+        "reference there,\n"
         "                     a fixture that reaches rows no container selects (replay it with\n"
         "                     --all-rows)\n"
         "      --analysis FILE  a markdown fragment from tools/kbench-analysis.sh, spliced into\n"
@@ -2243,9 +2263,11 @@ void usage() {
         "                     well as query length, which covers the block table, the KV split\n"
         "                     and the window.\n"
         "      --home DIR     $RADIANCE_HOME\n"
-        "      --kernels A:B  the kernel libraries to load, first wins; default every library found\n"
+        "      --kernels A:B  the kernel libraries to load, first wins; default every "
+        "library found\n"
         "      --op NAME      check only this op (repeatable prefix match)\n"
-        "      --ref NAME     the oracle plugin's name (default: the library that declares itself a\n"
+        "      --ref NAME     the oracle plugin's name (default: the library that "
+        "declares itself a\n"
         "                     reference implementation)\n"
         "      --no-ref       replay: leave the reference out of the libraries under test. Its\n"
         "                     answers are what the fixture holds; replaying it is its own check\n"
@@ -2255,12 +2277,15 @@ void usage() {
         "                     now describes differently from its recording\n"
         "      --all-rows     replay: run every row of a library whose constraints hold, not only\n"
         "                     the one selection picks\n"
-        "      --coverage DIR replay: fail when a row a fixture reached (DIR/kbench_rows_<fixture>_\n"
+        "      --coverage DIR replay: fail when a row a fixture reached "
+        "(DIR/kbench_rows_<fixture>_\n"
         "                     <library>.txt) is no longer reached; rows a memory skip kept from\n"
         "                     running are not counted lost\n"
         "      --coverage-write  with --coverage: write those files from this run\n"
-        "      --no-cache     replay: run the reference instead of reusing its cached answers. The\n"
-        "                     cache is keyed by the reference's code, its inputs and the case, and\n"
+        "      --no-cache     replay: run the reference instead of reusing its "
+        "cached answers. The\n"
+        "                     cache is keyed by the reference's code, its inputs and "
+        "the case, and\n"
         "                     the comparison runs either way.\n"
         "      --cache-dir DIR  the reference cache (default $RADIANCE_HOME/cache/kbench)\n"
         "      --seed N       base seed; every case derives its own from it, so changing a\n"
@@ -2274,18 +2299,22 @@ void usage() {
         "                     replaces is otherwise run against that chain, out of its own\n"
         "                     plugin, and the outputs compared byte for byte\n"
         "      --max-cases N  runs per distinct (op, kernel, library, domain, geometry, operand\n"
-        "                     shapes); 0 means every one (default 4). A 62-layer model presents the\n"
-        "                     same kernel at the same shape sixty times and only the weights differ.\n"
+        "                     shapes); 0 means every one (default 4). A 62-layer "
+        "model presents the\n"
+        "                     same kernel at the same shape sixty times and only the "
+        "weights differ.\n"
         "      --max-bytes MIB  skip a case whose operands would need more than this, by name\n"
         "                     (default: half the memory available at start, at most 8192). One\n"
         "                     case holds every operand as drawn, again as the kernel's copy and\n"
-        "                     again on the device; without a bound a small machine dies in the OOM\n"
+        "                     again on the device; without a bound a small machine "
+        "dies in the OOM\n"
         "                     killer without naming the op. Also bounds the weight caches.\n"
         "      --bench        time each case that passes, on the bytes it was checked on. Device\n"
         "                     cases are timed after the checks, back to back after one sustained\n"
         "                     warm-up: device timestamps around a batch of launches queued behind\n"
         "                     a gate, weights read cold, in-place operands restored, until the\n"
-        "                     median is known to 1%%. Host cases are timed where they are checked.\n"
+        "                     median is known to 1%%. Host cases are timed where "
+        "they are checked.\n"
         "                     The report's speed section says how, with the calibration.\n"
         "      --timing-only  time every device kernel and check nothing: no reference run, no\n"
         "                     comparison, no margins, no fusion chain, host rows skipped. For\n"
@@ -2308,7 +2337,8 @@ void usage() {
         "                     op-by-library completeness matrix, every case and its error, the\n"
         "                     speed table, and every skip named\n"
         "      --kv-cache-dtype T  bf16 | i8, the cache width declare is run at, as it is on the\n"
-        "                     engine: an architecture whose attention kernels serve only one width\n"
+        "                     engine: an architecture whose attention kernels serve "
+        "only one width\n"
         "                     declares no attention at the other. Default bf16\n"
         "      --num-speculative-tokens N\n"
         "                     draft depth to declare at (default: the container's own). It puts\n"
@@ -2375,11 +2405,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](const char* w) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "rad-kbench: %s needs a value\n", w);
-                                 std::exit(2); }
-            return argv[++i];
-        };
+        auto next = [&](const char* w) { return rad_flag_value("rad-kbench", argc, argv, &i, w); };
         if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a == "-m" || a == "--model") model = next("--model");
         else if (a == "--home")    home = next("--home");
@@ -2387,10 +2413,23 @@ int main(int argc, char** argv) {
         else if (a == "--op")      op_filters.push_back(next("--op"));
         else if (a == "--ref")     ref_name = next("--ref");
         else if (a == "--seed")    seed = (uint64_t)std::strtoull(next("--seed"), nullptr, 10);
-        else if (a == "--tol")     tol_override = std::strtod(next("--tol"), nullptr);
-        else if (a == "--max-tok") max_tok = std::atoll(next("--max-tok"));
-        else if (a == "--max-ctx") max_ctx_flag = std::atoll(next("--max-ctx"));
-        else if (a == "--mm-max-patches") mm_max_patches = std::atoll(next("--mm-max-patches"));
+        else if (a == "--tol") {
+            const char* v = next("--tol");
+            char* end = nullptr;
+            tol_override = std::strtod(v, &end);
+            if (end == v || *end || !(tol_override >= 0)) {
+                std::fprintf(stderr, "rad-kbench: --tol takes a number >= 0, not '%s'\n", v);
+                return 2;
+            }
+        }
+        else if (a == "--max-tok")
+            max_tok = rad_flag_int("rad-kbench", "--max-tok", next("--max-tok"), 1, INT32_MAX);
+        else if (a == "--max-ctx")
+            max_ctx_flag = rad_flag_int("rad-kbench", "--max-ctx", next("--max-ctx"), 0,
+                                        INT32_MAX);
+        else if (a == "--mm-max-patches")
+            mm_max_patches = rad_flag_int("rad-kbench", "--mm-max-patches",
+                                          next("--mm-max-patches"), 0, INT32_MAX);
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
             if (v == "i8")        kv_dtype = RAD_I8;
@@ -2421,14 +2460,23 @@ int main(int argc, char** argv) {
         else if (a == "--bench")   bench = true;
         else if (a == "--timing-only") timing_only = true;
         else if (a == "--bench-flush") {
-            topts.footprint = std::max<int64_t>(0, (int64_t)std::atoll(next("--bench-flush"))) << 20;
+            topts.footprint = rad_flag_int("rad-kbench", "--bench-flush", next("--bench-flush"),
+                                           0, INT32_MAX) << 20;
             bench = true;
         }
-        else if (a == "--bench-iters") topts.fixed = std::max(0, std::atoi(next("--bench-iters")));
-        else if (a == "--bench-reps")  topts.max_reps = std::max(1, std::atoi(next("--bench-reps")));
-        else if (a == "--bench-warm-ms") topts.warm_ms = std::max(0, std::atoi(next("--bench-warm-ms")));
+        else if (a == "--bench-iters")
+            topts.fixed = (int)rad_flag_int("rad-kbench", "--bench-iters", next("--bench-iters"),
+                                            0, INT32_MAX);
+        else if (a == "--bench-reps")
+            topts.max_reps = (int)rad_flag_int("rad-kbench", "--bench-reps", next("--bench-reps"),
+                                               1, INT32_MAX);
+        else if (a == "--bench-warm-ms")
+            topts.warm_ms = (int)rad_flag_int("rad-kbench", "--bench-warm-ms",
+                                              next("--bench-warm-ms"), 0, INT32_MAX);
         else if (a == "--report")  report_path = next("--report");
-        else if (a == "--num-speculative-tokens") n_spec = std::atoi(next("--num-speculative-tokens"));
+        else if (a == "--num-speculative-tokens")
+            n_spec = (int)rad_flag_int("rad-kbench", "--num-speculative-tokens",
+                                       next("--num-speculative-tokens"), 0, INT32_MAX);
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
         else { std::fprintf(stderr, "rad-kbench: unrecognised argument '%s'. Try --help.\n",
                             a.c_str()); return 2; }
@@ -2436,8 +2484,8 @@ int main(int argc, char** argv) {
 
     if (timing_only) {
         if (!record_path.empty()) {
-            std::fprintf(stderr, "rad-kbench: --timing-only runs no reference, so it has nothing to "
-                                 "record; drop one of --timing-only and --record\n");
+            std::fprintf(stderr, "rad-kbench: --timing-only runs no reference, so it has nothing "
+                                 "to record; drop one of --timing-only and --record\n");
             return 2;
         }
         bench = true;          /* it is the clock or nothing */
@@ -2527,23 +2575,8 @@ int main(int argc, char** argv) {
     ref_name = resolve_reference(rad_tools_registry(), ref_name);
     if (ref_name.empty()) return 1;
 
-
-    RadModelMeta meta{};
-    std::vector<std::string> kk, kv;
-    std::vector<const char*> kp, vp;
-    meta.arch_id = f.str(f.header().arch_id);
-    meta.name    = f.str(f.header().model_name);
-    meta.quant   = f.str(f.header().quant);
-    auto mi = [&](const char* k, int64_t d) { int64_t v = d; f.get_i(k, &v); return v; };
-    auto mf = [&](const char* k, double d) { double v = d; f.get_f(k, &v); return (float)v; };
-    meta.n_layers = mi("n_layers", 0);  meta.n_embd = mi("n_embd", 0);
-    meta.n_head   = mi("n_head", 0);    meta.n_head_kv = mi("n_head_kv", 0);
-    meta.head_dim = mi("head_dim", 0);  meta.n_ff = mi("n_ff", 0);
-    meta.n_vocab  = mi("n_vocab", 0);   meta.n_ctx_train = mi("n_ctx_train", 0);
-    meta.n_expert = mi("n_expert", 0);  meta.n_expert_used = mi("n_expert_used", 0);
-    meta.n_expert_shared = mi("n_expert_shared", 0);
-    meta.rms_eps = mf("rms_eps", 1e-6); meta.rope_theta = mf("rope_theta", 10000.f);
-    meta.rope_scale = 1.f;   /* the rotary's scaling is the free-form rope keys (rad_builder.h) */
+    const ContainerMeta cm(f);
+    const RadModelMeta& meta = cm.meta;
 
     /* GDN head counts (see ShapeCtx); zero for a non-hybrid container, so the gdn_* recipes
      * decline. Read through the string table too: rad-convert stores the checkpoint config
@@ -2563,15 +2596,6 @@ int main(int argc, char** argv) {
     sctx.n_seq    = 1;
     RAD_DEBUG("gdn head counts from the container: n_head_k=%lld n_head_v=%lld",
               (long long)sctx.n_head_k, (long long)sctx.n_head_v);
-    for (int64_t i = 0; i < f.meta_count(); ++i) {
-        const RadFileKV& e = f.meta_at(i);
-        if (e.type != RAD_P_STR) continue;
-        kk.push_back(f.str(e.key));
-        kv.push_back(f.str(e.v.s));
-    }
-    for (auto& s : kk) kp.push_back(s.c_str());
-    for (auto& s : kv) vp.push_back(s.c_str());
-    meta.n_kv = (int)kk.size(); meta.kv_key = kp.data(); meta.kv_val = vp.data();
 
     /* Declare with the drafter so its kernels (conv, selector, MTP head, draft GEMMs, `row_topk`,
      * ...) are checked; max_spec 0 would leave them out. The default depth is the plugin's
@@ -2681,7 +2705,8 @@ int main(int argc, char** argv) {
         const OpInfo& o = prog.ops[oi];
         if (!op_filters.empty()) {
             bool hit = false;
-            for (const std::string& f : op_filters) if (o.op.rfind(f, 0) == 0) { hit = true; break; }
+            for (const std::string& f : op_filters)
+                if (o.op.starts_with(f)) { hit = true; break; }
             if (!hit) continue;
         }
         if (!o.schema) continue;
@@ -3059,8 +3084,8 @@ int main(int argc, char** argv) {
                             if (o.weight_opd[wi] == (int)k) run.push_back(o.weights[wi]);
                         bool read = !recording && kop[k].has_enc && !kop[k].shape.empty() &&
                                     (int64_t)run.size() == kop[k].shape[0];
-                        const int64_t per = read ? rad_dtype_bytes(kop[k].dtype, n / kop[k].shape[0])
-                                                 : 0;
+                        const int64_t per =
+                            read ? rad_dtype_bytes(kop[k].dtype, n / kop[k].shape[0]) : 0;
                         for (size_t e = 0; read && e < run.size(); ++e) {
                             const WeightInfo* wi = run[e] ? &prog.weights[run[e]] : nullptr;
                             const RadFileEntry* fe = wi ? f.find(wi->source) : nullptr;
@@ -3179,10 +3204,10 @@ int main(int argc, char** argv) {
                     if (dev_ok && rad_stream_sync(stream) < 0) dev_ok = false;
                 }
 
-                /* INOUT operands' original bytes, kept for the fusion check and the timing pass: the
-                 * chain shares the fused run's inputs and weights, but the fused launch overwrites
-                 * INOUT operands, so the chain must start from a snapshot, and the timing pass
-                 * restores them from it before every launch. */
+                /* INOUT operands' original bytes, kept for the fusion check and the timing pass:
+                 * the chain shares the fused run's inputs and weights, but the fused launch
+                 * overwrites INOUT operands, so the chain must start from a snapshot, and the
+                 * timing pass restores them from it before every launch. */
                 std::vector<std::vector<uint8_t>> inout0;
                 const bool want_fuse = fuse_check && dom == RAD_DOMAIN_DEVICE && dev_ok &&
                                        r.row->info->replaces;
@@ -3237,7 +3262,8 @@ int main(int argc, char** argv) {
 
                 /* The oracle's launch counts toward its library's share of the launch phase. */
                 const auto tref0 = std::chrono::steady_clock::now();
-                const int s_ref  = oracle && !timing_only ? launch(oracle, t_ref, scratch_b) : RAD_OK;
+                const int s_ref  = oracle && !timing_only ? launch(oracle, t_ref, scratch_b)
+                                                          : RAD_OK;
                 if (oracle && !timing_only && s_ref >= 0) {
                     const double sec = std::chrono::duration<double>(
                                            std::chrono::steady_clock::now() - tref0).count();
@@ -3409,10 +3435,14 @@ int main(int argc, char** argv) {
                             if (src < 0 || (size_t)src >= sh.size()) {
                                 why = "an operand index outside the fused kernel's list"; break;
                             }
-                            if (sh[(size_t)src].absent) { st_t[(size_t)oi] = RadTensor{}; continue; }
-                            /* A shared weight is in the fused kernel's layout (e.g. fragment order),
-                             * so a step must use the same layout hook; a row-major reader such as
-                             * `gemm_fp8a16_nt_m1` would misread it. Decline otherwise. */
+                            if (sh[(size_t)src].absent) {
+                                st_t[(size_t)oi] = RadTensor{};
+                                continue;
+                            }
+                            /* A shared weight is in the fused kernel's layout (e.g. fragment
+                             * order), so a step must use the same layout hook; a row-major
+                             * reader such as `gemm_fp8a16_nt_m1` would misread it. Decline
+                             * otherwise. */
                             if (o.schema->operands[(size_t)src].role == RAD_OPD_WEIGHT &&
                                 srow->info->layout != r.row->info->layout) {
                                 why = fmt("step '%s' resolved to %s, which reads '%s' in a "
@@ -3453,7 +3483,8 @@ int main(int argc, char** argv) {
                         if (rad_stream_sync(stream) < 0) { why = "a step faulted"; break; }
                     }
 
-                    /* Copy the chain's outputs back and compare with the fused kernel's (in bufs[]). */
+                    /* Copy the chain's outputs back and compare with the fused kernel's (in
+                     * bufs[]). */
                     size_t n_cmp = 0, n_diff = 0;
                     std::string first_diff;
                     if (why.empty()) {
@@ -3785,7 +3816,8 @@ int main(int argc, char** argv) {
 
     st.fuse_failed = fuse_failed;
     BenchInfo binfo;
-    if (bench) binfo = finish_timing(timer.get(), report_rows, host_footprint, topts.footprint >= 0);
+    if (bench)
+        binfo = finish_timing(timer.get(), report_rows, host_footprint, topts.footprint >= 0);
     timer.reset();
     print_summary(st, timing_only, nm);
     print_row_coverage(census(reg, ref_name), report_rows);
@@ -3806,7 +3838,8 @@ int main(int argc, char** argv) {
         }
         if (write_report(report_path, report_rows, skipped_ops, fuse_skipped, diverged, overruns,
                          analysis_path,
-                         "container: `" + model + "` (weights read from it, in the layout each\n  resolved kernel asked for)",
+                         "container: `" + model + "` (weights read from it, in the layout each\n"
+                         "  resolved kernel asked for)",
                          fuse_passed, fuse_failed, st, ref_name,
                          plugins.libraries(), plugins.arch_plugin, graph_ops,
                          census(reg, ref_name), bench ? &binfo : nullptr) >= 0)

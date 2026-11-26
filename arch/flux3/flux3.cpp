@@ -37,7 +37,7 @@
  *
  * ============================== WHAT IS QUANTISED ==============================
  *
- * Every linear of the language model and of the DiT's blocks is a LinearFP8 (rad_fp8.h), bf16
+ * Every linear of the language model and of the DiT's blocks is a LinearQ (rad_linear.h), bf16
  * throughout when the first joint block's projection is plain; the embedders, the timestep MLPs,
  * the modulations, the output layer and the VAE stay bf16. That projection also says whether the
  * linears are rotated int8 (IQ8R): the activations they read then carry int8 codes in place of the
@@ -52,13 +52,12 @@
  * Everything else, the VAE included (its GroupNorm reads the whole picture), runs on every rank.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 #include <arch/rad_vae2d.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -102,9 +101,9 @@ enum { kText = 0, kRefs = 1, kImage = 2 };
 /* ================================================================== the model */
 struct TeLayer {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_n2 = 0, op_ar2 = 0, op_add2 = 0, op_tap = 0;
     int        tap = -1;
@@ -114,12 +113,12 @@ struct TeLayer {
  * attention and the SwiGLU from the same normed rows, their outputs added. */
 struct Block {
     rad_weight w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, ff_in{}, ff_out{};
-    GateQuantFP8 gq{};
-    QuantFP8   q_attn{};
+    LinearQ  qkv{}, o{}, ff_in{}, ff_out{};
+    GateQuant gq{};
+    QuantAct   q_attn{};
     /* The normed rows' quantiser for a rotated int8 model whose norm is the unquantised one
      * (Model::norm_i8 false). */
-    QuantFP8   q_n{};
+    QuantAct   q_n{};
     rad_op     op_n = 0, op_qkr = 0, op_attn = 0, op_sum = 0, op_ar = 0;
 };
 
@@ -144,7 +143,7 @@ struct Model {
     rad_weight w_tok = 0, w_ctx = 0;
     rad_op  op_embed = 0, op_iota = 0, op_ctx = 0, op_store_t = 0;
     rad_buf b_tx = 0, b_tkv = 0, b_th2 = 0, b_tgu = 0, b_tidx = 0, b_taps = 0, b_ctx = 0;
-    ActFP8  a_th{}, a_tattn{}, a_tffn{};
+    ActQ  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
 
     /* ---- the reference pictures: the encoder, the mode, 2 x 2 tokens, BatchNorm, the embedder */
@@ -176,14 +175,14 @@ struct Model {
             op_gimg = 0, op_nout = 0, op_pout = 0, op_euler = 0;
     rad_buf b_lat = 0, b_xc = 0, b_h = 0, b_qkv = 0, b_o = 0, b_gu = 0, b_f = 0, b_sum = 0,
             b_hi = 0, b_fz = 0, b_v = 0;
-    ActFP8  a_hm{}, a_attn{}, a_ffn{};
+    ActQ  a_hm{}, a_attn{}, a_ffn{};
     std::vector<Block> mode[3], single;
-    LinearFP8 qkv0{};
+    LinearQ qkv0{};
     /* The linears of both networks are rotated int8 (IQ8R, or the 128-group int8 before it), read
      * off qkv0's probe: the activations then carry int8 code pairs with one scale per (token, `g8`
      * columns) in place of the E4M3 pair. */
     bool      i8 = false;
-    int64_t   g8 = RAD_FP8_BLOCK;
+    int64_t   g8 = RAD_SCALE_GROUP;
     /* A block's modulated norm writes those int8 codes in its own pass (rms_mod_had_quant_i8g),
      * where a library serves it. */
     bool      norm_i8 = false;
@@ -201,63 +200,13 @@ struct Model {
 
 static Model g_model[MAX_SLOTS];
 
-static std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
-    std::vector<double> v;
-    const char* s = rad_meta_gets(m, key, nullptr);
-    while (s && *s) {
-        char* e = nullptr;
-        const double x = std::strtod(s, &e);
-        if (e == s) { ++s; continue; }
-        v.push_back(x);
-        s = e;
-    }
-    return v;
-}
-
-static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
-                        std::initializer_list<int64_t> shape, int access, int group) {
-    if (map_copy(b, dn, src) < 0) return 0;
-    return decl_w(b, dn, dtype, shape, access, RAD_SHARD_NONE, grp_layer(group));
-}
-
 /* A bf16 linear without a bias, read whole on every rank. */
 static rad_op dense(RadBuilder* b, Names& nm, const char* dn, const char* src, int64_t N, int64_t K,
                     int64_t rows, rad_buf in, rad_buf out, rad_weight* w, int access, int group) {
     *w = wcopy(b, nm.f("%s.weight", dn), nm.ckpt("%s.weight", src), RAD_BF16, { N, K }, access,
                group);
     if (!*w) return 0;
-    return rw(b, RAD_OP(b, "gemm_nt",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(*w)),
-              { in }, { out });
-}
-
-static rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, rad_buf in,
-                    rad_buf out) {
-    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                          RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { in }, { out });
-}
-
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf a, rad_buf c, rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
-}
-
-static rad_op all_reduce(RadBuilder* b, const Geom& g, rad_buf x, int64_t rows) {
-    if (g.world <= 1) return 0;
-    return rw(b, RAD_OP(b, "all_reduce",
-                        RAD_PARAMS(RAD_INT("world_size", g.world),
-                                   RAD_RANGE("numel", g.n_embd, rows * g.n_embd),
-                                   RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
-                                   RAD_INT("min_bytes", g.wire_min_bytes)),
-                        RAD_NOWEIGHTS),
-              { x }, { x });
+    return gemm_op(b, rows, N, K, *w, in, out);
 }
 
 /* ================================================================== check_format */
@@ -377,7 +326,7 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                  RAD_SHARD_COL, grp_layer(l),
                                  { nm.ckpt("%s.self_attn.o_proj.weight", lp) }, m.a_tattn, m.b_th2,
                                  T));
-        L.op_ar1 = all_reduce(b, g, m.b_th2, T);
+        L.op_ar1 = decl_all_reduce_tp(b, g, m.b_th2, T);
         L.op_add1 = add_op(b, T, E, m.b_tx, m.b_th2, m.b_tx);
         L.op_n2 = rw(b, RAD_OP(b, "rmsnorm",
                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
@@ -395,7 +344,7 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                     RAD_SHARD_COL, grp_layer(l),
                                     { nm.ckpt("%s.mlp.down_proj.weight", lp) }, m.a_tffn, m.b_th2,
                                     T));
-        L.op_ar2 = all_reduce(b, g, m.b_th2, T);
+        L.op_ar2 = decl_all_reduce_tp(b, g, m.b_th2, T);
         L.op_add2 = add_op(b, T, E, m.b_tx, m.b_th2, m.b_tx);
         if (L.tap >= 0)
             L.op_tap = rw(b, RAD_OP(b, "gather_rows",
@@ -556,7 +505,8 @@ static int declare_block(RadBuilder* b, Model& m, Block& B, const char* pre, con
         rad_op op = q ? RAD_OP(b, m.norm_i8 ? "rms_mod_had_quant_i8g" : "rms_mod_quant_fp8",
                                RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", D),
                                           RAD_F64("eps", eps),
-                                          RAD_INT("group", m.norm_i8 ? m.g8 : RAD_FP8_BLOCK),
+                                          RAD_INT("group",
+                                                  m.norm_i8 ? m.g8 : (int64_t)RAD_SCALE_GROUP),
                                           RAD_INT("gated", gt ? 1 : 0), RAD_STR("dtype", "bf16"),
                                           RAD_STR("norm", "layer")),
                                RAD_NOWEIGHTS)
@@ -610,7 +560,7 @@ static int declare_block(RadBuilder* b, Model& m, Block& B, const char* pre, con
                                   grp_layer(grp), { nm.ckpt("%s.ff.linear_out.weight", pre) },
                                   m.a_ffn, m.b_f, rows));
     B.op_sum = add_op(b, rows, D, m.b_o, m.b_f, m.b_sum);
-    B.op_ar = all_reduce(b, g, m.b_sum, rows);
+    B.op_ar = decl_all_reduce_tp(b, g, m.b_sum, rows);
     return B.op_n && B.op_qkr && B.op_attn && B.op_sum ? RAD_OK : RAD_E_INVAL;
 }
 
@@ -961,7 +911,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.C = rad_meta_geti(meta, "transformer.in_channels", 128);
     {
-        LinearFP8& probe = m.qkv0;
+        LinearQ& probe = m.qkv0;
         RAD_ARCH_TRY(probe.probe(b, nm, gd, "dit.single.0.attn_qkv",
                                  { "transformer.single_transformer_blocks.0.attn.to_q.weight",
                                    "transformer.single_transformer_blocks.0.attn.to_k.weight",
@@ -971,7 +921,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const bool plain = known && rad_enc_is(&e, "plain");
         gd.w_bf16 = m.gt.w_bf16 = plain;
         /* Or rotated int8 (IQ8R): the activations then carry int8 codes at the weights' scale
-         * group in place of the E4M3 pair (ActFP8::declare_pair). */
+         * group in place of the E4M3 pair (ActQ::declare_pair). */
         m.i8 = known && (linear_is_w8h(e) || linear_is_wnh(e));
         if (m.i8) m.g8 = linear_w8h_group(e);
     }
@@ -1154,7 +1104,7 @@ static void step_blocks(RadCtx* c, const Model& m, const std::vector<Block>& sta
                         int64_t r0, int64_t R, const RadOperand& acu, const RadOperand& mcu,
                         const RadOperand& s, const RadOperand& gt, const RadOperand& pos) {
     const Geom& g = m.gd;
-    const int64_t D = g.n_embd, qd = g.q_dim(), nD = D / RAD_FP8_BLOCK;
+    const int64_t D = g.n_embd, qd = g.q_dim();
     const bool q8 = (!g.w_bf16 && !m.i8) || m.norm_i8;
     const RadOperand xv = brow_slice(x, r0, R, D);
     for (size_t i = 0; i < stack.size(); ++i) {
@@ -1180,13 +1130,12 @@ static void step_blocks(RadCtx* c, const Model& m, const std::vector<Block>& sta
         RAD_ISSUE_N(c, B.op_sum, R, brows(m.b_o, R), brows(m.b_f, R), brows(m.b_sum, R));
         if (B.op_ar) RAD_ISSUE_N(c, B.op_ar, R * D, brows(m.b_sum, R), RAD_NONE);
     }
-    (void)nD;
 }
 
 static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadGenBatch* G = batch->gen_b;
     const Geom& g = m.gd;
-    const int64_t N = batch->n_tok, S = batch->n_seq, NI = G->n_img, C = m.C, D = g.n_embd;
+    const int64_t N = batch->n_tok, S = batch->n_seq, NI = G->n_img, D = g.n_embd;
     const int64_t nt = G->n_mode_h[kText], nr = G->n_mode_h[kRefs];
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const RadOperand icu = praw(G->img_cu, RAD_I32, S + 1);
@@ -1265,7 +1214,6 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
                 praw(G->pair, RAD_I32, S), lanes, praw(G->flags, RAD_I32, S),
                 praw(G->seed, RAD_U32, 2 * S), icu, brows(m.b_inp, LR), brows(m.b_mask, LR),
                 brows(m.b_state, LR), brows(m.b_prev, LR));
-    (void)C;
 }
 
 static void step_decode(RadCtx* c, const RadBatch* batch, const Model& m) {

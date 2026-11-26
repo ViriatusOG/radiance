@@ -20,7 +20,7 @@ multiple of the KV head count below the world (the **attention world**), and the
 
 Three ranks over two KV heads give an attention world of 2. Ranks 0 and 1 split the heads as a
 two-rank serve does (12 query heads, one KV head, gqa 12, the same kernels). Rank 2 computes no
-attention: `rad_block_attn_gated_fp8.h` declares no projections, no attention and no cache store on
+attention: `rad_block_attn_gated_q.h` declares no projections, no attention and no cache store on
 it, and zeroes the block's output wire with one `fill` ([OPS.md](OPS.md)). The all-reduce and the
 residual after it run as usual, and the zero adds nothing to the reduce. Five ranks over two KV
 heads give an attention world of 4 (two replicated pairs) with rank 4 attention-zero; six give
@@ -85,7 +85,7 @@ real heads and nothing is padded.
 The extra head goes to the rank without attention (`remainder_place` in `rad_arch.h`), which has
 the time; a rank holding both the extra head and attention would be the step's slowest. The
 experts' extra block stays on the parity rotation (`qwen4exp_fp8.cpp` gives the reason).
-`qwen4exp` computes the split and `rad_block_gdn_fp8.h` declares it as spans of the container's
+`qwen4exp` computes the split and `rad_block_gdn_q.h` declares it as spans of the container's
 rows. Each rank's recurrent state has its own size, so each rank's own plan clears a fresh slot,
 takes a snapshot and lays out a tier entry: a slot of the snapshot store or of the tiers is the sum
 of the ranks' shares, each rank's share starting where the previous one ends.
@@ -103,7 +103,7 @@ When the counts divide, the even split is used.
 - `rad_kv_group_zero(b, g)`: this rank keeps no cache for a paged group.
 - The `fill` op: libr4d's `fill_bf16`, libref's `ref_fill`.
 - `Geom::attn_world / attn_rank / attn_zero`, set by `geom_from` under `attn_world_ok`;
-  `GdnFP8::Config::k_first / v_first`, set by the plugin.
+  `GdnQ::Config::k_first / v_first`, set by the plugin.
 - Both exports are additive: `RAD_ABI_VERSION` is unchanged by them, and a plugin that does not
   call them is unaffected.
 - Tests: `tests/share_test.cpp` covers the per-part cut, `tests/arch_test.cpp` the three-rank

@@ -5,7 +5,7 @@
  *
  * ============================== WHY A SECOND DSPARK BLOCK ==============================
  *
- * rad_block_dspark.h is the same drafter shape for a block-fp8 release: its linears are DenseFP8
+ * rad_block_dspark.h is the same drafter shape for a block-fp8 release: its linears are DenseQ
  * behind `quant_act_fp8`, its feed-forward is `silu_mul`, its norms carry q/k gains, and its draft
  * head is a 2-bit copy of the target's. The published Spark drafts (`dflash` GGUFs, and the HF
  * Spark drafter releases behind them) ship the other way: bf16 linears, no q/k norms, one sigmoid
@@ -106,17 +106,7 @@
 namespace rad {
 namespace arch {
 
-/* The builder refuses a declaration it cannot serve and says why in its own words; this names which
- * handle did not come back, so that message reads against a line of this file. An op that resolves
- * to no kernel is recorded and handed back null -- it is only an error if the block issues it -- so
- * without this a missing kernel surfaces as a bare "invalid argument" at startup. */
-#define DS_REFUSED(...) ::rad::arch::drafter_refused({ __VA_ARGS__ })
-inline int drafter_refused(std::initializer_list<const char*> what) {
-    std::string list;
-    for (const char* w : what) { if (!list.empty()) list += ", "; list += w; }
-    std::fprintf(stderr, "DSpark drafter: the builder gave no handle for %s\n", list.c_str());
-    return RAD_E_INVAL;
-}
+#define DS_REFUSED(...) ::rad::arch::declare_refused("DSpark drafter", { __VA_ARGS__ })
 
 struct DsparkBF16 {
     enum { MAX_LAYERS = 8 };
@@ -196,7 +186,7 @@ struct DsparkBF16 {
     rad_op op_qp[MAX_LAYERS] = {}, op_kp[MAX_LAYERS] = {}, op_vp[MAX_LAYERS] = {};
     rad_op op_qn[MAX_LAYERS] = {}, op_kn[MAX_LAYERS] = {}, op_gp[MAX_LAYERS] = {};
     rad_op op_op[MAX_LAYERS] = {}, op_gu[MAX_LAYERS] = {}, op_dn[MAX_LAYERS] = {};
-    rad_op op_widen2 = 0, op_widen3 = 0;
+    rad_op op_widen2 = 0;
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn = 0;
     rad_op op_sig = 0, op_gate_heads = 0, op_act = 0;
 
@@ -449,17 +439,9 @@ inline int DsparkBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, const
                                 RAD_INT("vocab_offset", g.vocab_off)),
                      RAD_WEIGHTS(w_tok)),
                  {}, {w.h});
-    op_widen = rw(b, RAD_OP(b, "cast",
-                            RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
-                                       RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                            RAD_NOWEIGHTS),
-                  {w.h}, {w.x});
+    op_widen = cast_op(b, qrows, E, "bf16", "f32", w.h, w.x);
     /* One widen and one add serve both residual sites a layer: same shapes, same buffers. */
-    op_widen2 = rw(b, RAD_OP(b, "cast",
-                             RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
-                                        RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                             RAD_NOWEIGHTS),
-                   {w.h}, {w.delta});
+    op_widen2 = cast_op(b, qrows, E, "bf16", "f32", w.h, w.delta);
     op_add = rw(b, RAD_OP(b, "add",
                           RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", E),
                                      RAD_STR("dtype", "f32")),
@@ -730,11 +712,7 @@ struct DsparkTaps {
         if (!src) return DS_REFUSED("src");
         /* Declared over the trunk's own residual buffer: the op's operand pair is the stream and a
          * tap's slice, and every issue site passes the slice it is writing. */
-        op = rw(b, RAD_OP(b, "cast",
-                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
-                                     RAD_STR("from", "f32"), RAD_STR("to", "f32")),
-                          RAD_NOWEIGHTS),
-                {residual}, {src});
+        op = cast_op(b, rows, g.n_embd, "f32", "f32", residual, src);
         return op ? RAD_OK : RAD_E_INVAL;
     }
 

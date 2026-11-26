@@ -231,7 +231,7 @@ TEST(json_dom_api_carries_the_shapes_callers_use) {
     Json j = { { "name", "edit" }, { "count", 3 }, { "ratio", 0.5 }, { "on", true },
                { "tags", Json::array({ "a", "b" }) }, { "none", nullptr } };
     CHECK(j.is_object());
-    CHECK_EQ(j.size(), 6u);
+    REQUIRE_EQ(j.size(), 6u);
     CHECK_EQ(j["name"].get<std::string>(), std::string("edit"));
     CHECK_EQ(j["count"].get<int>(), 3);
     CHECK(j["count"].is_number_integer() && !j["count"].is_number_unsigned());
@@ -414,7 +414,7 @@ TEST(json_parse_duplicate_keys_and_large_flat_objects) {
     }
     text += ",\"tok0\":-1}";
     const Json big = Json::parse(text);
-    CHECK_EQ(big.size(), 20000u);
+    REQUIRE_EQ(big.size(), 20000u);
     CHECK_EQ(big["tok0"].get<int64_t>(), -1LL);
     CHECK_EQ(big["tok12345"].get<int64_t>(), (long long)(12345 * 7 % 100000));
     CHECK_EQ(big["tok19999"].get<int64_t>(), (long long)(19999 * 7 % 100000));

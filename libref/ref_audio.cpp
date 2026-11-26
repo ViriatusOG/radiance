@@ -614,13 +614,15 @@ int ref_ras_pick(const RadArgs* a, RadStream) {
     for (int64_t i = 0; i < n; ++i) {
         const int64_t hb = ldi(lane, i) * W;
         if (clear)
-            for (int64_t w = 0; w < W; ++w) st_int(hist->dtype, hist->data, offlin(hist, hb + w), -1);
+            for (int64_t w = 0; w < W; ++w)
+                st_int(hist->dtype, hist->data, offlin(hist, hb + w), -1);
         const int64_t f = ldi(first, rep * i);
         int64_t pick = f;
         if (f >= lo && f < hi)
             for (int64_t w = 0; w < W; ++w)
                 if (ldi(hist, hb + w) == f) { pick = ldi(alt, rep * i); break; }
-        for (int64_t r = 0; r < rep; ++r) st_int(ids->dtype, ids->data, offlin(ids, rep * i + r), pick);
+        for (int64_t r = 0; r < rep; ++r)
+            st_int(ids->dtype, ids->data, offlin(ids, rep * i + r), pick);
         for (int64_t w = 0; w + 1 < W; ++w)
             st_int(hist->dtype, hist->data, offlin(hist, hb + w), ldi(hist, hb + w + 1));
         st_int(hist->dtype, hist->data, offlin(hist, hb + W - 1), pick);

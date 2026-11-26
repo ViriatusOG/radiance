@@ -113,12 +113,6 @@ void dims_for(double area, double ratio, int32_t mult, int32_t* w, int32_t* h) {
     if (*h < mult) *h = mult;
 }
 
-std::string replace_all(std::string s, const std::string& what, const std::string& with) {
-    for (size_t p = s.find(what); p != std::string::npos; p = s.find(what, p + with.size()))
-        s.replace(p, what.size(), with);
-    return s;
-}
-
 /* A picture as the generator's encoder reads it: each channel u -> 2 * (u / 255) - 1 in f32, then
  * bf16 (VaeImageProcessor's preprocess, cast to the VAE's dtype). An RGB model reads the colour
  * channels and not the alpha, as PIL's convert("RGB") drops it. */
@@ -850,7 +844,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         std::unique_ptr<Server, decltype(finish_turn)> waiting(this, finish_turn);
         int s;
         for (;;) {
-            if (req.peer_gone()) return HttpResponse::text(499, "client closed request\n");
+            if (req.peer_gone()) return client_closed();
             if (stopping_.load()) return error_response(err_overloaded("server stopping"), req.peer);
             if (turn == image_adapter_waiters_.begin()) {
                 lock.unlock();
@@ -862,10 +856,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             image_adapter_turn_.wait_for(lock, std::chrono::milliseconds(50));
         }
         if (s < 0) {
-            ApiError e = err_bad("loras", why);
-            if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
-            else if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
-            return error_response(e, req.peer);
+            return error_response(err_lora_acquire(s, why), req.peer);
         }
     }
 
@@ -962,8 +953,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             if (req.peer_gone()) {
                 ticket->cancel.store(true);
                 release(1);
-                metrics_.observe_http(499);
-                return HttpResponse::text(499, "client closed request\n");
+                return client_closed();
             }
             if (stopping_.load()) {
                 ticket->cancel.store(true);

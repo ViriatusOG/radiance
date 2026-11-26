@@ -13,6 +13,7 @@
  * Everything else goes on its own lines at a deeper indent, so the table stays greppable.
  */
 #include "rad_build.h"
+#include "mem/kv.h"
 
 #include "startup.h"
 
@@ -245,7 +246,7 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
         for (size_t i = 1; i < p.kv_groups.size(); ++i) {
             const KVGroupInfo& g = p.kv_groups[i];
             s += fmt("  %-20s %-7s block %-5lld %12s/block %12s/state  %zu layer(s)\n",
-                     g.name.c_str(), bld_kv_kind_name(g.decl.kind), (long long)g.block_size,
+                     g.name.c_str(), kv_kind_name(g.decl.kind), (long long)g.block_size,
                      humanb(g.bytes_per_block).c_str(), humanb(g.bytes_per_state).c_str(),
                      g.layers.size());
         }
@@ -720,7 +721,7 @@ std::string dump_graph_json(const Program& p, Registry* r) {
         if (g.name.empty() || g.layers.empty()) continue;
         json j;
         j["name"]            = g.name;
-        j["kind"]            = bld_kv_kind_name(g.decl.kind);
+        j["kind"]            = kv_kind_name(g.decl.kind);
         j["layers"]          = (int64_t)g.layers.size();
         j["block_size"]      = g.block_size;
         j["bytes_per_block"] = g.bytes_per_block;

@@ -53,7 +53,7 @@
 // The shim takes the row count, row pitch and ring depth from the operands (`sel`, `slot_block`),
 // with the ranged `M`, `sel_pitch` and `slots` as ceilings (arch/common/rad_arch.h, "step-sized
 // operands"), and addresses the byte planes by row pitch, so one kernel serves every cache layout.
-// It returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// It returns a RAD status rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d_args.h"
 #include "r4d_emit.h"

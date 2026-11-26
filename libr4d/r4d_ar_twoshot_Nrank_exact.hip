@@ -558,11 +558,24 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
                                 long acq, long pub, long gate, long gate_ctr, long chain) {
+  r4d_ar_twoshot_4rank_exact_w(peer_scratch0, peer_scratch1, peer_scratch2, peer_flags0,
+                               peer_flags1, peer_flags2, my_scratch, my_flags, seq_ctrs,
+                               slot_stride16, inp, out, n_elem, dtype, rank, stream, nblocks,
+                               nthreads, drain, acq, pub, gate, gate_ctr, chain, nullptr);
+}
+
+void r4d_ar_twoshot_4rank_exact_w(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                  long peer_flags0, long peer_flags1, long peer_flags2,
+                                  long my_scratch, long my_flags, long seq_ctrs,
+                                  long slot_stride16, long inp, long out, long n_elem, long dtype,
+                                  long rank, long stream, long nblocks, long nthreads, long drain,
+                                  long acq, long pub, long gate, long gate_ctr, long chain,
+                                  const int* shard_weights) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr,
-                       nullptr, 1L, 0L, 0L, chain != 0);
+                       shard_weights, 1L, 0L, 0L, chain != 0);
 }
 
 /* The coded form's conditions: bf16, a message that shards evenly into whole waves' 32 chunks

@@ -9,7 +9,7 @@
  * into the gates are replicated. The block's all_reduce sums the output. */
 #ifndef RAD_BLOCK_GLM_KDA_H
 #define RAD_BLOCK_GLM_KDA_H
-#include "rad_fp8.h"
+#include "rad_linear.h"
 #include "rad_glm_tp.h"
 #include <cmath>
 
@@ -140,7 +140,7 @@ struct GlmKda {
     Geom g{};
     Wire w{};
     KdaState core{};
-    LinearFP8 qkv{}, beta{}, forget_a{}, forget_b{}, gate_a{}, gate_b{}, output{};
+    LinearQ qkv{}, beta{}, forget_a{}, forget_b{}, gate_a{}, gate_b{}, output{};
     rad_op op_ar = 0;
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int layer, const Wire& wire,
                 const char* prefix, const KdaState::Src& src, rad_kvgroup state,
@@ -152,13 +152,13 @@ struct GlmKda {
             w.forget_low == w.gate_low)
             return RAD_E_INVAL;
         // All seven projections are plain bf16 in the pinned checkpoint; under w_bf16,
-        // LinearFP8::declare refuses a quantised one by name.
+        // LinearQ::declare refuses a quantised one by name.
         Geom bg = g;
         bg.w_bf16 = true;
         const int64_t width = GlmTp::kda_width(g.world), heads = GlmTp::heads(g.world);
         const auto group = grp_layer(layer);
         auto act = [](rad_buf x) {
-            ActFP8 a{};
+            ActQ a{};
             a.x = x;
             return a;
         };
@@ -200,7 +200,7 @@ struct GlmKda {
     void step(RadCtx* ctx, const RadBatch* batch) const {
         const int64_t T = batch->n_tok;
         auto act = [](rad_buf x) {
-            ActFP8 a{};
+            ActQ a{};
             a.x = x;
             return a;
         };

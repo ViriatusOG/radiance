@@ -216,7 +216,7 @@ int Server::speech_request(const json& body, const std::string& text,
             /* The file: a data: URL, or its base64 alone (as fish-speech's server takes it). */
             const std::string& a = e["audio"].get_ref<const std::string&>();
             std::vector<uint8_t> bytes;
-            if (a.rfind("data:", 0) == 0) {
+            if (a.starts_with("data:")) {
                 ApiError ue;
                 if (decode_media_url(a, at + ".audio", &bytes, &ue) < 0) return fail(ue);
             } else if (!base64_decode(a, &bytes)) {
@@ -446,8 +446,7 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
         if (req.peer_gone()) {
             ticket->cancel.store(true);
             release(1);
-            metrics_.observe_http(499);
-            return HttpResponse::text(499, "client closed request\n");
+            return client_closed();
         }
         if (stopping_.load()) {
             ticket->cancel.store(true);

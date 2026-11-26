@@ -14,7 +14,21 @@ endif()
 
 file(GLOB REF_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 
+# gemm_nt_ggml reads llama.cpp's blocks through libquant's one definition of them, compiled from
+# its sources as the core compiles them (nothing is linked, so abi/ stays the whole contract). Out
+# of tree, where libquant's sources are not beside libref, the row is simply absent.
+set(REF_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+if(EXISTS ${REF_GGML_DIR}/lq_ggml_planes.cpp)
+  list(APPEND REF_SRC ${REF_GGML_DIR}/lq_ggml_planes.cpp ${REF_GGML_DIR}/lq_ggml_dequant.cpp
+                      ${REF_GGML_DIR}/lq_ggml_tables.cpp)
+  set(REF_HAVE_GGML ON)
+endif()
+
 rad_add_plugin(libref kernels SOURCES ${REF_SRC})
+if(REF_HAVE_GGML)
+  target_compile_definitions(libref PRIVATE REF_HAVE_GGML=1)
+  target_include_directories(libref PRIVATE ${REF_GGML_DIR})
+endif()
 
 # -ffp-contract=off is a correctness flag: rad-kbench compares kernels against this reference to a
 # tolerance, so `a*b + c` must round twice and give the same result under any compiler

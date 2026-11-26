@@ -15,7 +15,7 @@
  * (`w:h`) instead lays the model's own canvas over that ratio: the short edge (the model's, or
  * `short_edge`), the area capped at the model's largest, both sides rounded to the multiple.
  * A video's length is a whole number of the model's chunks: `seconds` is rounded up to the next.
-* A model with the VAEs' encoders also takes keyframes, form file parts `first_frame` and
+ * A model with the VAEs' encoders also takes keyframes, form file parts `first_frame` and
  * `last_frame` (tasks i2va, l2va, fl2va), or reference media (task ref2va): `ref_image_N` (at
  * most 9), `ref_video_N` (3) with a soundtrack `ref_video_audio_N` and `ref_audio_N` (3), N from 1
  * without gaps within each kind. The parts carry the bytes: `input_reference` (but for i2va on a
@@ -442,7 +442,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     bool ref2va = false;
     std::string kf_task;   /* a keyframe task named */
     if (!has_ref && has(body, "task")) {
-        const std::string task = body["task"].is_string() ? body["task"].get<std::string>() : "";
+        const std::string task = str_or(body, "task");
         if (task == "ref2va" && takes_refs) ref2va = true;
         /* The parts say which frames there are; a named task is checked against them below. */
         else if (info.max_enc_side > 0 && (task == "i2va" || task == "l2va" || task == "fl2va"))
@@ -567,7 +567,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             double v = 0;
             if (!number(target["short_edge"], &v) || v < 1 || v != std::floor(v))
                 return bad("target", "short_edge must be a positive whole number of pixels");
-            se = (int64_t)v;
+            /* Past this the area cap decides the canvas whatever the edge is; the clamp keeps the
+             * cast defined. */
+            se = (int64_t)std::min(v, 1e15);
         }
         if (std::max(rw, rh) > (double)info.max_aspect * std::min(rw, rh))
             return bad("target", "the aspect ratio may be at most " +
@@ -605,7 +607,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         double sec = 0;
         if (!number(has_sec ? body["seconds"] : target["duration_seconds"], &sec) || !(sec > 0))
             return bad(has_sec ? "seconds" : "target", "the length is a positive number of seconds");
-        const int64_t want = (int64_t)std::ceil(sec * fps - 1e-9);
+        /* Clamped so a huge request reads as past the model's longest, not as an overflow. */
+        const int64_t want = (int64_t)std::min(std::ceil(sec * fps - 1e-9), 1e15);
         chunks = std::max<int64_t>(info.min_chunks,
                                    (want - info.frames_tail + info.frames_per_chunk - 1) /
                                        info.frames_per_chunk);
@@ -677,7 +680,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
     r->sampler = info.unipc_only ? RAD_SAMPLER_UNIPC : RAD_SAMPLER_EULER;
     if (has(body, "sampler")) {
-        const std::string sm = body["sampler"].is_string() ? body["sampler"].get<std::string>() : "";
+        const std::string sm = str_or(body, "sampler");
         if (info.unipc_only) {
             if (sm != "unipc") {
                 ApiError e = err_unsupported("sampler", "this model uses the UniPC sampler");
@@ -768,7 +771,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     bool seed_given = false;
     if (has(body, "seed")) {
         double v = 0;
-        if (!number(body["seed"], &v) || v != std::floor(v)) return bad("seed", "expected an integer");
+        if (!number(body["seed"], &v) || v != std::floor(v) || std::fabs(v) >= 9.2e18)
+            return bad("seed", "expected an integer");
         r->seed = (uint64_t)(int64_t)v;
         seed_given = v != -1;
     }
@@ -1025,10 +1029,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         std::string why, note;
         const int s = opt_.gen_lora_acquire(loras, &r->lora_slot, &r->lora_hold, &note, &why);
         if (s < 0) {
-            ApiError e = err_bad("loras", why);
-            if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
-            else if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
-            return error_response(e, req.peer);
+            return error_response(err_lora_acquire(s, why), req.peer);
         }
     }
     if (auto no = admit(1, req.peer)) return *no;
@@ -1095,11 +1096,21 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     sweep_videos_locked(unix_now());
     videos_.push_back(j);
     if (deps_.background) deps_.background->fetch_add(1);
-    j->worker = std::thread([this, j, model_lease = std::move(model_lease)]() mutable {
-        video_work(j);
+    try {
+        j->worker = std::thread([this, j, model_lease = std::move(model_lease)]() mutable {
+            video_work(j);
+            if (deps_.background) deps_.background->fetch_sub(1);
+            model_lease.reset();
+        });
+    } catch (const std::exception& e) {
+        /* No worker will ever finish the job: take it back out, as it was never queued. */
+        j->ticket->cancel.store(true);
+        videos_.pop_back();
         if (deps_.background) deps_.background->fetch_sub(1);
-        model_lease.reset();
-    });
+        release(1);
+        return error_response(err_overloaded(std::string("the job's thread could not be "
+                                                         "started: ") + e.what()), req.peer);
+    }
     return HttpResponse::json_body(200, json_dump(video_json(*j)));
 }
 

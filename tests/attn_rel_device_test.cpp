@@ -54,6 +54,11 @@ struct Case {
     bool cu = true;
     int rpitch = 0;
     int sink_every = 0;   /* a sink of 40 in every such row: it must take the row */
+    int used = 0;         /* host KV bound (RadArgs::kv_used_max_h); 0 leaves it unset */
+    int max_ctx = 0;      /* model bound passed as a parameter; 0 omits it */
+    int wgps = 0;
+    int want_splits = -1; /* decode split count the card must report; -1 skips the check */
+    bool scratch = false;
 };
 
 /* Every operand of one case on the host: the same values feed both plugins. */
@@ -150,8 +155,9 @@ struct Params {
     void s(const char* k, const char* v) { RadParam x{}; x.key = k; x.kind = RAD_P_STR; x.sval = v; p.push_back(x); }
 };
 
-/* Launch one row (`fn`) over the case's operands. */
-int launch(const Case& c, const Data& d, const Bufs& b, int (*fn)(const RadArgs*, RadStream)) {
+/* Launch one row (`fn`) over the case's operands. `scratch` is the card's split partials. */
+int launch(const Case& c, const Data& d, const Bufs& b, int (*fn)(const RadArgs*, RadStream),
+           void* scratch = nullptr, int64_t scratch_bytes = 0) {
     const int kv_w = c.i8 ? 2 * HD + 4 : 2 * HD;
     RadTensor t[11] = {};
     t[0] = tensor(b.q, RAD_BF16, {d.rows, d.nh, HD});
@@ -173,12 +179,17 @@ int launch(const Case& c, const Data& d, const Bufs& b, int (*fn)(const RadArgs*
     P.i("window", c.window); P.s("q_dtype", "bf16"); P.s("kv_dtype", c.i8 ? "i8" : "bf16");
     P.i("n_head", d.nh); P.i("max_seqs", d.n_seq); P.i("d_rel", DR); P.i("extent", E);
     P.f("scale", 1.0 / std::sqrt((double)HD));
+    if (c.max_ctx > 0) P.i("max_ctx", c.max_ctx);
 
     RadArgs a{};
     a.t = t;
     a.n_t = 11;
     a.p = P.p.data();
     a.n_p = (int)P.p.size();
+    a.scratch = scratch;
+    a.scratch_bytes = scratch_bytes;
+    a.kv_used_max_h = c.used;
+    a.wgp_count = c.wgps;
     return fn(&a, nullptr);
 }
 
@@ -227,6 +238,25 @@ int main(int argc, char** argv) {
         { "int8 cache, gqa 3, full", { 2, 1 }, { 900, 500 }, 1, 3, 0, E, true },
         { "r as a column slice of a wider row, gqa 3", { 3 }, { 700 }, 1, 3, 0, E, false, true, 5 },
         { "sink far above the scores, gqa 2", { 1, 1 }, { 300, 40 }, 1, 2, 0, E, false, true, 0, 1 },
+        /* The model bound is 262144. The split must follow the live bound, and a 10000-key
+         * one-row launch at four KV heads must take more than one wave of 32 splits. */
+        { "split 10000 keys, 4 kv heads, live 10000 not max_ctx", { 1 }, { 10000 }, 4, 3, 0, E,
+          false, true, 0, 0, 10000, 262144, 32, 39, true },
+        { "split 64 keys stays one piece despite max_ctx 262144", { 1 }, { 64 }, 4, 3, 0, E,
+          false, true, 0, 0, 64, 262144, 32, 1, true },
+        { "window ignores a 250000 live bound", { 1 }, { 1500 }, 4, 3, 1024, E,
+          false, true, 0, 0, 250000, 262144, 32, 4, true },
+        { "split 1500 keys, one kv head, five pieces", { 1 }, { 1500 }, 1, 3, 0, E,
+          false, true, 0, 0, 1500, 262144, 32, 5, true },
+        /* A verify packs its rows and group heads into one WMMA block a KV head; its partials
+         * are rows * kv heads * gqa slots, which bounds the splits (21 here), and the last keys
+         * carry the bias. */
+        { "packed verify 8 rows, 10000 keys, 8 kv heads, gqa 3, split", { 8 }, { 10000 }, 8, 3, 0, E,
+          false, true, 0, 0, 10000, 262144, 32, 21, true },
+        { "packed verify int8, 4 and 7 rows, window 1024, split", { 4, 7 }, { 3000, 2500 }, 2, 3,
+          1024, E, true, true, 0, 0, 3000, 262144, 32, 4, true },
+        { "packed verify 5 rows, gqa 8 (three waves), split", { 5 }, { 4000 }, 1, 8, 0, E,
+          false, true, 0, 0, 4000, 262144, 32, 15, true },
     };
 
     int fails = 0;
@@ -253,15 +283,36 @@ int main(int argc, char** argv) {
         Device<float> dsk(d.sk);
         Bufs db{ dq.p, c.i8 ? (const void*)dkvi.p : (const void*)dkvb.p, dbt.p, dsu.p,
                  c.cu ? (const void*)dcu.p : nullptr, dr.p, drp.p, dsk.p, dout.p };
-        if (launch(c, d, db, dev_fn) != RAD_OK) { std::printf("  %-64s card row refused\n", c.name); ++fails; continue; }
+        void* scratch = nullptr;
+        int64_t scratch_bytes = 0;
+        if (c.scratch) {
+            auto scratch_fn = reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(hr4d, "r4d_rad_attn_rel_scratch"));
+            if (!scratch_fn) { std::printf("  %-64s no scratch hook\n", c.name); ++fails; continue; }
+            scratch_bytes = scratch_fn(nullptr);
+            hipcheck(hipMalloc(&scratch, (size_t)scratch_bytes), "scratch");
+        }
+        if (launch(c, d, db, dev_fn, scratch, scratch_bytes) != RAD_OK) {
+            std::printf("  %-64s card row refused\n", c.name); ++fails;
+            if (scratch) (void)hipFree(scratch);
+            continue;
+        }
         hipcheck(hipDeviceSynchronize(), "sync");
+        int splits = -1;
+        bool splits_ok = true;
+        if (c.want_splits >= 0) {
+            auto last = reinterpret_cast<int (*)()>(dlsym(hr4d, "r4d_attn_rel_last_splits"));
+            splits = last ? last() : -1;
+            splits_ok = splits == c.want_splits;
+        }
+        if (scratch) (void)hipFree(scratch);
         const double e = rel_l2(ref_out, dout.get());
         /* A zero reference would match a zero card output for free: it must be a real answer. */
         double ref_norm = 0;
         for (uint16_t v : ref_out) ref_norm += (double)rad_bf16_to_f32(v) * rad_bf16_to_f32(v);
-        const bool ok = e < 2e-3 && ref_norm > 0;
+        const bool ok = e < 2e-3 && ref_norm > 0 && splits_ok;
         worst = std::max(worst, e);
-        std::printf("  %-64s rel_l2 %.2e  rows %d  %s\n", c.name, e, d.rows, ok ? "PASS" : "FAIL");
+        std::printf("  %-64s rel_l2 %.2e  rows %d  splits %d  %s\n", c.name, e, d.rows, splits,
+                    ok ? "PASS" : "FAIL");
         fails += ok ? 0 : 1;
     }
     std::printf("attn_paged_rel on the card: %zu case(s), %d failure(s), max rel_l2 %.3e\n",

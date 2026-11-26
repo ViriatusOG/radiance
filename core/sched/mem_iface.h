@@ -354,6 +354,18 @@ struct KVGeom {
         return (q >= 0 ? (q + 1) * bs : q * bs + 1) - x;
     }
 
+    /* The `len` slots of one affine run starting at position `pos` in block index `bi`, or -1
+     * throughout when the index is outside the table. */
+    static void fill_run(const int32_t* bt, size_t bt_n, int64_t bi, int64_t pos, int64_t len,
+                         int64_t bs, int32_t* out) {
+        if (bi < 0 || (size_t)bi >= bt_n) {
+            for (int64_t k = 0; k < len; ++k) out[k] = -1;
+            return;
+        }
+        const int64_t base = (int64_t)bt[(size_t)bi] * bs + pos % bs;
+        for (int64_t k = 0; k < len; ++k) out[k] = (int32_t)(base + k);
+    }
+
     /* slot() at n consecutive positions pos0, pos0+1, ..., identical values with one division a
      * segment instead of two a token. A segment ends where the block index or the in-block
      * offset would change rule (trunc_steps of (pos - first_pos) and of pos); inside it the slot
@@ -371,12 +383,7 @@ struct KVGeom {
             const int64_t lo = trunc_steps(pos, bs);
             if (lo < len) len = lo;
             if (len > n - done) len = n - done;
-            if (bi < 0 || (size_t)bi >= bt_n) {
-                for (int64_t k = 0; k < len; ++k) out[done + k] = -1;
-            } else {
-                const int64_t base = (int64_t)bt[(size_t)bi] * bs + pos % bs;
-                for (int64_t k = 0; k < len; ++k) out[done + k] = (int32_t)(base + k);
-            }
+            fill_run(bt, bt_n, bi, pos, len, bs, out + done);
             done += len;
         }
     }
@@ -407,12 +414,7 @@ struct KVGeom {
             const int64_t lo = trunc_steps(pos, bs);
             if (lo < len) len = lo;
             if (len > n - done) len = n - done;
-            if (bi < 0 || (size_t)bi >= bt_n) {
-                for (int64_t k = 0; k < len; ++k) out[done + k] = -1;
-            } else {
-                const int64_t base = (int64_t)bt[(size_t)bi] * bs + pos % bs;
-                for (int64_t k = 0; k < len; ++k) out[done + k] = (int32_t)(base + k);
-            }
+            fill_run(bt, bt_n, bi, pos, len, bs, out + done);
             done += len;
         }
     }

@@ -125,10 +125,20 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
     o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
+    o.window_seed_failures = m.window_seed_failures;
+    o.draft_window_stale_ckpts = m.draft_window_stale_ckpts;
+    o.draft_gated_steps = m.draft_gated_steps;
+    o.draft_acc_gated_steps = m.draft_acc_gated_steps;
+    o.draft_reach_declined_steps = m.draft_reach_declined_steps;
+    o.draft_spec_off_seqs = m.draft_spec_off_seqs;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
     o.suffix_steps = m.suffix_steps;             o.suffix_rows = m.suffix_rows;
     o.suffix_accepted = m.suffix_accepted;       o.suffix_held_ahead = m.suffix_held_ahead;
+    o.draft_zero_cycles = m.draft_zero_cycles;   o.draft_probe_cycles = m.draft_probe_cycles;
+    o.draft_zero_moves = m.draft_zero_moves;
+    o.hybrid_lookup = m.hybrid_lookup;           o.hybrid_head = m.hybrid_head;
+    o.hybrid_unahead = m.hybrid_unahead;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
@@ -163,11 +173,11 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
         o.loras[i].prompt_tokens = m.loras[i].prompt_tokens;
         o.loras[i].output_tokens = m.loras[i].output_tokens;
         o.loras[i].running       = m.loras[i].running;
-        if (m.loras[i].requests || m.loras[i].running) o.n_loras = i + 1;
     }
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
     o.step_ns_decode_best = m.step_ns_decode_best;
     o.step_ns_decode_recent = m.step_ns_decode_recent;
+    o.step_open_phase = m.step_open_phase;  o.step_open_ns = m.step_open_ns;
     o.encode_items = m.encode_items;      o.encode_patches = m.encode_patches;
     o.encode_ns = m.encode_ns;            o.encode_pending = m.encode_pending;
     return o;
@@ -721,6 +731,7 @@ public:
                 out->parser            = b.parser;
                 out->think_open        = b.think_open;
                 out->think_close       = b.think_close;
+                out->think_frame       = b.think_frame;
                 out->think_starts_open = b.think_starts_open;
                 return RAD_OK;
             }
@@ -772,6 +783,7 @@ public:
         const ReasoningMarkers rm = rp->reasoning();
         out->think_open        = rm.open;
         out->think_close       = rm.close;
+        out->think_frame       = rm.frame;
         out->think_starts_open = rm.starts_open;
         out->parser = std::make_shared<ReplyParserBridge>(std::move(rp));
         if (!built_key.empty()) {
@@ -782,6 +794,7 @@ public:
             b.parser            = out->parser;
             b.think_open        = out->think_open;
             b.think_close       = out->think_close;
+            b.think_frame       = out->think_frame;
             b.think_starts_open = out->think_starts_open;
             std::lock_guard<std::mutex> lk(built_mu_);
             if (built_.size() >= 32) built_.clear();
@@ -801,7 +814,7 @@ private:
         bool grammar_lazy = false;
         std::vector<SamplingParams::GrammarTrigger> triggers;
         std::shared_ptr<IReplyParser> parser;
-        std::string think_open, think_close;
+        std::string think_open, think_close, think_frame;
         bool think_starts_open = false;
     };
 

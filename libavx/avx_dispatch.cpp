@@ -16,7 +16,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <atomic>
 #include <new>
 #include <vector>

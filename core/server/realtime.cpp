@@ -104,11 +104,6 @@ std::string rtrim(std::string s) {
     return s;
 }
 
-/* A string member, or `def` when it is absent or not a string. */
-std::string str_of(const ojson& o, const char* k, const std::string& def) {
-    return o.contains(k) && o[k].is_string() ? o[k].get<std::string>() : def;
-}
-
 ojson event(const char* type) {
     ojson o;
     o["type"] = type;
@@ -541,7 +536,7 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
                 const ojson& in = se["audio"]["input"];
                 if (in.contains("format") && in["format"].is_object()) {
                     const ojson& fo = in["format"];
-                    if (str_of(fo, "type", "audio/pcm") != "audio/pcm")
+                    if (str_or(fo, "type", "audio/pcm") != "audio/pcm")
                         return bad("session.audio.input.format.type",
                                    "the audio is \"audio/pcm\": 16-bit little-endian mono");
                     if (fo.contains("rate")) {
@@ -568,8 +563,8 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
         }
         if (tr) {
             const ojson& t = *tr;
-            model = str_of(t, "model", model);
-            std::string want = str_of(t, "language", "");
+            model = str_or(t, "model", model);
+            std::string want = str_or(t, "language", "");
             bool detect = t.contains("language") && t["language"].is_null();
             /* The live models' `languages`: one is a forced language; several, detection. */
             if (t.contains("languages") && t["languages"].is_array()) {
@@ -594,14 +589,14 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
                 code = want;
                 name = n;
             }
-            prompt = str_of(t, "prompt", prompt);
+            prompt = str_or(t, "prompt", prompt);
             if (t.contains("keywords") && t["keywords"].is_array()) {
                 keywords.clear();
                 for (const auto& k : t["keywords"])
                     if (k.is_string()) keywords.push_back(k.get<std::string>());
             }
             if (t.contains("delay") && t["delay"].is_string()) {
-                delay = str_of(t, "delay", "");
+                delay = str_or(t, "delay", "");
                 if (delay != "minimal" && delay != "low" && delay != "medium" && delay != "high" &&
                     delay != "xhigh")
                     return bad("session.audio.input.transcription.delay",
@@ -613,7 +608,7 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
             if (t.is_null()) {
                 vad = false;
             } else if (t.is_object()) {
-                const std::string type = str_of(t, "type", "server_vad");
+                const std::string type = str_or(t, "type", "server_vad");
                 if (type != "server_vad")
                     return bad("turn_detection.type",
                                "turn detection is server_vad, or null for turns the client "

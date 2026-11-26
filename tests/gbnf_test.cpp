@@ -540,13 +540,6 @@ void report(const char* what, const Tally& t) {
 
 /* ================================================================== grammars */
 
-std::string slurp(const std::string& p) {
-    std::ifstream f(p, std::ios::binary);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
 std::string fixture(const char* name) {
     return std::string(RAD_GBNF_TEST_DATA) + "/" + name;
 }
@@ -588,7 +581,7 @@ std::vector<std::pair<std::string, std::string>> template_grammars() {
     const ojson messages = ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } });
     for (const TemplateCase& tc : kTemplates) {
         ChatTemplate ct;
-        if (ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) < 0) continue;
+        if (ct.load(read_file(fixture(tc.file)), tc.bos, tc.eos) < 0) continue;
         for (int par = 0; par < 2; ++par) {
             for (const char* choice : { "auto", "required" }) {
                 ChatOptions opt;
@@ -957,7 +950,7 @@ TEST(gbnf_a_property_no_value_satisfies_is_a_key_never_written) {
     int built = 0;
     for (const TemplateCase& tc : kTemplates) {
         ChatTemplate ct;
-        REQUIRE(ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) >= 0);
+        REQUIRE(ct.load(read_file(fixture(tc.file)), tc.bos, tc.eos) >= 0);
         for (int par = 0; par < 2; ++par) {
             ChatOptions opt;
             opt.tool_choice = "auto";
@@ -1025,13 +1018,13 @@ TEST(gbnf_a_not_of_every_json_type_is_never_too) {
  * grammar it writes must compile, as admission requires. */
 TEST(gbnf_oh_my_pi_tools_build_and_compile_under_every_template) {
     auto bv = bpe_like(31, 3000);
-    const ojson tools = ojson::parse(slurp(fixture("../chat/oh-my-pi-18.6.0-tools.json")));
+    const ojson tools = ojson::parse(read_file(fixture("../chat/oh-my-pi-18.6.0-tools.json")));
     REQUIRE(tools.is_array() && tools.size() == 11);
     const ojson messages = ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } });
     int built = 0;
     for (const TemplateCase& tc : kTemplates) {
         ChatTemplate ct;
-        REQUIRE(ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) >= 0);
+        REQUIRE(ct.load(read_file(fixture(tc.file)), tc.bos, tc.eos) >= 0);
         for (int par = 0; par < 2; ++par) {
             ChatOptions opt;
             opt.tool_choice = "auto";
@@ -1351,7 +1344,7 @@ TEST(gbnf_a_length_bound_past_two_thousand_is_held_exactly) {
     int compiled = 0, carried = 0;
     for (const TemplateCase& tc : kTemplates) {
         ChatTemplate ct;
-        REQUIRE(ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) >= 0);
+        REQUIRE(ct.load(read_file(fixture(tc.file)), tc.bos, tc.eos) >= 0);
         for (int par = 0; par < 2; ++par) {
             for (const char* choice : { "auto", "required" }) {
                 ChatOptions opt;
@@ -1479,7 +1472,7 @@ TEST(gbnf_bounds_over_one_operand_share_their_links) {
 TEST(gbnf_rule_copies_share_one_plan) {
     auto bv = bpe_like(41, 1500);
     ChatTemplate ct;
-    REQUIRE(ct.load(slurp(fixture("qwen3.8.jinja")), "", "<|im_end|>") >= 0);
+    REQUIRE(ct.load(read_file(fixture("qwen3.8.jinja")), "", "<|im_end|>") >= 0);
     std::vector<size_t> dense;
     for (int n_tools : { 3, 30 }) {
         ojson tools = ojson::array();
@@ -1577,7 +1570,7 @@ TEST(gbnf_a_held_program_is_found_whatever_was_compiled_since) {
 TEST(gbnf_a_mask_does_a_fraction_of_a_vocabulary_pass) {
     auto bv = bpe_like(53, 48000);
     ChatTemplate ct;
-    REQUIRE(ct.load(slurp(fixture("qwen3.8.jinja")), "", "<|im_end|>") >= 0);
+    REQUIRE(ct.load(read_file(fixture("qwen3.8.jinja")), "", "<|im_end|>") >= 0);
     ChatPrompt cp;
     REQUIRE(ct.apply(ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } }),
                      ojson::parse(kTools), ChatOptions(), &cp) >= 0);
@@ -1638,7 +1631,7 @@ TEST(gbnf_a_mask_does_a_fraction_of_a_vocabulary_pass) {
 TEST(perf_gbnf_mask_latency_stays_within_budget) {
     auto bv = bpe_like(53, 48000);
     ChatTemplate ct;
-    REQUIRE(ct.load(slurp(fixture("qwen3.8.jinja")), "", "<|im_end|>") >= 0);
+    REQUIRE(ct.load(read_file(fixture("qwen3.8.jinja")), "", "<|im_end|>") >= 0);
     ChatPrompt cp;
     REQUIRE(ct.apply(ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } }),
                      ojson::parse(kTools), ChatOptions(), &cp) >= 0);
@@ -1819,8 +1812,8 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
      * integers), so {"type":"number","minimum":0.5} admits -1. Refusing such schemas would refuse
      * common structured-output requests; it is reported rather than pinned here. */
     if (schema_admits(bv->v, R"({"type":"number","minimum":0.5})", "-1"))
-        fprintf(stderr, "    SKIP number bounds: the converter does not enforce minimum/maximum "
-                        "on \"number\"\n");
+        fprintf(stderr, "    known gap, number bounds: the converter does not enforce "
+                        "minimum/maximum on \"number\"\n");
     for (const char* schema : { R"({"type":"string","pattern":"^a|b"})",
                                 R"({"type":"string","pattern":"a|b$"})",
                                 R"({"type":"string","pattern":"^[a\\S]$"})",

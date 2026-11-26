@@ -33,7 +33,7 @@
 // reads at i8a8, w4a8i8_asym and w5a8i8. Only the epilogue differs; it reads the same bf16 norm
 // output from LDS, so the codes are the norm + quant_act_i8g pair's bytes.
 //
-// Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a negative code instead of throwing, for the reason given in r4d_gemm_i8a8.hip.
 #include "r4d_chain.h"
 #include "r4d.h"
 #include "r4d_args.h"

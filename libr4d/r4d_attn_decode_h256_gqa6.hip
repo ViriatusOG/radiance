@@ -73,9 +73,6 @@
 // measured from the block's first position plus its depth. Compiled in only where a row asks.
 #define O_TREE  536870912
 __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
-__host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
-    int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
-}
 // Segments the combine reads for output row `tok`. The decode kernel cuts the tiles of the launch's
 // context (the last row's) into segments of `tps` tiles. A causal row ends earlier than that: its
 // own context is ctx - q_len + 1 + row, and the segments past it hold nothing it needs. Reading
@@ -694,7 +691,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
 // and a scale group is 128 columns, so the `_gq` forms finish the row in registers instead of in a
 // second dispatch.
 //
-// Byte-identical to gate_quant_fp8 (r4d_fused_quant_fp8.hip): gate rounded to bf16 before the
+// Byte-identical to gate_quant_fp8 (r4d_fused_quant.hip): gate rounded to bf16 before the
 // multiply, product rounded, scale = group absmax / 448 (1 at zero), codes clamped to +-448, and
 // the bf16 product stored to `out`. A padded slot merges to zeros and takes the same epilogue.
 // GQ == 2 is the int8 form (scale amax / 127, round to nearest-even, r4d_q8.h).

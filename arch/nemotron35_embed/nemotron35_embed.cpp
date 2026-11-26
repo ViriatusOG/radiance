@@ -283,12 +283,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            RAD_WEIGHTS(m.score)),
                     {m.mean}, {m.pooled});
     } else {
-        m.cast = rw(b,
-                    RAD_OP(b, "cast",
-                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", E),
-                                      RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                           RAD_NOWEIGHTS),
-                    {m.mean}, {m.pooled});
+        m.cast = cast_op(b, g.max_seqs, E, "bf16", "f32", m.mean, m.pooled);
     }
     /* Recipes may quantise weights without changing the architecture descriptor. Do not read an
      * INT8 plane with a BF16-only graph, even when a container still advertises quant="". */

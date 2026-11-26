@@ -200,8 +200,8 @@ int ref_kv_resolve(const RadArgs* a, RadStream) {
     /* ---- 4. one victim per miss: identity, a free slot, then CLOCK, from the hand, never a slot
      * this call uses ---- */
     /* Identity first (step 4), leaving the hand alone. Then free slots, before any resident block
-     * is evicted; a free scan that finds nothing changes nothing. A free count of zero holds for the
-     * rest of the call (placements fill slots, evictions re-point them), so a full ring goes
+     * is evicted; a free scan that finds nothing changes nothing. A free count of zero holds for
+     * the rest of the call (placements fill slots, evictions re-point them), so a full ring goes
      * straight to CLOCK. */
     int64_t free_left = 0;
     for (int64_t s = 0; s < slots; ++s)
@@ -264,8 +264,8 @@ int ref_kv_resolve(const RadArgs* a, RadStream) {
     /* ---- 7. the rewrite: every valid entry becomes the slot holding its block ---- */
     for (size_t e = 0; e < ent.size(); ++e) {
         const int32_t s = R[ent[e]];
-        /* An unplaced miss's entry names slot 0, inside the ring, not its block id (see the header's
-         * overflow note); ctl[3] says the table is unusable. */
+        /* An unplaced miss's entry names slot 0, inside the ring, not its block id (see the
+         * header's overflow note); ctl[3] says the table is unusable. */
         st_int(sel->dtype, sel->data, off[e], s >= 0 ? s : 0);
     }
 

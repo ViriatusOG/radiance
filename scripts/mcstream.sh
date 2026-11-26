@@ -10,7 +10,6 @@ one() { # $1 label  $2 prompt
   curl -s -N -m 240 http://127.0.0.1:$P/v1/chat/completions -H 'Content-Type: application/json' \
     -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$2}],\"tools\":$T,\"stream\":true,\"max_tokens\":2500,\"temperature\":0}" > "$WORK/sse.txt"
   # every content fragment the client would render, concatenated
-  jq -rj '.choices[0].delta.content // ""' < /dev/null 2>/dev/null
   CONTENT=$(grep '^data: {' "$WORK/sse.txt" | sed 's/^data: //' | jq -rj '.choices[0].delta.content // ""' 2>/dev/null)
   NCALLS=$(grep '^data: {' "$WORK/sse.txt" | sed 's/^data: //' | jq -r '[.choices[0].delta.tool_calls[]?.function.name//empty]|.[]' 2>/dev/null | grep -c . )
   FIN=$(grep '^data: {' "$WORK/sse.txt" | sed 's/^data: //' | jq -r '.choices[0].finish_reason//empty' 2>/dev/null | grep -v '^$' | tail -1)

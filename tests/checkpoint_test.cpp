@@ -10,9 +10,13 @@
 #include "gguf_writer.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
+#include "format/ggml_planes.h"
+#include "../libquant/lq_ggml_planes.h"
+#include "../libquant/lq_ggml_dequant.h"
 #include "rad_plugin.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,11 +40,7 @@ struct T {
 
 /* A new empty directory under the test's temporary directory, so no checkpoint holds a file
  * another case wrote. */
-std::string fresh_dir() {
-    std::string t = radtest::tmp_path("ckpt.XXXXXX");
-    if (!mkdtemp(t.data())) throw std::runtime_error("cannot make " + t);
-    return t;
-}
+std::string fresh_dir() { return radtest::make_tmp_dir("ckpt"); }
 
 /* One safetensors file holding `ts`, in order. */
 void write_shard(const std::string& path, const std::vector<T>& ts) {
@@ -67,12 +67,6 @@ void write_shard(const std::string& path, const std::vector<T>& ts) {
 }
 
 /* One model.safetensors and a config.json in a fresh directory. */
-void write_file(const std::string& path, const std::string& body) {
-    FILE* f = std::fopen(path.c_str(), "wb");
-    std::fwrite(body.data(), 1, body.size(), f);
-    std::fclose(f);
-}
-
 std::string write_checkpoint(const std::vector<T>& ts, const std::string& config) {
     const std::string dir = fresh_dir();
     write_shard(dir + "/model.safetensors", ts);
@@ -2301,7 +2295,83 @@ std::vector<GKv> llama_kvs(int64_t file_type) {
     return kvs;
 }
 
+/* llama.cpp's dequantize_row_iq2_xxs (ggml-quants.c at 06938ac12, the commit libquant's port
+ * names), over the core's copies of its tables: quant_ggml_test holds those to libquant's, which
+ * are llama.cpp's. `k` values, a whole number of 66-byte blocks. */
+void ref_dequant_iq2_xxs(const uint8_t* blocks, float* y, int64_t k) {
+    static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+    for (int64_t i = 0; i < k / 256; ++i) {
+        const uint8_t* x = blocks + 66 * i;
+        const float d = rad_f16_to_f32((uint16_t)(x[0] | x[1] << 8));
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            uint32_t aux32[2];
+            std::memcpy(aux32, x + 2 + 8 * ib32, 8);
+            const uint8_t* aux8 = (const uint8_t*)aux32;
+            const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid = (const uint8_t*)(ggml_planes::kIq2xxsGrid + aux8[l]);
+                const uint8_t signs = ggml_planes::kSignsIq2xs[(aux32[1] >> (7 * l)) & 127];
+                for (int j = 0; j < 8; ++j)
+                    y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                y += 8;
+            }
+        }
+    }
+}
+
 }  /* namespace */
+
+/* The IQ2_XXS GGUF (Nemotron-3.5-Bolt's 2-bit release ships in this format) imports as the
+ * engine's affine planes, and its decode gives llama.cpp's dequantize_row_iq2_xxs values. */
+TEST(a_gguf_iq2_xxs_tensor_imports_and_decodes_as_llama_cpp) {
+    const std::string dir = fresh_dir();
+    const std::string path = dir + "/m.gguf";
+    /* [2, 512]: two rows of two blocks each; seeded random blocks, finite f16 scales. */
+    const int R = 2, C = 512, nb = R * (C / 256);
+    uint64_t seed = 0x4951325858535F43ull;
+    auto rnd = [&]() {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        return seed >> 33;
+    };
+    std::vector<uint8_t> blocks((size_t)nb * 66);
+    for (uint8_t& b : blocks) b = (uint8_t)rnd();
+    for (int b = 0; b < nb; ++b) {
+        const uint16_t d = rad_f32_to_f16(0.5f + 0.125f * (float)b);
+        blocks[b * 66] = (uint8_t)d;
+        blocks[b * 66 + 1] = (uint8_t)(d >> 8);
+    }
+    GTensor t{ "t.iq2_xxs", 16, { 512, 2 }, blocks };
+    write_gguf(path, llama_kvs(1), { t });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("t.iq2_xxs", RAD_MAP_COPY, { "t.iq2_xxs" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "t.iq2_xxs", false, &w, &why), RAD_OK);
+    CHECK(w.imported);
+    CHECK(!w.trivial);
+    CHECK(has(w.why, "iq2_xxs"));
+    CHECK_EQ(w.shape[0], (int64_t)R);
+    CHECK_EQ(w.shape[1], (int64_t)C);
+    CHECK_EQ(w.enc.plane[1].kind, (uint32_t)RAD_PLANE_TABLE);
+    char en[128];
+    rad_enc_format(&w.enc, en, sizeof en);
+    CHECK(has(en, "grid"));
+    std::vector<float> f((size_t)R * C);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, R, f.data(), &why), RAD_OK);
+    std::vector<float> ref(f.size());
+    ref_dequant_iq2_xxs(blocks.data(), ref.data(), R * C);
+    int bad = 0;
+    for (size_t i = 0; i < f.size(); ++i) bad += f[i] != ref[i];
+    CHECK_EQ(bad, 0);
+    /* A row range inside the second row: the table's requested rows come out of the table. */
+    std::vector<float> one(C);
+    REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, one.data(), &why), RAD_OK);
+    bad = 0;
+    for (int j = 0; j < C; ++j) bad += one[j] != ref[C + j];
+    CHECK_EQ(bad, 0);
+}
 
 TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     const std::string dir = fresh_dir();
@@ -2824,81 +2894,21 @@ TEST(a_drafter_merges_under_its_prefix_without_resizing_the_trunk) {
     }
 }
 
-/* Inkling 2 ships its drafter as one file beside the target (mtp.safetensors), configured by the
- * target's own `mtp_config`: the file's tensors merge under the prefix and the config is published
- * as `draft.<key>`. A file that is not a .safetensors, or a target with no mtp_config, is refused. */
-TEST(a_single_file_drafter_takes_its_config_from_mtp_config) {
-    const std::string dir = write_checkpoint(
-        { bf16("embed.weight", { 4, 4 }, 1.0f) },
-        R"({"model_type":"qwen3_5","hidden_size":256,"num_hidden_layers":2,
-            "mtp_config":{"block_size":8,"num_hidden_layers":3,"target_layer_ids":[5,23]}})");
-    write_shard(dir + "/mtp.safetensors", { bf16("fuse_weight", { 2, 2 }, 7.0f) });
-    {
-        Checkpoint ck;
-        REQUIRE_EQ(ck.open(dir), RAD_OK);
-        REQUIRE_EQ(ck.add_draft(dir + "/mtp.safetensors", "draft."), RAD_OK);
-        const SrcTensor* fw = ck.find("draft.fuse_weight");
-        REQUIRE(fw != nullptr);
-        CHECK_EQ(rad_load_f32(fw->data, RAD_BF16, 1), 8.0f);
-        const MetaOwn& m = ck.meta();
-        CHECK(m.get("draft.block_size") && std::string(m.get("draft.block_size")) == "8");
-        CHECK(m.get("draft.num_hidden_layers") &&
-              std::string(m.get("draft.num_hidden_layers")) == "3");
-        CHECK_EQ(m.m.n_layers, (int64_t)2);                  /* the trunk keeps its own */
-        CHECK_EQ(m.m.n_kv, (int)m.keys.size());
-    }
-    write_file(dir + "/notes.txt", "x");
-    {
-        Checkpoint ck;
-        REQUIRE_EQ(ck.open(dir), RAD_OK);
-        CHECK_EQ(ck.add_draft(dir + "/notes.txt", "draft."), (int)RAD_E_UNSUPPORTED);
-    }
-    const std::string bare = write_checkpoint({ bf16("embed.weight", { 4, 4 }, 1.0f) }, kConfig);
-    write_shard(bare + "/mtp.safetensors", { bf16("fuse_weight", { 2, 2 }, 7.0f) });
-    {
-        Checkpoint ck;
-        REQUIRE_EQ(ck.open(bare), RAD_OK);
-        CHECK_EQ(ck.add_draft(bare + "/mtp.safetensors", "draft."), (int)RAD_E_FORMAT);
-    }
-}
-
-/* RAD_MAP_MATMUL folds a projection into the one before it at convert, as Inkling 2's drafter folds
- * its Markov head's hidden_out into the lm_head; a vector right factor gives a vector.
- * RAD_MAP_SOFTMAX takes one row's softmax (the drafter's tap weights). Neither is stored as the
- * checkpoint holds it. */
-TEST(derived_matmul_and_softmax_weights) {
-    const std::string dir = write_checkpoint(
-        { bf16("l", { 3, 2 }, 0.0f), bf16("r", { 2, 4 }, 1.0f), bf16("b", { 2 }, 10.0f),
-          bf16("f", { 2, 3 }, 0.0f), bf16("odd", { 3, 3 }, 0.0f) }, "{}");
+/* Inkling 2's release carries its own DSpark drafter (mtp.safetensors, config.json's mtp_config),
+ * which is not served: naming that directory as the drafter is refused by name, and nothing is
+ * merged under `draft.`. */
+TEST(inkling2s_own_dspark_drafter_is_refused_as_a_drafter) {
+    const std::string dir = write_checkpoint({ bf16("embed.weight", { 4, 4 }, 1.0f) }, kConfig);
+    const std::string draft = dir + "_mtp";
+    ::mkdir(draft.c_str(), 0755);
+    write_file(draft + "/config.json",
+               R"({"model_type":"inkling2","mtp_config":{"block_size":8,"num_hidden_layers":3}})");
+    write_shard(draft + "/mtp.safetensors", { bf16("fc.weight", { 2, 2 }, 5.0f) });
     Checkpoint ck;
     REQUIRE_EQ(ck.open(dir), RAD_OK);
-    Program prog;
-    prog.name_map.push_back(map("lr", RAD_MAP_MATMUL, { "l", "r" }));
-    prog.name_map.push_back(map("lb", RAD_MAP_MATMUL, { "l", "b" }));
-    prog.name_map.push_back(map("bad", RAD_MAP_MATMUL, { "l", "odd" }));
-    prog.name_map.push_back(map("sm", RAD_MAP_SOFTMAX, { "f" }, { 1 }));
-    CkptWeight w;
-    std::string why;
-    REQUIRE_EQ(ckpt_resolve(ck, prog, "lr", false, &w, &why), RAD_OK);
-    CHECK(!w.trivial);
-    REQUIRE_EQ(w.rank, 2u);
-    CHECK_EQ(w.shape[0], (int64_t)3);
-    CHECK_EQ(w.shape[1], (int64_t)4);
-    std::vector<float> f(4);
-    REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, f.data(), &why), RAD_OK);   /* [2, 3] @ r */
-    for (int j = 0; j < 4; ++j) CHECK_EQ(f[(size_t)j], 2.0f * (1 + j) + 3.0f * (5 + j));
-    REQUIRE_EQ(ckpt_resolve(ck, prog, "lb", false, &w, &why), RAD_OK);
-    REQUIRE_EQ(w.rank, 1u);
-    CHECK_EQ(w.shape[0], (int64_t)3);
-    REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);   /* a vector is one row */
-    CHECK_EQ(f[2], 4.0f * 10 + 5.0f * 11);
-    CHECK(ckpt_resolve(ck, prog, "bad", false, &w, &why) != RAD_OK);
-    CHECK(why.find("columns") != std::string::npos);
-    REQUIRE_EQ(ckpt_resolve(ck, prog, "sm", false, &w, &why), RAD_OK);   /* row [3, 4, 5] */
-    REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
-    const double z = 1.0 + std::exp(1.0) + std::exp(2.0);
-    CHECK(std::fabs(f[0] - (float)(1.0 / z)) < 1e-7f);
-    CHECK(std::fabs(f[2] - (float)(std::exp(2.0) / z)) < 1e-7f);
+    CHECK_EQ(ck.add_draft(draft, "draft."), (int)RAD_E_UNSUPPORTED);
+    CHECK(ck.find("draft.fc.weight") == nullptr);
+    CHECK(ck.meta().get("draft.model_type") == nullptr);
 }
 
 /* ================================================================== NVFP4 and per-row FP8 */
@@ -3733,6 +3743,49 @@ TEST(row_pieces_over_several_maps_join_in_order) {
         for (int c = 0; c < 3; ++c) CHECK_EQ(f[(size_t)(r * 3 + c)], (float)(order[r] * 3 + c));
 }
 
+/* A row piece of a ModelOpt NVFP4 weight is those rows of its codes and of its scale plane, so
+ * Nemotron-H's z | x|B|C | dt pieces of one NVFP4 in_proj resolve: rows 1 and 2 of a 4-row weight
+ * whose rows have their own block scales decode to rows 1 and 2 of the whole weight. Rows past the
+ * weight are refused. */
+TEST(a_row_piece_of_an_nvfp4_weight_is_those_rows_of_its_codes_and_scales) {
+    const int64_t N = 4, K = 32;
+    std::vector<T> ts;
+    T p{ "g.weight", "U8", { N, K / 2 }, {} };
+    for (int64_t i = 0; i < N * K / 2; ++i) p.bytes.push_back((uint8_t)((i * 37 + 11) & 0xFF));
+    ts.push_back(p);
+    T s{ "g.weight_scale", "F8_E4M3", { N, K / 16 }, {} };
+    static const uint8_t kScale[4][2] = { { 0x40, 0x30 }, { 0x38, 0x48 }, { 0x30, 0x40 }, { 0x48, 0x38 } };
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < 2; ++b) s.bytes.push_back(kScale[n][b]);
+    ts.push_back(s);
+    ts.push_back(f32_scalar("g.weight_scale_2", 0.25f));
+    const std::string dir = write_checkpoint(ts, kModelOptConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("whole", RAD_MAP_COPY, { "g.weight" }));
+    prog.name_map.push_back(ranged("mid", RAD_MAP_ROWS, { "g.weight" }, { 1 }, { 2 }));
+    prog.name_map.push_back(ranged("past", RAD_MAP_ROWS, { "g.weight" }, { 3 }, { 2 }));
+    CkptWeight whole, mid;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "whole", false, &whole, &why), RAD_OK);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "mid", false, &mid, &why), RAD_OK);
+    CHECK(mid.imported && !mid.trivial);
+    CHECK_EQ(mid.shape[0], (int64_t)2);
+    CHECK_EQ(mid.shape[1], K);
+    char en[96];
+    rad_enc_format(&mid.enc, en, sizeof en);
+    CHECK_EQ(std::string(en), std::string("fp4_e2m1*f32[1x16]"));
+    std::vector<float> a((size_t)(N * K)), b((size_t)(2 * K));
+    REQUIRE_EQ(ckpt_rows_f32(whole, 0, N, a.data(), &why), RAD_OK);
+    REQUIRE_EQ(ckpt_rows_f32(mid, 0, 2, b.data(), &why), RAD_OK);
+    int bad = 0;
+    for (int64_t i = 0; i < 2 * K; ++i) bad += b[(size_t)i] != a[(size_t)(K + i)];
+    CHECK_EQ(bad, 0);
+    CkptWeight past;
+    CHECK_EQ(ckpt_resolve(ck, prog, "past", false, &past, &why), (int)RAD_E_SHAPE);
+}
+
 /* A release split into single files merges them under their own names; a name two files share
  * is refused. The metadata and tokenizer come from the directory set before open(). */
 TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
@@ -3802,6 +3855,393 @@ TEST(a_bailing_gguf_must_promise_a_walkable_layer_count) {
     write_gguf(deep_rank, bailing_kvs(4, 1, 4, 4611686018427387904LL), {});
     Checkpoint ck5;
     REQUIRE_EQ(ck5.open(deep_rank), RAD_E_FORMAT);
+}
+
+/* pack_of inverts unpack for the native-layout types: any bytes as blocks, unpacked into their
+ * planes and packed again, come back unchanged (every bit pattern is a valid block of these
+ * types: codes, scales and signs are copied, never interpreted). */
+TEST(ggml_pack_inverts_unpack_for_every_block) {
+    const uint32_t types[] = { 8 /* q8_0 */, 13 /* q5_K */, 14 /* q6_K */, 20 /* iq4_nl */,
+                               16 /* iq2_xxs */, 19 /* iq1_s */, 18 /* iq3_xxs */ };
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    for (uint32_t ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty);
+        REQUIRE(k != nullptr);
+        const lq::ggml::PackFn pack = lq::ggml::pack_of(ty);
+        REQUIRE(pack != nullptr);
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        for (int64_t nb : { (int64_t)1, (int64_t)3, (int64_t)7 }) {
+            std::vector<uint8_t> blocks((size_t)(nb * (int64_t)k->block_bytes)), back(blocks.size(), 0xA5);
+            for (uint8_t& b : blocks) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                b = (uint8_t)(seed >> 56);
+            }
+            const int64_t cols = nb * k->block;
+            std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+            std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
+            for (int i = 0; i < e.n_planes; ++i) {
+                const RadEncPlane& pl = e.plane[i];
+                if (pl.kind == RAD_PLANE_TABLE || (pl.block[0] == 0 && pl.block[1] == 0)) continue;
+                int64_t pr = 0, pc = 0;
+                rad_enc_plane_dims(&pl, 1, cols, &pr, &pc);
+                planes[(size_t)i].assign((size_t)(rad_enc_row_bytes(pl.dtype, pc) + 8), 0);
+                row[(size_t)i] = planes[(size_t)i].data();
+            }
+            k->unpack(blocks.data(), nb, row.data());
+            pack((const uint8_t* const*)row.data(), nb, back.data());
+            CHECK(blocks == back);
+            if (blocks != back) {
+                size_t at = 0;
+                while (at < blocks.size() && blocks[at] == back[at]) ++at;
+                fprintf(stderr, "  %s nb=%lld: first byte differing at %zu of %zu (%02x vs %02x)\n",
+                        k->name, (long long)nb, at, blocks.size(), blocks[at], back[at]);
+            }
+        }
+    }
+}
+
+/* Each GGUF type's encoding is its own (arch/common/rad_ggml.h names a weight's type by its encoding,
+ * so two types with one encoding would be read as whichever comes first). Every pair of types the
+ * import reads differs. */
+TEST(ggml_encodings_are_distinct) {
+    std::vector<const lq::ggml::PlaneKind*> kinds;
+    for (uint32_t t = 0; t < 64; ++t)
+        if (const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t)) kinds.push_back(k);
+    REQUIRE(kinds.size() >= 6);
+    for (size_t i = 0; i < kinds.size(); ++i)
+        for (size_t j = i + 1; j < kinds.size(); ++j) {
+            const RadEncoding a = lq::ggml::encoding_of(kinds[i]->type);
+            const RadEncoding b = lq::ggml::encoding_of(kinds[j]->type);
+            if (rad_enc_equal(&a, &b))
+                fprintf(stderr, "  %s and %s share an encoding\n", kinds[i]->name, kinds[j]->name);
+            CHECK(!rad_enc_equal(&a, &b));
+        }
+}
+
+/* No GGUF type's encoding is OCP MXFP4's (fp4_e2m1 codes, an e8m0 exponent per 32): MXFP4 is a
+ * retired weight format, refused by name (arch/common/rad_linear.h, linear_retired), and a type sharing
+ * its encoding would let arch/common/rad_ggml.h name such a weight a GGUF type and serve it. */
+TEST(no_ggml_type_has_the_mxfp4_encoding) {
+    RadEncoding mx;
+    rad_enc_clear(&mx);
+    rad_enc_copy_str(mx.scheme, "affine");
+    rad_enc_add_plane(&mx, "codes", RAD_FP4E2M1, 1, 1);
+    rad_enc_add_plane(&mx, "scale", RAD_E8M0, 1, 32);
+    for (uint32_t t = 0; t < 64; ++t)
+        if (const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t)) {
+            const RadEncoding e = lq::ggml::encoding_of(k->type);
+            if (rad_enc_equal(&e, &mx)) fprintf(stderr, "  %s has MXFP4's encoding\n", k->name);
+            CHECK(!rad_enc_equal(&e, &mx));
+        }
+}
+
+/* dequant_of (llama.cpp's dequantize_row_<type>) over native blocks equals the core's decode of the
+ * same blocks' planes, bit for bit: the native reader's values are the container's. Random blocks
+ * with each f16 super-scale set to a finite value (a NaN scale compares unequal to itself). */
+TEST(ggml_native_dequant_equals_the_plane_decode) {
+    struct T { uint32_t type; std::vector<size_t> f16_at; };
+    const T types[] = {
+        { 8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { 13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
+        { 14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { 20, { offsetof(lq::ggml::block_iq4_nl, d) } },
+        { 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { 19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { 18, { offsetof(lq::ggml::block_iq3_xxs, d) } },
+    };
+    uint64_t seed = 0xD1B54A32D192ED03ull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    for (const T& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const lq::ggml::DequantFn dq = lq::ggml::dequant_of(ty.type);
+        REQUIRE(dq != nullptr);
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        const int64_t nb = 5, cols = nb * k->block;
+        std::vector<uint8_t> blocks((size_t)(nb * (int64_t)k->block_bytes));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < nb; ++i)
+            for (size_t off : ty.f16_at) {
+                /* sign, exponent 1..30 (normal), any mantissa; small exponents keep the
+                 * products away from overflow */
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((5u + rnd() % 14u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
+            }
+        std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+        std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
+        std::vector<void*> all((size_t)e.n_planes, nullptr);
+        for (int i = 0; i < e.n_planes; ++i) {
+            const RadEncPlane& pl = e.plane[i];
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&pl, 1, cols, &pr, &pc);
+            planes[(size_t)i].assign((size_t)(pr * rad_enc_row_bytes(pl.dtype, pc) + 8), 0);
+            all[(size_t)i] = planes[(size_t)i].data();
+            if (pl.kind != RAD_PLANE_TABLE && !(pl.block[0] == 0 && pl.block[1] == 0))
+                row[(size_t)i] = planes[(size_t)i].data();
+        }
+        k->unpack(blocks.data(), nb, row.data());
+        lq::ggml::write_shared(k->type, e, all.data());
+        EncodedView v;
+        enc_view(e, 1, cols, (const void* const*)all.data(), &v);
+        std::vector<float> a((size_t)cols), b((size_t)cols);
+        std::string why;
+        REQUIRE_EQ(enc_decode_rows(v, 0, 1, a.data(), &why), RAD_OK);
+        dq(blocks.data(), b.data(), cols);
+        int64_t bad = 0, first = -1;
+        for (int64_t j = 0; j < cols; ++j) {
+            uint32_t x, y;
+            std::memcpy(&x, &a[(size_t)j], 4);
+            std::memcpy(&y, &b[(size_t)j], 4);
+            if (x != y) { ++bad; if (first < 0) first = j; }
+        }
+        CHECK_EQ(bad, (int64_t)0);
+        if (bad) fprintf(stderr, "  %s: %lld of %lld differ, first at %lld (%.9g vs %.9g)\n", k->name,
+                         (long long)bad, (long long)cols, (long long)first, a[(size_t)first], b[(size_t)first]);
+    }
+}
+
+/* ---------------------------------------------------------------- DeepSeek-V4's release form
+ *
+ * quant_method fp8 with scale_fmt ue8m0 and expert_dtype fp4: `X.weight` F8_E4M3 beside an
+ * `X.scale` F8_E8M0 per 32x32 block, the routed experts `X.weight` I8 [N, K/2] (two e2m1 codes a
+ * byte, element 2j low) beside `X.scale` F8_E8M0 [N, K/32], and the Engram tables e4m3 rows with
+ * an e8m0 per 32 of a row. Every value is exact in f32: code times 2^(e - 127). */
+namespace {
+
+const char* kDsConfig =
+    "{\"architectures\":[\"DeepseekV41ForCausalLM\"],\"model_type\":\"deepseek_v41\","
+    "\"quantization_config\":{\"quant_method\":\"fp8\",\"activation_scheme\":\"dynamic\","
+    "\"weight_block_size\":[32,32],\"scale_fmt\":\"ue8m0\",\"expert_dtype\":\"fp4\"},"
+    "\"text_config\":{\"hidden_size\":64,\"num_hidden_layers\":1}}";
+
+/* e8m0 exponents around 127 and both ends that stay finite in f32 (0 is 2^-127, a subnormal). */
+T e8m0(const std::string& name, std::vector<int64_t> shape, int seed) {
+    T t{ name, "F8_E8M0", shape, {} };
+    int64_t n = 1;
+    for (int64_t s : shape) n *= s;
+    static const uint8_t pick[] = { 127, 120, 131, 0, 254, 111, 126, 128, 1 };
+    for (int64_t i = 0; i < n; ++i) t.bytes.push_back(pick[(size_t)((i + seed) % 9)]);
+    return t;
+}
+/* Every e4m3 code but the two NaNs (0x7f, 0xff), in turn. */
+T e4m3_codes(const std::string& name, std::vector<int64_t> shape, int seed) {
+    T t{ name, "F8_E4M3", shape, {} };
+    int64_t n = 1;
+    for (int64_t s : shape) n *= s;
+    for (int64_t i = 0; i < n; ++i) {
+        uint8_t b = (uint8_t)((i * 29 + seed) & 0xff);
+        if ((b & 0x7f) == 0x7f) b ^= 1;
+        t.bytes.push_back(b);
+    }
+    return t;
+}
+T i8_nibbles(const std::string& name, int64_t N, int64_t K, int seed) {
+    T t{ name, "I8", { N, K / 2 }, {} };
+    for (int64_t i = 0; i < N * K / 2; ++i) t.bytes.push_back((uint8_t)((i * 53 + seed) & 0xff));
+    return t;
+}
+float e4m3_at(const T& t, int64_t i) { return rad_fp8e4m3_to_f32(t.bytes[(size_t)i]); }
+float e8m0_at(const T& t, int64_t i) { return std::ldexp(1.0f, (int)t.bytes[(size_t)i] - 127); }
+
+}  /* namespace */
+
+TEST(a_deepseek_v4_release_is_imported_as_fp8_blocks_and_mxfp4_experts) {
+    const int64_t N = 64, K = 96, E = 3, KE = 64;
+    const T wq = e4m3_codes("l.wq.weight", { N, K }, 3), wqs = e8m0("l.wq.scale", { 2, 3 }, 1);
+    const T w1 = i8_nibbles("l.experts.0.w1.weight", E, KE, 1), w1s = e8m0("l.experts.0.w1.scale", { E, 2 }, 2);
+    const T w3 = i8_nibbles("l.experts.0.w3.weight", E, KE, 7), w3s = e8m0("l.experts.0.w3.scale", { E, 2 }, 5);
+    const T em = e4m3_codes("l.engram.embed.weight", { 5, 64 }, 11), ems = e8m0("l.engram.embed.scale", { 5, 2 }, 4);
+    const std::string dir = write_checkpoint({ wq, wqs, w1, w1s, w3, w3s, em, ems,
+                                               bf16("l.norm.weight", { 4 }, 1.0f) }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::Fp8Mx);
+    CHECK(ck.import_refusal().empty());
+    CHECK_EQ(ck.fp8_block_rows(), (int64_t)32);
+    CHECK_EQ(ck.fp8_block_cols(), (int64_t)32);
+    /* the release's quantization_config is provenance: no plugin claims "fp8" for it */
+    CHECK(ck.meta().get("quantization_config.quant_method") == nullptr);
+    CHECK(ck.meta().get("imported_quantization_config.expert_dtype") != nullptr);
+    const SrcTensor* st = ck.find("l.wq.scale");
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->rad_dtype, (uint32_t)RAD_E8M0);
+
+    Program prog;
+    prog.name_map.push_back(map("wq", RAD_MAP_COPY, { "l.wq.weight" }));
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "l.experts.0.w1.weight", "l.experts.0.w3.weight" }));
+    prog.name_map.push_back(map("em", RAD_MAP_COPY, { "l.engram.embed.weight" }));
+    prog.name_map.push_back(map("n", RAD_MAP_COPY, { "l.norm.weight" }));
+    CkptWeight w;
+    std::string why;
+
+    /* block FP8: fp8_e4m3*e8m0[32x32], every element exact */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "wq", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)32);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    CHECK(rad_enc_valid(&w.enc));
+    std::unordered_set<std::string> hit;
+    CHECK(ckpt_reads_any(w, { "l.wq.scale" }, &hit));
+    std::vector<float> f((size_t)(N * K));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, N, f.data(), &why), RAD_OK);
+    int64_t bad = 0;
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c)
+            if (f[(size_t)(r * K + c)] != e4m3_at(wq, r * K + c) * e8m0_at(wqs, (r / 32) * 3 + c / 32)) ++bad;
+    CHECK_EQ(bad, (int64_t)0);
+
+    /* fp4 experts: gate and up joined, fp4_e2m1*e8m0[1x32], the codes the shipped bytes */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    CHECK_EQ(w.rows, 2 * E);
+    CHECK_EQ(w.cols, KE);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_FP4E2M1);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    std::vector<uint8_t> cp((size_t)(2 * E * KE / 2)), sp((size_t)(2 * E * KE / 32));
+    REQUIRE_EQ(ckpt_plane_rows(w, 0, 0, 2 * E, cp.data(), &why), RAD_OK);
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 2 * E, sp.data(), &why), RAD_OK);
+    CHECK_EQ(std::memcmp(cp.data(), w1.bytes.data(), w1.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(cp.data() + w1.bytes.size(), w3.bytes.data(), w3.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(sp.data(), w1s.bytes.data(), w1s.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(sp.data() + w1s.bytes.size(), w3s.bytes.data(), w3s.bytes.size()), 0);
+    std::vector<float> g((size_t)(2 * E * KE));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 2 * E, g.data(), &why), RAD_OK);
+    bad = 0;
+    for (int64_t r = 0; r < 2 * E; ++r) {
+        const T& c = r < E ? w1 : w3;
+        const T& s = r < E ? w1s : w3s;
+        const int64_t rr = r % E;
+        for (int64_t k = 0; k < KE; ++k) {
+            const uint8_t b = c.bytes[(size_t)(rr * KE / 2 + k / 2)];
+            const float code = rad_fp4e2m1_to_f32((uint8_t)(k % 2 ? b >> 4 : b & 15));
+            if (g[(size_t)(r * KE + k)] != code * e8m0_at(s, rr * 2 + k / 32)) ++bad;
+        }
+    }
+    CHECK_EQ(bad, (int64_t)0);
+
+    /* e4m3 rows with an e8m0 per 32 of each row: fp8_e4m3*e8m0[1x32] */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "em", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    std::vector<float> h((size_t)(5 * 64));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 5, h.data(), &why), RAD_OK);
+    bad = 0;
+    for (int64_t i = 0; i < 5 * 64; ++i)
+        if (h[(size_t)i] != e4m3_at(em, i) * e8m0_at(ems, (i / 64) * 2 + (i % 64) / 32)) ++bad;
+    CHECK_EQ(bad, (int64_t)0);
+
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
+}
+
+/* A row range of a block-scaled FP8 tensor (DeepSeek-V4.1's grouped output projection read one
+ * group at a time) takes its scale plane's rows with it when it starts and ends on a block; one
+ * that cuts a block is refused, since its first rows would take another block's scales. */
+TEST(row_pieces_of_block_fp8_take_their_scale_rows) {
+    const int64_t N = 96, K = 64;
+    const T wo = e4m3_codes("l.wo.weight", { N, K }, 9), wos = e8m0("l.wo.scale", { 3, 2 }, 6);
+    const T em = e4m3_codes("l.t.weight", { 6, 64 }, 2), ems = e8m0("l.t.scale", { 6, 2 }, 3);
+    const std::string dir = write_checkpoint({ wo, wos, em, ems }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(ranged("g1", RAD_MAP_ROWS, { "l.wo.weight" }, { 32 }, { 32 }));
+    prog.name_map.push_back(ranged("g12", RAD_MAP_ROWS, { "l.wo.weight" }, { 32 }, { 64 }));
+    prog.name_map.push_back(ranged("cut", RAD_MAP_ROWS, { "l.wo.weight" }, { 16 }, { 32 }));
+    prog.name_map.push_back(ranged("t", RAD_MAP_ROWS, { "l.t.weight" }, { 3 }, { 2 }));
+    CkptWeight w;
+    std::string why;
+    for (const char* name : { "g1", "g12" }) {
+        REQUIRE_EQ(ckpt_resolve(ck, prog, name, false, &w, &why), RAD_OK);
+        REQUIRE(w.trivial);
+        CHECK_EQ(w.enc.plane[1].block[0], (int64_t)32);
+        std::vector<float> f((size_t)(w.rows * K));
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, w.rows, f.data(), &why), RAD_OK);
+        int64_t bad = 0;
+        for (int64_t r = 0; r < w.rows; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                const int64_t R = 32 + r;
+                if (f[(size_t)(r * K + c)] != e4m3_at(wo, R * K + c) * e8m0_at(wos, (R / 32) * 2 + c / 32))
+                    ++bad;
+            }
+        CHECK_EQ(bad, (int64_t)0);
+        std::vector<uint8_t> sp((size_t)(w.rows / 32 * 2));
+        REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, w.rows / 32, sp.data(), &why), RAD_OK);
+        CHECK_EQ(std::memcmp(sp.data(), wos.bytes.data() + 2, sp.size()), 0);
+    }
+    CHECK(ckpt_resolve(ck, prog, "cut", false, &w, &why) < 0);
+    CHECK(why.find("scale blocks") != std::string::npos);
+    /* a plane of a scale per group of a row cuts anywhere */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "t", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    std::vector<float> f((size_t)(2 * 64));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 2, f.data(), &why), RAD_OK);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < 2 * 64; ++i)
+        if (f[(size_t)i] != e4m3_at(em, 3 * 64 + i) * e8m0_at(ems, 6 + (i / 64) * 2 + (i % 64) / 32)) ++bad;
+    CHECK_EQ(bad, (int64_t)0);
+}
+
+/* Another expert dtype or scale format is not read as DeepSeek-V4's: refused by name, and an I8
+ * expert whose exponent plane does not fit is refused at the weight. */
+TEST(a_deepseek_release_in_another_form_is_refused) {
+    {
+        const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+            "{\"model_type\":\"deepseek_v41\",\"quantization_config\":{\"quant_method\":\"fp8\","
+            "\"weight_block_size\":[32,32],\"scale_fmt\":\"ue8m0\",\"expert_dtype\":\"fp6\"}}");
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() == Checkpoint::Import::None);
+        CHECK(ck.import_refusal().find("DeepSeek-V4 release form") != std::string::npos);
+    }
+    const T w1 = i8_nibbles("e.w1.weight", 3, 64, 1), bad = e8m0("e.w1.scale", { 3, 4 }, 0);
+    const std::string dir = write_checkpoint({ w1, bad }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("e", RAD_MAP_COPY, { "e.w1.weight" }));
+    CkptWeight w;
+    std::string why;
+    CHECK(ckpt_resolve(ck, prog, "e", false, &w, &why) < 0);
+    CHECK(why.find("exponent plane") != std::string::npos);
+}
+
+/* A gain shipped as two factors (DeepSeek-V4.1's Engram q_weight and k_weight) is their product,
+ * element by element, in f32: exact for two bf16s, flattened to the one row every model declares
+ * it as. Factors of two shapes are refused. */
+TEST(a_product_map_multiplies_its_two_factors) {
+    T q = bf16("e.q_weight", { 2, 6 }, 0.0f), k = bf16("e.k_weight", { 2, 6 }, 0.0f);
+    for (int i = 0; i < 12; ++i) {
+        rad_store_f32(q.bytes.data(), RAD_BF16, i, 0.75f + 0.125f * (float)i);
+        rad_store_f32(k.bytes.data(), RAD_BF16, i, -1.5f + 0.0625f * (float)(i * i));
+    }
+    const std::string dir = write_checkpoint({ q, k, bf16("odd", { 3, 4 }, 1.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("g", RAD_MAP_MUL, { "e.q_weight", "e.k_weight" }));
+    prog.name_map.push_back(map("bad", RAD_MAP_MUL, { "e.q_weight", "odd" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "g", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    CHECK_EQ(w.rows, (int64_t)1);
+    CHECK_EQ(w.cols, (int64_t)12);
+    std::vector<float> f(12);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
+    for (int i = 0; i < 12; ++i)
+        CHECK_EQ(f[(size_t)i], rad_load_f32(q.bytes.data(), RAD_BF16, i) *
+                               rad_load_f32(k.bytes.data(), RAD_BF16, i));
+    CHECK(ckpt_resolve(ck, prog, "bad", false, &w, &why) < 0);
+    CHECK(why.find("not the same shape") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

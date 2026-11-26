@@ -301,10 +301,7 @@ int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiL
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     if (!only_keys(b, { "model", "state", "questions", "images" }, "", err)) return RAD_E_INVAL;
-    if (b.contains("model") && (!b["model"].is_string() || b["model"] != model_id)) {
-        *err = err_bad("model", "must name the loaded model, " + model_id);
-        return RAD_E_INVAL;
-    }
+    if (!names_loaded_model(b, model_id, err)) return RAD_E_INVAL;
     if (!b.contains("state")) {
         *err = err_bad("state", "required: a string, any JSON value, or null with images");
         return RAD_E_INVAL;
@@ -312,6 +309,11 @@ int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiL
     const json& qs = b.contains("questions") ? b["questions"] : json();
     if (!qs.is_object() || qs.empty()) {
         *err = err_bad("questions", "must be a non-empty object of named questions");
+        return RAD_E_INVAL;
+    }
+    if (qs.size() > kMaxDecisionQuestions) {
+        *err = err_bad("questions", "at most " + std::to_string(kMaxDecisionQuestions) +
+                                    " questions a request");
         return RAD_E_INVAL;
     }
 

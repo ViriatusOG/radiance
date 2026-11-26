@@ -2979,7 +2979,7 @@ __device__ __forceinline__ void hc_down_tiled_body(
     }
 
     /* ---- the split's finisher. With `ctr` the last K slice of a (row tile, column tile) to arrive
-     * reduces it, as gemm_fp8a8's split finisher does, instead of a separate hc_down_reduce launch
+     * reduces it, as gemm_i8a8's split finisher does, instead of a separate hc_down_reduce launch
      * (a dependent dispatch and its ~3 us of ordering a connection). The counter resets itself,
      * sound while two launches on its block never overlap (hc_mix_ctr). Each element is summed
      * from zero in ascending z with hc_down_reduce_kernel's loads and adds, so the bytes are that
@@ -3109,7 +3109,8 @@ void hc_down_reduce_kernel(const float* __restrict__ part, unsigned short* __res
     const long tot = rows * ncol;
     if (i >= tot) return;
     /* Eight loads before the adds: with one `s +=` per iteration a deep split becomes a dependent
-     * chain of DRAM latency. The add order is unchanged (as in gemm_fp8a8's splitk_reduce_kernel). */
+     * chain of DRAM latency. The add order is unchanged (as in gemm_i8a8's
+     * splitk_reduce_kernel). */
     float s = 0.0f;
     int   z = 0;
     for (; z + 8 <= ksplit; z += 8) {
@@ -4084,7 +4085,7 @@ void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* _
     if (rq) hc_rot_group<I8>(t, lane, rq + r * rqrow + base, rqs + r * rsrow + g);
 }
 
-/* The mix finisher's arrival counters, one block per stream (as gemm_fp8a8's split_ctr): a
+/* The mix finisher's arrival counters, one block per stream (as gemm_i8a8's split_ctr): a
  * self-resetting counter is sound only while two launches of its kernel cannot overlap, which one
  * stream guarantees. Allocation failure is not an error; the caller runs the unfused pair. */
 constexpr unsigned kMaxMixCtr = 2048;

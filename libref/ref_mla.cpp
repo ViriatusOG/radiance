@@ -80,7 +80,8 @@ int ref_mla_attn_paged(const RadArgs* a, RadStream) {
     heads_view(qr, R);
     heads_view(o, L);
     if (h < 1 || L < 1 || L > 2048 || R < 0 || bs < 1 || !std::isfinite(scale) || scale <= 0 ||
-        q.rank != 3 || q.shape[0] < 1 || q.shape[1] != h || q.shape[2] != L || (R && (qr.rank != 3 ||
+        q.rank != 3 || q.shape[0] < 1 || q.shape[1] != h || q.shape[2] != L ||
+            (R && (qr.rank != 3 ||
         qr.shape[0] != q.shape[0] || qr.shape[1] != h || qr.shape[2] != R)) || kv.rank != 4 ||
         kv.shape[1] != 1 || kv.shape[2] != bs || kv.shape[3] < L + R || bt.rank != 2 ||
         su.rank != 1 || cu.rank != 1 || numel(&cu) != numel(&su) + 1 || o.rank != 3 ||

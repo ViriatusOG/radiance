@@ -20,6 +20,7 @@
 #include "suffix.h"
 #include "diag/diagnose.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -74,6 +75,17 @@ struct SchedReq {
      * (hit_holes_draft_); drafting then waits until the window has slid past it. */
     int64_t  draft_lo = 0;
     int64_t  draft_hi = 0;
+
+    /* --draft-min-accept (Scheduler::block_begin, commit): this request's smoothed tokens per
+     * verify step, whether the drafter is stopped for it, and the generated-token count at which
+     * it next proposes one block to measure again. Describes the text, so it is reset at admission
+     * only (add_locked), not by drafter_reset(): a preemption keeps it, a recycled slot must not. */
+    double   acc_ewma = 0.0;
+    int32_t  acc_n = 0;
+    bool     spec_off = false;
+    int64_t  probe_at = 0;
+    int64_t  probe_gap = 128;    /* generated tokens to the next probe; doubles on a failed one */
+    bool     probing = false;    /* a probe block was proposed and its verify is not yet committed */
 
     /* Clears all drafter state for the sequence in this slot, on admission and on preemption.
      * Slots are recycled, so anything not reset here leaks into an unrelated sequence: a stale
@@ -487,12 +499,37 @@ public:
         return was_on;
     }
     const RadBatch* block_context(int step);
+    /* The engine saved the checkpoint of `seq` at `pos` without a valid drafter window (no
+     * context pass behind its step, or the drafter group's window rows were not held): do not
+     * commit it, and count it. The slot is released when the next step begins. */
+    void skip_ckpt_commit(uint64_t seq, int64_t pos);
+    /* The same, from inside locked(). */
+    void skip_ckpt_commit_locked(uint64_t seq, int64_t pos);
+    /* Consumes the mark for (seq, pos), if any. Every entry of a step's checkpoint consumes its
+     * mark in commit (running or not), so none outlives the step that made it. */
+    bool take_ckpt_skip(uint64_t seq, int64_t pos);
     const RadBatch* block_query(int step);
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    /* Depth 0 and the hybrid (draft.h; hybrid_ below) are set at load from the configuration
+     * (--draft-depth0, --draft-probe, --draft-probe-backoff, --draft-hybrid, --draft-hybrid-match).
+     * These change them between steps, for tests; each returns the value the scheduler now runs,
+     * refusing what the deployment cannot (depth 0 without the adaptive window, the hybrid
+     * without a head that drafts chains). */
+    int      set_draft_depth0(int v);
+    int      set_draft_probe(int v);
+    int      set_draft_hybrid(int v);
+    int      set_draft_hybrid_match(int v);
+    /* The hybrid's counts: steps whose proposal for a sequence was the lookup's, the head's, and
+     * steps not issued ahead because of a long match. */
+    bool     hybrid_enabled() const { return hybrid_on(); }
+    int      hybrid_match() const { return hybrid_match_; }
+    int64_t  hybrid_lookups() const { return hybrid_lookup_; }
+    int64_t  hybrid_heads() const { return hybrid_head_; }
+    int64_t  hybrid_unahead() const { return hybrid_unahead_; }
     LookupGate&          lookup_gate() { return lookup_; }
     SchedMetrics         metrics() const;
 
@@ -617,6 +654,18 @@ private:
      * IKVManager::window_snapshot() so prefix.cpp's and the KV manager's rules live in one
      * place. */
     bool          hit_holes_draft_ = true;
+    /* --draft-max-lanes: whether the last block_begin found the load above the gate (for the log). */
+    bool          draft_gate_off_ = false;
+    /* (sequence, position) checkpoints this step saved without a valid drafter window
+     * (skip_ckpt_commit): collect does not commit them. */
+    std::vector<std::pair<uint64_t, int64_t>> ckpt_skip_;
+    int64_t       gate_flips_ = 0;   /* --draft-max-lanes transitions so far (log rate limit) */
+    int64_t       acc_flips_ = 0;    /* --draft-min-accept transitions so far (log rate limit) */
+    /* --draft-min-accept constants: the on threshold sits this far above the off one; the smoothing
+     * of each verify and of a probe; verifies before the first decision; tokens between probes. */
+    static constexpr double  kAccBand = 0.4, kAccAlpha = 0.25, kAccProbeAlpha = 0.5;
+    static constexpr int32_t kAccWarm = 2;
+    static constexpr int64_t kAccProbeFirst = 128, kAccProbeMax = 1024;
     /* Does a hit leave a hole in the trunk: a paged group with a trunk layer (bound below
      * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index and
      * no checkpoint slot carries? Unlike a drafter hole, recomputing the tail cannot repair it;
@@ -642,6 +691,9 @@ private:
      * A hit whose nearest checkpoint below that point gives back more than two windows is kept
      * whole. */
     int64_t       draft_refill_ = 0;
+    /* The widest window group only a block drafter's layers read, when the drafter stages no window
+     * itself (RadDrafterDecl::window 0); else 0. It is the refill span and the reach guard's window. */
+    int64_t       draft_local_window_ = 0;
     /* A serial head with no cache of its own (rad_drafter_shared_kv). It owes no history, so
      * serial_begin gives it one row per drafting sequence and none otherwise, and its rounds stay
      * at the committed position (advance.h). False and 0 for every other drafter. */
@@ -687,6 +739,31 @@ private:
     /* --draft-suffix: the suffix proposal for `s`'s next step, over its committed history, into
      * `out` (RAD_SCHED_MAX_SPEC entries). Returns its length, 0 for none. */
     int suffix_propose(SchedReq& s, int32_t* out, int* match = nullptr);
+    /* The same lookup into `out` rather than s.draft, the match counted up to `match_cap`; never the
+     * oracle's ids. For the hybrid, which must not touch a head's published proposal until it
+     * takes the lookup's. */
+    int lookup_into(SchedReq& s, int depth, int32_t* out, int* match, int match_cap) const;
+
+    /* The hybrid (--draft-hybrid): beside a draft head, a sequence whose prompt lookup matches at
+     * least hybrid_match_ tokens back verifies the lookup's proposal instead of the head's. A long
+     * match is a copy (an edit re-emitting a region, a quoted block, a repeated structure), where
+     * the lookup's drafts come true far more often than a head's, and cost no head pass. The head
+     * still drafts every sequence; its proposal is the one replaced. The lookup needs the
+     * sequence's text up to the anchor, which the host has only after the commit, so a step issued
+     * ahead (which verifies the card's proposals before the commit) is not issued while a running
+     * sequence's last match was long: that step is planned by step() instead, after the commit,
+     * where the lookup and the head's proposal are both known. hybrid_match_ is
+     * --draft-hybrid-match, LookupGate's kLongMatch by default. A lookup proposal is the whole window (next_depth()), not the head's
+     * estimate of the sequence, and stays out of that estimate (commit). Off (the default), none
+     * of this runs: hybrid_on() is false at both sites. */
+    bool    hybrid_ = false;
+    int     hybrid_match_ = LookupGate::kLongMatch;
+    int64_t hybrid_lookup_ = 0, hybrid_head_ = 0, hybrid_unahead_ = 0;
+    bool    hybrid_on() const { return hybrid_ && draft_head_ && debug_oracle_.empty(); }
+    /* The deployment declares a draft head (serial or block) that drafts chains. Not a tree head:
+     * a tree is verified only on a step issued ahead (Engine::step_loop), and the hybrid plans the
+     * steps behind a long match after the commit, where a neighbour's tree could not be verified. */
+    bool    draft_head_ = false;
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;
@@ -852,6 +929,10 @@ private:
 
     SchedMetrics m_{};
     std::chrono::steady_clock::time_point step_start_{};
+    /* The running step's phase and start (steady clock, ns), for observed_metrics(): written by
+     * the engine thread once a step, read by any thread without a lock. -1 when no step runs. */
+    std::atomic<int>     open_phase_{-1};
+    std::atomic<int64_t> open_start_ns_{0};
     /* When the last step ended. An idle engine runs no steps, so nothing adds time to the
      * throughput window; metrics() decays what it reports by this. */
     std::chrono::steady_clock::time_point last_step_at_ = std::chrono::steady_clock::now();
@@ -943,6 +1024,8 @@ private:
      * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
      * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
     bool preempted_can_prefill(const SchedReq& s) const;
+    int64_t blocks_still_needed(const Request& r, int32_t g, int64_t block_size) const;
+    bool refill_cap(const Request& r, HitCap* cap) const;
     /* A fresh prefill: the whole prompt plus one decode position fits in every FULL paged group,
      * with one block past that for every running sequence. WINDOW/RING recycle. */
     bool fresh_prefill_can_fit(const SchedReq& s) const;

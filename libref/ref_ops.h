@@ -64,6 +64,8 @@ int ref_mhc_pre_partial    (const RadArgs*, RadStream);
 int ref_mhc_pre_finish     (const RadArgs*, RadStream);
 int ref_mhc_post           (const RadArgs*, RadStream);
 int ref_mhc_contract       (const RadArgs*, RadStream);
+int ref_mhc_mix            (const RadArgs*, RadStream);
+int ref_mhc_collapse       (const RadArgs*, RadStream);
 int ref_kda_update         (const RadArgs*, RadStream);
 int ref_ssd_update         (const RadArgs*, RadStream);
 int ref_hc_read            (const RadArgs*, RadStream);
@@ -75,6 +77,8 @@ int ref_grid_embed         (const RadArgs*, RadStream);
 int ref_grid_embed_pad     (const RadArgs*, RadStream);
 int ref_grid_embed_aa      (const RadArgs*, RadStream);
 int ref_grid_embed_cpe     (const RadArgs*, RadStream);
+int ref_grid_embed_hw      (const RadArgs*, RadStream);
+int ref_posemb_resample    (const RadArgs*, RadStream);
 int ref_window_order       (const RadArgs*, RadStream);
 int ref_attn_res_mix      (const RadArgs*, RadStream);
 int ref_situ_mul          (const RadArgs*, RadStream);
@@ -87,6 +91,13 @@ int ref_mul                (const RadArgs*, RadStream);
 int ref_silu_mul           (const RadArgs*, RadStream);
 int ref_swiglu_clamped     (const RadArgs*, RadStream);
 int ref_router_sigmoid_topk(const RadArgs*, RadStream);
+int ref_router_scored_topk(const RadArgs*, RadStream);
+int ref_router_scored_topk_vl(const RadArgs*, RadStream);
+/* DeepSeek-V4.1's vision tower: its own 2-D rotary (both axes one ladder) and the aligner's
+ * 3x3 zero-padded pack, plus the gate's per-row bias swap. */
+int ref_ds41_vit_rope2d(const RadArgs*, RadStream);
+int ref_ds41_pack3x3(const RadArgs*, RadStream);
+int ref_ds41_span_rows(const RadArgs*, RadStream);
 int ref_router_sigmoid_group_topk(const RadArgs*, RadStream);
 int ref_swiglu_step        (const RadArgs*, RadStream);
 int ref_dsa_pool(const RadArgs*, RadStream);
@@ -143,12 +154,10 @@ int ref_gemm_nt_q_gated    (const RadArgs*, RadStream);
 int ref_dflash_select      (const RadArgs*, RadStream);
 int ref_dflash_markov_greedy(const RadArgs*, RadStream);
 int ref_dflash_markov_greedy_f32(const RadArgs*, RadStream);
-int ref_dspark_rnn_markov_greedy(const RadArgs*, RadStream);
 int ref_dflash_tree        (const RadArgs*, RadStream);
 int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
 int ref_gated_had_quant_i8 (const RadArgs*, RadStream);
-int ref_gated_quant_i8    (const RadArgs*, RadStream);
 int ref_dequant            (const RadArgs*, RadStream);
 int ref_dequant_w4         (const RadArgs*, RadStream);
 
@@ -176,10 +185,12 @@ int ref_attn_cross         (const RadArgs*, RadStream);
 int ref_table_add          (const RadArgs*, RadStream);
 int ref_mix_rows           (const RadArgs*, RadStream);
 int ref_chan_stats         (const RadArgs*, RadStream);
-/* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position (ref_sam_attn.cpp). */
+/* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position
+ * (ref_sam_attn.cpp). */
 int ref_sam_attn           (const RadArgs*, RadStream);
 int ref_kv_store           (const RadArgs*, RadStream);
-/* the store of a streamed group: the host mirror always, the ring slot when the block is resident */
+/* the store of a streamed group: the host mirror always, the ring slot when the block is
+ * resident */
 int ref_kv_store_streamed  (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
 int ref_position_scale     (const RadArgs*, RadStream);
@@ -188,6 +199,27 @@ int ref_ministral_rope     (const RadArgs*, RadStream);
 int ref_pixtral_rope       (const RadArgs*, RadStream);
 int ref_pixtral_merge      (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
+int ref_rope_rows          (const RadArgs*, RadStream);
+int ref_quant_roundtrip    (const RadArgs*, RadStream);
+int ref_softmax_pool       (const RadArgs*, RadStream);
+int ref_attn_sparse_sink   (const RadArgs*, RadStream);
+int ref_index_score        (const RadArgs*, RadStream);
+int ref_index_candidates   (const RadArgs*, RadStream);
+int ref_index_topk         (const RadArgs*, RadStream);
+/* index_candidates' keep: one bit a block of `block` positions over `width`, 32 to an i32 word. */
+static inline int64_t ref_keep_words(int64_t width, int64_t block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
+int ref_entry_store        (const RadArgs*, RadStream);
+#ifdef REF_HAVE_GGML
+int ref_gemm_nt_ggml       (const RadArgs*, RadStream);
+int ref_moe_gemm_ggml      (const RadArgs*, RadStream);
+int ref_logits_gemm_ggml   (const RadArgs*, RadStream);
+int ref_embed_lookup_ggml  (const RadArgs*, RadStream);
+#endif
+int ref_token_map          (const RadArgs*, RadStream);
+int ref_embed_lookup_planes(const RadArgs*, RadStream);
+int ref_stream_gate_add    (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
 int ref_ln_mod(const RadArgs*, RadStream);
@@ -319,6 +351,10 @@ int ref_gdn_kkt_solve      (const RadArgs*, RadStream);
 int ref_gdn_chunk_scan     (const RadArgs*, RadStream);
 int ref_gdn_recurrent_update(const RadArgs*, RadStream);
 int ref_gdn_conv_recurrent_update(const RadArgs*, RadStream);
+/* The decode trio over a tree verify (rad_drafter_tree): `spec_parent` appended. */
+int ref_gdn_conv_update_tree(const RadArgs*, RadStream);
+int ref_gdn_recurrent_update_tree(const RadArgs*, RadStream);
+int ref_gdn_conv_recurrent_update_tree(const RadArgs*, RadStream);
 int ref_gdn_gated_rmsnorm  (const RadArgs*, RadStream);
 
 /* ---- collectives */
@@ -367,6 +403,8 @@ REF_SHAPE_FN(ref_mhc_pre_partial);
 REF_SHAPE_FN(ref_mhc_pre_finish);
 REF_SHAPE_FN(ref_mhc_post);
 REF_SHAPE_FN(ref_mhc_contract);
+REF_SHAPE_FN(ref_mhc_mix);
+REF_SHAPE_FN(ref_mhc_collapse);
 REF_SHAPE_FN(ref_kda_update);
 REF_SHAPE_FN(ref_ssd_update);
 REF_SHAPE_FN(ref_hc_read);
@@ -378,6 +416,8 @@ REF_SHAPE_FN(ref_grid_embed);
 REF_SHAPE_FN(ref_grid_embed_pad);
 REF_SHAPE_FN(ref_grid_embed_aa);
 REF_SHAPE_FN(ref_grid_embed_cpe);
+REF_SHAPE_FN(ref_grid_embed_hw);
+REF_SHAPE_FN(ref_posemb_resample);
 REF_SHAPE_FN(ref_window_order);
 REF_SHAPE_FN(ref_attn_res_mix);
 REF_SHAPE_FN(ref_situ_mul);
@@ -390,6 +430,11 @@ REF_SHAPE_FN(ref_mul);
 REF_SHAPE_FN(ref_silu_mul);
 REF_SHAPE_FN(ref_swiglu_clamped);
 REF_SHAPE_FN(ref_router_sigmoid_topk);
+REF_SHAPE_FN(ref_router_scored_topk);
+REF_SHAPE_FN(ref_router_scored_topk_vl);
+REF_SHAPE_FN(ref_ds41_vit_rope2d);
+REF_SHAPE_FN(ref_ds41_pack3x3);
+REF_SHAPE_FN(ref_ds41_span_rows);
 REF_SHAPE_FN(ref_router_sigmoid_group_topk);
 REF_SHAPE_FN(ref_swiglu_step);
 REF_SHAPE_FN(ref_dsa_pool);
@@ -445,12 +490,10 @@ REF_SHAPE_FN(ref_gemm_nt_q_gated);
 REF_SHAPE_FN(ref_dflash_select);
 REF_SHAPE_FN(ref_dflash_markov_greedy);
 REF_SHAPE_FN(ref_dflash_markov_greedy_f32);
-REF_SHAPE_FN(ref_dspark_rnn_markov_greedy);
 REF_SHAPE_FN(ref_dflash_tree);
 REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
 REF_SHAPE_FN(ref_gated_had_quant_i8);
-REF_SHAPE_FN(ref_gated_quant_i8);
 REF_SHAPE_FN(ref_dequant);
 REF_SHAPE_FN(ref_dequant_w4);
 
@@ -485,6 +528,23 @@ REF_SHAPE_FN(ref_ministral_rope);
 REF_SHAPE_FN(ref_pixtral_rope);
 REF_SHAPE_FN(ref_pixtral_merge);
 REF_SHAPE_FN(ref_rope_table);
+REF_SHAPE_FN(ref_rope_rows);
+REF_SHAPE_FN(ref_quant_roundtrip);
+REF_SHAPE_FN(ref_softmax_pool);
+REF_SHAPE_FN(ref_attn_sparse_sink);
+REF_SHAPE_FN(ref_index_score);
+REF_SHAPE_FN(ref_index_candidates);
+REF_SHAPE_FN(ref_index_topk);
+REF_SHAPE_FN(ref_entry_store);
+#ifdef REF_HAVE_GGML
+REF_SHAPE_FN(ref_gemm_nt_ggml);
+REF_SHAPE_FN(ref_moe_gemm_ggml);
+REF_SHAPE_FN(ref_logits_gemm_ggml);
+REF_SHAPE_FN(ref_embed_lookup_ggml);
+#endif
+REF_SHAPE_FN(ref_token_map);
+REF_SHAPE_FN(ref_embed_lookup_planes);
+REF_SHAPE_FN(ref_stream_gate_add);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);
 REF_SHAPE_FN(ref_gate_add);
@@ -593,6 +653,9 @@ REF_SHAPE_FN(ref_gdn_kkt_solve);
 REF_SHAPE_FN(ref_gdn_chunk_scan);
 REF_SHAPE_FN(ref_gdn_recurrent_update);
 REF_SHAPE_FN(ref_gdn_conv_recurrent_update);
+REF_SHAPE_FN(ref_gdn_conv_update_tree);
+REF_SHAPE_FN(ref_gdn_recurrent_update_tree);
+REF_SHAPE_FN(ref_gdn_conv_recurrent_update_tree);
 REF_SHAPE_FN(ref_gdn_gated_rmsnorm);
 
 REF_SHAPE_FN(ref_all_reduce);

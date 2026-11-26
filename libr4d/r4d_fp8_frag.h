@@ -1,7 +1,7 @@
-// r4d_fp8_frag.h -- where a byte of a block-scaled FP8 weight lives in WMMA fragment order. Pure
+// r4d_fp8_frag.h -- where a byte of an 8-bit weight (int8 codes) lives in WMMA fragment order. Pure
 // C++ (no HIP, no r4d.h) so the host layout hook and the device kernels share one definition.
 //
-// Why permute: the fp8a8 GEMMs read operands through r4d_fp8::frag(), which wants lane `l` to hold
+// Why permute: the int8 GEMMs read operands through r4d_fp8::frag(), which wants lane `l` to hold
 // row `l & 15` of a 16-row tile at k `(l >> 4) * 8`, eight bytes. From a row-major weight those
 // sixteen rows are `K` bytes apart, so a wave's load is sixteen transactions; the kernels stage
 // through LDS to transpose, at the cost of a barrier, 36 KiB per block and a second pass over the
@@ -15,7 +15,7 @@
 // 32 bytes are its four fragments back to back: bytes `8t` are fragment `t`, covering
 // k `t*16 + (l>>4)*8` of row `l & 15`.
 //
-// K must be a multiple of 64 and N of 16; the 128 scale block already guarantees both.
+// K must be a multiple of 64 and N of 16; the 128 scale group already guarantees both.
 #pragma once
 #include <cstdint>
 

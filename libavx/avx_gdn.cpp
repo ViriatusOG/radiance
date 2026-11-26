@@ -419,7 +419,7 @@ AVX_KERNEL(gdn_conv_prep) {
         }
     }
 
-    /* ---- phase 4: rewrite the conv state from the sequence's last width-1 tokens -------------- */
+    /* ---- phase 4: rewrite the conv state from the sequence's last width-1 tokens ---- */
     /* After phase 1, which has read the old history. A sequence shorter than width-1 keeps the
      * old state ahead of its tokens, so a sequence's next prefill chunk continues from this one. */
     if (cs->data && width > 1) {
@@ -457,12 +457,26 @@ static inline void silu_store_pieces(float* acc, int64_t cbw, int64_t c0, int64_
 }
 
 /* ------------------------------------------------------------------ gdn_conv_update */
+/* The row a tree step's row `t` continues from, within its sequence's rows from `bos`
+ * (RadBatch::spec_parent, docs/OPS.md): -1 for the committed history, which the sequence's first
+ * row always continues. An ordinary causal row (-2), an out-of-range entry, and every row of a
+ * chain step (`par` null) continue the row before. libref's rule (ref_gdn.cpp: tree_parent). */
+static inline int64_t tree_parent(const RadTensor* par, int64_t bos, int64_t t) {
+    if (t <= 0) return -1;
+    if (!par) return t - 1;
+    const int64_t p = ldi(par, offlin(par, bos + t));
+    return (p < -1 || p >= t) ? t - 1 : p;
+}
+
 /* The convolution for a decode step against the rolling window: the read starts at
  * num_accepted - 1 and the rewrite shifts the window down by one (the rollback contract in the
- * file header).
+ * file header). With `par` (the `_tree` op's spec_parent) a row's taps are its ancestors' inputs,
+ * newest first, and above the block's first row the committed history from its newest entry
+ * back; the window is still rewritten by row, and the core moves the accepted path's entries to
+ * the front afterwards.
  *
  * No L2 norm here; on the decode path the recurrent update applies it, as in libr4d. */
-AVX_KERNEL(gdn_conv_update) {
+static int conv_update_impl(const RadArgs* a, const RadTensor* par) {
     if (a->n_t < 10) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cs = &a->t[3], *cu = &a->t[6];
     const RadTensor *q = &a->t[7], *k = &a->t[8], *v = &a->t[9];
@@ -501,6 +515,7 @@ AVX_KERNEL(gdn_conv_update) {
         if (off + width - 1 > state_len) return RAD_E_SHAPE;
         if (width > 1 && (width - 2) + slen > state_len) return RAD_E_SHAPE;
     }
+    if (par && numel(par) < T) return RAD_E_SHAPE;
 
     const V3 qv = view3(q, Hg, K), kv = view3(k, Hg, K), vv = view3(v, H, V);
     const V2 wv = view2(w, width);
@@ -546,11 +561,30 @@ AVX_KERNEL(gdn_conv_update) {
                     hseg[i * cbw + c] = ldt(cs, at3(cvs, slot, c0 + c, off + i));
         }
         for (int64_t t = 0; t < slen; ++t) {
+            /* Tap j's source: a row of the sequence (>= 0), or history entry e as -1 - e. */
+            int64_t srcs[AVX_CONV_HIST_MAX + 1];
+            if (par) {
+                srcs[width - 1] = t;
+                int64_t anc = tree_parent(par, bos, t), used = 0;
+                for (int64_t i = 1; i < width; ++i) {
+                    if (anc >= 0) {
+                        srcs[width - 1 - i] = anc;
+                        anc = tree_parent(par, bos, anc);
+                    } else {
+                        srcs[width - 1 - i] = -1 - (width - 2 - used++);
+                    }
+                }
+            } else {
+                for (int64_t j = 0; j < width; ++j) {
+                    const int64_t src = t - (width - 1) + j;
+                    srcs[j] = src >= 0 ? src : -1 - (src + width - 1);
+                }
+            }
             int64_t c = 0;
             for (; c + VF_N <= cbw; c += VF_N) vf_storeu(acc + c, vf_loadu(bs + c));
             for (; c < cbw; ++c) acc[c] = bs[c];
             for (int64_t j = 0; j < width; ++j) {
-                const int64_t src = t - (width - 1) + j;
+                const int64_t src = srcs[j];
                 if (src >= 0) {
                     if (xcol == 1)
                         row_to_f32(x->dtype,
@@ -560,8 +594,8 @@ AVX_KERNEL(gdn_conv_update) {
                         for (int64_t c = 0; c < cbw; ++c)
                             xr[c] = ldt(x, (bos + src) * xrow + (c0 + c) * xcol);
                 } else {
-                    /* src + width - 1 is in [0, width - 2]: the history segment. */
-                    const float* hs = hseg + (src + width - 1) * cbw;
+                    /* -1 - src is in [0, width - 2]: the history segment. */
+                    const float* hs = hseg + (-1 - src) * cbw;
                     for (int64_t c = 0; c < cbw; ++c) xr[c] = hs[c];
                 }
                 /* Separate mul and add, not FMA, to match the reference's two roundings. */
@@ -609,6 +643,15 @@ AVX_KERNEL(gdn_conv_update) {
         }
     }
     return RAD_OK;
+}
+
+AVX_KERNEL(gdn_conv_update) { return conv_update_impl(a, nullptr); }
+
+/* gdn_conv_update over a tree verify (rad_drafter_tree): operand 10 is `spec_parent`. */
+AVX_KERNEL(gdn_conv_update_tree) {
+    const RadTensor* par = a->n_t > 10 ? rad_arg_in(a, 10) : nullptr;
+    if (!par || !par->data) return RAD_E_INVAL;
+    return conv_update_impl(a, par);
 }
 
 /* ------------------------------------------------------------------ gdn_kkt_solve */
@@ -938,8 +981,16 @@ struct AnchorLayout {
 /* Decode's counterpart of the chunked scan, against the paged state cache: the initial state is
  * read from the slot the last accepted token wrote, and every candidate token writes its own slot
  * (see the rollback contract), or under `anchor` the replayed state is published and each token's
- * factors are written instead. The gated RMS norm is folded into the epilogue, as in libr4d. */
-AVX_KERNEL(gdn_recurrent_update) {
+ * factors are written instead. The gated RMS norm is folded into the epilogue, as in libr4d.
+ *
+ * With `par` (the `_tree` op's spec_parent) a row continues from its parent's state rather than
+ * the row before's, so every row's state is kept: snap[0] the state the block starts from,
+ * snap[t + 1] the one row t left. Under `anchor` the start is the published anchor as the cache
+ * holds it and a row is applied from its stored factors, so a row's state does not depend on
+ * which rows ran between it and its parent, at any state dtype (libref's reading, which libr4d's
+ * branch-point rebuild follows). Factor records and per-candidate slots stay indexed by row; the
+ * core moves the accepted path's to the front afterwards. */
+static int recurrent_update_impl(const RadArgs* a, const RadTensor* par) {
     if (a->n_t < 14) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *av = &a->t[3], *bvt = &a->t[4];
     const RadTensor *state = &a->t[7], *o = &a->t[13];
@@ -985,6 +1036,7 @@ AVX_KERNEL(gdn_recurrent_update) {
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     if (cu_at(cu, n_seq) != Tk) return RAD_E_SHAPE;
+    if (par && numel(par) < Tk) return RAD_E_SHAPE;
     const int64_t sw = sidx ? (sidx->rank >= 2 ? sidx->shape[sidx->rank - 1]
                                                : (numel(sidx) / n_seq > 0 ? numel(sidx) / n_seq
                                                                           : 1))
@@ -1076,39 +1128,54 @@ AVX_KERNEL(gdn_recurrent_update) {
             else for (int64_t e = 0; e < V; ++e) gainv[e] = ldt(nw, e * laststride(nw));
         }
 
-        if (anchor) {
-            /* Replay the previous step's accepted tokens from their factors, with the token
-             * loop's own arithmetic, so the replayed state is the one per_candidate would hold.
-             * Then publish it at column 2 and stamp each factor copy with its column. */
-            for (int64_t t = 0; t < na; ++t) {
-                const int64_t f = fb + t * al.fstr;
-                for (int64_t e = 0; e < V; ++e) vrow[e] = ldt(state, f + al.vb + e);
-                /* Each 32-row group of V replays from its own copy of k and its own (g, beta), as
-                 * libr4d's kernel and libref read them; writers store equal copies. */
-                for (int64_t gi = 0; gi < al.groups; ++gi) {
-                    const int64_t e0 = 32 * gi, e1 = std::min<int64_t>(V, e0 + 32);
-                    for (int64_t d = 0; d < K; ++d) kn[d] = ldt(state, f + gi * K + d);
-                    const float gval = ldt(state, f + al.gb + 2 * gi);
-                    const float bt = ldt(state, f + al.gb + 2 * gi + 1);
-                    const float dec = sc_exp(gval);
-                    const vf vdec = vf_set1(dec);
-                    for (int64_t e = e0; e < e1; ++e) {
-                        float* Se = S + e * K;
-                        int64_t d = 0;
-                        for (; d + VF_N <= K; d += VF_N)
-                            vf_storeu(Se + d, vf_mul(vf_loadu(Se + d), vdec));
-                        for (; d < K; ++d) Se[d] *= dec;
-                        uu[e] = bt * (vrow[e] - dot2(Se, kn, K));
-                    }
-                    for (int64_t e = e0; e < e1; ++e) axpy(S + e * K, kn, uu[e], K);
+        /* One token's update from its factors at `f`, with the token loop's own arithmetic, so
+         * a replayed state is the one per_candidate would hold. Each 32-row group of V replays
+         * from its own copy of k and its own (g, beta), as libr4d's kernel and libref read them;
+         * writers store equal copies. Overwrites kn and vrow. */
+        auto replay = [&](int64_t f) {
+            for (int64_t e = 0; e < V; ++e) vrow[e] = ldt(state, f + al.vb + e);
+            for (int64_t gi = 0; gi < al.groups; ++gi) {
+                const int64_t e0 = 32 * gi, e1 = std::min<int64_t>(V, e0 + 32);
+                for (int64_t d = 0; d < K; ++d) kn[d] = ldt(state, f + gi * K + d);
+                const float gval = ldt(state, f + al.gb + 2 * gi);
+                const float bt = ldt(state, f + al.gb + 2 * gi + 1);
+                const float dec = sc_exp(gval);
+                const vf vdec = vf_set1(dec);
+                for (int64_t e = e0; e < e1; ++e) {
+                    float* Se = S + e * K;
+                    int64_t d = 0;
+                    for (; d + VF_N <= K; d += VF_N)
+                        vf_storeu(Se + d, vf_mul(vf_loadu(Se + d), vdec));
+                    for (; d < K; ++d) Se[d] *= dec;
+                    uu[e] = bt * (vrow[e] - dot2(Se, kn, K));
                 }
+                for (int64_t e = e0; e < e1; ++e) axpy(S + e * K, kn, uu[e], K);
             }
+        };
+
+        if (anchor) {
+            /* Replay the previous step's accepted tokens from their factors, then publish the
+             * state at column 2 and stamp each factor copy with its column. */
+            for (int64_t t = 0; t < na; ++t) replay(fb + t * al.fstr);
             for (int64_t e = 0; e < V; ++e)        /* the anchor block is dense (checked) */
                 row_from_f32(state->dtype, S + e * K,
                              (void*)byte_at(state->data, state->dtype,
                                             col[2] * sstride + h * hstride + e * K),
                              K);
             for (int c = 0; c < 3; ++c) stt(state, fbs[c] + al.mark, (float)(c + 1));
+        }
+
+        const bool tree = par != nullptr && q_len > 0;
+        float* snap = nullptr;
+        if (tree) {
+            if (anchor)                            /* the published anchor, as stored */
+                for (int64_t e = 0; e < V; ++e)
+                    row_to_f32(state->dtype,
+                               byte_at(state->data, state->dtype,
+                                       col[2] * sstride + h * hstride + e * K),
+                               S + e * K, K);
+            snap = scratch_f32_b((size_t)((q_len + 1) * V * K));
+            std::memcpy(snap, S, (size_t)(V * K) * sizeof(float));
         }
 
         for (int64_t t = 0; t < q_len; ++t) {
@@ -1143,24 +1210,9 @@ AVX_KERNEL(gdn_recurrent_update) {
                 for (; d < K; ++d) { qn[d] *= qs; kn[d] *= ks; }
             }
 
-            const float dec = sc_exp(gval);
-            const vf vdec = vf_set1(dec);
-            for (int64_t e = 0; e < V; ++e) {
-                float* Se = S + e * K;
-                int64_t d = 0;
-                for (; d + VF_N <= K; d += VF_N)
-                    vf_storeu(Se + d, vf_mul(vf_loadu(Se + d), vdec));
-                for (; d < K; ++d) Se[d] *= dec;
-                uu[e] = bt * (vrow[e] - dot2(Se, kn, K));
-            }
-            for (int64_t e = 0; e < V; ++e) {
-                float* Se = S + e * K;
-                axpy(Se, kn, uu[e], K);
-                orow[e] = dot2(Se, qn, K);
-            }
-
             /* This token's factors, for the next step to replay: the normalised k once per
-             * 32-row group, v, then the decay exponent and beta once per group. */
+             * 32-row group, v, then the decay exponent and beta once per group. Written before
+             * the update, which a tree step's anchor form applies from them. */
             if (anchor)
                 for (int c = 0; c < 3; ++c) {
                     if (c != 1 && !dup_f) continue;
@@ -1172,6 +1224,32 @@ AVX_KERNEL(gdn_recurrent_update) {
                     }
                     for (int64_t e = 0; e < V; ++e) stt(state, f + al.vb + e, vrow[e]);
                 }
+
+            if (tree) {
+                const int64_t p = tree_parent(par, bos, t);
+                std::memcpy(S, snap + (p + 1) * V * K, (size_t)(V * K) * sizeof(float));
+            }
+            if (tree && anchor) {
+                replay(fb + t * al.fstr);
+                for (int64_t e = 0; e < V; ++e) orow[e] = dot2(S + e * K, qn, K);
+            } else {
+                const float dec = sc_exp(gval);
+                const vf vdec = vf_set1(dec);
+                for (int64_t e = 0; e < V; ++e) {
+                    float* Se = S + e * K;
+                    int64_t d = 0;
+                    for (; d + VF_N <= K; d += VF_N)
+                        vf_storeu(Se + d, vf_mul(vf_loadu(Se + d), vdec));
+                    for (; d < K; ++d) Se[d] *= dec;
+                    uu[e] = bt * (vrow[e] - dot2(Se, kn, K));
+                }
+                for (int64_t e = 0; e < V; ++e) {
+                    float* Se = S + e * K;
+                    axpy(Se, kn, uu[e], K);
+                    orow[e] = dot2(Se, qn, K);
+                }
+            }
+            if (tree) std::memcpy(snap + (t + 1) * V * K, S, (size_t)(V * K) * sizeof(float));
 
             /* Gate row, widened once per token. */
             if (z) {
@@ -1251,6 +1329,15 @@ AVX_KERNEL(gdn_recurrent_update) {
     return RAD_OK;
 }
 
+AVX_KERNEL(gdn_recurrent_update) { return recurrent_update_impl(a, nullptr); }
+
+/* gdn_recurrent_update over a tree verify (rad_drafter_tree): operand 16 is `spec_parent`. */
+AVX_KERNEL(gdn_recurrent_update_tree) {
+    const RadTensor* par = a->n_t > 16 ? rad_arg_in(a, 16) : nullptr;
+    if (!par || !par->data) return RAD_E_INVAL;
+    return recurrent_update_impl(a, par);
+}
+
 /* ------------------------------------------------------------------ gdn_conv_recurrent_update */
 /* Defined as gdn_conv_update into a staging q, k and v, then gdn_recurrent_update over them, and
  * implemented as exactly that pair of this level's kernels. The staging geometry comes from `o`
@@ -1258,7 +1345,7 @@ AVX_KERNEL(gdn_recurrent_update) {
  *
  * The staging uses x's dtype; sub-byte dtypes are refused. It is a per-thread buffer that only
  * grows. */
-AVX_KERNEL(gdn_conv_recurrent_update) {
+static int conv_recurrent_impl(const RadArgs* a, const RadTensor* par) {
     if (a->n_t < 16) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *o = &a->t[15];
     if (!x->data || !o->data || o->rank != 3 || x->rank < 2) return RAD_E_SHAPE;
@@ -1297,17 +1384,27 @@ AVX_KERNEL(gdn_conv_recurrent_update) {
                          tv };
     RadArgs ca = *a;
     ca.t = ct; ca.n_t = 10; ca.p = cp; ca.n_p = 4;
-    const int rc = AVX_FN(avx_gdn_conv_update)(&ca, stream);
+    const int rc = conv_update_impl(&ca, par);
     if (rc != RAD_OK) return rc;
 
     /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
      * o_scale. The parameters pass as they are: the recurrence reads its own by name. */
     RadTensor rt[16] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
                          a->t[11], a->t[12], a->t[13], a->t[14], a->t[15],
-                         a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17] : RadTensor{} };
+                         a->n_t > 16 ? a->t[16] : RadTensor{},
+                         a->n_t > 17 ? a->t[17] : RadTensor{} };
     RadArgs ra = *a;
     ra.t = rt; ra.n_t = 16;
-    return AVX_FN(avx_gdn_recurrent_update)(&ra, stream);
+    return recurrent_update_impl(&ra, par);
+}
+
+AVX_KERNEL(gdn_conv_recurrent_update) { return conv_recurrent_impl(a, nullptr); }
+
+/* gdn_conv_update_tree then gdn_recurrent_update_tree: operand 18 is `spec_parent`. */
+AVX_KERNEL(gdn_conv_recurrent_update_tree) {
+    const RadTensor* par = a->n_t > 18 ? rad_arg_in(a, 18) : nullptr;
+    if (!par || !par->data) return RAD_E_INVAL;
+    return conv_recurrent_impl(a, par);
 }
 
 /* ------------------------------------------------------------------ gdn_gated_rmsnorm */
@@ -1315,8 +1412,8 @@ AVX_KERNEL(gdn_conv_recurrent_update) {
  * form of the epilogue the recurrent update folds in.
  *
  * The gate may be a rank-2 column slice of a wider projection row (the fp8 delta net fuses
- * [q|k|v|z] into one GEMM) with heads*ch as its last axis, which rowoff() would read as a dense row.
- * Handled here since it is specific to this operand. */
+ * [q|k|v|z] into one GEMM) with heads*ch as its last axis, which rowoff() would read as a dense
+ * row. Handled here since it is specific to this operand. */
 static inline int64_t gate_rowoff(const RadTensor* t, int64_t r, int64_t ch) {
     if (t->rank == 2 && ch > 0 && t->shape[1] != ch && t->shape[1] % ch == 0) {
         const int64_t heads = t->shape[1] / ch;

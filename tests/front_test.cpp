@@ -200,8 +200,7 @@ TEST(model_discovery_does_not_restart_the_idle_clock) {
     listener.thread = std::thread([&] { front.run(); });
     for (int i = 0; i < 200 && !front.port(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    CHECK(front.port() > 0);
-    if (front.port() <= 0) return;
+    REQUIRE(front.port() > 0);
     httplib::Client client("127.0.0.1", front.port());
     client.set_read_timeout(2, 0);
     const auto before = front.activity("test-model");

@@ -8,44 +8,85 @@
 //
 // libref/ref_elementwise.cpp is the oracle and docs/OPS.md the contract.
 //
-// One thread per (row, group). The group's norm is taken before any of its outputs are stored, and
-// each element is read before it is written, so y may alias x; a group belongs to one thread, so
-// no two threads write the same element. Pitched x and y are read through their row pitch.
+// Wave-per-(row, group): 32 lanes cooperate on each group in f32, caching up to 256 elements in
+// registers (single global read, DPP wave sum) before storing y; safe for in-place y == x.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
+#include "r4d_emit.h"
+
+#include <hip/hip_runtime.h>
+
+#include <cmath>
+#include <cstdint>
 
 namespace {
 
-constexpr int kL2Threads = 256;
+constexpr int kL2Wave = 32;
 
-__global__ __launch_bounds__(kL2Threads)
-void l2_clip_kernel(const uint16_t* __restrict__ x, long long xld, const uint16_t* __restrict__ w,
-                    const int32_t* __restrict__ pos, uint16_t* __restrict__ y, long long yld,
-                    long long n, long long g, long long G, long long rows, double thr, double flr,
-                    double alpha) {
-    const long long idx = (long long)blockIdx.x * kL2Threads + threadIdx.x;
-    if (idx >= rows * G) return;
-    const long long r = idx / G, gi = idx % G;
-    float tau = 1.0f;
-    if (pos) {
-        const double p = (double)pos[r];
-        tau = 1.0f + (float)alpha * (float)log(fmax(1.0, (p + 1.0) / flr));
-    }
-    const uint16_t* xr = x + r * xld + gi * g;
-    uint16_t* yr = y + r * yld + gi * g;
+__device__ __forceinline__ void l2_clip_wave_body(
+    const uint16_t* __restrict__ x, long long xld, const uint16_t* __restrict__ w,
+    const int32_t* __restrict__ pos, uint16_t* __restrict__ y, long long yld,
+    long long g, long long rows, float thr, float flr, float alpha) {
+    const long long gi = (long long)blockIdx.x;
+    const int lane = (int)threadIdx.x;
     const uint16_t* wg = w ? w + gi * g : nullptr;
 
-    double ss = 0.0;
-    for (long long j = 0; j < g; ++j) {
-        const double v = (double)bf16_to_f32(xr[j]) * (wg ? (double)bf16_to_f32(wg[j]) : 1.0);
-        ss += v * v;
+    for (long long r = (long long)blockIdx.y; r < rows; r += (long long)gridDim.y) {
+        float tau = 1.0f;
+        if (pos) {
+            const float p = (float)pos[r];
+            tau = 1.0f + alpha * logf(fmaxf(1.0f, (p + 1.0f) / flr));
+        }
+        const uint16_t* xr = x + r * xld + gi * g;
+        uint16_t* yr = y + r * yld + gi * g;
+
+        if (g <= 256) {
+            float v[8];
+            float ss = 0.0f;
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const long long j = lane + (long long)p * kL2Wave;
+                if (j < g) {
+                    const float xw = bf16_to_f32(xr[j]) * (wg ? bf16_to_f32(wg[j]) : 1.0f);
+                    v[p] = xw;
+                    ss += xw * xw;
+                }
+            }
+            ss = r4d_wave_sum(ss);
+            const float f = fminf(1.0f, thr / (sqrtf(ss) + 1e-6f));
+            const float s = f * tau;
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const long long j = lane + (long long)p * kL2Wave;
+                if (j < g) yr[j] = f32_to_bf16(v[p] * s);
+            }
+        } else {
+            float ss = 0.0f;
+            for (long long j = lane; j < g; j += kL2Wave) {
+                const float xw = bf16_to_f32(xr[j]) * (wg ? bf16_to_f32(wg[j]) : 1.0f);
+                ss += xw * xw;
+            }
+            ss = r4d_wave_sum(ss);
+            const float f = fminf(1.0f, thr / (sqrtf(ss) + 1e-6f));
+            const float s = f * tau;
+            for (long long j = lane; j < g; j += kL2Wave) {
+                const float xw = bf16_to_f32(xr[j]) * (wg ? bf16_to_f32(wg[j]) : 1.0f);
+                yr[j] = f32_to_bf16(xw * s);
+            }
+        }
     }
-    const float f = (float)fmin(1.0, thr / (sqrt(ss) + 1e-6));
-    for (long long j = 0; j < g; ++j) {
-        const float v = bf16_to_f32(xr[j]) * (wg ? bf16_to_f32(wg[j]) : 1.0f);
-        yr[j] = f32_to_bf16(v * f * tau);
-    }
+}
+
+template <class CH>
+__global__ __launch_bounds__(kL2Wave) void l2_clip_wave_kernel(
+    const uint16_t* __restrict__ x, long long xld, const uint16_t* __restrict__ w,
+    const int32_t* __restrict__ pos, uint16_t* __restrict__ y, long long yld,
+    long long g, long long rows, float thr, float flr, float alpha) {
+    if (CH::on) r4d_chain_wait();
+    l2_clip_wave_body(x, xld, w, pos, y, yld, g, rows, thr, flr, alpha);
+    if (CH::on) r4d_chain_done();
 }
 
 }  // namespace
@@ -74,11 +115,15 @@ extern "C" int r4d_rad_l2_clip(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_SHAPE);
 
     const long long G = n / g;
-    const uint32_t blocks = (uint32_t)((rows * G + kL2Threads - 1) / kL2Threads);
-    hipLaunchKernelGGL(l2_clip_kernel, dim3(blocks), dim3(kL2Threads), 0, (hipStream_t)s,
-                       (const uint16_t*)r4d_addr(x), xld,
-                       w ? (const uint16_t*)r4d_addr(w) : nullptr,
-                       pos ? (const int32_t*)r4d_addr(pos) : nullptr,
-                       (uint16_t*)r4d_addr(y), yld, n, g, G, rows, thr, flr, alpha);
+    const unsigned gy = (unsigned)(rows < 65535LL ? rows : 65535LL);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    const int rc = R4D_EMIT(s, (chain ? l2_clip_wave_kernel<r4dchain> : l2_clip_wave_kernel<R4dUnchained>),
+                            dim3((unsigned)G, gy), dim3(kL2Wave), 0,
+                            (const uint16_t*)r4d_addr(x), xld,
+                            w ? (const uint16_t*)r4d_addr(w) : nullptr,
+                            pos ? (const int32_t*)r4d_addr(pos) : nullptr,
+                            (uint16_t*)r4d_addr(y), yld, g, rows,
+                            (float)thr, (float)flr, (float)alpha);
+    if (rc != RAD_OK) return rc;
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }

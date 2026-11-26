@@ -175,8 +175,8 @@ StepSlot slot_for(const int32_t* tok, int rounds, int n_acc) {
 
 /* VARYING n_acc, SEVERAL ROUNDS, A CUT COMMIT. Every round of a live request binds at the length
  * its commit left, which is the position the next build samples it at. The cut commit closes the
- * request; its rows bind nothing, and the old formula's position for them is provably not a row the
- * sampler would stage. */
+ * request; its rows bind nothing, and the position `base + n_acc + round` the card's acceptance
+ * alone would give them is provably not a row the sampler would stage. */
 TEST(the_bound_position_is_the_verify_rows_sampling_position) {
     const int kRounds = 3;
     /* The card's one-based acceptance (S.n_acc) and what the commit actually appended, per step.
@@ -210,8 +210,8 @@ TEST(the_bound_position_is_the_verify_rows_sampling_position) {
                 const uint64_t n_out = (uint64_t)r.output.size();
                 CHECK(rad_mtp_couple_binds(bound[(size_t)k], r.id, draw.seed, n_out, k,
                                            bound[(size_t)k].x, 1 << 20));
-                /* The old formula on the same states: identical while the previous commit emitted
-                 * its whole acceptance, one ahead per missing token otherwise. */
+                /* The acceptance-only position on the same states: identical while the previous
+                 * commit emitted its whole acceptance, one ahead per missing token otherwise. */
                 const uint64_t old_pos = prev_base + (uint64_t)prev_n_acc + (uint64_t)k;
                 CHECK_EQ(old_pos == n_out + (uint64_t)k,
                          emitted[step - 1] == n_acc[step - 1]);
@@ -254,7 +254,7 @@ TEST(the_bound_position_is_the_verify_rows_sampling_position) {
                                        (uint64_t)r.output.size(), rd - 1, tok[rd], 1 << 20));
         }
 
-        /* THE REGRESSION: where the old formula would have bound this step's rounds, the row
+        /* A cut commit: where the acceptance-only position would bind this step's rounds, the row
          * check fails as soon as the commit emitted fewer than the card accepted. */
         if (!live) {
             for (int rd = 1; rd <= kRounds; ++rd) {
@@ -288,7 +288,7 @@ TEST(a_state_from_another_step_is_refused) {
     const RadMtpCoupleState good = sampled(d, 1, rad_mtp_couple_verify_pos(n_out, 1));
     CHECK(rad_mtp_couple_binds(good, r.id, d.seed, n_out, 0, good.x, 1 << 20));
 
-    /* One position ahead: the old arithmetic's answer. */
+    /* One position ahead, which is what the acceptance-only arithmetic gives. */
     CHECK(!rad_mtp_couple_binds(sampled(d, 1, rad_mtp_couple_verify_pos(n_out, 1) + 1), r.id,
                                 d.seed, n_out, 0, good.x, 1 << 20));
     /* Another step's round. */

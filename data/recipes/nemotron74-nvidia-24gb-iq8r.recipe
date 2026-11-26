@@ -1,0 +1,31 @@
+# nemotron74-nvidia-24gb-iq8r.recipe -- NVIDIA's 2-bit Nemotron-3.5-Bolt-74B-A9B-24GB release (ModelOpt
+# MIXED_PRECISION safetensors) with its LiLiCorr drafter. llama.cpp's blocks are imported as the
+# release stores them and served by the ggml ops; only the NVFP4 linears, which this build does not
+# serve, are quantised again:
+#   routed and shared experts     IQ2_XXS  as stored    moe_gemm_ggml, gemm_nt_ggml
+#   latent, attention, head       Q8_0     as stored    gemm_nt_ggml, logits_gemm_ggml
+#   Mamba in_proj (z, x|B|C), out NVFP4 -> IQ8R         gemm_nt_q
+#   Mamba in_proj's dt rows       NVFP4 -> bf16         gemm_nt
+#   the drafter's linears         NVFP4 -> rotated int8 at 128
+#   the drafter's correlator      bf16
+#   vision tower, embedding, norms as stored (bf16)
+#
+#   rad-convert <NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB> --draft-model <...-24GB-LiLiCorr> \
+#     --recipe data/recipes/nemotron74-nvidia-24gb-iq8r.recipe -o nemotron74-nvidia-24gb-iq8r.rad
+dflash.fc.weight                  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_q.weight        rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_k.weight        rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_v.weight        rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_output.weight   rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.ffn_gate_up.weight   rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.ffn_down.weight      rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.lili.token_proj.weight     cast dtype=bf16
+dflash.lili.pass_proj.weight      cast dtype=bf16
+dflash.lili.context_proj.weight   cast dtype=bf16
+dflash.lili.blk.*.attn_out.weight cast dtype=bf16
+dflash.lili.blk.*.mlp_up.weight   cast dtype=bf16
+dflash.lili.blk.*.mlp_down.weight cast dtype=bf16
+blk.*.ssm_in_z.weight   rtn codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ssm_in_xbc.weight rtn codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ssm_dt.weight     cast dtype=bf16
+blk.*.ssm_out.weight    rtn codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search

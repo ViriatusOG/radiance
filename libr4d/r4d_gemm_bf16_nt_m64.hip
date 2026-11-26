@@ -55,7 +55,7 @@ constexpr int KU = 8;
 template <int MT, bool CHAIN, typename CT = __hip_bfloat16>
 __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    CT* __restrict__ C, int M, int K, int N, int WV, int SK) {
+    CT* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
   if (CHAIN) r4d_chain_wait_vec();
   extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
@@ -75,7 +75,7 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
   unsigned aoff[MT];
 #pragma unroll
   for (int i = 0; i < MT; i++)
-    aoff[i] = rowGo((unsigned)K, (mt0 + i) * 16, M - 1, lane) + (unsigned)kbase;
+    aoff[i] = rowGo((unsigned)LDA, (mt0 + i) * 16, M - 1, lane) + (unsigned)kbase;
 
   // Unrolled so the k step is a load immediate (the 13-bit field of global_load_b64) and the base
   // pointers advance once per KU steps; rolled, LLVM rebuilds a 64-bit address every step.
@@ -127,8 +127,8 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
       // The language's float-to-bf16 conversion on purpose; the header's f2bf rounds half away
       // from zero.
       if (n < N && m < M) {
-        if constexpr (std::is_same<CT, float>::value) C[(size_t)m * N + n] = v;   // f32 logits
-        else C[(size_t)m * N + n] = (__hip_bfloat16)v;
+        if constexpr (std::is_same<CT, float>::value) C[(size_t)m * LDC + n] = v;   // f32 logits
+        else C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
       }
     }
   }
@@ -138,33 +138,39 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
 template <int MT>
 __global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
-  r4d_gemm_bf16_nt_m64_body<MT, false>(A, W, C, M, K, N, WV, SK);
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
+  r4d_gemm_bf16_nt_m64_body<MT, false>(A, W, C, M, K, N, WV, SK, LDA, LDC);
 }
 template <int MT>
 __global__ __launch_bounds__(1024) void r4dchain_gemm_bf16_nt_m64(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
-  r4d_gemm_bf16_nt_m64_body<MT, true>(A, W, C, M, K, N, WV, SK);
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
+  r4d_gemm_bf16_nt_m64_body<MT, true>(A, W, C, M, K, N, WV, SK, LDA, LDC);
 }
 
 // grid = ceil(ceil(N/16)/WV) x ceil(ceil(M/16)/MB) blocks; block = WV*SK waves. MT = MB is
 // compile-time so the accumulators are sized exactly.
 static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
-                                 int MB, long stream, bool chain);
+                                 int MB, long stream, bool chain, long long lda, long long ldc);
 void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, int SK, int MB,
                           long stream) {
-  gemm_bf16_m64_launch(a, w, c, M, K, N, WV, SK, MB, stream, false);
+  gemm_bf16_m64_launch(a, w, c, M, K, N, WV, SK, MB, stream, false, K, N);
 }
 /* `chain`: the chained form (r4d_rad_gemm_bf16_m64 passes the row's parameter; M <= 64 always). */
+/* `lda` / `ldc`: the rows' pitches in elements (K and N for contiguous planes). A's fragments are
+ * 8-byte loads, so its pitch is a multiple of 4; its offsets are 32-bit from each launch's base,
+ * so a launch takes at most 2^32 / lda rows (r4d_bf16_gemm_chunk_rows_lda). */
 static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
-                                 int MB, long stream, bool chain) {
+                                 int MB, long stream, bool chain, long long lda, long long ldc) {
+  if (M < 1) throw std::runtime_error("r4d gemm_bf16_nt_m64: M out of range");
+  if (lda < K || ldc < N || lda % 4 || ldc > INT32_MAX)
+    throw std::runtime_error("r4d gemm_bf16_nt_m64: row pitch unsupported");
   if (WV < 1 || SK < 1 || (int64_t)WV * SK > 1024 / WAVE32)
     throw std::runtime_error("r4d gemm_bf16_nt_m64: invalid threads/block");
   if (K % ((int64_t)SK * 16))
     throw std::runtime_error("r4d gemm_bf16_nt_m64: K must be divisible by SK*16");
   if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_bf16_nt_m64: MB must be 1..4");
-  const int chunk = r4d_bf16_gemm_chunk_rows(M, N, K, MB * 16, WV * 16);
+  const int chunk = r4d_bf16_gemm_chunk_rows_lda(M, N, K, lda, MB * 16, WV * 16);
   if (!chunk) throw std::runtime_error("r4d gemm_bf16_nt_m64: invalid dimensions or weight span");
   // A chained op must publish one completion, not one per rebased launch. Existing chained
   // decode shapes (M <= 64) fit one launch; do not silently change their synchronization law.
@@ -177,12 +183,12 @@ static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, in
   hipStream_t st = (hipStream_t)stream;
 #define LAUNCH(MT)                                                                                 \
   hipLaunchKernelGGL((chain ? r4dchain_gemm_bf16_nt_m64<MT> : r4d_gemm_bf16_nt_m64_kernel<MT>),    \
-                     grid, block, smem, st, Ap, Wp, Cp, mm, K, N, WV, SK)
+                     grid, block, smem, st, Ap, Wp, Cp, mm, K, N, WV, SK, (int)lda, (int)ldc)
   for (int64_t m0 = 0; m0 < M; m0 += chunk) {
     const int mm = (int)std::min<int64_t>(chunk, M - m0), mtiles = (mm + 15) / 16;
     dim3 grid((ntiles + WV - 1) / WV, (mtiles + MB - 1) / MB);
-    auto Ap = (const unsigned short*)a + m0 * K;
-    auto Cp = (__hip_bfloat16*)c + m0 * N;
+    auto Ap = (const unsigned short*)a + m0 * lda;
+    auto Cp = (__hip_bfloat16*)c + m0 * ldc;
     switch (MB) {
     case 1:
       LAUNCH(1);
@@ -216,7 +222,7 @@ template <int MT>
 __global__ __launch_bounds__(1024) void r4d_logits_wmma_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
     float* __restrict__ C, int M, int K, int N, int WV, int SK) {
-  r4d_gemm_bf16_nt_m64_body<MT, false, float>(A, W, C, M, K, N, WV, SK);
+  r4d_gemm_bf16_nt_m64_body<MT, false, float>(A, W, C, M, K, N, WV, SK, K, N);
 }
 extern "C" int r4d_logits_gemm_bf16_wmma(long a, long w, long c, int M, int K, int N, int a_ld,
                                          int c_ld, long stream) {
@@ -250,18 +256,20 @@ int r4d_gemm_bf16_nt_m64_max_m(void) {
 // The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
-    int rc = gemm_ops(a, &g, 0);
+    int rc = gemm_ops(a, &g, 0, 0, /*pitched=*/1);
     if (rc != RAD_OK) return rc;
     if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 16, 16)) return R4D_NO(RAD_E_SHAPE);
+    if (g.lda % 4 || g.ldc > INT32_MAX) return R4D_NO(RAD_E_STRIDE);
     Cfg c;
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);  /* "K divisible by SK*16" */
     if (rc != RAD_OK) return rc;
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
-    if (chain && r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, c.mb * 16, c.wv * 16) < g.M)
+    if (chain && r4d_bf16_gemm_chunk_rows_lda(g.M, g.N, g.K, g.lda, c.mb * 16, c.wv * 16) < g.M)
       return R4D_NO(RAD_E_UNSUPPORTED);
     R4D_TRY("gemm_bf16_nt_m64",
-            gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M, (int)g.K,
-                                 (int)g.N, c.wv, c.sk, c.mb, (long)(uintptr_t)s, chain));
+        gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y),
+                             (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb,
+                             (long)(uintptr_t)s, chain, g.lda, g.ldc));
     return RAD_OK;
 }
 

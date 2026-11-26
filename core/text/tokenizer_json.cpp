@@ -17,9 +17,7 @@
 #include "rad_internal.h"
 
 #include <cstring>
-#include <fstream>
 #include <new>
-#include <sstream>
 
 namespace rad {
 
@@ -659,14 +657,11 @@ void read_config(const std::string& dir, VocabBuild& out) {
 
 int read_chat_template_path(const char* path, VocabBuild& out) {
     if (!path) return RAD_E_INVAL;
-    std::ifstream f(path);
-    if (!f) {
+    std::string t;
+    if (!read_file_bytes(path, &t)) {
         RAD_ERR("tokenizer: cannot read chat template %s", path);
         return RAD_E_IO;
     }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string t = ss.str();
     while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
     if (t.empty()) {
         RAD_ERR("tokenizer: chat template %s is empty", path);
