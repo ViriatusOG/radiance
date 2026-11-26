@@ -21,7 +21,7 @@
 
 namespace {
 
-constexpr int HD = 128, BS = 16, DR = 16, E = 1024;
+constexpr int HD = 128, BS = 16, E = 1024;
 
 std::mt19937 rng(91);
 float nrm() { static std::normal_distribution<float> d(0.f, 1.f); return d(rng); }
@@ -59,6 +59,7 @@ struct Case {
     int wgps = 0;
     int want_splits = -1; /* decode split count the card must report; -1 skips the check */
     bool scratch = false;
+    int dr = 16;          /* d_rel: 16 takes the kernels' WMMA bias, other widths the scalar one */
 };
 
 /* Every operand of one case on the host: the same values feed both plugins. */
@@ -111,6 +112,7 @@ Data make(const Case& c) {
 
     d.q.resize((size_t)d.rows * d.nh * HD);
     for (auto& v : d.q) v = rad_f32_to_bf16(nrm());
+    const int DR = c.dr;
     d.rstride = d.nh * DR + c.rpitch;
     d.r.assign((size_t)d.rows * d.rstride, rad_f32_to_bf16(9.0f));   /* the pitch's extra columns */
     for (int t = 0; t < d.rows; ++t)
@@ -166,6 +168,7 @@ int launch(const Case& c, const Data& d, const Bufs& b, int (*fn)(const RadArgs*
     t[2] = tensor(b.bt, RAD_I32, {d.n_seq, d.maxb});
     t[3] = tensor(b.su, RAD_I32, {d.n_seq});
     if (c.cu) t[6] = tensor(b.cu, RAD_I32, {d.n_seq + 1});
+    const int DR = c.dr;
     t[7] = c.rpitch ? tensor(b.r, RAD_BF16, {d.rows, d.nh, DR}, {d.rstride, DR, 1})
                     : tensor(b.r, RAD_BF16, {d.rows, d.nh, DR});
     t[8] = tensor(b.rp, RAD_BF16, {DR, E});
@@ -245,6 +248,13 @@ int main(int argc, char** argv) {
         { "ragged prefill 1500, 1000, 500 rows (2000 keys), gqa 2, full", { 1500, 1000, 500 }, { 2000, 1100, 700 }, 1, 2, 0, E },
         { "ragged prefill 1500, 1000, 500 rows (2000 keys), gqa 2, window 1024", { 1500, 1000, 500 }, { 2000, 1100, 700 }, 1, 2, 1024, E },
         { "int8 cache, gqa 3, full", { 2, 1 }, { 900, 500 }, 1, 3, 0, E, true },
+        /* Prefill (the WMMA kernel where a library has one) at the int8 cache, and at widths of
+         * r that take the scalar bias rather than the d_rel 16 WMMA one. */
+        { "ragged prefill 700, 300 rows, int8 cache, gqa 3, full", { 700, 300 }, { 900, 400 }, 1, 3, 0, E, true },
+        { "ragged prefill 1500, 1000, 500 rows, d_rel 32, gqa 2, full", { 1500, 1000, 500 }, { 2000, 1100, 700 },
+          1, 2, 0, E, false, true, 0, 0, 0, 0, 0, -1, false, 32 },
+        { "ragged prefill 600, 300 rows, d_rel 8, int8 cache, gqa 3, window 1024", { 600, 300 }, { 900, 500 },
+          1, 3, 1024, E, true, true, 0, 0, 0, 0, 0, -1, false, 8 },
         { "r as a column slice of a wider row, gqa 3", { 3 }, { 700 }, 1, 3, 0, E, false, true, 5 },
         { "sink far above the scores, gqa 2", { 1, 1 }, { 300, 40 }, 1, 2, 0, E, false, true, 0, 1 },
         /* The model bound is 262144. The split must follow the live bound, and a 10000-key

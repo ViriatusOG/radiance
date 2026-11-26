@@ -2,12 +2,16 @@
  * then ported to gfx1151; see libhalo/README.md.
  *
  * gfx1151 port state: the split-KV decode kernel, its merge and the generic kernel are ported as
- * they stand (wave32, no WMMA). The two WMMA kernels (the prefill, rel_wmma_kernel, and the packed
- * verify, rel_vfy_kernel) are written against gfx12's 16x16x16 fragment layout and are compiled
- * out until they are ported to gfx1151's (libhalo/PORTING.md section 2): HALO_REL_WMMA 0 sends a
- * prefill to the generic kernel and a verify to the decode kernel, which serve every shape. */
-#ifndef HALO_REL_WMMA
-#define HALO_REL_WMMA 0
+ * they stand (wave32, no WMMA). The WMMA prefill (rel_wmma_kernel) is ported to gfx1151's
+ * 16x16x16 fragment layout (halo_dt16.h): a lane's A / B fragment is its sixteen k values and its
+ * accumulator element e is row 2*e + (lane>>4), where gfx12 has eight and 8*(lane>>4) + e. The
+ * packed verify (rel_vfy_kernel) is still gfx12's and compiled out: HALO_REL_WMMA_VERIFY 0 sends a
+ * verify to the decode kernel, which serves every shape. */
+#ifndef HALO_REL_WMMA_PREFILL
+#define HALO_REL_WMMA_PREFILL 1
+#endif
+#ifndef HALO_REL_WMMA_VERIFY
+#define HALO_REL_WMMA_VERIFY 0
 #endif
 /* halo_attn_rel.hip -- Inkling 2's attention, attn_paged_rel (libref/ref_attn.cpp's
  * ref_attn_paged_rel is the contract): attn_paged with a relative-position bias on each score and
@@ -39,6 +43,7 @@
 #include "halo_common.h"
 #include "halo_launch.h"
 #include "halo_plugin.h"
+#include "halo_dt16.h"
 #include "rad_plugin.h"
 
 namespace halo_rel {
@@ -805,14 +810,14 @@ __device__ __forceinline__ float ex2(float x) {
 __device__ __forceinline__ int imin(int a, int b) { return a < b ? a : b; }
 __device__ __forceinline__ int imax(int a, int b) { return a > b ? a : b; }
 
-#if HALO_REL_WMMA
+#if HALO_REL_WMMA_VERIFY
 __device__ __forceinline__ rel_v8f wmma_bf16(rel_v8s a, rel_v8s b, rel_v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
 }
 __device__ __forceinline__ rel_v8f wmma_f16(rel_v8h a, rel_v8h b, rel_v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
 }
-#endif  /* HALO_REL_WMMA */
+#endif  /* HALO_REL_WMMA_VERIFY */
 __device__ __forceinline__ unsigned f16_bits(float f) {
     if (f == f) f = __builtin_fminf(__builtin_fmaxf(f, -65504.0f), 65504.0f);
     return (unsigned)__builtin_bit_cast(unsigned short, (_Float16)f);
@@ -892,7 +897,7 @@ __device__ void find_rel_tile(const int32_t* cu, int n_seq, int tile, int* s_sca
     lt_out = s_res[1];
 }
 
-#if HALO_REL_WMMA
+#if HALO_REL_WMMA_PREFILL
 template <bool I8, bool DR16>
 __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kernel(RelArgs A) {
     constexpr int ESZ = I8 ? 1 : 2;
@@ -903,6 +908,9 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
     constexpr int NVI = 8 * NCH;
     constexpr int KPT = (NKI + kWThreads - 1) / kWThreads;
     constexpr int VPT = (NVI + kWThreads - 1) / kWThreads;
+    /* gfx1151: Q, K, r and rel_proj enter the WMMA as bf16, P and V as f16 (halo_dt16.h). */
+    typedef DT16<0> WQ;
+    typedef DT16<1> WP;
 
     __shared__ uint4    s_k[16 * kWKS / 16];
     __shared__ uint4    s_vt[kHd * kWVS / 16];
@@ -959,10 +967,13 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
 
     const uint16_t* r16 = (const uint16_t*)A.r + (long long)tok0 * A.r_rs +
                           (long long)h_head * A.r_hs;
-    rel_v8s rf{};
+    WQ::frag rf{};
     if constexpr (DR16) {
-        const uint16_t* rp_q = r16 + (long long)(rval ? qrow : 0) * A.r_rs + 8 * h;
-        rf = __builtin_bit_cast(rel_v8s, rval ? ld_u4(rp_q) : make_uint4(0u, 0u, 0u, 0u));
+        const uint16_t* rp_q = r16 + (long long)(rval ? qrow : 0) * A.r_rs;
+        const uint4 u0 = rval ? ld_u4(rp_q) : make_uint4(0u, 0u, 0u, 0u);
+        const uint4 u1 = rval ? ld_u4(rp_q + 8) : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+        rf = WQ::mk(w8);
     } else {
         for (int qr = wave; qr < npos; qr += kWThreads / 32) {
             if (lane < A.d_rel) s_r[qr][lane] = r16[(long long)qr * A.r_rs + lane];
@@ -972,17 +983,19 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
         __syncthreads();
     }
 
-    rel_v8s qf[kHd / 16];
+    WQ::frag qf[kHd / 16];
     {
         const uint16_t* qp = (const uint16_t*)A.q + (long long)(tok0 + (rval ? qrow : 0)) * A.q_rs +
-                             (long long)h_head * A.q_hs + 8 * h;
+                             (long long)h_head * A.q_hs;
 #pragma unroll
         for (int kc = 0; kc < kHd / 16; ++kc) {
-            const uint4 w = rval ? ld_u4(qp + kc * 16) : make_uint4(0u, 0u, 0u, 0u);
-            qf[kc] = __builtin_bit_cast(rel_v8s, w);
+            const uint4 u0 = rval ? ld_u4(qp + kc * 16) : make_uint4(0u, 0u, 0u, 0u);
+            const uint4 u1 = rval ? ld_u4(qp + kc * 16 + 8) : make_uint4(0u, 0u, 0u, 0u);
+            const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+            qf[kc] = WQ::mk(w8);
         }
     }
-    rel_v8f oacc[kHd / 16];
+    v8f oacc[kHd / 16];
 #pragma unroll
     for (int mc = 0; mc < kHd / 16; ++mc)
 #pragma unroll
@@ -1138,43 +1151,54 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
         if (kt + 1 < nkt) fetch(kt + 1);
         if constexpr (DR16) {
             if (need_rp) {
-                rel_v8f b0 = {}, b1 = {};
-                const uint4 a0 = ld_u4(&s_rp[wave * 16 + n][8 * h]);
-                const uint4 a1 = ld_u4(&s_rp[wave * 16 + 16 + n][8 * h]);
-                b0 = wmma_bf16(__builtin_bit_cast(rel_v8s, a0), rf, b0);
-                b1 = wmma_bf16(__builtin_bit_cast(rel_v8s, a1), rf, b1);
+                v8f b0 = {}, b1 = {};
+                {
+                    const uint4 x0 = *(const uint4*)&s_rp[wave * 16 + n][0];
+                    const uint4 x1 = *(const uint4*)&s_rp[wave * 16 + n][8];
+                    const uint4 y0 = *(const uint4*)&s_rp[wave * 16 + 16 + n][0];
+                    const uint4 y1 = *(const uint4*)&s_rp[wave * 16 + 16 + n][8];
+                    const uint32_t wa[8] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
+                    const uint32_t wb[8] = { y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w };
+                    b0 = WQ::wmma(WQ::mk(wa), rf, b0);
+                    b1 = WQ::wmma(WQ::mk(wb), rf, b1);
+                }
+                /* Element e is distance row 2*e + h of each sixteen (halo_dt16.h). */
                 float* sb = &s_bias[wave][n][0];
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    sb[8 * h + e]      = b0[e];
-                    sb[16 + 8 * h + e] = b1[e];
+                    sb[2 * e + h]      = b0[e];
+                    sb[16 + 2 * e + h] = b1[e];
                 }
                 lds_barrier();
             }
         }
 
         /* S^T = K * Q^T over all 128 dims (8 WMMAs, NS=1). */
-        rel_v8f sacc;
+        v8f sacc;
 #pragma unroll
         for (int e = 0; e < 8; ++e) sacc[e] = 0.0f;
         {
-            const uint8_t* ka = kb + n * kWKS + (8 * h) * 2;
+            /* A = K row n, its sixteen dims a chunk; element e of the result is key 2*e + h. */
+            const uint8_t* ka = kb + n * kWKS;
 #pragma unroll
-            for (int kc = 0; kc < kHd / 16; ++kc)
-                sacc = wmma_bf16(__builtin_bit_cast(rel_v8s, *(const uint4*)(ka + kc * 32)),
-                                 qf[kc], sacc);
+            for (int kc = 0; kc < kHd / 16; ++kc) {
+                const uint4 u0 = *(const uint4*)(ka + kc * 32);
+                const uint4 u1 = *(const uint4*)(ka + kc * 32 + 16);
+                const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+                sacc = WQ::wmma(WQ::mk(w8), qf[kc], sacc);
+            }
         }
 
         if constexpr (I8) {
 #pragma unroll
             for (int e = 0; e < 8; ++e)
                 sacc[e] *= (float)__builtin_bit_cast(
-                    _Float16, (unsigned short)(s_sc[8 * h + e] & 0xffffu));
+                    _Float16, (unsigned short)(s_sc[2 * e + h] & 0xffffu));
         }
 
         /* Add relative bias r[qrow] . rp[:, dist] and convert score to log2 domain. */
         float sv[8], mx = -__builtin_inff();
-        const int u0 = qrow + 15 - 8 * h;
+        const int u0 = qrow + 15 - h;   /* key 2*e + h: the rel_proj row is u0 - 2*e */
         const int d_rel = (int)A.d_rel;
         const bool interior = rval && tok && k0 >= lo && (k0 + 15) < hi &&
                               (!causal || (k0 + 15) <= pos) &&
@@ -1191,10 +1215,10 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
         } else if constexpr (DR16) {
             if (interior && need_rp && (pos - (k0 + 15)) >= 0 && (pos - k0) < (int)A.extent) {
                 const float* sb = &s_bias[wave][n][0];
-                const int m0 = 15 + n - 8 * h;
+                const int m0 = 15 + n - h;
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    sv[e] = (sacc[e] * sscale + sb[m0 - e]) * kLog2e;
+                    sv[e] = (sacc[e] * sscale + sb[m0 - 2 * e]) * kLog2e;
                     mx = __builtin_fmaxf(mx, sv[e]);
                 }
                 fast = true;
@@ -1203,7 +1227,7 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
         if (!fast) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const int kk = k0 + 8 * h + e;
+                const int kk = k0 + 2 * e + h;
                 bool vis = rval && tok && kk >= lo && kk < hi;
                 if (causal) vis = vis && kk <= pos;
                 if (window > 0) vis = vis && (pos - kk < window) && (causal || kk - pos < window);
@@ -1211,9 +1235,9 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
                     float bias = 0.0f;
                     const int dist = pos - kk;
                     if (need_rp && dist >= 0 && dist < (int)A.extent) {
-                        const int u = u0 - e;
+                        const int u = u0 - 2 * e;
                         if constexpr (DR16) {
-                            bias = s_bias[wave][n][15 + n - 8 * h - e];
+                            bias = s_bias[wave][n][15 + n - h - 2 * e];
                         } else {
                             for (int c = 0; c < d_rel; ++c)
                                 bias += bf(s_r[qrow][c]) * bf(s_rp[u][c]);
@@ -1229,46 +1253,65 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
         mx = __builtin_fmaxf(mx, wshfl_xor(mx, 16));
         const float mn = __builtin_fmaxf(m, mx);
         const float corr = mn == -__builtin_inff() ? 1.0f : (m == -__builtin_inff() ? 0.0f : ex2(m - mn));
+        /* P in f16 (element e: key 2*e + h), held as the f16 values in f32 so the denominator
+         * sums P as rounded, as libr4d's does. Packed below with WP::pk, exact for an f16 value:
+         * a bit_cast of a _Float16 vector element miscompiled to every element's bits here. */
         float ps = 0.0f;
-        rel_v8h pf;
+        float pv[8];
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const float pe = (sv[e] == -__builtin_inff() || mn == -__builtin_inff())
                                  ? 0.0f
                                  : ex2(sv[e] - mn);
-            pf[e] = (_Float16)pe;
-            ps += (float)pf[e];
+            pv[e] = (float)(_Float16)pe;
+            ps += pv[e];
         }
         l = l * corr + ps;
         m = mn;
         if constexpr (I8) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const float pe = (float)pf[e];
                 const float vs = (float)__builtin_bit_cast(
-                    _Float16, (unsigned short)(s_sc[8 * h + e] >> 16));
-                pf[e] = pe != 0.0f ? (_Float16)(pe * vs) : (_Float16)0.0f;
+                    _Float16, (unsigned short)(s_sc[2 * e + h] >> 16));
+                pv[e] = pv[e] != 0.0f ? (float)(_Float16)(pv[e] * vs) : 0.0f;
             }
         }
-        const uint8_t* va = vb + n * kWVS + h * 16;
+        /* The B fragment wants the tile's sixteen keys in order; a lane holds one parity of them,
+         * so p16w interleaves the half-pair's eight values (halo_dt16.h). */
+        WP::frag pfrag;
+        {
+            uint32_t pw[4], pw16[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) pw[i] = WP::pk(pv[2 * i], pv[2 * i + 1]);
+            p16w<WP>(pw, pw16);
+            pfrag = WP::mk(pw16);
+        }
+        /* A = V^T row n (dim mc*16 + n): the tile's sixteen keys, 32 bytes of its staged row. */
+        const uint8_t* va = vb + n * kWVS;
         if (__builtin_amdgcn_ballot_w32(corr != 1.0f) != 0) {
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc) oacc[mc] *= corr;
         }
 #pragma unroll
-        for (int mc = 0; mc < kHd / 16; ++mc)
-            oacc[mc] = wmma_f16(__builtin_bit_cast(rel_v8h, *(const uint4*)(va + mc * 16 * kWVS)),
-                                pf, oacc[mc]);
+        for (int mc = 0; mc < kHd / 16; ++mc) {
+            const uint4 u0 = *(const uint4*)(va + mc * 16 * kWVS);
+            const uint4 u1 = *(const uint4*)(va + mc * 16 * kWVS + 16);
+            const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+            oacc[mc] = WP::wmma(WP::mk(w8), pfrag, oacc[mc]);
+        }
     }
 
     const float lt2 = l + wshfl_xor(l, 16);
     if (rval) {
+        /* O^T's element e is head dim 2*e + h (halo_dt16.h): a scatter of eight 16-bit values a
+         * chunk, the half-pair writing the even and odd dims between them. */
         uint16_t* op = (uint16_t*)A.out + (long long)(tok0 + qrow) * A.o_rs +
-                       (long long)h_head * A.o_hs + 8 * h;
+                       (long long)h_head * A.o_hs + h;
         if (m == -__builtin_inff()) {
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc)
-                *(uint4*)(op + mc * 16) = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) op[mc * 16 + 2 * e] = 0;
         } else {
             const float sk_log2 = ld_bf_or_f(A.sk, A.s_f32,
                                              (long long)(tok0 + qrow) * A.s_rs +
@@ -1280,15 +1323,15 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
             const float inv = den > 0.0f ? (vds * alpha) / den : 0.0f;
 #pragma unroll
             for (int mc = 0; mc < kHd / 16; ++mc)
-                *(uint4*)(op + mc * 16) = make_uint4(
-                    pack2(oacc[mc][0] * inv, oacc[mc][1] * inv),
-                    pack2(oacc[mc][2] * inv, oacc[mc][3] * inv),
-                    pack2(oacc[mc][4] * inv, oacc[mc][5] * inv),
-                    pack2(oacc[mc][6] * inv, oacc[mc][7] * inv));
+#pragma unroll
+                for (int e = 0; e < 8; ++e) op[mc * 16 + 2 * e] = tobf(oacc[mc][e] * inv);
         }
     }
 }
 
+#endif  /* HALO_REL_WMMA_PREFILL */
+
+#if HALO_REL_WMMA_VERIFY
 /* Packed verify: rel_wmma_kernel's tile walk for a verify's few rows. The decode kernel gives each
  * verify row its own blocks, and each scores the group's heads one key at a time, so eight rows
  * cost eight times one. Here a block is one sequence's verify rows for one KV head, and a WMMA
@@ -1719,7 +1762,7 @@ __global__ __launch_bounds__(kWThreads, 1) void rel_vfy_kernel(RelArgs A) {
     rel_vfy_body<I8, DR16>(A);
     if (CH::on) halo_chain_done();
 }
-#endif  /* HALO_REL_WMMA */
+#endif  /* HALO_REL_WMMA_VERIFY */
 
 static inline int64_t rel_scratch_bytes() {
     return (int64_t)kRelPartBudget * kMaxGqa * (kHd + 4) * (int64_t)sizeof(float);
@@ -1763,7 +1806,7 @@ static int rel_verify_splits(long long n_seq, long long rows, long long kv_heads
     return ns < 1 ? 1 : (int)ns;
 }
 
-#if HALO_REL_WMMA
+#if HALO_REL_WMMA_VERIFY
 template <bool I8, bool DR16>
 static void launch_vfy(bool chain, dim3 grid, hipStream_t hs, const RelArgs& A) {
     if (chain)
@@ -1771,7 +1814,7 @@ static void launch_vfy(bool chain, dim3 grid, hipStream_t hs, const RelArgs& A) 
     else
         HALO_KLAUNCH(HALO_KNAME(rel_vfy_kernel<I8, DR16, HaloUnchained>), grid, dim3(kWThreads), hs, A);
 }
-#endif  /* HALO_REL_WMMA */
+#endif  /* HALO_REL_WMMA_VERIFY */
 
 /* Shared host side: validate geometry, dispatch WMMA prefill, split-KV decode, or fallback. */
 static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
@@ -1868,7 +1911,7 @@ static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
             rad_ptr_aligned(kv->data, 16) && ((A.q_rs | A.q_hs | A.o_rs | A.o_hs) % 8) == 0 &&
             (A.sb * esz) % 16 == 0 && (A.sh * esz) % 16 == 0 &&
             kv->stride[2] == (i8 ? (2 * kHd + 4) : (2 * kHd));
-#if HALO_REL_WMMA
+#if HALO_REL_WMMA_PREFILL
         if (wmma_aligned && qmax >= 32 && rows >= n_seq * 16) {
             long long ntw = 0, tps = 0;
             if (!cu) {
@@ -1900,7 +1943,7 @@ static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
                 return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
             }
         }
-#endif  /* HALO_REL_WMMA */
+#endif  /* HALO_REL_WMMA_PREFILL */
 
         const bool kv_dec_aligned = i8
             ? (rad_ptr_aligned(kv->data, 4) && ((A.sb | A.sh | A.so) % 4) == 0)
@@ -1920,7 +1963,7 @@ static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
              * (under 12 columns) takes it only over a short span: on an R9700 at gqa 3, 8 rows
              * run 1.8-2.2x faster from 1k to 131k keys and 4 rows 1.0-1.7x, while 2 rows win
              * 1.7x at 1k keys and lose 0.6x from 32k. */
-            const bool packed = HALO_REL_WMMA && wmma_aligned && qmax >= 2 && qmax * gqa <= kWBQ &&
+            const bool packed = HALO_REL_WMMA_VERIFY && wmma_aligned && qmax >= 2 && qmax * gqa <= kWBQ &&
                                 (qmax * gqa >= 12 || span <= 8192);
             long long ns = 1;
             if (packed)
@@ -1937,7 +1980,7 @@ static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
 
             const bool chain = rad_args_geti_or(a, "chain", 0) != 0 && rows <= 16;
             hipStream_t hs = (hipStream_t)stream;
-#if HALO_REL_WMMA
+#if HALO_REL_WMMA_VERIFY
             if (packed) {
                 const dim3 g((unsigned)n_seq, (unsigned)kv_heads, (unsigned)ns);
                 const bool dr16 = d_rel == 16;
@@ -1949,7 +1992,7 @@ static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
                     else      launch_vfy<false, false>(chain, g, hs, A);
                 }
             } else
-#endif  /* HALO_REL_WMMA */
+#endif  /* HALO_REL_WMMA_VERIFY */
             if (i8) {
                 if (chain)
                     HALO_KLAUNCH(HALO_KNAME(rel_dec_kernel<true, r4dchain>),
