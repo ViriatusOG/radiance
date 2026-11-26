@@ -1,4 +1,5 @@
-/* l2_clip on the card: libr4d's exported launcher (r4d_rad_l2_clip) against the formula in double,
+/* l2_clip on the card: libr4d's exported launcher (r4d_rad_l2_clip), or another library's given as
+ * the second argument, against the formula in double,
  * at the model's shapes (per-head norms of 128 over 8 heads, with the scale and positions, and a
  * plain 1024-wide clip). Build with hipcc; pass the path of libr4d.so.
  *
@@ -125,11 +126,13 @@ void run_case(Fn fn, const char* what, int64_t M, int64_t n, int64_t g, int64_t 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s libr4d.so\n", argv[0]); return 77; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s libr4d.so [entry]\n", argv[0]); return 77; }
+    /* The entry defaults to libr4d's; libhalo's (halo_rad_l2_clip) is the same contract. */
+    const char* entry = argc > 2 ? argv[2] : "r4d_rad_l2_clip";
     void* h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-    auto fn = reinterpret_cast<Fn>(dlsym(h, "r4d_rad_l2_clip"));
-    if (!fn) { std::fprintf(stderr, "dlsym r4d_rad_l2_clip: %s\n", dlerror()); return 1; }
+    auto fn = reinterpret_cast<Fn>(dlsym(h, entry));
+    if (!fn) { std::fprintf(stderr, "dlsym %s: %s\n", entry, dlerror()); return 1; }
 
     std::printf("l2_clip on the card:\n");
     /* The model's QK clip: 8 heads of 128 per row, the scale, positions. */

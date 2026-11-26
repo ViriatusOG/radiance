@@ -115,6 +115,7 @@ set(HALO_UNITS
   "halo_kda|"
   "halo_kv_len_trim|"
   "halo_kv_resolve|"
+  "halo_l2_clip_bf16|"
   "halo_lili|"
   "halo_logits_gemm|"
   "halo_logits_vocab|"

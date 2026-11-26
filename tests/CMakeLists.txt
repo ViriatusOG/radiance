@@ -445,18 +445,31 @@ if(RAD_HIP_FOUND AND TARGET libr4d)
     ENVIRONMENT "${RAD_TEST_CARD_ENV}")
 endif()
 
-# l2_clip on the card: libr4d's exported launcher against the formula, at the model's shapes.
-if(RAD_HIP_FOUND AND TARGET libr4d)
+# l2_clip on the card: libr4d's and libhalo's exported launchers against the formula, at the
+# model's shapes.
+if(RAD_HIP_FOUND AND (TARGET libr4d OR TARGET libhalo))
   add_executable(l2clip_device_test ${CMAKE_CURRENT_SOURCE_DIR}/l2clip_device_test.cpp)
   set_target_properties(l2clip_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   target_link_libraries(l2clip_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
-  add_dependencies(l2clip_device_test libr4d)
-  add_test(NAME l2clip_device_test_card COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
-  set_tests_properties(l2clip_device_test_card PROPERTIES
-    LABELS gpu
-    RUN_SERIAL TRUE
-    TIMEOUT ${RAD_TEST_TIMEOUT}
-    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  if(TARGET libr4d)
+    add_dependencies(l2clip_device_test libr4d)
+    add_test(NAME l2clip_device_test_card COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+    set_tests_properties(l2clip_device_test_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
+  if(TARGET libhalo)
+    add_dependencies(l2clip_device_test libhalo)
+    add_test(NAME l2clip_device_test_halo_card
+             COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libhalo.so halo_rad_l2_clip)
+    set_tests_properties(l2clip_device_test_halo_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
 endif()
 
 # posemb_resample on the card: libr4d's row against libref's over the vision tower's grids and the

@@ -1954,6 +1954,21 @@ static const RadOperandSpec oRmsNorm[] = {
 static const RadParamSpec pSituMul[] = {
     P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("gate_cap"), P_F64O("up_cap"),
 };
+static const RadParamSpec pL2Clip[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "n",         RAD_P_INT, RAD_REQUIRED },
+    { "group",     RAD_P_INT, RAD_REQUIRED },
+    { "threshold", RAD_P_F64, RAD_REQUIRED },
+    { "dtype",     RAD_P_STR, RAD_REQUIRED },
+    { "floor",     RAD_P_F64, RAD_OPTIONAL },
+    { "alpha",     RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oL2Clip[] = {
+    { "x",         RAD_OPD_IN,     0 },
+    { "w",         RAD_OPD_WEIGHT, 1 },
+    { "positions", RAD_OPD_IN,     1 },
+    { "y",         RAD_OPD_OUT,    0 },
+};
 static const RadParamSpec pMnDtype[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -3447,6 +3462,10 @@ static const RadOpSchema kSchemas[] = {
            "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
            "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
            "The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's."),
+    SCHEMA("l2_clip", pL2Clip, oL2Clip,
+           "y[r][i] = x[r][i] * w[i] * min(1, threshold / (||x*w over i's group|| + 1e-6)) * tau[r], "
+           "tau = 1 + alpha * ln(max(1, (positions[r] + 1) / floor)) with positions, else 1. "
+           "floor 1 and alpha 0 by default."),
     SCHEMA("ngram_hint", pNgramHint, oNgramHint,
            "ids[s][h] = ngram_ids' hash of the n-gram ending at sequence s's NEWEST token on a "
            "draft head's pass: with `hist` the history pass's last row (the token the verify "
@@ -6229,6 +6248,7 @@ static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype"
 
 /* No tunable axes. */
 #define NOTUNE nullptr, 0, nullptr
+static const RadConstraint cL2Clip[] = { C_IN("dtype", "bf16"), C_GE("group", 1) };
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
  * that window's memory bandwidth without taking the compute units the other lane needs. */
@@ -7059,6 +7079,13 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, halo_rad_situ_mul, nullptr, nullptr, nullptr,
   halo_shape_silu_mul },
+{ "l2_clip_bf16", "l2_clip", "elem",
+  "Inkling 2's per-group L2 clip with an optional scale and a position tau; one wave a (row, group)",
+  "any group size dividing n",
+  "bf16 activations and scale, i32 positions; pitched x and y, y may alias x",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cL2Clip), NOTUNE,
+  nullptr, nullptr, halo_rad_l2_clip },
 
 { "gelu_mul_bf16", "gelu_mul", "elem",
   "gelu-gated product over a fused [M, 2n] gate_up",
