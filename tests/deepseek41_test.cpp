@@ -4,6 +4,7 @@
 
 #include "arch_fakes.h"
 
+#include <cstring>
 #include <map>
 #include <string>
 
@@ -26,7 +27,9 @@ struct Ds41Meta {
     std::vector<std::string> k, v;
     std::vector<const char*> kp, vp;
     RadModelMeta meta{};
-    explicit Ds41Meta(int r) {
+    /* `vision_cfg`: the config's vision_config stated, as in a container converted without the
+     * tower's weights. */
+    explicit Ds41Meta(int r, bool vision_cfg = false) {
         const std::string ratios = "0," + std::to_string(r) + "," + std::to_string(r);
         const std::pair<const char*, const char*> kv[] = {
             { "deepseek41.block_count", "3" },
@@ -53,6 +56,7 @@ struct Ds41Meta {
             { "deepseek41.attention.indexer.source_layers", "1" },
         };
         for (const auto& e : kv) { k.push_back(e.first); v.push_back(e.second); }
+        if (vision_cfg) { k.push_back("vision_config.hidden_size"); v.push_back("1152"); }
         for (size_t i = 0; i < k.size(); ++i) { kp.push_back(k[i].c_str()); vp.push_back(v[i].c_str()); }
         meta.arch_id = "deepseek41";
         meta.n_layers = 3;
@@ -162,6 +166,35 @@ TEST(ds41_fp8_kv_cache_narrows_the_latent_and_index_groups_only) {
             for (const auto& n : b.notes) noted |= n.find("KV cache fp8") != std::string::npos;
             CHECK_EQ(noted, narrow);
         }
+}
+
+/* Text-only serving (max_enc_patches 0, which the engine sets when the container has no tower's
+ * weights) declares no image-span router correction, even when the metadata states a
+ * vision_config: such a container carries no exp_probs_b_vl, and its routers read the text bias. */
+TEST(ds41_text_only_serving_declares_no_image_span_router_bias) {
+    for (bool vision_cfg : { false, true }) {
+        Ds41Meta dm(2, vision_cfg);
+        RadBuilder b;
+        b.kv_block = 2;
+        ds41_encs(b);
+        const RadBuildCtx build = ds41_ctx(RAD_BF16, 0, 1);
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = deepseek41::declare(&b, &dm.meta, &build); });
+        if (rc != RAD_OK) std::fprintf(stderr, "%s", err.c_str());
+        REQUIRE_EQ(rc, RAD_OK);
+        int text = 0, image = 0;
+        for (const auto& w : b.weights) {
+            const std::string& n = w.name;
+            const auto ends = [&](const char* t) {
+                const size_t m = std::strlen(t);
+                return n.size() >= m && n.compare(n.size() - m, m, t) == 0;
+            };
+            text += ends(".glm_router.correction");
+            image += ends(".glm_router.correction_vl");
+        }
+        CHECK(text > 0);
+        CHECK_EQ(image, 0);
+    }
 }
 
 /* Only bf16 and fp8 caches are served; the probe says fp8 is one. */

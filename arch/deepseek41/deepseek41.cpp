@@ -466,6 +466,10 @@ struct Model {
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
     bool release = false;
+    /* Images are served (the engine found the tower's weights, mm-max-patches > 0), so the routers
+     * need the image-span corrections (bias_vl / exp_probs_b_vl). A container converted without
+     * the tower keeps vision_config in its metadata but carries neither, and serves text. */
+    bool vl = false;
     int n_stage = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
@@ -1099,10 +1103,10 @@ static void moe_names(Model& m, int l, MoeQ::Src* s) {
     auto& nm = m.nm;
     s->router = ckpt_name(nm.f("blk.%d.ffn_gate_inp.weight", l));
     s->router_bias = ckpt_name(nm.f("blk.%d.exp_probs_b.bias", l));
-    s->router_bias_vl = m.release
-        ? (l < m.c.n_layer ? nm.ckpt("layers.%d.ffn.gate.bias_vl", l)
-                           : nm.ckpt("mtp.%d.ffn.gate.bias_vl", l - (int)m.c.n_layer))
-        : ckpt_name(nm.f("blk.%d.exp_probs_b_vl.bias", l));
+    s->router_bias_vl = !m.vl ? nullptr
+        : m.release ? (l < m.c.n_layer ? nm.ckpt("layers.%d.ffn.gate.bias_vl", l)
+                                       : nm.ckpt("mtp.%d.ffn.gate.bias_vl", l - (int)m.c.n_layer))
+                    : ckpt_name(nm.f("blk.%d.exp_probs_b_vl.bias", l));
     s->shared_mlp_gate = ckpt_name(nm.f("blk.%d.ffn_gate_shexp.weight", l));
     s->shared_mlp_up = ckpt_name(nm.f("blk.%d.ffn_up_shexp.weight", l));
     s->shared_mlp_down = ckpt_name(nm.f("blk.%d.ffn_down_shexp.weight", l));
@@ -2071,6 +2075,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
     m.release = is_release(meta);
+    m.vl = ctx->max_enc_patches > 0;
     m.n_stage = (int)gi(meta, "nextn_predict_layers", 0);
     naming = &m;
     DS_TRY(geometry(m, ctx));
