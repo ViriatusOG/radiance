@@ -2704,12 +2704,14 @@ by 0.002-0.003 nats.
 
 #### 4.10.1 The inkling2 vector
 
-`inkling2-control-vector.gguf` ships grenforcer's published `refusal-inkling2-late` directions
-(huggingface.co/grenforcer/Kintsugi-Inkling-2-Mini-control-vector) stored unit-normalised, with
-the sidecar carrying the package's own scale: layers 6..23 at 0.6, applied as
+`inkling2-control-vector.gguf` ships grenforcer's Kintsugi pack from Hugging Face
+(huggingface.co/grenforcer/Kintsugi-Inkling-2-Mini-control-vector, file `refusal-inkling2-late.gguf`,
+~218 KB: 24 f32[2304] directions at keys `direction.24..47`, package scale 0.6), stored
+unit-normalised, with the sidecar carrying the package's own scale: layers 6..23 at 0.6, applied as
 `h -= 0.6 (h . v) v` at each of those layers. Their pack addresses inkling2's repeat-block layers
 by visit (24..47); the shipped file remaps them to the physical layers the loader validates
-(30..47 -> 6..23). Measured on the shipped `inkling-2-mini-iq4r` container, greedy, thinking on,
+(30..47 -> 6..23, the six earliest visits dropped). Measured on the shipped `inkling-2-mini-iq4r`
+container, greedy, thinking on,
 `control_vector` per request, refusal-eval's 50/50 corpora, where a hedged substitution counts
 as a refusal:
 
