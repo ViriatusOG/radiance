@@ -2626,8 +2626,10 @@ them on. With the key the engine looks, in order, at:
 
 1. `<container without its extension>.control-vector.gguf` beside the model,
 2. `control-vector.gguf` in the container's directory (one file for a directory of quants), then
-3. `<home>/vectors/<architecture>-control-vector.gguf` for each `server.radiance-home`. radiance ships
-   `qwen4exp-control-vector.gguf` there (`data/vectors/`, installed into every plugin home).
+3. `<home>/vectors/<architecture>-control-vector.gguf` for each `server.radiance-home`. radiance
+   ships `qwen4exp-control-vector.gguf` and `inkling2-control-vector.gguf` there (`data/vectors/`,
+   installed into every plugin home; provenance and measurements at the top of `CMakeLists.txt`'s
+   vectors block and, for inkling2, `docs/GUIDE.md` 4.10.1).
 
 The startup is refused, naming the reason, when the key is set and the architecture plugin does
 not apply control vectors, no file is found, or the file does not fit: its
@@ -2699,6 +2701,32 @@ changes; the stock column is a separate boot of 1.9.0). First generated token, 2
 
 Seventeen of eighteen policy prompts flip from a refusal opening to content; neutral prompts move
 by 0.002-0.003 nats.
+
+#### 4.10.1 The inkling2 vector
+
+`inkling2-control-vector.gguf` ships grenforcer's Kintsugi pack from Hugging Face
+(huggingface.co/grenforcer/Kintsugi-Inkling-2-Mini-control-vector, file `refusal-inkling2-late.gguf`,
+~218 KB: 24 f32[2304] directions at keys `direction.24..47`, package scale 0.6), stored
+unit-normalised, with the sidecar carrying the package's own scale: layers 6..23 at 0.6, applied as
+`h -= 0.6 (h . v) v` at each of those layers. Their pack addresses inkling2's repeat-block layers
+by visit (24..47); the shipped file remaps them to the physical layers the loader validates
+(30..47 -> 6..23, the six earliest visits dropped). Measured on the shipped `inkling-2-mini-iq4r`
+container, greedy, thinking on,
+`control_vector` per request, refusal-eval's 50/50 corpora, where a hedged substitution counts
+as a refusal:
+
+| | stock | vector on |
+|---|---:|---:|
+| harmful-50 delivered | 0/50 | 49/50 |
+| harmless-50 delivered | 43/50 | 47/50 |
+| within-boot KL vs stock, mean / median | — | 0.42 / 0.007 |
+
+The single miss is a prompt asking for a game that *glorifies* violence: the model designs the
+subject but declines the glorifying frame. Within-boot KL is bimodal as usual -- most positions
+barely move; the decision points flip wholesale (greedy forks after ~8 tokens on neutral text).
+One measurement caveat carried over from `hc_project` bring-up: a steered greedy run can spend
+its whole token budget in the reasoning field and emit an empty answer; a row that comes back
+content-empty must be re-asked before counting it as a refusal.
 
 ### 4.11 Every key
 

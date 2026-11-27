@@ -348,7 +348,8 @@ AVX_KERNEL(hc_project) {
     const int64_t n  = p_int(a, "n", 0);
     const int64_t hc = p_int(a, "hc", 0);
     const float   sc = p_f32(a, "scale", 1.0f);
-    if (n <= 0 || hc <= 1 || numel(v) < n) return RAD_E_SHAPE;
+    /* hc 1 is legal: a plain residual stream (inkling2's). The stream loop is then one pass. */
+    if (n <= 0 || hc < 1 || numel(v) < n) return RAD_E_SHAPE;
     const int64_t hn = hc * n;
     const int64_t rows = numel(h) / hn;
     if (rows <= 0 || numel(on) < rows) return RAD_E_SHAPE;

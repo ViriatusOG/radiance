@@ -133,8 +133,11 @@ TEST(the_derivation_refuses_a_buffer_too_small) {
 TEST(the_reference_projection_removes_the_direction_per_stream) {
     /* Directly the operation the package's README states, on a synthetic stream: after one
      * application every stream's component along v is (1 - scale) times what it was, and with a
-     * unit direction at the stored scale 1 it is exactly zero, i.e. h -= (h.v) v. */
-    const int64_t n = 8, hc = 2, rows = 2;
+     * unit direction at the stored scale 1 it is exactly zero, i.e. h -= (h.v) v. Run at two
+     * widths: a gated stream (hc 2) and a single plain one (hc 1 -- inkling2's bf16 residual,
+     * where the stream loop is one pass). */
+    const int64_t n = 8, rows = 2;
+    for (const int64_t hc : { (int64_t) 2, (int64_t) 1 }) {
     std::vector<float> h((size_t) (rows * hc * n));
     std::vector<float> v((size_t) n);
     std::vector<int32_t> on{ 1, 0 };
@@ -193,6 +196,7 @@ TEST(the_reference_projection_removes_the_direction_per_stream) {
             const size_t k = (size_t) ((1 * hc + c) * n + i);
             CHECK_EQ(std::memcmp(&h[k], &want[k], sizeof(float)), 0);
         }
+    }
 }
 
 RAD_TEST_MAIN()

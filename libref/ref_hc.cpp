@@ -280,7 +280,7 @@ int ref_hc_project(const RadArgs* a, RadStream) {
     const int64_t n  = p_int(a, "n", 0);
     const int64_t hc = p_int(a, "hc", 0);
     const float   sc = p_f32(a, "scale", 1.0f);
-    if (n <= 0 || hc <= 1) return RAD_E_SHAPE;
+    if (n <= 0 || hc < 1) return RAD_E_SHAPE;   /* hc 1: a plain residual stream, inkling2's */
     if (numel(v) < n) return RAD_E_SHAPE;
     const int64_t hn = hc * n;
 

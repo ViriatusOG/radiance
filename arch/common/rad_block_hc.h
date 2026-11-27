@@ -455,10 +455,12 @@ struct HcProject {
     }
 
     /* `layer`'s projection, when the vector steers it. Called for every layer; the unsteered ones
-     * (outside the file, outside the range, or no vector at all) declare nothing. */
+     * (outside the file, outside the range, or no vector at all) declare nothing. `hc_streams` 1
+     * is legal: the stream may be a plain bf16 residual (inkling2's) rather than a gated one,
+     * and the kernel's per-stream loop is the identity at one stream. */
     int declare(RadBuilder* b, const char* name, const Geom& g, int64_t layer,
                 const RadControlVector* cv, rad_buf mask, rad_buf stream, int64_t hc_streams) {
-        if (!b || !mask || !stream || !cv || !cv->dir || hc_streams <= 1) return RAD_OK;
+        if (!b || !mask || !stream || !cv || !cv->dir || hc_streams < 1) return RAD_OK;
         if (layer <= 0 || layer >= cv->n_layers || layer >= g.n_layer) return RAD_OK;
         const float scale = cv->scales ? cv->scales[(size_t) layer] : 0.0f;
         if (scale == 0.0f) return RAD_OK;

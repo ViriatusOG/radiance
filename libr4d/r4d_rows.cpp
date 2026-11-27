@@ -669,8 +669,11 @@ static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), 
 static const RadOperandSpec oHcProject[] = {
     { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
 };
+/* hc 1 is admitted here and nowhere else among the gated-residual rows: the projection steers a
+ * plain residual stream too (inkling2's), and the kernel's loop over the streams is the identity
+ * at one. The other hc ops mix streams and are meaningless below two. */
 static const RadConstraint cHcProject[] = {
-    C_GE("M", 1), C_GE("n", 1), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_GE("n", 1), C_GE("hc", 1), C_LE("hc", 8), C_IN("dtype", "bf16"),
 };
 /* The gated residual. `hc_enter` and `hc_write` share a parameter list; `hc_read` adds the two
  * switches its operand list depends on: `inject` 0 is the final mixer and `group` 0 a read whose
@@ -8951,7 +8954,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "hc_project_bf16", "hc_project", "norm",
   "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
-  "any M, any n, hc 2..8",
+  "any M, any n, hc 1..8",
   "bf16 stream, f32 direction, i32 switch",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHcProject), NOTUNE,
