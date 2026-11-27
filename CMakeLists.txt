@@ -199,8 +199,19 @@ endif()
 # License 1.0 (data/vectors/LICENSE.qwen-community-1.0.txt, NOTICE); radiance's Apache-2.0 grant
 # covers the code that reads them, never the file. It ships loaded only when the deployment asks
 # (--control-vector), and the request default is off, because what it removes is a safety behaviour.
+# Inkling2's vector ships the same way, and is the one measured in docs/GUIDE.md 4.10 for that
+# arch: grenforcer's published directions (huggingface.co/grenforcer/Kintsugi-Inkling-2-Mini-control-vector,
+# the `refusal-inkling2-late` pack), stored unit-normalised and remapped from their visit view
+# (direction.30..47 -> physical layers 6..23, which is what 2.3's loader validates against the
+# physical count). gguf sha256 9d83085565cffb9f..., json dc0cf696597f7636.... No license is stated
+# at the source as of shipping; the directions are derived from Kintsugi's Inkling-2-Mini, and
+# radiance's Apache-2.0 grant covers the reader, not the file. Measured greedy on the shipped
+# iq4r container, 50 harmful / 50 harmless, substitution counted as refusal: harmful delivered
+# 49/50 (stock 0/50), harmless 47/50 (stock 43/50); within-boot KL mean 0.42, median 0.007. It
+# ships loaded only when the deployment asks, and the request default is off.
 file(MAKE_DIRECTORY ${RAD_PLUGIN_OUT}/vectors)
-foreach(rrad_vector qwen4exp-control-vector.gguf qwen4exp-control-vector.json)
+foreach(rrad_vector qwen4exp-control-vector.gguf qwen4exp-control-vector.json
+                    inkling2-control-vector.gguf inkling2-control-vector.json)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/${rrad_vector}
                  ${RAD_PLUGIN_OUT}/vectors/${rrad_vector} COPYONLY)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/${rrad_vector}
