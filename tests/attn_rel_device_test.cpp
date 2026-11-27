@@ -60,6 +60,7 @@ struct Case {
     int want_splits = -1; /* decode split count the card must report; -1 skips the check */
     bool scratch = false;
     int dr = 16;          /* d_rel: 16 takes the kernels' WMMA bias, other widths the scalar one */
+    int want_splits_halo = -2;  /* libhalo's count where its split rule differs; -2: want_splits */
 };
 
 /* Every operand of one case on the host: the same values feed both plugins. */
@@ -271,11 +272,14 @@ int main(int argc, char** argv) {
          * are rows * kv heads * gqa slots, which bounds the splits (21 here), and the last keys
          * carry the bias. */
         { "packed verify 8 rows, 10000 keys, 8 kv heads, gqa 3, split", { 8 }, { 10000 }, 8, 3, 0, E,
-          false, true, 0, 0, 10000, 262144, 32, 21, true },
+          false, true, 0, 0, 10000, 262144, 32, 21, true, 16, 39 },
         { "packed verify int8, 4 and 7 rows, window 1024, split", { 4, 7 }, { 3000, 2500 }, 2, 3,
           1024, E, true, true, 0, 0, 3000, 262144, 32, 4, true },
         { "packed verify 5 rows, gqa 8 (three waves), split", { 5 }, { 4000 }, 1, 8, 0, E,
           false, true, 0, 0, 4000, 262144, 32, 15, true },
+        /* Over 64 columns: the packed verify's largest block where a library sizes it to them. */
+        { "packed verify 12 rows, gqa 8 (96 columns), split", { 12 }, { 3000 }, 1, 8, 0, E,
+          true, true, 0, 0, 3000, 262144, 32, -1, true },
     };
 
     int fails = 0;
@@ -319,10 +323,13 @@ int main(int argc, char** argv) {
         int splits = -1;
         bool splits_ok = true;
         const bool packed_case = std::strncmp(c.name, "packed", 6) == 0;
-        if (c.want_splits >= 0 && !(no_packed && packed_case)) {
+        /* libhalo's packed verify runs smaller blocks and so more splits (halo_attn_rel.hip,
+         * rel_verify_splits): where its count differs the case names it. */
+        const int want = (pfx == "halo" && c.want_splits_halo != -2) ? c.want_splits_halo : c.want_splits;
+        if (want >= 0 && !(no_packed && packed_case)) {
             auto last = reinterpret_cast<int (*)()>(dlsym(hr4d, (pfx + "_attn_rel_last_splits").c_str()));
             splits = last ? last() : -1;
-            splits_ok = splits == c.want_splits;
+            splits_ok = splits == want;
         }
         if (scratch) (void)hipFree(scratch);
         const double e = rel_l2(ref_out, dout.get());

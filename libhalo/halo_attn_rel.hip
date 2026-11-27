@@ -57,7 +57,10 @@ constexpr int kMaxGqa       = 8;
 constexpr int kDecBK        = 32;    /* two 16-key paged blocks per tile in decode kernel */
 constexpr int kRelTilesMin  = 8;     /* keys a split keeps, in tiles: rad_prefill_splits_law's floor */
 constexpr int kRelMaxSplit  = 128;   /* merge width; scratch holds this at four (tok, kv-head) pairs */
-constexpr int kRelPartBudget = 512;  /* max (tok, kv_head, split) partial slots in scratch */
+/* max (tok, kv_head, split) partial slots in scratch. libr4d's is 512; the packed verify's smaller
+ * blocks here take four times the splits (rel_verify_splits), and the decode split count is held by
+ * its fill target before this binds. */
+constexpr int kRelPartBudget = 2048;
 constexpr int kRelBlocksPerWgp = 16; /* 128-thread blocks wanted on a WGP before the scratch cuts it */
 
 constexpr int kWThreads     = 256;   /* WMMA prefill: 8 waves x 16 qrows = 128 qrows per block */
@@ -1331,7 +1334,7 @@ __global__ __launch_bounds__(kWThreads, kWBQ >= 128 ? 1 : 2) void rel_wmma_kerne
  * than one split, leaves rel_dec_body's partial for rel_merge_kernel. A column's position, masks and
  * bias distance follow its row (prow). Kept apart from rel_wmma_kernel: sharing one body moved the
  * prefill's code and cost it 3-5%. */
-template <bool I8, bool DR16>
+template <bool I8, bool DR16, int VT>
 __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     constexpr int ESZ = I8 ? 1 : 2;
     constexpr int SLOT = 2 * kHd * ESZ + (I8 ? 4 : 0);
@@ -1342,14 +1345,19 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     constexpr int NCH = kHd / CW;
     constexpr int NKI = 16 * NCH;
     constexpr int NVI = 8 * NCH;
-    constexpr int KPT = (NKI + kWThreads - 1) / kWThreads;
-    constexpr int VPT = (NVI + kWThreads - 1) / kWThreads;
+    /* VT threads, VT/32 waves of sixteen columns: sized to the verify's columns by the launch. */
+    constexpr int KPT = (NKI + VT - 1) / VT;
+    constexpr int VPT = (NVI + VT - 1) / VT;
 
     __shared__ uint4    s_k[16 * kWKS / 16];
     __shared__ uint4    s_vt[kHd * kWVS / 16];
-    alignas(16) __shared__ uint16_t s_rp[kWBQ + 16][DR16 ? 24 : 66]; /* 24 shorts: 16B aligned + zero bank conflicts */
-    __shared__ uint16_t s_r[DR16 ? 1 : kWBQ][DR16 ? 1 : 66];
-    __shared__ float    s_bias[DR16 ? (kWThreads / 32) : 1][DR16 ? 16 : 1][DR16 ? 33 : 1];
+    /* rel_proj rows: a wave's bias reads rows pw + n and pw + 16 + n (pw <= 16 * (waves - 1)), the
+     * scalar path row prow + 15 - key (prow < 16 * waves), so 16 * waves + 16 cover them: kWBQ + 16
+     * at 256 threads, as the prefill's, and a third of it at 64. */
+    constexpr int RPR = VT / 2 + 16;
+    alignas(16) __shared__ uint16_t s_rp[RPR][DR16 ? 24 : 66]; /* 24 shorts: 16B aligned + zero bank conflicts */
+    __shared__ uint16_t s_r[DR16 ? 1 : VT / 2][DR16 ? 1 : 66];
+    __shared__ float    s_bias[DR16 ? (VT / 32) : 1][DR16 ? 16 : 1][DR16 ? 33 : 1];
     __shared__ unsigned s_sc[I8 ? 16 : 1];
 
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
@@ -1404,7 +1412,7 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         const uint32_t w8[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
         rf = WQ::mk(w8);
     } else {
-        for (int qr = wave; qr < npos; qr += kWThreads / 32) {
+        for (int qr = wave; qr < npos; qr += VT / 32) {
             const uint16_t* rq = (const uint16_t*)A.r + (long long)(tok0 + qr / gqa) * A.r_rs +
                                  (long long)(kh * gqa + qr % gqa) * A.r_hs;
             if (lane < A.d_rel) s_r[qr][lane] = rq[lane];
@@ -1437,15 +1445,19 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     uint4 pk[KPT], pv[VPT][2];
     unsigned psc = 0u;
     bool pre_ok = false;
-    auto fetch = [&](int kt) __attribute__((always_inline)) {
+    /* A tile's paged block, read a tile ahead of its K and V: fetch() then issues them at once rather
+     * than behind the block table's own load, a second round trip on every tile. */
+    auto bt_at = [&](int kt) __attribute__((always_inline)) -> int {
         const int k0 = lo_a + kt * 16, lb = k0 >> 4;
-        int blk = -1;
-        if (lb < A.max_blocks && k0 < hi) blk = A.bt[(long long)s * A.bt_rs + lb];
+        return (kt < kt1 && lb < A.max_blocks && k0 < hi) ? A.bt[(long long)s * A.bt_rs + lb] : -1;
+    };
+    auto fetch = [&](int kt, int blk) __attribute__((always_inline)) {
+        (void)kt;
         pre_ok = blk >= 0;
         const uint8_t* base = A.kv + ((long long)(blk >= 0 ? blk : 0) * A.sb + (long long)kh * A.sh) * ESZ;
 #pragma unroll
         for (int j = 0; j < KPT; ++j) {
-            const int idx = tid + j * kWThreads;
+            const int idx = tid + j * VT;
             pk[j] = make_uint4(0u, 0u, 0u, 0u);
             if (pre_ok && idx < NKI) {
                 const int key = idx / NCH, ch = idx - key * NCH;
@@ -1458,7 +1470,7 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         }
 #pragma unroll
         for (int j = 0; j < VPT; ++j) {
-            const int idx = tid + j * kWThreads;
+            const int idx = tid + j * VT;
             pv[j][0] = pv[j][1] = make_uint4(0u, 0u, 0u, 0u);
             if (pre_ok && idx < NVI) {
                 const int kp = idx & 7, ch = idx >> 3;
@@ -1472,7 +1484,11 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
     const uint16_t* rp16 = (const uint16_t*)A.rp;
     uint8_t* kb = (uint8_t*)s_k;
     uint8_t* vb = (uint8_t*)s_vt;
-    if (kt0 < kt1) fetch(kt0);
+    int blk_next = -1;
+    if (kt0 < kt1) {
+        fetch(kt0, bt_at(kt0));
+        blk_next = bt_at(kt0 + 1);
+    }
     for (int kt = kt0; kt < kt1; ++kt) {
         const int k0 = lo_a + kt * 16;
         const bool tok = pre_ok;
@@ -1481,7 +1497,7 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         /* Stage K: [key][dim] as bf16 */
 #pragma unroll
         for (int j = 0; j < KPT; ++j) {
-            const int idx = tid + j * kWThreads;
+            const int idx = tid + j * VT;
             if (idx < NKI) {
                 const int key = idx / NCH, ch = idx - key * NCH;
                 const int kk = k0 + key;
@@ -1506,7 +1522,7 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         /* Stage V: [dim][key] as f16 */
 #pragma unroll
         for (int j = 0; j < VPT; ++j) {
-            const int idx = tid + j * kWThreads;
+            const int idx = tid + j * VT;
             if (idx < NVI) {
                 const int kp = idx & 7, ch = idx >> 3;
                 const int ka = k0 + 2 * kp, kb1 = ka + 1;
@@ -1548,9 +1564,9 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
         const int d_max = plast - k0;
         const bool need_rp = tok && d_max >= 0 && d_min < (int)A.extent;
         if constexpr (DR16) {
-            if (need_rp && tid < kWBQ + 16) {
-                const int dist = d_min + tid;
-                const bool dv = tid < kWBQ + 15 && dist >= 0 && dist < (int)A.extent;
+            for (int rr = tid; need_rp && rr < RPR; rr += VT) {
+                const int dist = d_min + rr;
+                const bool dv = rr < RPR - 1 && dist >= 0 && dist < (int)A.extent;
                 uint32_t w0[4], w1[4];
                 if (dv) {
 #pragma unroll
@@ -1566,19 +1582,22 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
 #pragma unroll
                     for (int p = 0; p < 4; ++p) w0[p] = w1[p] = 0u;
                 }
-                *(uint4*)(&s_rp[tid][0]) = make_uint4(w0[0], w0[1], w0[2], w0[3]);
-                *(uint4*)(&s_rp[tid][8]) = make_uint4(w1[0], w1[1], w1[2], w1[3]);
+                *(uint4*)(&s_rp[rr][0]) = make_uint4(w0[0], w0[1], w0[2], w0[3]);
+                *(uint4*)(&s_rp[rr][8]) = make_uint4(w1[0], w1[1], w1[2], w1[3]);
             }
         } else {
-            if (need_rp && tid < kWBQ + 15) {
-                const int dist = d_min + tid;
+            for (int rr = tid; need_rp && rr < RPR - 1; rr += VT) {
+                const int dist = d_min + rr;
                 const bool dv = dist >= 0 && dist < (int)A.extent;
                 for (int c = 0; c < (int)A.d_rel; ++c)
-                    s_rp[tid][c] = dv ? rp16[(long long)c * A.rp_c + dist] : 0;
+                    s_rp[rr][c] = dv ? rp16[(long long)c * A.rp_c + dist] : 0;
             }
         }
         lds_barrier();
-        if (kt + 1 < kt1) fetch(kt + 1);
+        if (kt + 1 < kt1) {
+            fetch(kt + 1, blk_next);
+            blk_next = bt_at(kt + 2);
+        }
         if constexpr (DR16) {
             if (need_rp) {
                 if (wact) {
@@ -1779,10 +1798,10 @@ __device__ __forceinline__ void rel_vfy_body(RelArgs A) {
 }
 
 /* Grid (sequences, KV heads, splits); see rel_vfy_body. */
-template <bool I8, bool DR16, class CH>
-__global__ __launch_bounds__(kWThreads, 1) void rel_vfy_kernel(RelArgs A) {
+template <bool I8, bool DR16, class CH, int VT>
+__global__ __launch_bounds__(VT, 1) void rel_vfy_kernel(RelArgs A) {
     if (CH::on) halo_chain_wait();
-    rel_vfy_body<I8, DR16>(A);
+    rel_vfy_body<I8, DR16, VT>(A);
     if (CH::on) halo_chain_done();
 }
 #endif  /* HALO_REL_WMMA_VERIFY */
@@ -1815,7 +1834,9 @@ static int rel_decode_splits(int pairs, int span, int wgps) {
 
 /* Packed verify split count. Its partials are (row, KV head, split, head) slots, so the scratch
  * that holds kRelPartBudget slots of kMaxGqa heads bounds the splits at rows * kv_heads * gqa. A
- * split keeps sixteen 16-key tiles, and eight 256-thread blocks a WGP is the fill. */
+ * split keeps sixteen 16-key tiles, and thirty-two blocks a WGP is the fill: a verify's block is
+ * two or four waves here (launch_vfy), and on gfx1151 an 8-row verify of 37k keys at 8 KV heads
+ * measured 0.70 ms at libr4d's eight and 0.57 ms at thirty-two (sixty-four: 0.64). */
 static int rel_verify_splits(long long n_seq, long long rows, long long kv_heads, long long gqa,
                              long long span, int wgps) {
     const long long slots = rows * kv_heads * gqa, blocks = n_seq * kv_heads;
@@ -1824,18 +1845,28 @@ static int rel_verify_splits(long long n_seq, long long rows, long long kv_heads
     if (ns > kRelMaxSplit) ns = kRelMaxSplit;
     const long long by_work = ((span + 15) / 16) / 16;
     if (ns > by_work) ns = by_work;
-    const long long by_fill = ((wgps > 0 ? wgps : 32) * 8LL + blocks - 1) / blocks;
+    const long long by_fill = ((wgps > 0 ? wgps : 32) * 32LL + blocks - 1) / blocks;
     if (ns > by_fill) ns = by_fill;
     return ns < 1 ? 1 : (int)ns;
 }
 
 #if HALO_REL_WMMA_VERIFY
-template <bool I8, bool DR16>
-static void launch_vfy(bool chain, dim3 grid, hipStream_t hs, const RelArgs& A) {
+/* The block is sized to the verify's columns (rows * gqa): libr4d's 256 threads leave most of a
+ * verify's waves only staging, and on gfx1151 a 256-thread block of this kernel (240 VGPRs, 34 KB of
+ * LDS) holds a CU alone, so its tile walk's latency goes unhidden. Two waves take up to 32 columns,
+ * four up to 64. */
+template <bool I8, bool DR16, int VT>
+static void launch_vfy_vt(bool chain, dim3 grid, hipStream_t hs, const RelArgs& A) {
     if (chain)
-        HALO_KLAUNCH(HALO_KNAME(rel_vfy_kernel<I8, DR16, r4dchain>), grid, dim3(kWThreads), hs, A);
+        HALO_KLAUNCH(HALO_KNAME(rel_vfy_kernel<I8, DR16, r4dchain, VT>), grid, dim3(VT), hs, A);
     else
-        HALO_KLAUNCH(HALO_KNAME(rel_vfy_kernel<I8, DR16, HaloUnchained>), grid, dim3(kWThreads), hs, A);
+        HALO_KLAUNCH(HALO_KNAME(rel_vfy_kernel<I8, DR16, HaloUnchained, VT>), grid, dim3(VT), hs, A);
+}
+template <bool I8, bool DR16>
+static void launch_vfy(bool chain, dim3 grid, hipStream_t hs, const RelArgs& A, long long cols) {
+    if (cols <= 32)      launch_vfy_vt<I8, DR16, 64>(chain, grid, hs, A);
+    else if (cols <= 64) launch_vfy_vt<I8, DR16, 128>(chain, grid, hs, A);
+    else                 launch_vfy_vt<I8, DR16, kWThreads>(chain, grid, hs, A);
 }
 #endif  /* HALO_REL_WMMA_VERIFY */
 
@@ -2008,11 +2039,11 @@ static int launch_rel(const RadArgs* a, RadStream stream, bool i8) {
                 const dim3 g((unsigned)n_seq, (unsigned)kv_heads, (unsigned)ns);
                 const bool dr16 = d_rel == 16;
                 if (i8) {
-                    if (dr16) launch_vfy<true, true>(chain, g, hs, A);
-                    else      launch_vfy<true, false>(chain, g, hs, A);
+                    if (dr16) launch_vfy<true, true>(chain, g, hs, A, qmax * gqa);
+                    else      launch_vfy<true, false>(chain, g, hs, A, qmax * gqa);
                 } else {
-                    if (dr16) launch_vfy<false, true>(chain, g, hs, A);
-                    else      launch_vfy<false, false>(chain, g, hs, A);
+                    if (dr16) launch_vfy<false, true>(chain, g, hs, A, qmax * gqa);
+                    else      launch_vfy<false, false>(chain, g, hs, A, qmax * gqa);
                 }
             } else
 #endif  /* HALO_REL_WMMA_VERIFY */
