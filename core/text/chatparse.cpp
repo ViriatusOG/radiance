@@ -1322,6 +1322,10 @@ struct ReplyStream::Impl {
     ReplyMessage msg;
     ContentOut   content;
     bool         think_text = false;    /* the reasoning has had a non-blank byte */
+    /* Answer messages whose content_open header was read and whose content_close has not come
+     * yet. Counted only for a format that declares content_close; without one it stays zero and
+     * every reasoning close in the answer leaves the format, as it always did. */
+    int          open_answers = 0;
     std::string  think_pend;            /* its leading blanks, until then */
     std::vector<ReplyEvent>* out = nullptr;
 
@@ -1788,6 +1792,17 @@ struct ReplyStream::Impl {
     /* Whitespace after a loose opener: any byte at or below a space, which covers a model's stray
      * control characters. */
     static bool loose_ws(unsigned char c) { return c <= ' '; }
+    /* A reasoning close in the answer, with no reasoning block open: the content_close of an answer
+     * message still open (chat_format_check allows content_close only as reasoning_close), or else
+     * outside the format. Either way not part of the answer. */
+    void close_with_no_block() {
+        if (open_answers > 0) --open_answers;
+        else lenient();
+    }
+    /* The answer's header was read: its declared close is now in the format, once. */
+    void answer_opened() {
+        if (!F.f.content_close.empty()) ++open_answers;
+    }
 
     /* Not a call after all: the opener's first byte is text of the region it was found in, and
      * everything after it is read again from there. */
@@ -2322,7 +2337,11 @@ struct ReplyStream::Impl {
             const unsigned char c = (unsigned char)*p;
             if (lpos < F.f.content_open.size() && (unsigned char)F.f.content_open[lpos] == c) {
                 lhold.push_back((char)c);
-                if (++lpos == F.f.content_open.size()) { lhold.clear(); st = after_think(); }
+                if (++lpos == F.f.content_open.size()) {
+                    lhold.clear();
+                    answer_opened();
+                    st = after_think();
+                }
                 return p + 1;
             }
             /* Not the header: what was held is content (or the start of the document). */
@@ -2376,7 +2395,7 @@ struct ReplyStream::Impl {
             if (hit < 0) return p;
             if (P.anywhere && !P.calls) {
                 if (hit == 0) { trail = 0; st = St::ThinkOpenWs; }
-                else lenient();  /* A reasoning close with no block open. */
+                else close_with_no_block();
                 return p;
             }
             if ((size_t)hit < n_open) {
@@ -2404,7 +2423,7 @@ struct ReplyStream::Impl {
                 st = St::ThinkOpenWs;
             } else if ((size_t)hit == F.think_close_hit) {
                 /* Its close with no block open: not part of the answer. */
-                lenient();
+                close_with_no_block();
             }
             return p;
 
@@ -3285,6 +3304,7 @@ struct ReplyStream::Impl {
             }
             if (!co.empty() && rest == co) {
                 fr_drop(fh.size());
+                answer_opened();
                 fh.clear();
                 fr = Fr::Scan;
                 return;

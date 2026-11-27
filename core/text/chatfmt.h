@@ -108,6 +108,11 @@ struct ChatFormat {
     /* A header the model writes first when it answers without reasoning; dropped when the reply
      * starts with it. Empty: none. */
     std::string content_open;
+    /* What ends the answer message content_open began: dropped, and in the format once for each
+     * answer header read. Must be reasoning_close's literal (trimmed), with content_open and
+     * reasoning_anywhere set, since that close is the one the answer is scanned for. Empty: the
+     * answer has no close of its own, and a reasoning close in it leaves the format. */
+    std::string content_close;
     /* A header every message of the reply starts with. Before reasoning_open or content_open it
      * is punctuation and dropped; anywhere else it is read as written, and with tool calls it is
      * the call's name_prefix. Empty: none. */

@@ -18,8 +18,8 @@
  * opener, before <|content_text|> (content_open) the answer's header, and both are dropped there;
  * before anything else it opens a call, so it is also name_prefix. The envelope is
  * object_args_key "args". With reasoning_anywhere a block the template interleaves later is
- * reasoning too, and the answer's own <|end_message|>, a close with no block open, is not part of
- * the answer.
+ * reasoning too. The answer's own <|end_message|> is content_close: not part of the answer, and in
+ * the format. A second one, with no message open, still leaves it.
  *
  * No grammar triggers. Every message opens with the same header, so a trigger word on it would
  * arm the call grammar on the reasoning and the answer as well (llama.cpp triggers on a pattern,
@@ -41,6 +41,7 @@ inline const RadChatFormat* inkling2_chat_format() {
         c.reasoning_in_prompt = RAD_CHAT_THINK_FROM_PROMPT;
         c.reasoning_anywhere  = 1;
         c.content_open        = "<|content_text|>";
+        c.content_close       = "<|end_message|>";
         c.message_open        = "<|message_model|>";
         c.name_prefix         = "<|message_model|>";
         c.name_suffix         = "<|content_invoke_tool_json|>";

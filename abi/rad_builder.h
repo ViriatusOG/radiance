@@ -1959,6 +1959,14 @@ typedef struct RadChatFormat {
      * Needs reasoning_open or content_open; with tool calls, name_prefix must be this literal
      * and call_open and section_open empty. NULL or "": messages have no header of their own. */
     const char* message_open;
+
+    /* What ends the answer message content_open began (Inkling 2's `<|end_message|>`): not part of
+     * the answer, and in the format, once for each answer header the reply wrote. Without it a
+     * reasoning_close in the answer, with no block open, leaves the format. Read only where it is
+     * reasoning_close (the one close the answer is scanned for), with content_open and
+     * reasoning_anywhere set; anything else is refused. NULL or "": the answer has no close of its
+     * own. */
+    const char* content_close;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */

@@ -1456,6 +1456,13 @@ envelope is still read, as not strict. Both are read ahead of the parser's autom
 frame reader that holds at most a header and the opener after it, or the envelope's head and
 tail, so arguments still stream as they arrive. Zero in either is the format as before.
 
+`content_close` names what ends the answer message `content_open` began (Inkling 2's
+`<|end_message|>`): it is dropped and in the format, once for each answer header the reply wrote.
+The parser does not infer it from a close that happens to equal `reasoning_close`: without it, a
+reasoning close in the answer with no block open is still read as leaving the format. It is read
+only as `reasoning_close`, with `content_open` and `reasoning_anywhere` set, the one close the
+answer is scanned for; the checker refuses anything else as not read yet.
+
 The format comes from the architecture plugin's optional `rad_arch_chat_format` export
 (`abi/rad_builder.h`) when it has one, which covers a template the analysis cannot read. Otherwise
 it comes from llama.cpp's differential analysis of the chat template: render with and without
