@@ -3471,6 +3471,12 @@ static const RadOpSchema kSchemas[] = {
            "width), of which the grid keeps the top-left part: RADIO's cropped position embedding. "
            "Two taps an axis, the row blended first; f32, rounded once before the add. A row "
            "whose row coordinate is negative gets the learned prefix row its column names."),
+    SCHEMA("grid_embed_hw", pGridEmbedCpe, oGridEmbedCpe,
+           "x += the side x side table resampled as torch's F.interpolate(size=(grid height, "
+           "grid width), bilinear, align_corners=False) -- no antialias -- each axis onto its own "
+           "extent: Inkling 2's position embedding. Two taps an axis, the row blended first; f32, "
+           "rounded once before the add. A row whose row coordinate is negative gets the learned "
+           "prefix row its column names."),
     SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
            "y = res + act(a @ b^T + bias), rounded to bf16 after the biased product, after the "
            "activation and after the residual -- the unfused chain's three tensors."),
@@ -6881,6 +6887,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cGridEmbed), NOTUNE,
   nullptr, nullptr, halo_rad_grid_embed_cpe, nullptr, nullptr, nullptr,
+  halo_shape_grid_embed_cpe },
+
+{ "grid_embed_hw_bf16", "grid_embed_hw", "elem",
+  "a learned position grid resampled half-pixel bilinear onto the grid's own height and width "
+  "(Inkling 2)",
+  "any n and side; coord [4, M] dense; one workgroup a row",
+  "bf16 x, bf16 or f32 table, i32 coord, f32 taps",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cGridEmbed), NOTUNE,
+  nullptr, nullptr, halo_rad_grid_embed_hw, nullptr, nullptr, nullptr,
   halo_shape_grid_embed_cpe },
 
 { "grid_embed_pad_bf16", "grid_embed_pad", "elem",

@@ -1234,6 +1234,7 @@ int halo_rad_seg_softmax_pool(const RadArgs*, RadStream);
 /* The vision towers' position embeddings and window order (halo_vit_norm_embed.hip,
  * halo_vit_muse.hip). */
 int halo_rad_grid_embed_cpe   (const RadArgs*, RadStream);
+int halo_rad_grid_embed_hw    (const RadArgs*, RadStream);
 int halo_rad_grid_embed_pad   (const RadArgs*, RadStream);
 int halo_rad_window_order     (const RadArgs*, RadStream);
 int halo_shape_grid_embed_cpe (const RadParam*, int, int operand, RadOpdDesc*);

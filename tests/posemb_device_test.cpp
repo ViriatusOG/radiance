@@ -3,7 +3,8 @@
  * serves (bf16 or f32 table, bf16 or f32 output). Then grid_embed_hw, the per-axis resample the
  * engine's tower adds in place (r4d_vit_bf16.hip), over pictures with their class row. Both plugins are dlopen'd and each row is found by
  * its name in the plugin's kernel table, so the device answer is the one the engine would reach.
- * Build with hipcc, pass libr4d.so and libref.so; exits 77 when no card is visible. */
+ * Build with hipcc, pass libr4d.so and libref.so; exits 77 when no card is visible. A third
+ * argument, --hw-only, runs grid_embed_hw alone, for a plugin without posemb_resample (libhalo). */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include <hip/hip_runtime.h>
@@ -120,7 +121,8 @@ std::vector<uint8_t> table_bytes(int64_t count, uint32_t dt, std::mt19937& rng) 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s libr4d.so libref.so\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s libr4d.so libref.so [--hw-only]\n", argv[0]); return 2; }
+    const bool hw_only = argc > 3 && std::strcmp(argv[3], "--hw-only") == 0;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) { std::printf("no card visible: skipped\n"); return 77; }
     void* hr4d = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
     if (!hr4d || !href) { std::fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
     int (*dev_fn)(const RadArgs*, RadStream) = find_row(hr4d, "posemb_resample");
     int (*ref_fn)(const RadArgs*, RadStream) = find_row(href, "ref_posemb_resample");
-    if (!dev_fn || !ref_fn) { std::fprintf(stderr, "posemb_resample row missing (libr4d %p, libref %p)\n", (void*)dev_fn, (void*)ref_fn); return 1; }
+    if (!hw_only && (!dev_fn || !ref_fn)) { std::fprintf(stderr, "posemb_resample row missing (libr4d %p, libref %p)\n", (void*)dev_fn, (void*)ref_fn); return 1; }
 
     const uint32_t F = RAD_F32, B = RAD_BF16;
     const std::vector<Case> cases = {
@@ -141,7 +143,8 @@ int main(int argc, char** argv) {
     };
     std::mt19937 rng(77);
     int fails = 0;
-    for (const Case& c : cases) {
+    const std::vector<Case> none;
+    for (const Case& c : hw_only ? none : cases) {
         const int64_t rows = c.Th * c.Tw, count = rows * c.n;
         const std::vector<uint8_t> tab = table_bytes(c.S * c.S * c.n, c.tdt, rng);
         /* libref's answer on the host buffers. */
@@ -170,7 +173,8 @@ int main(int argc, char** argv) {
         std::printf("  %-74s rel_l2 %.2e  (tol %.0e)  %s\n", c.name, rel, tol, ok ? "PASS" : "FAIL");
         fails += ok ? 0 : 1;
     }
-    std::printf("posemb_resample on the card: %zu case(s), %d failure(s)\n", cases.size(), fails);
+    if (!hw_only)
+        std::printf("posemb_resample on the card: %zu case(s), %d failure(s)\n", cases.size(), fails);
 
     /* grid_embed_hw: x [M, n] bf16 in place, the 32 x 32 table bf16, coord [4, M] i32 for one or
      * two pictures, each a class row at (-1, -1) then its h x w patches, and the class prefix row. */

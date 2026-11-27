@@ -2896,10 +2896,10 @@ corpus (115522 positions, top-512 reference): mean KL 0.00663, top-1 agreement 9
 
 **Strix Halo.** On gfx1151 libhalo serves the model's own ops: `attn_paged_rel` (the WMMA
 prefill, the packed WMMA verify and the split-KV decode, at a bf16 or int8 cache), `sconv_res` and
-`sconv_res_add`, `attn_res_mix`, `l2_clip` and `situ_mul`, beside the trunk's int8 and IQR rows. A
-weight only a host kernel reads keeps its whole placement group in the container's mapping, so
-each of these needs its device row for the layers' weights to reach the card at all, not only for
-speed. The vision tower's `grid_embed_hw` still runs on the host.
+`sconv_res_add`, `attn_res_mix`, `l2_clip` and `situ_mul`, beside the trunk's int8 and IQR rows, and
+the vision tower's `grid_embed_hw`. A weight only a host kernel reads keeps its whole placement
+group in the container's mapping, so each of these needs its device row for the layers' weights to
+reach the card at all, not only for speed.
 
 **incoai's DFlash2 drafter.** The container is converted with `--draft-model` pointing at
 incoai/Inkling-2-Mini-DFlash2 (a `DFlash2DraftModel`: five layers, the selector, block 8;
