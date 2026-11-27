@@ -9,9 +9,10 @@
  * row. An input every rank holds whole (a norm's output) is read where it is.
  *
  * One rank records each layer (layer % world), so the Gram work and the host memory split
- * evenly. Its f32 scratch receives one step's sum for one input (`gram_accum` with `upper` 1: H is
- * symmetric and only k2 >= k1 is kept), whose upper triangle is copied to a pinned square and which
- * is zeroed for the next input, all in stream order. A worker thread waits on the copy's event and adds the square to a
+ * evenly. Its f32 scratch is zeroed (it is arena memory, which is not zeroed when it is allocated,
+ * and `gram_accum` adds to what it finds), receives one step's sum for one input (`upper` 1: H is
+ * symmetric and only k2 >= k1 is kept), and its upper triangle is copied to a pinned square, all in
+ * stream order. A worker thread waits on the copy's event and adds the square to a
  * host accumulator holding the upper triangle packed row by row (k(k+1)/2 f32), while the rank goes
  * on issuing the step: two squares alternate, so the rank waits only when the adds fall two Grams
  * behind. Syncing and adding on the rank's own thread instead left the card idle for every add, 16
@@ -190,8 +191,8 @@ struct CalibFull {
         return RAD_OK;
     }
 
-    /* Site `i` over a step's T rows: gather (every rank), then on the owner the Gram into the
-     * scratch, copied to a free square, the scratch zeroed, and the square handed to the worker. */
+    /* Site `i` over a step's T rows: gather (every rank), then on the owner the scratch zeroed,
+     * the Gram into it, copied to a free square, and the square handed to the worker. */
     void tap(RadCtx* c, size_t i, int64_t T) {
         Site& s = sites[i];
         RadOperand a = brows(s.local, T);
@@ -220,6 +221,13 @@ struct CalibFull {
             }
         }
         const int64_t K = s.K;
+        /* Before the Gram, not after: nothing else has zeroed the scratch when the first input
+         * of a run arrives, nor the part past it when a wider one does, and a Gram summed onto
+         * what the card's memory held is NaNs and 3.4e38 in a file of the right size. */
+        if (rad_memset_async(dev, 0, K * K * 4, rad_stream(c)) < 0) {
+            rad_step_fail(c, "calibration: zeroing the scratch failed");
+            return;
+        }
         if (s.q8)
             RAD_ISSUE_N(c, s.op_gram, T, brows(s.q8, T), brows(s.s8, T), praw2(dev, RAD_F32, K, K));
         else
@@ -233,8 +241,7 @@ struct CalibFull {
         for (int64_t r = 0; r < K && ok; r += kBand)
             ok = rad_memcpy_2d_async(q.square[k] + r * K + r, K * 4, dev + r * K + r, K * 4,
                                      (K - r) * 4, std::min(kBand, K - r), rad_stream(c)) >= 0;
-        if (!ok || rad_memset_async(dev, 0, K * K * 4, rad_stream(c)) < 0 ||
-            rad_event_record(q.copied[k], rad_stream(c)) < 0) {
+        if (!ok || rad_event_record(q.copied[k], rad_stream(c)) < 0) {
             rad_step_fail(c, "calibration: copying a Gram back failed");
             return;
         }

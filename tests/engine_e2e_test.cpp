@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -1522,6 +1523,164 @@ TEST(gemma4_s_calibration_tap_gives_gptq_a_container_closer_to_bf16_than_roundin
             gptq);
     REQUIRE(rtn > 0.0 && gptq > 0.0);
     CHECK(gptq * 3.0 < rtn);
+}
+
+/* The calibration taps sum Grams in arena memory, and the arena is not zeroed when it is
+ * allocated, so a tap must zero what it sums into before its first sum. The two cases below record
+ * the same corpus twice, with every device allocation filled with zeros and with 0xff
+ * (RADIANCE_DEBUG_POISON_ALLOC; 0xff is NaN as f32), and hold the two recordings to the same
+ * bytes: a tap that sums onto what the memory held writes NaN in the second. Seen on four R9700s
+ * serving Flash-Next from bf16: layer 0's two trunk Hessians came out with NaNs and values near
+ * 3.4e38, in files of the right size from a run that reported no error.
+ *
+ * The recordings can only be the same bytes because the steps are (each case says why its steps
+ * are), and libref sums in one order.
+ *
+ * `record(fill, dir, &log)` makes one recording into `dir`; `read(file bytes)` gives a file's
+ * values (GramFile). Every file must hold finite values and a positive diagonal sum: a tap that
+ * zeroed after its sums, or summed nothing, also writes the same bytes under both fills. Returns
+ * the files of the 0xff recording. */
+struct GramFile {
+    size_t values = 0, not_finite = 0;   /* values 0: not a recording file */
+    double trace = 0.0;                  /* the sum of the diagonal */
+};
+size_t check_recordings_ignore_the_fill(
+    tiny::TempDir& d,
+    const std::function<bool(const char*, const std::string&, std::string*)>& record,
+    const std::function<GramFile(const std::string&)>& read) {
+    const std::string zeros = d / "fill0", ones = d / "fill255";
+    std::string log0, log255;
+    if (::mkdir(zeros.c_str(), 0755) != 0 || ::mkdir(ones.c_str(), 0755) != 0) return 0;
+    const bool ran = record("0", zeros, &log0) && record("255", ones, &log255);
+    CHECK(ran);
+    if (!ran) return 0;
+    /* The fill ran: without it the case would pass on any tap. */
+    CHECK(log0.find("filled with 0x00") != std::string::npos);
+    CHECK(log255.find("filled with 0xff") != std::string::npos);
+    CHECK(log255.find("was not filled") == std::string::npos);
+    size_t files = 0, in_zeros = 0, bad = 0, differing = 0;
+    for (const auto& e : std::filesystem::directory_iterator(zeros)) { (void)e; ++in_zeros; }
+    for (const auto& e : std::filesystem::directory_iterator(ones)) {
+        const std::string name = e.path().filename().string();
+        const std::string a = tiny::read_text(ones + "/" + name);
+        const GramFile g = read(a);
+        ++files;
+        if (g.values == 0) {
+            ++bad;
+            fprintf(stderr, "    %s is not a recording file\n", name.c_str());
+        } else if (g.not_finite) {
+            ++bad;
+            fprintf(stderr, "    %s: %zu of %zu values are not finite\n", name.c_str(),
+                    g.not_finite, g.values);
+        } else if (!(g.trace > 0.0)) {
+            ++bad;
+            fprintf(stderr, "    %s: its diagonal sums to %g\n", name.c_str(), g.trace);
+        }
+        if (a != tiny::read_text(zeros + "/" + name)) {
+            ++differing;
+            fprintf(stderr, "    %s is not the zero-filled recording's\n", name.c_str());
+        }
+    }
+    CHECK_EQ(files, in_zeros);
+    CHECK_EQ(bad, (size_t)0);
+    CHECK_EQ(differing, (size_t)0);
+    return files;
+}
+
+/* The `n` f32 at byte `at` of `a`, a k x k Gram whose r-th diagonal entry is value `diag(r)`. */
+GramFile gram_file(const std::string& a, size_t at, size_t n, int64_t k,
+                   const std::function<size_t(int64_t)>& diag) {
+    GramFile g;
+    g.values = n;
+    for (size_t i = 0; i < n; ++i) {
+        float v;
+        std::memcpy(&v, a.data() + at + 4 * i, 4);
+        if (!std::isfinite(v)) ++g.not_finite;
+    }
+    for (int64_t r = 0; r < k; ++r) {
+        float v;
+        std::memcpy(&v, a.data() + at + 4 * diag(r), 4);
+        g.trace += v;
+    }
+    return g;
+}
+
+/* --calib-dir's tap (arch/common/rad_calib_full.h): one device scratch receives a step's Gram of
+ * each recorded input in turn, so the tap zeroes the K x K an input uses before its Gram. The
+ * tiny Qwen3.5 at --tp 2: four inputs a layer and the head's, each rank recording its layers.
+ * --max-num-seqs 1 makes the steps the same in both runs: a --calib-corpus run feeds documents
+ * as the KV pool frees, which follows timing once two can be in flight. */
+TEST(qwen35_calibration_hessians_do_not_depend_on_what_the_device_memory_held) {
+    REQUIRE(world().ok);
+    World& w = world();
+    const tiny::Qwen35 s;
+    tiny::TempDir d("e2e_calibfull");
+    const size_t files = check_recordings_ignore_the_fill(
+        d,
+        [&](const char* fill, const std::string& dir, std::string* log) {
+            const Ran r = radiance(w.qwen35, { "--tp", "2", "--calib-corpus", w.corpus_short,
+                                               "--calib-dir", dir, "--max-num-batched-tokens",
+                                               "512", "--max-num-seqs", "1" },
+                                   { "RADIANCE_HOST_DEVICES=2", "RADIANCE_TRACE_ALLOC=0",
+                                     std::string("RADIANCE_DEBUG_POISON_ALLOC=") + fill });
+            if (r.status != 0)
+                fprintf(stderr, "    the recording with fill %s exited %d:\n%s\n", fill, r.status,
+                        tail(r.log).c_str());
+            *log = r.log;
+            return r.status == 0;
+        },
+        /* safetensors: a u64 header length, the JSON header, then the one tensor: the upper
+         * triangle packed row by row, k (k + 1) / 2 f32. */
+        [](const std::string& a) -> GramFile {
+            uint64_t h = 0;
+            if (a.size() <= 8) return {};
+            std::memcpy(&h, a.data(), 8);
+            if (8 + h >= a.size() || (a.size() - 8 - h) % 4 != 0) return {};
+            const size_t n = (a.size() - 8 - h) / 4;
+            const int64_t k = (int64_t)((std::sqrt(8.0 * (double)n + 1.0) - 1.0) / 2.0 + 0.5);
+            if (k <= 0 || (size_t)(k * (k + 1) / 2) != n) return {};
+            return gram_file(a, (size_t)(8 + h), n, k,
+                             [k](int64_t r) { return (size_t)(r * k - r * (r - 1) / 2); });
+        });
+    CHECK_EQ(files, (size_t)(4 * s.layers + 1));
+}
+
+/* The taps that sum over the whole corpus in a buffer of their own (CalibTap in
+ * arch/common/rad_linear.h: Gemma 3 and 4, Spark, the MTP draft head): the first live step zeroes
+ * the accumulator, or every Gram of the recording carries what the memory held. The tiny Gemma 4
+ * at --tp 2, as the GPTQ case above records it: rank 0 writes q|k|v's and gate|up's inputs, each
+ * rank its part of o's and of down's. A --kld-record run submits its corpus under one hold, so
+ * its steps depend only on the corpus and the flags. */
+TEST(gemma4_calibration_grams_do_not_depend_on_what_the_device_memory_held) {
+    REQUIRE(world().ok);
+    World& w = world();
+    const tiny::Gemma4 s;
+    tiny::TempDir d("e2e_g4calibfill");
+    const size_t files = check_recordings_ignore_the_fill(
+        d,
+        [&](const char* fill, const std::string& dir, std::string* log) {
+            const Ran r = radiance(w.gemma4, { "--tp", "2", "--kld-record", dir + ".rec",
+                                               "--kld-corpus", w.corpus, "--max-num-batched-tokens",
+                                               "512", "--max-num-seqs", "1" },
+                                   { "RADIANCE_HOST_DEVICES=2", "RADIANCE_CALIB_DIR=" + dir,
+                                     "RADIANCE_CALIB_TOKENS=1000", "RADIANCE_TRACE_ALLOC=0",
+                                     std::string("RADIANCE_DEBUG_POISON_ALLOC=") + fill });
+            if (r.status != 0)
+                fprintf(stderr, "    the recording with fill %s exited %d:\n%s\n", fill, r.status,
+                        tail(r.log).c_str());
+            *log = r.log;
+            return r.status == 0;
+        },
+        /* RADGRAM2: a 32-byte header (k at byte 8), then k * k f32. */
+        [](const std::string& a) -> GramFile {
+            uint32_t k = 0;
+            if (a.size() <= 32 || a.compare(0, 8, "RADGRAM2") != 0) return {};
+            std::memcpy(&k, a.data() + 8, 4);
+            if (k == 0 || a.size() != 32 + (size_t)k * k * 4) return {};
+            return gram_file(a, 32, (size_t)k * k, (int64_t)k,
+                             [k](int64_t r) { return (size_t)(r * ((int64_t)k + 1)); });
+        });
+    CHECK_EQ(files, (size_t)(6 * s.layers));
 }
 
 /* A container rad-convert made block fp8 (llama_dense_fp8): the fp8 activation quantisers and

@@ -1991,14 +1991,18 @@ inline rad_op decl_gated_fold_iqr(RadBuilder* b, int64_t rows, int64_t N, int64_
 
 /* ================================================== a calibration tap */
 /* One tap of the GPTQ calibration (calib_dir): the Gram of a linear's bf16 input, summed over the
- * corpus in a PERSIST [K, K] f32 buffer that calib_write() saves. */
+ * corpus in a PERSIST [K, K] f32 buffer that calib_write() saves. The buffer is arena memory, which
+ * is not zeroed when it is allocated, and gram_accum adds to what it finds: the first live step
+ * zeroes it. */
 struct CalibTap {
     rad_buf h = 0;
     rad_op  op = 0;
     int64_t K = 0;
+    mutable bool zeroed = false;   /* step() is const to the plugins' step functions */
 
     int declare(RadBuilder* b, Names& nm, int64_t max_tok, const char* name, rad_buf a, int64_t k) {
         K = k;
+        zeroed = false;
         h = decl_b(b, nm.f("%s.gram", name), RAD_F32, { k, k }, RAD_BUF_PERSIST);
         if (!h) return RAD_E_INVAL;
         op = rw(b, RAD_OP(b, "gram_accum",
@@ -2009,8 +2013,18 @@ struct CalibTap {
         return op ? RAD_OK : RAD_E_INVAL;
     }
     /* gram_accum takes a, a_scale?, h: no scale for a bf16 input. */
+    /* The zeroing goes on the rank's stream, lane 0's: a tap must be stepped on lane 0, as every
+     * caller's is (the plugins that use a second lane turn it off under calibration). */
     void step(RadCtx* c, rad_buf a, int64_t T, bool live) const {
-        if (op && live) RAD_ISSUE_N(c, op, T, brows(a, T), RAD_NONE, brows(h, K));
+        if (!op || !live) return;
+        if (!zeroed) {
+            if (rad_memset_async(rad_buf_ptr(c, h), 0, K * K * 4, rad_stream(c)) < 0) {
+                rad_step_fail(c, "calibration: zeroing a Gram accumulator failed");
+                return;
+            }
+            zeroed = true;
+        }
+        RAD_ISSUE_N(c, op, T, brows(a, T), RAD_NONE, brows(h, K));
     }
 };
 
