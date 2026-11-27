@@ -7356,6 +7356,143 @@ TEST(gemma4_probe_names_the_dflash_blocks_depth) {
     CHECK_EQ(r.draft_depth, 0);
 }
 
+/* ================== gemma4 + Google's assistant MTP head: the drafter the dense family serves ================== */
+
+namespace {
+
+/* The 26B-A4B trunk with Gemma's assistant head merged under `draft.` as `rad-convert
+ * --draft-model` writes it: the head's config flattened, its text config under `draft.text_config.`.
+ * The head: width 1024, four layers (three sliding, one full), the trunk's cache geometry --
+ * sliding kv 8, full kv 2, width 256/512, window 1024, the trunk's rope (full-width neox over the
+ * sliding layers, the proportional ladder over the full one) -- and its own 262144-row table. */
+std::vector<const char*> g4moe_assist_keys() {
+    std::vector<const char*> k(std::begin(k_g4moe_keys), std::end(k_g4moe_keys));
+    for (const char* s : { "draft.architectures", "draft.backbone_hidden_size",
+                           "draft.use_ordered_embeddings",
+                           "draft.text_config.hidden_size", "draft.text_config.num_hidden_layers",
+                           "draft.text_config.layer_types", "draft.text_config.num_attention_heads",
+                           "draft.text_config.num_key_value_heads",
+                           "draft.text_config.num_global_key_value_heads",
+                           "draft.text_config.head_dim", "draft.text_config.global_head_dim",
+                           "draft.text_config.intermediate_size", "draft.text_config.sliding_window",
+                           "draft.text_config.vocab_size", "draft.text_config.rms_norm_eps",
+                           "draft.text_config.rope_parameters.sliding_attention.rope_theta",
+                           "draft.text_config.rope_parameters.full_attention.rope_theta",
+                           "draft.text_config.rope_parameters.full_attention.partial_rotary_factor" })
+        k.push_back(s);
+    return k;
+}
+std::vector<const char*> g4moe_assist_vals() {
+    std::vector<const char*> v(std::begin(k_g4moe_vals), std::end(k_g4moe_vals));
+    for (const char* s : { "[\"Gemma4AssistantForCausalLM\"]", "2816", "0",
+                           "1024", "4",
+                           "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+                           "\"full_attention\"]",
+                           "32", "8", "2",
+                           "256", "512",
+                           "8192", "1024",
+                           "262144", "1e-06",
+                           "10000.0", "1000000.0", "0.25" })
+        v.push_back(s);
+    return v;
+}
+}  /* namespace */
+
+/* (a) The assistant head is declared when the container's `draft.architectures` says
+ * Gemma4Assistant: a serial drafter over the trunk's own cache, depth an operating point (not a
+ * trained block), its four layers beside the trunk's six, no cache of its own. */
+TEST(gemma4_moe_declares_the_assistant_head_as_a_serial_drafter) {
+    const std::vector<const char*> keys = g4moe_assist_keys(), vals = g4moe_assist_vals();
+    RadModelMeta meta = gemma4_moe_meta();
+    meta.n_kv   = (int)keys.size();
+    meta.kv_key = keys.data();
+    meta.kv_val = vals.data();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 3;
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+    CHECK_EQ(b.drafter.depth, 3);
+    CHECK_EQ(b.drafter_name, std::string("mtp"));
+    CHECK_EQ((int)b.drafter.proposal, 0);         /* proposes through the sampler chain */
+    CHECK(b.drafter_shared);
+    CHECK_EQ(b.drafter_pos, gemma4::kHeadPosOffset);
+
+    /* The head's four attention layers are paged; the trunk's six are unchanged (five read the fused
+     * q row, the one full one attn_paged). The head keeps no cache: no new kv group, no new store. */
+    CHECK_EQ(count_op(b, "attn_paged_qrow"), 5);   /* the trunk's sliding layers, unchanged */
+    CHECK_EQ(count_op(b, "attn_paged"), 5);        /* the trunk's full one + the head's four */
+    CHECK_EQ((int)b.kv_groups.size(), 2);
+    CHECK_EQ(count_op(b, "kv_store"), 6);          /* the trunk only; the head stores none */
+    CHECK_EQ(count_op(b, "logits_gemm"), 2);      /* the trunk's + the head's */
+
+    /* The head's linears, from the draft checkpoint: q-only attention (k == v), the fused gate and
+     * up, and the two projections. The head's table is its own embedding (no fallback). */
+    const RecWeight* wq0 = find_w(b, "mtp.blk.0.attn_q.weight");
+    const RecWeight* wq3 = find_w(b, "mtp.blk.3.attn_q.weight");
+    REQUIRE(wq0 != nullptr); REQUIRE(wq3 != nullptr);
+    CHECK_EQ(wq0->d.shape[0], 32 * 256); CHECK_EQ(wq0->d.shape[1], 1024);
+    CHECK_EQ(wq3->d.shape[0], 32 * 512); CHECK_EQ(wq3->d.shape[1], 1024);
+    CHECK(find_w(b, "mtp.blk.0.attn_v.weight") == nullptr);   /* k == v: no v projection */
+    const RecWeight* gu = find_w(b, "mtp.blk.1.ffn_gate_up.weight");
+    REQUIRE(gu != nullptr);
+    CHECK_EQ(gu->d.shape[0], 2 * 8192); CHECK_EQ(gu->d.shape[1], 1024);
+    const RecWeight* pre  = find_w(b, "mtp.pre_proj.weight");
+    const RecWeight* post = find_w(b, "mtp.post_proj.weight");
+    REQUIRE(pre != nullptr); REQUIRE(post != nullptr);
+    CHECK_EQ(pre->d.shape[0], 1024);  CHECK_EQ(pre->d.shape[1], 2 * 2816);
+    CHECK_EQ(post->d.shape[0], 2816); CHECK_EQ(post->d.shape[1], 1024);
+    const RecWeight* lm = find_w(b, "mtp.output.weight");
+    REQUIRE(lm != nullptr);
+    CHECK_EQ(lm->d.shape[0], 262144); CHECK_EQ(lm->d.shape[1], 1024);
+
+    /* The checkpoint names merged under `draft.`, as rad-convert --draft-model writes them: the
+     * head's table is its own embedding (no fallback), and gate and up are fused like the trunk's. */
+    const RecMap* mlm = find_map(b, "mtp.output.weight");
+    REQUIRE(mlm != nullptr);
+    CHECK_EQ(mlm->src[0], std::string("draft.model.embed_tokens.weight"));
+    const RecMap* mgu = find_map(b, "mtp.blk.1.ffn_gate_up.weight");
+    REQUIRE(mgu != nullptr);
+    CHECK_EQ(mgu->mode, RAD_MAP_CONCAT);
+    CHECK_EQ(mgu->src[0], std::string("draft.model.layers.1.mlp.gate_proj.weight"));
+    CHECK_EQ(mgu->src[1], std::string("draft.model.layers.1.mlp.up_proj.weight"));
+    const RecMap* mpre = find_map(b, "mtp.pre_proj.weight");
+    REQUIRE(mpre != nullptr);
+    CHECK_EQ(mpre->src[0], std::string("draft.pre_projection.weight"));
+
+    for (const auto& o : b.ops)
+        if (o.resolved) CHECK(o.uses_declared);
+    for (const auto& w : b.weights)
+        CHECK(find_map(b, w.name) != nullptr);
+}
+
+/* (c) A head that states a width, a head width, a kv count or a window the trunk's cache does not
+ * have was trained with another trunk; the plugin refuses rather than run the head's queries
+ * against the trunk's keys at the wrong angle. */
+TEST(gemma4_moe_refuses_an_assistant_head_that_mismatches_the_trunk) {
+    const struct { const char* key; const char* val; } bads[] = {
+        { "draft.backbone_hidden_size", "1024" },    /* a trunk width the cache does not have */
+        { "draft.text_config.head_dim", "128" },    /* a sliding head width the cache does not have */
+        { "draft.text_config.num_key_value_heads", "7" },   /* a kv count the cache does not have */
+        { "draft.text_config.sliding_window", "2048" },    /* a window the cache does not have */
+    };
+    for (const auto& bad : bads) {
+        std::vector<const char*> keys = g4moe_assist_keys();
+        std::vector<const char*> vals = g4moe_assist_vals();
+        for (size_t i = 0; i < keys.size(); ++i)
+            if (!std::strcmp(keys[i], bad.key)) vals[i] = bad.val;
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 3;
+        CHECK_EQ(stderr_of_rc([&] { return gemma4::declare(&b, &meta, &ctx); }), RAD_E_INVAL);
+    }
+}
+
 /* Each tap is declared where it is issued. The buffer planner takes liveness from declaration
  * order, so `dflash_src` is live from its first declared write; a tap declared after the trunk but
  * issued inside it would let the plan alias it with `moe_edn`, which every MoE layer writes,
