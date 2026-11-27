@@ -1,5 +1,9 @@
 /* sconv_res on the card: libr4d's exported launcher (r4d_rad_sconv_res) against the formula in
- * double, over the shapes the model issues. Build with hipcc; pass the path of libr4d.so.
+ * double, over the shapes the model issues. Build with hipcc; pass the path of libr4d.so, and
+ * optionally the entries' prefix (`halo` for libhalo's halo_rad_sconv_res). Where the library
+ * exports <prefix>_rad_sconv_res_add as well, every launch also runs it on a copy of the state:
+ * its output is held to add_resid plus the formula, and the state it leaves must be the plain
+ * kernel's, byte for byte.
  *
  * A ragged prefill of sequences of several lengths at the model's width (n 1024, 8 heads of 128
  * for the dynamic form, n 2304 for the plain one), then decode steps of one row a sequence, then a
@@ -15,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <string>
 #include <vector>
 
 using Fn = int (*)(const RadArgs*, RadStream);
@@ -22,6 +27,7 @@ using Fn = int (*)(const RadArgs*, RadStream);
 namespace {
 
 int failures = 0;
+Fn g_add = nullptr;   /* <prefix>_rad_sconv_res_add, when the library exports it */
 
 void hipcheck(hipError_t e) {
     if (e != hipSuccess) { std::fprintf(stderr, "HIP: %s\n", hipGetErrorString(e)); std::exit(1); }
@@ -109,6 +115,35 @@ void launch(const char* what, const Stream& st, const std::vector<uint16_t>& x, 
     Device<int32_t> dcu(cu), dci(cidx), dhi(hini ? *hini : std::vector<int32_t>(1, 1)),
                     dna(nacc ? *nacc : std::vector<int32_t>(1, 1));
     Device<uint16_t> dy(std::vector<uint16_t>((size_t)(M * st.n), 0));
+    /* sconv_res_add on a copy of the state, before the plain launch moves it. */
+    std::vector<uint16_t> resid, y_add, cs_add;
+    int rc_add = RAD_OK;
+    if (g_add) {
+        resid.resize((size_t)(M * st.n));
+        for (size_t i = 0; i < resid.size(); ++i) resid[i] = bf16((float)std::cos(0.11 * (double)i));
+        Device<uint16_t> dcs2(cs), dr(resid), dy2(std::vector<uint16_t>((size_t)(M * st.n), 0));
+        RadTensor t2[10] = {
+            tensor(dx.p, RAD_BF16, { M, st.n }), tensor(dwt.p, RAD_BF16, { st.n, st.k }),
+            tensor(dcs2.p, RAD_BF16, { slots, st.n, st.S }), tensor(dcu.p, RAD_I32, { N + 1 }),
+            dyn ? tensor(ddy.p, RAD_BF16, { M, dw }) : RadTensor{},
+            tensor(dci.p, RAD_I32, { N }),
+            hini ? tensor(dhi.p, RAD_I32, { N }) : RadTensor{},
+            nacc ? tensor(dna.p, RAD_I32, { N }) : RadTensor{},
+            tensor(dy2.p, RAD_BF16, { M, st.n }), tensor(dr.p, RAD_BF16, { M, st.n }),
+        };
+        RadParam p2[5]{};
+        p2[0].key = "M";      p2[0].kind = RAD_P_INT; p2[0].ival = M;
+        p2[1].key = "n";      p2[1].kind = RAD_P_INT; p2[1].ival = st.n;
+        p2[2].key = "width";  p2[2].kind = RAD_P_INT; p2[2].ival = st.k;
+        p2[3].key = "heads";  p2[3].kind = RAD_P_INT; p2[3].ival = st.heads;
+        p2[4].key = "dtype";  p2[4].kind = RAD_P_STR; p2[4].sval = "bf16";
+        RadArgs a2{};
+        a2.t = t2; a2.n_t = 10; a2.p = p2; a2.n_p = 5;
+        rc_add = g_add(&a2, nullptr);
+        hipcheck(hipDeviceSynchronize());
+        y_add = dy2.get();
+        cs_add = dcs2.get();
+    }
     RadTensor t[9] = {
         tensor(dx.p, RAD_BF16, { M, st.n }), tensor(dwt.p, RAD_BF16, { st.n, st.k }),
         tensor(dcs.p, RAD_BF16, { slots, st.n, st.S }), tensor(dcu.p, RAD_I32, { N + 1 }),
@@ -141,6 +176,20 @@ void launch(const char* what, const Stream& st, const std::vector<uint16_t>& x, 
     }
     std::printf("  %-52s worst %.2e  %s\n", what, worst, ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
+    if (g_add) {
+        if (rc_add != RAD_OK) { std::printf("  %-52s add launch %d\n", what, rc_add); ++failures; return; }
+        double worst_add = 0;
+        bool ok_add = cs_add == cs;   /* the state is the plain kernel's */
+        for (int64_t i = 0; i < M * st.n; ++i) {
+            const double r = fbf16(resid[i]);
+            const double e = std::fabs((double)fbf16(y_add[i]) - (r + want[i]));
+            worst_add = std::max(worst_add, e / (std::fabs(r + want[i]) + 1e-2));
+            if (e > 0.01 * std::fabs(want[i]) + 0.01 * std::fabs(r) + 2e-3) ok_add = false;
+        }
+        std::printf("  %-52s worst %.2e  %s%s\n", "  ... sconv_res_add", worst_add, ok_add ? "PASS" : "FAIL",
+                    cs_add == cs ? "" : " (its state differs from sconv_res's)");
+        if (!ok_add) ++failures;
+    }
 }
 
 /* Ragged prefill: sequences of lengths 1, 37 and 300 in distinct slots, cold. */
@@ -207,11 +256,14 @@ void speculative(Fn fn, const Stream& st, const char* what) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s libr4d.so\n", argv[0]); return 77; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s libr4d.so [prefix]\n", argv[0]); return 77; }
+    const std::string pfx = argc > 2 ? argv[2] : "r4d";
     void* h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { std::fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-    auto fn = reinterpret_cast<Fn>(dlsym(h, "r4d_rad_sconv_res"));
-    if (!fn) { std::fprintf(stderr, "dlsym r4d_rad_sconv_res: %s\n", dlerror()); return 1; }
+    const std::string entry = pfx + "_rad_sconv_res";
+    auto fn = reinterpret_cast<Fn>(dlsym(h, entry.c_str()));
+    if (!fn) { std::fprintf(stderr, "dlsym %s: %s\n", entry.c_str(), dlerror()); return 1; }
+    g_add = reinterpret_cast<Fn>(dlsym(h, (entry + "_add").c_str()));
 
     std::printf("sconv_res on the card:\n");
     /* The model's dynamic form: n 1024, 8 heads of 128, k 4. */

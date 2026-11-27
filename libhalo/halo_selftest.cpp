@@ -9934,6 +9934,49 @@ void rope_llama3_case(const Plugin& pl) {
     ok("rope_bf16 refuses llama3 beside YaRN", rc2 == RAD_E_INVAL, "rc " + std::to_string(rc2));
 }
 
+/* rope's axial mode at Inkling 2's vision tower (head 64, 16 heads, q and k turned, sections 16 16)
+ * with its positions a [2, M] view of the tower's [2, P] per-pass buffer: row-contiguous, the
+ * component pitch P wider than M. It must turn the rows exactly as the same positions packed
+ * [2, M] do. */
+void rope_axial_pitched_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "rope_bf16");
+    if (!r) { ok("rope_bf16 axial pitched positions", false, "row absent"); return; }
+    const int64_t M = 1153, P = 16384, hd = 64, nh = 16, row = 3 * nh * hd;
+    std::vector<float> x = randv((size_t)(M * row), 1.0f);
+    std::vector<int32_t> packed((size_t)(2 * M)), wide((size_t)(2 * P), -7);
+    for (int64_t m = 0; m < M; ++m) {
+        const int32_t h = (int32_t)(m / 37 + 1), w = (int32_t)(m % 37 + 1);
+        packed[(size_t)m] = h; packed[(size_t)(M + m)] = w;
+        wide[(size_t)m] = h;   wide[(size_t)(P + m)] = w;
+    }
+    void* dq_packed = up_bf16(x);
+    void* dq_wide = up_bf16(x);
+    void* dp_packed = up_i32(packed);
+    void* dp_wide = up_i32(wide);
+    const std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head", nh),
+                                       PI("n_head_kv", nh), PI("rotary_dim", hd),
+                                       PF("theta", 10000.0), PF("scale", 1.0), PS("mode", "axial"),
+                                       PS("sections", "16 16") };
+    RadTensor pw = T(dp_wide, RAD_I32, { 2, M });
+    pw.stride[0] = P;
+    const int rc_p = launch(r, { T(dq_packed, RAD_BF16, { M, row }), T(dp_packed, RAD_I32, { 2, M }) }, ps);
+    const int rc_w = launch(r, { T(dq_wide, RAD_BF16, { M, row }), pw }, ps);
+    if (rc_p != RAD_OK || rc_w != RAD_OK) {
+        ok("rope_bf16 axial pitched positions", false,
+           fmt("rc packed %d, pitched %d", rc_p, rc_w));
+        return;
+    }
+    const std::vector<float> a = down_bf16(dq_packed, x.size()), b = down_bf16(dq_wide, x.size());
+    int64_t diff = 0, moved = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff += a[i] != b[i];
+        moved += a[i] != h_bf16(h_to_bf16(x[i]));
+    }
+    ok("rope_bf16 axial pitched positions", diff == 0 && moved > 0,
+       fmt("%lld of %zu values differ from the packed positions; %lld turned", (long long)diff,
+           a.size(), (long long)moved));
+}
+
 /* attn_dense causal over a fused [rows, 3 * nh * hd] row (a codec transformer's sliding layers,
  * an audio encoder's own-heads attention), with a window behind and without, one sequence or
  * two, against libref's mask. */
@@ -13645,6 +13688,11 @@ struct ConvRef {
     std::vector<char> live;                 /* [T]: a token some sequence committed */
     std::vector<int32_t> cu, sidx, hini, nacc;
     bool have_sidx = false, have_hini = false, have_nacc = false;
+    /* Two sequences of one launch that share a slot write its window with nothing ordering their
+     * blocks, so each value may come from either. `alt_sidx` is the slot table with the later of
+     * them dropped (the earlier one's window); a value of the window is then accepted from either
+     * mirror, and every other byte must still match. Empty: one mirror, byte for byte. */
+    std::vector<int32_t> alt_sidx;
     std::vector<uint16_t> stb;              /* the window, before and after the step */
     void *dcs = nullptr, *dy = nullptr;     /* the device's state (kept across a chain) and y */
 };
@@ -13759,6 +13807,7 @@ int cv_launch(const RadKernelInfo* r, ConvRef& c) {
  * window the step left, byte for byte. */
 void cv_check(const RadKernelInfo* r, ConvRef& c, const std::string& tag, double tol) {
     const int rc = cv_launch(r, c);
+    const std::vector<uint16_t> before = c.stb;
     cv_model(c);   /* after the upload, so the mirror convolves the bytes the device reads */
     if (rc != RAD_OK) { ok(tag.c_str(), false, "rc " + std::to_string(rc)); return; }
     const std::vector<uint16_t> gy = down_u16(c.dy, (size_t)(c.T * c.yld));
@@ -13776,10 +13825,28 @@ void cv_check(const RadKernelInfo* r, ConvRef& c, const std::string& tag, double
               (long long)nlive, (long long)c.T, (long long)c.wid, (long long)c.dil,
               (long long)c.n, c.have_resid ? "silu + residual" : "silu"), got, want, tol);
     const std::vector<uint16_t> gs = down_u16(c.dcs, c.stb.size());
-    const int64_t sdiff = differ(gs, c.stb);
-    ok(fmt("%s: the window after the step, byte for byte (%lld slots x %lld x %lld)", tag.c_str(),
-           (long long)c.slots, (long long)c.n, (long long)c.state_len).c_str(), sdiff == 0,
-       std::to_string(sdiff) + " of " + std::to_string(c.stb.size()) + " bytes differ");
+    if (c.alt_sidx.empty()) {
+        const int64_t sdiff = differ(gs, c.stb);
+        ok(fmt("%s: the window after the step, byte for byte (%lld slots x %lld x %lld)", tag.c_str(),
+               (long long)c.slots, (long long)c.n, (long long)c.state_len).c_str(), sdiff == 0,
+           std::to_string(sdiff) + " of " + std::to_string(c.stb.size()) + " bytes differ");
+    } else {
+        ConvRef alt = c;
+        alt.stb = before;
+        alt.sidx = c.alt_sidx;
+        cv_model(alt);
+        int64_t bad = 0, other = 0;
+        for (size_t i = 0; i < gs.size(); ++i) {
+            if (gs[i] == c.stb[i]) continue;
+            if (gs[i] == alt.stb[i]) ++other; else ++bad;
+        }
+        ok(fmt("%s: the window after the step, each value one writer's (%lld slots x %lld x %lld)",
+               tag.c_str(), (long long)c.slots, (long long)c.n, (long long)c.state_len).c_str(),
+           bad == 0, std::to_string(bad) + " of " + std::to_string(c.stb.size()) +
+                         " values neither writer's (" + std::to_string(other) +
+                         " the earlier writer's)");
+        c.stb = gs;   /* a later step of a chain reads what the device kept */
+    }
     const int64_t pad = cv_pad_moved(gy, c.T, c.n, c.yld);
     ok(fmt("%s: y's row padding [%lld, %lld) untouched", tag.c_str(), (long long)c.n,
            (long long)c.yld).c_str(), pad == 0, std::to_string(pad) + " markers moved");
@@ -13861,7 +13928,9 @@ void causal_conv1d_cases(const Plugin& pl) {
         cv_check(r, c2, "causal_conv1d_bf16 the step after it, reading at offset zero", 2e-3);
     }
     /* The branches: a cold window over a slot holding a stale value, a slot shared by two
-     * sequences, and a negative `cache_idx`, whose sequence writes neither y nor the window. */
+     * sequences (both cold, so neither reads it; the window it is left holding is either one's,
+     * value by value), and a negative `cache_idx`, whose sequence writes neither y nor the
+     * window. */
     {
         ConvRef c;
         c.causal = true;
@@ -13870,6 +13939,7 @@ void causal_conv1d_cases(const Plugin& pl) {
         c.slots = 3; c.state_len = 3;
         c.cu = { 0, 3, 6, 9, 12, 15 };
         c.sidx = { 0, 1, 2, 0, -1 };
+        c.alt_sidx = { 0, 1, 2, -1, -1 };   /* sequences 0 and 3 share slot 0 */
         c.have_sidx = true;
         c.hini = { 0, 1, 1, 0, 1 };
         c.have_hini = true;
@@ -18526,7 +18596,9 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
         return x ^ (x >> 31);
     };
     Planes p;
-    if (f.kind == 5) {
+    if (f.kind == 1) {
+        p.enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    } else if (f.kind == 5) {
         rad_enc_clear(&p.enc);
         rad_enc_copy_str(p.enc.scheme, "trellis");
         rad_enc_add_plane(&p.enc, "codes", kU[f.B], 1, 1);
@@ -18542,7 +18614,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
     if (f.rot) rad_enc_copy_str(p.enc.transform, "fwht128");
     p.size(rows, dim);
     const int ic = p.find("codes"), is = p.find("scale"), is2 = p.find("scale.1");
-    const int ia = f.kind == 5 ? p.find("trellis") : f.kind == 3 ? p.find("table") : p.find("zero");
+    const int ia = f.kind == 1 ? -1 : f.kind == 5 ? p.find("trellis") : f.kind == 3 ? p.find("table") : p.find("zero");
     for (int64_t n = 0; n < rows; ++n)
         for (int64_t c = 0; c < dim; ++c)
             rad_store_bits(p.data[(size_t)ic].data() + n * p.row_bytes(ic), f.B, c,
@@ -18552,7 +18624,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
             for (int64_t g = 0; g < nkb; ++g)
                 rad_store_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), std::max(f.B, 6), g,
                                (uint32_t)((1 << (std::max(f.B, 6) - 1)) - 8 + rnd() % 17));
-    else
+    else if (ia >= 0)
         for (auto& v : p.data[(size_t)ia]) v = (uint8_t)(int8_t)((int)(rnd() % 255) - 127);
     for (int64_t i = 0; i < rows * nkb; ++i) {
         if (f.two) p.data[(size_t)is][(size_t)i] = (uint8_t)(0x30 + rnd() % 0x28);
@@ -18578,7 +18650,8 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
         std::vector<float> v((size_t)dim);
         for (int64_t k = 0; k < dim; ++k) {
             int q;
-            if (f.kind == 3) q = ((const int8_t*)p.data[(size_t)ia].data())[code(n, k)];
+            if (f.kind == 1) q = (int8_t)(uint8_t)code(n, k);
+            else if (f.kind == 3) q = ((const int8_t*)p.data[(size_t)ia].data())[code(n, k)];
             else if (f.kind == 2) q = (int)code(n, k) - (int)rad_load_bits(p.data[(size_t)ia].data() + n * p.row_bytes(ia), std::max(f.B, 6), k / 128);
             else {
                 uint32_t st = 0;
@@ -18614,6 +18687,7 @@ static void iqr_embed_case(const Plugin& pl, const IqrEmbedCase& f, int64_t rows
     std::vector<const char*> roles;
     const int rc = f.kind == 5 ? (f.two ? stored(r, lp, 1, p, { "codes", "scale", "scale.1", "trellis" }, &wq, &lay)
                                         : stored(r, lp, 1, p, { "codes", "scale", "trellis" }, &wq, &lay))
+                 : f.kind == 1 ? stored(r, lp, 1, p, { "codes", "scale" }, &wq, &lay)
                  : f.kind == 3 ? stored(r, lp, 1, p, { "codes", "scale", "table" }, &wq, &lay)
                                : stored(r, lp, 1, p, { "codes", "scale", "zero" }, &wq, &lay);
     if (rc != RAD_OK) { ok(nm, false, "relayout rc " + std::to_string(rc)); return; }
@@ -37105,6 +37179,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("quant_cols_fp8_bf16")) vsa::quant_cols_cases(pl);
     if (sel("attn_prefix_self_h128_bf16")) vsa::dense_cases(pl);
     if (sel("rope_bf16")) au::rope_llama3_case(pl);
+    if (sel("rope_bf16")) au::rope_axial_pitched_case(pl);
     if (sel("flow_euler_bf16")) cvdc::flow_euler_case(pl);
     if (sel("lane_gather_w32")) cvdc::lane_gather_case(pl);
     if (sel("lane_store_w32")) cvdc::lane_store_case(pl);
@@ -37867,13 +37942,148 @@ static void device_phase(const Plugin& pl) {
         const IqrEmbedCase es[] = {
             { 3, 2, 0, false, false }, { 3, 3, 0, false, false }, { 3, 4, 0, false, true },
             { 3, 5, 0, false, false }, { 2, 6, 0, false, false }, { 2, 7, 0, false, false },
-            { 2, 8, 0, false, false }, { 5, 2, 12, true, true },
+            { 2, 8, 0, false, false }, { 1, 8, 0, false, false }, { 5, 2, 12, true, true },
             { 5, 3, 12, true, true }, { 5, 4, 12, true, true }, { 5, 5, 12, true, true },
             { 5, 6, 12, true, true }, { 5, 7, 12, true, true },
         };
         for (const IqrEmbedCase& f : es) {
             iqr_embed_case(pl, f, 512, 640, 1.0f);
             iqr_embed_case(pl, f, 512, 640, 3.25f);
+        }
+    }
+    if (sel("attn_res_mix_bf16")) {
+        /* Block attention residuals against the contract in double (OPS.md): two states and cur
+         * as the depth, two queries, no addend and no gain. */
+        const RadKernelInfo* r = find(pl, "attn_res_mix_bf16");
+        if (!r) ok("attn_res_mix_bf16", false, "row absent");
+        else {
+            const int64_t Mt = 3, nn = 64, nst = 2, nqr = 2;
+            const float eps = 1e-6f;
+            std::vector<uint16_t> hs((size_t)(nst * Mt * nn)), hc((size_t)(Mt * nn));
+            std::vector<float> hq((size_t)(nqr * nn));
+            std::vector<uint16_t> hy16((size_t)(nqr * Mt * nn), 0);
+            for (size_t i = 0; i < hs.size(); ++i)
+                hs[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 401) - 200) * 0.01f);
+            for (size_t i = 0; i < hc.size(); ++i)
+                hc[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i ^ 977u) % 401) - 200) * 0.02f);
+            for (size_t i = 0; i < hq.size(); ++i)
+                hq[i] = (float)((int)(st_mix32((uint32_t)i ^ 31u) % 201) - 100) * 0.01f;
+            void* dS = dalloc(hs.size() * 2);
+            void* dC = dalloc(hc.size() * 2);
+            void* dQ = dalloc(hq.size() * 4);
+            void* dY = dalloc(hy16.size() * 2);
+            if (!dS || !dC || !dQ || !dY) ok("attn_res_mix_bf16", false, "hipMalloc failed");
+            else {
+                st_memcpy(dS, hs.data(), hs.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(dC, hc.data(), hc.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(dQ, hq.data(), hq.size() * 4, hipMemcpyHostToDevice);
+                st_memcpy(dY, hy16.data(), hy16.size() * 2, hipMemcpyHostToDevice);
+                std::vector<RadTensor> ts = { T(dS, RAD_BF16, { nst, Mt, nn }),
+                                              T(dC, RAD_BF16, { Mt, nn }),
+                                              T(nullptr, RAD_BF16, { 0 }),
+                                              T(dQ, RAD_F32, { nqr, nn }),
+                                              T(nullptr, RAD_F32, { 0 }),
+                                              T(dY, RAD_BF16, { nqr, Mt, nn }) };
+                absent(ts[2]); absent(ts[4]);
+                std::vector<RadParam> ps = { PI("M", Mt), PI("n", nn), PI("n_state", nst),
+                                             PI("n_query", nqr), PS("dtype", "bf16"),
+                                             PF("eps", eps) };
+                RadArgs a{};
+                a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+                a.world_size = 1;
+                const int rc = r->launch(&a, nullptr);
+                const bool synced = st_stream_sync(nullptr) == hipSuccess;
+                st_memcpy(hy16.data(), dY, hy16.size() * 2, hipMemcpyDeviceToHost);
+                int bad = 0; double worst = 0;
+                for (int64_t t = 0; t < Mt; ++t) {
+                    std::vector<std::vector<double>> vh(nst + 1, std::vector<double>(nn));
+                    for (int64_t d = 0; d <= nst; ++d) {
+                        double ss = 0;
+                        for (int64_t i = 0; i < nn; ++i) {
+                            const double v = d < nst ? h_bf16(hs[(size_t)((d * Mt + t) * nn + i)])
+                                                     : h_bf16(hc[(size_t)(t * nn + i)]);
+                            ss += v * v;
+                        }
+                        const double inv = 1.0 / std::sqrt(ss / nn + eps);
+                        for (int64_t i = 0; i < nn; ++i)
+                            vh[(size_t)d][(size_t)i] = (d < nst ? h_bf16(hs[(size_t)((d * Mt + t) * nn + i)])
+                                                                : h_bf16(hc[(size_t)(t * nn + i)])) * inv;
+                    }
+                    for (int64_t q = 0; q < nqr; ++q) {
+                        std::vector<double> sc((size_t)(nst + 1));
+                        double mx = -1e300;
+                        for (int64_t d = 0; d <= nst; ++d) {
+                            double dot = 0;
+                            for (int64_t i = 0; i < nn; ++i) dot += vh[(size_t)d][(size_t)i] * hq[(size_t)(q * nn + i)];
+                            sc[(size_t)d] = dot / std::sqrt((double)nn);
+                            mx = std::max(mx, sc[(size_t)d]);
+                        }
+                        double den = 0;
+                        for (double& s : sc) { s = std::exp(s - mx); den += s; }
+                        for (int64_t i = 0; i < nn; ++i) {
+                            double m = 0;
+                            for (int64_t d = 0; d <= nst; ++d) m += sc[(size_t)d] / den * vh[(size_t)d][(size_t)i];
+                            const double got = h_bf16(hy16[(size_t)((q * Mt + t) * nn + i)]);
+                            const double err = std::fabs(got - m);
+                            if (err > 1e-2 * std::fabs(m) + 2e-3) ++bad;
+                            worst = std::max(worst, err);
+                        }
+                    }
+                }
+                std::printf("    attn_res_mix_bf16: %lld values, bad=%d worst=%.3g\n", (long long)(Mt * nqr * nn), bad, worst);
+                ok("attn_res_mix_bf16 against the contract", rc == RAD_OK && synced && bad == 0,
+                   "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) +
+                       " worst=" + std::to_string(worst));
+            }
+        }
+    }
+    if (sel("situ_mul_bf16")) {
+        /* SiTU over a fused gate_up against the formula in double: libr4d's case (both caps), and
+         * Inkling 2 Mini's expert width (n 1152, not a multiple of the workgroup) with its caps
+         * and with the up cap off. */
+        const RadKernelInfo* r = find(pl, "situ_mul_bf16");
+        if (!r) ok("situ_mul_bf16", false, "row absent");
+        struct SituCase { const char* name; int64_t Ms, ns; double gcap, ucap; };
+        const SituCase cs[] = {
+            { "situ_mul_bf16 against the formula", 4, 128, 4.0, 25.0 },
+            { "situ_mul_bf16 against the formula, n 1152", 16, 1152, 4.0, 25.0 },
+            { "situ_mul_bf16 against the formula, up cap 0", 7, 1152, 4.0, 0.0 },
+        };
+        for (const SituCase& c : cs) {
+            if (!r) break;
+            const int64_t Ms = c.Ms, ns = c.ns;
+            std::vector<uint16_t> gu((size_t)(Ms * 2 * ns)), y((size_t)(Ms * ns), 0);
+            for (size_t i = 0; i < gu.size(); ++i)
+                gu[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 801) - 400) * 0.02f);
+            void* dg = dalloc(gu.size() * 2);
+            void* dy = dalloc(y.size() * 2);
+            if (!dg || !dy) { ok(c.name, false, "hipMalloc failed"); continue; }
+            st_memcpy(dg, gu.data(), gu.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dy, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = { T(dg, RAD_BF16, { Ms, 2 * ns }), T(dy, RAD_BF16, { Ms, ns }) };
+            std::vector<RadParam> ps = { PI("M", Ms), PI("n", ns), PS("dtype", "bf16"),
+                                         PF("gate_cap", c.gcap), PF("up_cap", c.ucap) };
+            RadArgs a{};
+            a.t = ts.data(); a.n_t = 2; a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            const int rc = r->launch(&a, nullptr);
+            const bool synced = st_stream_sync(nullptr) == hipSuccess;
+            st_memcpy(y.data(), dy, y.size() * 2, hipMemcpyDeviceToHost);
+            int bad = 0; double worst = 0;
+            for (int64_t t = 0; t < Ms; ++t)
+                for (int64_t i = 0; i < ns; ++i) {
+                    const double g = h_bf16(gu[(size_t)(t * 2 * ns + i)]);
+                    const double u = h_bf16(gu[(size_t)(t * 2 * ns + ns + i)]);
+                    const double ga = c.gcap > 0 ? c.gcap * std::tanh(g / c.gcap) : g;
+                    const double ua = c.ucap > 0 ? c.ucap * std::tanh(u / c.ucap) : u;
+                    const double ref = ga * (1.0 / (1.0 + std::exp(-g))) * ua;
+                    const double err = std::fabs((double)h_bf16(y[(size_t)(t * ns + i)]) - ref);
+                    if (err > 1e-2 * std::fabs(ref) + 1e-3) ++bad;
+                    worst = std::max(worst, err);
+                }
+            std::printf("    %s: %lld values, bad=%d worst=%.3g\n", c.name, (long long)(Ms * ns), bad, worst);
+            ok(c.name, rc == RAD_OK && synced && bad == 0,
+               "rc=" + std::to_string(rc) + " bad=" + std::to_string(bad) + " worst=" + std::to_string(worst));
         }
     }
     /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */

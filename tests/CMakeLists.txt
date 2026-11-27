@@ -362,6 +362,17 @@ foreach(t ${RAD_TESTS})
         TIMEOUT ${RAD_TEST_TIMEOUT}
         ENVIRONMENT "${RAD_TEST_CARD_ENV}")
     endif()
+    # ...and libhalo's, the same cases and split counts.
+    if(RAD_HIP_FOUND AND TARGET libhalo AND TARGET libref)
+      add_dependencies(${n} libhalo libref)
+      add_test(NAME ${n}_halo COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libhalo.so
+                                     ${RAD_PLUGIN_OUT}/kernels/libref.so halo)
+      set_tests_properties(${n}_halo PROPERTIES
+        LABELS gpu
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
   else()
     if(DEFINED RAD_TEST_SHARDS_${n})
       math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
@@ -431,49 +442,89 @@ if(TARGET libr3d)
   endif()
 endif()
 
-# sconv_res on the card: libr4d's exported launcher against the formula, over the model's shapes.
-if(RAD_HIP_FOUND AND TARGET libr4d)
+# sconv_res (and sconv_res_add) on the card: libr4d's and libhalo's exported launchers against the
+# formula, over the model's shapes.
+if(RAD_HIP_FOUND AND (TARGET libr4d OR TARGET libhalo))
   add_executable(sconv_device_test ${CMAKE_CURRENT_SOURCE_DIR}/sconv_device_test.cpp)
   set_target_properties(sconv_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   target_link_libraries(sconv_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
-  add_dependencies(sconv_device_test libr4d)
-  add_test(NAME sconv_device_test_card COMMAND sconv_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
-  set_tests_properties(sconv_device_test_card PROPERTIES
-    LABELS gpu
-    RUN_SERIAL TRUE
-    TIMEOUT ${RAD_TEST_TIMEOUT}
-    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  if(TARGET libr4d)
+    add_dependencies(sconv_device_test libr4d)
+    add_test(NAME sconv_device_test_card COMMAND sconv_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+    set_tests_properties(sconv_device_test_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
+  if(TARGET libhalo)
+    add_dependencies(sconv_device_test libhalo)
+    add_test(NAME sconv_device_test_halo_card
+             COMMAND sconv_device_test ${RAD_PLUGIN_OUT}/kernels/libhalo.so halo)
+    set_tests_properties(sconv_device_test_halo_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
 endif()
 
-# l2_clip on the card: libr4d's exported launcher against the formula, at the model's shapes.
-if(RAD_HIP_FOUND AND TARGET libr4d)
+# l2_clip on the card: libr4d's and libhalo's exported launchers against the formula, at the
+# model's shapes.
+if(RAD_HIP_FOUND AND (TARGET libr4d OR TARGET libhalo))
   add_executable(l2clip_device_test ${CMAKE_CURRENT_SOURCE_DIR}/l2clip_device_test.cpp)
   set_target_properties(l2clip_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   target_link_libraries(l2clip_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
-  add_dependencies(l2clip_device_test libr4d)
-  add_test(NAME l2clip_device_test_card COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
-  set_tests_properties(l2clip_device_test_card PROPERTIES
-    LABELS gpu
-    RUN_SERIAL TRUE
-    TIMEOUT ${RAD_TEST_TIMEOUT}
-    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  if(TARGET libr4d)
+    add_dependencies(l2clip_device_test libr4d)
+    add_test(NAME l2clip_device_test_card COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+    set_tests_properties(l2clip_device_test_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
+  if(TARGET libhalo)
+    add_dependencies(l2clip_device_test libhalo)
+    add_test(NAME l2clip_device_test_halo_card
+             COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libhalo.so halo_rad_l2_clip)
+    set_tests_properties(l2clip_device_test_halo_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
 endif()
 
 # posemb_resample on the card: libr4d's row against libref's over the vision tower's grids and the
-# dtype pairs (tests/posemb_device_test.cpp).
-if(RAD_HIP_FOUND AND TARGET libr4d AND TARGET libref)
+# dtype pairs, then grid_embed_hw; libhalo's grid_embed_hw alone (tests/posemb_device_test.cpp).
+if(RAD_HIP_FOUND AND TARGET libref AND (TARGET libr4d OR TARGET libhalo))
   add_executable(posemb_device_test ${CMAKE_CURRENT_SOURCE_DIR}/posemb_device_test.cpp)
   set_target_properties(posemb_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   target_link_libraries(posemb_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
-  add_dependencies(posemb_device_test libr4d libref)
-  add_test(NAME posemb_device_test_card COMMAND posemb_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so
-                                        ${RAD_PLUGIN_OUT}/kernels/libref.so)
-  set_tests_properties(posemb_device_test_card PROPERTIES
-    LABELS gpu
-    RUN_SERIAL TRUE
-    SKIP_RETURN_CODE 77
-    TIMEOUT ${RAD_TEST_TIMEOUT}
-    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  add_dependencies(posemb_device_test libref)
+  if(TARGET libr4d)
+    add_dependencies(posemb_device_test libr4d)
+    add_test(NAME posemb_device_test_card COMMAND posemb_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so
+                                          ${RAD_PLUGIN_OUT}/kernels/libref.so)
+    set_tests_properties(posemb_device_test_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 77
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
+  if(TARGET libhalo)
+    add_dependencies(posemb_device_test libhalo)
+    add_test(NAME posemb_device_test_halo_card COMMAND posemb_device_test
+             ${RAD_PLUGIN_OUT}/kernels/libhalo.so ${RAD_PLUGIN_OUT}/kernels/libref.so --hw-only)
+    set_tests_properties(posemb_device_test_halo_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 77
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
 endif()
 
 # ================================================================== the device tests on a card

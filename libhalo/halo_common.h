@@ -177,6 +177,11 @@ __device__ __forceinline__ float halo_wave_sum(float v) {
     return v;
 }
 
+// `x` where `c`, else `y`, by value: a conditional over two elements of one array is an lvalue, which
+// the compiler turns into one indexed read and then into a compare and select per element. (libr4d's
+// r4d_pick; halo_attn_rel.hip's decode reduction uses it.)
+__device__ __forceinline__ float halo_pick(bool c, float x, float y) { return c ? x : y; }
+
 // The same butterfly over a group of W lanes (W a power of two up to the wave): the exchanges of
 // `for (o = W / 2; o; o >>= 1) v = op(v, __shfl_xor(v, o))`, in its order, so bit-identical to
 // that loop.

@@ -21,7 +21,7 @@
 
 namespace {
 
-constexpr int HD = 128, BS = 16, DR = 16, E = 1024;
+constexpr int HD = 128, BS = 16, E = 1024;
 
 std::mt19937 rng(91);
 float nrm() { static std::normal_distribution<float> d(0.f, 1.f); return d(rng); }
@@ -59,6 +59,8 @@ struct Case {
     int wgps = 0;
     int want_splits = -1; /* decode split count the card must report; -1 skips the check */
     bool scratch = false;
+    int dr = 16;          /* d_rel: 16 takes the kernels' WMMA bias, other widths the scalar one */
+    int want_splits_halo = -2;  /* libhalo's count where its split rule differs; -2: want_splits */
 };
 
 /* Every operand of one case on the host: the same values feed both plugins. */
@@ -111,6 +113,7 @@ Data make(const Case& c) {
 
     d.q.resize((size_t)d.rows * d.nh * HD);
     for (auto& v : d.q) v = rad_f32_to_bf16(nrm());
+    const int DR = c.dr;
     d.rstride = d.nh * DR + c.rpitch;
     d.r.assign((size_t)d.rows * d.rstride, rad_f32_to_bf16(9.0f));   /* the pitch's extra columns */
     for (int t = 0; t < d.rows; ++t)
@@ -166,6 +169,7 @@ int launch(const Case& c, const Data& d, const Bufs& b, int (*fn)(const RadArgs*
     t[2] = tensor(b.bt, RAD_I32, {d.n_seq, d.maxb});
     t[3] = tensor(b.su, RAD_I32, {d.n_seq});
     if (c.cu) t[6] = tensor(b.cu, RAD_I32, {d.n_seq + 1});
+    const int DR = c.dr;
     t[7] = c.rpitch ? tensor(b.r, RAD_BF16, {d.rows, d.nh, DR}, {d.rstride, DR, 1})
                     : tensor(b.r, RAD_BF16, {d.rows, d.nh, DR});
     t[8] = tensor(b.rp, RAD_BF16, {DR, E});
@@ -219,7 +223,16 @@ double rel_l2(const std::vector<uint16_t>& ref, const std::vector<uint16_t>& got
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s libr4d.so libref.so\n", argv[0]); return 2; }
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s libr4d.so libref.so [prefix [--no-packed]]\n", argv[0]);
+        return 2;
+    }
+    /* The scratch hook's and split counter's prefix: `halo` for libhalo. --no-packed names a
+     * library whose verify takes the decode kernel (a port without the packed WMMA verify): the
+     * packed-verify cases still run against libref, but their split counts are the packed
+     * kernel's and are not checked. */
+    const std::string pfx = argc > 3 ? argv[3] : "r4d";
+    const bool no_packed = argc > 4 && std::strcmp(argv[4], "--no-packed") == 0;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) { std::printf("no card visible: skipped\n"); return 77; }
 
@@ -236,6 +249,13 @@ int main(int argc, char** argv) {
         { "ragged prefill 1500, 1000, 500 rows (2000 keys), gqa 2, full", { 1500, 1000, 500 }, { 2000, 1100, 700 }, 1, 2, 0, E },
         { "ragged prefill 1500, 1000, 500 rows (2000 keys), gqa 2, window 1024", { 1500, 1000, 500 }, { 2000, 1100, 700 }, 1, 2, 1024, E },
         { "int8 cache, gqa 3, full", { 2, 1 }, { 900, 500 }, 1, 3, 0, E, true },
+        /* Prefill (the WMMA kernel where a library has one) at the int8 cache, and at widths of
+         * r that take the scalar bias rather than the d_rel 16 WMMA one. */
+        { "ragged prefill 700, 300 rows, int8 cache, gqa 3, full", { 700, 300 }, { 900, 400 }, 1, 3, 0, E, true },
+        { "ragged prefill 1500, 1000, 500 rows, d_rel 32, gqa 2, full", { 1500, 1000, 500 }, { 2000, 1100, 700 },
+          1, 2, 0, E, false, true, 0, 0, 0, 0, 0, -1, false, 32 },
+        { "ragged prefill 600, 300 rows, d_rel 8, int8 cache, gqa 3, window 1024", { 600, 300 }, { 900, 500 },
+          1, 3, 1024, E, true, true, 0, 0, 0, 0, 0, -1, false, 8 },
         { "r as a column slice of a wider row, gqa 3", { 3 }, { 700 }, 1, 3, 0, E, false, true, 5 },
         { "sink far above the scores, gqa 2", { 1, 1 }, { 300, 40 }, 1, 2, 0, E, false, true, 0, 1 },
         /* The model bound is 262144. The split must follow the live bound, and a 10000-key
@@ -252,11 +272,14 @@ int main(int argc, char** argv) {
          * are rows * kv heads * gqa slots, which bounds the splits (21 here), and the last keys
          * carry the bias. */
         { "packed verify 8 rows, 10000 keys, 8 kv heads, gqa 3, split", { 8 }, { 10000 }, 8, 3, 0, E,
-          false, true, 0, 0, 10000, 262144, 32, 21, true },
+          false, true, 0, 0, 10000, 262144, 32, 21, true, 16, 39 },
         { "packed verify int8, 4 and 7 rows, window 1024, split", { 4, 7 }, { 3000, 2500 }, 2, 3,
           1024, E, true, true, 0, 0, 3000, 262144, 32, 4, true },
         { "packed verify 5 rows, gqa 8 (three waves), split", { 5 }, { 4000 }, 1, 8, 0, E,
           false, true, 0, 0, 4000, 262144, 32, 15, true },
+        /* Over 64 columns: the packed verify's largest block where a library sizes it to them. */
+        { "packed verify 12 rows, gqa 8 (96 columns), split", { 12 }, { 3000 }, 1, 8, 0, E,
+          true, true, 0, 0, 3000, 262144, 32, -1, true },
     };
 
     int fails = 0;
@@ -286,7 +309,7 @@ int main(int argc, char** argv) {
         void* scratch = nullptr;
         int64_t scratch_bytes = 0;
         if (c.scratch) {
-            auto scratch_fn = reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(hr4d, "r4d_rad_attn_rel_scratch"));
+            auto scratch_fn = reinterpret_cast<int64_t (*)(const RadArgs*)>(dlsym(hr4d, (pfx + "_rad_attn_rel_scratch").c_str()));
             if (!scratch_fn) { std::printf("  %-64s no scratch hook\n", c.name); ++fails; continue; }
             scratch_bytes = scratch_fn(nullptr);
             hipcheck(hipMalloc(&scratch, (size_t)scratch_bytes), "scratch");
@@ -299,10 +322,14 @@ int main(int argc, char** argv) {
         hipcheck(hipDeviceSynchronize(), "sync");
         int splits = -1;
         bool splits_ok = true;
-        if (c.want_splits >= 0) {
-            auto last = reinterpret_cast<int (*)()>(dlsym(hr4d, "r4d_attn_rel_last_splits"));
+        const bool packed_case = std::strncmp(c.name, "packed", 6) == 0;
+        /* libhalo's packed verify runs smaller blocks and so more splits (halo_attn_rel.hip,
+         * rel_verify_splits): where its count differs the case names it. */
+        const int want = (pfx == "halo" && c.want_splits_halo != -2) ? c.want_splits_halo : c.want_splits;
+        if (want >= 0 && !(no_packed && packed_case)) {
+            auto last = reinterpret_cast<int (*)()>(dlsym(hr4d, (pfx + "_attn_rel_last_splits").c_str()));
             splits = last ? last() : -1;
-            splits_ok = splits == c.want_splits;
+            splits_ok = splits == want;
         }
         if (scratch) (void)hipFree(scratch);
         const double e = rel_l2(ref_out, dout.get());

@@ -951,6 +951,23 @@ int halo_rad_fill            (const RadArgs*, RadStream);
 int halo_rad_logit_softcap   (const RadArgs*, RadStream);
 int halo_rad_scale           (const RadArgs*, RadStream);
 int halo_rad_silu_mul        (const RadArgs*, RadStream);
+/* SiTU over a fused gate_up (halo_situ.hip). */
+int halo_rad_situ_mul        (const RadArgs*, RadStream);
+/* Inkling 2's per-group L2 clip (halo_l2_clip_bf16.hip). */
+int halo_rad_l2_clip         (const RadArgs*, RadStream);
+/* Inkling 2's short convolution with its residual, and the stream-residual form
+ * (halo_ple_conv_bf16.hip). */
+int     halo_rad_sconv_res       (const RadArgs*, RadStream);
+int     halo_rad_sconv_res_add   (const RadArgs*, RadStream);
+/* Block attention residuals (halo_attn_res.hip). */
+int     halo_rad_attn_res_mix    (const RadArgs*, RadStream);
+/* Inkling 2's attn_paged_rel: a relative-position bias and a sink logit per row (halo_attn_rel.hip),
+ * head_dim 128, a bf16 or int8 cache. */
+int     halo_rad_attn_rel_h128_bf16kv(const RadArgs*, RadStream);
+int     halo_rad_attn_rel_h128_i8kv  (const RadArgs*, RadStream);
+int64_t halo_rad_attn_rel_scratch    (const RadArgs*);
+int halo_shape_attn_paged_rel (const RadParam*, int, int operand, RadOpdDesc*);
+int halo_shape_attn_res_mix   (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_rad_swiglu_clamped(const RadArgs*, RadStream);
 int halo_rad_swiglu_step(const RadArgs*, RadStream);
 int halo_rad_swiglu_clamped_quant_fp8(const RadArgs*, RadStream);
@@ -1217,6 +1234,7 @@ int halo_rad_seg_softmax_pool(const RadArgs*, RadStream);
 /* The vision towers' position embeddings and window order (halo_vit_norm_embed.hip,
  * halo_vit_muse.hip). */
 int halo_rad_grid_embed_cpe   (const RadArgs*, RadStream);
+int halo_rad_grid_embed_hw    (const RadArgs*, RadStream);
 int halo_rad_grid_embed_pad   (const RadArgs*, RadStream);
 int halo_rad_window_order     (const RadArgs*, RadStream);
 int halo_shape_grid_embed_cpe (const RadParam*, int, int operand, RadOpdDesc*);
