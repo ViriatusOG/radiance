@@ -8080,6 +8080,100 @@ static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const R
     return back;
 }
 
+/* sweep_dead: a hybrid conversation is usable only up to its deepest snapshot at or below the
+ * first block the cache lost. Losing its last block (no host copy) leaves the rest cached and
+ * unusable under tip-only retention: the sweep gives all of it and the unreachable tip up. With
+ * a snapshot lower down it keeps what that one resumes from; a prefix another conversation
+ * shares stays; a live sequence's blocks stay. */
+static void publish_hybrid(TierFixture& x, uint64_t id, const std::vector<int32_t>& p,
+                           std::initializer_list<int64_t> snaps) {
+    publish(x.f, id, p, (int64_t)p.size() / 16 * 16);
+    const std::vector<BlockHash> hs = chain_of(p);
+    for (int64_t pos : snaps) { x.f.pc.begin_step(); ckpt_at(x.f, id, hs, pos); }
+    x.f.pc.begin_step();
+}
+
+TEST(sweep_dead_gives_up_a_conversation_its_lost_end_left_unusable) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    x.f.pc.set_policy(std::make_unique<KeepAll>());
+    const auto a = tok_run(30000, 320);
+    publish_hybrid(x, 1, a, { 320 });                  /* 20 blocks, the tip snapshot only */
+    x.f.kv.free_sequence(1);
+    CHECK_EQ(x.f.pc.evict_lru(1), 1);                  /* the end goes, with no host copy */
+    CHECK_EQ(x.f.pc.size(), 19ll);
+    CHECK_EQ(x.f.pc.sweep_dead(), 19);
+    CHECK_EQ(x.f.pc.size(), 0ll);
+    CHECK_EQ(x.f.pc.stats().dead, 19ll);
+    CHECK_EQ(x.f.pc.stats().ckpt_dead, 1ll);           /* the tip, past the lost block */
+    CHECK_EQ(x.f.kv.pool_bytes_used(G_FULL), 0ll);
+}
+
+TEST(sweep_dead_keeps_what_a_lower_snapshot_resumes_from) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    x.f.pc.set_policy(std::make_unique<KeepAll>());
+    const auto a = tok_run(31000, 320);
+    publish_hybrid(x, 1, a, { 160, 320 });
+    x.f.kv.free_sequence(1);
+    CHECK_EQ(x.f.pc.evict_lru(1), 1);
+    CHECK_EQ(x.f.pc.sweep_dead(), 9);                  /* blocks 10..18: past the 160 snapshot */
+    CHECK_EQ(x.f.pc.size(), 10ll);
+    CHECK_EQ(x.f.pc.lookup(a, {}).n_linear_tokens, 160);
+    /* The row is cut to what it resumes from, so the next sweep finds it sound and frees nothing. */
+    const auto rows = x.t.sessions();
+    REQUIRE_EQ(rows.size(), 1u);
+    CHECK_EQ(rows[0].n_tokens, 160);
+    CHECK_EQ(x.f.pc.sweep_dead(), 0);
+    CHECK_EQ(x.f.pc.size(), 10ll);
+}
+
+/* A sound row (its end held, a snapshot right there) is left as it is: nothing past its snapshot. */
+TEST(sweep_dead_leaves_a_sound_conversation_alone) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    x.f.pc.set_policy(std::make_unique<KeepAll>());
+    const auto a = tok_run(34000, 320);
+    publish_hybrid(x, 1, a, { 320 });
+    x.f.kv.free_sequence(1);
+    const auto b = tok_run(35000, 320);
+    publish_hybrid(x, 2, b, { 320 });
+    x.f.kv.free_sequence(2);
+    CHECK_EQ(x.f.pc.sweep_dead(), 0);
+    CHECK_EQ(x.f.pc.size(), 40ll);
+    REQUIRE_EQ(x.t.sessions().size(), 2u);
+    for (const auto& r : x.t.sessions()) CHECK_EQ(r.n_tokens, 320);
+}
+
+TEST(sweep_dead_leaves_a_shared_prefix_and_a_live_sequence_alone) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    x.f.pc.set_policy(std::make_unique<KeepAll>());
+    auto a = tok_run(32000, 320);
+    auto b = a;
+    for (size_t i = 80; i < b.size(); ++i) b[i] += 7;  /* shares its first 5 blocks with a */
+    publish_hybrid(x, 1, a, { 320 });
+    x.f.kv.free_sequence(1);
+    publish_hybrid(x, 2, b, { 320 });
+    x.f.kv.free_sequence(2);
+    x.f.pc.lookup(b, {});                              /* b is the more recent: a's end goes */
+    CHECK_EQ(x.f.pc.evict_lru(1), 1);
+    CHECK_EQ(x.f.pc.sweep_dead(), 14);                 /* a's own blocks 5..18 */
+    auto next = b;                                     /* b's next turn: one block more */
+    next.insert(next.end(), 16, 5);
+    CHECK_EQ(x.f.pc.lookup(next, {}).n_linear_tokens, 320);   /* b and the shared head intact */
+
+    /* A live sequence's blocks are not given up, whatever the snapshots say. */
+    TierFixture y;
+    CHECK_OK(y.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    y.f.pc.set_policy(std::make_unique<KeepAll>());
+    const auto c = tok_run(33000, 320);
+    publish_hybrid(y, 3, c, { 320 });                  /* sequence 3 still holds its blocks */
+    y.f.pc.drop_offdevice(chain_of(c)[19]);            /* as if the host tier lost the end */
+    CHECK_EQ(y.f.pc.sweep_dead(), 0);
+    CHECK_EQ(y.f.pc.size(), 19ll);
+}
+
 /* Two conversations of 0.6 of the pool each, as the scheduler leaves them: A published and copied
  * to the host, B admitted by giving up A's VRAM under pressure, published, and the reserve's trim
  * run while B's sequence still holds its blocks (Scheduler::close_request publishes before it
