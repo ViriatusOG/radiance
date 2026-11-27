@@ -2012,6 +2012,11 @@ struct CalibTap {
     void step(RadCtx* c, rad_buf a, int64_t T, bool live) const {
         if (op && live) RAD_ISSUE_N(c, op, T, brows(a, T), RAD_NONE, brows(h, K));
     }
+    /* The rows [first, first + n) only: the routed arm issues row chunks, not whole buffers. */
+    void step_rows(RadCtx* c, rad_buf a, int64_t first, int64_t n, int64_t pitch, bool live) const {
+        if (op && live)
+            RAD_ISSUE_N(c, op, n, brow_slice(a, first, n, pitch), RAD_NONE, brows(h, K));
+    }
 };
 
 }  /* namespace arch */

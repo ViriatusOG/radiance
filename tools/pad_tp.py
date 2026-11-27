@@ -3,7 +3,7 @@
 tensor-parallel world size, with zero weights, so the padded model computes exactly what the
 original does.
 
-    pad_tp.py SRC DST --heads 36 --kv-heads 9 [--ff 8448] [--gdn-k 18 --gdn-v 54]
+    pad_tp.py SRC DST [--heads 36] [--kv-heads 9] [--ff 8448] [--gdn-k 18 --gdn-v 54] [--moe-ffn 768] [--sparse]
 
 What is padded and why it is exact (fp32-accumulated, zero terms add nothing):
   attention   k_proj / v_proj gain zero rows (new kv heads); q_proj gains zero rows so every kv
@@ -14,6 +14,10 @@ What is padded and why it is exact (fp32-accumulated, zero terms add nothing):
   mlp         gate_proj / up_proj gain zero rows, down_proj zero columns: silu(0)*0 = 0.
   gdn         (Qwen3-Next, --gdn-k/--gdn-v) in_proj_qkvz / in_proj_ba gain zero rows per the
               fused layout, conv1d zero channels, A_log / dt_bias zero heads, out_proj zero columns.
+  MoE (gemma-4, --moe-ffn) experts.gate_up_proj [E, 2*ffe, hidden]: the fused gate|up axis is split
+              into the two blocks and each gains zero rows (gelu(0)*0 = 0); experts.down_proj
+              [E, hidden, ffe] gains zero columns on the input axis. Rewrites
+              text_config.moe_intermediate_size when the key exists.
 Everything with n_embd as its only width (norms, embeddings, lm_head) is untouched. config.json is
 rewritten with the new counts and an explicit head_dim. Dummies go LAST, as tcclaviger's vLLM tp_padding
 does, so rank w-1 carries them.
@@ -81,14 +85,22 @@ def take_cols(w, idx, hd):
 def pad_rows(w, n2):
     out = np.zeros((n2,) + w.shape[1:], dtype=w.dtype); out[:w.shape[0]] = w; return out
 
-def pad_cols(w, n2):
-    out = np.zeros(w.shape[:1] + (n2,) + w.shape[2:], dtype=w.dtype); out[:, :w.shape[1]] = w; return out
+def pad_cols(w, n2, axis=1):
+    """pad axis with zeros at the end (2-D: columns; 3-D expert down_proj: axis 2, the input/K axis)."""
+    pad = [(0, 0)] * w.ndim; pad[axis] = (0, n2 - w.shape[axis])
+    return np.pad(w, pad)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src"); ap.add_argument("dst")
-    ap.add_argument("--heads", type=int, required=True); ap.add_argument("--kv-heads", type=int, required=True)
+    ap.add_argument("--heads", type=int, default=0, help="new num_attention_heads (0 = unchanged; experts-only pads leave attention as-is)")
+    ap.add_argument("--kv-heads", type=int, default=0, help="new num_key_value_heads (0 = unchanged)")
     ap.add_argument("--ff", type=int, default=0, help="new intermediate_size for DENSE mlp (0 = unchanged; MoE experts are never padded)")
+    ap.add_argument("--moe-ffn", type=int, default=0,
+                    help="new moe_intermediate_size for MoE experts (0 = unchanged): experts.gate_up_proj's fused gate|up axis is "
+                         "split into the two blocks and each gains zero rows (N -> N'), experts.down_proj gains zero columns on the "
+                         "input axis. Exact: the new intermediate components are gelu(0)*0 = 0 and down's zero columns read 0. "
+                         "Rewrites config text_config.moe_intermediate_size when the key exists")
     ap.add_argument("--gdn-k", type=int, default=0); ap.add_argument("--gdn-v", type=int, default=0)
     ap.add_argument("--sparse", action="store_true",
                     help="write ONLY the padded tensors, into new shards named to sort first; reflink every original "
@@ -101,13 +113,16 @@ def main():
     n_head, n_kv = cfg["num_attention_heads"], cfg.get("num_key_value_heads", cfg["num_attention_heads"])
     n_embd = cfg["hidden_size"]; hd = cfg.get("head_dim") or n_embd // n_head
     n_ff = cfg.get("intermediate_size", 0); n_ff2 = a.ff or n_ff      # MoE-only models (QFN) have none
-    qmap = head_map(n_head, n_kv, a.heads, a.kv_heads)
-    kmap = list(range(n_kv)) + [-1] * (a.kv_heads - n_kv)
+    n_ffe = cfg.get("moe_intermediate_size", 0); n_ffe2 = a.moe_ffn or n_ffe   # MoE expert width (gemma4)
+    n_head2 = a.heads or n_head; n_kv2 = a.kv_heads or n_kv
+    qmap = head_map(n_head, n_kv, n_head2, n_kv2)
+    kmap = list(range(n_kv)) + [-1] * (n_kv2 - n_kv)
     gk, gv = cfg.get("linear_num_key_heads"), cfg.get("linear_num_value_heads")
     gkd, gvd = cfg.get("linear_key_head_dim"), cfg.get("linear_value_head_dim")
     gk2, gv2 = a.gdn_k or gk, a.gdn_v or gv
-    print(f"attention {n_head}/{n_kv} (gqa {n_head//n_kv}) @ {hd} -> {a.heads}/{a.kv_heads} (gqa {a.heads//a.kv_heads}); "
-          f"dense ff {n_ff} -> {n_ff2}" + (f"; gdn K {gk}->{gk2} V {gv}->{gv2}" if gk else ""), flush=True)
+    print(f"attention {n_head}/{n_kv} (gqa {n_head//n_kv}) @ {hd} -> {n_head2}/{n_kv2} (gqa {n_head2//n_kv2}); "
+          f"dense ff {n_ff} -> {n_ff2}" + (f"; gdn K {gk}->{gk2} V {gv}->{gv2}" if gk else "")
+          + (f"; moe ff {n_ffe} -> {n_ffe2}" if n_ffe else ""), flush=True)
     os.makedirs(a.dst, exist_ok=True)
     idx_path = os.path.join(a.src, "model.safetensors.index.json")
     files = sorted(set(json.load(open(idx_path))["weight_map"].values())) if os.path.exists(idx_path) else ["model.safetensors"]
@@ -127,16 +142,27 @@ def main():
 
     def plan(name, shape):
         """-> (kind, transform) for a tensor, by name and SOURCE shape. None = untouched."""
-        if re.search(r"self_attn\.q_proj\.(weight|bias)$", name):
+        if n_head2 != n_head and re.search(r"self_attn\.q_proj\.(weight|bias)$", name):
             # Qwen3-Next gated attention fuses q and its gate: rows = n_head * 2 * hd, per head [q | gate].
             # A plain q_proj has n_head * hd rows. Either way one head is one block of rows.
             blk = shape[0] // n_head
             assert blk in (hd, 2 * hd), f"{name}: {shape[0]} rows is neither {n_head}*{hd} nor {n_head}*{2*hd}"
             return "q", lambda w: take_rows(w, qmap, blk)
-        if re.search(r"self_attn\.[kv]_proj\.(weight|bias)$", name):   return "kv", lambda w: take_rows(w, kmap, hd)
-        if re.search(r"self_attn\.o_proj\.weight$", name):             return "o",  lambda w: take_cols(w, qmap, hd)
+        if n_kv2 != n_kv and re.search(r"self_attn\.[kv]_proj\.(weight|bias)$", name):   return "kv", lambda w: take_rows(w, kmap, hd)
+        if n_head2 != n_head and re.search(r"self_attn\.o_proj\.weight$", name):        return "o",  lambda w: take_cols(w, qmap, hd)
         if n_ff2 != n_ff and re.search(r"mlp\.(gate|up)_proj\.weight$", name): return "ff", lambda w: pad_rows(w, n_ff2)
         if n_ff2 != n_ff and re.search(r"mlp\.down_proj\.weight$", name):      return "ff", lambda w: pad_cols(w, n_ff2)
+        if n_ffe2 != n_ffe and re.search(r"experts\.gate_up_proj$", name):
+            # 3-D stacked [E, 2*ffe, hidden]: fused gate|up rows, [0,ffe)=gate [ffe,2*ffe)=up. Split into the
+            # two blocks and zero-pad each (gate rows then up rows; gelu(0)*0 = 0). Qwen-style 2-D names
+            # (mlp.*_proj) never match this.
+            half = shape[1] // 2
+            assert 2 * half == shape[1] and half == n_ffe, \
+                f"{name}: fused axis {shape[1]} != 2 * moe_intermediate_size {2 * n_ffe}"
+            return "moe_gu", lambda w: parts(w, [half, half], [n_ffe2, n_ffe2], axis=1)
+        if n_ffe2 != n_ffe and re.search(r"experts\.down_proj$", name):
+            # 3-D stacked [E, hidden, ffe]: zero columns on the input/K axis (last axis).
+            return "moe_d", lambda w: pad_cols(w, n_ffe2, axis=2)
         if gk and re.search(r"linear_attn\.", name) and (gk2 != gk or gv2 != gv):
             # Qwen3-Next GDN, both spellings. Fused: in_proj_qkvz rows [q gk*gkd][k gk*gkd][v gv*gvd][z gv*gvd],
             # in_proj_ba [b gv][a gv]. Separate (Qwen3.8-Flash-Next): in_proj_qkv [q][k][v], in_proj_z [z],
@@ -176,7 +202,11 @@ def main():
             if not os.path.exists(dstf):
                 r = subprocess.run(["cp", "--reflink=always", os.path.join(a.src, fn), dstf],
                                    stderr=subprocess.DEVNULL).returncode
-                if r: os.link(os.path.join(a.src, fn), dstf)      # not btrfs/xfs: hard link, still no copy
+                if r:
+                    try: os.link(os.path.join(a.src, fn), dstf)      # not btrfs/xfs: hard link, still no copy
+                    except OSError:
+                        shutil.copy2(os.path.join(a.src, fn), dstf)  # cross-FS: plain copy (reflink/hardlink impossible)
+                        print(f"  copied {fn} (reflink/hardlink unavailable)", flush=True)
         else:
             st_write_stream(os.path.join(a.dst, fn), meta, items); print(f"  wrote {fn} ({len(items)} tensors)", flush=True)
     if a.sparse:
@@ -194,11 +224,12 @@ def main():
     if len(files) > 1 or a.sparse:
         json.dump({"metadata": {"total_size": total}, "weight_map": weight_map},
                   open(os.path.join(a.dst, "model.safetensors.index.json"), "w"), indent=2)
-    cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"] = a.heads, a.kv_heads, hd
+    cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"] = n_head2, n_kv2, hd
     if n_ff: cfg["intermediate_size"] = n_ff2
+    if n_ffe: cfg["moe_intermediate_size"] = n_ffe2
     if gk: cfg["linear_num_key_heads"], cfg["linear_num_value_heads"] = gk2, gv2
-    cfg_all["_tp_padding"] = {"from": {"heads": n_head, "kv_heads": n_kv, "ff": n_ff, "gdn_k": gk, "gdn_v": gv},
-                              "to": {"heads": a.heads, "kv_heads": a.kv_heads, "ff": n_ff2, "gdn_k": gk2, "gdn_v": gv2},
+    cfg_all["_tp_padding"] = {"from": {"heads": n_head, "kv_heads": n_kv, "ff": n_ff, "gdn_k": gk, "gdn_v": gv, "moe_ff": n_ffe},
+                              "to": {"heads": n_head2, "kv_heads": n_kv2, "ff": n_ff2, "gdn_k": gk2, "gdn_v": gv2, "moe_ff": n_ffe2},
                               "zero_weights": True, "dummies": "last", "sparse": bool(a.sparse)}
     json.dump(cfg_all, open(os.path.join(a.dst, "config.json"), "w"), indent=2)
     for f in os.listdir(a.src):

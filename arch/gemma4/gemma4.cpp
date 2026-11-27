@@ -1,6 +1,6 @@
 /* gemma4 -- Gemma 4 decoders (26B-A4B MoE, and the dense members of the family): a bf16
- * trunk, routed experts bf16, block fp8 or rotated int8 (see FP8 EXPERTS), and the DFlash
- * block-diffusion drafter, with the shared Gemma 4 vision tower.
+ * trunk, routed experts bf16, block fp8, rotated int8 or the rotated computed trellis (see FP8
+ * EXPERTS), the DFlash block-diffusion drafter, and the shared Gemma 4 vision tower.
  *
  * ============================== THE SHAPE (gemma-4-26B-A4B-it) ==============================
  *
@@ -82,8 +82,15 @@
  * Rotated int8 experts (`rtn codes=i8 group=128 scale=bf16 transform=fwht128`) take the same
  * tables and the same widths through `moe_gemm_q` at i8a8h, over int8 codes of the experts' input
  * that the attention join's fused route writes (`norm_add_norm_route_i8g`), or the rotating norm
- * (`rmsnorm_had_quant_i8g`) where that is not served. A model's quantised experts are all one or
- * all the other.
+ * (`rmsnorm_had_quant_i8g`) where that is not served. The computed trellis (an IQR weight; the
+ * recipe's `gptq codes=uN tcq=16 tcq_code=mad tcq_rows=... block=1x* scale=f32
+ * transform=fwht128`, rad_block_moe_q.h's format 11) takes the same tables and the same widths
+ * through the same GEMM at i8a8h over the same int8 input: the codes stay at their stored width
+ * (two to six bits; libr4d's iqr forms decode them where they are read) with the code's
+ * constants in a `trellis.mad` plane, and the scale an f32 one a row times one a 128 of K for
+ * all rows (`scale.col`). The rotated forms share the int8 input, so a model's quantised
+ * experts are all block fp8 or all rotated against int8 (rotated int8 and the computed
+ * trellis, mixed across layers and projections).
  *
  * The cache is bf16 or int8 with an f16 scale of K and of V per token and head
  * (--kv-cache-dtype i8, libr4d's windowed kernels' int8 rows and kv_store_i8), the drafter's
@@ -121,6 +128,15 @@ static const int64_t kMoeRouterFusedRows = 64;
 /* Gemma4ForConditionalGeneration nests the text model's config under `text_config`; a
  * Gemma4ForCausalLM checkpoint does not, so config keys are read with meta_text_get*. */
 
+/* How one expert projection is stored (the container's entry, or in rad-convert the recipe's
+ * plan; expert_format reads it and the GEMM follows): plain bf16 is `moe_gemm`, block fp8
+ * (fp8_e4m3 codes, a bf16 scale per 128x128 block) is `moe_gemm_q` at fp8a8 over an E4M3 input,
+ * and the rotated forms (rotated int8, the computed trellis) at i8a8h over the int8 codes the
+ * trunk's producers write. */
+enum { EXP_BF16 = 0, EXP_FP8 = 1, EXP_I8 = 2, EXP_TRELLIS = 3 };
+static const char* const kExpertFmt[4] = { "bf16", "block fp8", "rotated int8",
+                                           "the rotated computed trellis" };
+
 /* One attention kind: the sliding and the full layers differ in head width, KV heads, rotary
  * and window, and in whether V has a projection of its own. */
 struct Kind {
@@ -150,15 +166,22 @@ struct Layer {
     /* dense arm */
     rad_weight w_fnorm = 0, w_gu = 0, w_dn = 0, w_fpost1 = 0;
     rad_op op_fnorm = 0, op_gu = 0, op_act = 0, op_dn = 0;
-    /* routed arm. Each projection's experts are plain bf16 or block fp8, as the container holds
-     * (expert_format). A bf16 projection's handles are its experts in order, one table; an fp8
-     * one's are the even local experts then the odd ones, codes in w_egu/w_edn and scale views in
-     * w_egus/w_edns, so each parity is one run (see declare). */
+    /* routed arm. Each projection's experts are plain bf16 or quantised (block fp8, rotated
+     * int8 or the rotated computed trellis), as the container holds (expert_format). A bf16
+     * projection's handles are its experts in order, one table; a quantised one's are the even
+     * local experts then the odd ones, codes in w_egu/w_edn and scale views in w_egus/w_edns, so
+     * each parity is one run (see declare). */
     rad_weight w_rscale = 0, w_router = 0, w_escale = 0, w_enorm = 0, w_fpost2 = 0;
     std::vector<rad_weight> w_egu, w_edn, w_egus, w_edns;
-    /* A projection's experts are quantised (block fp8 or rotated int8: the table GEMM over a code
-     * pair), else plain bf16. */
+    /* A projection's experts are quantised (block fp8: one E4M3 scale a 128x128 tile; the
+     * rotated forms: codes with a scale per row, the table GEMM over a code pair), else plain
+     * bf16. */
     bool gu_q = false, dn_q = false;
+    /* The encoding each quantised projection's experts are stored in (expert_format), and for
+     * the trellis the codes' stored width: its views are declared at it (libr4d's iqr forms
+     * cover two to six bits). */
+    int fgu = EXP_BF16, fdn = EXP_BF16;
+    uint32_t gu_cdt = 0, dn_cdt = 0;
     rad_op op_rnorm = 0, op_router = 0, op_topk = 0, op_escale = 0, op_emul = 0, op_enorm = 0;
     rad_op op_scatter = 0, op_egu = 0, op_eact = 0, op_eq = 0, op_edn = 0, op_gather = 0;
     /* libr4d's fused forms of the router, its top-k and the sort, where they resolve: the pair
@@ -179,7 +202,8 @@ struct Layer {
     rad_op op_join_a = 0, op_join_f = 0;
     /* op_join_r: op_join_a writing the routed arm's two inputs as well -- the router's norm into
      * b_rn and the experts' codes into b_hq / b_hqs (norm_add_norm_route's E4M3, or
-     * norm_add_norm_route_i8g's rotated int8) -- where the layer's gate_up is quantised. op_rnorm
+     * norm_add_norm_route_i8g's rotated int8, the rotated experts' input: rotated int8 and the
+     * computed trellis alike) -- where the layer's gate_up is quantised. op_rnorm
      * and op_enorm are then declared and not issued. */
     rad_op op_join_r = 0;
     /* op_join_f also writes the next norm (the following layer's input norm, or the final norm
@@ -191,8 +215,10 @@ struct Layer {
     rad_op op_tap = 0;
     /* Calibration: the attention's input (q, k and v share it), its output (this rank's columns,
      * o_proj's input), the dense arm's input and its gated product (this rank's columns, down's
-     * input). */
-    CalibTap tap_in{}, tap_o{}, tap_gu{}, tap_dn{};
+     * input), and -- on a MoE -- the routed arm's inputs: the normed stream the experts' gate/up
+     * gathers rows from (its pooled gram IS every expert's gate/up Hessian, weighted by the
+     * routing) and the gated product the experts' down reads (this rank's columns). */
+    CalibTap tap_in{}, tap_o{}, tap_gu{}, tap_dn{}, tap_egu{}, tap_edn{};
 };
 
 struct Model {
@@ -219,12 +245,13 @@ struct Model {
     rad_buf b_ff2 = 0, b_gu = 0, b_act = 0;                /* the arms' join; the dense arm */
     rad_buf b_rn = 0, b_logit = 0, b_ids = 0, b_ew = 0, b_es = 0, b_hx = 0;
     rad_buf b_sorted = 0, b_eoff = 0, b_ecnt = 0, b_egu = 0, b_eact = 0, b_edn = 0;
-    /* the experts' E4M3 inputs, declared only where some layer's projection is fp8: gate_up's
-     * (the normed block input, a row a token) and down's (the gated product, a row a slot) */
+    /* the experts' quantised inputs (E4M3 for block fp8, rotated int8 for the rotated forms),
+     * declared only where some layer's projection is quantised: gate_up's (the normed block
+     * input, a row a token) and down's (the gated product, a row a slot) */
     rad_buf b_hq = 0, b_hqs = 0, b_eq = 0, b_eqs = 0;
     int     n_gu_q = 0, n_dn_q = 0;   /* layers whose projection is quantised */
-    /* The quantised experts are rotated int8 against int8 activations (EXP_I8), every layer's:
-     * the code pairs are one buffer each for the whole model. */
+    /* The quantised experts read int8 activations (EXP_I8 or EXP_TRELLIS), every layer's: the
+     * code pairs are one buffer each for the whole model. */
     bool    exp_i8 = false, exp_seen = false;
     rad_buf b_hout = 0, b_logits = 0;
 
@@ -335,17 +362,29 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
 /* ============================================================== the experts' encoding */
 
 /* How one expert projection is stored (the container's entry, or in rad-convert the recipe's
- * plan, rad_weight_encoding), which picks the GEMM: plain bf16 is `moe_gemm`, block fp8 (fp8_e4m3
- * codes, a bf16 scale per 128x128 block) is `moe_gemm_q` at fp8a8. Anything else is refused by
- * name. A builder with no model behind it answers nothing, and the declared dtype bf16 is read. */
-enum { EXP_BF16 = 0, EXP_FP8 = 1, EXP_I8 = 2 };
-static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
+ * plan, rad_weight_encoding), which picks the GEMM: plain bf16 is `moe_gemm`, block fp8 at
+ * fp8a8, and the rotated forms (rotated int8, the computed trellis) at i8a8h (the names,
+ * kExpertFmt). `cdt` (where given) takes the codes' stored dtype, which the trellis' views are
+ * declared at. Anything else is refused by name. A builder with no model behind it answers
+ * nothing, and the declared dtype bf16 is read. */
+static int expert_format(RadBuilder* b, const char* wn, int* fmt, uint32_t* cdt) {
     RadEncoding e{};
     *fmt = EXP_BF16;
+    if (cdt) *cdt = 0;
     if (!weight_enc(b, wn, &e)) return RAD_OK;
     if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return RAD_OK;
     if (block_fp8_128(e)) {
         *fmt = EXP_FP8;
+        return RAD_OK;
+    }
+    /* The computed trellis under one f32 scale a row, rotated (rad_block_moe_q.h's format 11,
+     * an IQR weight): GPTQ's codes at their stored width -- libr4d's iqr forms decode two to six
+     * bits where they are read -- with the code's constants in a "trellis.mad" plane, and the
+     * scale an f32 one a row times one a 128 of K for all rows ("scale.col"). */
+    if (rad_enc_is(&e, "trellis") && std::strcmp(e.transform, "fwht128") == 0 &&
+        linear_w8h_mad(e) && linear_w8h_rowf(e)) {
+        *fmt = EXP_TRELLIS;
+        if (cdt) *cdt = e.plane[0].dtype;
         return RAD_OK;
     }
     /* Rotated int8: codes with a bf16 scale per (row, 128 of K), each 128 of K rotated by the
@@ -360,29 +399,45 @@ static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
     char en[256];
     rad_enc_format(&e, en, sizeof en);
     fprintf(stderr, "radiance: gemma4: '%s' is %s; the routed experts are served plain bf16, "
-                    "block fp8 (fp8_e4m3*bf16[128x128]) or rotated int8 "
-                    "(i8*bf16[1x128]/fwht128). Convert with no rule for them, or with `rtn "
-                    "codes=fp8_e4m3 block=128x128 scale=bf16` or `rtn codes=i8 group=128 "
-                    "scale=bf16 transform=fwht128 clamp=sym rule=search`.\n", wn, en);
+                    "block fp8 (fp8_e4m3*bf16[128x128]), rotated int8 (i8*bf16[1x128]/fwht128) "
+                    "or the rotated computed trellis (uN codes with the trellis's constants, "
+                    "f32[1x*] x f32[*x128], fwht128; an IQR weight). Convert with no rule for "
+                    "them, or with `rtn codes=fp8_e4m3 block=128x128 scale=bf16`, `rtn codes=i8 "
+                    "group=128 scale=bf16 transform=fwht128 clamp=sym rule=search`, or `gptq "
+                    "codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 "
+                    "transform=fwht128 tcq_gain=1.12 damp=0.01 calib=<dir> tcq_order=1`.\n",
+            wn, en);
     return RAD_E_DTYPE;
 }
 
 /* One encoding per projection per layer, since one expert table takes one: the first local
- * expert's decides and every other must match. `what` is "gate_up" or "down". */
+ * expert's decides and every other must match. `what` is "gate_up" or "down"; for the trellis
+ * the first's codes' stored width decides too, the views being declared at it. */
 static int layer_expert_format(RadBuilder* b, Names& nm, int64_t l, int64_t base, int64_t n,
-                               const char* what, int* fmt) {
+                               const char* what, int* fmt, uint32_t* cdt) {
     for (int64_t e = 0; e < n; ++e) {
         const char* wn = nm.f("blk.%lld.ffn_%s_exps.%lld.weight", (long long)l, what,
                               (long long)(base + e));
         int f = EXP_BF16;
-        RAD_ARCH_TRY(expert_format(b, wn, &f));
-        if (e == 0) { *fmt = f; continue; }
+        uint32_t cd = 0;
+        RAD_ARCH_TRY(expert_format(b, wn, &f, &cd));
+        if (e == 0) {
+            *fmt = f;
+            if (cdt) *cdt = cd;
+            continue;
+        }
         if (f != *fmt) {
-            static const char* const kName[3] = { "bf16", "block fp8", "rotated int8" };
             fprintf(stderr, "radiance: gemma4: '%s' is %s and expert %lld of the same layer is %s; "
                             "one layer's %s experts take one encoding (a recipe rule for them "
-                            "matches all of a layer's or none)\n", wn, kName[f], (long long)base,
-                    kName[*fmt], what);
+                            "matches all of a layer's or none)\n", wn, kExpertFmt[f],
+                    (long long)base, kExpertFmt[*fmt], what);
+            return RAD_E_DTYPE;
+        }
+        if (f == EXP_TRELLIS && cd != *cdt) {
+            fprintf(stderr, "radiance: gemma4: '%s' is %s-width trellis codes and expert %lld of "
+                            "the same layer is %s-width; one layer's %s experts take one code "
+                            "width (the views are declared at it)\n", wn, rad_dtype_name(cd),
+                    (long long)base, rad_dtype_name(*cdt), what);
             return RAD_E_DTYPE;
         }
     }
@@ -603,8 +658,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                                                        : "model.language_model";
 
     /* ---- the experts' name maps, and from them each layer's expert format, before any buffer:
-     * an fp8 projection reads an E4M3 input a bf16 one does not, and an unread plane would still
-     * be charged by the planner. One stacked tensor per projection per layer, sliced by the global
+     * a block fp8 projection reads an E4M3 input, the rotated forms read the int8 pair, and a
+     * bf16 one reads neither -- an unread plane would still be charged by the planner. One
+     * stacked tensor per projection per layer, sliced by the global
      * expert index: this rank declares its window into the checkpoint's experts. */
     m.layers.resize((size_t)m.n_layer);
     if (m.moe) {
@@ -620,19 +676,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 RAD_ARCH_TRY(map_slice(b, nm.f("blk.%lld.ffn_down_exps.%lld.weight", ll, ge), sdn, (int)ge));
             }
             int fgu = EXP_BF16, fdn = EXP_BF16;
-            RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "gate_up", &fgu));
-            RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "down", &fdn));
+            RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "gate_up", &fgu,
+                                             &y.gu_cdt));
+            RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "down", &fdn,
+                                             &y.dn_cdt));
+            y.fgu = fgu;
+            y.fdn = fdn;
             y.gu_q = fgu != EXP_BF16;
             y.dn_q = fdn != EXP_BF16;
-            /* One quantised format for the model: the experts' code pairs are shared buffers. */
+            /* One quantised family for the model: the experts' code pairs are shared buffers,
+             * and the int8 family (rotated int8, the computed trellis) shares one rotated int8
+             * input and the i8a8h GEMM, so it mixes across layers and projections; block fp8
+             * reads an E4M3 input and does not. */
             for (const int f : { fgu, fdn }) {
                 if (f == EXP_BF16) continue;
-                const bool i8 = f == EXP_I8;
+                const bool i8 = f == EXP_I8 || f == EXP_TRELLIS;
                 if (m.exp_seen && i8 != m.exp_i8) {
                     fprintf(stderr, "radiance: gemma4: layer %lld's experts are %s and an earlier "
-                                    "projection's %s; a model's quantised experts are all block "
-                                    "fp8 or all rotated int8\n", ll,
-                            i8 ? "rotated int8" : "block fp8", i8 ? "block fp8" : "rotated int8");
+                                    "projection's are %s; a model's quantised experts are all "
+                                    "block fp8 or all rotated against int8 activations (rotated "
+                                    "int8 and the computed trellis mix)\n", ll, kExpertFmt[f],
+                            m.exp_i8 ? "rotated (rotated int8 or the computed trellis)"
+                                     : "block fp8");
                     return RAD_E_DTYPE;
                 }
                 m.exp_seen = true;
@@ -994,7 +1059,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* The attention join. On a layer whose gate_up is quantised it also writes the routed
          * arm's two inputs: the router's norm (rmsnorm with mult hidden^-0.5) and the experts'
-         * codes (as rmsnorm_quant_fp8, or for rotated int8 experts rmsnorm_had_quant_i8g),
+         * codes (as rmsnorm_quant_fp8, or for the rotated experts (rotated int8, the computed
+         * trellis) rmsnorm_had_quant_i8g),
          * saving two launches and two reads of x per layer. Otherwise norm_add_norm, else the
          * chain. */
         if (has_join_r && m.moe && y.gu_q)
@@ -1041,17 +1107,24 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* The experts: this rank's run of whole experts (name maps and encodings were settled
              * before the buffers). Each projection's handles are declared in its GEMM's table
              * order, since a table is a run of consecutively declared handles: bf16 is one run in
-             * expert order; block fp8 or int8 is the even local experts' codes, then the odd ones',
-             * then the scale views in the same two runs (`moe_gemm_q` takes two tables by parity;
-             * an int8 expert's scale is per row, block fp8's per 128 rows). Codes
+             * expert order; a quantised one is the even local experts' codes, then the odd
+             * ones', then the scale views in the same two runs (`moe_gemm_q` takes two tables by
+             * parity; a rotated expert's scale is per row, block fp8's per 128 rows). Codes
              * and scale plane are two views of one stored weight and one movement unit (slot 0
-             * gate_up, 1 down). */
-            const uint32_t cdt = m.exp_i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
-            auto experts = [&](bool fp8, const char* what, int slot, int64_t rows, int64_t cols,
+             * gate_up, 1 down).
+             *
+             * The views are per encoding (expert_format): block fp8 is "codes" (fp8_e4m3) beside
+             * "scale" (bf16, one a 128x128 tile); rotated int8 is "codes" (i8) beside "scale"
+             * (bf16, one a row's 128 of K); the computed trellis is "codes,trellis,trellis.mad"
+             * at the codes' stored width (libr4d's iqr forms decode two to six bits where they
+             * are read) beside "scale,scale.col" (f32, one a row times one a 128 of K for all
+             * rows), declared at the weight's extents as rad_block_moe_q.h's format 11 leaves
+             * the stored planes to the layout hook. */
+            auto experts = [&](int fmt, const char* what, int slot, int64_t rows, int64_t cols,
                                std::vector<rad_weight>& wc, std::vector<rad_weight>& ws) {
                 wc.assign((size_t)NL, 0);
                 ws.clear();
-                if (!fp8) {
+                if (fmt == EXP_BF16) {
                     for (int64_t e = 0; e < NL; ++e) {
                         const long long ge = (long long)(m.expert_base + e);
                         wc[(size_t)e] = decl_w(b, nm.f("blk.%lld.ffn_%s_exps.%lld.weight", ll, what, ge),
@@ -1063,6 +1136,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 }
                 ws.assign((size_t)NL, 0);
                 const int64_t half = NL / 2;
+                const bool iqr = fmt == EXP_TRELLIS;
+                const uint32_t cdt = iqr ? (slot ? y.dn_cdt : y.gu_cdt)
+                                         : fmt == EXP_I8 ? (uint32_t)RAD_I8
+                                                         : (uint32_t)RAD_F8E4M3;
+                const uint32_t sdt = iqr ? RAD_F32 : RAD_BF16;
+                const int64_t srows = fmt == EXP_FP8 ? scale_groups(rows) : rows;
+                const int64_t scols = iqr ? cols : scale_groups(cols);
                 for (int pass = 0; pass < 2; ++pass)          /* codes, then scales */
                     for (int par = 0; par < 2; ++par)         /* even, then odd */
                         for (int64_t i = 0; i < half; ++i) {
@@ -1071,22 +1151,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             const char* wn = nm.f("blk.%lld.ffn_%s_exps.%lld.weight", ll, what, ge);
                             rad_weight& h = (pass ? ws : wc)[(size_t)(par * half + i)];
                             h = pass ? decl_view(b, nm.f("blk.%lld.ffn_%s_exps.%lld.scale", ll, what, ge),
-                                                 wn, "scale", RAD_BF16,
-                                                 {m.exp_i8 ? rows : scale_groups(rows),
-                                                  scale_groups(cols)},
+                                                 wn, iqr ? "scale,scale.col" : "scale", sdt,
+                                                 {srows, scols},
                                                  RAD_ACCESS_CONDITIONAL, N,
                                                  grp_expert_slot(li, (int)e, slot))
-                                     : decl_view(b, wn, nullptr, "codes", cdt, {rows, cols},
-                                                 RAD_ACCESS_CONDITIONAL, N,
+                                     : decl_view(b, wn, nullptr,
+                                                 iqr ? "codes,trellis,trellis.mad" : "codes", cdt,
+                                                 {rows, cols}, RAD_ACCESS_CONDITIONAL, N,
                                                  grp_expert_slot(li, (int)e, slot));
                             if (!h) return RAD_E_INVAL;
                         }
                 return RAD_OK;
             };
-            RAD_ARCH_TRY(experts(y.gu_q, "gate_up", 0, 2 * m.n_ffe, E, y.w_egu, y.w_egus));
-            RAD_ARCH_TRY(experts(y.dn_q, "down", 1, E, m.n_ffe, y.w_edn, y.w_edns));
-            /* An fp8 projection's op takes its weights in its table operands' order: even codes,
-             * even scales, odd codes, odd scales. */
+            RAD_ARCH_TRY(experts(y.fgu, "gate_up", 0, 2 * m.n_ffe, E, y.w_egu, y.w_egus));
+            RAD_ARCH_TRY(experts(y.fdn, "down", 1, E, m.n_ffe, y.w_edn, y.w_edns));
+            /* A quantised projection's op takes its weights in its table operands' order: even
+             * codes, even scales, odd codes, odd scales. */
             auto tables = [&](const std::vector<rad_weight>& wc, const std::vector<rad_weight>& ws) {
                 const size_t h = wc.size() / 2;
                 std::vector<rad_weight> t;
@@ -1124,8 +1204,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 y.op_emul   = binop("mul", P, K, m.b_ew, m.b_es, m.b_ew);
             }
             /* The experts' input, pre_feedforward_layernorm_2 of the stream. For a quantised
-             * gate_up it is normed and quantised in one pass (`rmsnorm_quant_fp8`, or for int8
-             * experts the rotating `rmsnorm_had_quant_i8g`) with no bf16 copy, since the table
+             * gate_up it is normed and quantised in one pass (`rmsnorm_quant_fp8`, or for the
+             * rotated experts (rotated int8, the computed trellis) the rotating
+             * `rmsnorm_had_quant_i8g`) with no bf16 copy, since the table
              * GEMM reads only codes and scales. */
             if (y.gu_q) {
                 y.op_enorm = RAD_OP(b, m.exp_i8 ? "rmsnorm_had_quant_i8g" : "rmsnorm_quant_fp8",
@@ -1315,7 +1396,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the weights the 31B's w4a8 container quantises (gemma4_bf16: blk.N.attn_qkv, attn_o,
      * ffn_gate_up, ffn_down), which a GPTQ recipe reads with calib=DIR: the Hessians of the bf16
      * model, whose activations a quantised container's own tap would see through its quantisers.
-     * The routed arm is not tapped. */
+     * On a MoE the routed arm is tapped too: the pooled expert stream under
+     * blk.N.ffn_gate_up_exps and the experts' gated product (this rank's columns) under
+     * blk.N.ffn_down_exps.part -- the names libquant's calib_stem resolves an expert's weights
+     * to. */
     if (calib_dir()) {
         m.overlap = false;
         m.arms = false;
@@ -1330,6 +1414,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                          y.full ? m.b_attf : m.b_atts, k.q()));
             RAD_ARCH_TRY(y.tap_gu.declare(b, nm, T, nm.f("blk.%d.ffn_gate_up", i), m.b_h, E));
             RAD_ARCH_TRY(y.tap_dn.declare(b, nm, T, nm.f("blk.%d.ffn_down", i), m.b_act, m.n_ff));
+            if (m.moe) {
+                /* gate/up reads b_hx, one row per token, whole on every rank: its pooled gram is
+                 * the Hessian every expert's gate/up sees, the routing only reweighting it (the
+                 * same pooled source the qwen4exp recipes state). A layer whose gate/up is
+                 * quantised reads the codes instead; calibration serves the bf16 model, where
+                 * b_hx is written, so a quantised graph simply carries no gate/up tap. */
+                if (m.b_hx && !y.gu_q)
+                    RAD_ARCH_TRY(y.tap_egu.declare(b, nm, T, nm.f("blk.%d.ffn_gate_up_exps", i),
+                                                   m.b_hx, E));
+                RAD_ARCH_TRY(y.tap_edn.declare(b, nm, m.moe_rows * m.top_k,
+                                               nm.f("blk.%d.ffn_down_exps", i),
+                                               m.b_eact, m.n_ffe));
+            }
         }
         m.calib = true;
         m.tap_live = true;
@@ -1419,7 +1516,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.moe) {
         auto how = [&](int n_fp8) {
             return n_fp8 == 0 ? "bf16" : n_fp8 < m.n_layer ? "mixed"
-                 : m.exp_i8 ? "rotated int8" : "block fp8";
+                 : m.exp_i8 ? "rotated int8 or the computed trellis" : "block fp8";
         };
         rad_note(b, "routed arm: %lld local experts from %lld of %lld, top %lld, %lld wide; "
                     "gate_up %s (%d of %lld layers quantised), down %s (%d quantised); passes of "
@@ -1518,8 +1615,10 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         else
             RAD_ISSUE_N(c, y.op_egu, n, brow_slice(m.b_hx, r0, n, E), RAD_WTAB(y.w_egu[0], NL),
                         brows(m.b_sorted, n * K), brows(m.b_eoff, NL + 1), brows(m.b_egu, n * K));
+        y.tap_egu.step_rows(c, m.b_hx, r0, n, E, m.tap_live);
         RAD_ISSUE_N(c, y.op_eact, n * K, bcol(m.b_egu, 0, m.n_ffe, n * K),
                     bcol(m.b_egu, m.n_ffe, m.n_ffe, n * K), brows(m.b_eact, n * K));
+        y.tap_edn.step_rows(c, m.b_eact, 0, n * K, m.n_ffe, m.tap_live);
         if (y.dn_q) {
             RAD_ISSUE_N(c, y.op_eq, n * K, brows(m.b_eact, n * K), brows(m.b_eq, n * K),
                         brows(m.b_eqs, n * K));
@@ -1844,11 +1943,22 @@ static void calib_count(RadCtx* c, Model& m, int64_t T) {
             ok = calib_write(c, y.tap_in.h, y.tap_in.K, m.calib_rows, stem, 0) && ok;
             std::snprintf(stem, sizeof stem, "blk.%d.ffn_gate_up", (int)l);
             ok = calib_write(c, y.tap_gu.h, y.tap_gu.K, m.calib_rows, stem, 0) && ok;
+            if (y.tap_egu.op) {
+                /* The pooled expert stream: whole on every rank (the router is replicated and
+                 * gate/up reads whole rows), so rank 0 writes it under the name the experts'
+                 * pooled Hessian is read from (calib_stem strips the expert index). */
+                std::snprintf(stem, sizeof stem, "blk.%d.ffn_gate_up_exps", (int)l);
+                ok = calib_write(c, y.tap_egu.h, y.tap_egu.K, m.calib_rows, stem, 0) && ok;
+            }
         }
         std::snprintf(stem, sizeof stem, "blk.%d.attn_o.part", (int)l);
         ok = calib_write(c, y.tap_o.h, y.tap_o.K, m.calib_rows, stem, 0) && ok;
         std::snprintf(stem, sizeof stem, "blk.%d.ffn_down.part", (int)l);
         ok = calib_write(c, y.tap_dn.h, y.tap_dn.K, m.calib_rows, stem, 0) && ok;
+        if (y.tap_edn.op) {
+            std::snprintf(stem, sizeof stem, "blk.%d.ffn_down_exps.part", (int)l);
+            ok = calib_write(c, y.tap_edn.h, y.tap_edn.K, m.calib_rows, stem, 0) && ok;
+        }
     }
     m.tap_live = false;
     std::fprintf(stderr, "radiance: gemma4: rank %d wrote the Hessians of layers %lld:%lld after "
