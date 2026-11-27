@@ -7981,6 +7981,120 @@ TEST(gemma4_serves_rotated_int8_experts_from_the_join_or_the_rotating_norm) {
     }
 }
 
+/* The computed trellis beside it: uN codes with the trellis's constants in a trellis.mad plane
+ * and one f32 scale a row times one a 128 of K for all rows, rotated fwht128 -- an IQR weight.
+ * The codes' view is declared at the stored width, the scale's at the weight's extents; the
+ * GEMM is the rotated family's i8a8h. One layer's experts take one encoding and, for the
+ * trellis, one code width -- the views are declared at the first's. The 704-wide test experts
+ * take no quantised down (K must be whole 128-blocks), so that half rides a padded meta. */
+TEST(gemma4_serves_rotated_trellis_experts_at_their_stored_width) {
+    RadEncoding tq{};
+    rad_enc_clear(&tq);
+    rad_enc_copy_str(tq.scheme, "trellis");
+    rad_enc_add_plane(&tq, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&tq, "scale", RAD_F32, 1, 0);
+    const int tt = rad_enc_add_table(&tq, "trellis", RAD_I8, 1 << 16, 1);
+    tq.plane[tt].block[0] = 128;
+    rad_enc_add_table(&tq, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&tq, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(tq.transform, "fwht128");
+    REQUIRE(rad_enc_valid(&tq));
+
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", tq } };
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+    CHECK(noted(b, "gate_up rotated int8 or the computed trellis"));
+    int gu = 0;
+    for (const auto& o : b.ops) {
+        if (o.op != "moe_gemm_q") continue;
+        CHECK_EQ(pstr(&o, "dtype"), std::string("i8a8h"));
+        CHECK_EQ(pint(&o, "K"), 2816);
+        ++gu;
+    }
+    CHECK_EQ(gu, 6);
+    int codes = 0, scales = 0;
+    for (const RecWeight& w : b.weights) {
+        if (!w.d.planes) continue;
+        if (std::string(w.d.planes) == "codes,trellis,trellis.mad") {
+            CHECK(w.name.find("_exps.") != std::string::npos);
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U4);   /* the stored width, not a promoted one */
+            ++codes;
+        } else if (std::string(w.d.planes) == "scale,scale.col") {
+            CHECK(w.name.size() > 6 && w.name.compare(w.name.size() - 6, 6, ".scale") == 0);
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F32);
+            ++scales;
+        }
+    }
+    CHECK_EQ(codes, 6 * 128);   /* one view per expert per quantised projection per layer */
+    CHECK_EQ(scales, codes);
+
+    RadBatch batch = decode_batch();
+    RadCtx c{ .b = &b, .batch = &batch };
+    gemma4::step(&c, &batch);
+    CHECK_LINT(b, &c);
+    CHECK(c.step_fail.empty());
+    std::map<std::string, int> issued;
+    for (const auto& n : issued_ops(b, c)) ++issued[n];
+    CHECK_EQ(issued["moe_gemm_q"], 6);
+    CHECK_EQ(issued["rmsnorm_quant_fp8"], 0);
+    CHECK_EQ(issued["quant_act_fp8"], 0);
+
+    /* Both arms trellis, on experts padded to 768: the down gemm reads K in whole scale
+     * blocks, so the padded checkpoint is the only place that shape exists. */
+    {
+        std::vector<const char*> vals(k_g4moe_vals, k_g4moe_vals + sizeof(k_g4moe_vals) /
+                                                       sizeof(k_g4moe_vals[0]));
+        vals.back() = "768";
+        RadModelMeta padded = gemma4_moe_meta();
+        padded.kv_val = vals.data();
+        RadBuilder pb;
+        pb.encs = { { "ffn_gate_up_exps", tq }, { "ffn_down_exps", tq } };
+        RadBuildCtx pctx = build_ctx();
+        CHECK_OK(gemma4::declare(&pb, &padded, &pctx));
+        int dn = 0;
+        for (const auto& o : pb.ops)
+            if (o.op == "moe_gemm_q" && pint(&o, "K") == 768) {
+                CHECK_EQ(pstr(&o, "dtype"), std::string("i8a8h"));
+                ++dn;
+            }
+        CHECK_EQ(dn, 6);
+        RadBatch pbatch = decode_batch();
+        RadCtx pc{ .b = &pb, .batch = &pbatch };
+        gemma4::step(&pc, &pbatch);
+        CHECK_LINT(pb, &pc);
+        CHECK(pc.step_fail.empty());
+        std::map<std::string, int> pissued;
+        for (const auto& n : issued_ops(pb, pc)) ++pissued[n];
+        CHECK_EQ(pissued["moe_gemm_q"], 12);
+        CHECK_EQ(pissued["had_quant_act_i8g"], 6);   /* the gated product, i8 not fp8 */
+        CHECK_EQ(pissued["quant_act_fp8"], 0);
+    }
+
+    /* One layer's trellis experts take one code width -- expert 1 read at u5 would declare
+     * views the shared GEMM's tables cannot hold -- and one encoding, so a rotated-int8
+     * expert among the trellis ones is refused too. */
+    {
+        RadEncoding tq5 = tq;
+        tq5.plane[0].dtype = RAD_U5;
+        RadBuilder wb;
+        wb.encs = { { "blk.0.ffn_gate_up_exps.1.weight", tq5 }, { "ffn_gate_up_exps", tq } };
+        RadModelMeta wmeta = gemma4_moe_meta();
+        RadBuildCtx  wctx  = build_ctx();
+        CHECK_EQ(stderr_of_rc([&] { return gemma4::declare(&wb, &wmeta, &wctx); }), RAD_E_DTYPE);
+    }
+    {
+        RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+        rad_enc_copy_str(r8.transform, "fwht128");
+        RadBuilder mb;
+        mb.encs = { { "blk.0.ffn_gate_up_exps.2.weight", r8 }, { "ffn_gate_up_exps", tq } };
+        RadModelMeta mmeta = gemma4_moe_meta();
+        RadBuildCtx  mctx  = build_ctx();
+        CHECK_EQ(stderr_of_rc([&] { return gemma4::declare(&mb, &mmeta, &mctx); }), RAD_E_DTYPE);
+    }
+}
+
 /* On a layer whose gate_up is block fp8 the attention join (norm_add_norm_route) also writes the
  * routed arm's inputs: the router's norm into moe_rn and the experts' codes into moe_hq / moe_hqs,
  * so neither the router's rmsnorm nor rmsnorm_quant_fp8 is issued. Refused: norm_add_norm plus
