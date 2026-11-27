@@ -193,13 +193,14 @@ ARG JOBS=
 # The prefix is fixed at configure time because the default $RADIANCE_HOME is compiled in as
 # <prefix>/share/radiance; DESTDIR stages the tree without moving that default.
 # oom_score_adj 1000: on a host that is also serving, the OOM killer takes the compiler first.
-# ccache: git archive stamps every file with the commit time, so ninja alone rebuilds everything.
-# The rebuilt libLLVM is part of the key, so a VOPD or ROCm change starts clean.
+# ccache: /build starts empty in every build (any source change re-runs this layer), so only a
+# content-keyed cache keeps the compiles. The rebuilt libLLVM is part of the key, so a VOPD or ROCm
+# change starts clean.
 RUN --mount=type=cache,id=radiance-ccache,target=/ccache \
     echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     export CCACHE_DIR=/ccache CCACHE_MAXSIZE=30G CCACHE_DEPEND=1 \
       CCACHE_EXTRAFILES=/opt/rocm-repeatable/lib/llvm/lib/$(basename $(readlink -f /opt/rocm/lib/llvm/lib/libLLVM.so)); \
-    test -f "$CCACHE_EXTRAFILES" && ccache -z > /dev/null \
+    ccache -z > /dev/null \
  && cmake -S . -B /build -G Ninja \
       -DCMAKE_INSTALL_PREFIX=/opt/radiance \
       -DRAD_WITH_HIP=ON -DRAD_WITH_FFMPEG=ON \
@@ -242,10 +243,8 @@ ARG TEST_EXCLUDE=
 # package) repeats this stage's whole compile, so it runs from the development tree instead
 # (tests/oot_plugins.sh). The `parity` entry (halo_parity: libhalo's tables against libr4d's) is
 # left out until libhalo has ported the ops libr4d added after it (the test names each one).
-# llvm-check.sh wants the plain clang++ command line.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
-    cmake -DCMAKE_HIP_COMPILER_LAUNCHER= /build > /dev/null \
- && bash /src/docker/llvm-check.sh /build \
+    bash /src/docker/llvm-check.sh /build \
  && RAD_TEST_CPU_BUDGET_SCALE="${TEST_CPU_BUDGET_SCALE}" \
     ctest --test-dir /build -LE 'gpu|oot|parity' ${TEST_EXCLUDE:+-E "${TEST_EXCLUDE}"} \
       -j"${TEST_JOBS:-${JOBS:-$(( ($(nproc) + 1) / 2 ))}}" --output-on-failure \
