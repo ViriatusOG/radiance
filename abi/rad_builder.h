@@ -1927,7 +1927,10 @@ typedef struct RadChatFormat {
 
     /* Non-zero: a reasoning block may open again later in the reply (after its answer, between
      * calls) and is read as reasoning there too, and a reasoning_close with no block open is not
-     * part of the answer. Zero: only a block the reply starts with is reasoning. */
+     * part of the answer. Such a close is the model straying (Gemma 4's lone close): the reply is
+     * read as having left the format, and the server logs it. A format whose answer message ends
+     * with that same literal declares it as content_close, which keeps the answer's own close in
+     * the format. Zero: only a block the reply starts with is reasoning. */
     uint32_t    reasoning_anywhere;
 
     /* Tagged arguments whose tag says the value's type: written in place of arg_value_prefix,

@@ -102,8 +102,10 @@ struct ChatFormat {
     std::vector<std::string> reasoning_breaks;
     ChatThink   reasoning_in_prompt = ChatThink::FromPrompt;
     /* A block may also open later in the reply (after the answer, between calls) and is read as
-     * reasoning there; a close with no block open is dropped. Gemma 4 sometimes writes an empty
-     * block after its answer, or a lone close. Needs `reasoning_open`. */
+     * reasoning there; a close with no block open is dropped, and the reply is read as having
+     * left the format (ReplyStream::strict). Gemma 4 sometimes writes an empty block after its
+     * answer, or a lone close. An answer that closes with the same literal declares it as
+     * `content_close`, so its own close stays in the format. Needs `reasoning_open`. */
     bool        reasoning_anywhere = false;
     /* A header the model writes first when it answers without reasoning; dropped when the reply
      * starts with it. Empty: none. */
