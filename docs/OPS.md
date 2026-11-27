@@ -2096,8 +2096,8 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   group; libref leaves it untouched). A kernel may take several launches but must be deterministic,
   a fixed reduction order with no float atomics. `y` may be the same memory as `x`. `w` and `b`
   `[n]`, bf16 or f32. MiniMax-H3: `n` 512, `groups` 32, `eps` 1e-5; SDXL's UNet 320 to 2560
-  channels in 32 groups (10 to 80 a group), its VAE 128 to 512. libr4d serves `n` a multiple of 8
-  up to 8192 with an even group width.
+  channels in 32 groups (10 to 80 a group), its VAE 128 to 512, and MOSS-Image's decoder 96 in
+  32 groups (3 a group). libr4d serves `n` a multiple of 8 up to 8192 at any group width.
 - `tconv_dw`: a depthwise convolution along the frames (a Conv3d of kernel `(k, 1, 1)`, one group a
   channel): `geom = (T, H, W)`, `P = H W` rows a frame, `w` PyTorch's `[n, 1, k, 1, 1]` (tap `j` of
   channel `c` at `c k + j`), `b [n]`, `k` odd:

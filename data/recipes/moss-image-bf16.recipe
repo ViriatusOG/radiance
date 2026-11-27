@@ -1,0 +1,15 @@
+# moss-image-bf16.recipe -- MOSS-Image served at the checkpoint's precision.
+#
+#   rad-convert <MOSS-Image pipeline directory> --arch mossimage \
+#       --recipe data/recipes/moss-image-bf16.recipe -o moss-image-bf16.rad \
+#       --tokenizer <dir>/tokenizer/tokenizer.json --chat-template <dir>/tokenizer/chat_template.jinja
+#
+# The DiT and the Qwen3.5 trunk ship bf16 and are kept, as is the unused vision tower. The VAE
+# ships f32, which the plugin reads as bf16 (the precision diffusers decodes it at) -- so the cast
+# is done here, once. `vae.*` covers the decoder the plugin runs and the encoder it carries.
+#
+# `--arch mossimage` is needed: model_index.json's `_class_name` is MOSSImagePipeline, which is
+# the id, but the pipeline also names a text encoder and a VAE whose folders rad-convert would
+# otherwise read as a known model's.
+
+vae.*                                cast dtype=bf16

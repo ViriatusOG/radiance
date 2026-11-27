@@ -1,0 +1,27 @@
+# moss-image-bf16dit.recipe -- MOSS-Image with IQ8R linears on the trunk and the DiT left bf16.
+#
+#   rad-convert <MOSS-Image pipeline directory> --arch mossimage \
+#       --recipe data/recipes/moss-image-bf16dit.recipe -o moss-image-bf16dit.rad \
+#       --tokenizer <dir>/tokenizer/tokenizer.json --chat-template <dir>/tokenizer/chat_template.jinja
+#
+# The container to serve with runtime LoRA adapters (--lora, --lora-dir). Adapter files for
+# MOSS-Image target the DiT's 42 blocks (`layers.N.proj.q/k/v/o/ffn_up_gate/ffn_down`), and an
+# adapter's delta follows a plain GEMM only: a rotated int8 linear is fed a rotated activation, so
+# under moss-image-iq8r.recipe every request naming an adapter is refused. Here the DiT keeps the
+# checkpoint's bf16 and its linears run `gemm_nt`.
+#
+# The Qwen3.5 trunk is quantised exactly as moss-image-iq8r.recipe quantises it (the adapters'
+# trainers keep the text encoder frozen, so nothing targets it): rotated int8, codes in -127..127
+# in the 128-wide Hadamard domain with a u8 scale per [1 x 256] of K under a bf16 scale a row. Its
+# delta nets (in, z and out projections, convolution and norm), the embedding table, the vision
+# tower, the DiT's text refiner and the VAE are bf16 in both recipes.
+
+# ---- the trunk: the 8 full-attention layers' four projections and all 32 layers' MLPs
+te.blk.*.attn_qg.weight              rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_k.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_v.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_output.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_gate_up.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_down.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+
+vae.*                                cast dtype=bf16

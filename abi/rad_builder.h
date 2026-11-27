@@ -1044,8 +1044,8 @@ typedef struct RadGeneratorDecl {
 
     /* The sampler: flow matching, Euler steps from sigma 1 towards 0.
      *   A fixed schedule: `n_sigmas` values, the terminal 0 implied; a request may not change the
-     *   step count. Otherwise `default_steps` sigmas from 1 to 1/steps (or off `sigma_grid`'s
-     *   table), shifted:
+     *   step count. Otherwise `default_steps` sigmas from 1 to 1/steps (or to `sigma_lower`, or
+     *   off `sigma_grid`'s table), shifted:
      *     dyn_shift 0   sigma' = shift * s / (1 + (shift - 1) * s)
      *     dyn_shift 1   mu linear in the image's token count, 256 -> base_shift .. max_seq ->
      *                   max_shift; shift_exp 1: exp(mu) / (exp(mu) + (1/s - 1)), 0: mu / (mu + ...)
@@ -1134,6 +1134,13 @@ typedef struct RadGeneratorDecl {
     /* The RAD_GEN_COND_* options (rad_runtime.h) the plugin's COND pass serves, as a mask; a
      * request asking for another is refused. 0: none. */
     uint32_t    cond_opts;
+
+    /* ---- appended in ABI 45 (MOSS-Image's schedule) */
+    /* A flow-matching schedule whose unshifted linspace ends at `sigma_lower` instead of 1/steps
+     * (0: diffusers' default) -- MOSSImageScheduler's table, which ends at
+     * shift/(train_steps + shift - 1), so the last sigma is the same for every step count.
+     * Read only by the linspace path: ignored with `n_sigmas`, `sigma_grid` and a fixed `sigmas`. */
+    double      sigma_lower;
 } RadGeneratorDecl;
 
 /* RadGeneratorDecl::beta_schedule: betas linear in sqrt(beta) (Stable Diffusion's

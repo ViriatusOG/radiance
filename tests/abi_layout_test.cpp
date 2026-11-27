@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 44 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 44, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 45 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 45, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -251,6 +251,12 @@ TEST(the_reference_fields_are_appended_past_the_generator_batchs_end) {
     CHECK_EQ(offsetof(RadGenBatch, ref_log_bias), (size_t)408);
     CHECK_EQ(offsetof(RadGenBatch, mode_sigma), (size_t)416);
     CHECK_EQ(sizeof(RadGenBatch), (size_t)424);
+}
+
+/* ABI 45: a schedule's own lower bound sits past the generator declaration's old end. */
+TEST(the_schedule_lower_bound_is_appended_past_the_generator_declarations_end) {
+    CHECK_EQ(offsetof(RadGeneratorDecl, sigma_lower), (size_t)376);
+    CHECK_EQ(sizeof(RadGeneratorDecl), (size_t)384);
 }
 
 RAD_TEST_MAIN()

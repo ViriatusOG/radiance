@@ -51,7 +51,8 @@ __device__ __forceinline__ void st8(float* p, const float* f) {
     *(float4*)p = make_float4(f[0], f[1], f[2], f[3]);
     *(float4*)(p + 4) = make_float4(f[4], f[5], f[6], f[7]);
 }
-// Four- and two-channel forms of the above, and a chunk of CW (8, 4 or 2) channels through them.
+// Four- and two-channel forms of the above, and the scalar one a group of an odd width needs, and
+// a chunk of CW (8, 4, 2 or 1) channels through them.
 __device__ __forceinline__ void ld4(const uint16_t* p, float* f) {
     const uint2 u = *(const uint2*)p;
     f[0] = bf16w_lo(u.x); f[1] = bf16w_hi(u.x); f[2] = bf16w_lo(u.y); f[3] = bf16w_hi(u.y);
@@ -80,15 +81,21 @@ __device__ __forceinline__ void st2(uint16_t* p, const float* f) {
 __device__ __forceinline__ void st2(float* p, const float* f) {
     *(float2*)p = make_float2(f[0], f[1]);
 }
+__device__ __forceinline__ void ld1(const uint16_t* p, float* f) { f[0] = bf2f(p[0]); }
+__device__ __forceinline__ void ld1(const float* p, float* f) { f[0] = p[0]; }
+__device__ __forceinline__ void st1(uint16_t* p, const float* f) { p[0] = f32_to_bf16(f[0]); }
+__device__ __forceinline__ void st1(float* p, const float* f) { p[0] = f[0]; }
 template <int CW, typename T> __device__ __forceinline__ void ldc(const T* p, float* f) {
     if constexpr (CW == 8) ld8(p, f);
     else if constexpr (CW == 4) ld4(p, f);
-    else ld2(p, f);
+    else if constexpr (CW == 2) ld2(p, f);
+    else ld1(p, f);
 }
 template <int CW, typename T> __device__ __forceinline__ void stc(T* p, const float* f) {
     if constexpr (CW == 8) st8(p, f);
     else if constexpr (CW == 4) st4(p, f);
-    else st2(p, f);
+    else if constexpr (CW == 2) st2(p, f);
+    else st1(p, f);
 }
 // CW per-channel values of an f32 or bf16 vector, its dtype known only at run time.
 template <int CW> __device__ __forceinline__ void ldcw(const void* p, bool f32, int c, float* f) {
@@ -490,8 +497,8 @@ __device__ __forceinline__ void chan_merge(float& n, float& mean, float& m2, flo
     n = nab;
 }
 
-/* A chunk is CW channels (8, 4 or 2: the widest dividing a group). `tpr` threads a row, each over
- * `cpt` chunks; `tpg` threads a group (its chunks / cpt). */
+/* A chunk is CW channels (8, 4, 2 or, for an odd group, 1: the widest dividing a group). `tpr`
+ * threads a row, each over `cpt` chunks; `tpg` threads a group (its chunks / cpt). */
 template <typename TX, int CW>
 __global__ __launch_bounds__(kT) void gn_part_kernel(const TX* __restrict__ x,
                                                      float* __restrict__ stats, int M, int groups,
@@ -920,14 +927,15 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
         if (!std::strcmp(act, "silu")) silu = 1;
         else if (std::strcmp(act, "none")) return R4D_NO(RAD_E_INVAL);
     }
-    /* A chunk is CW channels inside one group: 8, 4 or 2, the widest dividing the group (the
-     * FLUX.2 VAE's 128 channels in 32 groups take 4, SDXL's 320 in 32 take 2). A row's chunks are
-     * split over at most 256 threads, each taking `cpt` consecutive chunks of one group, `cpt`
-     * the smallest divisor of the group's chunks that fits the row in the block. */
-    if (groups <= 0 || groups > kT || n <= 0 || n % groups || (n / groups) % 2)
+    /* A chunk is CW channels inside one group: 8, 4, 2 or 1, the widest dividing the group (the
+     * FLUX.2 VAE's 128 channels in 32 groups take 4, SDXL's 320 in 32 take 2, and MOSS-Image's
+     * decoder, 96 channels in 32 groups, an odd group of 3 takes 1). A row's chunks are split
+     * over at most 256 threads, each taking `cpt` consecutive chunks of one group, `cpt` the
+     * smallest divisor of the group's chunks that fits the row in the block. */
+    if (groups <= 0 || groups > kT || n <= 0 || n % groups)
         return R4D_NO(RAD_E_SHAPE);
     const long long cg = n / groups;
-    const int CW = cg % 8 == 0 ? 8 : cg % 4 == 0 ? 4 : 2;
+    const int CW = cg % 8 == 0 ? 8 : cg % 4 == 0 ? 4 : cg % 2 == 0 ? 2 : 1;
     const int cpr = (int)(n / CW), gs8 = (int)(cg / CW);
     int cpt = 1;
     while (cpr / cpt > kT || gs8 % cpt) ++cpt;
@@ -959,11 +967,13 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
     if (is_f32(x)) {
         if (CW == 8)      GN_P(float, 8);
         else if (CW == 4) GN_P(float, 4);
-        else              GN_P(float, 2);
+        else if (CW == 2) GN_P(float, 2);
+        else              GN_P(float, 1);
     } else {
         if (CW == 8)      GN_P(uint16_t, 8);
         else if (CW == 4) GN_P(uint16_t, 4);
-        else              GN_P(uint16_t, 2);
+        else if (CW == 2) GN_P(uint16_t, 2);
+        else              GN_P(uint16_t, 1);
     }
 #undef GN_P
     if (rc != RAD_OK) return R4D_NO(rc);
@@ -978,7 +988,10 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
                     (int)n, cpr, gs8, (int)ldx, (int)ldy, (int)is_f32(w), (int)is_f32(b),         \
                     modk, silu)
 #define GN_A(TX, TY)                                                                              \
-    do { if (CW == 8) GN_A2(TX, TY, 8); if (CW == 4) GN_A2(TX, TY, 4); GN_A2(TX, TY, 2); } while (0)
+    do { if (CW == 8) GN_A2(TX, TY, 8);                                                           \
+         else if (CW == 4) GN_A2(TX, TY, 4);                                                      \
+         else if (CW == 2) GN_A2(TX, TY, 2);                                                      \
+         else GN_A2(TX, TY, 1); } while (0)
     if (is_f32(x)) {
         if (is_f32(y)) GN_A(float, float);
         GN_A(float, uint16_t);
