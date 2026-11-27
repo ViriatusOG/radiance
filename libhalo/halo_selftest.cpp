@@ -9934,6 +9934,49 @@ void rope_llama3_case(const Plugin& pl) {
     ok("rope_bf16 refuses llama3 beside YaRN", rc2 == RAD_E_INVAL, "rc " + std::to_string(rc2));
 }
 
+/* rope's axial mode at Inkling 2's vision tower (head 64, 16 heads, q and k turned, sections 16 16)
+ * with its positions a [2, M] view of the tower's [2, P] per-pass buffer: row-contiguous, the
+ * component pitch P wider than M. It must turn the rows exactly as the same positions packed
+ * [2, M] do. */
+void rope_axial_pitched_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "rope_bf16");
+    if (!r) { ok("rope_bf16 axial pitched positions", false, "row absent"); return; }
+    const int64_t M = 1153, P = 16384, hd = 64, nh = 16, row = 3 * nh * hd;
+    std::vector<float> x = randv((size_t)(M * row), 1.0f);
+    std::vector<int32_t> packed((size_t)(2 * M)), wide((size_t)(2 * P), -7);
+    for (int64_t m = 0; m < M; ++m) {
+        const int32_t h = (int32_t)(m / 37 + 1), w = (int32_t)(m % 37 + 1);
+        packed[(size_t)m] = h; packed[(size_t)(M + m)] = w;
+        wide[(size_t)m] = h;   wide[(size_t)(P + m)] = w;
+    }
+    void* dq_packed = up_bf16(x);
+    void* dq_wide = up_bf16(x);
+    void* dp_packed = up_i32(packed);
+    void* dp_wide = up_i32(wide);
+    const std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head", nh),
+                                       PI("n_head_kv", nh), PI("rotary_dim", hd),
+                                       PF("theta", 10000.0), PF("scale", 1.0), PS("mode", "axial"),
+                                       PS("sections", "16 16") };
+    RadTensor pw = T(dp_wide, RAD_I32, { 2, M });
+    pw.stride[0] = P;
+    const int rc_p = launch(r, { T(dq_packed, RAD_BF16, { M, row }), T(dp_packed, RAD_I32, { 2, M }) }, ps);
+    const int rc_w = launch(r, { T(dq_wide, RAD_BF16, { M, row }), pw }, ps);
+    if (rc_p != RAD_OK || rc_w != RAD_OK) {
+        ok("rope_bf16 axial pitched positions", false,
+           fmt("rc packed %d, pitched %d", rc_p, rc_w));
+        return;
+    }
+    const std::vector<float> a = down_bf16(dq_packed, x.size()), b = down_bf16(dq_wide, x.size());
+    int64_t diff = 0, moved = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff += a[i] != b[i];
+        moved += a[i] != h_bf16(h_to_bf16(x[i]));
+    }
+    ok("rope_bf16 axial pitched positions", diff == 0 && moved > 0,
+       fmt("%lld of %zu values differ from the packed positions; %lld turned", (long long)diff,
+           a.size(), (long long)moved));
+}
+
 /* attn_dense causal over a fused [rows, 3 * nh * hd] row (a codec transformer's sliding layers,
  * an audio encoder's own-heads attention), with a window behind and without, one sequence or
  * two, against libref's mask. */
@@ -37136,6 +37179,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("quant_cols_fp8_bf16")) vsa::quant_cols_cases(pl);
     if (sel("attn_prefix_self_h128_bf16")) vsa::dense_cases(pl);
     if (sel("rope_bf16")) au::rope_llama3_case(pl);
+    if (sel("rope_bf16")) au::rope_axial_pitched_case(pl);
     if (sel("flow_euler_bf16")) cvdc::flow_euler_case(pl);
     if (sel("lane_gather_w32")) cvdc::lane_gather_case(pl);
     if (sel("lane_store_w32")) cvdc::lane_store_case(pl);
