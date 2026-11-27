@@ -368,8 +368,8 @@ int Mp4Writer::finish(std::string* out, std::string* why) {
         return RAD_E_STATE;
     }
     if (p.ac) {
-        /* The soundtrack in the encoder's frames, deinterleaved; the last frame padded with
-         * silence, which the encoder's own length bookkeeping trims. */
+        /* The soundtrack in the encoder's frames, deinterleaved; the last frame carries only the
+         * remaining samples. */
         const int64_t total = (int64_t)p.audio.size() / p.channels;
         const int fs = p.af->nb_samples;
         for (int64_t at = 0; at < total; at += fs) {

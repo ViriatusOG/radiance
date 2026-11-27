@@ -140,8 +140,8 @@ AVX_KERNEL(sample_penalties) {
 /* ------------------------------------------------------------------ sample_dry */
 /* DRY ("don't repeat yourself"), as in libref (ref_sample.cpp) and llama.cpp: each token that
  * would extend a previously seen suffix of the window is penalised once, by
- * multiplier * base^(L - allowed_length) for the longest repeat L it extends, with repeats capped at
- * the row's `dry_rep_limit`. Positions marked in the optional `breakers` plane hold sequence
+ * multiplier * base^(L - allowed_length) for the longest repeat L it extends, with repeats capped
+ * at the row's `dry_rep_limit`. Positions marked in the optional `breakers` plane hold sequence
  * breakers and are never penalised. The penalty is built by repeated multiplication that stops
  * short of overflow, as other implementations do, so results agree to the bit.
  *
@@ -719,7 +719,8 @@ AVX_KERNEL(sample_logprobs) {
                 s2 = vf_add(s2, vf_exp(vf_sub(vf_loadu(v + i + 2 * VF_N), vmx)));
                 s3 = vf_add(s3, vf_exp(vf_sub(vf_loadu(v + i + 3 * VF_N), vmx)));
             }
-            for (; i + VF_N <= n_vocab; i += VF_N) s0 = vf_add(s0, vf_exp(vf_sub(vf_loadu(v + i), vmx)));
+            for (; i + VF_N <= n_vocab; i += VF_N)
+                s0 = vf_add(s0, vf_exp(vf_sub(vf_loadu(v + i), vmx)));
             sum = vf_hsum(vf_add(vf_add(s0, s1), vf_add(s2, s3)));
             for (; i < n_vocab; ++i) sum += sc_exp(v[i] - mx);
         }
@@ -930,8 +931,8 @@ AVX_KERNEL(dflash_select) {
  * DSpark's walk over the whole vocabulary (libref ref_quant.cpp, ref_markov_greedy): at each step
  * every token scores its draft logit plus sum_r pred[pid][r] * succ[token][r], the greatest wins
  * (ties to the lower id) and becomes the next predecessor. The winners of each 64-token tile are
- * written too, as the device row's decomposition. Scalar and in libref's order (the bf16 form starts
- * the sum at the logit, the f32 form adds it last), so the argmax ties the same way. */
+ * written too, as the device row's decomposition. Scalar and in libref's order (the bf16 form
+ * starts the sum at the logit, the f32 form adds it last), so the argmax ties the same way. */
 static int markov_greedy(const RadArgs* a, uint32_t logits_dtype) {
     if (a->n_t < 7) return RAD_E_INVAL;
     const RadTensor *logits = &a->t[0], *anc = &a->t[1], *pred = &a->t[2], *succ = &a->t[3];

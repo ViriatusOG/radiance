@@ -200,4 +200,165 @@ TEST(h3_a_song_guide_keyframe_reads_its_own_soundtrack_slot) {
     CHECK(!ref_pack_of(&g, tab.data(), &p, false));
 }
 
+TEST(h3_sparse_capacity_covers_packed_video_and_prefix_padding) {
+    using namespace minimaxh3;
+    CHECK_EQ(vsa_prefix_tiles(INT64_MAX), INT64_MAX / kVsaRows + 1);
+    const int64_t area = 864 * 480, budget = 32768;
+    int64_t tiles = 0, keep = 0;
+    vsa_bounds(0.9, area, budget, &tiles, &keep);
+    REQUIRE(tiles > 0 && tiles <= kVsaTileLimit);
+    REQUIRE(keep > 0 && keep <= tiles);
+    for (int64_t width = kMult; width * width <= kMaxAspect * area; width += kMult)
+        for (int64_t height = kMult; height * height <= kMaxAspect * area && height * width <= area; height += kMult)
+            for (int64_t chunks = kMinChunks; chunks <= kMaxChunks; ++chunks) {
+                const int64_t frames = max_lat_frames(chunks);
+                const int64_t rows = frames * (height / kMult) * (width / kMult);
+                if (rows >= budget) continue;
+                const int64_t video = vsa_video_tiles(frames, height / kMult, width / kMult);
+                const int64_t prefix = vsa_prefix_tiles(budget - rows) + kVsaPrefixSegments;
+                if (prefix + video <= kVsaTileLimit) CHECK(prefix + video <= tiles);
+                CHECK(vsa_keep(0.9, video) <= keep);
+            }
+}
+
+TEST(h3_sparse_profiles_select_dense_prefixes_and_reject_invalid_cutoffs) {
+    for (bool gated : {false, true}) {
+        auto meta = h3_fixture();
+        meta.set("transformer.num_layers", "2")
+            .set("fastvideo_inference.attention_backend", "VIDEO_SPARSE_ATTN_H3")
+            .set("fastvideo_inference.vsa_sparsity", "0.9")
+            .set("fastvideo_inference.vsa_tile_size", "64")
+            .set("fastvideo_inference.vsa_gate_compress", gated ? "1" : "0")
+            .set("fastvideo_inference.vsa_dense_prefix_layers", gated ? "0" : "1")
+            .set("fastvideo_inference.vsa_min_tokens", gated ? "0" : "4096");
+        for (int world : {1, 2}) for (int rank = 0; rank < world; ++rank) {
+            RadBuilder builder;
+            h3_encodings(builder);
+            auto ctx = build_ctx(rank, world);
+            ctx.max_tok = 1000000;
+            REQUIRE_EQ(minimaxh3::declare(&builder, meta.meta(), &ctx), RAD_OK);
+            const auto& model = minimaxh3::g_model[rad_build_slot(&ctx)];
+            CHECK_EQ(model.vsa_gated, gated);
+            CHECK_EQ(model.dit[0].op_vsa != 0, gated);
+            CHECK(model.dit[1].op_vsa != 0);
+            CHECK_EQ(model.dit[0].op_attn != 0, !gated);
+            CHECK_EQ(model.dit[1].op_attn != 0, !gated);
+            const auto* qkv = named_buffer(builder, "dit.qkv");
+            REQUIRE(qkv);
+            CHECK_EQ(qkv->d.shape[1], (gated ? 4 : 3) * model.gd.q_dim());
+        }
+    }
+    for (const char* value : {"-1", "2"}) {
+        auto meta = h3_fixture();
+        meta.set("transformer.num_layers", "2")
+            .set("fastvideo_inference.attention_backend", "VIDEO_SPARSE_ATTN_H3")
+            .set("fastvideo_inference.vsa_gate_compress", "0")
+            .set("fastvideo_inference.vsa_dense_prefix_layers", value)
+            .set("fastvideo_inference.vsa_sparsity", "0.9")
+            .set("fastvideo_inference.vsa_tile_size", "64");
+        RadBuilder builder;
+        h3_encodings(builder);
+        auto ctx = build_ctx(); ctx.max_tok = 1000000;
+        CHECK_EQ(minimaxh3::declare(&builder, meta.meta(), &ctx), RAD_E_UNSUPPORTED);
+    }
+}
+
+namespace {
+struct DitStep {
+    std::vector<std::string> ops;          // the op of every issue, in order
+    std::vector<std::vector<bool>> none;   // for each issue, whether each operand is RAD_NONE
+    std::string failure;
+    size_t lint = 0;
+};
+// One VSTEP pass on a declared model, recorded: no references, no GPU. Returns the issued ops.
+DitStep issue_dit_step(RadBuilder& builder, int64_t n_text, int32_t n_audio) {
+    const int32_t lat_frames = 4, lat_h = 8, lat_w = 8;
+    const int64_t arows = minimaxh3::kAudioCh * n_audio;
+    const int64_t vrows = (int64_t)lat_frames * (lat_h / minimaxh3::kPatch) * (lat_w / minimaxh3::kPatch);
+    const int64_t rows = n_text + arows + vrows;
+    std::vector<int32_t> seg_cu = {0, (int32_t)n_text, (int32_t)(n_text + arows), (int32_t)rows};
+    std::vector<int32_t> lat_cu = {0, (int32_t)vrows, 0, (int32_t)(minimaxh3::kAudioCh * n_audio)};
+    std::vector<int32_t> geom_d(RAD_VGEOM_N, 0), one = {0, 1}, cu = {0, (int32_t)rows};
+    std::vector<float> sched(16, 0.5f), pos(3 * (size_t)rows, 0.f);
+    std::vector<uint32_t> seed = {1, 0, 2, 0};
+    RadVideoGenBatch v{};
+    v.lane = 0;
+    v.geom = {(int32_t)n_text, 17, lat_frames, lat_h, lat_w, n_audio};
+    v.geom_d = geom_d.data(); v.lane_d = one.data(); v.first_d = one.data() + 1;
+    v.seg_cu = seg_cu.data(); v.lat_cu = lat_cu.data();
+    v.step = 1; v.sched = sched.data(); v.pos = pos.data(); v.seed = seed.data();
+    v.mod_cu = seg_cu.data();
+    RadBatch batch{};
+    batch.gen = RAD_GEN_PASS_VSTEP;
+    batch.n_tok = rows; batch.n_seq = 1;
+    batch.cu_seqlens = cu.data();
+    batch.vgen_b = &v;
+    RadCtx run{};
+    run.b = &builder;
+    run.batch = &batch;
+    minimaxh3::step(&run, &batch);
+    DitStep out;
+    out.failure = run.step_fail;
+    for (const auto& issue : run.issues) {
+        out.ops.push_back(builder.op_of(issue.op)->op);
+        std::vector<bool> none;
+        for (const auto& operand : issue.opd) none.push_back(operand.kind == RAD_OPK_NONE);
+        out.none.push_back(none);
+    }
+    if (out.failure.empty()) out.lint = report_lint(lint_step(builder, {&run}));
+    return out;
+}
+int count_op(const DitStep& s, const char* op) {
+    int n = 0;
+    for (const auto& o : s.ops) n += o == op;
+    return n;
+}
+}
+
+// The recorder test the declare-only tests above lack: it issues a VSTEP on the recorded graph and
+// lints it, for the gated profile, the ungated one above vsa_min_tokens, the ungated one below it
+// (dense fallback on every layer) and the ungated one with a dense prefix layer.
+TEST(h3_sparse_profiles_issue_the_ops_each_profile_declares) {
+    struct Case { bool gated; const char* prefix; const char* min_tokens; int sparse_layers; int dense_layers; };
+    const Case cases[] = {
+        {true,  "0", "0",       2, 0},   // gated: every layer sparse
+        {false, "0", "1",       2, 0},   // ungated, step above vsa_min_tokens: every layer sparse
+        {false, "0", "1000000", 0, 2},   // ungated, step below it: dense fallback on every layer
+        {false, "1", "1",       1, 1},   // ungated, dense prefix layer 0, sparse layer 1
+        {false, "1", "1000000", 0, 2},   // dense prefix and below the cutoff: all dense
+    };
+    for (const Case& cs : cases) {
+        auto meta = h3_fixture();
+        meta.set("transformer.num_layers", "2")
+            .set("fastvideo_inference.attention_backend", "VIDEO_SPARSE_ATTN_H3")
+            .set("fastvideo_inference.vsa_sparsity", "0.9")
+            .set("fastvideo_inference.vsa_tile_size", "64")
+            .set("fastvideo_inference.vsa_gate_compress", cs.gated ? "1" : "0")
+            .set("fastvideo_inference.vsa_dense_prefix_layers", cs.prefix)
+            .set("fastvideo_inference.vsa_min_tokens", cs.min_tokens);
+        RadBuilder builder;
+        h3_encodings(builder);
+        auto ctx = build_ctx();
+        ctx.max_tok = 1000000;
+        REQUIRE_EQ(minimaxh3::declare(&builder, meta.meta(), &ctx), RAD_OK);
+        const DitStep s = issue_dit_step(builder, 100, 50);
+        CHECK(s.failure.empty());
+        CHECK_EQ(s.lint, (size_t)0);
+        CHECK_EQ(count_op(s, "attn_vsa"), cs.sparse_layers);
+        CHECK_EQ(count_op(s, "vsa_select"), cs.sparse_layers);
+        CHECK_EQ(count_op(s, "attn_dense") + count_op(s, "attn_prefix_self"), cs.dense_layers);
+        // The ungated sparse issues pass the pooled values, coarse buffer and gate as none; the gated
+        // form passes all three.
+        for (size_t i = 0; i < s.ops.size(); ++i) {
+            if (s.ops[i] == "vsa_select") {
+                CHECK_EQ(s.none[i][2], !cs.gated);   // pooled values
+                CHECK_EQ(s.none[i][6], !cs.gated);   // coarse
+            } else if (s.ops[i] == "attn_vsa") {
+                CHECK_EQ(s.none[i][6], !cs.gated);   // coarse
+                CHECK_EQ(s.none[i][7], !cs.gated);   // gate
+            }
+        }
+    }
+}
+
 RAD_TEST_MAIN()

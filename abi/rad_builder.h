@@ -291,6 +291,26 @@ typedef struct RadBuildCtx {
      * max_tok rows. 0, the zero-initialised default, keeps the interval-tall passes. A plugin
      * without such a pass ignores it. */
     int      span_pass_step;
+    /* ---- appended in ABI 44 (prompt-lookup head-off, expert split, DSpark walk) */
+    /* Nonzero from --spec-ngram: the deployment drafts by prompt lookup only, in the core, and
+     * verifies up to `max_spec` drafts a step. The plugin declares no draft head, so a head the
+     * container carries stays off the card, but sizes every verify buffer, state ring and kernel
+     * band for `max_spec` as at any speculative serve. rad_ctx_draft_head() below is the test.
+     * The engine refuses to start when a head is declared anyway, rather than load one it was
+     * told to leave out.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      draft_head_off;
+    /* --expert-split: the routed experts a layer each rank holds, comma-separated counts in rank
+     * order ("104,88,104,88"), for a plugin that gives each rank whole experts
+     * (arch/common/rad_expert_split.h). Null or empty: the even split. A plugin without expert
+     * parallelism ignores it. */
+    const char* expert_split;
+    /* --dspark-walk: nonzero asks a DSpark drafter to walk its Markov tables over the whole
+     * vocabulary, as the reference implementation does, instead of re-ranking the head's top
+     * candidates. The trunk verifies every draft, so the output does not depend on it. 0, the
+     * zero-initialised default, keeps the re-rank. */
+    int      dspark_walk;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
@@ -298,6 +318,12 @@ typedef struct RadBuildCtx {
 
 /* The declaring instance's slot (see RadBuildCtx::slot_base). */
 static inline int rad_build_slot(const RadBuildCtx* c) { return c->slot_base + c->rank; }
+
+/* Whether a declare should include the container's draft head: the deployment speculates and
+ * does not draft by prompt lookup alone. */
+static inline int rad_ctx_draft_head(const RadBuildCtx* ctx) {
+    return ctx && ctx->max_spec > 0 && !ctx->draft_head_off;
+}
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
@@ -471,7 +497,7 @@ enum {
 typedef struct RadKVGroupDecl {
     int      kind;            /* RAD_KV_* */
     uint32_t dtype;
-    int64_t  window;          /* RAD_KV_WINDOW: the window; RAD_KV_RING: the ring's W; 0 otherwise */
+    int64_t  window;          /* RAD_KV_WINDOW: the window; RAD_KV_RING: the ring's W; else 0 */
     int64_t  n_head_kv;
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
@@ -541,12 +567,12 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
 
 /* ---- appended in ABI 27 (the second lane's window) */
 /* The second lane's window: every op the architecture issues on lane 1 is declared between
- * rad_lane1_window_begin and rad_lane1_window_end. With a window a rad_buf_concurrent buffer is live
- * over the window and its own declared uses instead of the whole program, so buffers used only
+ * rad_lane1_window_begin and rad_lane1_window_end. With a window a rad_buf_concurrent buffer is
+ * live over the window and its own declared uses instead of the whole program, so buffers used only
  * outside the window (a drafter's, the heads') can share its bytes. The runtime holds the
  * architecture to it: an op issued on lane 1 outside the window fails the step by name, and an op
- * issued on lane 0 outside the window joins lane 1 first when lane 1 has work pending. Optional, one
- * window a program; call both at declare, in order. */
+ * issued on lane 0 outside the window joins lane 1 first when lane 1 has work pending. Optional,
+ * one window a program; call both at declare, in order. */
 int rad_lane1_window_begin(RadBuilder* b);
 int rad_lane1_window_end(RadBuilder* b);
 
@@ -616,7 +642,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_MUL = 8 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -677,8 +704,13 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * RAD_MAP_MUL is the elementwise product of src[0] and src[1], two tensors of one shape: a gain a
+ * checkpoint ships as two factors that the model only ever multiplies (DeepSeek-V4.1's Engram gate,
+ * q_weight * k_weight, which llama.cpp's converter folds into one engram_gate the same way). Two
+ * bf16 factors multiply exactly in f32.
+ *
+ * TRANSPOSE, EMA, TAP, COLS and MUL are computed at convert in f32, like WNORM, and stored as the
+ * recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 
@@ -781,7 +813,7 @@ typedef struct RadDrafterDecl {
      *                        its own position. The head sees rows 1..depth. DFlash2.
      *   block = depth        every row, the anchor included, predicts the token at the next
      *                        position (the ordinary next-token relation). The head sees rows
-     *                        0..depth-1. DSpark, whose reference takes `hidden[:, -block_size:, :]`.
+     *                        0..depth-1. DSpark.
      *
      * A wrong value is not visible in the output: both run, every draft is verified so the text
      * stays correct, but the proposals shift by one position and acceptance drops to about chance.
@@ -915,6 +947,14 @@ typedef struct RadEncoderDecl {
      * causally. The core then ends no prefill chunk inside such a run and states each trunk pass's
      * runs (RadBatch::n_bidi). 0 for an audio encoder. */
     int32_t     bidirectional;
+
+    /* ---- appended in ABI 44 (typed span rows) */
+    /* A span the language model embeds by position type, not contiguously: `span_rows` is the
+     * learned row each non-image position takes -- [4, n_embd] bf16, index 0 image_start, 1 unused
+     * (the encoder's own rows), 2 image_newline, 3 image_end. DeepSeek-V4.1's span is one
+     * placeholder id repeated, so the engine needs these rows to build the span's embeddings
+     * (Item::types says which row a position takes). Null: the span is embedded contiguously. */
+    rad_buf     span_rows;
 } RadEncoderDecl;
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
@@ -1175,8 +1215,9 @@ int rad_lora_source_targeted(RadBuilder* b, const char* src);
  *                        conditions on, and runs the language model over the frame's embedding
  *                        (one row a branch, appended to that branch's KV). It writes `status` for
  *                        each lane: >= 0 a frame was made, -1 the model ended the piece instead.
- *   RAD_GEN_PASS_WINDOW  one denoising step of one or more windows, each a run of a request's frames
- *                        (two entries a window with guidance, conditional and unconditional).
+ *   RAD_GEN_PASS_WINDOW  one denoising step of one or more windows, each a run of a request's
+ *                        frames (two entries a window with guidance, conditional and
+ *                        unconditional).
  *   RAD_GEN_PASS_VOCODE  one finished window's latents to samples, in `audio_out`, which the core
  *                        reads back; with `voc_chunk`, the frames [voc_frame0, voc_frame0 +
  *                        voc_latents) of one lane, of which the first `voc_left` are context and
@@ -1330,9 +1371,9 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  * (height / latent_scale) x (width / latent_scale) latents of `latent_channels`; the denoiser
  * reads them in `patch` x `patch` patches. A positive `frames_tail` adds frames to the last
  * chunk. A negative `frames_tail` trims the first chunk, which must still emit at least one
- * frame. Every other chunk has `frames_per_chunk` frames. A side is a multiple of `size_multiple` pixels, at least
- * `min_side`, the area at most `max_area`, and the long side over the short at most `max_aspect`.
- * The soundtrack has round(frames / fps * audio_rate) latents a channel, each
+ * frame. Every other chunk has `frames_per_chunk` frames. A side is a multiple of `size_multiple`
+ * pixels, at least `min_side`, the area at most `max_area`, and the long side over the short at
+ * most `max_aspect`. The soundtrack has round(frames / fps * audio_rate) latents a channel, each
  * `sample_rate / audio_rate` samples.
  *
  * The rotary positions of a pass's rows are the plugin's (rad_arch_video_positions), which a video
@@ -1460,12 +1501,13 @@ typedef struct RadVideoGenDecl {
     /* The text rows of every VSTEP pass, whatever the prompt's length (0: the prompt's tokens):
      * a model whose text encoder writes a fixed number of rows. */
     int64_t       step_text_rows;
-    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is nonzero: the defaults a request
-     * that names none gets, the video's scale, spatio-temporal scale, modality scale and rescale,
-     * then the soundtrack's four. A request whose video or soundtrack scale is not 1 is guided
-     * against a negative prompt: its own, else `default_negative` (null: ""). The VCOND pass then
-     * carries both prompts, the positive first (two cu_seqlens entries).
-     * RAD_VIDEO_GUIDANCE_CFG accepts only the video and soundtrack CFG scales and negative prompt. */
+    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is nonzero: the defaults a
+     * request that names none gets, the video's scale, spatio-temporal scale, modality scale and
+     * rescale, then the soundtrack's four. A request whose video or soundtrack scale is not 1 is
+     * guided against a negative prompt: its own, else `default_negative` (null: ""). The VCOND pass
+     * then carries both prompts, the positive first (two cu_seqlens entries).
+     * RAD_VIDEO_GUIDANCE_CFG accepts only the video and soundtrack CFG scales and negative
+     * prompt. */
     int32_t       guidance;
     double        guidance_default[8];
     const char*   default_negative;
@@ -1702,7 +1744,8 @@ typedef struct RadArchProbe {
      * keeps no KV. */
     int32_t gen_video;
     /* Nonzero when the plugin serves an E4M3 cache for this model (--kv-cache-dtype fp8,
-     * RadBuildCtx::kv_dtype RAD_F8E4M3): GLM-5.3's latent attention. The engine refuses the flag
+     * RadBuildCtx::kv_dtype RAD_F8E4M3): GLM-5.3's latent attention, DeepSeek-V4.1's compressed
+     * latent and index keys (block-scaled entries, rad_kv_fp8.h). The engine refuses the flag
      * for a plugin that leaves it zero, naming the int8 cache every paged attention serves. */
     int32_t kv_fp8_ok;
 
@@ -1756,7 +1799,7 @@ typedef struct RadArchProbe {
      * KV. */
     int32_t gen_shape;
 
-    /* ---- appended in ABI 43 (a checkpoint inside the step), in the tail padding behind gen_shape */
+    /* ---- appended in ABI 43 (a checkpoint inside the step), in the padding behind gen_shape */
     /* Nonzero when the plugin serves RadBatch::ckpt_cut: a step of one prefill sequence whose
      * checkpoint lies inside it runs its recurrence in two pieces and snapshots between them
      * (rad_ckpt_snap). The scheduler then takes a prompt's tail snapshot inside its last chunk
@@ -1899,6 +1942,23 @@ typedef struct RadChatFormat {
      * written. When the model does reason, its header after the block is reasoning_close's.
      * NULL or "": the reply starts with its content. */
     const char* content_open;
+
+    /* RAD_CHAT_ARGS_OBJECT: the object after the name is an envelope that names the call again
+     * and holds the arguments under this key, `{"name":NAME,"KEY":{...}}` (Inkling 2's
+     * `<|content_invoke_tool_json|>{"name":"f","args":{...}}`). The reply's arguments are KEY's
+     * value. The grammar writes the envelope compactly in that order; a reply that writes the
+     * keys the other way round, names another function or leaves the envelope out is still read,
+     * as not strict. JSON objects only: no object_string_open, no bare keys. NULL or "": the
+     * object is the arguments. */
+    const char* object_args_key;
+
+    /* A header every message of the reply starts with (Inkling 2's `<|message_model|>`): before
+     * reasoning_open it is part of the block's opener, before content_open it is the content's
+     * header, and both are dropped there; before anything else it is read as written, which
+     * makes it a call's name_prefix when the format names it so (`<|message_model|>NAME...`).
+     * Needs reasoning_open or content_open; with tool calls, name_prefix must be this literal
+     * and call_open and section_open empty. NULL or "": messages have no header of their own. */
+    const char* message_open;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */

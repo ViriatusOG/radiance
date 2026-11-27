@@ -24,7 +24,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr int64_t kMiB = (int64_t)1 << 20;
 /* Untimed launches between the gate and the timed batch: the first after the gate's L2 invalidate
- * and the keep-alive copy re-warms the activations, as the previous op leaves them in the engine. */
+ * and the keep-alive copy re-warms the activations, as the previous op leaves them in the
+ * engine. */
 constexpr int     kWarmUnits = 2;
 /* The fewest batches a median is taken from (the fewest whose range covers the median with 95%
  * confidence), and its interval's target half-width. */
@@ -276,7 +277,8 @@ double DeviceTimer::clock_now(uint64_t* throttle) {
 void DeviceTimer::sweep(int64_t bytes) {
     for (int64_t done = 0; done < bytes; done += kSweepPiece) {
         if (sweep_off_ + kSweepPiece > sweep_src_bytes_) sweep_off_ = 0;
-        (void)rad_memcpy_async(sweep_dst_, (const uint8_t*)sweep_src_ + sweep_off_, kSweepPiece, s_);
+        (void)rad_memcpy_async(sweep_dst_, (const uint8_t*)sweep_src_ + sweep_off_, kSweepPiece,
+                               s_);
         sweep_off_ += kSweepPiece;
     }
 }
@@ -517,7 +519,8 @@ bool DeviceTimer::prepare(Held& h, Prepared* p, std::string* why) {
     p->c = &c;
     for (const TimedOperand& d : c.opd) p->t.push_back(d.t);
     for (size_t k = 0; k < c.opd.size(); ++k)
-        if (h.pristine[k]) p->restores.push_back({ c.opd[k].t.data, h.pristine[k], c.opd[k].bytes });
+        if (h.pristine[k])
+            p->restores.push_back({ c.opd[k].t.data, h.pristine[k], c.opd[k].bytes });
     const RotPlan plan = plan_rotation(c, footprint_);
     p->R = plan.R;
     for (size_t k : plan.ops) {
@@ -550,7 +553,10 @@ bool DeviceTimer::prepare(Held& h, Prepared* p, std::string* why) {
             ptr.reserve((size_t)(count * n));
             for (int64_t l = 0; l < count; ++l) table_pointers(bases, n, entry, c.seed, l, &ptr);
             uint8_t* tables = (uint8_t*)rad_dev_alloc(count * n * 8, RAD_MEM_DEVICE);
-            if (!tables) { *why = "no device memory for the weight table's pointer tables"; return false; }
+            if (!tables) {
+                *why = "no device memory for the weight table's pointer tables";
+                return false;
+            }
             p->frees.push_back(tables);
             if (rad_memcpy_async(tables, ptr.data(), count * n * 8, s_) < 0 ||
                 rad_stream_sync(s_) < 0) {
@@ -563,7 +569,10 @@ bool DeviceTimer::prepare(Held& h, Prepared* p, std::string* why) {
             p->rot.push_back({ k, arena, stride });
         }
     }
-    if (rad_stream_sync(s_) < 0) { *why = std::string("setup failed: ") + rad_dev_last_error(); return false; }
+    if (rad_stream_sync(s_) < 0) {
+        *why = std::string("setup failed: ") + rad_dev_last_error();
+        return false;
+    }
     return true;
 }
 
@@ -688,8 +697,8 @@ void DeviceTimer::time_case(Held& h) {
         if (p.gated && p.unit_subs > 0)
             room = (p.room - kRoomMargin - kWarmUnits * p.unit_subs) /
                    (p.unit_subs + p.restore_subs);
-        const int64_t n = batch_launches(est, target, p.gated && p.unit_subs > 0 ? std::max<int64_t>(room, 1) : 0,
-                                         o_.fixed);
+        const int64_t n = batch_launches(
+            est, target, p.gated && p.unit_subs > 0 ? std::max<int64_t>(room, 1) : 0, o_.fixed);
         r = rep(p, n, p.gated);
         if (!r.ok) break;
         if (r.idle_us > kIdleUs && p.gated) sweep_bytes_ = std::min(2 * sweep_bytes_, sweep_max_);
@@ -728,7 +737,8 @@ void DeviceTimer::time_case(Held& h) {
         std::printf("  timed  %-60s %9.2f us  n=%d ci=%.1f%%  %s%s%s%s%.1f s\n",
                     h.c.what.c_str(), out.st.median, out.st.n, out.st.ci_pct,
                     out.gated ? "gated" : "ungated", out.rotation.empty() ? "" : ", ",
-                    out.rotation.c_str(), out.note.empty() ? "  " : ("  " + out.note + "  ").c_str(),
+                    out.rotation.c_str(),
+                    out.note.empty() ? "  " : ("  " + out.note + "  ").c_str(),
                     std::chrono::duration<double>(Clock::now() - t0).count());
 }
 
@@ -808,7 +818,8 @@ Timing time_host(const TimedCase& c, const TimerOpts& o, int64_t footprint, doub
         uint8_t* base = (uint8_t*)d.t.data;
         uint8_t* arena = nullptr;
         if (plan.R > 1) {
-            arena = (uint8_t*)std::aligned_alloc(4096, (size_t)((plan.R * stride + 4095) & ~(int64_t)4095));
+            arena = (uint8_t*)std::aligned_alloc(
+                4096, (size_t)((plan.R * stride + 4095) & ~(int64_t)4095));
             if (!arena) {
                 out.note = "no memory for " + std::to_string(plan.R) + " rotated copies of " +
                            humanb(d.bytes);
@@ -829,7 +840,8 @@ Timing time_host(const TimedCase& c, const TimerOpts& o, int64_t footprint, doub
             std::vector<uint64_t> bases;
             for (int64_t r = 0; r < plan.R; ++r)
                 bases.push_back((uint64_t)(uintptr_t)(arena ? arena + r * stride : base));
-            for (int64_t l = 0; l < b.count; ++l) table_pointers(bases, n, entry, c.seed, l, &b.ptr);
+            for (int64_t l = 0; l < b.count; ++l)
+                table_pointers(bases, n, entry, c.seed, l, &b.ptr);
             t[k].stride[0] = 0;
             tab.push_back(std::move(b));
         } else if (arena) {

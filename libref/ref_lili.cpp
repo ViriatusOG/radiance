@@ -25,9 +25,9 @@ using namespace ref;
 /* ------------------------------------------------------------------ lili_cand */
 /* stats [M, world * (2 + 2 row_k)] f32: each rank's sample_logprobs row (max, sum of exp(l - max),
  * row_k >= k (id, logit) pairs descending), all-gathered row-interleaved; row_k defaults to k (a
- * caller widens it so a row is whole 16-byte words for the all-gather). The ranks merge as one row would:
- * the maximum and the rescaled sum give the log-normaliser, the pairs the k largest by value, ties
- * to the lower id. For candidate j of row m, with lp_j = logit_j - lse:
+ * caller widens it so a row is whole 16-byte words for the all-gather). The ranks merge as one row
+ * would: the maximum and the rescaled sum give the log-normaliser, the pairs the k largest by
+ * value, ties to the lower id. For candidate j of row m, with lp_j = logit_j - lse:
  *
  *   feat  = [lp_j, exp(lp_j), lp_j - lp_0, j / (k - 1), j == 0]
  *   f     = silu(up_w . layernorm(feat; ln_w, ln_b, eps) + up_b)              -> feat out, row m*k+j
@@ -160,7 +160,8 @@ int ref_lili_attn(const RadArgs* a, RadStream) {
         for (int64_t d = 0; d < hd; ++d) {
             float acc = 0.0f;
             for (int64_t j = 0; j < L; ++j)
-                acc += sc[(size_t)j] * ldt(qkv, rowoff(qkv, q0 + j, 3 * n) + (2 * n + h * hd + d) * qs);
+                acc += sc[(size_t)j] * ldt(qkv,
+                                           rowoff(qkv, q0 + j, 3 * n) + (2 * n + h * hd + d) * qs);
             stt(o, ob + d * os, acc / sum);
         }
     }
@@ -248,13 +249,16 @@ int ref_lili_walk(const RadArgs* a, RadStream) {
         for (int64_t s = 0; s < steps; ++s) {
             int64_t best = 0;
             for (int64_t j = 1; j < k; ++j)
-                if (sc[(size_t)((s * k + prev) * k + j)] > sc[(size_t)((s * k + prev) * k + best)]) best = j;
-            const int64_t id = ld_int(cd->dtype, cd->data, rowoff(cd, m * steps + s, k) + best * laststride(cd));
+                if (sc[(size_t)((s * k + prev) * k + j)] > sc[(size_t)((s * k + prev) * k + best)])
+                    best = j;
+            const int64_t id = ld_int(cd->dtype, cd->data,
+                                      rowoff(cd, m * steps + s, k) + best * laststride(cd));
             ((int32_t*)tk->data)[rowoff(tk, m, steps) + s * laststride(tk)] = (int32_t)id;
             prev = best;
         }
         if (sco)
-            for (int64_t e = 0; e < steps * k * k; ++e) stt(sco, m * steps * k * k + e, sc[(size_t)e]);
+            for (int64_t e = 0; e < steps * k * k; ++e)
+                stt(sco, m * steps * k * k + e, sc[(size_t)e]);
     }
     return RAD_OK;
 }

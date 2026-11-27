@@ -1,5 +1,5 @@
 // gemm_nt_q over the IQR weights (r4d_iqr.h), decoded from their codes where they are read; VRAM
-// holds a B-bit weight in B bits. Two rows, as the int8 family's (r4d_gemm_fp8a8.hip):
+// holds a B-bit weight in B bits. Two rows, as the int8 family's (r4d_gemm_i8a8.hip):
 //
 //   gemm_iqr_nt_m64   M <= 64 (decode and speculative verify). At one token (a computed trellis;
 //                     M <= 8 for the other forms) a GEMV: a block a 16-row tile, its waves across
@@ -14,7 +14,7 @@
 // The narrow tile above 16 tokens and the prefill tile compute what the int8 narrow and prefill
 // tiles compute over the same int8 values (their split, staging, accumulation order and fold), so
 // a weight decoded here and the same weight's int8 values in those tiles give the same output
-// bytes (the int8 rows' K-parallel tile, r4d_gemm_fp8a8.hip, sums in another order). The GEMV and
+// bytes (the int8 rows' K-parallel tile, r4d_gemm_i8a8.hip, sums in another order). The GEMV and
 // the 16-token tile sum per wave and then across waves: the product within f32 rounding.
 
 #include "r4d.h"
@@ -30,7 +30,7 @@
 #include <algorithm>
 #include <cstdio>
 
-/* The i8a8 narrow tile's grid and split rules and its finisher counters (r4d_gemm_fp8a8.hip): a
+/* The i8a8 narrow tile's grid and split rules and its finisher counters (r4d_gemm_i8a8.hip): a
  * split here sums each output as the int8 tile's does. */
 uint32_t r4d_8a8_narrow_mw(uint32_t n, uint32_t m);
 uint32_t r4d_8a8_narrow_ksplit(uint32_t N, uint32_t K, uint32_t M, uint32_t* ck, uint32_t target);
@@ -450,7 +450,7 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
             f8v raw = rb_first<BIAS ? 32 : 0>();
 #pragma unroll
             for (uint32_t ks = 0; ks < kBlock / kK; ++ks)
-                raw = mma8<true>(frag_of(a8[ks / 4u], ks % 4u), bq[j & 1u][ks], raw);
+                raw = mma_i8(frag_of(a8[ks / 4u], ks % 4u), bq[j & 1u][ks], raw);
             const float as = XS[(size_t)tok[j] * xs_ld + kb];
             if constexpr (BIAS) {
                 const float sb = sbw * as;
@@ -460,7 +460,7 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
             } else {
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t)
-                    out[j][t] = __builtin_fmaf(acc_val<true>(raw[t]), wsr[t] * as, out[j][t]);
+                    out[j][t] = __builtin_fmaf(acc_i32(raw[t]), wsr[t] * as, out[j][t]);
             }
         }
         if constexpr (BIAS) {
@@ -533,7 +533,7 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
 
 /* ---- the narrow tile: 16 < M <= 64 -----------------------------------------------------------
  *
- * r4d_gemm_fp8a8.hip's gemm_fp8a8_body at I8, unfused: MW waves a block, a wave one 16-row weight
+ * r4d_gemm_i8a8.hip's gemm_i8a8_narrow_body, unfused: MW waves a block, a wave one 16-row weight
  * tile against NT 16-token tiles staged through LDS, split-K over the caller's scratch with the
  * last z block reducing. Only the weight operand's source differs: each 128-K block's unit is
  * decoded and transposed into fragment order through the wave's LDS tile (r4d_iqr_dec.h), its two
@@ -629,7 +629,7 @@ __device__ __forceinline__ void iqr_m64_body(R4D_IQR_M64_PARAMS) {
 #pragma unroll
                 for (uint32_t j = 0; j < NT; ++j) bf[j] = frag<FK>(s_b, j * 16, ks, lane);
 #pragma unroll
-                for (uint32_t j = 0; j < NT; ++j) raw[j] = mma8<true>(af, bf[j], raw[j]);
+                for (uint32_t j = 0; j < NT; ++j) raw[j] = mma_i8(af, bf[j], raw[j]);
             }
             /* The unit's 128-K block is done: fold its sums. Units are 128-K aligned and a split's
              * slice is a whole number of FK chunks (narrow_ksplit), so every block ends here. */
@@ -669,13 +669,13 @@ __device__ __forceinline__ void iqr_m64_body(R4D_IQR_M64_PARAMS) {
                         const float ws = wsr[0] * s;
 #pragma unroll
                         for (uint32_t t = 0; t < 8; ++t) {
-                            out[j][t] += acc_val<true>(raw[j][t]) * ws;
+                            out[j][t] += acc_i32(raw[j][t]) * ws;
                             raw[j][t] = 0.0f;
                         }
                     } else {
 #pragma unroll
                         for (uint32_t t = 0; t < 8; ++t) {
-                            out[j][t] += acc_val<true>(raw[j][t]) * (wsr[t] * s);
+                            out[j][t] += acc_i32(raw[j][t]) * (wsr[t] * s);
                             raw[j][t] = 0.0f;
                         }
                     }
@@ -751,7 +751,7 @@ void iqr_m64_kernel(R4D_IQR_M64_PARAMS) {
 }
 #undef R4D_IQR_M64_PARAMS
 
-/* The split's separate reduce, for a split with no counter block (r4d_gemm_fp8a8.hip's). */
+/* The split's separate reduce, for a split with no counter block (r4d_gemm_i8a8.hip's). */
 __global__ void iqr_splitk_reduce(const float* __restrict__ ws, uint16_t* __restrict__ y,
                                   uint32_t n_out, uint32_t ksplit) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -870,11 +870,11 @@ void iqr_prefill_kernel(IqrPre<F> pre, const uint8_t* __restrict__ A, const floa
     if constexpr (F::SC == kRowF32) {
         constexpr Form f{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
         const uint8_t* const sb = pre.c.S;
-        gemm_8a8_prefill_body<true, 32, IqrPre<F>, true>(
+        gemm_8a8_prefill_body<32, IqrPre<F>, true>(
             A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, pre, (const float*)sb,
             (const float*)(sb + cf_off(f, N, K)));
     } else {
-        gemm_8a8_prefill_body<true, RB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, pre);
+        gemm_8a8_prefill_body<RB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, pre);
     }
 }
 
@@ -1056,7 +1056,7 @@ int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int sp
     if (M <= (tiles_form<F>() ? 64u : 16u) && ((uintptr_t)g.y->data & 15u) == 0u)
         return m16_launch<F>(g, stream);
     /* At most eight waves a block: each has its own transpose tile in LDS. The wave count changes
-     * no output bit (r4d_gemm_fp8a8.hip's narrow_mw). */
+     * no output bit (r4d_gemm_i8a8.hip's narrow_mw). */
     const uint32_t mw = std::min(r4d_8a8_narrow_mw(N, M), 8u);
     const uint32_t gx = (N + mw * 16u - 1) / (mw * 16u);
     uint32_t ck = 0;

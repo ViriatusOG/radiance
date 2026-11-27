@@ -9,6 +9,7 @@
 #include "rad_device.h"
 #include "rad_encoding.h"
 #include "rad_format.h"
+#include "rad_kv_fp8.h"
 #include "rad_philox.h"
 #include "rad_planes.h"
 #include "rad_plugin.h"

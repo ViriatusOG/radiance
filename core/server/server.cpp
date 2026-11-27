@@ -1,4 +1,5 @@
 #include "server.h"
+#include "loras.h"
 #include "server_priv.h"
 
 #include <cstdio>
@@ -14,7 +15,6 @@
 #include "util/json.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <chrono>
 #include <thread>
@@ -154,6 +154,7 @@ void Server::register_routes() {
         return r;
     });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
+    router_.post_guarded("/v1/loras/validate", [this](const HttpRequest& q) { return handle_validate_loras(q); });
     router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
     router_.post_guarded("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
@@ -304,7 +305,12 @@ void Server::check_template_defaults(std::string* kwargs_why, std::string* effor
 
 std::vector<std::string> Server::probe_reasoning_efforts() {
     lim_.reasoning_efforts.clear();
+    lim_.template_off_efforts.clear();
     if (!deps_.chat) return {};
+    /* Before the levels, and whatever they turn out to be: a template that takes any word can
+     * still be one that reads "none" as a level and never reads enable_thinking. The renders
+     * below send neither word, so they do not depend on this. */
+    lim_.template_off_efforts = probe_off_efforts(*deps_.chat);
     OaiLimits l = lim_;
     l.default_template_kwargs.clear();
     l.default_reasoning_effort.clear();
@@ -618,6 +624,10 @@ std::optional<HttpResponse> Server::abandoned(const HttpRequest& req,
     retire(gens);
     release(n);
     if (!gone) return error_response(err_overloaded(kLeaving), req.peer, shape);
+    return client_closed();
+}
+
+HttpResponse Server::client_closed() {
     metrics_.observe_http(499);
     return HttpResponse::text(499, "client closed request\n");
 }
@@ -683,8 +693,8 @@ static std::vector<LogprobEntry> kept_logprobs(const std::vector<LogprobEntry>& 
  * longer be completed, since the text only grows at its end. So this holds back exactly what
  * pump() may yet cut, for any decoder: one that leaves stop strings to the server (iface.h), and
  * core/text's, which cannot see a stop the server's scan can find in the U+FFFD it returned for
- * a byte that was not UTF-8. A blanket (longest stop - 1) bytes, which this replaced, delayed
- * every delta, the first one included, by up to a 4 KiB stop's worth of text.
+ * a byte that was not UTF-8. A blanket hold-back of (longest stop - 1) bytes would delay every
+ * delta, the first one included, by up to a 4 KiB stop's worth of text.
  *
  * Run on every drain of every running choice, so its cost is bounded three ways:
  *
@@ -698,8 +708,7 @@ static std::vector<LogprobEntry> kept_logprobs(const std::vector<LogprobEntry>& 
  *     steers the text, and text that keeps almost matching long stop strings would cost a drain
  *     up to 4095 tails times 64 strings times their length. Past the budget the whole unsent
  *     window, up to the longest stop less a byte, is held back: more than the tail, never less,
- *     so nothing of a stop string is sent, and as late as the blanket hold-back this replaced.
- *     The next drain tries again. */
+ *     so nothing of a stop string is sent. The next drain tries again. */
 constexpr size_t kStopTailBudget = size_t(1) << 14;
 
 static size_t stop_prefix_tail(std::string_view text, size_t emitted,
@@ -1011,6 +1020,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
         c.finish = g.finish;
         c.stop_word = g.stop_word;
         if (r.want_logprobs) c.logprobs = kept_logprobs(g.logprobs, g.stop_cut);
+        if (r.return_tokens) c.tokens = g.tokens;
 
         if (r.endpoint == Endpoint::Chat) {
             /* Parse whenever there is a parser, not only with tools: it also splits
@@ -1165,12 +1175,14 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
 
 static std::string text_chunk(const OaiRequest& r, int index, const std::string& delta,
                               const char* finish_reason, const TimingsOut* t = nullptr,
-                              const std::string& logprobs = std::string()) {
+                              const std::string& logprobs = std::string(),
+                              const std::vector<int32_t>* token_ids = nullptr) {
     json ch;
     ch["text"] = delta;
     ch["index"] = index;
     if (!logprobs.empty()) ch["logprobs"] = json::parse(logprobs);
     else ch["logprobs"] = nullptr;
+    if (token_ids) ch["token_ids"] = *token_ids;
     if (finish_reason) ch["finish_reason"] = finish_reason; else ch["finish_reason"] = nullptr;
     json o;
     o["id"] = r.id;
@@ -1351,9 +1363,20 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 now = timings_of(&one, 1, st->r.t_received_ns);
                 if (g.delta) g.delta->set_timings(now);
             }
+            /* The ids since the last chunk (return_tokens), for the OpenAI shapes. The native
+             * chunk below writes its own. */
+            std::vector<int32_t> ids;
+            if (st->r.return_tokens && st->r.shape != ApiShape::LlamaNative &&
+                g.tokens.size() > g.tokens_sent) {
+                ids.assign(g.tokens.begin() + (long)g.tokens_sent, g.tokens.end());
+            }
             if (st->r.endpoint == Endpoint::Chat) {
                 /* Only the new text: the reader keeps its place, so a reply costs linear time. */
                 if (lp_n) g.delta->add_logprobs(logprobs_content(lp_at, lp_n));
+                if (!ids.empty()) {
+                    g.delta->add_token_ids(ids.data(), ids.size());
+                    g.tokens_sent = g.tokens.size();
+                }
                 out += g.delta->push(std::string_view(g.text).substr(g.emitted, safe - g.emitted),
                                      g.closed);
             } else if (st->r.shape == ApiShape::LlamaNative) {
@@ -1377,9 +1400,13 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                     g.tokens_sent = g.tokens.size();
                 }
             } else if (safe > g.emitted || lp_n) {
+                /* Ids whose text is still held back (a possible stop string) wait for the chunk
+                 * that carries it, or the final one. */
                 out += text_chunk(st->r, g.index, g.text.substr(g.emitted, safe - g.emitted),
                                   nullptr, st->r.timings_per_token ? &now : nullptr,
-                                  lp_n ? logprobs_legacy(lp_at, lp_n, lp_off) : std::string());
+                                  lp_n ? logprobs_legacy(lp_at, lp_n, lp_off) : std::string(),
+                                  st->r.return_tokens ? &ids : nullptr);
+                if (!ids.empty()) g.tokens_sent = g.tokens.size();
             }
             g.emitted = safe;
             /* Of the sent entries only the last is read again (for where the next one starts);
@@ -1419,7 +1446,12 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                     if (g.finish == Finish::Error) out += sse_error(e);
                     overall = outcome(overall, g.finish);
                 } else {
-                    out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish), &gt);
+                    /* The ids no earlier chunk carried (return_tokens). */
+                    std::vector<int32_t> rest;
+                    if (st->r.return_tokens && g.tokens.size() > g.tokens_sent)
+                        rest.assign(g.tokens.begin() + (long)g.tokens_sent, g.tokens.end());
+                    out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish), &gt,
+                                      std::string(), st->r.return_tokens ? &rest : nullptr);
                     if (g.finish == Finish::Error) out += sse_error(e);
                     overall = outcome(overall, g.finish);
                 }
@@ -2358,9 +2390,50 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     return HttpResponse::json_body(200, id.empty() ? models_body(cards) : model_body(c));
 }
 
-/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
- * to unload. The path is read on this machine, so without --api-key only a loopback client may
- * ask, the rule /diagnostics follows. */
+HttpResponse Server::handle_validate_loras(const HttpRequest& req) {
+    auto fail = [&](const char* field, const std::string& why, int status, const char* type) {
+        ApiError error = err_bad(field, why);
+        error.status = status;
+        error.type = type;
+        return error_response(error, req.peer);
+    };
+    if (opt_.api_key.empty() && !local_operator(req))
+        return fail("loras", "adapter validation requires operator access", 403, "permission_error");
+
+    bool over = false, deep = false;
+    const json body = parse_json_bounded(req.body, 0, &over, &deep);
+    if (body.is_discarded() || over || deep || !body.is_object() ||
+        !body.contains("model") || !body["model"].is_string() || body["model"] == "")
+        return error_response(err_bad("model", "expected a nonempty image model ID"), req.peer);
+    const std::string model = body["model"].get<std::string>();
+    if (auto it = req.query.find("model"); it != req.query.end() && it->second != model)
+        return error_response(err_bad("model", "query and body name different models"), req.peer);
+    if (!deps_.front && model != opt_.model_id)
+        return fail("model", "unknown model", 404, "not_found_error");
+    std::vector<std::pair<std::string, double>> choices;
+    std::string field, why;
+    if (parse_loras(body, nullptr, &choices, &field, &why) < 0)
+        return error_response(err_bad(field.c_str(), why), req.peer);
+    if (choices.empty())
+        return error_response(err_bad("loras", "expected at least one adapter"), req.peer);
+
+    if (!opt_.gen_lora_validate)
+        return error_response(err_not_implemented("this model has no generator adapter slots"), req.peer);
+    if (auto no = admit(1, req.peer)) return *no;
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
+    const int status = opt_.gen_lora_validate(choices, &why);
+    if (status == RAD_E_FULL) return error_response(err_overloaded(why), req.peer);
+    if (status == RAD_E_NOTFOUND) return fail("loras", why, 404, "not_found_error");
+    if (status == RAD_E_STATE) return fail("loras", why, 409, "conflict_error");
+    if (status == RAD_E_IO || status == RAD_E_NOMEM)
+        return fail("loras", why, 503, "service_unavailable");
+    if (status < 0) return error_response(err_bad("loras", why), req.peer);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{{"model", model},
+                                                       {"compatibility", "compatible"}}));
+}
+
 /* A generator's adapter files: what `loras` and <lora:...> tags may name. */
 HttpResponse Server::handle_loras(const HttpRequest& req) {
     if (!opt_.gen_lora_names) {
@@ -2376,6 +2449,9 @@ HttpResponse Server::handle_loras(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(json{ { "object", "list" }, { "data", std::move(data) } }));
 }
 
+/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
+ * to unload. The path is read on this machine, so without --api-key only a loopback client may
+ * ask, the rule /diagnostics follows. */
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     auto fail = [&](int status, const char* type, const std::string& msg) {
         ApiError e;

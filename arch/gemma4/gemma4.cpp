@@ -96,7 +96,7 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_vision.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
 
@@ -111,25 +111,15 @@ namespace gemma4 {
 
 using namespace rad::arch;
 
-/* The fused router's two bounds (rad_block_moe_fp8.h): the most routing slots libr4d's sort
+/* The fused router's two bounds (rad_block_moe_q.h): the most routing slots libr4d's sort
  * serves in one workgroup (kScatterSmall), and the skinny bf16 GEMM's decode band, within which the
  * fused op's GEMM matches that GEMM's arithmetic. */
 static const int64_t kMoeSortRows = 1024;
 static const int64_t kMoeRouterFusedRows = 64;
 
-/* ============================================================== metadata */
-/* Gemma4ForConditionalGeneration nests the text model's config under `text_config`; a
- * Gemma4ForCausalLM checkpoint does not, so keys are read with meta_text_get*. */
-/* A JSON boolean reaches the meta as 1/0 or as true/false, depending on the converter's path. */
-static bool tc_getb(const RadModelMeta* m, const char* k, bool dflt) {
-    const char* s = meta_text_gets(m, k, nullptr);
-    if (!s) return dflt;
-    if (!std::strcmp(s, "true") || !std::strcmp(s, "True")) return true;
-    if (!std::strcmp(s, "false") || !std::strcmp(s, "False") || !std::strcmp(s, "null")) return false;
-    return std::atoll(s) != 0;
-}
-
 /* ============================================================== the model */
+/* Gemma4ForConditionalGeneration nests the text model's config under `text_config`; a
+ * Gemma4ForCausalLM checkpoint does not, so config keys are read with meta_text_get*. */
 
 /* One attention kind: the sliding and the full layers differ in head width, KV heads, rotary
  * and window, and in whether V has a projection of its own. */
@@ -362,7 +352,7 @@ static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
      * Hadamard (libquant's `codes=i8 group=128 scale=bf16 transform=fwht128`). */
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
     if (rad_enc_is(&e, "affine") && e.n_planes == 2 && e.plane[0].dtype == RAD_I8 && sc &&
-        sc->dtype == RAD_BF16 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK &&
+        sc->dtype == RAD_BF16 && sc->block[0] == 1 && sc->block[1] == RAD_SCALE_GROUP &&
         std::strcmp(e.transform, "fwht128") == 0) {
         *fmt = EXP_I8;
         return RAD_OK;
@@ -425,8 +415,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- variants this plugin does not serve, refused by name. */
     if (meta_text_geti(meta, "hidden_size_per_layer_input", 0) > 0 ||
-        meta_text_geti(meta, "num_kv_shared_layers", 0) > 0 || tc_getb(meta, "use_double_wide_mlp", false) ||
-        tc_getb(meta, "attention_bias", false)) {
+        meta_text_geti(meta, "num_kv_shared_layers", 0) > 0 ||
+        meta_text_getb(meta, "use_double_wide_mlp", false) ||
+        meta_text_getb(meta, "attention_bias", false)) {
         fprintf(stderr, "radiance: gemma4: this checkpoint uses per-layer embeddings, shared KV "
                         "layers, a double-wide MLP or attention biases (the E2B/E4B shape); this "
                         "plugin serves the 26B-A4B and 31B shape\n");
@@ -452,7 +443,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.ks.nkv_all = meta_text_geti(meta, "num_key_value_heads", meta->n_head_kv);
     m.kf.hd      = meta_text_geti(meta, "global_head_dim", m.ks.hd);
     m.kf.nkv_all = meta_text_geti(meta, "num_global_key_value_heads", m.ks.nkv_all);
-    m.kf.k_eq_v  = tc_getb(meta, "attention_k_eq_v", false);
+    m.kf.k_eq_v  = meta_text_getb(meta, "attention_k_eq_v", false);
     m.ks.theta   = meta_text_getf(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
     m.kf.theta   = meta_text_getf(meta, "rope_parameters.full_attention.rope_theta", 0.0);
     m.ks.window  = meta_text_geti(meta, "sliding_window", 0);   /* HF: q - k < window, attn_paged's rule */
@@ -538,7 +529,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const int64_t E = m.E, T = g.max_tok;
 
     /* ---- the routed arm's geometry. */
-    m.moe = tc_getb(meta, "enable_moe_block", false);
+    m.moe = meta_text_getb(meta, "enable_moe_block", false);
     if (m.moe) {
         m.n_expert = meta_text_geti(meta, "num_experts", meta->n_expert);
         m.top_k    = meta_text_geti(meta, "top_k_experts", meta->n_expert_used);
@@ -655,21 +646,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "holds %lld\n", (long long)NL);
                 return RAD_E_INVAL;
             }
-            if (y.gu_q && ((2 * m.n_ffe) % 64 || E % RAD_FP8_BLOCK)) {
+            if (y.gu_q && ((2 * m.n_ffe) % 64 || E % RAD_SCALE_GROUP)) {
                 fprintf(stderr, "radiance: gemma4: layer %lld's gate_up experts are quantised at "
                                 "%lld x %lld; the grouped GEMM takes N in 64s and K in whole "
                                 "%d-column blocks\n", ll, (long long)(2 * m.n_ffe), (long long)E,
-                        RAD_FP8_BLOCK);
+                        RAD_SCALE_GROUP);
                 return RAD_E_INVAL;
             }
-            if (y.dn_q && (E % 64 || m.n_ffe % RAD_FP8_BLOCK)) {
+            if (y.dn_q && (E % 64 || m.n_ffe % RAD_SCALE_GROUP)) {
                 fprintf(stderr, "radiance: gemma4: layer %lld's down experts are quantised, and "
                                 "the experts are %lld wide: the grouped GEMM reads K in whole "
                                 "%d-column scale blocks. Keep `ffn_down_exps` bf16 (no recipe "
                                 "rule for it), or pad the experts to a multiple of %d (zero rows "
                                 "of gate and up, zero columns of down) and convert the padded "
                                 "checkpoint.\n", ll,
-                        (long long)m.n_ffe, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
+                        (long long)m.n_ffe, RAD_SCALE_GROUP, RAD_SCALE_GROUP);
                 return RAD_E_INVAL;
             }
             m.n_gu_q += y.gu_q;
@@ -702,7 +693,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.b_hx = decl_b(b, nm.f("moe_h"),      RAD_BF16, {T, E});
         if (m.n_gu_q > 0) {
             m.b_hq  = decl_b(b, nm.f("moe_hq"),    m.exp_i8 ? RAD_I8 : RAD_F8E4M3, {T, E});
-            m.b_hqs = decl_b(b, nm.f("moe_hqs"),   RAD_F32,    {T, fp8_blocks(E)});
+            m.b_hqs = decl_b(b, nm.f("moe_hqs"),   RAD_F32,    {T, scale_groups(E)});
         }
         m.b_sorted = decl_b(b, nm.f("moe_sorted"), RAD_I32,  {P * K});
         m.b_eoff   = decl_b(b, nm.f("moe_eoff"),   RAD_I32,  {m.n_local + 1});
@@ -711,7 +702,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_eact   = decl_b(b, nm.f("moe_eact"),   RAD_BF16, {P * K, m.n_ffe});
         if (m.n_dn_q > 0) {
             m.b_eq  = decl_b(b, nm.f("moe_eq"),    m.exp_i8 ? RAD_I8 : RAD_F8E4M3, {P * K, m.n_ffe});
-            m.b_eqs = decl_b(b, nm.f("moe_eqs"),   RAD_F32,    {P * K, fp8_blocks(m.n_ffe)});
+            m.b_eqs = decl_b(b, nm.f("moe_eqs"),   RAD_F32,    {P * K, scale_groups(m.n_ffe)});
         }
         m.b_edn    = decl_b(b, nm.f("moe_edn"),    RAD_BF16, {P * K, E});
     }
@@ -937,11 +928,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 /* Declared here, not with the others: a buffer no op names is live for the whole
                  * program, and when q is read in place nothing names this one. */
                 if (!m.b_qs) m.b_qs = decl_b(b, nm.f("q_s"), RAD_BF16, {T, k.q()});
-                y.op_lift = rw(b, RAD_OP(b, "cast",
-                                    RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", k.q()),
-                                               RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                    RAD_NOWEIGHTS),
-                                {m.b_qkv}, {m.b_qs});
+                y.op_lift = cast_op(b, T, k.q(), "bf16", "bf16", m.b_qkv, m.b_qs);
                 y.op_attn = attn(k, m.b_qs, m.b_atts);
             }
             if (m.vis.bidirectional) {
@@ -1015,7 +1002,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
                                                RAD_F64("eps", eps), RAD_STR("dtype", "bf16"),
                                                RAD_F64("mult", 1.0 / std::sqrt((double)E)),
-                                               RAD_INT("group", RAD_FP8_BLOCK)),
+                                               RAD_INT("group", RAD_SCALE_GROUP)),
                                     RAD_WEIGHTS(y.w_apost, y.w_fnorm, y.w_rscale, y.w_enorm)),
                              {m.b_o, m.b_x}, {m.b_x, m.b_h, m.b_rn, m.b_hq, m.b_hqs});
         if (has_join_a && !y.op_join_r)
@@ -1045,7 +1032,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_exp_scale", ll), src("router.per_expert_scale")));
             y.w_fpost1 = decl_w(b, nm.f("blk.%lld.ffn_post_norm1.weight", ll), RAD_F32, {E}, A, N, gl);
             y.w_fpost2 = decl_w(b, nm.f("blk.%lld.ffn_post_norm2.weight", ll), RAD_F32, {E}, A, N, gl);
-            /* The router is replicated (rad_block_moe_fp8.h): every rank routes every token the
+            /* The router is replicated (rad_block_moe_q.h): every rank routes every token the
              * same way from the same residual stream. */
             y.w_router = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.weight", ll), RAD_BF16,
                                 {m.n_expert, E}, A, N, gl);
@@ -1085,8 +1072,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             rad_weight& h = (pass ? ws : wc)[(size_t)(par * half + i)];
                             h = pass ? decl_view(b, nm.f("blk.%lld.ffn_%s_exps.%lld.scale", ll, what, ge),
                                                  wn, "scale", RAD_BF16,
-                                                 {m.exp_i8 ? rows : fp8_blocks(rows),
-                                                  fp8_blocks(cols)},
+                                                 {m.exp_i8 ? rows : scale_groups(rows),
+                                                  scale_groups(cols)},
                                                  RAD_ACCESS_CONDITIONAL, N,
                                                  grp_expert_slot(li, (int)e, slot))
                                      : decl_view(b, wn, nullptr, "codes", cdt, {rows, cols},
@@ -1143,7 +1130,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (y.gu_q) {
                 y.op_enorm = RAD_OP(b, m.exp_i8 ? "rmsnorm_had_quant_i8g" : "rmsnorm_quant_fp8",
                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", E),
-                                               RAD_F64("eps", eps), RAD_INT("group", RAD_FP8_BLOCK),
+                                               RAD_F64("eps", eps),
+                                               RAD_INT("group", RAD_SCALE_GROUP),
                                                RAD_STR("dtype", "bf16"), RAD_F64("wadd", 0.0)),
                                     RAD_WEIGHTS(y.w_enorm));
                 y.op_enorm = rw(b, y.op_enorm, {m.b_x}, {m.b_hq, m.b_hqs});
@@ -1163,7 +1151,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * Both are byte-identical to the separate launches (docs/OPS.md). The per-expert scale
              * and the experts' input norm sit between them in issue order and read only the ids
              * and weights the fused op writes. Declared after every buffer they name; a late
-             * declaration only lengthens a buffer's planned life (rad_block_moe_fp8.h). */
+             * declaration only lengthens a buffer's planned life (rad_block_moe_q.h). */
             {
                 const int64_t sort_rows = P * K <= kMoeSortRows ? P : kMoeSortRows / K;
                 if (sort_rows > 0 && rad_op_declared(b, "router_topk_scatter"))
@@ -1193,16 +1181,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
             /* The two grouped GEMMs use different a_order: gate_up reads the block input, one row
              * per token, gathered through sorted_tok; down reads gate_up's product, already one row
-             * per (token, slot) in scatter order (rad_block_moe_fp8.h). */
+             * per (token, slot) in scatter order (rad_block_moe_q.h). */
             if (y.gu_q) {
                 const std::vector<rad_weight> tab = tables(y.w_egu, y.w_egus);
                 /* `a_group` is stated to the int8 rows alone, last and cut off otherwise. */
                 const RadParam ps[] = { RAD_RANGE("M", 1, P), RAD_INT("N", 2 * m.n_ffe),
                                         RAD_INT("K", E), RAD_INT("n_expert", NL),
-                                        RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
+                                        RAD_INT("top_k", K), RAD_INT("group", RAD_SCALE_GROUP),
                                         RAD_STR("a_order", "token"),
                                         RAD_STR("dtype", m.exp_i8 ? "i8a8h" : "fp8a8"),
-                                        RAD_INT("a_group", RAD_FP8_BLOCK) };
+                                        RAD_INT("a_group", RAD_SCALE_GROUP) };
                 y.op_egu = rw(b, rad_decl_op(b, "moe_gemm_q", ps,
                                      (int)(sizeof ps / sizeof *ps) - (m.exp_i8 ? 0 : 1),
                                      tab.data(), (int)tab.size()),
@@ -1222,17 +1210,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (y.dn_q) {
                 y.op_eq = rw(b, RAD_OP(b, m.exp_i8 ? "had_quant_act_i8g" : "quant_act_fp8",
                                     RAD_PARAMS(RAD_RANGE("M", 1, P * K), RAD_INT("n", m.n_ffe),
-                                               RAD_INT("group", RAD_FP8_BLOCK),
+                                               RAD_INT("group", RAD_SCALE_GROUP),
                                                RAD_STR("dtype", "bf16")),
                                     RAD_NOWEIGHTS),
                              {m.b_eact}, {m.b_eq, m.b_eqs});
                 const std::vector<rad_weight> tab = tables(y.w_edn, y.w_edns);
                 const RadParam ps[] = { RAD_RANGE("M", 1, P), RAD_INT("N", E),
                                         RAD_INT("K", m.n_ffe), RAD_INT("n_expert", NL),
-                                        RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
+                                        RAD_INT("top_k", K), RAD_INT("group", RAD_SCALE_GROUP),
                                         RAD_STR("a_order", "sorted"),
                                         RAD_STR("dtype", m.exp_i8 ? "i8a8h" : "fp8a8"),
-                                        RAD_INT("a_group", RAD_FP8_BLOCK) };
+                                        RAD_INT("a_group", RAD_SCALE_GROUP) };
                 y.op_edn = rw(b, rad_decl_op(b, "moe_gemm_q", ps,
                                      (int)(sizeof ps / sizeof *ps) - (m.exp_i8 ? 0 : 1),
                                      tab.data(), (int)tab.size()),
@@ -1302,11 +1290,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * what the drafter reads while the output stays correct. */
         for (int t = 0; t < m.n_taps; ++t)
             if (m.tap_layer[t] == (int)l && !y.op_tap)
-                y.op_tap = rw(b, RAD_OP(b, "cast",
-                                  RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
-                                             RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                  RAD_NOWEIGHTS),
-                              {m.b_x}, {m.b_dfsrc});
+                y.op_tap = cast_op(b, T, E, "bf16", "bf16", m.b_x, m.b_dfsrc);
     }
 
     /* ---- the prefill overlap (trunk_overlap). Requires a reduction to hide, a routed arm whose
@@ -1512,7 +1496,8 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
          * issued only where the attention join did not already write the codes. */
         if (y.gu_q && !y.op_join_r)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_NONE, RAD_W(y.w_enorm),
-                        brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK),
+                        brow_slice(m.b_hq, r0, n, E),
+                        brow_slice(m.b_hqs, r0, n, E / RAD_SCALE_GROUP),
                         RAD_NONE);
         else if (!y.gu_q)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_enorm),
@@ -1525,7 +1510,7 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         const int64_t H = NL / 2;
         if (y.gu_q)
             RAD_ISSUE_N(c, y.op_egu, n, brow_slice(m.b_hq, r0, n, E),
-                        brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK),
+                        brow_slice(m.b_hqs, r0, n, E / RAD_SCALE_GROUP),
                         RAD_WTAB(y.w_egu[0], H), RAD_WTAB(y.w_egus[0], H),
                         brows(m.b_sorted, n * K), brows(m.b_eoff, NL + 1),
                         RAD_WTAB(y.w_egu[(size_t)H], H), RAD_WTAB(y.w_egus[(size_t)H], H),
@@ -1554,7 +1539,7 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         if (r0 + n >= T) {
             RadRouting rt{};
             rt.expert_ids    = ids;
-            rt.expert_w      = nullptr;   /* bf16 weights; the field is const float* (moe_fp8.h) */
+            rt.expert_w      = nullptr;   /* bf16 weights; the field is const float* (rad_block_moe_q.h) */
             rt.expert_count  = counts ? counts : (const int32_t*)rad_buf_ptr(c, m.b_ecnt);
             rt.sorted_tok    = (const int32_t*)rad_buf_ptr(c, m.b_sorted);
             rt.expert_offset = (const int32_t*)rad_buf_ptr(c, m.b_eoff);
@@ -1763,7 +1748,7 @@ static void arms(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t r
         RAD_ISSUE_N(c, y.op_join_r, n, brow_slice(m.b_o, r0, n, E), RAD_W(y.w_apost),
                     brow_slice(m.b_x, r0, n, E), RAD_W(y.w_fnorm), brow_slice(m.b_h, r0, n, E),
                     RAD_W(y.w_rscale), brow_slice(m.b_rn, r0, n, E), RAD_W(y.w_enorm),
-                    brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK));
+                    brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_SCALE_GROUP));
     else
         RAD_ISSUE_N(c, y.op_join_a, n, brow_slice(m.b_o, r0, n, E), RAD_W(y.w_apost),
                     brow_slice(m.b_x, r0, n, E), RAD_W(y.w_fnorm), brow_slice(m.b_h, r0, n, E));

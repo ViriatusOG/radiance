@@ -1,7 +1,7 @@
 /* rad_block_mtp_hc.h -- the multi-token-prediction head of a model whose residual stream is `hc`
  * times the model width.
  *
- * ============================== DIFFERENCES FROM rad_block_mtp_fp8.h ==============================
+ * ============================== DIFFERENCES FROM rad_block_mtp_q.h ==============================
  *
  * That file serves Qwen3.5 / Qwen3-Next / Qwen3.6, whose head is a pre-norm layer reading the
  * trunk's [n_embd] hidden state. Qwen4-Exp's head has the same indexing and passes but lives in
@@ -32,7 +32,7 @@
  *
  * ============================== THE TWO KINDS OF PASS ==============================
  *
- * By the sign of `RadBatch::draft_pass` (details in rad_block_mtp_fp8.h):
+ * By the sign of `RadBatch::draft_pass` (details in rad_block_mtp_q.h):
  *
  *   < 0   History pass, one row per token, continuing from the trunk's wide stream. It writes the
  *         head's own K and V, which nothing else writes. It is also draft round 1 for drafting
@@ -53,7 +53,7 @@
  *
  * The head's attention is bound to the trunk's full-attention group as one more layer, at
  * absolute index n_layer, sharing its slot mapping and block table; a rejected draft's entry is
- * overwritten by the next step's token at the same address (see rad_block_mtp_fp8.h). The group's
+ * overwritten by the next step's token at the same address (see rad_block_mtp_q.h). The group's
  * page grows from 12 layers to 13 (8% more attention KV), only when speculation is declared.
  *
  * ============================== BUFFERS ==============================
@@ -69,10 +69,10 @@
 #ifndef RAD_BLOCK_MTP_HC_H
 #define RAD_BLOCK_MTP_HC_H
 
-#include "rad_block_attn_gated_fp8.h"
+#include "rad_block_attn_gated_q.h"
 #include "rad_block_hc.h"
-#include "rad_block_moe_fp8.h"
-#include "rad_block_mtp_fp8.h"     /* mtp_draft_head_q2(): one reading of the 2-bit head */
+#include "rad_block_moe_q.h"
+#include "rad_block_mtp_q.h"     /* mtp_draft_head_q2(): one reading of the 2-bit head */
 #include "rad_spechub.h"           /* RAD_MTP_COUPLE_*: the coupling wire */
 #include "rad_qsa.h"
 #include "rad_block_vit.h"
@@ -102,7 +102,7 @@ struct MtpHcBlock {
         rad_buf inj  = 0;   /* [max_tok, hc]           both connections' write gains */
         rad_buf hout = 0;   /* [max_logit_rows, n_embd]  the mixer's output, the lm_head's input */
         rad_buf logits = 0; /* [max_logit_rows, n_vocab] the trunk's, shared */
-        ActFP8  x{};        /* the narrow block input, the trunk's */
+        ActQ  x{};        /* the narrow block input, the trunk's */
         /* The 2-bit draft head's working set, sized at max_logit_rows (only drafting rows reach
          * it). */
         rad_buf dq = 0, ds = 0, dsum = 0, dlog = 0, didx = 0, dval = 0;
@@ -112,8 +112,8 @@ struct MtpHcBlock {
         /* --draft-coupling: [max_seqs] draws and [depth, max_seqs] states, both PERSIST across
          * the serial passes (round 1 resets the logical stream, not the plane). */
         rad_buf couple_draws = 0, couple_state = 0;
-        AttnGatedFP8::Wire attn{};
-        MoeFP8::Wire       mlp{};
+        AttnGatedQ::Wire attn{};
+        MoeQ::Wire       mlp{};
         QsaIndexer::Wire   qsa{};
     };
 
@@ -123,8 +123,8 @@ struct MtpHcBlock {
         const char* pre_norm_hidden    = nullptr;
         const char* pre_norm_embedding = nullptr;
         HyperConn::Src    hc_attn{}, hc_mlp{}, hc_mix{};
-        AttnGatedFP8::Src attn{};
-        MoeFP8::Src       mlp{};
+        AttnGatedQ::Src attn{};
+        MoeQ::Src       mlp{};
         /* The indexer's names and geometry; `qk_proj` null declares no indexer at all. */
         QsaIndexer::Config qsa{};
     };
@@ -144,12 +144,12 @@ struct MtpHcBlock {
     rad_weight w_dh = 0, w_dhs = 0;
 
     HyperConn    hc_attn{}, hc_mlp{}, mixer{};
-    AttnGatedFP8 attn{};
+    AttnGatedQ attn{};
     QsaIndexer   qsa{};
     /* The indexer's window bounds for a pass wider than its score plane (QsaIndexer::step), set by
      * the caller before step(); null where no pass is. */
     const int32_t* qsa_win_cu = nullptr;
-    MoeFP8       mlp{};
+    MoeQ       mlp{};
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
     /* The selected draft calibration also records the bf16 attention input shared by
@@ -160,7 +160,7 @@ struct MtpHcBlock {
     mutable int64_t attn_gram_rows = 0;
     mutable bool attn_gram_done = false;
 
-    /* Media rows over the head's embedding (see MtpBlockFP8::media). Set before declare when the
+    /* Media rows over the head's embedding (see MtpBlockQ::media). Set before declare when the
      * program has an encoder. */
 
     bool       media = false;
@@ -243,12 +243,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     /* The trunk's table is vocab-sharded, so the lookup is partial and needs an exact
      * all-reduce. */
     if (g.world > 1)
-        op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                            RAD_PARAMS(RAD_INT("world_size", g.world),
-                                       RAD_RANGE("numel", g.n_embd, rows * g.n_embd),
-                                       RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                            RAD_NOWEIGHTS),
-                        {w.e}, {w.e});
+        op_embed_ar = decl_all_reduce_exact(b, g, w.e, g.n_embd, rows, g.dtype);
 
     op_enter = rw(b, RAD_OP(b, "mtp_enter",
                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
@@ -274,7 +269,8 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                              {g.n_embd, g.n_embd}, RAD_BUF_PERSIST);
         op_attn_gram = rw(b, RAD_OP(b, "gram_accum",
                               RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
-                                         RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
+                                         RAD_INT("group", RAD_SCALE_GROUP),
+                                         RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
                           {w.attn.h.x, b_attn_gram}, {b_attn_gram});
         if (!b_attn_gram || !op_attn_gram) return RAD_E_INVAL;
@@ -293,11 +289,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.hw}, {w.hin});
-    op_dback = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.hin}, {w.hw});
+    op_dback = cast_op(b, g.max_logit_rows, HN, g.dtype, g.dtype, w.hin, w.hw);
     if (!op_dsel || !op_dback) return RAD_E_INVAL;
 
     /* The connection's read also writes the rotated expert input, as on the trunk. */
@@ -328,11 +320,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     }
 
     /* ---- the carry (see the header: `mtp_enter` cannot run in place). */
-    op_carry = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", HN),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.hw}, {w.hin});
+    op_carry = cast_op(b, rows, HN, g.dtype, g.dtype, w.hw, w.hin);
 
     /* ---- the head's mixer: a connection with no write half that collapses the wide stream for
      * the lm_head, which reads bf16, so no fp8 codes. */
@@ -355,7 +343,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                   {w.hout}, {w.logits});
     if (!op_carry || !op_logits) return RAD_E_INVAL;
 
-    /* ---- The 2-bit draft head (rationale in rad_block_mtp_fp8.h): fewer bytes per draft round,
+    /* ---- The 2-bit draft head (rationale in rad_block_mtp_q.h): fewer bytes per draft round,
      * at the cost of acceptance only. */
     enum { MTP_W2_GROUP = 128 };
     /* R is kDraftTopR. It must also be at least 2: `ar_gather_2rank` needs rows of whole 16-byte
@@ -384,12 +372,8 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
                       {w.hout}, {w.dq, w.ds, w.dsum});
-        op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                      RAD_INT("N", hrows), RAD_INT("K", g.n_embd),
-                                      RAD_INT("group", MTP_W2_GROUP), RAD_STR("dtype", "w2a8")),
-                           RAD_WEIGHTS(w_dh, w_dhs)),
-                       {w.dq, w.ds, w.dsum}, {w.dlog});
+        op_dlogits = decl_gemm_q(b, g.max_logit_rows, hrows, g.n_embd, MTP_W2_GROUP, "w2a8", w_dh,
+                                 w_dhs, { w.dq, w.ds, w.dsum }, w.dlog);
         /* Sharded, the top-R runs over this rank's plane, reports global ids and also writes the
          * pair plane the gather moves. Replicated, `vocab_off` is omitted: an optional parameter
          * present with value 0 is a different declaration from an absent one. */
@@ -427,8 +411,8 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                        RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(w_lm));
             if (!op_drerank) return RAD_E_INVAL;
-            /* Arrays rather than rw(): the write set is conditional (see rad_fp8.h:
-             * NormQuantFP8). */
+            /* Arrays rather than rw(): the write set is conditional (see rad_linear.h:
+             * NormQuant). */
             rad_buf rd[2] = { w.hout, w.didx };
             rad_buf wr[3] = { w.didx, w.dval, w.dpair };
             rad_op_reads (b, op_drerank, rd, 2);
@@ -593,7 +577,7 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_dquant, L, brows(w.hout, L), brows(w.dq, L), brows(w.ds, L),
                     RAD_B(w.dsum));
         /* The trailing `b_ref` is mxfp4's and absent; operands are positional, so pass RAD_NONE
-         * (rad_fp8.h). */
+         * (rad_linear.h). */
         RAD_ISSUE_N(c, op_dlogits, L, brows(w.dq, L), brows(w.ds, L), RAD_W(w_dh), RAD_W(w_dhs),
                     brows(w.dlog, L), RAD_B(w.dsum), RAD_NONE);
         if (op_dmerge) {

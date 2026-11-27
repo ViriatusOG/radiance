@@ -28,8 +28,8 @@ using namespace ref;
 
 /* ------------------------------------------------------------------ router_topk */
 /* Softmax over all n_expert logits, then the top_k by probability, then (with `norm`) renormalise
- * the kept weights to sum to one. Softmax-then-select is the order Mixtral, Qwen3 and every model in
- * scope use; selecting first would be a different router. */
+ * the kept weights to sum to one. Softmax-then-select is the order Mixtral, Qwen3 and every
+ * model in scope use; selecting first would be a different router. */
 int ref_router_topk(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *ids = &a->t[1], *w = &a->t[2];
@@ -220,7 +220,8 @@ int ref_router_gemm_topk_scatter(const RadArgs* a, RadStream s) {
     }
 
     /* The pair over the logits the GEMM just wrote. Every parameter the pair reads is a parameter
-     * of this op, under the same name -- the fused lists are unions, so `a`'s list passes through. */
+     * of this op, under the same name -- the fused lists are unions, so `a`'s list passes
+     * through. */
     const RadTensor t6[] = { a->t[3], a->t[4], a->t[5], a->t[6], a->t[7], a->t[8] };
     const RadArgs   fa{ t6, 6, a->p, a->n_p, nullptr, 0, nullptr, a->rank, a->world_size };
     return ref_router_topk_scatter(&fa, s);
@@ -288,20 +289,19 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
 
 /* What a codebook `dtype` stores: the code width, the scale's group along K and dtype, and whether
  * the scale view carries the level above it. `bits` is 0 for any other dtype. */
-struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; bool fp4; };
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
-    if (s && !std::strcmp(s, "nvfp4a8i8")) return CbForm{ 4, 16, RAD_F8E4M3, true, true };
-    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, false };
-    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, false };
-    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, false };
-    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, false };
-    if (s && !std::strcmp(s, "w6nl64a8h")) return CbForm{ 6, 64, RAD_F8E4M3, true, false };
+    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false };
+    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w6nl64a8h")) return CbForm{ 6, 64, RAD_F8E4M3, true };
     /* The same stored experts under their names against an int8 activation. */
-    if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, false };
-    if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, false };
-    return CbForm{ 0, 0, 0, false, false };
+    if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
+    return CbForm{ 0, 0, 0, false };
 }
 
 /* Whether a selection of several planes for `operand` is what `dtype` names: the codes operands of
@@ -313,7 +313,7 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
     const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
     if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes != 2 ||
-        (!f.fp4 && std::strcmp(enc->transform, "fwht128") != 0))
+        std::strcmp(enc->transform, "fwht128") != 0)
         return RAD_E_DTYPE;
     for (int i = 0; i < 2; ++i)
         if (sel[i] < 0 || sel[i] >= enc->n_planes) return RAD_E_SHAPE;
@@ -321,7 +321,8 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const RadEncPlane& b = enc->plane[sel[1]];
     if (codes)
         return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
-               a.dtype == (f.bits == 6 ? (uint32_t)RAD_U6 : f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
+               a.dtype == (f.bits == 6 ? (uint32_t)RAD_U6 : f.bits == 5 ? (uint32_t)RAD_U5
+                           : (uint32_t)RAD_U4) &&
                a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
                b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
                b.extent[1] == ((int64_t)1 << f.bits)
@@ -394,7 +395,8 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
     const void* codes = h ? rad_planes_find(w.data, "codes", &ec) : nullptr;
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
-    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : ec->dtype == RAD_U6 ? 6 : 0;
+    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : ec->dtype == RAD_U6 ? 6
+        : 0;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
         et->kind != RAD_PLANE_TABLE || et->dtype != RAD_F32 ||
         et->rows * et->cols != ((int64_t)1 << bits))
@@ -406,26 +408,6 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
     out->cols = ec->cols;
     out->row_bytes = ec->row_bytes;
     out->bits = bits;
-    return 1;
-}
-
-/* NVFP4's codes are e2m1 nibbles (sign bit 3, magnitude index in bits 0-2 of {0, 0.5, 1, 1.5, 2,
- * 3, 4, 6}) read through this table as a u4 codebook, so one tile serves both forms. Code 8 is
- * negative zero, which contributes zero either way. */
-static const float kE2m1Table[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                                      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
-
-/* An NVFP4 expert's codes: the plain e2m1 plane, two codes a byte with element k in nibble k & 1
- * (rad_load_bits), row-major with a row every K / 2 bytes. A plain plane needs no joining. */
-static int cb_fp4(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
-    if (w.dtype != RAD_FP4E2M1 || w.rank < 2 || w.shape[0] < n || w.shape[1] < k || !w.data ||
-        k % 2 || w.stride[1] != 1)
-        return RAD_E_DTYPE;
-    out->t = w;
-    std::memcpy(out->tab, kE2m1Table, sizeof kE2m1Table);
-    out->cols = k;
-    out->row_bytes = k / 2;
-    out->bits = 4;
     return 1;
 }
 
@@ -563,7 +545,6 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     std::vector<CbTensor>  cbt;
     std::vector<CbScale>   cbs;
     bool codebook = false;
-    const CbForm cf = quant ? cb_form(a->p, a->n_p) : CbForm{ 0, 0, 0, false, false };
     for (int64_t e = 0; e < n_expert; ++e) {
         const int q = (int)(e % nc);
         const RadTensor* tw = Wq[q];
@@ -582,7 +563,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
         }
         if (quant) {
             CbTensor ct;
-            const int jc = cf.fp4 ? cb_fp4(we[(size_t)e], n, k, &ct) : cb_codes(we[(size_t)e], n, k, &ct);
+            const int jc = cb_codes(we[(size_t)e], n, k, &ct);
             if (jc < 0) return jc;
             if (e == 0 && jc > 0) {
                 codebook = true;
@@ -795,7 +776,8 @@ int ref_moe_gemm_w4a8(const RadArgs* a, RadStream) {
     if (p_int(a, "N", N) != N || p_int(a, "K", K) != K) return RAD_E_SHAPE;
 
     const int64_t n_even = (n_expert + 1) / 2, n_odd = n_expert / 2;
-    if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K) return RAD_E_SHAPE;
+    if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K)
+        return RAD_E_SHAPE;
     if (WS->rank < 3 || WS->shape[0] < n_even || WS->shape[1] < N || WS->shape[2] < K / 128)
         return RAD_E_SHAPE;
     if (n_odd > 0) {
@@ -850,12 +832,14 @@ int ref_moe_gemm_w4a8(const RadArgs* a, RadStream) {
                 if (e4m3) {
                     float dot = 0.f;
                     for (int64_t k = 0; k < 128; ++k)
-                        dot += fp8e4m3_to_f32(ap8[(size_t)src * a_ld + k0 + k]) * w4_code(wrow, k0 + k);
+                        dot += fp8e4m3_to_f32(ap8[(size_t)src * a_ld + k0 + k]) * w4_code(wrow,
+                            k0 + k);
                     term = dot * asr[b] * wscale;
                 } else {
                     int32_t sub = 0;
                     for (int64_t k = 0; k < 128; ++k)
-                        sub += (int32_t)ap[(size_t)src * a_ld + k0 + k] * (int32_t)w4_code(wrow, k0 + k);
+                        sub += (int32_t)ap[(size_t)src * a_ld + k0 + k] * (int32_t)w4_code(wrow,
+                            k0 + k);
                     term = (float)sub * asr[b] * wscale;
                 }
                 acc += term;
@@ -868,13 +852,14 @@ int ref_moe_gemm_w4a8(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ moe_gemm_w4a4 */
 /* moe_gemm_q dtype w4a4: y[i, :] = a[sorted_tok[i] / top_k, :] @ w[e(i)]^T. Both the activation and
- * the experts are two's-complement int4 (nibbles, -8..7) packed two per byte; the activation carries
- * one f32 scale per (row, 128 of K), each expert one bf16 scale per (row, 128 of K); the output is
- * bf16 in sorted order. The experts are two tables by parity (the even in `w` / `w_scale`, the odd in
- * `w_odd` / `w_odd_scale`, expert e at entry e/2 of class e%2). Each 128-block accumulates its raw
- * product sum in i32 (exact: both codes widen to int8), then folds (sub * a_scale) * w_scale in f32
- * in ascending block order -- the exact arithmetic and order the libr3d kernel runs, so the two agree
- * bit for bit. A row no expert owns (a dropped slot) is left as the caller set it. */
+ * the experts are two's-complement int4 (nibbles, -8..7) packed two per byte; the activation
+ * carries one f32 scale per (row, 128 of K), each expert one bf16 scale per (row, 128 of K); the
+ * output is bf16 in sorted order. The experts are two tables by parity (the even in `w` /
+ * `w_scale`, the odd in `w_odd` / `w_odd_scale`, expert e at entry e/2 of class e%2). Each
+ * 128-block accumulates its raw product sum in i32 (exact: both codes widen to int8), then folds
+ * (sub * a_scale) * w_scale in f32 in ascending block order -- the exact arithmetic and order
+ * the libr3d kernel runs, so the two agree bit for bit. A row no expert owns (a dropped slot) is
+ * left as the caller set it. */
 int ref_moe_gemm_w4a4(const RadArgs* a, RadStream) {
     if (!have(a, 9)) return RAD_E_INVAL;
     const RadTensor* A   = &a->t[0];
@@ -905,7 +890,8 @@ int ref_moe_gemm_w4a4(const RadArgs* a, RadStream) {
     if (p_int(a, "N", N) != N || p_int(a, "K", K) != K) return RAD_E_SHAPE;
 
     const int64_t n_even = (n_expert + 1) / 2, n_odd = n_expert / 2;
-    if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K) return RAD_E_SHAPE;
+    if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K)
+        return RAD_E_SHAPE;
     if (WS->rank < 3 || WS->shape[0] < n_even || WS->shape[1] < N || WS->shape[2] < K / 128)
         return RAD_E_SHAPE;
     if (n_odd > 0) {
@@ -919,7 +905,8 @@ int ref_moe_gemm_w4a4(const RadArgs* a, RadStream) {
     if (M <= 0 || numel(AS) < ar * (K / 128) || numel(ST) < T || numel(OF) < n_expert + 1)
         return RAD_E_SHAPE;
 
-    const int64_t a_ld  = A->rank >= 2 ? A->stride[0] / 2 : K / 2;   // BYTES per activation row (K int4 = K/2 bytes)
+    // BYTES per activation row (K int4 = K/2 bytes)
+    const int64_t a_ld  = A->rank >= 2 ? A->stride[0] / 2 : K / 2;
     const int64_t y_ld  = Y->rank >= 2 ? Y->stride[0] : N;
     const int64_t w_ld  = W->stride[1];                 // nibbles per weight row
     const int64_t ws_ld = WS->stride[1];                // scales per weight row
@@ -1138,10 +1125,10 @@ int ref_row_topk_merge(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ pair_argmax */
-/* The top-1 of a gathered pair plane as a proposal: one id per row at the output's pitch, so a block
- * drafter's per-position picks land contiguous in the token buffer it verifies. `pairs` holds `n`
- * (int32 id, f32 value) pairs per row, a negative id being a pad; largest value wins, ties to the
- * lower id, matching an argmax over the unsharded row.
+/* The top-1 of a gathered pair plane as a proposal: one id per row at the output's pitch, so a
+ * block drafter's per-position picks land contiguous in the token buffer it verifies. `pairs` holds
+ * `n` (int32 id, f32 value) pairs per row, a negative id being a pad; largest value wins, ties to
+ * the lower id, matching an argmax over the unsharded row.
  *
  * Not row_topk_merge with R = 1: a rank sending R = 1 sends 8 bytes, which a row-interleaved
  * all_gather of 16-byte words cannot carry, so ranks send R >= 2 and this takes the top-1 of all

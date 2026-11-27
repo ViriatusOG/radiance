@@ -99,8 +99,10 @@ struct MoveUnit {
      * report still attributes `bytes`, since padding is not weight. */
     int64_t slot_bytes = 0;
 
-    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), so
-     * the file tier can stage it with a read. A unit that is not never goes to the file tier. */
+    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), or
+     * the file tier relayouts it on each read (weight_file_relaid, PlannerInput::file_relayout), so
+     * the file tier can stage it with a read (and the relayout). A unit that is neither never
+     * goes to the file tier. */
     bool    file_direct = true;
 
     /* The drafter's own weights (the "mtp." namespace). They run on every draft pass of every
@@ -294,6 +296,10 @@ struct PlannerInput {
     /* No card is visible and the device backend is host memory (device_is_host()), so a host
      * kernel can read the weights pool as well as the mapping. See mapped_unit(). */
     bool                  host_backend = false;
+    /* The file tier relayouts a weight on every read when its kernel has a relayout
+     * (weight_file_relaid), so such a unit may go there too, not only one stored as it is read.
+     * The engine's mover does; a caller whose mover has no relayout leaves it false. */
+    bool                  file_relayout = false;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel
@@ -431,16 +437,22 @@ int64_t expert_vram_floor_draft_hosted(const WeightFootprint& wf, int64_t host_r
 int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
 
 /* The tables the placement flags move, identified by their readers rather than by name: a
- * model-level weight read by at least one op, and only by `embed_lookup`, is a token embedding;
- * only by `embed_lookup_q`, an n-gram table. A lookup reads M rows a step, so a tier below the
- * card is usable; a weight a GEMM also reads (an output head tied to the embedding) would stream
- * whole every step and is neither. Shared by the budget resolver and the planner. */
+ * model-level weight read by at least one op, and only by one token gather, is a token embedding;
+ * only by `embed_lookup_q`, an n-gram table. The token gathers are `embed_lookup` (a plain table)
+ * and the two gathers of a quantised table that plugin/exl3i serves, `embed_tq` and `embed_exl3i`.
+ * Each plane of a quantised table is a model-level weight of its own, so each is a table here, and
+ * none is sharded: a rank holds all of it. A gather reads a step's rows (embed_exl3i the 16-row
+ * group of each), so a tier below the card is usable; a weight a GEMM also reads (an output head
+ * tied to the embedding) would stream whole every step and is neither. An n-gram table read
+ * only by `embed_lookup_planes` (its planes read in place, each plane its own view) is one too.
+ * Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup");
+    return read_only_by(prog, w, "embed_lookup") || read_only_by(prog, w, "embed_tq") ||
+           read_only_by(prog, w, "embed_exl3i");
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup_q");
+    return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");
 }
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight": the report's per-class

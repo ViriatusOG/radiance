@@ -51,7 +51,7 @@ TEST(a_command_line_rule_goes_ahead_of_the_file) {
     const RecipeRule* m = r.match("output.weight");
     REQUIRE(m != nullptr);
     CHECK_EQ(m->origin, std::string("--quant"));
-    CHECK_EQ(m->options.size(), (size_t)3);
+    REQUIRE_EQ(m->options.size(), (size_t)3);
     CHECK_EQ(m->options[0].first, std::string("codes"));
     CHECK_EQ(m->options[2].second, std::string("bf16"));
     CHECK_EQ(r.match("blk.0.attn_q.weight")->origin, std::string("file:1"));

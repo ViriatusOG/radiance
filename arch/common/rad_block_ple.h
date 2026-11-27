@@ -45,13 +45,13 @@
  * gdn_conv_update's shifted layout, where the next read offset selects the history ending at the
  * last kept token. A prefill chunk commits everything and leaves its tail at offset zero, read by
  * the next step's `num_accepted` of 1. One layout cannot serve both, so step() issues both ops
- * once per half of the batch, as rad_block_gdn_fp8.h does.
+ * once per half of the batch, as rad_block_gdn_q.h does.
  */
 #ifndef RAD_BLOCK_PLE_H
 #define RAD_BLOCK_PLE_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"
+#include "rad_linear.h"
 
 namespace rad {
 namespace arch {
@@ -104,8 +104,8 @@ struct PleLayer {
      * halves the bytes a pass waits for once the rows are on the card. `a_embd` is their input and
      * `a_fed` the same planes for the second projection, whose codes the first one's quantiser
      * wrote. */
-    LinearFP8  key{}, value{};
-    ActFP8     a_embd{}, a_fed{};
+    LinearQ  key{}, value{};
+    ActQ     a_embd{}, a_fed{};
 
     rad_kvgroup kv_tok = 0, kv_conv = 0;
     rad_buf b_ids = 0, b_emb = 0, b_embd = 0, b_k = 0, b_v = 0, b_gv = 0, b_gvn = 0, b_out = 0;
@@ -334,7 +334,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         return RAD_E_INVAL;
 
     /* State slots come from RadKVGroupBatch::state_index, filled per group by the step batch, as in
-     * rad_block_gdn_fp8.h; the core's `conv_state_index` is not used.
+     * rad_block_gdn_q.h; the core's `conv_state_index` is not used.
      *
      * ---- the ops, in the order step() issues them ------------------------------------------- */
     layer_ = layer;
@@ -398,15 +398,11 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
             op_hint_hist = op_hint_round = op_hint_gather = 0;
     }
 
-    op_embd = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.embed_dim),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {b_emb}, {b_embd});
+    op_embd = cast_op(b, g.max_tok, c.embed_dim, g.dtype, g.dtype, b_emb, b_embd);
 
     /* The projections. An int8 one reads the embedding's int8 codes at its own scale group; the
      * first such quantises the bf16 plane and a second reads those codes, so two int8 projections
-     * must agree in rotation and group (LinearFP8 refuses the pair otherwise). */
+     * must agree in rotation and group (LinearQ refuses the pair otherwise). */
     {
         const char* kb = nm.f("blk.%d.ple_key", layer);
         const char* vb = nm.f("blk.%d.ple_value", layer);
@@ -465,7 +461,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
 }
 
 /* Slots come from the group batch, and `has_init` is `ctx_lens` (nonzero means a history), as in
- * rad_block_gdn_fp8.h.
+ * rad_block_gdn_q.h.
  *
  * The two windowed ops are issued once per half of the step (batch_split: decode sequences
  * [0, D) with tokens [0, DT) first, then prefill). The decode half passes `num_accepted`, so the

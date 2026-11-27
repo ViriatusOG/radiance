@@ -210,8 +210,9 @@ public:
     std::string diagnostics_json() const;
     bool startup_report_printed() const { return report_printed_; }
     /* The cards an engine may run on, as start() filters them (one architecture, discrete before
-     * integrated); the fleet places models on them. */
-    static int usable_cards(std::vector<int>* out);
+     * integrated; `prefer`, a card the configuration lists first, chooses the architecture); the
+     * fleet places models on them. */
+    static int usable_cards(std::vector<int>* out, int prefer = -1);
 
     /* --proceed-with-incompatible-configuration's banner (diag::unsupported_banner) on W lines;
      * main prints it before anything else, so it heads the log. */
@@ -274,7 +275,14 @@ private:
     std::unique_ptr<RadFile> file_;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
-    /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
+    /* --weight-sidecar FILE: a second, small container
+     * (written by rad-sidecar) whose entries replace the container's entries of the same name and
+     * logical shape in another encoding: declare sees the sidecar's encoding, the load reads its
+     * planes. Null when none is given (open_weight_sidecar). */
+    std::unique_ptr<RadFile> side_;
+    int open_weight_sidecar();
+    /* The source rad_weight_encoding answers from: container entries (or a sidecar's in their
+     * place) or checkpoint tensors. */
     WeightSourceFn sources() const;
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
@@ -330,11 +338,17 @@ public:
     struct LoraUse { std::string name; double weight = 1.0; };
     int gen_lora_acquire(const std::vector<LoraUse>& uses, int32_t* slot,
                          std::shared_ptr<void>* hold, std::string* note, std::string* err);
+    /* Strict CPU compatibility check through the same composition/packing path. It takes no
+     * adapter slot, uploads nothing and keeps existing holds intact. Unsupported components or
+     * a structural rank bound above capacity fail; an uncached acquire may wait for its CPU work. */
+    int gen_lora_validate(const std::vector<LoraUse>& uses, std::string* err);
     /* The adapter files a generator request may name: --lora's and those under --lora-dir. */
     std::vector<std::string> gen_lora_names() const;
 private:
     /* A generator keeps explicitly loaded files and snapshots discovered files on a cache miss. */
     int gen_lora_start();
+    int gen_lora_request(const std::vector<LoraUse>& uses, int32_t* slot, std::shared_ptr<void>* hold,
+                         std::string* note, std::string* err, bool validate_only);
     struct LoraReplacement {
         rad_buf buffer;
         std::vector<uint16_t> values;
@@ -516,6 +530,7 @@ private:
     int                           drain_tier_streams();
     int                           report_tier_jobs(std::vector<TierJob>& jobs,
                                                    const std::vector<char>& ok, uint64_t now);
+    void                          issue_planned_copy(TierPump& P);
     int                           release_deferred_quietly();
     std::vector<int>              rank_devices() const;   /* each rank's card, in rank order */
     server::Server*               srv_ = nullptr;   /* run_server's, while it runs */
@@ -714,7 +729,8 @@ private:
      * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
      * reads the states back once, then binds each to the verify row it will be coupled at. */
     bool     mtp_couple_ = false;
-    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    rad_buf  couple_state_buf_ = 0;                    /* rank 0's state plane */
+    std::vector<rad_buf> couple_draws_rank_;           /* the draws plane, by rank */
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
@@ -817,14 +833,34 @@ private:
     /* A program's block drafter rides its window in the window snapshot: it stores its context
      * in the context pass right behind the trunk step, and the snapshot is saved after that. Only
      * where the trunk's window is snapshotted at all (window_snapshots): a full-attention trunk
-     * takes no snapshot for a drafter's window alone. */
+     * takes no snapshot for a drafter's window alone. A model with linear state takes snapshots
+     * anyway, and its drafter's window rides in them only when asked
+     * (--checkpoint-draft-window): the slot then grows by a drafter window, in return for a hit
+     * that needs no draft refill. */
     bool drafter_window_snap(const Program& p) const {
-        return cfg_.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.depth > 0 &&
-               window_snapshots(p, cfg_);
+        if (!(cfg_.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.depth > 0))
+            return false;
+        if (window_snapshots(p, cfg_)) return true;
+        /* The flag adds the drafter's window to the slots a model with linear state already has;
+         * with none (no linear state, no trunk window) there are no slots to carry it. */
+        bool linear = false;
+        for (const KVGroupInfo& kg : p.kv_groups)
+            if (kg.decl.kind != RAD_KV_FULL && kg.decl.kind != RAD_KV_WINDOW &&
+                kg.decl.kind != RAD_KV_RING)
+                linear = true;
+        return cfg_.checkpoint_draft_window && linear && cfg_.prefix_cache &&
+               cfg_.checkpoint_interval > 0;
     }
     /* The drafter's window rides in the window snapshot (KVManager::drafter_window_snapshot), so
      * the checkpoint save waits for its context pass (save_checkpoints). */
     bool drafter_snap_ = false;
+    /* Set around one save_checkpoints() whose step ran no drafter context pass: the slot's
+     * drafter window would be stale, so the copy is skipped (the slot may be shared with a
+     * committed checkpoint) and the checkpoint is not committed. */
+    bool ckpt_save_skip_ = false;
+    /* Rate-limit state for the two skip warnings (per engine, not per process). */
+    int  ckpt_win_missing_ = 0;
+    bool ckpt_stale_warned_ = false;
     int  save_checkpoints();
     /* Checkpoints through the stage (KVManager::ckpt_stage).
      *

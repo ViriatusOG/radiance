@@ -87,8 +87,8 @@ TEST(vae_constants_are_the_reference_tables) {
     const auto& k = golden()["video"]["constants"];
     const auto mean = k["latents_mean"].get<std::vector<double>>();
     const auto stdv = k["latents_std"].get<std::vector<double>>();
-    CHECK_EQ(mean.size(), 24u);
-    CHECK_EQ(stdv.size(), 24u);
+    REQUIRE_EQ(mean.size(), 24u);
+    REQUIRE_EQ(stdv.size(), 24u);
     for (size_t i = 0; i < mean.size() && i < 24; ++i) {
         CHECK(kVaeLatentsMean[i] == mean[i]);
         CHECK(kVaeLatentsStd[i] == stdv[i]);

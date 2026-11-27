@@ -175,6 +175,7 @@ struct ComposeReport {
     int64_t exact = 0;               /* ... held exactly */
     double  worst_kept = 1.0;        /* lowest kept energy among the truncated */
     std::string worst_module;
+    std::string over_rank; // First module whose structural rank bound exceeds the slot rank.
     std::vector<std::string> unplaced;   /* "<adapter>: <key>: why" */
     std::vector<std::string> skipped;    /* "<adapter>: <tensor>: why" */
 };

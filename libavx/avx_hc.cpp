@@ -396,10 +396,10 @@ AVX_KERNEL(hc_project) {
  *
  * Entry of the multi-token-prediction head for a model with an `hc`-wide residual stream.
  *
- * A pre-norm MTP head usually joins the trunk's hidden state and the next token's embedding with one
- * `fc` over their concatenation. Qwen4-Exp's hidden state is the wide stream and the checkpoint has
- * two square matrices: `fc_h` is applied to each of the hc sub-streams, and one n-wide embedding
- * product is added into all of them.
+ * A pre-norm MTP head usually joins the trunk's hidden state and the next token's embedding with
+ * one `fc` over their concatenation. Qwen4-Exp's hidden state is the wide stream and the checkpoint
+ * has two square matrices: `fc_h` is applied to each of the hc sub-streams, and one n-wide
+ * embedding product is added into all of them.
  *
  *     ne[j]     = e[j] * rsqrt(mean(e^2) + eps) * (w_e[j] + wadd)
  *     fe[i]     = sum_j fc_e[i][j] * ne[j]

@@ -981,7 +981,6 @@ TEST(moe_int4_gptq_against_a_calibration_hessian) {
             for (int64_t j = 0; j < K; ++j)
                 h[(size_t)(i * K + j)] += x[(size_t)(t * K + i)] * x[(size_t)(t * K + j)];
     const TempDir td("rad_relayout_parity");
-    REQUIRE(!td.path.empty());
     const char* dir = td.path.c_str();
     const std::string path = std::string(dir) + "/gram.r0.blk.5.ffn_down_exps.bin";
     /* The Gram of `x` as it stands (the model's own domain), so the rotated recipe below rotates

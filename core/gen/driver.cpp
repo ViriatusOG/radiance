@@ -90,6 +90,8 @@ int64_t carve(const Sizes& z, int64_t pixel_ch, int64_t (*bytes)[2], int n) {
         { 0, z.S * I },                 /* R_SAMP */
         { 0, z.S * I },                 /* R_STEPI */
         { 0, 2 * z.S * 4 },             /* R_SIZE */
+        { 0, J * z.S * 4 },             /* R_REF_BIAS */
+        { 0, J * 3 * z.S * 4 },         /* R_MODE_SIGMA */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -115,6 +117,7 @@ int Driver::init(const Program& prog, IKVManager* kv, const std::vector<RankIO>&
     fini();
     if (!prog.is_generator()) return RAD_E_STATE;
     decl_   = prog.generator;
+    grounded_joint_ = joint() && !prog.gen_str.tmpl_image.empty();
     fixed_  = prog.gen_str.sigmas;
     kv_     = kv;
     ranks_  = ranks;
@@ -216,6 +219,10 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
         if (why) *why = w;
         return RAD_E_INVAL;
     };
+    if (!std::isfinite(r->ref_log_bias) || std::fabs(r->ref_log_bias) > 16.0f)
+        return no("the reference log bias must be finite and in [-16, 16]");
+    if (r->ref_log_bias != 0.0f && (!grounded_joint_ || r->refs.empty()))
+        return no("reference boost needs grounded reference conditioning");
     if (r->width <= 0 || r->height <= 0 || r->width % d.size_multiple || r->height % d.size_multiple)
         return no("the size must be whole multiples of " + std::to_string(d.size_multiple) +
                   " pixels");
@@ -240,12 +247,22 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
         return no("n must be 1.." + std::to_string(d.max_lanes));
     if ((int64_t)r->refs.size() > d.max_refs)
         return no("at most " + std::to_string(d.max_refs) + " pictures a request");
+    const bool outfill = r->outfill.w || r->outfill.h || r->outfill.x || r->outfill.y;
+    if (outfill && (!grounded_joint_ || d.latent_scale != 16 || r->refs.size() != 1 ||
+                        r->inpaint || r->ref_log_bias != 0.0f || r->outfill.x < 0 || r->outfill.y < 0 ||
+                        r->outfill.w <= 0 || r->outfill.h <= 0 ||
+                        (int64_t)r->outfill.x + r->outfill.w > r->width ||
+                        (int64_t)r->outfill.y + r->outfill.h > r->height))
+        return no("the outfill reference does not fit its destination");
     for (const Branch* b : { &r->pos, &r->neg }) {
         if (b == &r->neg && !r->has_neg) continue;
         if (d.aux_tokens && (b->aux.empty() || (int64_t)b->aux.size() > d.aux_max_tokens))
             return no("the prompt is " + std::to_string(b->aux.size()) + " tokens to the "
                       "model's second tokenizer, which reads 1.." +
                       std::to_string(d.aux_max_tokens));
+        if (grounded_joint_ && (int64_t)b->tokens.size() - b->n_drop >
+                                   decl_.cond_rows - decl_.max_refs * decl_.max_tokens)
+            return no("the prompt with its pictures exceeds the conditioning token limit");
         if ((int64_t)b->tokens.size() > max_tok_)
             return no("the prompt is " + std::to_string(b->tokens.size()) + " tokens with its "
                       "pictures; a conditioning pass carries " + std::to_string(max_tok_));
@@ -258,7 +275,13 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
                       " (--mm-max-patches)");
     }
     int64_t px = 0;
-    for (const Pixels& p : r->refs) px += (int64_t)p.w * p.h;
+    for (const Pixels& p : r->refs) {
+        if (grounded_joint_ && (p.w <= 0 || p.h <= 0 || p.w % d.latent_scale ||
+                                p.h % d.latent_scale || p.w > r->width || p.h > r->height ||
+                                (int64_t)p.bf16.size() != (int64_t)p.w * p.h * d.pixel_channels))
+            return no("the reference picture does not fit the latent grid");
+        px += (int64_t)p.w * p.h;
+    }
     if (r->inpaint) px += (int64_t)r->inp_src.w * r->inp_src.h;
     if (px > max_px_) return no("the pictures are larger than the staging holds");
     if (r->inpaint && ((int64_t)r->inp_mask.size() != tokens || r->inp_src.w != r->width ||
@@ -361,7 +384,8 @@ int Driver::admit_locked() {
                 const int s = joint()
                     ? build_joint_layout(b ? r.neg : r.pos, decl_.pad_multiple,
                                          decl_.rope_hw_scale, decl_.rope_text_l != 0, j.ref_hw,
-                                         &j.cond[b].lay, &why)
+                                         &j.cond[b].lay, &why, grounded_joint_, j.h_lat, j.w_lat,
+                                         r.outfill)
                     : build_layout(b ? r.neg : r.pos, decl_.slot_rows, j.ref_hw, &j.cond[b].lay,
                                    &why);
                 if (s < 0) { fail_locked(j, s, why); break; }
@@ -419,6 +443,17 @@ int Driver::admit_locked() {
             j.sigmas = schedule_discrete(decl_, table_, r.scheduler, r.steps);
             j.tsteps.clear();
             for (float sg : j.sigmas) j.tsteps.push_back(sg > 0 ? (float)table_.timestep(sg) : 0.0f);
+        } else if (r.outfill.w) {
+            /* ComfyUI's ModelSamplingFlux uses a fixed exponential shift for outpaint. */
+            RadGeneratorDecl sampling = decl_;
+            sampling.sigma_grid = 10000;
+            sampling.dyn_shift = 1;
+            sampling.shift_exp = 1;
+            sampling.base_shift = sampling.max_shift = 1.15;
+            sampling.base_seq = 256;
+            sampling.max_seq = 4096;
+            sampling.shift_terminal = 0;
+            j.sigmas = schedule(sampling, {}, r.steps ? r.steps : 8, j.tokens);
         } else {
             j.sigmas = schedule(decl_, fixed_, r.steps, j.tokens);
         }
@@ -880,6 +915,8 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
     int32_t* samp = hptr<int32_t>(R_SAMP);
     int32_t* stepi = hptr<int32_t>(R_STEPI);
     float* size = hptr<float>(R_SIZE);
+    float* ref_bias = joint() ? hptr<float>(R_REF_BIAS) : nullptr;
+    float* mode_sigma = joint() ? hptr<float>(R_MODE_SIGMA) : nullptr;
     host_entry_.assign((size_t)(4 * S), 0);
     int64_t row = 0;
     cu[0] = 0;
@@ -903,6 +940,7 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
             }
             for (int cc = 0; cc < 4; ++cc)
                 std::memcpy(ropef + cc * n_tok + row, c.lay.rope_f.data() + cc * P, (size_t)P * 4);
+            ref_bias[i] = j.req->outfill.w ? -INFINITY : j.req->ref_log_bias;
             mcu[3 * i] = (int32_t)row;
             mcu[3 * i + 1] = (int32_t)(row + c.lay.text);
             mcu[3 * i + 2] = (int32_t)(row + P);
@@ -925,6 +963,10 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
         row += N;
         cu[i + 1] = (int32_t)row;
         sig[i] = j.sigmas[(size_t)ln.step];
+        if (joint()) {
+            mode_sigma[3 * i] = mode_sigma[3 * i + 2] = sig[i];
+            mode_sigma[3 * i + 1] = j.req->outfill.w ? 0.0f : sig[i];
+        }
         sign[i] = j.sigmas[(size_t)ln.step + 1];
         sigp[i] = ln.step > 0 ? j.sigmas[(size_t)ln.step - 1] : 0.0f;
         tstep[i] = discrete() ? j.tsteps[(size_t)ln.step] : 0.0f;
@@ -995,6 +1037,8 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
         reg_[R_IROWS].used = n_img * 4;
         reg_[R_ICU].used = (S + 1) * 4;
         reg_[R_MCU].used = (3 * S + 1) * 4;
+        reg_[R_REF_BIAS].used = S * 4;
+        reg_[R_MODE_SIGMA].used = 3 * S * 4;
         reg_[R_ROPEF].used = 4 * n_tok * 4;
     } else {
         reg_[R_GROPE].used = 3 * n_tok * 4;
@@ -1038,6 +1082,8 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
             G.img_cu = dptr<int32_t>(ri, R_ICU);
             G.img_rows = dptr<int32_t>(ri, R_IROWS);
             G.mode_cu = dptr<int32_t>(ri, R_MCU);
+            G.ref_log_bias = dptr<float>(ri, R_REF_BIAS);
+            G.mode_sigma = dptr<float>(ri, R_MODE_SIGMA);
             G.rope_f = dptr<float>(ri, R_ROPEF);
             G.slot_mapping = nullptr;
             G.mode_rows = dptr<int32_t>(ri, R_MROWS);

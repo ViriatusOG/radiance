@@ -17,9 +17,9 @@
  * ============================== The rotation ==============================
  *
  * Unnormalised butterflies at ascending strides 1, 2, 4, ... group/2, pairing i with i+h where
- * (i & h) == 0: the order and pairing of r4d_fwht.h, so the two agree bit for bit. The 1/sqrt(group)
- * is folded into the scale, as the fast kernel does; scaling every element by a constant cannot
- * change its int8 code here.
+ * (i & h) == 0: the order and pairing of r4d_fwht.h, so the two agree bit for bit. The
+ * 1/sqrt(group) is folded into the scale, as the fast kernel does; scaling every element by a
+ * constant cannot change its int8 code here.
  */
 #include "ref_common.h"
 #include "ref_gemm.h"   /* Mat and Scales, for gemm_nt_q_gated */
@@ -254,52 +254,6 @@ int ref_gated_had_quant_i8(const RadArgs* a, RadStream) {
             return (act == 1 ? act_sigmoid(gate) : act_silu(gate)) * x;
         };
         stt(s, r * laststride(s), had_i8_row(gated, n, g, q, rowoff(q, r, n), laststride(q)));
-    }
-    return RAD_OK;
-}
-
-/* ------------------------------------------------------------------ gated_quant_i8 */
-/* gated_had_quant_i8 without the rotation: the same gated product (the same `act`, SiTU included),
- * quantised per `group` contiguous elements, default 128, against one f32 scale each as
- * quant_act_i8g writes them. The NVFP4 experts' down projection reads this form. */
-int ref_gated_quant_i8(const RadArgs* a, RadStream) {
-    if (a->n_t < 4) return RAD_E_INVAL;
-    const RadTensor *ga = &a->t[0], *q = &a->t[2], *s = &a->t[3];
-    const RadTensor* up = t_in(a, 1);
-    if (!ga->data || !q->data || !s->data) return RAD_E_INVAL;
-    const int64_t n = p_int(a, "n", 0);
-    int64_t g = p_int(a, "group", 128);
-    static const char* kActs[] = { "silu", "sigmoid", "situ" };
-    const int act = p_enum(a, "act", kActs, 3, (int)p_int(a, "mode", 0));
-    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
-    if (n <= 0) return RAD_E_SHAPE;
-    if (act < 0 || act > 2) return RAD_E_INVAL;
-    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
-        return RAD_E_INVAL;
-    if (g <= 0 || g > n) g = n;
-    const int64_t ngrp = (n + g - 1) / g;
-    const int64_t rows = numel(q) / n;
-    if (rows <= 0 || numel(s) < rows * ngrp) return RAD_E_SHAPE;
-    if (numel(ga) < rows * (up ? n : 2 * n)) return RAD_E_SHAPE;
-    if (up && numel(up) < rows * n) return RAD_E_SHAPE;
-
-    REF_PAR_FOR(rows * n * 8)
-    for (int64_t r = 0; r < rows; ++r) {
-        const int64_t gb = rowoff(ga, r, up ? n : 2 * n), gs = laststride(ga);
-        const int64_t ub = up ? rowoff(up, r, n) : 0, us = up ? laststride(up) : 0;
-        auto gated = [&](int64_t i) {
-            const float gate = ldt(ga, gb + i * gs);
-            const float x    = up ? ldt(up, ub + i * us) : ldt(ga, gb + (n + i) * gs);
-            if (act == 2) return act_situ_gate(gate, gcap) * act_situ_up(x, ucap);
-            return (act == 1 ? act_sigmoid(gate) : act_silu(gate)) * x;
-        };
-        const int64_t qb = rowoff(q, r, n), qs = laststride(q);
-        for (int64_t gi = 0; gi < ngrp; ++gi) {
-            const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
-            const float sc = q8_group([&](int64_t i) { return gated(k0 + i); }, k1 - k0, 127.0f, q,
-                                      qb + k0 * qs, qs);
-            stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
-        }
     }
     return RAD_OK;
 }
@@ -571,7 +525,7 @@ int ref_gram_accum(const RadArgs* a, RadStream) {
  */
 
 /* One group-scaled fp8 row from the values in `v`; constants and scale layout as quant_act_fp8.
- * An int8 `q` (an int8 linear's input, ActFP8::q8_fed) takes quant_act_i8g's codes instead, scale
+ * An int8 `q` (an int8 linear's input, ActQ::q8_fed) takes quant_act_i8g's codes instead, scale
  * amax / 127, as libr4d's fused quantisers write them. */
 static inline void fp8_row(const float* v, int64_t n, int64_t g, const RadTensor* q,
                            const RadTensor* s, int64_t r) {
@@ -690,8 +644,8 @@ int ref_gated_quant_fp8(const RadArgs* a, RadStream) {
  * gate, and an optional parameter would let it resolve for the other.
  *
  * Byte-identical to gemm_nt_q followed by gated_quant_fp8 (ref_test checks it): the product comes
- * from `quant_dot` as gemm_nt_q's does, and both halves are narrowed to bf16 before the gate, as the
- * unfused pair writes and re-reads a bf16 [M, N] tensor.
+ * from `quant_dot` as gemm_nt_q's does, and both halves are narrowed to bf16 before the gate, as
+ * the unfused pair writes and re-reads a bf16 [M, N] tensor.
  *
  * Comparing against a device kernel on the engine's own operands needs the layout inverted first:
  * libr4d stores fp8a8 weights in WMMA fragment order (r4d.fp8.w.frag64) while libref reads [N, K]
@@ -859,7 +813,8 @@ static int ref_markov_greedy(const RadArgs* a, uint32_t logits_dtype) {
         return RAD_E_SHAPE;
 
     const int64_t ls = laststride(logits), ps = laststride(pred), ss = laststride(succ);
-    const int64_t os = laststride(out), tss = laststride(tile_scores), tis = laststride(tile_tokens);
+    const int64_t os = laststride(out), tss = laststride(tile_scores),
+        tis = laststride(tile_tokens);
     REF_PAR_FOR(M * steps * V * R)
     for (int64_t m = 0; m < M; ++m) {
         std::vector<float> previous((size_t)R);

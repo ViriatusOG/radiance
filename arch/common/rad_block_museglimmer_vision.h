@@ -68,7 +68,7 @@
 #define RAD_BLOCK_MUSEGLIMMER_VISION_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"
+#include "rad_linear.h"
 
 #include <cmath>
 #include <cstdio>
@@ -88,9 +88,9 @@ namespace arch {
 struct MuseVisionAct {
     rad_buf q = 0, s = 0;
     int declare(RadBuilder* b, Names& nm, const char* name, int64_t rows, int64_t n) {
-        if (n % RAD_FP8_BLOCK) return RAD_E_SHAPE;
+        if (n % RAD_SCALE_GROUP) return RAD_E_SHAPE;
         q = decl_b(b, nm.f("%s.q", name), RAD_I8, { rows, n });
-        s = decl_b(b, nm.f("%s.s", name), RAD_F32, { rows, n / RAD_FP8_BLOCK });
+        s = decl_b(b, nm.f("%s.s", name), RAD_F32, { rows, n / RAD_SCALE_GROUP });
         return q && s ? RAD_OK : RAD_E_INVAL;
     }
 };
@@ -139,7 +139,7 @@ struct MuseVisionLinear {
                             "int8 with a bf16 scale per (row, 128 of K)\n", wn, fmt);
             return RAD_E_DTYPE;
         }
-        if (N % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK) {
+        if (N % RAD_SCALE_GROUP || K % RAD_SCALE_GROUP) {
             fprintf(stderr, "radiance: museglimmer vision: '%s' is %lldx%lld; an int8 linear "
                             "needs N and K in whole 128s\n", wn, (long long)N, (long long)K);
             return RAD_E_SHAPE;
@@ -148,7 +148,7 @@ struct MuseVisionLinear {
         w = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, RAD_ACCESS_PER_REQUEST,
                       RAD_SHARD_NONE, group, part_n ? part_w : nullptr, (int)part_n);
         ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_BF16,
-                       { N, K / RAD_FP8_BLOCK }, RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, group,
+                       { N, K / RAD_SCALE_GROUP }, RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, group,
                        part_n ? part_w : nullptr, (int)part_n);
         return w && ws ? RAD_OK : RAD_E_INVAL;
     }
@@ -176,13 +176,10 @@ struct MuseVisionLinear {
             return op ? RAD_OK : RAD_E_INVAL;
         }
         if (!a.q || !a.s) return RAD_E_INVAL;
-        op_q = rw(b, RAD_OP(b, "quant_act_i8g",
-                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", K),
-                                    RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
-                         RAD_NOWEIGHTS), { x }, { a.q, a.s });
+        op_q = decl_quant_act(b, "quant_act_i8g", rows, K, RAD_SCALE_GROUP, x, a.q, a.s);
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                               RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8"),
+                               RAD_INT("group", RAD_SCALE_GROUP), RAD_STR("dtype", "i8a8"),
                                RAD_INT("w_rb", 1)),
                     RAD_WEIGHTS(w, ws)),
                 { a.q, a.s }, { tmp });

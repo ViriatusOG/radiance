@@ -130,9 +130,12 @@ struct Grid {
      * is ~37): values a 16-bit reader takes exactly (f16 holds integers to 2048), so the code is not
      * held to the int8 grid's ~42 dB floor. No int8 encoding can carry it; gptqsim measures it. */
     bool     tcq_wide = false;
+    /* gpu=0: a trellis rule that runs its GPTQ on this thread's host loop instead of the cards,
+     * so a conversion can divide large weights between the host pool and --gpus. */
+    bool     gpu = true;
 
-    /* The planes of the encoding, by index; -1 when the grid has none. */
-    int plane_zero() const { return asym ? 2 : -1; }
+    /* The planes of the encoding after codes (0) and scale (1), by index, in the order
+     * grid_encoding adds them; -1 when the grid has none. */
     int plane_grid() const {
         return vq.empty() && !tcq_L ? -1 : 2 + (asym ? 1 : 0) + (lv2 ? 1 : 0);
     }
@@ -246,11 +249,15 @@ struct Scales {
     std::vector<BlockScale> b;
     int64_t nr = 0, nc = 0;            /* first-level blocks */
     int64_t br = 1, bc = 1;            /* their extents, resolved against the call */
+    /* A window (a card's row chunk of a larger call): b's row 0 is the call's row r0, and
+     * s2's first block row is the call's block r2_0. Full calls leave both 0. */
+    int64_t r0 = 0, r2_0 = 0;
     std::vector<float> s2;             /* the second level as stored */
     int64_t nr2 = 0, nc2 = 0;
     std::vector<float> colf;           /* tcq_colf: each 128-column block's factor, all rows' */
     const BlockScale& at(int64_t r, int64_t c) const {
-        return b[(size_t)((r / br) * nc + c / bc)];
+        const int64_t rr = r - r0;
+        return b[(size_t)((rr / br) * nc + c / bc)];
     }
 };
 

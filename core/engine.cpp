@@ -2173,13 +2173,28 @@ int Engine::save_checkpoints() {
         const int ss = sched_.locked([&]() -> int {
             for (const StepEntry& e : plan.e) {
                 if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
+                if (ckpt_save_skip_) continue;     /* marked by the caller; nothing copied */
                 if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
                 /* The window behind the checkpoint position. This step's chunk reaches it, and
-                 * a window slides only from a step's first query, so a miss is a broken
-                 * invariant; skipping would commit a slot holding another sequence's pages. */
+                 * a window slides only from a step's first query, so a miss in a trunk group is a
+                 * broken invariant, and committing the slot would leave it holding another
+                 * sequence's pages. */
+                bool bad_drafter = false;
                 if (ranks_[0]->kv.has_window_snapshot() &&
                     !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
-                                               &ckpt_win_)) {
+                                               &ckpt_win_, &bad_drafter)) {
+                    /* Only the drafter's window missing: the drafter is an optimisation, so skip
+                     * this checkpoint (not committed, counted) instead of failing the engine. */
+                    if (bad_drafter) {
+                        const int n_bad = ++ckpt_win_missing_;
+                        if (n_bad <= 4 || n_bad % 64 == 0)
+                            RAD_WARN("sequence %llu: the drafter's window behind checkpoint %d is "
+                                     "not held; checkpoint not committed (occurrence %d; first 4, "
+                                     "then every 64th)", (unsigned long long)e.seq,
+                                     (int)(e.ctx_len + e.ckpt_tok + 1), n_bad);
+                        sched_.skip_ckpt_commit_locked(e.seq, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+                        continue;
+                    }
                     RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
@@ -2677,6 +2692,17 @@ int Engine::arena_step(const RadBatch* b) {
     return RAD_OK;
 }
 
+/* Starts the planned tier copy on every rank's transfer stream; a rank that fails to start keeps
+ * its error in copy_st. */
+void Engine::issue_planned_copy(TierPump& P) {
+    P.copy_st.assign(ranks_.size(), 0);
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        const int st = ranks_[i]->tierx.issue_copy(P.copy, ranks_[i]->ctx.stream());
+        if (st < 0) P.copy_st[i] = st;
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+}
+
 int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_, rows); }
 
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
@@ -2753,14 +2779,7 @@ void Engine::tier_tick() {
             const auto lk = sched_.hold();
             lead.tiers.plan_writeback(P.max_copy, &P.copy);
         }
-        if (!P.copy.empty()) {
-            P.copy_st.assign(ranks_.size(), 0);
-            for (size_t i = 0; i < ranks_.size(); ++i) {
-                const int st = ranks_[i]->tierx.issue_copy(P.copy, ranks_[i]->ctx.stream());
-                if (st < 0) P.copy_st[i] = st;
-            }
-            if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
-        }
+        if (!P.copy.empty()) issue_planned_copy(P);
     }
 
     /* ---- what is not live leaves VRAM -------------------------------------------------------- */
@@ -2830,12 +2849,7 @@ bool Engine::flush_copies() {
         if (!lead.tiers.writeback_waiting()) break;
         lead.tiers.plan_writeback(P.max_copy, &P.copy);
         if (P.copy.empty()) break;
-        P.copy_st.assign(ranks_.size(), 0);
-        for (size_t i = 0; i < ranks_.size(); ++i) {
-            const int st = ranks_[i]->tierx.issue_copy(P.copy, ranks_[i]->ctx.stream());
-            if (st < 0) P.copy_st[i] = st;
-        }
-        if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
+        issue_planned_copy(P);
     }
     return landed;
 }
@@ -3294,7 +3308,7 @@ std::string Engine::engine_info() const {
         if (!pl || pl->name.empty() || pl->n_layers <= 0) continue;
         Json k;
         k["name"]     = pl->name;
-        k["kind"]     = bld_kv_kind_name(pl->kind);
+        k["kind"]     = kv_kind_name(pl->kind);
         k["n_layers"] = pl->n_layers;
         k["bytes"]    = pl->pool_bytes;
         if (pl->paged()) {
@@ -3610,6 +3624,7 @@ int Engine::run_server() {
 
             s.link.present        = true;
             s.link.world          = (int)ranks_.size();
+            s.link.ranks.clear();
             s.link.ar_calls       = ranks_[0]->ctx.ar_calls();
             s.link.ar_bytes       = ranks_[0]->ctx.ar_bytes();
             s.link.h2d_bytes = s.link.d2h_bytes = s.link.ssd_reads = 0;
@@ -3639,6 +3654,59 @@ int Engine::run_server() {
                 s.link.prefetch_bytes += (int64_t)rms.prefetch_bytes;
                 s.link.staged_bytes   += (int64_t)rms.staged_bytes;
                 if (rk->heat.enabled()) s.link.stream_bytes += (int64_t)rk->heat.stats().stream_bytes;
+                /* Rank by rank as well (LinkStat::Rank). */
+                server::LinkStat::Rank lr;
+                lr.ar_calls       = rk->ctx.ar_calls();
+                lr.ar_bytes       = rk->ctx.ar_bytes();
+                lr.h2d_bytes      = (int64_t)rms.h2d_bytes;
+                lr.d2h_bytes      = (int64_t)rms.d2h_bytes;
+                lr.prefetch_bytes = (int64_t)rms.prefetch_bytes;
+                lr.staged_bytes   = (int64_t)rms.staged_bytes;
+                lr.promotions     = (int64_t)rms.promotions;
+                lr.demotions      = (int64_t)rms.demotions;
+                const bool live = rk->heat.enabled();
+                if (live) {
+                    const HeatStats rhs = rk->heat.stats();
+                    lr.stream_bytes    = (int64_t)rhs.stream_bytes;
+                    lr.routed          = (int64_t)rhs.routed;
+                    lr.routed_resident = (int64_t)rhs.routed_resident;
+                }
+                for (size_t u = 0; u < rk->plan.units.size(); ++u) {
+                    const MoveUnit& mu = rk->plan.units[u];
+                    if (mu.expert < 0 || mu.layer < 0) continue;
+                    const Tier t = live ? rk->heat.tier_published((int32_t)u) : mu.tier;
+                    lr.units++;
+                    if (t == Tier::VRAM) lr.units_vram++;
+                    else if (t == Tier::HostPinned) lr.units_pinned++;
+                }
+                s.link.ranks.push_back(lr);
+            }
+            /* Card to card: what each rank's collectives sent to each rank (Ctx::traffic). */
+            {
+                static const char* const kRoute[] = { "oneshot", "twoshot", "twoshot_coded", "lossy", "gather" };
+                const int w = (int)ranks_.size();
+                std::vector<Ctx::LinkTraffic> tr;
+                for (auto& rk : ranks_) tr.push_back(rk->ctx.traffic());
+                s.link.ar_routes.clear();
+                s.link.ar_uncounted_calls = 0;
+                s.link.ar_traffic = w <= Ctx::kTrafficRanks && !tr.empty() && tr[0].present;
+                if (s.link.ar_traffic) {
+                    for (int i = 0; i < Ctx::kTrafficRoutes; ++i) s.link.ar_routes.push_back({ kRoute[i], 0, 0 });
+                    for (int r = 0; r < w; ++r) {
+                        auto& lr = s.link.ranks[(size_t)r];
+                        lr.ar_to.assign((size_t)w, 0);
+                        for (int q = 0; q < w; ++q) {
+                            lr.ar_to[(size_t)q] = tr[(size_t)r].to[q];
+                            lr.ar_out_bytes += tr[(size_t)r].to[q];
+                            lr.ar_in_bytes  += tr[(size_t)q].to[r];
+                        }
+                        for (int i = 0; i < Ctx::kTrafficRoutes; ++i) {
+                            s.link.ar_routes[(size_t)i].calls += tr[(size_t)r].route_calls[i];
+                            s.link.ar_routes[(size_t)i].bytes += tr[(size_t)r].route_bytes[i];
+                        }
+                        s.link.ar_uncounted_calls += tr[(size_t)r].uncounted;
+                    }
+                }
             }
             /* KV streaming: only rank 0's resolve counters are read -- every rank sees the same
              * misses by design -- so the figure takes the world factor to reach all cards, the
@@ -3858,6 +3926,12 @@ int Engine::run_server() {
             for (const auto& [n, w] : u) uses.push_back({ n, w });
             return gen_lora_acquire(uses, slot, hold, note, e);
         };
+        o.gen_lora_validate = [this](const std::vector<std::pair<std::string, double>>& choices,
+                                     std::string* err) {
+            std::vector<LoraUse> uses;
+            for (const auto& [name, weight] : choices) uses.push_back({name, weight});
+            return gen_lora_validate(uses, err);
+        };
         o.gen_lora_names = [this] { return gen_lora_names(); };
         o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
             return lora_load(n, d, e);
@@ -3909,7 +3983,8 @@ int Engine::run_server() {
          * are refused by name: LFM2-VL takes pictures only, and a token-budget processor (Gemma
          * 4's) sizes by soft tokens (--image-tokens, --video-max-frame-tokens), not pixel
          * bands. */
-        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next) &&
+        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next ||
+             vc.family == mm::Family::Inkling2) &&
             (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
              cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
             RAD_ERR("media: this model's processor takes pictures, not video, so the --video-* "
@@ -3959,6 +4034,16 @@ int Engine::run_server() {
                 RAD_ERR("media: this model's processor sizes images by a token budget, so "
                         "--image-min-pixels and --image-max-pixels do nothing; use "
                         "--image-tokens");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.image_tokens) vc.max_image_tokens = *cfg_.image_tokens;
+        } else if (vc.family == mm::Family::Inkling2) {
+            /* Inkling 2 pads rather than resizes, so only the cap in cells (--image-tokens)
+             * applies; the pixel bands would do nothing. */
+            if (cfg_.image_min_pixels || cfg_.image_max_pixels) {
+                RAD_ERR("media: this model's processor pads a picture to whole 40-pixel cells "
+                        "rather than resizing it, so --image-min-pixels and --image-max-pixels "
+                        "do nothing; use --image-tokens to cap its cells");
                 return RAD_E_INVAL;
             }
             if (cfg_.image_tokens) vc.max_image_tokens = *cfg_.image_tokens;
@@ -4075,6 +4160,12 @@ int Engine::run_server() {
                      ranks_[0]->program.encoder_name.c_str(), mm_proc->config().image_soft_tokens,
                      mm_proc->config().video_soft_tokens, mm_proc->config().fps,
                      mm_proc->config().max_frames, (long long)encd.max_patches);
+        else if (mm_proc->config().family == mm::Family::Inkling2)
+            RAD_INFO("media: images through '%s'; a picture is padded to whole %d-pixel cells, "
+                     "one token a cell, at most %d cells (larger pictures shrink to that); %lld "
+                     "patches a pass", ranks_[0]->program.encoder_name.c_str(),
+                     mm_proc->config().factor(), mm_proc->config().max_image_tokens,
+                     (long long)encd.max_patches);
         else if (mm_proc->config().family == mm::Family::Radio)
             RAD_INFO("media: %s%s through '%s'; an image becomes one tile of %d..%d patches "
                      "(a quarter as many tokens), a video frame about %d patches, %d frames a "
@@ -4235,7 +4326,10 @@ int Engine::run_server() {
         in.max_tokens = gd.max_tokens;
         /* Edits need the conditioning network to read pictures, unless only the generator's
          * own encoder reads them. */
-        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP;
+        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP && in.tmpl_image.empty();
+        // A JOINT_STEP image template declares grounded vision plus latent references (Krea).
+        // Other JOINT_STEP generators keep their encoder-only reference preparation.
+        in.refs_fit_output = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP && !in.refs_encoder_only;
         in.max_refs = mm_proc || in.refs_encoder_only ? gd.max_refs : 0;
         in.ref_shrink_only = gd.ref_shrink_only != 0;
         in.ref_area = gd.ref_area;
@@ -4501,17 +4595,22 @@ int Engine::run_server() {
         if (!efforts.empty()) {
             std::string list;
             for (const std::string& e : efforts) list += (list.empty() ? "" : ", ") + e;
-            RAD_INFO("chat: the template takes reasoning_effort %s, and none or minimal turn "
-                     "thinking off%s%s", list.c_str(), mapped.empty() ? "" : "; mapped: ",
-                     mapped.c_str());
+            RAD_INFO("chat: the template takes reasoning_effort %s; %s%s%s", list.c_str(),
+                     server::off_efforts_note(srv.template_off_efforts()).c_str(),
+                     mapped.empty() ? "" : "; mapped: ", mapped.c_str());
             /* What a request naming no effort gets, which a client cannot see: a template may
              * render a level into a system prompt (Qwen3.8's renders xhigh). */
             const std::string& dflt = srv.template_default_effort();
             if (cfg_.reasoning_effort.empty() && !dflt.empty())
                 RAD_INFO("chat: a request naming no reasoning_effort renders as '%s', the "
                          "template's own default (--reasoning-effort sets another)", dflt.c_str());
-        } else if (!mapped.empty()) {
-            RAD_INFO("chat: reasoning_effort mapped: %s", mapped.c_str());
+        } else {
+            /* A template that takes any word publishes no set, but an operator still needs to
+             * know when "none" is a level and not the thinking switch. */
+            if (!srv.template_off_efforts().empty())
+                RAD_INFO("chat: the template takes any reasoning_effort; %s",
+                         server::off_efforts_note(srv.template_off_efforts()).c_str());
+            if (!mapped.empty()) RAD_INFO("chat: reasoning_effort mapped: %s", mapped.c_str());
         }
         if (const std::string why = srv.check_reasoning_effort_map(); !why.empty()) {
             RAD_ERR("--reasoning-effort-map %s", why.c_str());

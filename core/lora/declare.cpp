@@ -306,6 +306,21 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         const bool coded = is_coded(a_dt);
         if (coded && oas < 0) { refuse("a coded activation and no `a_scale` operand"); continue; }
         const int64_t a_grid = coded ? activation_grid(P, reads) : 0;
+        if (x.fwht128_input) {
+            long long group = 0;
+            if (a_dt != RAD_I8 || a.rank != 2 || a.shape[1] != x.K_r ||
+                reads.size() != 2 || !g.base.get_i("group", &group) || group <= 0 ||
+                x.K_r % group != 0) {
+                refuse("Hadamard LoRA requires a full row of int8 activation codes");
+                continue;
+            }
+            const RadBufDecl& scales = P.buffers[reads[1]].decl;
+            if (scales.dtype != RAD_F32 || scales.rank != 2 || scales.shape[0] != a.shape[0] ||
+                scales.shape[1] != x.K_r / group) {
+                refuse("Hadamard LoRA requires one f32 activation scale per code group");
+                continue;
+            }
+        }
 
         if (coded && a_grid <= 0) {
             refuse("a coded activation whose read set holds no single f32 scale stream beside the "
@@ -382,7 +397,13 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         for (size_t i = 1; i < P.ops.size(); ++i)
             if (P.ops[i].op == "mix_rows" && b.op_resolved((rad_op)i))
                 RAD_TRY(declare_replacement_slots(b, P.ops[i], S));
-    if (gen) P.lora_rused.assign(P.lora_pools.size() * (size_t)S, 0);
+    if (gen) {
+        std::set<uint32_t> resolved;
+        for (size_t i = 1; i < P.ops.size(); ++i)
+            if (b.op_resolved((rad_op)i)) resolved.insert((uint32_t)i);
+        P.lora_placement_issues = lora::generator_placement_issues(P, d.targets, resolved);
+        P.lora_rused.assign(P.lora_pools.size() * (size_t)S, 0);
+    }
     if (d.sites_out) {
         std::vector<lora::Site> kept;
         for (size_t i = 0; i < sites.size(); ++i)

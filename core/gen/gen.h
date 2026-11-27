@@ -109,6 +109,9 @@ struct Request {
     int32_t  previews = 0;              /* partial images per image, 0..3 */
     /* The reference pictures' encoder view, one per media item of `pos`, in order. */
     std::vector<Pixels> refs;
+    float ref_log_bias = 0.0f;
+    /* Destination rectangle in output pixels, empty for an ordinary instruction edit. */
+    struct Outfill { int32_t x = 0, y = 0, w = 0, h = 0; } outfill;
     /* Inpainting (an edit with a mask): the source picture at the output size, and per latent
      * token how much is repainted (1) versus kept (0). */
     bool                 inpaint = false;
@@ -185,7 +188,9 @@ void image_rope(int32_t pos, int32_t h, int32_t w, int32_t* planes, int64_t n_to
  * text segment (causal) and a segment per picture (bidirectional). */
 int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
                        const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
-                       std::string* why);
+                       std::string* why, bool grounded = false, int32_t target_h = 0,
+                       int32_t target_w = 0,
+                       const Request::Outfill& outfill = {});
 /* The f32 positions (0, s h, s w, l) of an h x w grid: [4, h * w] component-major. */
 void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, int64_t n_total);
 

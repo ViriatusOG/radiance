@@ -74,7 +74,9 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                         const int* __restrict__ bt, int bt_pitch,
                         const uint16_t* __restrict__ kvc, int kv_heads,
                         float scale, int causal, int q_ld, int k_ld, int k8_ld, int ks_ld,
-                        int v_ld, int o_ld, const float* __restrict__ gvs)
+                        int v_ld, int o_ld, const float* __restrict__ gvs,
+                        const int* __restrict__ modes, const float* __restrict__ biases,
+                        int total_q)
 {
     typedef DT16<0> D;
     typedef D::frag frag16;
@@ -127,11 +129,25 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     // Flat grid over all sequences' query blocks: block b is the b-th BQ-row block counting through
     // the sequences in order, instead of (longest sequence) x (sequences). Few sequences, so a
     // linear walk.
+    // Validate the reference variant's device metadata before any address arithmetic or write.
+    // Every block checks the whole batch, so an invalid later segment cannot leave a partial result.
+    if (modes) {
+        for (int sequence = 0; sequence < num_seqs; ++sequence) {
+            const int64_t begin = cu[sequence], end = cu[sequence + 1];
+            const int64_t first = modes[3 * sequence + 1], last = modes[3 * sequence + 2];
+            if (begin < 0 || begin >= end || end > total_q || first < begin ||
+                first > last || last > end ||
+                (biases[sequence] != -INFINITY &&
+                 (!isfinite(biases[sequence]) || fabsf(biases[sequence]) > 16.0f))) return;
+        }
+    }
     int seq = -1, q0 = 0;
-    for (int s = 0, b = blockIdx.x; s < num_seqs; ++s) {
-        const int nb = (cu[s + 1] - cu[s] + BQ - 1) / BQ;
-        if (b < nb) { seq = s; q0 = b * BQ; break; }
-        b -= nb;
+    int64_t block = blockIdx.x;
+    for (int sequence = 0; sequence < num_seqs; ++sequence) {
+        const int64_t length = (int64_t)cu[sequence + 1] - cu[sequence];
+        const int64_t blocks = (length + BQ - 1) / BQ;
+        if (block < blocks) { seq = sequence; q0 = (int)(block * BQ); break; }
+        block -= blocks;
     }
     if (seq < 0) return;
     const int s0 = cu[seq], slen = cu[seq + 1] - s0;
@@ -146,6 +162,12 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     const float mul = scale * 1.44269504089f;
     const int  qpos = q0 + qbi * 16 + c;
     const bool live = qpos < slen;
+    const int ref_begin = modes ? modes[3 * seq + 1] - s0 : 0;
+    const int ref_end = modes ? modes[3 * seq + 2] - s0 : 0;
+    const float bias = biases ? biases[seq] * 1.44269504089f : 0.0f;
+    const bool isolate = bias == -INFINITY;
+    const bool ref_query = isolate && qpos >= ref_begin && qpos < ref_end;
+    const bool boost = !isolate && bias != 0.0f && ref_begin < ref_end && qpos >= ref_end;
 
     // The query: bf16 fragments pre-multiplied by the softmax scale, or int8 codes against the
     // row absmax (a lane holds half the head's dims, lane + 16 the other half) with the scale in
@@ -518,6 +540,16 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 }
             }
 
+            if (boost || ref_query) {
+                const int first = k0 + mt * 16 + 8 * h;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const bool ref_key = first + e >= ref_begin && first + e < ref_end;
+                    if (boost && ref_key) sc[e] += bias;
+                    if (ref_query && !ref_key) sc[e] = -INFINITY;
+                }
+            }
+
             // qs > 0, so the max of the scaled scores is the scaled max.
             float smax = sc[0];
             #pragma unroll
@@ -605,17 +637,18 @@ static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, cons
                               const int* used, const int* bt, int bt_pitch, const void* kvc,
                               int num_seqs, int max_q, int n_head_kv, float scale, int causal,
                               int q_ld, int k_ld, int k8_ld, int ks_ld, int v_ld, int o_ld,
-                              const float* vs, hipStream_t s)
+                              const float* vs, hipStream_t s, const int* modes = nullptr,
+                              const float* biases = nullptr)
 {
     constexpr int BQ = NQB * 16;
     // At most total / BQ full blocks plus one partial block per sequence.
-    dim3 grid((max_q + BQ - 1) / BQ + num_seqs, n_head_kv, 1);
+    dim3 grid((unsigned)(((int64_t)max_q + BQ - 1) / BQ + num_seqs), n_head_kv, 1);
     hipLaunchKernelGGL((r4d_attn_ps_kernel<HD, GQA, NQB, TILE, I8, PV8>), grid,
                        dim3(NQB * GQA * 32), 0, s,
                        (const uint16_t*)q, (const uint16_t*)k, (const int8_t*)k8, ks,
                        (const uint16_t*)v, (uint16_t*)o, cu, cuk, num_seqs, used, bt, bt_pitch,
                        (const uint16_t*)kvc, n_head_kv, scale, causal, q_ld, k_ld, k8_ld, ks_ld,
-                       v_ld, o_ld, vs);
+                       v_ld, o_ld, vs, modes, biases, max_q);
     const hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -100 - (int)e;
 }
@@ -632,7 +665,8 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
                        int num_seqs, int max_q, int n_head, int n_head_kv, int head_dim,
                        float scale, int causal, int q_ld, int k_ld, int k8_ld, int ks_ld,
                        int v_ld, int o_ld, hipStream_t s, const float* vs = nullptr,
-                       const int* cuk = nullptr)
+                       const int* cuk = nullptr, const int* modes = nullptr,
+                       const float* biases = nullptr)
 {
     if (n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv) return -2;
     if ((q_ld | k_ld | v_ld | o_ld) & 7) return -3;
@@ -661,7 +695,8 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
     return r4d_attn_ps_launch<128, G, NQB, T, I8, false>(q, k, k8, ks, v, o, cu, cuk, used, bt,   \
                                                          bt_pitch, kvc, num_seqs, max_q,          \
                                                          n_head_kv, scale, causal, q_ld, k_ld,    \
-                                                         k8_ld, ks_ld, v_ld, o_ld, nullptr, s)
+                                                         k8_ld, ks_ld, v_ld, o_ld, nullptr, s, \
+                                                         modes, biases)
     /* Sixteen query tiles per workgroup at gqa 1: a workgroup streams its head's whole K and V
      * once, so more rows per workgroup divide that traffic. At 16384 rows a head's K/V (8 MB) do
      * not fit L2; 128 rows per workgroup gave 66 TFLOP/s, 256 gave 111, 512 gave 102. */
@@ -779,13 +814,16 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
 }
 
 /* attn_dense at head_dim 128, causal or not: the same kernel with no prefix. */
-extern "C" int r4d_rad_attn_dense_h128(const RadArgs* a, RadStream s) {
+static int dense_h128(const RadArgs* a, RadStream s, bool reference_bias) {
     const RadTensor* q  = r4d_opt(a, 0);
     const RadTensor* k  = r4d_opt(a, 1);
     const RadTensor* v  = r4d_opt(a, 2);
     const RadTensor* cu = r4d_opt(a, 3);
     const RadTensor* o  = r4d_opt(a, 4);
     if (!q || !k || !v || !cu || !o) return R4D_NO(RAD_E_INVAL);
+    if (reference_bias && (q->dtype != RAD_BF16 || k->dtype != RAD_BF16 ||
+                           v->dtype != RAD_BF16 || o->dtype != RAD_BF16 || cu->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(cu) || cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const long long hd = r4d_geti_or(a, "head_dim", 0), gqa = r4d_geti_or(a, "gqa", 1);
     if (hd != 128 || gqa <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -802,16 +840,37 @@ extern "C" int r4d_rad_attn_dense_h128(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_STRIDE);
     if (hk != hv || ho != nh || hk * gqa != nh) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
+    if (reference_bias && (total <= 0 || total > 2147483647LL ||
+                           cu->shape[0] - 1 > 2147483647LL / 3))
+        return R4D_NO(RAD_E_SHAPE);
     const int num_seqs = (int)(cu->shape[0] - 1);
+    const RadTensor* modes = reference_bias ? r4d_opt(a, 5) : nullptr;
+    const RadTensor* biases = reference_bias ? r4d_opt(a, 6) : nullptr;
+    const int causal = (int)r4d_geti_or(a, "causal", 0);
+    if (reference_bias && (!modes || modes->dtype != RAD_I32 || modes->rank != 1 ||
+                           !r4d_contig(modes) || modes->shape[0] != 3 * num_seqs + 1 ||
+                           !biases || biases->dtype != RAD_F32 || biases->rank != 1 ||
+                           !r4d_contig(biases) || biases->shape[0] != num_seqs || causal))
+        return R4D_NO(RAD_E_SHAPE);
     const float scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)hd));
     const int e = r4d_attn_ps(q->data, k->data, nullptr, nullptr, v->data, o->data,
                               (const int*)cu->data, nullptr, nullptr, 0, nullptr, num_seqs,
                               (int)total, (int)nh, (int)hk, (int)hd, scale,
-                              (int)r4d_geti_or(a, "causal", 0), (int)q_ld, (int)k_ld, 0, 0,
-                              (int)v_ld, (int)o_ld, (hipStream_t)s);
+                              causal, (int)q_ld, (int)k_ld, 0, 0, (int)v_ld, (int)o_ld,
+                              (hipStream_t)s, nullptr, nullptr,
+                              modes ? (const int*)modes->data : nullptr,
+                              biases ? (const float*)biases->data : nullptr);
     if (e == -1 || e == -2) return R4D_NO(RAD_E_SHAPE);
     if (e == 0) return RAD_OK;
     return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
+}
+
+extern "C" int r4d_rad_attn_dense_h128(const RadArgs* a, RadStream s) {
+    return dense_h128(a, s, false);
+}
+
+extern "C" int r4d_rad_attn_dense_ref_h128(const RadArgs* a, RadStream s) {
+    return dense_h128(a, s, true);
 }
 
 /* attn_cross at head_dim 64 or 128: the dense kernel with each entry's keys a run of their own

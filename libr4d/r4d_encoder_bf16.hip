@@ -5,7 +5,9 @@
 // transcendentals use the accurate libm forms.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
+#include "r4d_emit.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,7 +44,7 @@ static inline uint32_t grid_rows(int64_t M) {
 }
 
 template <int ACT>
-__global__ __launch_bounds__(kThreads) void act_mul_kernel(
+__device__ __forceinline__ void act_mul_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
     uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, uint32_t M) {
     const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
@@ -51,6 +53,15 @@ __global__ __launch_bounds__(kThreads) void act_mul_kernel(
         const float g = bf2f(f32_to_bf16(act_of<ACT>(bf2f(a[(size_t)m * a_ld + i]))));
         y[(size_t)m * y_ld + i] = f32_to_bf16(g * bf2f(b[(size_t)m * b_ld + i]));
     }
+}
+
+template <int ACT, class CH = R4dUnchained>
+__global__ __launch_bounds__(kThreads) void act_mul_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
+    uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, uint32_t M) {
+    if (CH::on) r4d_chain_wait();
+    act_mul_body<ACT>(a, b, y, n, a_ld, b_ld, y_ld, M);
+    if (CH::on) r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------- seg_mean
@@ -784,15 +795,18 @@ __global__ __launch_bounds__(kLrThreads) void attn_local_rel_kernel(
 // ============================================================== launchers
 
 // act: 0 silu, 1 gelu (erf), 2 gelu_tanh, 3 sigmoid, 4 quick_gelu (sigmoid(bf16(1.702*a))), 5 relu.
-extern "C" int r4d_act_mul_bf16(long a, long b, long y, int M, int n, int act, int a_ld, int b_ld,
-                                int y_ld, long stream) {
+static int act_mul_launch(long a, long b, long y, int M, int n, int act, int a_ld, int b_ld,
+                          int y_ld, long stream, bool chain) {
     if (!a || !b || !y) return -1;
     if (M <= 0 || n <= 0 || act < 0 || act > 5) return -2;
     const dim3 grid((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M));
+    int emit_rc = RAD_OK;
 #define R4D_AM(A)                                                                               \
-    hipLaunchKernelGGL(act_mul_kernel<A>, grid, dim3(kThreads), 0, (hipStream_t)stream,         \
-                       (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,      \
-                       (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, (uint32_t)M)
+    emit_rc = R4D_EMIT((RadStream)(uintptr_t)stream,                                            \
+                       (chain ? act_mul_kernel<A, r4dchain> : act_mul_kernel<A, R4dUnchained>), \
+                       grid, dim3(kThreads), 0, (const uint16_t*)a, (const uint16_t*)b,         \
+                       (uint16_t*)y, (uint32_t)n, (uint32_t)a_ld, (uint32_t)b_ld,               \
+                       (uint32_t)y_ld, (uint32_t)M)
     if (act == 0)      R4D_AM(0);
     else if (act == 1) R4D_AM(1);
     else if (act == 2) R4D_AM(2);
@@ -800,6 +814,7 @@ extern "C" int r4d_act_mul_bf16(long a, long b, long y, int M, int n, int act, i
     else if (act == 4) R4D_AM(4);
     else               R4D_AM(5);
 #undef R4D_AM
+    if (emit_rc != RAD_OK) return -4;
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1150,8 +1165,9 @@ extern "C" int r4d_rad_act_mul(const RadArgs* a, RadStream s) {
     const long long b_ld = r4d_rows_pitch(B, n, &Mb);
     if (y_ld < 0 || a_ld < 0 || b_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || Ma < M || Mb < M) return R4D_NO(RAD_E_SHAPE);
-    return enc_status(r4d_act_mul_bf16(r4d_addr(A), r4d_addr(B), r4d_addr(Y), (int)M, (int)n, ai,
-                                       (int)a_ld, (int)b_ld, (int)y_ld, (long)(uintptr_t)s));
+    return enc_status(act_mul_launch(r4d_addr(A), r4d_addr(B), r4d_addr(Y), (int)M, (int)n, ai,
+                                     (int)a_ld, (int)b_ld, (int)y_ld, (long)(uintptr_t)s,
+                                     r4d_geti_or(a, "chain", 0) != 0));
 }
 
 /* ------------------------------------------------------------------ seg_mean */

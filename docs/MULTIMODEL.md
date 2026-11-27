@@ -140,6 +140,7 @@ memory:
   gpu-headroom-mib: 160    # per card, as before
   card-headroom-mib: {0: 4096}        # card 0 (the desktop's) keeps 4 GiB free instead
   host-mib: 40960          # pinned host RAM the fleet may hold: parked weights, KV host tier, pools
+  queue-reserve: 8         # hardware queues each card keeps ready; each costs ~41 MiB of the card
   disk-tier: /var/cache/radiance      # prefix-cache disk tier and park files
   # pinned-numa-node: 1    # prefer this node for pinned host memory (default: each card's own)
 
@@ -198,8 +199,8 @@ scheduler:
 | Level | Keys |
 |---|---|
 | `server:` | `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `log` (`info`/`debug`/`trace`), `radiance-home`, `kernels`, `download-dir`, `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `cards:` | `all` or a list of card indices |
-| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier`, `pinned-numa-node` |
+| `cards:` | `all` or a list of card indices. A fleet serves one card architecture: the first card listed (here, else by the first model that lists `cards`) chooses it, so a machine whose card 0 is an RDNA3 card serves on its RDNA4 cards when those are listed; `all` is the discrete cards of card 0's architecture |
+| `memory:` | `gpu-headroom-mib`, `gpu-memory-mib` (per card), `card-headroom-mib` (`{CARD: MiB}`, a card's own reserve), `host-mib`, `host-headroom-mib`, `disk-tier`, `pinned-numa-node`, `queue-reserve` (1-24, default 8: the HW queues a card keeps ready, §7.1) |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive`, `stuck-exit`, `warm-up` |
 | `defaults:` / `models.<name>:` | every per-model flag: model source, TP, placement, KV, scheduler, spec decode, LoRA, request defaults and limits, media limits, offline modes, debug; plus the fleet keys `aliases`, `priority`, `pin`, `ttl`, `flex`, `park`, `cards` |
 | `groups:` | `together` / `exclusive` lists |
@@ -207,6 +208,11 @@ scheduler:
 A key at the wrong level is refused with the level it belongs to. An unknown key is refused with
 the closest known key. `served-model-name` is gone: the entry's name is the model id, and `aliases`
 adds more.
+
+With one TP model, `memory.card-headroom-mib` also applies to the model's VRAM split. The card
+with least room after its own reserve sets the common KV pool; under `expert_tiered`, a card with
+more room uses it for resident experts. Changing the per-card reserves requires a restart, since
+the loaded model's pools were sized against them.
 
 ### 4.4 Single-model use
 
@@ -434,17 +440,30 @@ the slab's gain (§13.2) is a few percent at one client, more under load.
 | Non-expert weights | VRAM | unmapped; read again from the container | disk |
 | Experts | slab + host pool | slab unmapped, read again from the container; host pool kept | disk |
 | KV pool | committed | decommitted, and the prefix cache reset: a conversation's next turn prefills again | released |
-| Arena, staging, queues | committed | decommitted; queues kept | released |
+| Arena, staging, queues | committed | decommitted; kept queues trimmed to four | released |
 
 Queues are kept across a park and an unload: destroying a HW queue next to a busy card is the risky
 path (§3.1), so a closed stream's queue stays open for the card's next stream. An open queue holds
 about 41 MiB of its card (the context save area), and opening one on a full card can stall the
 process for minutes, so the fleet opens queues only while a card has room: eight to a card at the
 start, and before each load as many as bring the kept ones back to eight, up to 24 open on a card.
-Kept queues are closed in two places, both where no other model has anything on the card: down to
-eight when an unload leaves the card empty, and down to four for a model that is short of exactly
-their memory after every other model has left (MiniMax-H3 on a 32 GB card). `/admin/fleet` gives
-each card's `queues` and `queues_idle`.
+`memory.queue-reserve` sets that eight (1 to 24, default 8): a fleet whose entries claim whole
+cards (`gpu-memory-mib`, §4.3) is short of exactly the reserve's bytes on a handover, so 2 or 4 is
+the number for it, and the default is the number for a fleet that parks and restores, where a
+restore needs several queues at once on a card its neighbour has filled.
+That is not a rounding trade. On a two-card box with four entries in one exclusive group and the chat
+seat claiming all of a card, the claim that failed on every handover back at the default eight -
+`the models that may leave did not free enough`, printed after the fleet had closed all eight queues
+under that demand - passes every leg at two, and ends a full tour with 266 MiB free on a card where it
+used to be left with about 51.
+Kept queues are closed in three places, all where the card has nothing that a queue destroy could
+disturb: down to the reserve, or four whichever is smaller, when an unload leaves the card, the same
+when a model parks (a parked model holds no streams, and that is more than its restore's streams
+take), and down to that number again for a model that is short of exactly their memory after every
+other model has left (MiniMax-H3 on a 32 GB card). Eight of them is 328 MiB of a card held by an
+otherwise idle card. The next bring-up reopens what its own reservation leaves room for, and a card
+just left is the emptiest and safest moment to have needed none. `/admin/fleet` gives each card's
+`queues` and `queues_idle`, and the fleet says the reserve on one line at the start.
 
 ### 7.2 Park
 
@@ -675,7 +694,8 @@ no request waiting, no load, restore or park running. Displacing a warm model la
 its weights come back from its container (§7.2). A warm load gives way to everything:
 
 - it takes room only from free memory and from other warm models (a model a request has used
-  stays, and no parked model unloads for it);
+  stays, parked or not; a warm model the warm-up parked unloads for it, so a model loaded later
+  in the file does not leave the first one cold);
 - it does not wait for room, and one that finds none leaves its model cold without an error (a
   request that came for it meanwhile asks for it again);
 - a request for a warm model makes it an ordinary one.

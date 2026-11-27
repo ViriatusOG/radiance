@@ -36,7 +36,7 @@
 // disjoint slices); the arrival counters are keyed on the output buffer (mxd_out_ctr), zero at
 // entry and reset by the reducer. Launches writing the same output are ordered; overlapping ones
 // write different outputs. The row is therefore concurrent (rad_kernel_concurrent), like
-// gemm_fp8a8_nt_m16. A scratch shorter than the split needs is refused.
+// gemm_i8a8_nt_m16. A scratch shorter than the split needs is refused.
 //
 // Every thread fences its partial stores before the counter; a fence on thread 0 alone would order
 // only its own stores.
@@ -490,7 +490,7 @@ namespace {
 // The arrival counters, one block per output buffer (see the header). They cannot live in the
 // scratch, which other ops overwrite, because they must be zero at entry. One allocation per
 // (device, output), kept zero by the reducer and freed only with the output's memory (a recorded
-// pass replays the pointer; r4d_keyed.h), as gemm_fp8a8_nt_m16's split_ctr.
+// pass replays the pointer; r4d_keyed.h), as gemm_i8a8_nt_m16's split_ctr.
 unsigned* mxd_out_ctr(const void* out) {
   return r4d::keyed_block(r4d::Keyed::MxDecode, nullptr, out,
                           (size_t)(R4D_MXD_MAX_N / (R4D_MXD_DWN * 16)) * sizeof(unsigned));

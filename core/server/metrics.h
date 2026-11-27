@@ -27,6 +27,9 @@ namespace server {
 
 struct SchedMetrics;
 
+/* A label value as the Prometheus text format spells it: backslash, quote and newline escaped. */
+std::string esc_label(const std::string& s);
+
 /* ------------------------------------------------------------------ primitives */
 
 class Counter {
@@ -156,9 +159,16 @@ private:
     Counter c_step_secs_, c_step_secs_decode_;
     /* Exact totals behind the rate gauges; see render(). */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
-    Counter c_draft_refills_, c_draft_refill_tokens_;
+    Counter c_draft_refills_, c_draft_refill_tokens_, c_window_seed_failures_;
+    Counter c_draft_window_stale_ckpts_, c_draft_gated_steps_, c_draft_acc_gated_steps_;
+    Counter c_draft_reach_declined_steps_;
+    Gauge   g_draft_spec_off_seqs_;
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
     Counter c_suffix_steps_, c_suffix_rows_, c_suffix_accepted_, c_suffix_held_ahead_;
+    /* Depth 0 and the hybrid; rendered only once any is nonzero, so a deployment without them
+     * renders none of these series. */
+    Counter c_draft_zero_cycles_, c_draft_probe_cycles_, c_draft_zero_moves_;
+    Counter c_hybrid_lookup_, c_hybrid_head_, c_hybrid_unahead_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_queries_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;

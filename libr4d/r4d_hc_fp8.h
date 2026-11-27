@@ -3,7 +3,7 @@
 // selftest share one definition.
 //
 // A stored row is [K E4M3 codes][K/G f32 scales][pad to 16 bytes], rows back to back. As in
-// r4d_rad_layout_fp8_logits, the scales ride in their row, so a kernel finds them at a fixed
+// r4d_rad_layout_i8_logits, the scales ride in their row, so a kernel finds them at a fixed
 // offset from its codes.
 //
 // The group size is set by the kernel that reads the row, not by tuning:

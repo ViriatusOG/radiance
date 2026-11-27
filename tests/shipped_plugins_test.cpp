@@ -96,19 +96,20 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "bailinghybrid", "gguf_ftype_25" },
         { "clef", "fp8_e4m3" }, { "embeddinggemma2", "" },
         { "fishomni", "bsgemm-moe" }, { "flint", "" }, { "flux3", "" }, { "flux3distilled", "" },
-        { "gemma3", "" }, { "gemma4", "" },
-        { "gemma4", "compressed-tensors" }, { "glm5next", "" },
+        { "deepseek41", "" }, { "gemma3", "" }, { "gemma4", "" },
+        { "gemma4", "compressed-tensors" }, { "gemma4", "exl3" }, { "glm5next", "" },
         { "hunyuan3d2", "" }, { "hyv3", "" }, { "hyv3", "fp8" }, { "hyv3", "gguf_ftype_15" },
         { "inkling2", "" }, { "laya", "" }, { "lfm2", "" }, { "lfm3", "" }, { "llama", "" }, { "mistral3", "" },
         { "llama", "fp8_e4m3" }, { "nemotronh", "" }, { "nomicbert", "" }, { "qwen35", "" },
         { "museglimmer", "" },
         { "museglimmer", "compressed-tensors" },
-        { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
+        { "qwen35", "exl3" }, { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" },
+        { "qwen35moe", "fp8_e4m3" },
         { "qwen35moe", "w8a8_fwht128" },
         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
         { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" },
         { "spark25", "" }, { "spark25", "w8a8_fwht128" }, { "sdxl", "" },
-        { "unlimitedocr", "" } };
+        { "unlimitedocr", "" }, { "wan", "" } };
     std::set<std::pair<std::string, std::string>> got;
     for (const auto& [k, name] : keys) got.insert(k);
     if (got != want)
@@ -309,4 +310,67 @@ TEST(libr4ds_rows_that_chain_acquire_for_themselves) {
         if (!k.chain_fenced) fprintf(stderr, "    %s chains and answers 1\n", k.info->name);
     }
     CHECK(chained > 0);
+}
+
+/* The EXL3 routed-expert libraries (exl3/) load beside the tree's own kernel libraries with no
+ * refusal: same ABI version and layout fingerprint, and no op schema that disagrees with one a
+ * library ahead of them declared. exl3ref is a reference and ranks last; it serves every
+ * moe_exl3 op exl3r4d serves, so a device row that declines has a reference behind it. */
+TEST(the_exl3_kernel_libraries_load_beside_the_trees_own) {
+    std::vector<std::string> names = { "libavx", "libref", "exl3ref" };
+#ifdef RAD_TEST_HAS_EXL3R4D
+    names.insert(names.begin(), "exl3r4d");
+#endif
+#ifdef RAD_TEST_HAS_LIBR4D
+    names.insert(names.begin(), "libr4d");
+#endif
+    Registry r;
+    const int st = r.load_dir(dir_of("kernels"), names);
+    if (!r.plugin("exl3ref")) {
+        (void)st;
+        ARTIFACT_MISSING("exl3ref under " + dir_of("kernels"));
+    }
+    if (!r.load_errors().empty()) fprintf(stderr, "%s", errors(r).c_str());
+    CHECK_OK(st);
+    CHECK(r.load_errors().empty());
+    const Plugin* ref = r.plugin("exl3ref");
+    CHECK(ref->reference);
+    std::set<std::string> ref_ops, dev_ops;
+    for (const KernelRow& k : r.rows()) {
+        if (k.plugin == "exl3ref") ref_ops.insert(k.info->op);
+        if (k.plugin == "exl3r4d") dev_ops.insert(k.info->op);
+    }
+    CHECK(ref_ops.count("moe_exl3_gate_up") == 1 && ref_ops.count("moe_exl3_down") == 1);
+    for (const auto& op : ref_ops) CHECK(r.schema(op) != nullptr);
+#ifdef RAD_TEST_HAS_EXL3R4D
+    const Plugin* dev = r.plugin("exl3r4d");
+    REQUIRE(dev != nullptr);
+    CHECK(!dev->reference);
+    CHECK(dev->order < ref->order);
+    CHECK(!dev_ops.empty());
+    /* exl3r4d's decode-band _dk ops have no reference row; every other op it serves must. */
+    for (const auto& op : dev_ops) {
+        const bool dk = op.size() > 3 && op.compare(op.size() - 3, 3, "_dk") == 0;
+        if (!dk && !ref_ops.count(op)) {
+            fprintf(stderr, "    exl3r4d serves '%s' and exl3ref does not\n", op.c_str());
+            CHECK(false);
+        }
+    }
+#endif
+}
+
+/* Every shipped quantiser plugin loads, and the `exl3` quantiser (exl3/quantizers/exl3) is offered
+ * by exactly one of them: quantiser names are unique across plugins, and a clash refuses the later
+ * plugin whole. */
+TEST(the_shipped_quantisers_load_and_exl3_is_offered_once) {
+    Registry r;
+    const int st = r.load_dir(dir_of("quantizers"), {});
+    if (st == RAD_E_IO && r.plugins().empty())
+        ARTIFACT_MISSING("the quantiser plugins under " + dir_of("quantizers"));
+    if (!r.load_errors().empty()) fprintf(stderr, "%s", errors(r).c_str());
+    CHECK_OK(st);
+    CHECK(r.load_errors().empty());
+    const Registry::QuantRow* q = r.quantizer("exl3");
+    REQUIRE(q != nullptr);
+    CHECK_EQ(q->plugin, std::string("exl3_quant"));
 }

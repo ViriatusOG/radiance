@@ -52,9 +52,8 @@ void indented(std::string* out, const std::string& text, int indent) {
 }
 
 std::string short_bdf(const std::string& b) {
-    return b.rfind("0000:", 0) == 0 ? b.substr(5) : b;
+    return b.starts_with("0000:") ? b.substr(5) : b;
 }
-
 
 std::string host_lines(const HostFacts& h, const RunFacts& r) {
     std::string o;

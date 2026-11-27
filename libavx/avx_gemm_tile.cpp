@@ -34,8 +34,8 @@
  *
  * An output's arithmetic does not depend on the blocking: a row's lane in the outer product is
  * the same whichever rows share its microkernel call, groups lie whole in a chunk, and the f32
- * chain runs over k in order through the C tile. So results do not depend on the team (avx_common.h's
- * threading rule) or on the chunk length.
+ * chain runs over k in order through the C tile. So results do not depend on the team
+ * (avx_common.h's threading rule) or on the chunk length.
  */
 #include "avx_gemm.h"
 
@@ -655,7 +655,8 @@ AVX_QB_TARGET static bool qb_core(const Mat& ma, int64_t abase, const int64_t* a
                     for (int64_t m0 = r0; m0 < r1; m0 += QB_MR) {
                         const int64_t mm = std::min(QB_MR, r1 - m0), ar = jb.a0 + m0;
                         kQbKernel[mm](Ab + ar * lda + k0, lda, P, S, gk, ngc,
-                                      satab + ar * ngrp + g0, ngrp, gc / G, Cp + (m0 - r0) * QB_COLS);
+                                      satab + ar * ngrp + g0, ngrp, gc / G,
+                                      Cp + (m0 - r0) * QB_COLS);
                     }
                 }
             }
@@ -830,7 +831,8 @@ static void tf_transpose(const float* src, int64_t ld, int64_t kn, float* dst) {
                 u[4 * h + 3] = _mm256_shuffle_ps(t[4 * h + 1], t[4 * h + 3], 0xee);
             }
             for (int c = 0; c < 4; ++c) {
-                _mm256_store_ps(dst + (k + c) * TF_NR + c0, _mm256_permute2f128_ps(u[c], u[4 + c], 0x20));
+                _mm256_store_ps(dst + (k + c) * TF_NR + c0,
+                                _mm256_permute2f128_ps(u[c], u[4 + c], 0x20));
                 _mm256_store_ps(dst + (k + 4 + c) * TF_NR + c0,
                                 _mm256_permute2f128_ps(u[c], u[4 + c], 0x31));
             }
@@ -1032,7 +1034,8 @@ static bool tf_core(const Mat& ma, int64_t abase, const int64_t* arow, int64_t a
                         jb.SB.row_groups(wr, g0, g1 - g0 + 1, gs);
                         if (e8)
                             for (int64_t g = 0; g <= g1 - g0; ++g)
-                                if (gs[g] >= 0x1p126f) unfoldable.store(true, std::memory_order_relaxed);
+                                if (gs[g] >= 0x1p126f)
+                                    unfoldable.store(true, std::memory_order_relaxed);
                         for (int64_t g = g0; g <= g1; ++g) {
                             const int64_t a0 = std::max(k0, g * gb) - k0;
                             const int64_t a1 = std::min(k1, (g + 1) * gb) - k0;

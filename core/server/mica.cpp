@@ -71,23 +71,24 @@ bool text_of(const json& v, const std::string& path, std::string* out, ApiError*
              const char* fallback = nullptr) {
     if (v.is_null() && fallback) { *out = fallback; return true; }
     if (v.is_string()) {
-        if (blank_text(v.get<std::string>())) return fail(err, path, "instructions and criteria descriptions must not be empty");
+        if (blank_text(v.get<std::string>()))
+            return fail(err, path, "instructions and criteria descriptions must not be empty");
         *out = v.get<std::string>();
         return true;
     }
     if (!(v.is_object() || v.is_array()) || v.empty())
-        return fail(err, path, "instructions and criteria must be strings, non-empty objects, or non-empty arrays");
+        return fail(err, path, "instructions and criteria must be strings, non-empty objects, or "
+                               "non-empty arrays");
     *out = py_json_compact_sorted(v);
     return true;
 }
 
-/* An image anywhere in the state: a part typed image, an image_url or image_bytes, an images list. */
+/* An image anywhere in the state: a part typed image, an image_url or image_bytes, an images
+ * list. */
 bool has_image(const json& v) {
     if (v.is_object()) {
         auto lower = [](const json& x) {
-            std::string s = x.is_string() ? x.get<std::string>() : x.dump();
-            for (char& c : s) c = (char)std::tolower((unsigned char)c);
-            return s;
+            return ascii_lower(x.is_string() ? x.get<std::string>() : x.dump());
         };
         if ((v.contains("modality") && lower(v["modality"]) == "image") ||
             (v.contains("type") && lower(v["type"]) == "image"))
@@ -131,10 +132,12 @@ std::string escape(const std::string& s) {
 std::string candidate_line(const std::string& label, const MicaCandidate& c) {
     /* An id that only says the position: [cs]?[0-9]+, or one ASCII letter. */
     auto digits = [](const std::string& d) {
-        return !d.empty() && std::all_of(d.begin(), d.end(), [](char x) { return x >= '0' && x <= '9'; });
+        return !d.empty() &&
+               std::all_of(d.begin(), d.end(), [](char x) { return x >= '0' && x <= '9'; });
     };
     const std::string& id = c.id;
-    const bool letter = id.size() == 1 && ((id[0] >= 'a' && id[0] <= 'z') || (id[0] >= 'A' && id[0] <= 'Z'));
+    const bool letter = id.size() == 1 && ((id[0] >= 'a' && id[0] <= 'z') ||
+                                           (id[0] >= 'A' && id[0] <= 'Z'));
     const bool positional =
         letter || digits(id) || ((id[0] == 'c' || id[0] == 's') && digits(id.substr(1)));
     std::string body = escape(c.text);
@@ -155,32 +158,52 @@ int parse_mica_request(const std::string& body, const OaiLimits& lim, const std:
     RAD_TRY(parse_request_object(body, lim, &b, err));
     for (const auto& kv : b.items())
         if (kv.key() != "model" && kv.key() != "state" && kv.key() != "questions") {
-            *err = err_bad(kv.key(), kv.key() == "images" ? "Image inputs are not supported by Mica"
-                                                         : "not a field of a System One request");
+            *err = err_bad(kv.key(), kv.key() == "images"
+                                         ? "Image inputs are not supported by Mica"
+                                         : "not a field of a System One request");
             return RAD_E_INVAL;
         }
-    if (!b.contains("state") || b["state"].is_null()) { fail(err, "state", "required"); return RAD_E_INVAL; }
-    if (has_image(b["state"])) { fail(err, "state", "Image inputs are not supported by Mica"); return RAD_E_INVAL; }
+    if (!b.contains("state") || b["state"].is_null()) {
+        fail(err, "state", "required");
+        return RAD_E_INVAL;
+    }
+    if (has_image(b["state"])) {
+        fail(err, "state", "Image inputs are not supported by Mica");
+        return RAD_E_INVAL;
+    }
     const json& qs = b.contains("questions") ? b["questions"] : json();
-    if (!qs.is_object() || qs.empty()) { fail(err, "questions", "must be a non-empty object"); return RAD_E_INVAL; }
-    out->state = escape(b["state"].is_string() ? b["state"].get<std::string>() : py_json_dumps(b["state"]));
+    if (!qs.is_object() || qs.empty()) {
+        fail(err, "questions", "must be a non-empty object");
+        return RAD_E_INVAL;
+    }
+    if (qs.size() > kMaxDecisionQuestions) {
+        fail(err, "questions", "at most " + std::to_string(kMaxDecisionQuestions) +
+                                   " questions a request");
+        return RAD_E_INVAL;
+    }
+    out->state = escape(b["state"].is_string() ? b["state"].get<std::string>()
+                                               : py_json_dumps(b["state"]));
 
     std::vector<MicaRow> rows;
     for (const auto& kv : qs.items()) {
         const std::string path = "questions." + kv.key();
         const json& q = kv.value();
-        if (kv.key().empty()) { fail(err, "questions", "question IDs must be non-empty strings"); return RAD_E_INVAL; }
+        if (kv.key().empty()) {
+            fail(err, "questions", "question IDs must be non-empty strings");
+            return RAD_E_INVAL;
+        }
         if (!q.is_object()) { fail(err, path, "must be an object"); return RAD_E_INVAL; }
         for (const auto& f : q.items())
             if (f.key() != "type" && f.key() != "instructions" && f.key() != "criteria" &&
-                f.key() != "allow_cannot_grade" && f.key() != "multi" && f.key() != "abstain_threshold") {
+                f.key() != "allow_cannot_grade" && f.key() != "multi" &&
+                f.key() != "abstain_threshold") {
                 fail(err, path + "." + f.key(), "not a field of a question");
                 return RAD_E_INVAL;
             }
         MicaRow row;
         row.id = kv.key();
-        std::string kind = q.contains("type") && q["type"].is_string() ? q["type"].get<std::string>() : "";
-        for (char& c : kind) c = (char)std::tolower((unsigned char)c);
+        const std::string kind = ascii_lower(
+            q.contains("type") && q["type"].is_string() ? q["type"].get<std::string>() : "");
         if (kind != "noul" && kind != "choice" && kind != "score") {
             fail(err, path + ".type", "must be noul, choice or score");
             return RAD_E_INVAL;
@@ -193,31 +216,44 @@ int parse_mica_request(const std::string& body, const OaiLimits& lim, const std:
             }
             row.cannot_grade = q["allow_cannot_grade"].get<bool>();
         }
-        if (!q.contains("instructions")) { fail(err, path + ".instructions", "required"); return RAD_E_INVAL; }
-        if (!text_of(q["instructions"], path + ".instructions", &row.question, err)) return RAD_E_INVAL;
+        if (!q.contains("instructions")) {
+            fail(err, path + ".instructions", "required");
+            return RAD_E_INVAL;
+        }
+        if (!text_of(q["instructions"], path + ".instructions", &row.question, err))
+            return RAD_E_INVAL;
         const json crit = q.contains("criteria") ? q["criteria"] : json();
         if (kind == "noul") {
             if (crit.is_null() || (crit.is_object() && crit.empty())) {
                 row.candidates = { { "false", "No" }, { "true", "Yes" } };
             } else {
-                if (!crit.is_object()) { fail(err, path + ".criteria", "must contain false and true"); return RAD_E_INVAL; }
-                /* The request's order, keys lowered; a later spelling of a key replaces its value. */
+                if (!crit.is_object()) {
+                    fail(err, path + ".criteria", "must contain false and true");
+                    return RAD_E_INVAL;
+                }
+                /* The request's order, keys lowered; a later spelling of a key replaces its
+                 * value. */
                 std::vector<std::pair<std::string, json>> by_id;
                 for (const auto& c : crit.items()) {
-                    std::string k = c.key();
-                    for (char& ch : k) ch = (char)std::tolower((unsigned char)ch);
-                    auto it = std::find_if(by_id.begin(), by_id.end(), [&](const auto& p) { return p.first == k; });
+                    const std::string k = ascii_lower(c.key());
+                    auto it = std::find_if(by_id.begin(), by_id.end(),
+                                           [&](const auto& p) { return p.first == k; });
                     if (it != by_id.end()) it->second = c.value();
                     else by_id.emplace_back(k, c.value());
                 }
-                if (by_id.size() != 2 || std::none_of(by_id.begin(), by_id.end(), [](const auto& p) { return p.first == "true"; }) ||
-                    std::none_of(by_id.begin(), by_id.end(), [](const auto& p) { return p.first == "false"; })) {
+                auto has = [&](const char* key) {
+                    return std::any_of(by_id.begin(), by_id.end(),
+                                       [&](const auto& p) { return p.first == key; });
+                };
+                if (by_id.size() != 2 || !has("true") || !has("false")) {
                     fail(err, path + ".criteria", "must contain false and true");
                     return RAD_E_INVAL;
                 }
                 for (const auto& [k, v] : by_id) {
                     MicaCandidate c{ k, "" };
-                    if (!text_of(v, path + ".criteria." + k, &c.text, err, k == "false" ? "No" : "Yes")) return RAD_E_INVAL;
+                    if (!text_of(v, path + ".criteria." + k, &c.text, err,
+                                 k == "false" ? "No" : "Yes"))
+                        return RAD_E_INVAL;
                     row.candidates.push_back(c);
                 }
             }
@@ -228,15 +264,22 @@ int parse_mica_request(const std::string& body, const OaiLimits& lim, const std:
             }
             for (const auto& c : crit.items()) {
                 MicaCandidate m{ c.key(), "" };
-                if (c.key().empty()) { fail(err, path + ".criteria", "candidate IDs must be non-empty strings"); return RAD_E_INVAL; }
-                if (!text_of(c.value(), path + ".criteria." + c.key(), &m.text, err, c.key().c_str())) return RAD_E_INVAL;
+                if (c.key().empty()) {
+                    fail(err, path + ".criteria", "candidate IDs must be non-empty strings");
+                    return RAD_E_INVAL;
+                }
+                if (!text_of(c.value(), path + ".criteria." + c.key(), &m.text, err,
+                             c.key().c_str()))
+                    return RAD_E_INVAL;
                 row.candidates.push_back(m);
             }
         } else {
             const size_t limit = 255 - (row.cannot_grade ? 1 : 0);
             if (!crit.is_array() || crit.size() < 2 || crit.size() > limit) {
-                fail(err, path + ".criteria", "a score requires 2.." + std::to_string(limit) + " ordered criteria" +
-                     (row.cannot_grade ? " when allow_cannot_grade is true (one label is reserved)" : ""));
+                fail(err, path + ".criteria",
+                     "a score requires 2.." + std::to_string(limit) + " ordered criteria" +
+                     (row.cannot_grade ? " when allow_cannot_grade is true (one label is reserved)"
+                                       : ""));
                 return RAD_E_INVAL;
             }
             for (size_t i = 0; i < crit.size(); ++i) {
@@ -244,7 +287,9 @@ int parse_mica_request(const std::string& body, const OaiLimits& lim, const std:
                 if (!text_of(crit[i], path + ".criteria", &m.text, err)) return RAD_E_INVAL;
                 row.candidates.push_back(m);
             }
-            if (row.cannot_grade) row.candidates.push_back({ "cannot_grade", "Cannot grade from the supplied state" });
+            if (row.cannot_grade)
+                row.candidates.push_back(
+                    { "cannot_grade", "Cannot grade from the supplied state" });
         }
         if (q.contains("multi")) {
             if (kind != "choice" || !q["multi"].is_boolean()) {
@@ -271,12 +316,14 @@ int parse_mica_request(const std::string& body, const OaiLimits& lim, const std:
         if (!r.multi) continue;
         out->multi.push_back(r);
         std::string menu;
-        for (size_t i = 0; i < r.candidates.size(); ++i) menu += (i ? " | " : "") + r.candidates[i].text;
+        for (size_t i = 0; i < r.candidates.size(); ++i)
+            menu += (i ? " | " : "") + r.candidates[i].text;
         for (const MicaCandidate& c : r.candidates) {
             MicaRow inc;
             inc.id = r.id + "~" + c.id;
             inc.kind = "noul";
-            inc.question = r.question + kInclusion + menu + "\nIs this option one of the correct answers? -> " + c.text;
+            inc.question = r.question + kInclusion + menu +
+                           "\nIs this option one of the correct answers? -> " + c.text;
             inc.candidates = { { "true", "True" }, { "false", "False" } };
             inc.multi_of = r.id;
             inc.multi_option = c.id;
@@ -296,14 +343,17 @@ std::string mica_prompt(const MicaRow& row, const std::string& s) {
         ending = "Candidates:";
         for (size_t i = 0; i < row.candidates.size(); ++i) {
             MicaCandidate shown = row.candidates[i];
-            if (row.kind == "score") shown.id = std::to_string(i);   /* levels show their text only */
+            /* Levels show their text only. */
+            if (row.kind == "score") shown.id = std::to_string(i);
             ending += "\n" + candidate_line(kLabels[i], shown);
         }
-        ending += std::string("\nAnswer with the label of the best ") + (row.kind == "score" ? "level." : "candidate.");
+        ending += std::string("\nAnswer with the label of the best ") +
+                  (row.kind == "score" ? "level." : "candidate.");
     }
-    const std::string content = "<state>\n" + s + "\n</state>\nQuestion: " + escape(row.question) + "\n" + ending;
-    return std::string("<|im_start|>system\n") + kSystem + "<|im_end|>\n<|im_start|>user\n" + content +
-           "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    const std::string content =
+        "<state>\n" + s + "\n</state>\nQuestion: " + escape(row.question) + "\n" + ending;
+    return std::string("<|im_start|>system\n") + kSystem + "<|im_end|>\n<|im_start|>user\n" +
+           content + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
 std::vector<std::string> mica_labels(const MicaRow& row) {
@@ -342,8 +392,8 @@ json typed(const MicaRow& row, const std::vector<double>& probabilities) {
         json probs = json::object();
         for (size_t i = 0; i < n; ++i) probs[row.candidates[i].id] = p[i];
         const double un = 1.0 / (double)n;
-        return json{ { "type", "choice" }, { "choice", row.candidates[mode].id }, { "probabilities", probs },
-                     { "confidence", (p[mode] - un) / (1.0 - un) } };
+        return json{ { "type", "choice" }, { "choice", row.candidates[mode].id },
+                     { "probabilities", probs }, { "confidence", (p[mode] - un) / (1.0 - un) } };
     }
     const bool cg = row.cannot_grade;
     const size_t levels = cg ? n - 1 : n;
@@ -369,8 +419,9 @@ json typed(const MicaRow& row, const std::vector<double>& probabilities) {
         probs[std::to_string(i)] = p[i];
     }
     const bool has_level = mass != 0.0 && (!cg || p[mode] >= p[n - 1]);
-    json r = { { "type", "score" }, { "score", score }, { "legend", legend }, { "probabilities", probs },
-               { "confidence", confidence }, { "level", has_level ? json(mode) : json(nullptr) },
+    json r = { { "type", "score" }, { "score", score }, { "legend", legend },
+               { "probabilities", probs }, { "confidence", confidence },
+               { "level", has_level ? json(mode) : json(nullptr) },
                { "expected_level", score }, { "margin", ranked[0] - ranked[1] } };
     if (cg) r["cannot_grade_probability"] = p[n - 1];
     return r;

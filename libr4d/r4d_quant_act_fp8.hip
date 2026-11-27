@@ -1,28 +1,27 @@
-// Per-(row, 128-column) symmetric E4M3 quantisation of a bf16 activation, the input to the fp8a8
-// GEMMs. The checkpoint's activation_scheme is "dynamic" (no stored activation scale), and a GEMM
+// Per-(row, 128-column) symmetric E4M3 quantisation of a bf16 activation, and the int8 forms of
+// the same quantiser (quant_act_i8g, had_quant_act_i8g). The scales are computed on the fly: a GEMM
 // cannot compute one without a reduction across every M block.
 //
 // Output is plain row-major, unlike r4d_quant_act_i8 (which writes gemm_w4a8_nt_m64's register
-// fragment order): the fp8a8 GEMMs stage both operands through the same `stage8` copy and fragment
-// read, and row-major lets the activation be the B operand of the narrow instantiation.
+// fragment order): the 8-bit GEMMs stage both operands through the same `stage8` copy and fragment
+// read, and row-major lets the activation be the B operand of the narrow tile.
 //
-// The group is fixed at 128, the checkpoint's weight-scale block width (unlike
-// R4D_GEMM_W4A8_GROUP); another group would make the GEMM's fold read the wrong scale. No LDS: the
-// input is already row-major per token.
+// The group is fixed at 128 (unlike R4D_GEMM_W4A8_GROUP); another group would make a GEMM's fold
+// read the wrong scale. No LDS: the input is already row-major per token.
 //
 // Not obvious:
-//   - The scale is `amax / 448` (E4M3's largest finite value), a dequant multiplier like the
-//     checkpoint's `weight_scale_inv`, so the GEMM's fold only multiplies.
+//   - The scale is `amax / 448` (E4M3's largest finite value), a dequant multiplier, so a GEMM's
+//     fold only multiplies.
 //   - A zero block gets scale 1 and quantises to zeros.
 //   - The clamp is required: `amax * (1/scale)` can land an ulp above 448, and v_cvt_pk_fp8_f32
 //     returns NaN for out-of-range input instead of saturating, so every block's maximum would
 //     become NaN.
 //
-// Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a negative code rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d.h"
 #include "r4d_emit.h"
-#include "r4d_fp8_args.h"
+#include "r4d_quant_args.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_fwht.h"
 #include "r4d_chain.h"
@@ -173,7 +172,7 @@ extern "C" int r4d_quant_act_fp8(long a, long q, long s, int M, int K,
 
 // ============================================================== the plugin ABI entry points
 //
-// The shared operand reader is r4d_fp8_args.h; see libr4d/r4d_args.h.
+// The shared operand reader is r4d_quant_args.h; see libr4d/r4d_args.h.
 /* ================================================================== the fp8 activation quantiser */
 
 static int rad_quant_act_fp8(const RadArgs* a, RadStream stream, bool rot, bool i8 = false) {

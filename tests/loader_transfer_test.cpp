@@ -42,7 +42,7 @@ int copy_async(void* dst, const void* src, int64_t bytes, RadStream stream) {
 #undef rad_memcpy_async
 
 TEST(failed_completion_events_drain_before_resolving_ring_ownership) {
-    if (!rad::device_is_host()) { radtest::skip("host backend only"); return; }
+    if (!rad::device_is_host()) SKIP("host backend only");
     for (Fault mode : { Create, Record, Wait, Copy }) {
         fault = None;
         fences = 0;
@@ -65,7 +65,7 @@ TEST(failed_completion_events_drain_before_resolving_ring_ownership) {
     }
 }
 TEST(ambiguous_upload_or_failed_fallback_fence_cannot_recycle_the_ring) {
-    if (!rad::device_is_host()) { radtest::skip("host backend only"); return; }
+    if (!rad::device_is_host()) SKIP("host backend only");
     for (Fault mode : { CopyFence, Fence }) {
         const pid_t child = fork();
         REQUIRE(child >= 0);

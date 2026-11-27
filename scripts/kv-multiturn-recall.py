@@ -99,8 +99,9 @@ def engine_pid():
         if not p.isdigit():
             continue
         try:
-            if open(f"/proc/{p}/comm").read().strip() == "radiance":
-                return int(p)
+            with open(f"/proc/{p}/comm") as f:
+                if f.read().strip() == "radiance":
+                    return int(p)
         except OSError:
             pass
     return None
@@ -128,7 +129,8 @@ class Server:
                 log(f"[{self.tag}] health after {time.time() - t0:.0f}s")
                 return
             if self.p.poll() is not None:
-                log(open(self.logf).read()[-2000:])
+                with open(self.logf) as lf:
+                    log(lf.read()[-2000:])
                 raise SystemExit(f"arm {self.tag}: engine exited before health")
             time.sleep(1)
         raise SystemExit(f"arm {self.tag}: no health after 300s")

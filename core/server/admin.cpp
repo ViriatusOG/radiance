@@ -425,7 +425,8 @@ json Server::capabilities() const {
     if (deps_.videos) video_caps(caps, deps_.videos);
     if (deps_.shapes) shape_caps(caps, deps_.shapes);
     /* The efforts a chat request may send, probed from the template at startup; null when it
-     * takes any word. "none" and "minimal" are this server's and turn thinking off. */
+     * takes any word. "none" and "minimal" are always served: as enable_thinking = false, or as
+     * the template's own levels where it has them (OaiLimits::template_off_efforts). */
     if (lim_.reasoning_efforts.empty()) {
         caps["reasoning_efforts"] = nullptr;
     } else {

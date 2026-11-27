@@ -452,6 +452,13 @@ rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-iq8r.rad \
 rad-convert /srv/models/google/gemma-4-26B-A4B-it -o gemma4-26b-a4b-dflash-i8.rad \
     --draft-model /srv/models/z-lab/gemma-4-26B-A4B-it-DFlash --recipe data/recipes/gemma4-26b-a4b-df-i8.recipe
 
+# NVIDIA's 2-bit Nemotron-3.5-Bolt-74B-A9B with its LiLiCorr drafter: the IQ2_XXS experts and Q8_0
+# linears as the release stores them, its NVFP4 linears again (served by arch/nemotronh;
+# docs/ARCHITECTURES.md has the list)
+rad-convert /srv/models/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB -o nemotron74-2bit.rad \
+    --draft-model /srv/models/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr \
+    --recipe data/recipes/nemotron74-nvidia-24gb-iq8r.recipe
+
 # Qwen-Image 2.1 or 2.1-Turbo, an image model (§5.6): the diffusers pipeline directory is the
 # checkpoint (text encoder, DiT, VAE and tokenizer). IQ8R for the text encoder and the DiT (rotated
 # int8), or the checkpoint's bf16 (31 GB, two cards)
@@ -596,8 +603,9 @@ rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \
 
 # DeepSeek-V4.1-Flash from the official release (no GGUF in between) at Unsloth's UD-IQ1_S mix:
 # Engram tables rebuilt from the release's tokenizer, the imatrix's split gate/up entries fused, a
-# chat template baked in (the release names none). The recipe's header has the details; serving it
-# needs the deepseek41 architecture plugin, not in this tree
+# chat template baked in (the release names none). The recipe's header has the details;
+# arch/deepseek41 serves it with num-speculative-tokens: 0, since the recipe keeps the drafter's
+# experts MXFP4 (docs/ARCHITECTURES.md)
 python3 data/engram_tables.py /srv/models/deepseek-ai/DeepSeek-V4.1-Flash engram-tables.safetensors
 python3 data/imatrix_merge.py imatrix_unsloth.gguf_file imatrix-merged.gguf
 rad-convert /srv/models/deepseek-ai/DeepSeek-V4.1-Flash --add engram-tables.safetensors \
@@ -683,7 +691,7 @@ A key sits at one of these levels:
 | level | holds |
 |---|---|
 | `server:` | the listener and the process: `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `radiance-home`, `kernels`, `download-dir`, `log` (`info`, `debug` or `trace`), `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, `disk-tier`, a directory for parked models' copies, and `pinned-numa-node`, a NUMA node preferred for pinned host memory over the node nearest each card |
+| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop; a model split over several cards sizes its pools to the card that is tightest once each keeps its own reserve, since every rank's pools are the same size); and `host-mib`, the pinned host memory the process may hold, `disk-tier`, a directory for parked models' copies, `pinned-numa-node`, a NUMA node preferred for pinned host memory over the node nearest each card, and `queue-reserve: N` (1-24, default 8), the hardware queues each card keeps ready for its next stream at about 41 MiB of the card apiece |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive` |
 | `cards:` | `all` or a list of card indices the models may use |
 | `groups:` | `together` and `exclusive` lists of model names |
@@ -771,6 +779,7 @@ that is not serving and waits for room is `waiting`, and its `waiting_for` names
 "Waiting for room". `POST /admin/models/NAME/{load,park,unload,pin,unpin}` moves one model, and
 `POST /admin/reload` or SIGHUP re-reads the file: changed models reload,
 removed ones leave, added ones register, and a `server:` or `cards:` change needs a restart.
+Changing `memory.card-headroom-mib` also needs a restart because the loaded pools keep their split.
 Without an api key these answer loopback callers only. Every model on one card runs its own queues
 beside the others (MULTIMODEL.md §9 has the measurement against taking turns).
 
@@ -937,10 +946,12 @@ server with the reason.
 *The token embedding* is a dense model's largest model-level weight: 248320 x 5120 in bf16 is 1.18
 GiB a card at `tp: 2`. Under `ram` each rank pins its own shard in host memory on top of
 `host-pool-mib`, and the lookup reads a step's rows over the link, so the table costs no VRAM. The
-table is the model-level weight only `embed_lookup` reads. A model whose head is tied to it keeps it
-on the card (the head's GEMM would stream it whole every step), and so does a host that cannot pin
-it (available memory and memory cgroups, after the pools, with `memory.host-headroom-mib` to spare,
-default 4 GiB); startup says which.
+table is the model-level weight that only a token gather reads: `embed_lookup` for a plain table,
+`embed_tq` or `embed_exl3i` for one quantised by plugin `exl3i` (each of its planes counts). A
+quantised table is not sharded, so under `ram` each rank pins all of it. A model whose head is
+tied to it keeps it on the card (the head's GEMM would stream it whole every step), and so does a
+host that cannot pin it (available memory and memory cgroups, after the pools, with
+`memory.host-headroom-mib` to spare, default 4 GiB); startup says which.
 An explicit `ram` turns either case into a refusal. `disk` is refused: the lookup writes activations
 the card reads, which a host kernel reading the container cannot do.
 
@@ -1122,9 +1133,13 @@ models:
 ```
 
 The order is required: libr4d's bf16 MLA rows can otherwise match an i8 request before the GLM
-reader. `kv-cache-dtype: fp8` remains GLM-5.3-Flash's alone: E4M3 latent codes at a descale of 1.
-Both narrow only the latent cache; the DSA index, its key tail and the KDA caches keep their widths.
-Every other model refuses `fp8`, naming `i8`.
+reader. `kv-cache-dtype: fp8` serves GLM-5.3-Flash and DeepSeek-V4.1. On GLM-5.3-Flash it holds
+E4M3 latent codes at a descale of 1; both it and `i8` narrow only the latent cache, and the DSA
+index, its key tail and the KDA caches keep their widths. On DeepSeek-V4.1 (`deepseek41`) it stores
+the compressed latent and the index keys as block-scaled E4M3 entries (544 bytes for the latent's
+1024, 144 for the keys' 256; [OPS.md](OPS.md#attention)), which hold quant_roundtrip's values
+exactly: the output is the bf16 cache's bit for bit. Its window and the compressor's tail stay bf16
+and f32. Every other model refuses `fp8`, naming `i8`.
 
 Measured on TP4, four R9700s, against the 1.17 MXFP4 reference: i8 mean KL 0.149 and top-1
 agreement 87.14%, fp8 0.151 and 87.10%. These compare whole containers, not cache error alone.
@@ -1665,6 +1680,34 @@ more than two windows is kept whole. The startup line `draft floor` says which a
 `radiance:draft_refills_total` counts the hits ended early and `radiance:draft_refill_tokens_total`
 the tokens recomputed.
 
+**Inkling 2's drafter cache.** Inkling 2's DFlash2 drafter attends over a bounded window, so it
+keeps a window KV group of its own (2048 positions) and no full-context storage. The window group is
+not prefix-cached, so on this model (which keeps linear state) a hit leaves a hole in it: the
+scheduler takes the refill span from the widest drafter-owned window group and ends the hit that far
+before the prompt's end, as above, and the reply is the same. `checkpoint-draft-window` (below)
+restores the window from the checkpoint slot instead. The refill cap also applies when the scheduler
+decides whether a preempted request can be re-admitted, for any windowed block drafter with the
+prefix cache on, so that gate credits the hit admission adopts.
+
+**Carrying the drafter's window in the checkpoint slot: `checkpoint-draft-window`.** On a model
+with linear state (as Inkling 2) a prefix hit resumes from a checkpoint slot that holds the trunk's
+state but not the drafter's own window, which is why such a hit is ended early and the window
+recomputed. `checkpoint-draft-window: true` (`--checkpoint-draft-window`) puts the drafter's window
+group in the slot too, so a hit restores it and the drafter proposes from the first decoded token,
+with no refill. The cost is one drafter window of pinned host memory per slot, so automatic slot
+sizing then holds fewer slots (the init line `checkpoint slots` says what a slot weighs). It needs a block drafter with a window KV group
+of its own (a windowed DFlash/DSpark block on a model with linear state, such as Inkling 2's
+DFlash2), speculation, the prefix cache and `checkpoint-interval` above 0; where it cannot apply,
+startup warns. Off by default. Two cases fall back to a recompute and are counted: a checkpoint
+saved with no drafter context pass behind its step (every row reaped or cancelled) would hold
+another sequence's window and is not committed, and a hit whose window blocks cannot be allocated is
+dropped and the prompt prefilled again. `draft_window_stale_ckpt_total` counts the checkpoints not
+committed, whether for that reason or because the drafter's window rows were not held when the
+checkpoint was saved (that case skips the checkpoint with a warning, with or without the flag; a
+missing trunk window stops the engine with an error). `prefix_window_seed_failures_total` counts the
+dropped hits, and the drop is logged on the 1st, 2nd, 4th, 8th... occurrence; both the counter and
+the log also apply on a model that restores a trunk window without the flag.
+
 **Prompt lookup.** The engine also drafts with no model at all: for each sequence it finds the
 latest earlier occurrence of the sequence's last n tokens (prompt and output alike, n from
 `spec-ngram-max` down to `spec-ngram-min`, 4 and 2 by default, the longest first) and proposes
@@ -1928,6 +1971,20 @@ nodes, grown over the block the drafter was trained at. A request with a grammar
 tools) speculates on a tree too: each row is masked against the grammar after its own ancestors.
 `draft-coupling: on` samples one path, so a coupled drafter proposes the chain.
 
+Qwen3.8-27B with its DFlash2 drafter (`qwen35_fp8`, block 8) verifies trees too: its attention
+layers through `attn_paged_tree` and its 48 delta-net layers through
+`gdn_conv_recurrent_update_tree`, whose conv window entries and replay records the core moves with
+the accepted path. On one R9700 (an IQ6R-S-V4 container, i8 KV, tuned, greedy, 800 tokens; one
+stream the mean of eight prompts, two and three streams in all), the chain of 7 decodes 71 / 109 / 155
+tok/s at one / two / three streams, a tree of 9 nodes 81 / 132 / 186 and a tree of 13 87 / 141 / 157.
+A tree is verified once more nodes are asked for than the chain's (`num-speculative-tokens: 9` to
+`13`); at the drafter's own depth, 7, the default, the chain runs as before. The routed (MoE)
+builds keep the chain. Those
+figures are with `draft-short-from: 0`: the short block (`auto`, from two sequences) costs the tree
+more than it saves (on 1.17 with fp8 KV a tree of 13 decoded 133 / 164 tok/s in all at two / three
+streams without it, 113 / 153 with it). Serve this model's trees with `draft-short-from: 0`. A single
+run of the same configuration moves by up to 9% at three streams.
+
 **A shorter block under load: `draft-short-from: N`.** A block drafter's block is paid for by
 every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
 drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
@@ -1966,6 +2023,28 @@ rounds: 1 stream 183.4 and 183.1, 4 streams 529.1 and 537.2). Set it to 8 for a 
 eight or more sequences at once. The drafts are verified as any others; as with
 `num-speculative-tokens`, a different block is a different verify shape, so greedy text can differ at
 a near-tie.
+
+**Turning a block drafter off when it does not pay: `draft-max-lanes: K` and `draft-min-accept: X`.**
+A block drafter adds a wide verify step to every drafting sequence. It pays when its drafts are
+accepted often and few sequences decode at once; otherwise a step can cost more than plain decoding
+gives back. Both keys default to 0, which never gates, and both only apply to a block drafter.
+
+- `draft-max-lanes: K` drafts only while at most K sequences decode in the step. Above K every
+  sequence takes the plain target step. The drafter's context pass still runs, so its cache stays
+  whole and drafting resumes at once when the load falls back to K. Steps gated off are counted in
+  `draft_gated_steps_total`. Startup warns if no block drafter runs or K is not below `max-num-seqs`.
+- `draft-min-accept: X` (0, or above 1 up to 16) stops drafting for one sequence whose smoothed tokens per verify
+  step (1 plus the drafts accepted) falls below X, and resumes above X + 0.4. A plain step gives 1
+  token, so X is a value above 1 at which a draft step pays for its extra cost; that depends on the
+  model and the load, so measure it for yours. While a sequence is stopped the drafter proposes one
+  block after 128 generated tokens, then 256, doubling after each probe that fails, up to 1024, to
+  measure again; the context pass keeps running. The state is per request and survives a preemption.
+  `draft_acc_gated_steps_total` counts the sequence-steps skipped and `draft_spec_off_sequences`
+  shows how many running sequences are stopped now.
+
+Transitions are logged (the first eight, then every 64th), and the startup `draft policy` line lists
+the drafter's KV groups, both keys and the prefix-hit cap. `RADIANCE_DEBUG_DRAFT=1` adds a periodic
+count of which gate declined a draft, including `acc` for `draft-min-accept`.
 
 ### 4.7 Multiple cards
 
@@ -2381,7 +2460,10 @@ models:
 
 At startup the template is probed with `low`, `medium`, `high`, `xhigh` and `max`, and the ones it
 takes are logged and published on `/server_info` as `capabilities.reasoning_efforts` (with the
-server's own `none` and `minimal`; `null` when the template takes any word). A request outside the set
+server's own `none` and `minimal`; `null` when the template takes any word). `none` and `minimal` set
+`enable_thinking` false, which is how most templates turn thinking off. A template that does not read
+`enable_thinking` and has the two words on its own ladder (found by rendering it at startup, and said
+in the log) gets the word as its `reasoning_effort` instead. A request outside the set
 gets a 400 with `param: "reasoning_effort"`, `code: "unsupported_value"` and the set in
 `error.supported`.
 
@@ -2396,7 +2478,8 @@ models:
 ```
 
 It applies to `reasoning_effort` and `chat_template_kwargs.reasoning_effort`, before `none` and
-`minimal` are read, so `minimal=low` keeps thinking on. A `TO` the template refuses stops startup.
+`minimal` are read, so `minimal=low` keeps thinking on, and a `TO` of `none` or `minimal` is handled as
+a request's would be. A `TO` the template refuses stops startup.
 
 **`thinking-token-budget: N`** caps the reasoning length: at N tokens inside the reasoning block the
 next position is masked to the block's end token (`</think>`) and the answer follows. It is the
@@ -2518,6 +2601,15 @@ models:
   such GEMM for is reported and skipped, as UIs do.
 - `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/file.safetensors"}` adds a file
   under a name; unload removes it and frees the slots of every combination using it.
+- `POST /v1/loras/validate {"model": "image", "loras": {"film": 0.6, "style": 1.0}}` checks a
+  combination before a request uses it: the same adapter names and strengths `loras` takes. It
+  composes and packs the combination on the CPU and answers 200 when every requested delta
+  reaches every op that reads its matrix, on every rank, and its structural rank bound fits
+  `max-lora-rank`, without reserving a slot
+  or generating an image. A combination generation would truncate to the slot rank is refused
+  here, so a caller learns before generating that the result would be approximated. Like the
+  load and unload routes it needs `--api-key` or a loopback client. A parked or unloaded fleet
+  model answers 409 rather than being brought back.
 
 ### 4.10 Control vectors
 
@@ -2650,7 +2742,7 @@ purpose:
 |---|---|---|
 | `memory.gpu-headroom-mib: N` | 96 | VRAM left unclaimed on every card |
 | `memory.gpu-memory-mib: N` | 0 (use `memory.gpu-headroom-mib`) | VRAM claimed on every card; inverse of `memory.gpu-headroom-mib`. Give one (§4.3) |
-| `kv-cache-dtype: T` | bf16 | `bf16` or `i8`; GLM i8 needs `server.kernels: glm,libr4d,libavx,libref` in that order. `fp8` remains GLM-5.3-Flash only (§4.4) |
+| `kv-cache-dtype: T` | bf16 | `bf16` or `i8`; GLM i8 needs `server.kernels: glm,libr4d,libavx,libref` in that order. `fp8` on GLM-5.3-Flash and DeepSeek-V4.1 (exact there) alone (§4.4) |
 | `state-cache-dtype: T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `host-pool-mib: N` | 0 | pinned host tier for weights, in all: the ranks of a model pin equal shares of it (N / `tp` each) |
 | `kv-resident: N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
@@ -2730,7 +2822,16 @@ purpose:
 | `draft-depth-load-jump-ms: LIST` | built in | `draft-depth-load: on`: what a verify of more than 16, 32, 48, 64 query rows costs on top, in milliseconds (up to four numbers) |
 | `draft-suffix: MODE` | off | SuffixDecoding as a step selector on a serial head's chain: a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless; with the fixed chain, `draft-verify: traversal` and `draft-depth: adaptive`, not `draft-verify: block` (§4.6) |
 | `draft-suffix-min-match: L`, `draft-suffix-max: N`, `draft-suffix-min-score: D` | 6, 7, 0.3 | the shortest match (1..12), the most rows of a suffix step (1..32; widens the verify window to max(`num-speculative-tokens`, N); at most 7 on Flash-Next), and the path score under which the chain is cut |
+| `checkpoint-draft-window: true` | off | a block drafter's own window KV group also rides in the checkpoint slots of a model with linear state, so a prefix hit restores it instead of ending early for a refill; one drafter window more pinned host memory per slot. Needs the prefix cache, `checkpoint-interval` above 0 and a drafter with a window group of its own; warns where it has no effect (§4.6) |
 | `draft-short-from: N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
+| `draft-max-lanes: K` | 0 (off) | a block drafter drafts only while at most K sequences decode in the step; above K every sequence takes the plain target step and the drafter only runs its context pass (§4.6) |
+| `draft-min-accept: X` | 0 (off) | a block drafter stops for a sequence whose smoothed tokens per verify step (1 + accepted drafts) falls below X (0, or above 1 up to 16), resumes above X + 0.4, and proposes one block now and then (after 128 generated tokens, doubling to 1024) to measure again (§4.6) |
+| `draft-depth0: MODE` | off | `on`: under `draft-window: adaptive` the window may also choose depth 0, the plain step (no query pass, no verify row; a block drafter's context pass still runs), where the measured plain step emits more tokens a millisecond than the drafting depth. The output is the same |
+| `draft-probe: N` | 16 | with `draft-depth0: on`, a step at the drafting depth every N cycles at depth 0 keeps its estimate measured (2 to 4096) |
+| `draft-probe-backoff: N` | 0 | with `draft-depth0: on`, each probe that leaves depth 0 in place doubles the probe interval, up to N doublings (0 to 8); a move starts it over |
+| `draft-hybrid: MODE` | off | `on`: beside a chain draft head (serial or block, not a tree), a sequence whose prompt lookup matches at least `draft-hybrid-match` tokens back verifies the lookup's proposal instead of the head's; its next step is planned after the commit. The output is the same |
+| `draft-hybrid-match: N` | 8 | the lookup match `draft-hybrid` needs, in tokens (1 to 256) |
+| `dspark-walk: MODE` | off | `on`: DeepSeek-V4.1's DSpark drafter walks its Markov tables over the whole vocabulary, as the reference does, instead of re-ranking the head's top candidates. The output is the same |
 | `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged by coupling. Qwen35's native U2 head couples its global top eight without reranking ([IQR-V4 conversion](IQR.md#keeping-the-native-mtp-head-with-a-split-target)). A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-verify: MODE` | token | how a coupled draft chain is verified: `token` decides each row on its own (maximal coupling); `block` decides the whole chain at once (Block Verification, arXiv 2403.10444) and switches `draft-coupling` on; `traversal` walks the chain bottom-up (Traversal Verification, arXiv 2505.12398) and needs `draft-coupling: on`. The output distribution is the same in all three, every draft a step accepts is one the target's own law would have produced, and `block` and `traversal` accept at least as many drafts a step as `token`. Sampled rows only: a greedy row is verified as before. The verify runs as one workgroup a request, with no scratch (§6) |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
@@ -2835,6 +2936,8 @@ keys are refused on it, and so are the pixel bands.
 | `expert-stats: FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
 | `expert-profile: FILE` | rank the expert plane by this `expert-stats` JSON's `decode` counts instead of the container's activation profile, which is prefill-heavy (decode-hot experts differ); the planner keeps the hottest resident |
 | `expert-pin-top: F` | pin the hottest fraction `F` (0 < F <= 1) of the routed experts by `expert-profile`'s share: heat never demotes them, so the decode-hot set stays resident while the rest streams. 0, the default, is off |
+| `expert-split: LIST` | the routed experts a layer each rank holds, comma-separated in rank order, even counts summing to the model's (`deepseek41`, `glm5next` with whole experts). A rank given few enough to hold them all in VRAM streams none over its link, for cards on unequal links. Empty, the default, is the even split |
+| `weight-sidecar: FILE` | a container `rad-sidecar` wrote from the model's: its entries stand in for the container's of the same name and logical shape, in another encoding. Empty, the default, is none |
 | `draft-expert-placement: WHERE` | `auto` (the default) or `host`: `host` pins a draft head's (MTP, DSpark) routed experts in the host pool before any placement strategy runs, read in place like a pooled expert; `auto` leaves them to the strategy |
 | `server.live: true` | the live terminal view (§6.4) |
 | `server.log: LEVEL` | `info` (the default), `debug` or `trace`: how much the server logs (§6.5) |
@@ -2879,7 +2982,7 @@ keys are refused on it, and so are the pixel bands.
 | `GET /` or `/dashboard` | the web dashboard |
 | `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from |
 | `GET /history` | the last hour the process sampled, one sample a second: what the dashboard draws (§6.1) |
-| `GET /v1/loras`, `POST /v1/load_lora_adapter`, `POST /v1/unload_lora_adapter` | runtime LoRA adapters: list, add and remove (§4.9.1, §4.9.2) |
+| `GET /v1/loras`, `POST /v1/load_lora_adapter`, `POST /v1/unload_lora_adapter`, `POST /v1/loras/validate` | runtime LoRA adapters: list, add, remove, and check a generator's combination (§4.9.1, §4.9.2) |
 | `GET\|POST /admin/control-vector` | the deployment's control-vector default (§4.10) |
 | `GET /admin/fleet`, `POST /admin/models/NAME/{load,park,unload,pin,unpin}`, `POST /admin/reload` | the fleet's state, one model moved, the file read again (§4.0, [MULTIMODEL.md](MULTIMODEL.md)) |
 
@@ -3316,11 +3419,12 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 | `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard, and names it for `DELETE /sessions/<label>` (§4.8) |
 | `control_vector` | `true` applies the control vector this deployment found to this request's steps, `false` leaves them on the stock model; absent or null takes the deployment's default (`control-vector: on\|off`, or as changed in the dashboard's Model view). A deployment with no vector refuses `true` by name. On a compatible container (Qwen3.8-Flash-Next), a refusal-direction vector makes the model decline far fewer requests -- that is a safety behaviour removed, and you own what it writes (§4.10, "Control vectors") |
 | `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives (§5.12). Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
+| `return_tokens`, `return_token_ids` | the generated token ids beside the text: each choice's `token_ids` (chat and completions; llama-server's and vLLM's names, either one). A stream's chunks carry the ids since the previous chunk, so together they hold each id once; ids whose text a possible stop string still holds back go out with the chunk that carries it. The prompt's ids are not returned (`usage.prompt_tokens` counts them) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}` (the flat Responses spelling of a tool or a choice is folded into that nested form); the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |
 | `continue_final_message` | chat only. A conversation ending in an assistant message is continued rather than answered, as llama-server and the Anthropic API do; the reply carries that message's text and what follows it. `true`, `"content"` or `"reasoning_content"` names it explicitly; `add_generation_prompt: true` opens a new turn instead |
 | `reasoning_format` | chat only, llama-server's: `none` keeps the reasoning in `content`; `auto` and `deepseek` split it into `reasoning_content` (and its alias `reasoning`), the default |
-| `reasoning_effort`, `enable_thinking`, `reasoning`, `thinking` | chat only. The levels are the template's (`capabilities.reasoning_efforts` on `/server_info`); `none` and `minimal` turn thinking off. `reasoning` is OpenRouter's object (`effort`, `enabled`, `max_tokens`; `exclude` is refused, never dropped) and `thinking` Anthropic's (`type`, `budget_tokens`) |
+| `reasoning_effort`, `enable_thinking`, `reasoning`, `thinking` | chat only. The levels are the template's (`capabilities.reasoning_efforts` on `/server_info`); `none` and `minimal` turn thinking off, or are passed where the template has levels by those names. `reasoning` is OpenRouter's object (`effort`, `enabled`, `max_tokens`; `exclude` is refused, never dropped) and `thinking` Anthropic's (`type`, `budget_tokens`) |
 | `thinking_token_budget`, `thinking_budget`, `thinking_budget_tokens`, `reasoning_budget_tokens`, `reasoning.max_tokens`, `thinking.budget_tokens` | chat only. ≥ 0: the reasoning tokens after which the block is closed (§5.2); -1 is none. Default `thinking-token-budget`, else none |
 | `preserve_thinking` | chat only. The chat template variable of that name, as llama.cpp maps it; Qwen3.6 and later keep earlier turns' reasoning in the prompt with it |
 | `response_format`, `json_schema` | chat only. `json_schema` is llama-server's shorthand: the schema itself. Mutually exclusive with `grammar` |
@@ -3364,7 +3468,7 @@ fall into four kinds:
 | `suffix` | empty | infilling through `/v1/completions` is not implemented |
 | `lora` | empty | an adapter is chosen by `model` (§4.9.1), not by a per-request list |
 | `modalities`, `audio` | `["text"]`, null | output other than text is not implemented |
-| `n_indent`, `t_max_predict_ms`, `return_tokens` | 0, ≤ 0, false | not implemented (`return_tokens` is served on `/completion`, §5.9) |
+| `n_indent`, `t_max_predict_ms` | 0, ≤ 0 | not implemented |
 | `grammar_lazy`, `grammar_triggers`, `preserved_tokens` | off, empty, empty | the chat format decides them |
 
 - **Anything else is ignored**, as llama-server and vLLM ignore it: an unknown field is far more often
@@ -3646,7 +3750,8 @@ The answer is an object with the same names, in the same order:
 - `questions` is an object of named questions, answered in the order sent. A question is `type`
   (`noul`, `choice` (the default) or `score`), `instructions`, and `criteria`: for a `noul`
   optionally `{"true": ..., "false": ...}`; for a `choice` the options, name to description; for a
-  `score` 2 to 10 level descriptions, lowest first.
+  `score` 2 to 10 level descriptions, lowest first. A request has at most 64 questions (a 400
+  above that).
 - `images` is an array of `data:` URLs, placed ahead of the state. Each picture is first scaled down
   to at most 1024 x 1024 pixels' area, as d1's runner does, then cut as LFM2-VL's processor cuts it:
   whole when it is small, else into 512-pixel tiles plus a thumbnail.
@@ -3972,13 +4077,12 @@ non-commercial use only, and BreezeBlue counts hosting it as an API as commercia
 
 #### Speech: drama-3
 
-drama-3's published container is listed under README.md's "Not served by this version"; what
-follows is the route a drama-3 container answers.
+Convert the released checkpoint and its codec using the [rotated int8 recipe](../data/recipes/drama3-i8.recipe).
 
 ```yaml
 models:
   drama3:
-    model: drama3.rad
+    model: drama3-i8.rad
     tp: 2                     # two cards
 ```
 
@@ -4317,6 +4421,9 @@ waits and answers with the file; `POST /send` makes it in the background and ans
 `steps`), then `"completed"` with the file as base64 in `model_base64`, or `"error"` with its
 `message`.
 
+A shape holds one admission place (`max-queued-requests`) while it is made, in the background too: a
+full queue answers 429. A `/generate` whose client disconnects is cancelled.
+
 ```yaml
 models:
   hunyuan3d-2-bf16:
@@ -4468,9 +4575,14 @@ show it, and Details reads `/graph` and `/server_info` once.
   state, cards, memory, policy and returns. A model that is not serving and waits for room, memory
   on its cards or host memory to pin, shows as Waiting for room in the table and in the state chart
   (`waiting` in `/admin/fleet`, §4.0).
-- **Performance**: decode, step time, prefill, requests, KV cache, prefix hits and acceptance, each
-  selecting the large chart; link traffic; acceptance by draft position; expert residency on a tiered
-  model.
+- **Performance**: decode, step time, prefill, requests, KV cache (in bytes, and in tokens: held now,
+  the capacity now and the most it can grow to when all lendable space goes to the cache), prefix hits
+  and acceptance, each selecting the large chart; link traffic; acceptance by draft position; expert
+  residency, with the hit rate and the moves only on a tiered model (`experts.tiered` in `/stats`).
+  A prefill step can run for seconds and the scheduler publishes its counters when a step ends, so
+  `/stats` also carries `step_open_phase` and `step_open_s`, the step running now. The decode and
+  prefill lines read 0 when nothing of their kind runs; a gap where work was under way but no step
+  of its kind finished is drawn through while the model is busy (history's `busy`), up to a minute.
 - **Requests**: what is running, then speed against context, time to first token and speed across
   finished requests. The process keeps the last 500 of the hour; **Export** saves them as
   `<model>-requests.json`.
@@ -4571,6 +4683,11 @@ always 1 and carries the cache's settings as labels: `cache_dtype`, `block_size`
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
 | `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
+| `draft_gated_steps_total`, `draft_acc_gated_steps_total` | steps a block drafter was gated off by `draft-max-lanes`, and sequence-steps it skipped under `draft-min-accept` (§4.6) |
+| `draft_reach_declined_steps_total` | sequence-steps a block drafter did not propose because a prefix hit left a hole in its cache that its window has not yet slid past |
+| `draft_spec_off_sequences` | gauge: running sequences the block drafter is stopped for under `draft-min-accept` |
+| `draft_window_stale_ckpt_total` | checkpoints not committed because the drafter's window could not be saved in them (§4.6) |
+| `prefix_window_seed_failures_total` | prefix hits dropped because the window blocks a restore needs could not be allocated (§4.6) |
 | `lookup_proposals_total`, `lookup_held_total`, `lookup_held_drafts_total`, `lookup_held_hits_total` | prompt lookup as the only drafter: proposals made, proposals held back as not paying for their verify rows and their drafts, and of the held ones scored against the text that followed, the drafts that came true (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `draft-window: adaptive` (§4.6) |
@@ -4739,7 +4856,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 2.2.0
+I STARTUP REPORT -- radiance 2.3.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [models.flashnext.model]
 I   --tp                               2                                           [models.flashnext.tp]

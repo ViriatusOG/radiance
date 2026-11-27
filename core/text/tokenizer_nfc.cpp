@@ -3,7 +3,6 @@
 #include "util/simd.h"
 
 #include <algorithm>
-#include <cstring>
 #include <vector>
 
 namespace rad {

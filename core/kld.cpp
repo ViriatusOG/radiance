@@ -727,6 +727,7 @@ int Kld::finish() {
     {
         std::ofstream o(tmp);
         o << m.dump(1) << "\n";
+        o.close();   /* flushes: a full disk fails here, not silently in the destructor */
         if (!o) { RAD_ERR("kld: cannot write %s", tmp.c_str()); return RAD_E_IO; }
     }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
@@ -789,6 +790,7 @@ int Kld::report() {
     {
         std::ofstream o(out_);
         o << rep.dump(1) << "\n";
+        o.close();
         if (!o) { RAD_ERR("kld: cannot write %s", out_.c_str()); return RAD_E_IO; }
     }
     /* Every position, in reference row order: KL, the candidate's and the reference's NLL of the

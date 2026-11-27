@@ -275,7 +275,7 @@ TEST(the_builder_accepts_a_ring_group) {
     CHECK_EQ(gi.bytes_per_block, 2 * 16 * 8 * 128 * 2 * 2);
     CHECK_EQ(gi.bytes_per_state, 0ll);
     /* Named, not "?". */
-    CHECK(std::strcmp(bld_kv_kind_name(RAD_KV_RING), "?") != 0);
+    CHECK(std::strcmp(kv_kind_name(RAD_KV_RING), "?") != 0);
 }
 
 RAD_TEST_MAIN()

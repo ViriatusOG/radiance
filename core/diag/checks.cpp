@@ -17,7 +17,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
-#include <set>
 
 namespace rad {
 namespace diag {
@@ -235,8 +234,8 @@ void check_od_runtime_pm(const Facts& f, std::vector<Finding>* out) {
 
 /* ---- the host ------------------------------------------------------------------------------- */
 
-/* Incompatible where cards serve (#42's class of hang); a host-backend run beside a loaded driver is
- * only told. */
+/* Incompatible where cards serve (a disabled CWSR can hang a card); a host-backend run beside a
+ * loaded driver is only told. */
 void check_cwsr(const Facts& f, std::vector<Finding>* out) {
     if (f.host.cwsr_enable != 0) return;
     add(out, served(f).empty() ? Finding::Warn : Finding::Incompatible, "cwsr-off",

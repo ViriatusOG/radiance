@@ -38,7 +38,8 @@ struct AttnLlamaBF16 {
         rad_buf x    = 0;   /* [max_tok, n_embd] the residual stream */
         rad_buf h    = 0;   /* [max_tok, n_embd] normed input, then the o output */
         rad_buf q    = 0;   /* [max_tok, q_dim + 2*kv_dim] fused q|k|v plane; q, k, v are the
-                             * column views [0, q_dim), [q_dim, q_dim+kv_dim), [q_dim+kv_dim, ...) */
+                             * column views [0, q_dim), [q_dim, q_dim+kv_dim),
+                             * [q_dim+kv_dim, ...) */
         rad_buf qs   = 0;   /* [max_tok, q_dim] dense q lifted out of the fused plane for
                              * attn_paged, whose kernels read q only contiguous (see step) */
         rad_buf k    = 0;   /* the same plane: the rope/kv_store readers take the k columns */
@@ -140,11 +141,7 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
      * can hand the slice to a kernel that reads q only dense (gemma4.cpp:1001-1023). Where the op
      * is not declared or does not resolve, the slice is lifted into dense qs first. The cast is
      * always declared but issued only in the fallback. */
-    op_qs = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", q_dim),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.q}, {w.qs});
+    op_qs = cast_op(b, g.max_tok, q_dim, g.dtype, g.dtype, w.q, w.qs);
     auto declare_attn = [&](const char* op, rad_buf q) {
         /* Declared before kv_store so block_size derives from the resolved attention kernel (spec
          * §7.2), pinned to RAD_KV_BLOCK for the same reason rad_arch.h states. This op keeps the
@@ -186,13 +183,7 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
               {w.attn}, {w.h});
 
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h);
 
     op_add = rw(b, RAD_OP(b, "add",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),

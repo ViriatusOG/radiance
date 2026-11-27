@@ -60,8 +60,13 @@ ADVICE = [
 ]
 
 
+def slurp(p, mode="r", n=-1):
+    with open(p, mode) as f:
+        return f.read(n)
+
+
 def rd(p, conv=str, default=None):
-    try: return conv(open(p).read().strip())
+    try: return conv(slurp(p).strip())
     except (OSError, ValueError): return default
 
 
@@ -71,7 +76,7 @@ class Card:
         hw = glob.glob(dev + "/hwmon/hwmon*"); self.hwmon = hw[0] if hw else None
 
     def read(self):
-        b = open(self.dev + "/gpu_metrics", "rb").read()
+        b = slurp(self.dev + "/gpu_metrics", "rb")
         size, fr, cr = struct.unpack_from("<HBB", b)
         if (fr, cr) != (1, 3) or size != 120 or len(b) < 120:
             raise SystemExit(f"{self.bdf}: gpu_metrics v{fr}.{cr} ({size} bytes) -- only the v1.3 layout is known here")
@@ -106,7 +111,7 @@ def find_cards():
         # Skip, do not stop, on another layout: an APU's integrated graphics reports a v2.x table and
         # the engine does not serve on it.
         try:
-            size, fr, cr = struct.unpack_from("<HBB", open(dev + "/gpu_metrics", "rb").read(4))
+            size, fr, cr = struct.unpack_from("<HBB", slurp(dev + "/gpu_metrics", "rb", 4))
             if (fr, cr) != (1, 3) or size != 120:
                 print(f"{c.bdf}: gpu_metrics v{fr}.{cr} ({size} bytes), not v1.3 -- skipped", file=sys.stderr)
                 continue
@@ -135,8 +140,10 @@ TOPICS = ["how a B-tree splits and merges nodes", "the history of the printing p
 
 
 def post(base, body, timeout=900):
-    return json.load(urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                                                    headers={"content-type": "application/json"}), timeout=timeout))
+    request = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"content-type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as r:
+        return json.load(r)
 
 
 ENGINE = ("decode_tokens_total", "engine_steps_total", "engine_steps_decode_total", "engine_steps_mixed_total",
@@ -145,7 +152,9 @@ ENGINE = ("decode_tokens_total", "engine_steps_total", "engine_steps_decode_tota
 
 def engine_counters(base):
     """The engine's own step counters (Radiance /metrics, summed over labels); None if the server has none."""
-    try: m = urllib.request.urlopen(base + "/metrics", timeout=5).read().decode()
+    try:
+        with urllib.request.urlopen(base + "/metrics", timeout=5) as r:
+            m = r.read().decode()
     except Exception: return None
     out = {}
     for k in ENGINE:
@@ -358,7 +367,10 @@ if a.watch:                                     # no load of our own; the server
     t1 = time.time(); tps, stalled, conc, done = [], False, None, []
     eng = engine_windows(snaps, t0, t1, a.window) if snaps else []
 else:
-    model = a.model or json.load(urllib.request.urlopen(base + "/v1/models", timeout=10))["data"][0]["id"]
+    model = a.model
+    if not model:
+        with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
+            model = json.load(r)["data"][0]["id"]
     t0, t1, done, stalled, snaps = load(a, base, model); tps = windows(t0, t1, done, a.window); conc = a.conc
     eng = engine_windows(snaps, t0, t1, a.window)
     errs = [d[3] for d in done if d[3]]

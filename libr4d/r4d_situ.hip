@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include "r4d_plugin.h"
+#include "r4d_chain.h"
 #include "r4d_launch.h"
 #include "rad_plugin.h"
 
@@ -33,7 +34,11 @@ struct Args {
     float gcap, ucap;
 };
 
+/* CH is r4dchain for the chained form (r4d_chain.h), which waits before its first read and adds
+ * after its last write; no block returns early. */
+template <class CH>
 __global__ __launch_bounds__(kThr) void situ_kernel(Args A) {
+    if (CH::on) r4d_chain_wait();
     const long long r = blockIdx.x;
     const uint16_t* g = A.gu + r * A.gu_rs;
     uint16_t* yr = A.y + r * A.y_rs;
@@ -43,6 +48,7 @@ __global__ __launch_bounds__(kThr) void situ_kernel(Args A) {
         const float ua = A.ucap > 0.0f ? A.ucap * tanhf(uv / A.ucap) : uv;
         yr[i] = tobf(ga * (1.0f / (1.0f + expf(-gv))) * ua);
     }
+    if (CH::on) r4d_chain_done();
 }
 
 }  // namespace r4d_situ
@@ -76,6 +82,11 @@ int r4d_rad_situ_mul(const RadArgs* a, RadStream stream) {
     A.y = (uint16_t*)y->data; A.y_rs = y->stride[0];
     A.n = (int)n;
     A.gcap = (float)gcap; A.ucap = (float)ucap;
-    R4D_KLAUNCH(R4D_KNAME(situ_kernel), dim3((unsigned)M), dim3(kThr), (hipStream_t)stream, A);
+    if (rad_args_geti_or(a, "chain", 0) != 0)
+        R4D_KLAUNCH(R4D_KNAME(situ_kernel<r4dchain>), dim3((unsigned)M), dim3(kThr),
+                    (hipStream_t)stream, A);
+    else
+        R4D_KLAUNCH(R4D_KNAME(situ_kernel<R4dUnchained>), dim3((unsigned)M), dim3(kThr),
+                    (hipStream_t)stream, A);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

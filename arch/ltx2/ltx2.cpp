@@ -70,12 +70,11 @@
  * area at most. The prompt enhancer and the temporal upsampler (the DFR pipeline's) are not run.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -184,13 +183,13 @@ static int64_t positions(const RadVideoGeom* g, float* pos, int64_t cap) {
 
 /* ================================================================== linears */
 /* An activation a linear reads: its bf16 plane and, for block-fp8 or rotated int8 linears, its
- * codes, which a quantiser makes from the plane (QuantFP8: E4M3, or had_quant_act_i8g's int8 at
+ * codes, which a quantiser makes from the plane (QuantAct: E4M3, or had_quant_act_i8g's int8 at
  * the weights' scale group). Rows narrower than that group carry no codes: a bf16 linear reads
  * them (the latents' projections in). Where no library serves the rotating quantiser, each int8
  * linear quantises its own input and this declares none. */
 struct Act {
-    ActFP8   a{};
-    QuantFP8 q{};
+    ActQ   a{};
+    QuantAct q{};
     int64_t  n = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t rows,
@@ -220,7 +219,7 @@ struct Act {
  * any container (a gate's logits: too few rows for 128-row fp8 blocks). The input and output rows
  * may sit at different offsets of their buffers. */
 struct Lin {
-    LinearFP8  l{};
+    LinearQ  l{};
     rad_weight w = 0, bias = 0;
     rad_op     op = 0, op_b = 0;
     bool       fp8 = false;      /* read through its codes: block fp8, or rotated int8 */
@@ -264,7 +263,7 @@ struct Lin {
         l.mapped = mapped;
         RAD_ARCH_TRY(l.declare(b, nm, g, base, N, K, RAD_SHARD_NONE, grp_layer(group), wsrc, in.a, y,
                                max_rows, parts));
-        const bool other = l.bf16 || l.mx || l.w4 || l.paro || l.paro5 || l.iqr;
+        const bool other = l.bf16 || l.w4 || l.iqr;
         if (other || (g.w_i8h ? !(l.i8 && l.i8_rot) : l.i8)) {
             fprintf(stderr, "radiance: ltx2: '%s' is not %s as the first DiT projection is; this "
                             "plugin reads bf16, block-fp8 or rotated int8 linears, one kind a "
@@ -298,43 +297,11 @@ struct Lin {
             l.step(c, in.a, y, ri + rows, ri, rows, ro);
         else
             RAD_ISSUE_N(c, op, rows, brow_slice(in.a.q, ri, rows, K),
-                        brow_slice(in.a.s, ri, rows, K / RAD_FP8_BLOCK), RAD_W(l.w), RAD_W(l.ws),
+                        brow_slice(in.a.s, ri, rows, K / RAD_SCALE_GROUP), RAD_W(l.w), RAD_W(l.ws),
                         out, RAD_NONE, RAD_NONE);
         if (op_b) RAD_ISSUE_N(c, op_b, rows, out, RAD_W(bias), out);
     }
 };
-
-/* A weight copied as the checkpoint holds it, read whole. */
-static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
-                        std::initializer_list<int64_t> shape, int access, int group) {
-    if (map_copy(b, dn, src) < 0) return 0;
-    return decl_w(b, dn, dtype, shape, access, RAD_SHARD_NONE, grp_layer(group));
-}
-
-static rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, const char* dtype,
-                    rad_buf in, rad_buf out) {
-    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                          RAD_STR("dtype", dtype)),
-                        RAD_NOWEIGHTS),
-              { in }, { out });
-}
-
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, const char* dtype, rad_buf a, rad_buf c,
-                     rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", dtype)),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
-}
-
-static rad_op cast_op(RadBuilder* b, int64_t rows, int64_t n, const char* from, const char* to,
-                      rad_buf x, rad_buf y) {
-    return rw(b, RAD_OP(b, "cast",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("from", from),
-                                   RAD_STR("to", to)),
-                        RAD_NOWEIGHTS),
-              { x }, { y });
-}
 
 /* An RMS norm over n with an optional gain (none: a gain of one), bf16. */
 static rad_op rms_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_weight w, rad_buf x,
@@ -375,20 +342,6 @@ static rad_op gate_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf table, rad
                                    RAD_STR("dtype", "bf16"), RAD_STR("act", "none")),
                         RAD_NOWEIGHTS),
               { y, table, x }, { x });
-}
-
-/* A space-separated list off the container (rad-convert flattens arrays that way). */
-static std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
-    std::vector<double> v;
-    const char* s = rad_meta_gets(m, key, nullptr);
-    while (s && *s) {
-        char* e = nullptr;
-        const double x = std::strtod(s, &e);
-        if (e == s) { ++s; continue; }
-        v.push_back(x);
-        s = e;
-    }
-    return v;
 }
 
 static std::string ints(std::initializer_list<long long> v) {
@@ -588,7 +541,7 @@ enum : int {
 struct Model {
     Names nm{""};
     Geom  gt{}, gd{};                /* text encoder and connectors (prompt rows), DiT (step rows) */
-    int64_t maxS = 0, maxA = 0, maxPpf = 0, maxVox = 0;
+    int64_t maxS = 0, maxA = 0, maxPpf = 0;
     std::vector<double> rungs, refine;
 
     /* ---- the text encoder: Gemma 4's language model, every layer's output kept */
@@ -675,7 +628,6 @@ struct Model {
 
     /* ---- the audio VAE's decoder and the vocoders */
     int64_t aC0 = 0;
-    std::string a_mean, a_std;
     rad_op  op_aden = 0, op_acast = 0, op_aunpack = 0, op_acin = 0, op_anout = 0;
     rad_op  op_acout[2] = {}, op_amel = 0;
     rad_weight w_acin = 0, b_acin = 0, w_acout[2] = {}, b_acout[2] = {}, w_amean = 0, w_astd = 0;
@@ -713,7 +665,7 @@ struct Model {
     rad_weight dw_t1 = 0, db_t1 = 0, dw_t2 = 0, db_t2 = 0, dw_ad = 0, db_ad = 0;
     rad_op  op_dpad = 0, op_dcin = 0, op_dtin = 0, op_dtsin = 0, op_dt1 = 0, op_dts = 0, op_dt2 = 0;
     rad_op  op_das = 0, op_dad = 0, op_ddcu = 0, op_dsig = 0, op_dtgeom = 0, op_dgrid = 0;
-    rad_op  op_dcrop = 0, op_dpos4 = 0, op_dg5[4] = {}, op_dpos5 = 0, op_dz = 0, op_dxcast = 0;
+    rad_op  op_dcrop = 0, op_dg5[4] = {}, op_dpos5 = 0, op_dz = 0, op_dxcast = 0;
     rad_op  op_dxin = 0, op_dnout = 0, op_ddout = 0, op_dst = 0;
     std::vector<rad_op> op_dnoise;   /* each tile's noise: its own stream */
     rad_buf b_dz = 0, b_dx = 0, b_dfeat = 0, b_d4 = 0, b_ddh = 0, b_dctx = 0, b_dn = 0;
@@ -3233,7 +3185,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- bf16, block fp8 or rotated int8: what the container holds for the first DiT projection
      * decides every large linear (rad_arch.h, Geom::w_bf16 and w_i8h) */
     {
-        LinearFP8 probe{};
+        LinearQ probe{};
         RAD_ARCH_TRY(probe.probe(b, nm, m.gd, "dit.blk.0.attn1.qkv",
                                  { "transformer.transformer_blocks.0.attn1.to_q.weight",
                                    "transformer.transformer_blocks.0.attn1.to_k.weight",

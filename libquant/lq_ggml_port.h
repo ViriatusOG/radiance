@@ -306,6 +306,20 @@ void ggml_quantize_init(enum ggml_type type);
 /* ggml_quantize_requires_imatrix: the types whose search has no path without `quant_weights`. */
 bool ggml_quantize_requires_imatrix(enum ggml_type type);
 
+/* The search tables an I type needs (the lattice, its index map and each off-grid point's
+ * neighbours), after ggml_quantize_init. `grid_size`, `map_size` and `neighbours_size` are the
+ * number of elements, not bytes. Only IQ2_XXS and IQ3_XXS have an entry; the other I types keep
+ * their tables host-side. */
+struct SearchTables {
+    const void * grid;
+    const int  * map;
+    const uint16_t * neighbours;
+    int64_t grid_size;
+    int64_t map_size;
+    int64_t neighbours_size;
+};
+bool ggml_search_tables(enum ggml_type type, SearchTables * out);
+
 /* Bytes of one row of `ne` values; `ne` a multiple of the type's block. */
 size_t ggml_row_size(enum ggml_type type, int64_t ne);
 

@@ -899,7 +899,7 @@ int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
     for (auto& [k, v] : by) { names.push_back(k); (*out)[k]; }
     std::vector<std::string> errs(names.size());
     std::vector<double> kept(names.size(), 1.0);
-    std::vector<char> exact(names.size(), 1);
+    std::vector<char> exact(names.size(), 1), exceeds_rank(names.size(), 0);
     std::atomic<size_t> next{ 0 };
     auto work = [&]() {
         for (size_t i; (i = next.fetch_add(1)) < names.size();) {
@@ -930,6 +930,7 @@ int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
                 bound += p.d->rank_bound;
             }
             if (!errs[i].empty()) continue;
+            exceeds_rank[i] = std::min({rows, K, bound}) > max_rank;
             c.rows = rows; c.K = K;
             if (lr && R <= max_rank) {
                 /* Side by side: every delta its own block of ranks. */
@@ -1019,6 +1020,7 @@ int compose(const KeyMap& km, const std::vector<Strength>& ads, int max_rank,
     for (size_t i = 0; i < names.size(); ++i) {
         if (!errs[i].empty()) return fail(err, RAD_E_SHAPE, errs[i]);
         ++rep->modules;
+        if (exceeds_rank[i] && rep->over_rank.empty()) rep->over_rank = names[i];
         /* Held exactly: side by side, or an operator whose rank fits (LoKr, LoHa within R). */
         if (exact[i] || kept[i] >= 0.9999) ++rep->exact;
         else if (kept[i] < rep->worst_kept) { rep->worst_kept = kept[i]; rep->worst_module = names[i]; }

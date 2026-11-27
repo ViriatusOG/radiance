@@ -319,7 +319,8 @@ AVX_KERNEL(causal_conv1d) {
     if (p_int(a, "dilation", 1) != 1) return RAD_E_INVAL;
     return depthwise_causal_conv(a, { rad_arg_in(a, 0), rad_arg_in(a, 1), rad_arg_in(a, 2),
                                       rad_arg_in(a, 3), nullptr, rad_arg_in(a, 4),
-                                      rad_arg_in(a, 5), rad_arg_in(a, 6), rad_arg_in(a, 7), false });
+                                      rad_arg_in(a, 5), rad_arg_in(a, 6), rad_arg_in(a, 7),
+                                          false });
 }
 
 /* Inkling 2's short convolution with its residual: causal_conv1d's operands with `dyn` before the

@@ -18,7 +18,9 @@ using namespace ref;
 
 namespace {
 
-inline int64_t ldi(const RadTensor* t, int64_t i) { return ld_int(t->dtype, t->data, offlin(t, i)); }
+inline int64_t ldi(const RadTensor* t, int64_t i) {
+    return ld_int(t->dtype, t->data, offlin(t, i));
+}
 
 /* torch.linspace(0, 1, steps) in f64: the first half up from the start, the second down from the
  * end, as torch computes it. */
@@ -377,7 +379,7 @@ int ref_vol_index(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ tile_grid / tile_crop / tile_stitch */
+/* ---------------------------------------------------- tile_grid / tile_crop / tile_stitch */
 /* A decoder run in tiles, as diffusers cuts and blends them: LTX-2's VAE (`tiled_decode`, rule
  * `stride`) and LTX-2.5's diffusion decoder (`_tile_intervals`, rule `intervals`). Along an axis
  * of L cells a tile starts at every multiple of `stride` below L; under `intervals` one tile covers
@@ -533,7 +535,8 @@ int ref_tile_stitch(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     const int64_t T = ldi(G, 0), H = ldi(G, 1), W = ldi(G, 2), f0 = ldi(Fst, 0);
     const int64_t Hpx = H * sc * p, Wpx = W * sc * p, P = C * p * p;
-    if (T <= 0 || H <= 0 || W <= 0 || Y->shape[1] != Wpx * C || Y->shape[0] % Hpx) return RAD_E_SHAPE;
+    if (T <= 0 || H <= 0 || W <= 0 || Y->shape[1] != Wpx * C || Y->shape[0] % Hpx)
+        return RAD_E_SHAPE;
     const int64_t nf = Y->shape[0] / Hpx;
     const TileStore ts(cs, ct, T, H, W, sc, st);
     if (nf <= 0 || f0 < 0 || f0 + nf > st * T - (st - 1) || rows_of(X, P) < ts.rows())
@@ -584,7 +587,8 @@ int ref_tile_stitch(const RadArgs* a, RadStream) {
         for (int64_t Xp = 0; Xp < Wpx; ++Xp)
             for (int64_t c = 0; c < C; ++c) {
                 float v = S(kt, f, Yp, Xp, c);
-                if (kt > 0 && f < et) v = mix(S(kt - 1, ts.frames(kt - 1) - et + f, Yp, Xp, c), v, f, et);
+                if (kt > 0 && f < et)
+                    v = mix(S(kt - 1, ts.frames(kt - 1) - et + f, Yp, Xp, c), v, f, et);
                 const float cl = std::min(std::max(v, -1.0f), 1.0f);
                 float u = round_dt(dt, round_dt(dt, cl / 2.0f) + 0.5f);
                 u = std::min(std::max(u, 0.0f), 1.0f);

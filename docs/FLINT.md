@@ -150,7 +150,7 @@ llama.cpp's numbers move with its build and flags; re-measure beside the run bei
   max and one lane's denominator in the log2 domain, and the final reduction adds both lanes.
   Decode and verify launches take the scalar kernel with split-KV, whose unsplit store and merge
   fold the sink.
-- **Residual and all-reduce.** `NormQuantFP8` folds the previous block's delta and its two-rank
+- **Residual and all-reduce.** `NormQuant` folds the previous block's delta and its two-rank
   all-reduce into the norm (`fuse_ar`), so only the embedding's reduce and the last block's
   remain. Flint also sets `shared_fp32_combine` 0: the gather adds the local routed and shared
   partials and one collective covers both, which is the TP1 arithmetic. The exact cross-rank

@@ -110,6 +110,13 @@ struct SchedMetrics {
     /* Prefix hits ended early for a windowed block drafter, and the tokens they gave back. */
     int64_t draft_refills = 0;
     int64_t draft_refill_tokens = 0;
+    int64_t window_seed_failures = 0;   /* hits dropped for want of window blocks */
+    int64_t draft_window_stale_ckpts = 0;     /* checkpoints not committed for a stale/unsaved drafter window */
+    /* Steps the block drafter sat out under --draft-max-lanes. */
+    int64_t draft_gated_steps = 0;
+    int64_t draft_acc_gated_steps = 0;   /* sequence-steps skipped under --draft-min-accept */
+    int64_t draft_reach_declined_steps = 0;   /* sequence-steps declined for a prefix-hit hole */
+    int64_t draft_spec_off_seqs = 0;          /* gauge: running sequences stopped by --draft-min-accept */
     /* Prompt lookup's verify gate, lookup the only drafter (sched/lookup.h): proposals made,
      * held back and their drafts, and of the held ones scored, the drafts that came true. */
     int64_t lookup_proposals = 0;
@@ -122,6 +129,15 @@ struct SchedMetrics {
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
     int64_t suffix_held_ahead = 0;
+    /* Depth 0 and the hybrid (draft.h, scheduler.h; --draft-depth0 / --draft-hybrid),
+     * zero while off: cycles planned at D = 0, probe cycles, moves between 0 and drafting; proposals
+     * the hybrid took from the lookup and left to the head, and steps it kept from issuing ahead. */
+    int64_t draft_zero_cycles = 0;
+    int64_t draft_probe_cycles = 0;
+    int64_t draft_zero_moves = 0;
+    int64_t hybrid_lookup = 0;
+    int64_t hybrid_head = 0;
+    int64_t hybrid_unahead = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */
@@ -159,7 +175,6 @@ struct SchedMetrics {
     struct LoraCount {
         int64_t requests = 0, prompt_tokens = 0, output_tokens = 0, running = 0;
     };
-    int        n_loras = 0;
     LoraCount  loras[MAX_LORA_SLOTS] = {};
     /* Cumulative nanoseconds inside steps, all shapes and decode-only. Wall clock over a step
      * count is not a step time: the engine idles between turns, and a prefill chunk costs an
@@ -170,6 +185,10 @@ struct SchedMetrics {
     /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+    /* The step under way: its phase (0 prefill, 1 decode, 2 mixed; -1 none) and its age in
+     * nanoseconds (rad::SchedMetrics::step_open_phase). */
+    int     step_open_phase = -1;
+    int64_t step_open_ns = 0;
     /* The encoder: cumulative items, patches and nanoseconds, and the items waiting or being
      * encoded now (rad::SchedMetrics::encode_items). */
     int64_t encode_items = 0;
@@ -453,6 +472,9 @@ struct ChatRender {
      * means no reasoning block. The server maps these to token ids (ReasoningSpan) to count the
      * block and enforce a budget. */
     std::string think_open, think_close;
+    /* The message header the reply may write before `think_open` (Inkling 2's
+     * <|message_model|>); empty for none. */
+    std::string think_frame;
     bool        think_starts_open = false;
 };
 
@@ -724,6 +746,7 @@ struct ImageGenInfo {
     /* The pictures are not read by the conditioning network: they go to the generator's own
      * encoder only (RAD_GEN_LAYOUT_JOINT_STEP). */
     bool    refs_encoder_only = false;
+    bool    refs_fit_output = false;
     /* A reference picture is shrunk to `ref_area` only when larger, then centre-cropped to the
      * size multiple; otherwise resized to `ref_area` at its aspect. */
     bool    ref_shrink_only = false;

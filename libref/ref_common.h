@@ -254,15 +254,51 @@ static inline void st_int(uint32_t dt, void* p, int64_t i, int64_t v) {
  * The GEMM family reads one element per FLOP, so the switch above would dominate its cost. These
  * let a caller resolve the dtype once at the top of the op. */
 template <uint32_t DT> struct Cvt;
-template <> struct Cvt<RAD_F32>    { static inline float ld(const void* p, int64_t i) { return ((const float*)p)[i]; } };
-template <> struct Cvt<RAD_F16>    { static inline float ld(const void* p, int64_t i) { return f16_to_f32(((const uint16_t*)p)[i]); } };
-template <> struct Cvt<RAD_BF16>   { static inline float ld(const void* p, int64_t i) { return bf16_to_f32(((const uint16_t*)p)[i]); } };
-template <> struct Cvt<RAD_F8E4M3> { static inline float ld(const void* p, int64_t i) { return fp8e4m3_lut(((const uint8_t*)p)[i]); } };
-template <> struct Cvt<RAD_I8>     { static inline float ld(const void* p, int64_t i) { return (float)((const int8_t*)p)[i]; } };
-template <> struct Cvt<RAD_I32>    { static inline float ld(const void* p, int64_t i) { return (float)((const int32_t*)p)[i]; } };
-template <> struct Cvt<RAD_I4>     { static inline float ld(const void* p, int64_t i) { return w4_code(p, i); } };
-template <> struct Cvt<RAD_I2>     { static inline float ld(const void* p, int64_t i) { return w2_code(p, i); } };
-template <> struct Cvt<RAD_FP4E2M1>  { static inline float ld(const void* p, int64_t i) { return mxfp4_code(p, i); } };
+template <> struct Cvt<RAD_F32> {
+    static inline float ld(const void* p, int64_t i) {
+        return ((const float*)p)[i];
+    }
+};
+template <> struct Cvt<RAD_F16> {
+    static inline float ld(const void* p, int64_t i) {
+        return f16_to_f32(((const uint16_t*)p)[i]);
+    }
+};
+template <> struct Cvt<RAD_BF16> {
+    static inline float ld(const void* p, int64_t i) {
+        return bf16_to_f32(((const uint16_t*)p)[i]);
+    }
+};
+template <> struct Cvt<RAD_F8E4M3> {
+    static inline float ld(const void* p, int64_t i) {
+        return fp8e4m3_lut(((const uint8_t*)p)[i]);
+    }
+};
+template <> struct Cvt<RAD_I8> {
+    static inline float ld(const void* p, int64_t i) {
+        return (float)((const int8_t*)p)[i];
+    }
+};
+template <> struct Cvt<RAD_I32> {
+    static inline float ld(const void* p, int64_t i) {
+        return (float)((const int32_t*)p)[i];
+    }
+};
+template <> struct Cvt<RAD_I4> {
+    static inline float ld(const void* p, int64_t i) {
+        return w4_code(p, i);
+    }
+};
+template <> struct Cvt<RAD_I2> {
+    static inline float ld(const void* p, int64_t i) {
+        return w2_code(p, i);
+    }
+};
+template <> struct Cvt<RAD_FP4E2M1> {
+    static inline float ld(const void* p, int64_t i) {
+        return mxfp4_code(p, i);
+    }
+};
 
 /* ------------------------------------------------------------------ the ranged key
  *
@@ -337,7 +373,9 @@ static inline int64_t laststride(const RadTensor* t) {
 }
 
 static inline float ldt(const RadTensor* t, int64_t off) { return ld_dt(t->dtype, t->data, off); }
-static inline void  stt(const RadTensor* t, int64_t off, float v) { st_dt(t->dtype, t->data, off, v); }
+static inline void  stt(const RadTensor* t, int64_t off, float v) {
+    st_dt(t->dtype, t->data, off, v);
+}
 
 /* `v` rounded through a store and load of dtype `dt`, as an unfused pair rounds the tensor between
  * them. Whole-byte dtypes only. */
@@ -427,7 +465,8 @@ static inline int p_enum(const RadArgs* a, const char* k, const char* const* nam
 #define RAD_REF_TRY(expr) do { int _s = (expr); if (_s < 0) return _s; } while (0)
 
 /* quant_act_i8g's rule for one row of `n` (ref_gen.cpp): returns the scale (amax/127, 1 for an
- * all-zero row) and writes the codes rint(clamp(x * (1/scale), +-127)) to `code`, which may be `x`. */
+ * all-zero row) and writes the codes rint(clamp(x * (1/scale), +-127)) to `code`, which may be
+ * `x`. */
 float ref_q8_row(const float* x, int64_t n, float* code);
 
 static inline const RadTensor* t_in(const RadArgs* a, int i) { return rad_arg_in(a, i); }

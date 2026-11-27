@@ -26,10 +26,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
 
-// Library version; expected to match the git tag it was built from, so a consumer can assert it
-// linked the sources it pinned.
-#define R4D_VERSION "0.5.0"
-
 struct R4DArgs {
     const void*  q;             // (num_seqs*q_len, q_heads, head_dim)  bf16
     const void*  kv;            // (num_blocks, kv_heads, block_size, 2*head_dim)  bf16, or the int8
@@ -150,8 +146,7 @@ void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_row
 int  r4d_attn_vit_h72_bf16(const void* q, const void* k, const void* v, void* o,
                            const void* cu_seqlens, int num_seqs, int max_seqlen,
                            int heads, int head_dim, float scale, void* stream);
-// head_dim, the two query-block heights, and the segment length at which the launcher switches.
-void r4d_attn_vit_dims(int* head_dim, int* rows_large, int* rows_small, int* split);
+// The same over strided q, k, v and o rows (`*_ld` elements a row).
 int  r4d_attn_vit_h72_strided_bf16(const void* q, const void* k, const void* v, void* o,
                                    const void* cu_seqlens, int num_seqs, int max_seqlen,
                                    int heads, int head_dim, float scale, int q_ld, int k_ld,
@@ -303,7 +298,10 @@ void r4d_ar_host_free(long p);
 // of its slots in this card's VRAM (same layout), which the reader's push check fills as it reads
 // the slot so the reduce reads VRAM instead of the link a second time (r4d_ar_seq.h).
 // Exact sum, fp32 accumulate, bf16 / fp16 / fp32 payload (dtype 0 / 1 / 2). `chain` launches the
-// chained form (r4d_chain.h).
+// chained form (r4d_chain.h). `coded` nonzero sends a bf16 message of whole 32-chunk waves as the
+// coded push (r4d_arc2_*, bit-exact) where its image fits the slot; on a host mailbox it runs
+// single-phase, reading the link once, and writes through `stage` only when `out` overlaps `inp`.
+// The register form, at one chunk a thread, does not use `stage`.
 void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                                 long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                                 long dtype, long stream, long nblocks, long nthreads, long drain,
@@ -479,6 +477,16 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
                                 long acq, long pub, long gate, long gate_ctr, long chain);
+// The same with a shard table from `shard_weights` (four weights, r4d_ar_shards.h; null: even). A
+// rank weighted 0 owns no shard: it receives each message once (the reduced shards) instead of 1.5
+// times, and the ranks that own the shards receive more. Same bits under every table.
+void r4d_ar_twoshot_4rank_exact_w(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                  long peer_flags0, long peer_flags1, long peer_flags2,
+                                  long my_scratch, long my_flags, long seq_ctrs,
+                                  long slot_stride16, long inp, long out, long n_elem, long dtype,
+                                  long rank, long stream, long nblocks, long nthreads, long drain,
+                                  long acq, long pub, long gate, long gate_ctr, long chain,
+                                  const int* shard_weights);
 // The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
 // same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
 // and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.
@@ -640,65 +648,26 @@ void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, long wref, l
 // `lda` is the activation's row pitch in bytes (0 = K), for a window of a wider plane.
 void r4d_mxfp4a8_tile_a(long a, long at, int M, int K, long stream, int lda = 0);
 long r4d_mxfp4a8_tile_a_bytes(int M, int K);
-int  r4d_gemm_mxfp4a8_tiled_group(void);
 // The decode band (M <= 128) is r4d_rad_gemm_mxfp4a8_decode only: its split-K partial is the op's
 // scratch, which only the plugin ABI provides.
 int  r4d_gemm_mxfp4a8_decode_max_m(void);
 
-// ---- Block-scaled FP8, as checkpoints ship it -------------------------------------------------
+// ---- the 8-bit-activation GEMMs (r4d_gemm_i8a8.hip) ---------------------------------------------
 //
-// Reads the weight as safetensors stores it: `<linear>.weight` F8_E4M3 row-major [N][K] and
-// `<linear>.weight_scale_inv` BF16 on a [ceil(N/128)][ceil(K/128)] grid (DeepSeek-style,
-// `weight_block_size = [128, 128]`). No permutation and no scale conversion.
-//
-// The block is 128 on both axes and is a property of the file, not a build flag (unlike
-// R4D_GEMM_W4A8_GROUP). The `_block()` queries report it, and every entry point rejects a K that
-// would leave a partial block.
-//
-// Three kernels, one per band. The two W8A8 ones put the weight on the WMMA A operand, so a lane's
-// accumulator slots share one activation scale; see r4d_gemm_fp8a8.hip.
-//
-//   M == 1    r4d_gemm_fp8a16_nt_m1   bf16 activation read directly, no quantise launch
-//   M <= 64   r4d_gemm_fp8a8_nt_m16   E4M3 activation, up to four 16-wide token tiles, split-K
-//   any M     r4d_gemm_fp8a8_tiled    E4M3 activation, 128x128 tile, eight waves; the weight read
-//                                     into registers, the activation staged through LDS
-//
-// `w_ld` is bytes per weight row and `sw_ld` elements per scale row, 0 meaning tight. All return 0
-// or a negative code instead of throwing, since they are reachable from C consumers.
-int  r4d_gemm_fp8a16_nt_m1(long a, long wq, long ws, long c,
-                           int M, int K, int N, int w_ld, int sw_ld, int rb, long stream);
-// The same GEMM for M <= r4d_gemm_fp8a16_nt_m1_max_m(): M token rows against each weight row, so
-// the weight is read once. `a` is [M][K] with `a_ld` elements a row and `c` is [M][N] with `c_ld`
-// (0 = N). This is the speculative-verify width; the 16-wide fp8a8 tile needs a quantise launch
-// first and reaches a lower fraction of the memory ceiling on the same weight traffic.
-int  r4d_gemm_fp8a16_nt_mt(long a, long wq, long ws, long c, int M, int K, int N,
-                           int a_ld, int c_ld, int w_ld, int sw_ld, long stream);
-/* The lm_head at fp8, scales interleaved in each row's tail; see the .hip for why that layout. */
-int  r4d_logits_gemm_fp8(long a, long wq, long c, int M, int K, int N,
-                         int a_ld, int c_ld, int w_ld, long stream);
-
-// `a` is E4M3 [M][K] with `ascale` f32 [M][ceil(K/128)], r4d_quant_act_fp8's output. `scratch` is
-// the split-K partial plane; 0 runs the launch unsplit (correct, slower). Size it with the query,
-// which returns 0 when this shape will not split.
+// The weight is a fragment-order plane with a bf16 scale per row and 128 (or 256) of K; the narrow
+// tile's split-K partial is the op's scratch, so its only entry is the plugin ABI's
+// r4d_rad_gemm_i8a8_m16. `r4d_gemm_i8a8_group` reports the scale group, and every entry point
+// rejects a K that would leave a partial group. All return 0 or a negative code instead of
+// throwing, since they are reachable from C consumers.
 //
 // Split-K is not bit-comparable across settings: ksplit repartitions K, so the accumulation order
 // differs. Two runs of the same binary still agree.
-int  r4d_gemm_fp8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
-                           int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
-                           long scratch, long scratch_bytes, long stream);
-long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N);
-int  r4d_gemm_fp8a8_nt_m16_max_m(void);
-// Test hook: pins the narrow tile's wave count, normally a launch heuristic over (N, M), for every
-// subsequent call on every thread; 0 restores the rule. Not for serving; r4d_selftest holds it for
-// one comparison. Unlike the split, the wave count is bit-comparable: it moves which wave owns an
-// output element, not the order of the K tiles it accumulates, and the split derives from
-// `gx * mw`, which the rule keeps invariant. r4d_selftest compares bytes at every legal count.
-void r4d_gemm_fp8a8_pin_mw(int mw);
-// Test hook: pins the waves the narrow tiles' K split aims for (fp8a8 and i8a8 128, the IQR narrow
-// tile 512) for every subsequent call on every thread; 0 restores each caller's own. Not for
-// serving; r4d_selftest holds it at the IQR tile's target around the i8a8 reference, so the two
-// split K alike and their bytes compare. While it is set an int8 GEMM takes the narrow tile at
-// every M, not the K-parallel tile, whose sums run in another order.
+int  r4d_gemm_i8a8_nt_m16_max_m(void);
+// Test hook: pins the waves the narrow tiles' K split aims for (i8a8 128, the IQR narrow tile 512)
+// for every subsequent call on every thread; 0 restores each caller's own. Not for serving;
+// r4d_selftest holds it at the IQR tile's target around the i8a8 reference, so the two split K
+// alike and their bytes compare. While it is set an int8 GEMM takes the narrow tile at every M,
+// not the K-parallel tile, whose sums run in another order.
 void r4d_gemm_i8a8_pin_split_waves(int waves);
 // Test hook: pins the QSA score's form. 0 is the launcher's rule, 1 the scalar decode form, 2 the
 // matrix form (which refuses a shape it is not built for). The two sum in different orders, so
@@ -779,86 +748,28 @@ int r4d_record_dispatches(const void** fns, int cap);
 // call; null restores the engine's. r4d_selftest checks weighted and empty shards, fixed piece
 // counts and the size floors with it, and --perfar8 --ar8-weights times another board's weights.
 void r4d_ar8_test_settings(const struct R4DAr8Settings* s);
-// The narrow GEMM with r4d_gated_quant_fp8 as its epilogue, for a gate_up projection whose only
-// consumer is that quantiser. `wq` is the [2*nout][K] gate_up plane, gate first; outputs are the
-// quantiser's: `q` E4M3 [M][nout], `s` f32 [M][ceil(nout/128)], and `y` the bf16 silu product or 0.
-//
-// Byte-identical to the unfused pair: the accumulator is rounded to bf16 first and the gate,
-// product and amax are taken over the rounded values. `act` is r4d_gated_quant_fp8's; only 0
-// (silu) is compiled.
-//
-// Refuses, without fallback, any shape the fold does not fit: M past the band, K not a multiple of
-// 256, `nout` not a multiple of 128 (a block emits exactly one 128-column scale group), or a grid
-// the split rule would widen.
-int  r4d_gemm_fp8a8_gated_nt_m16_max_m(void);
-// The same fold at any M (`gemm_nt_q_gated_wide`): past the narrow tile's 64 rows it takes the gated
-// prefill tile, whose accumulators are the unfused prefill GEMM's, so its bytes are the pair's.
-// The narrow GEMM with a bias: `bias` bf16 [N], added to each output column's f32 accumulator before
-// its one rounding, and C written at row pitch `c_ld` (0 = N), so C may be a column slice of a wider
-// buffer. Never split. M up to r4d_gemm_fp8a8_nt_m16_max_m(); K a multiple of 128, N of 16.
-int  r4d_gemm_fp8a8_tiled(long a, long ascale, long wq, long ws, long c,
-                          int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
-                          long stream);
-// The same two GEMMs at int8 codes for both operands (r4d_gemm_fp8a8.hip's I8 instantiations):
-// the activation i8 with an f32 scale per (row, 128 K), the weight i8 in the same fragment order
-// with a bf16 scale per row per 128 K, tile-major: ws is [N/16][ceil(K/128)][16] (written by
-// r4d_fp8_layout.cpp's i8 hooks); sw_ld is not read.
-int  r4d_gemm_i8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
-                          int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
-                          long scratch, long scratch_bytes, long stream);
-// The lm_head at int8 codes: r4d_logits_gemm_fp8's row layout (codes, the row's bf16 scales in its
-// tail, the pad) with i8 codes and a scale per 128 columns.
-int  r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
-                        int w_ld, long stream);
+// The prefill tile at int8 codes for both operands (r4d_gemm_i8a8.hip): the activation i8 with an
+// f32 scale per (row, 128 K), the weight i8 in fragment order with a bf16 scale per row per 128 K,
+// tile-major: ws is [N/16][ceil(K/128)][16] (written by r4d_fp8_layout.cpp's i8 hooks); sw_ld is
+// not read.
 int  r4d_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
                          int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                          long stream);
-// The same at a weight scale constant over 8 or 32 rows (a tcq_rb trellis), folded as the fp8
-// tile.
+// The same at a weight scale constant over 8 or 32 rows (a tcq_rb trellis).
 int  r4d_gemm_i8a8_rb8_tiled(long a, long ascale, long wq, long ws, long c,
                              int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                              long stream);
 int  r4d_gemm_i8a8_rb32_tiled(long a, long ascale, long wq, long ws, long c,
                               int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                               long stream);
-int  r4d_gemm_fp8a8_block(void);
+int  r4d_gemm_i8a8_group(void);
 
-// Per-(row, 128-column) symmetric E4M3 quantisation of a bf16 activation, read by the fp8a8 GEMMs.
-// Plain row-major output, unlike r4d_quant_act_i8's fragment order: the fp8a8 GEMMs stage both
-// operands through the same byte copy and swizzle. The scale is amax/448, a dequant multiplier
-// like the checkpoint's weight_scale_inv, so the GEMM multiplies both scales and never divides.
+// Per-(row, 128-column) symmetric E4M3 quantisation of a bf16 activation. Plain row-major output,
+// unlike r4d_quant_act_i8's fragment order. The scale is amax/448, a dequant multiplier, so a
+// consumer multiplies by it and never divides.
 int  r4d_quant_act_fp8(long a, long q, long s, int M, int K,
                        int x_ld, int q_ld, int s_ld, long stream);
 int  r4d_quant_act_fp8_group(void);
-
-// The same quantiser fused into the pass that produced the row. Both write the bf16 output the
-// unfused producer wrote and the E4M3 pair, quantising the bf16-rounded value so the codes match
-// the unfused pair (see r4d_fused_quant_fp8.hip). `y` may be null where nothing reads the bf16.
-// `w_f32` gives the norm gain's width; `mode` is 0 for silu and 1 for sigmoid.
-// A non-null `res` is the fused_add_rms_norm form: `res += x`, rounded to bf16 and stored, then
-// normalised, bit-identical to the `add` + `rmsnorm` pair. It may alias `y`.
-int  r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int M, int n,
-                           float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
-                           int q_ld, int s_ld, long stream);
-int  r4d_gated_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
-                         int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
-// The two above with had_quant_act_i8g's quantiser on the pass instead (the `_had_quant_i8g`
-// forms): the width-128 Hadamard, then int8 codes at amax / 127 per (row, 128), for a weight at
-// i8a8h. `q` is int8, `n` a multiple of 128, and `y` keeps the unrotated bf16 value. The codes
-// are the producer + had_quant_act_i8g pair's bytes.
-int  r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long q, long s, int M, int n,
-                               float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
-                               int q_ld, int s_ld, long stream);
-int  r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, int n, int mode,
-                             int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
-// The activation is rounded to bf16 before the product, matching the unfused `sigmoid` then `mul`
-// pair with a bf16 buffer between them; `mode` 2 is the plain product (`mul` + quantiser).
-// The same epilogue with the gate in a different buffer from what it scales, as in gated
-// attention: `x` is the attention output and the gate a column slice of the [q|gate] projection.
-// A row is then a (token, head) pair; both sources are a fixed stride apart and the scale plane
-// lands where the out projection reads it. `g` is passed already offset to the gate half.
-int  r4d_gate_quant_fp8(long g, long x, long y, long q, long s, int M, int n, int mode,
-                        int g_ld, int x_ld, int y_ld, int q_ld, int s_ld, long stream);
 
 // The same norm with the preceding tensor-parallel all-reduce folded in. Every row-parallel
 // linear's output is all-reduced then normalised (128 adjacent dispatches per decode step); fused,
@@ -876,8 +787,9 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int nblocks, int nthreads, int drain, int acq, int wire,
                               long loc_pack, long loc_scale_off, long wp = 0, long stage = 0);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
-// Its rotated int8 form, as r4d_rmsnorm_had_quant_i8g: the reduction and the norm unchanged, the
-// norm's pass quantised by had_quant_act_i8g's rule. No post-norm. `group` is the scale group, 128
+// Its rotated int8 form: the reduction and the norm unchanged, the norm's pass quantised by
+// had_quant_act_i8g's rule (the width-128 Hadamard, then int8 codes at amax / 127 per (row, 128)).
+// No post-norm. `group` is the scale group, 128
 // or IQ8R's 256 (`s` [M][n/group]). `chain` launches the chained form (r4d_chain.h) where the
 // launch is 1024 threads wide, the decode heights.
 int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_flags,
@@ -924,6 +836,20 @@ int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long 
                                    long stream, int nblocks, int drain, int acq, int pub,
                                    long gate, long gate_ctr, long tail_ctr, int tail_nbt,
                                    int chain, int sp);
+
+// Four-rank exact all-reduce fused with DeepSeek-V4.1's mhc_post_collapse_rmsnorm
+// (r4d_ar_mhc_pcn.hip): exact ascending-rank fold in place into `x`, then post -> collapse ->
+// rmsnorm into `out`, `xc`, `y`. Supports one-shot wide (`tail_nbt == 0`) and two-shot tail
+// (`tail_nbt > 0` for M <= 32).
+int  r4d_ar_mhc_pcn_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                          long peer_flags0, long peer_flags1, long peer_flags2, long my_scratch,
+                          long my_flags, long seq_ctrs, long slot_stride16, long x, long h,
+                          long hp, long post, long ptp, long comb, long cbp, long out, long op,
+                          long pre, long pp, long pst, long xc, long xc_ld, long w, int w_f32,
+                          long y, long y_ld, int M, int n, int hc, float eps, float wadd,
+                          float mult, int rank, long stream, int nblocks, int drain, int acq,
+                          int pub, long gate, long gate_ctr, long tail_ctr, int tail_nbt,
+                          int chain);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //
@@ -1021,52 +947,15 @@ void r4d_dequant_w4_bf16(long wq, long ws, long out, int N, int K, int group, in
 // Every pitch is in elements and 0 means tight. Index arrays are i32. A negative or out-of-range
 // index writes a zero row or skips the store: a kernel cannot return a per-row error, and a
 // defined answer beats a fault, which is why the bounds are arguments.
-// `vocab_off` is the first global row this rank holds: the table is a vocab-parallel slice and an
-// id outside it writes zeros, so summing the ranks reconstructs the embedding. 0 means the whole
-// table.
-int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_embd, int n_vocab,
-                          int vocab_off, int x_ld, long stream);
-// The same lookup with a runtime scale on found rows (x = table[id] * scale); 1.0 is the plain
-// copy, and a missed row still writes zero. Gemma 4 scales its embedding by sqrt(n_embd) at the
-// lookup rather than in the table.
-int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd, int n_vocab,
-                                 int vocab_off, int x_ld, float scale, long stream);
-int r4d_gather_rows_bf16(long x, long idx, long y, int M, int n, int src_rows,
-                         int x_ld, int y_ld, long stream);
-// y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in f32 after
-// the bf16 load (see r4d_rmsnorm_had_quant_i8). `w_f32` says whether the gain is f32 (as every
-// architecture plugin declares it) or bf16; the activation is bf16 either way.
-int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd, int w_f32,
-                     int x_ld, int y_ld, long stream);
+
 // y = x * rsqrt(mean(x^2) + eps): rmsnorm without the gain multiply, Gemma's value normalisation.
 int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps, int x_ld, int y_ld, long stream);
 // `op` 0 sums, 1 multiplies. A `b_ld` of 0 broadcasts one row of n elements to every row (a bias
 // add).
 int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
                     int a_ld, int b_ld, int y_ld, long stream);
-int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream);
 int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream);
 int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long stream);
-// y[.., i] = silu(gu[.., i]) * gu[.., n + i]. The gate is the first half, the order rad-convert
-// fuses gate_proj and up_proj in.
-int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);
-// y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i]. The gate is the first half; the tanh
-// approximation (Gemma's gelu_pytorch_tanh), not erf.
-int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);
-// In place over `n_rope_heads` consecutive heads of a row; later heads (the V heads of a fused
-// projection) are untouched. `gptj` 0 pairs i with i + rot/2 (NeoX, and mrope when every position
-// component is equal); 1 pairs 2i with 2i+1. `rot` may be less than head_dim: the frequency
-// exponent divides by `rot`, so the rotated prefix is a complete rotary of its own width.
-int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int gptj,
-                  float theta, float rscale, int row_pitch, long stream);
-// The multi-component rotary (docs/OPS.md, `rope`): `mode` 2 mrope, 3 imrope, 4 axial over
-// `sec[0..n_sec)`, component c of token m at pos[c * plane + m]. plane 0 is the call above.
-// `den` is the width the base ladder's exponent divides by: `rot` (the `rotary` ladder, the
-// default) or `head_dim` (the `head` ladder, the proportional variant). The `rope` row resolves it
-// from its `ladder` param; the plain form above passes `rot`.
-int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
-                      int gptj, float theta, float rscale, int row_pitch, int mode, const int* sec,
-                      int n_sec, int plane, long stream);
 // C[M,N] f32 = A[M,K] bf16 @ W[N,K]^T bf16, f32 accumulate. The output is f32 because the
 // engine's logits buffer is: a bf16 logit has eight mantissa bits, too coarse for a nucleus cut
 // that compares neighbouring probabilities. K must be a multiple of 8.
@@ -1075,17 +964,6 @@ int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N, int a_ld, 
 // The same bytes from a wave per four vocabulary columns; K must be 4096 or 5120.
 int r4d_logits_gemm_bf16_cols(long a, long w, long c, int M, int K, int N, int a_ld, int c_ld,
                               long stream);
-// Scatter into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim]: K at [.., d], V at
-// [.., head_dim + d], slot decomposing as block = slot / block_size, offset = slot % block_size.
-int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim, int kv_heads,
-                      int block_size, int n_blocks, int k_ld, int v_ld, long stream);
-// The same scatter into an E4M3 cache, read by GLM-5.3's latent attention. `k_scale` and `v_scale`
-// are the descales the reader multiplies by, so this divides by them; the read side has one per
-// (sequence, head), hence a caller constant here. 1.0 is vLLM's default and what the attention
-// kernels assume when their descale pointers are null. head_dim must be a multiple of 4.
-int r4d_kv_store_fp8(long k, long v, long slot, long kv, int M, int head_dim, int kv_heads,
-                     int block_size, int n_blocks, int k_ld, int v_ld,
-                     float k_scale, float v_scale, long stream);
 
 // ---- the decomposed sampler chain (r4d_sample_stages_f32.hip) -----------------------------------
 //

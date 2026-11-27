@@ -588,7 +588,7 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
     out->frames.assign(out->index.size(), Frame{});
 
     Input in;
-    RAD_TRY(in.open(data, n, true, why));
+    RAD_TRY(in.open(data, n, true, why, max_pixels));
     SwsContext* sws = nullptr;
     size_t next = 0;
     int64_t last_kept = -1;

@@ -123,7 +123,7 @@ TEST(allow_host_repeats_and_refuses_the_empty_name) {
     CHECK_EQ(parse_fresh({ "--allow-host", "" }), RAD_E_INVAL);
     Config c;
     CHECK_EQ(parse({ "--allow-host", "box", "--allow-host", "box.example" }, &c), 0);
-    CHECK(c.allow_hosts.size() == 2);
+    REQUIRE(c.allow_hosts.size() == 2);
     CHECK(c.allow_hosts[0] == "box" && c.allow_hosts[1] == "box.example");
 }
 
@@ -139,7 +139,7 @@ TEST(trusted_proxy_repeats_and_refuses_anything_but_a_cidr) {
     CHECK_EQ(parse_fresh({ "--trusted-proxy", "[::1]/128" }), RAD_E_INVAL);        /* URL form, not CIDR */
     Config c;
     CHECK_EQ(parse({ "--trusted-proxy", "127.0.0.0/8", "--trusted-proxy", "::1/128" }, &c), 0);
-    CHECK(c.trusted_proxies.size() == 2);
+    REQUIRE(c.trusted_proxies.size() == 2);
     CHECK(c.trusted_proxies[0] == "127.0.0.0/8" && c.trusted_proxies[1] == "::1/128");
 }
 
@@ -411,12 +411,14 @@ TEST(the_boolean_flags_are_off_until_they_are_given) {
     CHECK(!d.proceed_incompatible);
     CHECK(!d.profile_ops);
     CHECK(!d.live_view);
+    CHECK(!d.checkpoint_draft_window);
 
     Config c;
     CHECK_EQ(parse({ "--deterministic", "--no-prefix-cache", "--debug-placement",
-                     "--debug-accept-reference-kernels", "--profile-ops", "--live",
+                     "--checkpoint-draft-window", "--debug-accept-reference-kernels", "--profile-ops", "--live",
                      "--proceed-with-incompatible-configuration" }, &c), RAD_OK);
     CHECK(c.deterministic);
+    CHECK(c.checkpoint_draft_window);
     CHECK(!c.prefix_cache);
     CHECK(c.debug_placement);
     CHECK(c.accept_reference_kernels);
@@ -569,6 +571,43 @@ TEST(mixed_step_target_is_an_opt_in_soft_millisecond_target) {
     CHECK_EQ(parse({ "--mixed-step-target-ms", "-1" }, &c), RAD_E_INVAL);
 }
 
+/* --long-prefill-token-threshold is a token count; 0 (off) is the default. */
+TEST(long_prefill_token_threshold_takes_a_token_count) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.long_prefill_token_threshold, 0);
+    Config c;
+    CHECK_EQ(parse({ "--long-prefill-token-threshold", "1024" }, &c), RAD_OK);
+    CHECK_EQ(c.long_prefill_token_threshold, 1024);
+    CHECK_EQ(parse({ "--long-prefill-token-threshold", "-1" }, &c), RAD_E_INVAL);
+}
+
+/* The draft-window extensions and the DSpark walk are off by default; the probe interval, its
+ * back-off and the hybrid's match are bounded counts. */
+TEST(draft_depth0_hybrid_and_dspark_walk_take_their_ranges) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_depth0);
+    CHECK(!d.draft_hybrid);
+    CHECK(!d.dspark_walk);
+    CHECK_EQ(d.draft_probe, 16);
+    CHECK_EQ(d.draft_probe_backoff, 0);
+    CHECK_EQ(d.draft_hybrid_match, 8);
+    Config c;
+    CHECK_EQ(parse({ "--draft-depth0", "on", "--draft-probe", "4096", "--draft-probe-backoff", "8",
+                     "--draft-hybrid", "on", "--draft-hybrid-match", "256", "--dspark-walk", "on" },
+                   &c), RAD_OK);
+    CHECK(c.draft_depth0 && c.draft_hybrid && c.dspark_walk);
+    CHECK_EQ(c.draft_probe, 4096);
+    CHECK_EQ(c.draft_probe_backoff, 8);
+    CHECK_EQ(c.draft_hybrid_match, 256);
+    Config e;
+    CHECK_EQ(parse({ "--draft-probe", "1" }, &e), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-probe-backoff", "9" }, &e), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-hybrid-match", "0" }, &e), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth0", "1" }, &e), RAD_E_INVAL);
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
@@ -612,6 +651,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--mixed-step-target-ms", { "150" } },
+        { "--long-prefill-token-threshold", { "1024" } },
         { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
@@ -636,6 +676,10 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
+        { "--draft-max-lanes", { "2" } }, { "--draft-min-accept", { "2.1" } },
+        { "--draft-depth0", { "on" } }, { "--draft-probe", { "32" } },
+        { "--draft-probe-backoff", { "3" } }, { "--draft-hybrid", { "on" } },
+        { "--draft-hybrid-match", { "12" } }, { "--dspark-walk", { "on" } },
         { "--draft-coupling", { "on" } }, { "--draft-verify", { "block" } },
         { "--draft-suffix", { "on" } }, { "--draft-suffix-min-match", { "5" } },
         { "--draft-suffix-max", { "6" } }, { "--draft-suffix-min-score", { "0.4" } },
@@ -680,6 +724,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-source-pixels", { "1000000" } },
         { "--expert-stats", { "/s/experts.json" } },
         { "--expert-profile", { "/p.json" } }, { "--expert-pin-top", { "0.2" } },
+        { "--expert-split", { "104,88,104,88" } }, { "--weight-sidecar", { "/s.rad" } },
         { "--draft-expert-placement", { "host" } },
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
@@ -1531,7 +1576,7 @@ TEST(the_template_variables_merge_key_by_key_and_later_wins) {
     Config c;
     CHECK_EQ(parse({ "--chat-template-kwargs", R"({"enable_thinking": false, "custom": "a"})",
                      "--chat-template-kwargs", R"({"custom": "b", "n": 3})" }, &c), RAD_OK);
-    CHECK_EQ(c.chat_template_kwargs.size(), 3u);
+    REQUIRE_EQ(c.chat_template_kwargs.size(), 3u);
     CHECK_EQ(c.chat_template_kwargs["enable_thinking"], std::string("false"));
     CHECK_EQ(c.chat_template_kwargs["custom"], std::string("\"b\""));   /* JSON text, quoted */
     CHECK_EQ(c.chat_template_kwargs["n"], std::string("3"));
@@ -1718,7 +1763,7 @@ TEST(gpu_memory_mib_parses_and_excludes_headroom) {
 TEST(the_kernel_hierarchy_is_separated_by_commas_or_colons_and_ordered) {
     Config c;
     CHECK_EQ(parse({ "--kernels", "libr4d.so,libref.so" }, &c), RAD_OK);
-    CHECK_EQ(c.kernel_hierarchy.size(), 2u);
+    REQUIRE_EQ(c.kernel_hierarchy.size(), 2u);
     CHECK_EQ(c.kernel_hierarchy[0], std::string("libr4d.so"));   /* first wins, so order matters */
     CHECK_EQ(c.kernel_hierarchy[1], std::string("libref.so"));
 
@@ -1726,7 +1771,7 @@ TEST(the_kernel_hierarchy_is_separated_by_commas_or_colons_and_ordered) {
      * nothing and would warn on every start. */
     Config t;
     CHECK_EQ(parse({ "--kernels", ",a,,b," }, &t), RAD_OK);
-    CHECK_EQ(t.kernel_hierarchy.size(), 2u);
+    REQUIRE_EQ(t.kernel_hierarchy.size(), 2u);
     CHECK_EQ(t.kernel_hierarchy[0], std::string("a"));
     CHECK_EQ(t.kernel_hierarchy[1], std::string("b"));
 
@@ -1767,14 +1812,14 @@ TEST(the_environment_supplies_what_the_line_left_unsaid) {
     Config c;
     CHECK_EQ(parse({}, &c), RAD_OK);
     CHECK_EQ(c.radiance_home, std::string("/env/home"));
-    CHECK_EQ(c.kernel_hierarchy.size(), 2u);
+    REQUIRE_EQ(c.kernel_hierarchy.size(), 2u);
     CHECK_EQ(c.kernel_hierarchy[0], std::string("env_a"));
 
     /* The command line wins over the environment. */
     Config f;
     CHECK_EQ(parse({ "--radiance-home", "/flag/home", "--kernels", "flag_only" }, &f), RAD_OK);
     CHECK_EQ(f.radiance_home, std::string("/flag/home"));
-    CHECK_EQ(f.kernel_hierarchy.size(), 1u);
+    REQUIRE_EQ(f.kernel_hierarchy.size(), 1u);
     CHECK_EQ(f.kernel_hierarchy[0], std::string("flag_only"));
 
     /* An empty variable is treated as unset, not as an empty hierarchy. */

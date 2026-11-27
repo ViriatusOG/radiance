@@ -156,6 +156,26 @@ int Engine::run_encodes() {
             const RadBatch* b = sched_.build_encoder(parts, enc_step_++, enc);
             if (!b) return RAD_E_STATE;
             RAD_TRY(prepare_release(b));
+            /* Diagnostic: RADIANCE_DEBUG_MM_DUMP also writes the card's pixel staging exactly
+             * as the pass reads it, so a bad upload is visible without a host probe. */
+            if (dump_dir && *dump_dir && b->enc_pixels && b->enc_n_patch > 0) {
+                const int64_t nbytes = (int64_t)b->enc_n_patch * enc.patch_dim *
+                                       (int64_t)sizeof(uint16_t);
+                std::vector<char> pix((size_t)nbytes);
+                if (rad_memcpy_async(pix.data(), b->enc_pixels, nbytes, r0.ctx.stream()) >= 0) {
+                    rad_stream_sync(r0.ctx.stream());
+                    char path[512];
+                    std::snprintf(path, sizeof path, "%s/mm_pix.%016llx%016llx.raw", dump_dir,
+                                  (unsigned long long)parts.front().item->key_hi,
+                                  (unsigned long long)parts.front().item->key_lo);
+                    if (FILE* f = std::fopen(path, "wb")) {
+                        std::fwrite(pix.data(), 1, pix.size(), f);
+                        std::fclose(f);
+                        RAD_INFO("encoder: wrote %s (%lld patches)", path,
+                                 (long long)b->enc_n_patch);
+                    }
+                }
+            }
             /* Read the output address after prepare_release: a pass runs at the arena's full plan
              * (Engine::arena_step), and a buffer's offset differs per level. */
             void* out = r0.ctx.buf_ptr(enc.out);
@@ -174,13 +194,23 @@ int Engine::run_encodes() {
                 RAD_ERR("encoder pass failed: %s -- the engine cannot continue", rad_strerror(st));
                 return st;
             }
-            /* The rows, in pass order: each part's segments are consecutive rows of its item. */
+            /* The rows, in pass order: each part's segments are consecutive rows of its item. A
+             * typed span (Item::types) covers every span position: its image rows are copied in
+             * place from the pass's output, its other rows from the encoder's span_rows table,
+             * assembled after the sync below. */
             int64_t row = 0;
+            struct TypedPart { mm::Item* it; int64_t off; int64_t rows; };
+            std::vector<TypedPart> typed;
             for (const BatchBuilder::EncoderPart& p : parts) {
                 mm::Item& it = *const_cast<mm::Item*>(p.item);
                 const int64_t first = it.row_at(p.seg0);
                 const int64_t rows = it.row_at(p.seg0 + p.n_seg) - first;
                 const int64_t bytes = rows * n_embd * (int64_t)sizeof(uint16_t);
+                if (!it.types.empty()) {
+                    typed.push_back(TypedPart{ &it, row * n_embd * (int64_t)sizeof(uint16_t), rows });
+                    row += rows;
+                    continue;
+                }
                 RAD_TRY(rad_memcpy_async(it.embd.data() + first * n_embd,
                                          static_cast<const char*>(out) +
                                              row * n_embd * (int64_t)sizeof(uint16_t),
@@ -189,6 +219,47 @@ int Engine::run_encodes() {
             }
             /* Sync every rank's stream: the next pass rewrites every rank's staging and arena. */
             for (auto& rk : ranks_) RAD_TRY(rad_stream_sync(rk->ctx.stream()));
+
+            /* Typed spans: the image rows take the pass's output, every other position the
+             * encoder's learned row for its type (0 start, 2 newline, 3 end). */
+            if (!typed.empty()) {
+                int64_t ncopy = 0;
+                for (const TypedPart& t : typed)
+                    ncopy = std::max(ncopy, t.off / (int64_t)sizeof(uint16_t) + t.rows * n_embd);
+                /* `out` is the encoder's device buffer. The untyped path copies with
+                 * rad_memcpy_async; a host memcpy of that pointer faults. */
+                std::vector<uint16_t> host_out((size_t)ncopy, 0);
+                if (ncopy > 0 &&
+                    rad_memcpy_async(host_out.data(), out,
+                                     host_out.size() * sizeof(uint16_t), r0.ctx.stream()) < 0)
+                    return RAD_E_STATE;
+                std::vector<uint16_t> sr((size_t)(4 * n_embd), 0);
+                if (enc.span_rows) {
+                    void* sp = r0.ctx.buf_ptr(enc.span_rows);
+                    if (sp &&
+                        rad_memcpy_async(sr.data(), sp, (size_t)(4 * n_embd) * sizeof(uint16_t),
+                                         r0.ctx.stream()) < 0)
+                        return RAD_E_STATE;
+                }
+                RAD_TRY(rad_stream_sync(r0.ctx.stream()));
+                for (const TypedPart& t : typed) {
+                    mm::Item& it = *t.it;
+                    const uint16_t* src = host_out.data() + t.off / (int64_t)sizeof(uint16_t);
+                    it.embd.assign((size_t)it.expand.size() * (size_t)n_embd, 0);
+                    int64_t k = 0;
+                    for (size_t pos = 0; pos < it.types.size() && pos < it.expand.size(); ++pos) {
+                        const size_t ty = it.types[pos];
+                        const uint16_t* from = src + k * n_embd;
+                        if (ty != 1) {
+                            if (ty > 3) return RAD_E_INVAL;
+                            from = sr.data() + ty * (size_t)n_embd;
+                        }
+                        std::memcpy(it.embd.data() + pos * (size_t)n_embd, from,
+                                    (size_t)n_embd * sizeof(uint16_t));
+                        if (ty == 1) ++k;
+                    }
+                }
+            }
 
             if (dump_dir && *dump_dir && !dump_bufs.empty()) {
                 for (const DumpBuf& d : dump_bufs) {

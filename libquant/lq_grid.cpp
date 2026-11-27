@@ -339,6 +339,7 @@ void store_first_level(const Grid& g, float resid, BlockScale* b) {
 
 int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
     *g = Grid{};
+    g->gpu = rad_param_geti(o, n_o, "gpu", 1) != 0;
     const char* codes = rad_param_gets(o, n_o, "codes", nullptr);
     if (const char* vf = rad_param_gets(o, n_o, "vq", nullptr)) {
         /* One codeword a line, its integers separated by spaces; a line "# unit X" names the

@@ -176,6 +176,9 @@ struct RadCtx {
     const RadBatch* batch = nullptr;
     int             rank  = 0;
     int             world = 1;
+    int             slot_base = 0;   /* the engine's RadBuildCtx::slot_base: slot_base + rank is its
+                                        Model slot, so a second engine in this process serves its
+                                        own (rad_slot below) */
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
     std::string           step_fail;
@@ -597,8 +600,9 @@ extern "C" int rad_step_fail(RadCtx* c, const char* what) {
 }
 extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
-/* One engine: the slot is the rank (RadBuildCtx::slot_base zero). */
-extern "C" int             rad_slot(RadCtx* c)       { return c->rank; }
+/* slot_base + rank, the engine's own rad_slot: a second engine in this process addresses its
+ * Model slot. Every other test leaves slot_base zero, so its slot is its rank. */
+extern "C" int             rad_slot(RadCtx* c)       { return c->slot_base + c->rank; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
 extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */

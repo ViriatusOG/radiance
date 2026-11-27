@@ -434,6 +434,28 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", T).pi("head_dim", HD).pi("gqa", 1).pi("causal", 1).ps("dtype", "f32");
         hs.push_back(std::move(d));
     }
+    /* ---- attn_dense_ref: a target-to-reference bias, and a reference kept to itself -------- */
+    {
+        /* Two sequences of 11 and 13 rows; mode_cu holds each one's text, reference and target
+         * starts, then the end. Sequence 0's targets add the bias to its reference keys;
+         * sequence 1's bias is negative infinity, so its reference rows see only each other. */
+        const int64_t T = 24, NH = 4, KVH = 2, HD = 64;
+        for (const float bias : { 1.5f, -2.0f }) {
+            Hand h(bias > 0 ? "bias +1.5 on sequence 0, sequence 1 isolated"
+                            : "bias -2 on sequence 0, sequence 1 isolated",
+                   "attn_dense_ref", 1e-4);
+            h.dense(RAD_F32, { T, NH, HD }, hfill(40))
+             .dense(RAD_F32, { T, KVH, HD }, hfill(41))
+             .dense(RAD_F32, { T, KVH, HD }, hfill(42))
+             .idx({ 0, 11, 24 })
+             .dense(RAD_F32, { T, NH, HD }, hfill(43), true)
+             .idx({ 0, 3, 7, 11, 14, 19, 24 })
+             .dense(RAD_F32, { 2 }, [bias](int64_t i) { return i == 0 ? bias : -INFINITY; })
+             .pi("M", T).pi("head_dim", HD).pi("gqa", NH / KVH).pi("causal", 0)
+             .ps("dtype", "f32");
+            hs.push_back(std::move(h));
+        }
+    }
     /* ---- the GDN decode convolution read past offset zero ---------------------------------- */
     {
         const int64_t S = 2, QL = 3, HG = 2, H = 2, K = 16, V = 16, WID = 4;
@@ -595,6 +617,17 @@ void shape_cases(std::vector<Hand>& hs) {
           .pi("M", 6).pi("n", N).pi("side", 4).pi("n_prefix", 3).ps("dtype", "f32");
         hs.push_back(std::move(gc));
 
+        /* Inkling 2's per-axis resample: the same rows as RADIO's case, each axis onto its own
+         * extent (3 rows of 5 grow the 4 x 4 table unequally), so the two ops differ here. */
+        Hand gh("prefix rows and a 4 x 4 table onto 3 x 5 and 2 x 2 grids, per axis",
+                "grid_embed_hw", 1e-6);
+        gh.dense(RAD_F32, { 6, N }, hfill(61), true)
+          .dense(RAD_F32, { 16, N }, hfill(62))
+          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kCpeCrd[i / 6][i % 6]; })
+          .dense(RAD_F32, { 3, N }, hfill(63))
+          .pi("M", 6).pi("n", N).pi("side", 4).pi("n_prefix", 3).ps("dtype", "f32");
+        hs.push_back(std::move(gh));
+
         /* Muse's zero-padded resample: a 4 x 4 table onto rows of an 8 x 8 grid, whose top row
          * and right column reach taps off the table (zero-weight) and blend the rest. */
         static const int32_t kPadCrd[4][6] = { { 0, 7, 1, 4, 7, 3 }, { 0, 7, 3, 2, 0, 7 },
@@ -606,6 +639,32 @@ void shape_cases(std::vector<Hand>& hs) {
           .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kPadCrd[i / 6][i % 6]; })
           .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
         hs.push_back(std::move(gp));
+
+        /* posemb_resample: the position table resampled to a grid as a table of its own. A 4 x 4
+         * table onto 3 x 5 (both axes shrink and grow), a non-square 3 x 4 table onto a single
+         * cell, and a 4 x 4 table onto 2 x 7 (the coordinates clamp at both edges of the wide
+         * one). */
+        {
+            Hand pr("a 4 x 4 table onto a 3 x 5 grid", "posemb_resample", 1e-6);
+            pr.dense(RAD_F32, { 16, N }, hfill(66))
+              .dense(RAD_F32, { 15, N }, hfill(67), true)
+              .pi("S_h", 4).pi("S_w", 4).pi("T_h", 3).pi("T_w", 5).pi("n", N).ps("dtype", "f32");
+            hs.push_back(std::move(pr));
+        }
+        {
+            Hand pr("a 3 x 4 table onto a single cell", "posemb_resample", 1e-6);
+            pr.dense(RAD_F32, { 12, N }, hfill(68))
+              .dense(RAD_F32, { 1, N }, hfill(69), true)
+              .pi("S_h", 3).pi("S_w", 4).pi("T_h", 1).pi("T_w", 1).pi("n", N).ps("dtype", "f32");
+            hs.push_back(std::move(pr));
+        }
+        {
+            Hand pr("a 4 x 4 table onto a 2 x 7 grid", "posemb_resample", 1e-6);
+            pr.dense(RAD_F32, { 16, N }, hfill(70))
+              .dense(RAD_F32, { 14, N }, hfill(71), true)
+              .pi("S_h", 4).pi("S_w", 4).pi("T_h", 2).pi("T_w", 7).pi("n", N).ps("dtype", "f32");
+            hs.push_back(std::move(pr));
+        }
 
         /* Muse's window permutation: a 12 x 10 segment and an 8 x 8 one, window 8 (the first
          * segment's right and bottom windows are ragged). */
@@ -1075,7 +1134,8 @@ void mla_latent_cases(std::vector<Hand>& hs) {
                         const float s1 = 0.003f * (float)(1 + 2 * p + t);
                         for (int64_t c = 0; c < d; ++c) {
                             const int code = (int)(((p * bs + t) * 37 + c * 13) % 255) - 127;
-                            cache[(size_t)(at + c)] = (uint8_t)(int8_t)(c < d / 2 && s0 == 0 ? 0 : code);
+                            cache[(size_t)(at + c)] = (uint8_t)(int8_t)(c < d / 2 && s0 == 0 ? 0
+                                : code);
                         }
                         const uint16_t sc[] = { rad_f32_to_f16(s0), rad_f32_to_f16(s1) };
                         // The padded case deliberately puts some f16 scales at odd addresses.
@@ -1160,7 +1220,8 @@ void format_cases(std::vector<Hand>& hs) {
     /* ---- sample_merge_topk: two ranks' runs of (u32 id, f32 logit) words -------------------- *
      * Row 0 ties across the ranks at 2.0 and 1.5 (the lower id first), carries ids past 2^24
      * (exact as u32, not as f32), and has five live candidates for six slots. Row 1 asks top_k 2
-     * of eight, row 2 is greedy (the chain does not run; every slot a pad). 0xffffffff is a hole. */
+     * of eight, row 2 is greedy (the chain does not run; every slot a pad). 0xffffffff is a
+     * hole. */
     {
         const int64_t M = 3, W = 2, PER = 4, NC = 6;
         const uint32_t B = 1u << 24, H = 0xffffffffu;
@@ -1185,7 +1246,8 @@ void format_cases(std::vector<Hand>& hs) {
         sp[1].top_k = 2;
         sp[2].flags = RAD_SP_GREEDY;
         const int64_t b = (int64_t)B;
-        Hand h("ties across ranks, ids past 2^24, holes, top_k 2, greedy", "sample_merge_topk", 0.0);
+        Hand h("ties across ranks, ids past 2^24, holes, top_k 2, greedy", "sample_merge_topk",
+               0.0);
         h.raw(RAD_U32, { M, W * PER * 2 }, words.data())
          .raw(RAD_F32, { M, (int64_t)(sizeof(RadSampleParams) / 4) }, sp)
          .dense(RAD_I32, { M, NC }, [](int64_t) { return 7.0f; }, true)
@@ -1325,38 +1387,19 @@ void format_cases(std::vector<Hand>& hs) {
             h.dense(RAD_F8E4M3, { M, K }, hfill(100 + (uint64_t)form, 4.0f))
              .dense(RAD_F32, { M, K / ag }, [](int64_t i) { return 0.01f + 0.003f * (float)i; })
              .dense(wdt, { NE / 2, N, K }, hfill(103 + (uint64_t)form, 2.5f))
-             .dense(sdt, { NE / 2, N, sk }, [](int64_t i) { return 0.05f + 0.01f * (float)(i % 7); })
+             .dense(sdt, { NE / 2, N, sk },
+                    [](int64_t i) { return 0.05f + 0.01f * (float)(i % 7); })
              .idx(sorted)
              .idx(off)
              .dense(wdt, { NE / 2, N, K }, hfill(106 + (uint64_t)form, 2.5f))
-             .dense(sdt, { NE / 2, N, sk }, [](int64_t i) { return 0.04f + 0.01f * (float)(i % 5); })
+             .dense(sdt, { NE / 2, N, sk },
+                    [](int64_t i) { return 0.04f + 0.01f * (float)(i % 5); })
              .dense(RAD_BF16, { T, N }, zero, true)
              .pi("M", M).pi("N", N).pi("K", K).pi("n_expert", NE).pi("top_k", TOPK)
              .pi("group", ag).ps("a_order", "token")
              .ps("dtype", form == 0 ? "w4a8" : "fp8a8");
             hs.push_back(std::move(h));
         }
-        /* NVFP4 experts: every e2m1 code in turn, an E4M3-shaped scale per 16 of K (here as the
-         * product with the expert's level, the logical form), against an int8 activation at one
-         * scale per 64. The codes are one plane, two a byte, element k in the low nibble. */
-        const int64_t NV = NE / 2;
-        std::vector<uint8_t> codes((size_t)(NV * N * K / 2), 0);
-        for (int64_t i = 0; i < NV * N * K; ++i)
-            rad_store_code(codes.data(), RAD_FP4E2M1, i, (int)((i * 7 + 3) % 16));
-        Hand h("nvfp4 experts, every code, scales per 16 of K, against an int8 activation",
-               "moe_gemm_q", 8e-3);
-        h.dense(RAD_I8, { M, K }, [](int64_t i) { return (float)((i * 37) % 255) - 127.0f; })
-         .dense(RAD_F32, { M, K / 64 }, [](int64_t i) { return 0.01f + 0.003f * (float)i; })
-         .raw(RAD_FP4E2M1, { NV, N, K }, codes.data())
-         .dense(RAD_F32, { NV, N, K / 16 }, [](int64_t i) { return 0.25f + 0.25f * (float)(i % 5); })
-         .idx(sorted)
-         .idx(off)
-         .raw(RAD_FP4E2M1, { NV, N, K }, codes.data())
-         .dense(RAD_F32, { NV, N, K / 16 }, [](int64_t i) { return 0.5f + 0.125f * (float)(i % 3); })
-         .dense(RAD_BF16, { T, N }, zero, true)
-         .pi("M", M).pi("N", N).pi("K", K).pi("n_expert", NE).pi("top_k", TOPK)
-         .pi("group", 64).ps("a_order", "token").ps("dtype", "nvfp4a8i8");
-        hs.push_back(std::move(h));
     }
 }
 
@@ -1382,7 +1425,7 @@ struct AnLayout {
  * num_accepted tokens hold factors with a decaying g and a beta in (0, 1). `ql` and `nacc` are the
  * first two sequences' rows and acceptances, at most the head's capacity. */
 Hand anchor_case(const AnLayout& L, const char* name, int64_t ql0, int64_t ql1,
-                 std::vector<int64_t> nacc) {
+                 std::vector<int64_t> nacc, std::vector<int64_t> parents = {}) {
     const int64_t H = 2, N = 4, SLOTS = 14, T = ql0 + ql1 + 1;
     static const int32_t kIdx[4][6] = { { 0, 1, 2, 3, 4, 5 }, { 6, 6, 6, 7, 7, 7 },
                                         { 8, 9, 10, 11, 12, 13 }, { -1, 0, 0, 0, 0, 0 } };
@@ -1423,6 +1466,11 @@ Hand anchor_case(const AnLayout& L, const char* name, int64_t ql0, int64_t ql1,
      .pi("q_len", std::max(ql0, ql1)).pi("head_k", K).pi("head_v", V).pi("n_head_v", H)
      .pf("scale", 0.125).pf("eps", 1e-6).pf("l2_eps", 1e-6).pf("softplus_thr", 20.0)
      .ps("act", "silu").ps("state_form", "anchor");
+    /* The tree form: no fused quantiser, then the step's parents. */
+    if (!parents.empty()) {
+        h.op = "gdn_recurrent_update_tree";
+        h.none().none().idx(std::move(parents));
+    }
     return h;
 }
 
@@ -1442,6 +1490,92 @@ void anchor_cases(std::vector<Hand>& hs) {
     hs.push_back(anchor_case(small, "16 x 16, 8 accepted tokens are refused", 7, 3,
                              { 8, 3, 2, 1 })
                      .refuses(RAD_E_SHAPE));
+    /* Over a tree verify: two roots from the committed state, a branch, a causal row (-2), an
+     * out-of-range parent read as the row before, and the padded and empty sequences as above. */
+    hs.push_back(anchor_case(big, "tree: 64 x 64, two roots, a branch", 2, 3, { 2, 3, 2, 1 },
+                             { -1, -1, -1, 0, 0, -1 }));
+    hs.push_back(anchor_case(small, "tree: 16 x 16, 7 rows branching", 7, 3, { 7, 3, 2, 1 },
+                             { -1, 0, 0, 1, -2, 2, 9, -1, 0, -1, -1 }));
+}
+
+/* ================================================================== tree verify, gdn
+ *
+ * A tree step's spec_parent (rad_drafter_tree) names each row's parent within its sequence's
+ * rows: -1 the committed history, -2 an ordinary causal row (the row before). libref's description
+ * draws every row as -2, the chain op's answer; these cases branch. Two sequences of 4 and 3 rows:
+ * a row whose ancestors reach past the convolution's width, siblings of one parent, a second root
+ * (-1 past the first row) and a causal row. */
+void gdn_tree_cases(std::vector<Hand>& hs) {
+    const std::vector<int64_t> parents = { -1, 0, 0, 2, -1, -2, -1 };
+    const int64_t S = 2, T = 7, HG = 1, H = 2, K = 32, V = 32, WID = 4;
+    const int64_t CD = 2 * HG * K + H * V, SL = WID - 2 + 4;
+    {
+        Hand h("tree: rows 4 and 3, num_accepted 2 and 3", "gdn_conv_update_tree", 2e-5);
+        h.dense(RAD_F32, { T, CD }, hfill(150))
+         .dense(RAD_F32, { CD, WID }, hfill(151, 0.5f))
+         .dense(RAD_F32, { CD }, hfill(152, 0.2f))
+         .dense(RAD_F32, { 3, CD, SL }, hfill(153), true)
+         .idx({ 2, 0 })
+         .idx({ 2, 3 })
+         .idx({ 0, 4, T })
+         .dense(RAD_F32, { T, HG, K }, hfill(154), true)
+         .dense(RAD_F32, { T, HG, K }, hfill(155), true)
+         .dense(RAD_F32, { T, H, V }, hfill(156), true)
+         .idx(parents)
+         .pi("q_len", 4).pi("head_k", K).pi("head_v", V).pi("conv_width", WID)
+         .pi("max_query_len", 4);
+        hs.push_back(std::move(h));
+    }
+    /* The per-candidate state: each row writes its own slot, the step starts from the slot
+     * num_accepted names. */
+    {
+        Hand h("tree: per_candidate, rows 4 and 3", "gdn_recurrent_update_tree", 2e-5);
+        h.dense(RAD_F32, { T, HG, K }, hfill(160))
+         .dense(RAD_F32, { T, HG, K }, hfill(161))
+         .dense(RAD_F32, { T, H, V }, hfill(162))
+         .dense(RAD_F32, { T, H }, hfill(163))
+         .dense(RAD_F32, { T, H }, hfill(164))
+         .dense(RAD_F32, { H }, [](int64_t i) { return -1.5f + 0.5f * (float)i; })
+         .dense(RAD_F32, { H }, [](int64_t i) { return -0.75f + 0.25f * (float)i; })
+         .dense(RAD_F32, { 8, H, V, K }, hfill(165, 0.1f), true)
+         .dense(RAD_I32, { S, 4 }, [](int64_t i) { return (float)i; })
+         .idx({ 2, 1 })
+         .idx({ 0, 4, T })
+         .dense(RAD_F32, { T, H, V }, hfill(166))
+         .dense(RAD_F32, { V }, [](int64_t i) { return 1.0f + 0.01f * (float)(i % 7); })
+         .dense(RAD_F32, { T, H, V }, [](int64_t) { return 0.0f; }, true)
+         .none().none()
+         .idx(parents)
+         .pi("q_len", 4).pi("head_k", K).pi("head_v", V).pi("n_head_v", H)
+         .pf("scale", 0.125).pf("eps", 1e-6).pf("l2_eps", 1e-6).pf("softplus_thr", 20.0)
+         .ps("act", "silu").ps("state_form", "per_candidate");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("tree: per_candidate, rows 4 and 3", "gdn_conv_recurrent_update_tree", 2e-5);
+        h.dense(RAD_F32, { T, CD }, hfill(170))
+         .dense(RAD_F32, { CD, WID }, hfill(171, 0.5f))
+         .none()
+         .dense(RAD_F32, { 3, CD, SL }, hfill(172), true)
+         .idx({ 2, 0 })
+         .dense(RAD_F32, { T, H }, hfill(173))
+         .dense(RAD_F32, { T, H }, hfill(174))
+         .dense(RAD_F32, { H }, [](int64_t i) { return -1.5f + 0.5f * (float)i; })
+         .dense(RAD_F32, { H }, [](int64_t i) { return -0.75f + 0.25f * (float)i; })
+         .dense(RAD_F32, { 8, H, V, K }, hfill(175, 0.1f), true)
+         .dense(RAD_I32, { S, 4 }, [](int64_t i) { return (float)i; })
+         .idx({ 2, 3 })
+         .idx({ 0, 4, T })
+         .dense(RAD_F32, { T, H, V }, hfill(176))
+         .dense(RAD_F32, { V }, [](int64_t i) { return 1.0f + 0.01f * (float)(i % 7); })
+         .dense(RAD_F32, { T, H, V }, [](int64_t) { return 0.0f; }, true)
+         .none().none()
+         .idx(parents)
+         .pi("q_len", 4).pi("head_k", K).pi("head_v", V).pi("conv_width", WID)
+         .pi("n_head_v", H).pf("scale", 0.125).pf("eps", 1e-6).pf("l2_eps", 1e-6)
+         .pf("softplus_thr", 20.0).ps("act", "silu").ps("state_form", "per_candidate");
+        hs.push_back(std::move(h));
+    }
 }
 
 /* The anchor form's contract, on the library alone: with an f32 state the replay repeats the
@@ -1558,6 +1692,44 @@ bool anchor_replays_per_candidate(const Check& ck, int64_t K, int64_t V, int64_t
 }
 
 /* ================================================================== packed stores */
+/* embed_lookup_planes over the forms libref's description does not draw (it draws i8 codes and no
+ * table): u4 codes through a 16-entry table, the served form libavx decodes sixteen at a time,
+ * with group 32 and 16, a multiplier, a padded and out-of-slice id; u4 without a table and i4
+ * (signed, element loop); a group of 8 (element loop). Bit for bit: both sides multiply the same
+ * f32 operands in the same order. */
+void planes_gather_cases(std::vector<Hand>& hs) {
+    static const float kNl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                   1, 13, 25, 38, 53, 69, 89, 113 };
+    struct F { const char* name; uint32_t cdt; bool tab; int64_t E, G, voff; float mult; };
+    const F fs[] = {
+        { "u4 + table, group 32 (sixteen at a time)", RAD_U4, true, 256, 32, 0, 1.0f },
+        { "u4 + table, group 16, mult, vocab slice", RAD_U4, true, 64, 16, 5, 0.375f },
+        { "u4, no table", RAD_U4, false, 64, 32, 0, 1.0f },
+        { "i4, no table", RAD_I4, false, 64, 32, 0, 2.0f },
+        { "u4 + table, group 8 (element loop)", RAD_U4, true, 64, 8, 0, 1.0f },
+    };
+    for (const F& f : fs) {
+        const int64_t V = 61, M = 37;
+        std::vector<uint8_t> codes((size_t)(V * f.E / 2));
+        uint32_t st = 0x9e3779b9u ^ (uint32_t)f.E;
+        for (auto& c : codes) { st = st * 1664525u + 1013904223u; c = (uint8_t)(st >> 24); }
+        std::vector<int64_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (m * 17 + 3) % (V + f.voff) ;
+        ids[3] = -1;
+        Hand hd((std::string("embed_lookup_planes: ") + f.name).c_str(), "embed_lookup_planes",
+                0.0);
+        hd.idx(ids)
+          .raw(f.cdt, { V, f.E }, codes.data())
+          .dense(RAD_F16, { V, f.E / f.G }, [](int64_t i) { return 0.00048828125f * (float)((i * 7) % 23 + 1) * ((i & 1) ? -1.0f : 1.0f); });
+        if (f.tab) hd.dense(RAD_F32, { 16 }, [](int64_t i) { return kNl[i]; });
+        else       hd.none();
+        hd.dense(RAD_BF16, { M, f.E }, [](int64_t) { return 0.0f; }, true)
+          .pi("M", M).pi("n_embd", f.E).pi("n_vocab", V).pi("group", f.G).ps("dtype", "bf16")
+          .pi("vocab_offset", f.voff).pf("mult", f.mult);
+        hs.push_back(std::move(hd));
+    }
+}
+
 void packed_cases(std::vector<Hand>& hs) {
     /* Nearest code, ties to the even code, saturation and NaN, into e2m1, int4 and int2: the
      * stores a gather or a cast of packed rows rests on. 27 values, so the last byte is half
@@ -2271,7 +2443,7 @@ void gen_cases(std::vector<Hand>& hs) {
             hs.push_back(std::move(h));
         }
 
-        /* ---- the decoder ---------------------------------------------------------------------- */
+        /* ---- the decoder ------------------------------------------------------------------ */
         {
             /* Pixels past [-1, 1], NaN, and ties at the byte (0 maps to 127.5). */
             static const float kPx[12] = { -2.0f, -1.0f, -0.999f, 0.0f, 0.5f, 1.0f, 1.5f, NAN,
@@ -2500,6 +2672,154 @@ void gen_cases(std::vector<Hand>& hs) {
  * the tiles overlap unevenly; a chunk between two others (the temporal blend and the overlap it
  * hands on), a last one and a first one; positions into a view of a wider plane. Everything but
  * the norms and the rotaries is held to zero error: libref's arithmetic bit for bit. */
+/* ================================================================== Wan 2.2 TI2V
+ *
+ * What libref's descriptions of the Wan ops do not draw: grids with three different extents (its
+ * cubes repeat one value), rows of fused projections and padded pitches, the sampler's first step
+ * (no corrector) and its guidance, a time projection split between two steps' rows, and UMT5's
+ * packed sequences. The copies, the f64 trigonometry, the rotation, the residual and the sampler
+ * step are held to zero error. */
+void wan_cases(std::vector<Hand>& hs) {
+    /* ---- flow_unipc_step: a first step and a corrected one, with and without guidance ------- */
+    struct Unipc { const char* name; uint32_t dt; bool first, cfg; };
+    for (const Unipc& u : { Unipc{ "first step, guidance 4.5, f32 velocity", RAD_F32, true, true },
+                            Unipc{ "corrected, guidance 4.5, bf16 velocity", RAD_BF16, false,
+                                  true },
+                            Unipc{ "corrected, padded rows, bf16 velocity", RAD_BF16, false,
+                                  false } }) {
+        const int64_t M = 5, n = 67;
+        const std::vector<float> k = { 0.82f, u.first ? 0.0f : 0.61f, 0.27f, -0.13f, 0.44f,
+                                       0.93f, 0.11f, 0.052f };
+        Hand h(u.name, "flow_unipc_step", 0.0);
+        h.view(u.dt, { M, n }, { 2 * n, 1 }, M * 2 * n, hfill(500))
+         .dense(RAD_F32, { 8 }, [k](int64_t i) { return k[(size_t)i]; })
+         .view(RAD_F32, { M, 3 * n }, { 3 * n + 5, 1 }, M * (3 * n + 5), hfill(501), true)
+         .view(RAD_F32, { M, n }, { n + 3, 1 }, M * (n + 3), hfill(502), true);
+        if (u.cfg) h.view(u.dt, { M, n }, { n + 9, 1 }, M * (n + 9), hfill(503))
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return 4.5f; });
+        else h.none().none();
+        h.pi("M", M).pi("n", n).ps("dtype", u.dt == RAD_F32 ? "f32" : "bf16");
+        hs.push_back(std::move(h));
+    }
+    /* ---- timestep_embed_f64: unscaled sigmas near 1000, t as [M, 1], a padded pitch --------- */
+    {
+        const int64_t M = 4, n = 320;
+        Hand h("t [4, 1] near 1000, pitch 328", "timestep_embed_f64", 0.0);
+        h.dense(RAD_F32, { M, 1 }, [](int64_t i) { return 999.0f - 37.25f * (float)i; })
+         .view(RAD_F32, { M, n }, { n + 8, 1 }, M * (n + 8), hfill(504), true)
+         .pi("M", M).pi("n", n).pf("max_period", 10000.0).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+    /* ---- the rotary table and the unpatch over a 3 x 2 x 3 latent (pixels 3 x 4 x 6) -------- */
+    {
+        Hand h("grid 3 x 4 x 6, pitch 136", "wan_rope_table", 0.0);
+        h.idx({ 3, 4, 6 })
+         .view(RAD_F32, { 18, 128 }, { 136, 1 }, 18 * 136, hfill(505), true)
+         .pi("M", 18).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+    for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+        const char* dn = dt == RAD_F32 ? "f32" : "bf16";
+        const int64_t C = 5;
+        Hand h((std::string("grid 2 x 4 x 6, padded pitches, ") + dn).c_str(), "wan_unpatch", 0.0);
+        h.view(dt, { 12, 4 * C }, { 4 * C + 3, 1 }, 12 * (4 * C + 3), hfill(506))
+         .idx({ 2, 4, 6 })
+         .view(RAD_F32, { 48, C }, { C + 3, 1 }, 48 * (C + 3), hfill(507), true)
+         .pi("M", 12).pi("n", C).ps("dtype", dn);
+        hs.push_back(std::move(h));
+
+        /* q and k as column slices of a fused [q | k | v] row. */
+        const int64_t M = 6, heads = 2, W = heads * 128;
+        Hand r((std::string("q, k column slices of [q|k|v], ") + dn).c_str(), "wan_rope", 0.0);
+        r.view(dt, { M, W }, { 3 * W, 1 }, M * 3 * W, hfill(508), true)
+         .view(dt, { M, W }, { 3 * W, 1 }, M * 3 * W, hfill(509), true)
+         .dense(RAD_F32, { M, 128 }, [](int64_t i) {
+             const int64_t row = i / 128, pair = (i % 128) / 2;
+             const double angle = 0.31 * (double)row * (double)(pair + 1);
+             return (float)((i & 1) ? std::sin(angle) : std::cos(angle));
+         })
+         .pi("M", M).pi("heads", heads).ps("dtype", dn);
+        hs.push_back(std::move(r));
+    }
+    /* ---- the modulated norm and the gated residual with the time rows split at a row -------- */
+    {
+        const int64_t M = 7, n = 645;
+        Hand h("block group 3, time rows split at 3, bf16", "wan_mod_norm", 6e-3);
+        h.view(RAD_F32, { M, n }, { n + 4, 1 }, M * (n + 4), hfill(510, 2.0f))
+         .dense(RAD_F32, { 2, 6 * n }, hfill(511, 0.3f))
+         .dense(RAD_F32, { 1, 6, n }, hfill(512, 0.3f))
+         .idx({ 3 })
+         .dense(RAD_BF16, { M, n }, hfill(513), true)
+         .pi("M", M).pi("n", n).pi("group", 3).pf("eps", 1e-6).pi("round_norm", 1)
+         .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+
+        Hand g("head, time rows split at 5, f32", "wan_mod_norm", 1e-5);
+        g.dense(RAD_F32, { M, n }, hfill(514, 2.0f))
+         .dense(RAD_F32, { 2, n }, hfill(515, 0.3f))
+         .dense(RAD_F32, { 1, 2, n }, hfill(516, 0.3f))
+         .idx({ 5 })
+         .dense(RAD_F32, { M, n }, hfill(517), true)
+         .pi("M", M).pi("n", n).pi("group", -1).pf("eps", 1e-6).ps("dtype", "f32");
+        hs.push_back(std::move(g));
+
+        Hand r("gate 5, time rows split at 4", "wan_gated_add", 0.0);
+        r.view(RAD_F32, { M, n }, { n + 4, 1 }, M * (n + 4), hfill(518), true)
+         .view(RAD_BF16, { M, n }, { n + 2, 1 }, M * (n + 2), hfill(519))
+         .dense(RAD_F32, { 2, 6 * n }, hfill(520, 0.3f))
+         .dense(RAD_F32, { 1, 6, n }, hfill(521, 0.3f))
+         .idx({ 4 })
+         .pi("M", M).pi("n", n).pi("gate", 5).ps("dtype", "f32");
+        hs.push_back(std::move(r));
+    }
+    /* ---- attn_umt5: three packed sequences of 100, 3 and 127 tokens, q, k and v column
+     * slices of a fused projection, a padded output pitch ------------------------------------ */
+    {
+        const int64_t T = 230, heads = 2, W = heads * 64;
+        Hand h("sequences 100, 3, 127, fused q|k|v", "attn_umt5", 2e-2);
+        h.view(RAD_BF16, { T, W }, { 3 * W, 1 }, T * 3 * W, hfill(522))
+         .view(RAD_BF16, { T, W }, { 3 * W, 1 }, T * 3 * W, hfill(523))
+         .view(RAD_BF16, { T, W }, { 3 * W, 1 }, T * 3 * W, hfill(524))
+         .idx({ 0, 100, 103, T })
+         .dense(RAD_BF16, { 32, heads }, hfill(525, 2.0f))
+         .view(RAD_BF16, { T, W }, { W + 64, 1 }, T * (W + 64), hfill(526), true)
+         .pi("M", T).pi("heads", heads).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    /* ---- the VAE: expand over a 2 x 3 x 4 grid, history over a plane of 3 and 20 channels ---- */
+    {
+        Hand h("grid 2 x 3 x 4, st 2 s 2 drop 1, cin 8 cout 4", "wan_vae_expand", 0.0);
+        h.view(RAD_BF16, { 24, 8 }, { 11, 1 }, 24 * 11, hfill(527))
+         .idx({ 2, 3, 4 })
+         .dense(RAD_BF16, { 144, 4 }, hfill(528), true)
+         .pi("M", 24).pi("cin", 8).pi("cout", 4).pi("st", 2).pi("s", 2).pi("drop", 1)
+         .pi("temporal", 0).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+
+        Hand t("grid 2 x 3 x 4, temporal, cin 16 cout 8", "wan_vae_expand", 0.0);
+        t.view(RAD_BF16, { 24, 16 }, { 19, 1 }, 24 * 19, hfill(529))
+         .idx({ 2, 3, 4 })
+         .view(RAD_BF16, { 48, 8 }, { 10, 1 }, 48 * 10, hfill(530), true)
+         .pi("M", 24).pi("cin", 16).pi("cout", 8).pi("st", 2).pi("s", 1).pi("drop", 0)
+         .pi("temporal", 1).ps("dtype", "bf16");
+        hs.push_back(std::move(t));
+    }
+    struct Hist { const char* name; int64_t frames; int temporal, reset; };
+    for (const Hist& v : { Hist{ "plane 3, two frames, temporal", 2, 1, 0 },
+                           Hist{ "plane 3, two frames, reset", 2, 0, 1 },
+                           Hist{ "plane 3, one frame", 1, 0, 0 },
+                           Hist{ "plane 3, one frame, temporal, reset", 1, 1, 1 } }) {
+        const int64_t P = 3, C = 20, rows = v.frames * P;
+        const int64_t orows = v.temporal ? rows : rows + 2 * P, ocols = v.temporal ? 3 * C : C;
+        Hand h(v.name, "wan_vae_history", 0.0);
+        h.view(RAD_BF16, { rows, C }, { C + 4, 1 }, rows * (C + 4), hfill(531))
+         .view(RAD_BF16, { 2 * P, C }, { C + 2, 1 }, 2 * P * (C + 2), hfill(532), true)
+         .view(RAD_BF16, { orows, ocols }, { ocols + 4, 1 }, orows * (ocols + 4), hfill(533), true)
+         .pi("M", rows).pi("temporal", v.temporal).pi("reset", v.reset).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+}
+
 void video_cases(std::vector<Hand>& hs) {
     const auto zero = [](int64_t) { return 0.0f; };
     for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
@@ -3525,7 +3845,8 @@ void kv_cases(std::vector<Hand>& hs) {
     /* A free slot is taken before an unreferenced resident slot, even when the hand starts on the
      * resident one: the empty region is not a victim and the block in that slot stays. */
     {
-        Hand h = pool("a free slot is taken before an unreferenced one", 1, 8, 4, 1, 4, { 0 }, { 1 },
+        Hand h = pool("a free slot is taken before an unreferenced one", 1, 8, 4, 1, 4, { 0 },
+                      { 1 },
                       { -1, -1, -1, 0, -1, -1, -1, -1 }, { 3, -1, -1, -1 },
                       { 0, 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0, 0,
                                                    0, 0, 0, 0, 0, 0, 0, 0 });
@@ -3559,7 +3880,8 @@ void kv_cases(std::vector<Hand>& hs) {
      * way), so this case pins the counter: a saturated 3 is 1 after one pass, not the 0 a one-bit
      * CLOCK would leave. */
     {
-        Hand h = pool("a saturated counter halves 3 -> 1 on one pass", 1, 32, 3, 1, 8, { 20 }, { 1 },
+        Hand h = pool("a saturated counter halves 3 -> 1 on one pass", 1, 32, 3, 1, 8, { 20 },
+                      { 1 },
                       { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1,
                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
                       { 10, 11, 12 }, { 0, 3, 0, 0, 0, 0 },
@@ -3632,10 +3954,10 @@ void kv_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
-    /* 2052 claims -- four rows of 513, which is what `--max-num-seqs 4` selects, and eight more than
-     * the largest fixed list can hold. Every slot is free, so all 2052 are placed: ids 100..2099
-     * take their own slot and the 52 past the ring (2100..2151) take the first free slots from the
-     * hand, which are 0..51. Pinned to the placement. */
+    /* 2052 claims -- four rows of 513, which is what `--max-num-seqs 4` selects, and eight more
+     * than the largest fixed list can hold. Every slot is free, so all 2052 are placed: ids
+     * 100..2099 take their own slot and the 52 past the ring (2100..2151) take the first free
+     * slots from the hand, which are 0..51. Pinned to the placement. */
     {
         const int64_t M = 4, blocks = 4096, slots = 2100, pitch = 513, bbytes = 8, first = 100;
         std::vector<int64_t> sel, nsel((size_t)M, 513), res((size_t)blocks, -1),
@@ -3685,7 +4007,8 @@ void kv_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
     {
-        Hand h = pool("a claim in flight on entry is a state fault", 1, 8, 4, 2, 4, { 1, -1 }, { 1 },
+        Hand h = pool("a claim in flight on entry is a state fault", 1, 8, 4, 2, 4, { 1, -1 },
+                      { 1 },
                       { -1, -2, -1, -1, -1, -1, -1, -1 }, sblk_ok, sst_ok, ctl_ok);
         h.refuses(RAD_E_INVAL);
         hs.push_back(std::move(h));
@@ -3815,7 +4138,8 @@ void kvstream_cases(std::vector<Hand>& hs) {
         const uint8_t ksh[M] = { 0x3C, 0x40, 0x34, 0x44 }, vsh[M] = { 0x3C, 0x40, 0x38, 0x30 };
         const int8_t kc[M][2] = { { 64, 127 }, { -127, 32 }, { 127, 20 }, { 127, -25 } };
         const int8_t vc[M][2] = { { -127, 1 }, { 1, 127 }, { -127, -16 }, { 127, 24 } };
-        Hand h("the mirror's bytes, block-id addressing and the int8 rows", "kv_store_streamed", 0.0);
+        Hand h("the mirror's bytes, block-id addressing and the int8 rows", "kv_store_streamed",
+               0.0);
         h.view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
                [&](int64_t i) { return i % 4 < 2 ? kd[i / 4][i % 4] : 0.0f; })
          .view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
@@ -4323,7 +4647,8 @@ void planes_cases(const Check& ck, std::vector<Hand>& hs, Broken& broken) {
             }
             const std::string nm = std::string(gd.dtype) +
                                    (P > 1 ? ", " + std::to_string(P) + " parts" : "") + ", M=" +
-                                   std::to_string(M) + (K != 256 ? ", K=" + std::to_string(K) : "") +
+                                   std::to_string(M) + (K != 256 ? ", K=" + std::to_string(K)
+                                                        : "") +
                                    ", zeros 0 and " + std::to_string(top);
             Hand h(nm.c_str(), "gemm_nt_q", 8e-3);
             if (gd.act == 0) {
@@ -4488,7 +4813,8 @@ void encoder_cases(std::vector<Hand>& hs) {
      * Qwen3-ASR's geometries: the out-projection (K 1024) and the second feed-forward linear
      * (K 4096), 76 rows (one 6 s clip), and a gelu epilogue on a smaller shape. */
     struct Res { int64_t M, N, K; const char* act; uint32_t dt; };
-    for (const Res& c : { Res{ 76, 1024, 1024, "none", RAD_BF16 }, Res{ 76, 256, 4096, "none", RAD_BF16 },
+    for (const Res& c : { Res{ 76, 1024, 1024, "none", RAD_BF16 },
+                          Res{ 76, 256, 4096, "none", RAD_BF16 },
                           Res{ 9, 96, 64, "gelu", RAD_BF16 }, Res{ 9, 96, 64, "none", RAD_F32 } }) {
         auto round = [&](float v) {
             return c.dt == RAD_BF16 ? rad_bf16_to_f32(rad_f32_to_bf16(v)) : v;
@@ -5183,8 +5509,10 @@ void attnres_cases(std::vector<Hand>& hs) {
             return v;
         };
         std::vector<float> st((size_t)(g.MB * g.MT * g.n)), cur((size_t)(g.M * g.n)),
-                           add((size_t)(g.M * g.n)), q((size_t)(g.nQ * g.n)), w((size_t)(g.nQ * g.n));
-        for (size_t i = 0; i < st.size(); ++i) st[i] = std::sin(0.37f * (float)i) * (1.0f + (float)(i % 4));
+                           add((size_t)(g.M * g.n)), q((size_t)(g.nQ * g.n)),
+                               w((size_t)(g.nQ * g.n));
+        for (size_t i = 0; i < st.size(); ++i)
+            st[i] = std::sin(0.37f * (float)i) * (1.0f + (float)(i % 4));
         for (size_t i = 0; i < cur.size(); ++i) { cur[i] = std::cos(0.91f * (float)i); add[i] = 0.1f * (float)i - 0.4f; }
         for (size_t i = 0; i < q.size(); ++i) { q[i] = std::sin(1.3f * (float)i + 0.2f); w[i] = 1.0f + 0.05f * (float)i; }
         st = fit(st); cur = fit(cur); add = fit(add);
@@ -5222,11 +5550,253 @@ void attnres_cases(std::vector<Hand>& hs) {
      * on where the saturation starts. */
     for (const char* dt : { "f32", "bf16" }) {
         const uint32_t d = std::string(dt) == "bf16" ? RAD_BF16 : RAD_F32;
-        Hand h(std::string(dt) == "bf16" ? "situ far past both caps, bf16" : "situ far past both caps, f32",
+        Hand h(std::string(dt) == "bf16" ? "situ far past both caps, bf16"
+               : "situ far past both caps, f32",
                "situ_mul", 6e-3);
         h.dense(d, { 4, 2 * 64 }, hfill(401, 60.0f))
          .dense(d, { 4, 64 }, [](int64_t) { return 0.0f; }, true)
          .pi("M", 4).pi("n", 64).ps("dtype", dt).pf("gate_cap", 4.0).pf("up_cap", 25.0);
+        hs.push_back(std::move(h));
+    }
+}
+
+/* ================================================================== DeepSeek-V4.1
+ *
+ * The ops' descriptions draw what the model hands them, but not llama.cpp's native blocks (the
+ * weight is described in its float logical form), nor the optional operands and the negative ids
+ * that skip a row. */
+void ds41_cases(std::vector<Hand>& hs) {
+    /* ---- the GEMMs and the lookup over native blocks ------------------------------------ */
+    /* Random blocks, each f16 scale set to a finite value near 1, so every dequantised value is
+     * a number of the size the type stores. The offsets are the types' llama.cpp block layouts
+     * (libquant/lq_ggml_port.h). */
+    struct Ty { const char* name; int64_t block, bytes; std::vector<int64_t> f16_at; };
+    const Ty types[] = {
+        { "q8_0",    32,  34,  { 0 } },
+        { "q5_K",    256, 176, { 0, 2 } },
+        { "q6_K",    256, 210, { 208 } },
+        { "iq4_nl",  32,  18,  { 0 } },
+        { "iq2_xxs", 256, 66,  { 0 } },
+        { "iq1_s",   256, 50,  { 0 } },
+    };
+    uint64_t seed = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    auto blocks = [&](const Ty& ty, int64_t rows, int64_t K) {
+        const int64_t nb = K / ty.block;
+        std::vector<uint8_t> b((size_t)(rows * nb * ty.bytes));
+        for (uint8_t& v : b) v = (uint8_t)rnd();
+        for (int64_t i = 0; i < rows * nb; ++i) {
+            for (int64_t off : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(b.data() + i * ty.bytes + off, &h, 2);
+            }
+        }
+        return b;
+    };
+    for (const Ty& ty : types) {
+        for (const char* dt : { "f32", "bf16" }) {
+            const uint32_t D = std::strcmp(dt, "f32") ? RAD_BF16 : RAD_F32;
+            const double tol = D == RAD_F32 ? 2e-5 : 8e-3;
+            const int64_t K = 2 * ty.block, N = 37, M = 5, rb = K / ty.block * ty.bytes;
+            {
+                const std::vector<uint8_t> w = blocks(ty, N, K);
+                std::string nm = std::string("native ") + ty.name + " blocks, " + dt;
+                Hand h(nm.c_str(), "gemm_nt_ggml", tol);
+                h.dense(D, { M, K }, hfill(51))
+                 .raw(RAD_U8, { N, rb }, w.data())
+                 .dense(D, { M, N }, hfill(52), true)
+                 .pi("M", M).pi("N", N).pi("K", K).ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+            {
+                /* The engine's form: the stored bytes at the declared shape [N, K]. */
+                const std::vector<uint8_t> w = blocks(ty, N, K);
+                std::string nm = std::string("native ") + ty.name + " blocks at the declared shape, " + dt;
+                Hand h(nm.c_str(), "logits_gemm_ggml", tol);
+                h.dense(D, { 1, K }, hfill(53))
+                 .bytes(RAD_U8, { N, K }, { K, 1 }, N * rb, w, false)
+                 .dense(RAD_F32, { 1, N }, hfill(54), true)
+                 .pi("M", 1).pi("n_vocab", N).pi("n_embd", K).ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+            {
+                const int64_t V = 11;
+                const std::vector<uint8_t> w = blocks(ty, V, K);
+                std::string nm = std::string("native ") + ty.name + " rows, a padded id, mult, " + dt;
+                Hand h(nm.c_str(), "embed_lookup_ggml", D == RAD_F32 ? 0.0 : 4e-3);
+                h.idx({ 3, 10, -1, 0, 7, 3 })
+                 .raw(RAD_U8, { V, rb }, w.data())
+                 .dense(D, { 6, K }, hfill(55), true)
+                 .pi("M", 6).pi("n_embd", K).pi("n_vocab", V).ps("type", ty.name).ps("dtype", dt)
+                 .pf("mult", 1.75);
+                hs.push_back(std::move(h));
+            }
+            {
+                /* Five tokens, top 2, four experts stacked; one dropped slot, one expert idle. */
+                const int64_t NE = 4, TK = 2, T = M * TK, NN = 24;
+                const std::vector<uint8_t> w = blocks(ty, NE * NN, K);
+                std::string nm = std::string("native ") + ty.name + " experts stacked, " + dt;
+                Hand h(nm.c_str(), "moe_gemm_ggml", tol);
+                h.dense(D, { M, K }, hfill(56))
+                 .raw(RAD_U8, { NE, NN, rb }, w.data())
+                 .idx({ 7, 0, 4, 9, -1, 2, 5, 1, 8, 3 })
+                 .idx({ 0, 4, 4, 7, T })
+                 .dense(D, { T, NN }, hfill(57), true)
+                 .pi("M", M).pi("N", NN).pi("K", K).pi("n_expert", NE).pi("top_k", TK)
+                 .ps("a_order", "token").ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+        }
+    }
+
+    /* ---- the selections' optional operands and skipped rows ------------------------------ */
+    {
+        /* keep as index_candidates writes it, a bit a block of four: two blocks kept a row, one
+         * row keeping none it can reach. Positions past the width, before it and at its edge. */
+        const int64_t M = 4, C = 16, K = 5;
+        Hand h("keep given; reach 0, 8, 5 and past the width", "index_topk", 0.0);
+        h.dense(RAD_F32, { M, C }, hfill(61))
+         .dense(RAD_I32, { M, 1 },
+                [](int64_t m) { return (float)(m == 3 ? 0b1000 : 0b0101 << (m % 2)); })
+         .idx({ 0, 15, 40, 9 })
+         .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 2).pi("block", 4);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Blocks of one over 40 positions, two words a row: bit 31 (the word's sign) beside bits
+         * of the second word; every bit, the row reaching two; the second word alone. */
+        const int64_t M = 3, C = 40, K = 4;
+        const int32_t keep[] = { (int32_t)0x80000080u, 0x5, -1, -1, 0, 0x90 };
+        Hand h("keep a bit a position across two words", "index_topk", 0.0);
+        h.dense(RAD_F32, { M, C }, hfill(520))
+         .raw(RAD_I32, { M, 2 }, keep)
+         .idx({ 39, 1, 60 })
+         .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
+         .expect(3, { 7, 31, 32, 34, 0, 1, -1, -1, 36, 39, -1, -1 })
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 1).pi("block", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* keep's words are read only with `block`: without it they are refused, nothing written. */
+        Hand h("keep without block is refused", "index_topk", 0.0);
+        h.dense(RAD_F32, { 2, 8 }, hfill(521))
+         .dense(RAD_I32, { 2, 1 }, [](int64_t) { return 3.0f; })
+         .idx({ 7, 7 })
+         .dense(RAD_I32, { 2, 2 }, [](int64_t) { return 7.0f; }, true)
+         .refuses(RAD_E_SHAPE)
+         .pi("M", 2).pi("width", 8).pi("topk", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Ties: equal scores in a block and across blocks pick the lower index. */
+        const int64_t M = 2, C = 12;
+        Hand h("tied block maxima, the newest reachable block pinned", "index_candidates", 0.0);
+        h.dense(RAD_F32, { M, C }, [](int64_t i) { return (float)((i % 5) == 0 ? 2 : (i % 3)); })
+         .idx({ 11, 2 })
+         .dense(RAD_I32, { M, 1 }, [](int64_t) { return 9.0f; }, true)
+         .pi("M", M).pi("width", C).pi("block", 3).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* keep's bit layout by hand: 35 blocks of two, block 33 the best and block 34 (the newest
+         * reachable) pinned, so word 0 is clear and word 1 holds bits 1 and 2; the bits past the
+         * last block, preset, are cleared. */
+        const int64_t C = 70;
+        Hand h("keep's bits: blocks 33 and 34 in the second word", "index_candidates", 0.0);
+        h.dense(RAD_F32, { 1, C },
+                [](int64_t j) { return j == 66 ? 5.0f : 0.01f * (float)(j % 7); })
+         .idx({ 69 })
+         .dense(RAD_I32, { 1, 2 }, [](int64_t) { return -1.0f; }, true)
+         .expect_bytes(2, { 0, 0, 0, 0, 6, 0, 0, 0 })
+         .pi("M", 1).pi("width", C).pi("block", 2).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    for (int part : { 0, 1, 2 }) {
+        /* index_score's runs (row_part): five rows of two sequences (rows 0-2 and 3-4) in runs of
+         * two. Run 0 is a split step's first, run 1 straddles the sequences, run 2's second row
+         * is past the step and scores -inf. Blocks unmapped (-1) and past the cache (9). */
+        const char* nm[] = { "index scorer row_part: a split step's first run",
+                             "index scorer row_part: a run across two sequences",
+                             "index scorer row_part: a run past the step's last row" };
+        const int64_t Mq = 5, H = 2, Dm = 64, R = 4, C = 6;
+        Hand h(nm[part], "index_score", 1e-5);
+        h.dense(RAD_F32, { Mq, H * Dm }, hfill(522 + part))
+         .dense(RAD_F32, { Mq, H }, hfill(525 + part))
+         .dense(RAD_F32, { 4, 1, R, Dm / R }, hfill(528 + part))
+         .dense(RAD_I32, { 2, C }, [](int64_t i) {
+             const int64_t t[] = { 0, 2, 1, -1, 3, 0, 3, 1, 9, 2, -1, 1 };
+             return (float)t[i];
+         })
+         .idx({ 13, 14, 15, 20, 22 })
+         .idx({ 0, 3, 5 })
+         .dense(RAD_F32, { 2, C }, [](int64_t) { return 0.0f; }, true)
+         .pi("M", 2).pi("heads", H).pi("dim", Dm).pi("ratio", R).pi("width", C)
+         .pf("wscale", 0.5).ps("dtype", "f32").pi("row_part", part);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Without row_part score holds every row of q: fewer rows are refused, nothing written. */
+        Hand h("index scorer refuses a short score without row_part", "index_score", 1e-5);
+        h.dense(RAD_F32, { 3, 2 * 64 }, hfill(531))
+         .dense(RAD_F32, { 3, 2 }, hfill(532))
+         .dense(RAD_F32, { 2, 1, 4, 16 }, hfill(533))
+         .dense(RAD_I32, { 1, 2 }, [](int64_t i) { return (float)i; })
+         .idx({ 9, 10, 11 })
+         .idx({ 0, 3 })
+         .dense(RAD_F32, { 2, 3 }, [](int64_t) { return 0.0f; }, true)
+         .refuses(RAD_E_SHAPE)
+         .pi("M", 2).pi("heads", 2).pi("dim", 64).pi("ratio", 4).pi("width", 3)
+         .pf("wscale", 0.5).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a negative page skips its entry", "softmax_pool", 1e-6);
+        h.dense(RAD_F32, { 3 * 4, 2 * 40 }, hfill(62, 2.0f))
+         .dense(RAD_BF16, { 3, 40 }, hfill(63), true)
+         .idx({ 2, -1, 0 })
+         .pi("M", 3).pi("n", 40).pi("ratio", 4).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a negative page writes nothing", "entry_store", 0.0);
+        h.dense(RAD_BF16, { 3, 32 }, hfill(64))
+         .idx({ 4, -1, 1 })
+         .dense(RAD_BF16, { 6, 1, 4, 8 }, hfill(65), true)
+         .pi("M", 3).pi("n", 32).pi("block_size", 4).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a page past the cache is refused before any write", "entry_store", 0.0);
+        h.dense(RAD_BF16, { 2, 32 }, hfill(66))
+         .idx({ 6, 1 })
+         .dense(RAD_BF16, { 6, 1, 4, 8 }, hfill(67), true)
+         .pi("M", 2).pi("n", 32).pi("block_size", 4).ps("dtype", "bf16")
+         .refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Two sequences, the second's window partly evicted (window_used short of its length),
+         * absent selections (-1) and a selection past the compressed table. */
+        const int64_t M = 6, H = 2, Dm = 16, win = 4, ratio = 4, topk = 3, bs = 2, nb = 6, ncb = 4;
+        Hand h("two sequences, a short window, absent and out-of-table selections",
+               "attn_sparse_sink", 1e-4);
+        h.dense(RAD_F32, { M, H * Dm }, hfill(71))
+         .dense(RAD_F32, { nb, 1, bs, Dm }, hfill(72))
+         .dense(RAD_I32, { 2, 3 }, [](int64_t i) { const float t[6] = { 0, 1, 2, 3, 5, -1 }; return t[i]; })
+         .idx({ 3, 2 })
+         .dense(RAD_F32, { ncb, 1, ratio, Dm / ratio }, hfill(73))
+         .dense(RAD_I32, { 2, 2 }, [](int64_t i) { const float t[4] = { 1, 0, 3, 2 }; return t[i]; })
+         .dense(RAD_I32, { M, topk }, [](int64_t i) { const float t[18] = { 0, 1, -1, 1, 0, 7,
+                                                                         -1, -1, -1, 0, 1, 2,
+                                                                         1, -1, 0, 3, 2, 1 };
+                                                     return t[i]; })
+         .idx({ 0, 1, 2, 0, 1, 2 })
+         .idx({ 0, 3, 6 })
+         .dense(RAD_F32, { H }, hfill(74))
+         .dense(RAD_F32, { M, H * Dm }, hfill(75), true)
+         .pi("M", M).pi("heads", H).pi("dim", Dm).pi("window", win).pi("ratio", ratio)
+         .pi("topk", topk).pf("scale", 0.25).ps("dtype", "f32");
         hs.push_back(std::move(h));
     }
 }
@@ -5239,9 +5809,12 @@ bool hand_cases(const Check& ck) {
     mla_latent_cases(hs);
     format_cases(hs);
     anchor_cases(hs);
+    gdn_tree_cases(hs);
     packed_cases(hs);
+    planes_gather_cases(hs);
     gen_cases(hs);
     video_cases(hs);
+    wan_cases(hs);
     upscaler_cases(hs);
     vsa_cases(hs);
     qsa_cases(hs);
@@ -5250,6 +5823,7 @@ bool hand_cases(const Check& ck) {
     encoder_cases(hs);
     audio_cases(hs);
     attnres_cases(hs);
+    ds41_cases(hs);
     Broken broken;
     planes_cases(ck, hs, broken);
 

@@ -5,6 +5,7 @@
  * Separate from engine.cpp (the hot step loop), with which it shares only the Engine's fields.
  */
 #include "engine_priv.h"
+#include <dlfcn.h>
 #include "rad_internal.h"
 #include "engine_hostmem.h"
 #include "kld.h"
@@ -161,13 +162,16 @@ static MissReport miss_report(const Program& p, bool host_backend) {
 /* ================================================================== 1. devices */
 /* Choose the devices. An integrated GPU appears as its own HIP device with system RAM as VRAM, and
  * a rank placed on one runs slowly and wrongly. So the engine uses the discrete cards if any
- * (integrated only on an APU-only machine), restricted to the first one's arch, and reports only
- * what it skipped. ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES control what the runtime exposes.
+ * (integrated only on an APU-only machine), restricted to one arch, and reports only what it
+ * skipped. The arch is `prefer`'s when that names a device the first rule keeps (the first card a
+ * configuration lists: models.NAME.cards, the fleet's cards:), else the first kept device's, so a
+ * machine with an RDNA3 card at index 0 serves on its RDNA4 cards when they are the ones listed.
+ * ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES control what the runtime exposes.
  *
  * `names` receives every device's product name by index ("" if unreadable), for
  * Engine::identify_devices, so the properties are read only once. */
 static int usable_devices(std::vector<int>* out, std::string* inventory, std::string* note,
-                          std::vector<std::string>* names) {
+                          std::vector<std::string>* names, int prefer = -1) {
     const int n = rad_dev_count();
     if (n <= 0) return RAD_E_DEVICE;
     names->assign((size_t)n, std::string());
@@ -186,7 +190,9 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
         any_discrete |= !igpu;
     }
 
-    std::string want;              /* the first taken device's arch; all ranks must match */
+    std::string want;              /* the arch every taken device has; all ranks must match */
+    for (const D& d : all)
+        if (d.i == prefer && (!any_discrete || !d.igpu)) want = d.arch;
     std::string use, skip;
     for (const D& d : all) {
         const bool take = (!any_discrete || !d.igpu) && (want.empty() || want == d.arch);
@@ -202,17 +208,19 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
     *note = skip.empty()
           ? std::string()
           : fmt("using %zu of %d [%s], ignoring [%s]: integrated graphics beside a discrete card, "
-                "or a different architecture from the first card used, and a rank placed on one "
-                "runs slowly and wrongly. ROCR_VISIBLE_DEVICES chooses the devices explicitly",
-                out->size(), n, use.c_str(), skip.c_str());
+                "or a different architecture from the %s, and a rank placed on one runs slowly "
+                "and wrongly. A process serves one architecture; the first card `cards` lists "
+                "chooses it, and ROCR_VISIBLE_DEVICES chooses the devices explicitly",
+                out->size(), n, use.c_str(), skip.c_str(),
+                prefer >= 0 ? "first card listed" : "first card used");
     return out->empty() ? RAD_E_DEVICE : RAD_OK;
 }
 
-int Engine::usable_cards(std::vector<int>* out) {
+int Engine::usable_cards(std::vector<int>* out, int prefer) {
     std::string inventory, note;
     std::vector<std::string> names;
     out->clear();
-    return usable_devices(out, &inventory, &note, &names);
+    return usable_devices(out, &inventory, &note, &names, prefer);
 }
 
 /* A /proc/meminfo field ("MemTotal", "MemAvailable") in bytes, or -1 when absent. */
@@ -543,12 +551,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     if (emb_max == 0) {
         if (emb == TablePlacement::Ram && emb_asked) {
             RAD_ERR("--embedding-placement ram: this model has no token embedding table that only "
-                    "embed_lookup reads. An output head tied to the table reads it too, and would "
-                    "stream it over the link every step.");
+                    "a token gather (embed_lookup, embed_tq, embed_exl3i) reads. An output head "
+                    "tied to the table reads it too, and would stream it over the link every "
+                    "step.");
             return RAD_E_INVAL;
         }
         emb = TablePlacement::Vram;
-        emb_why = "no table only embed_lookup reads (an output head tied to it reads it too, "
+        emb_why = "no table only a token gather reads (an output head tied to it reads it too, "
                   "whole, every step)";
     } else if (emb == TablePlacement::Ram) {
         if (!emb_room()) {
@@ -794,12 +803,103 @@ bool is_container(const std::string& path) {
 }  /* namespace */
 
 WeightSourceFn Engine::sources() const {
+    /* --weight-sidecar: a sidecar's entry answers before the container's of the same name. */
+    if (file_ && side_) {
+        const WeightSourceFn side = rad_container_sources(*side_), main = rad_container_sources(*file_);
+        return [side, main](const std::string& name, const Program& prog, WeightSource* out) {
+            const int st = side(name, prog, out);
+            return st == RAD_E_NOTFOUND ? main(name, prog, out) : st;
+        };
+    }
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
 
+/* --weight-sidecar FILE, a container rad-sidecar wrote from the model's container: each of its
+ * entries stands in for the container's entry of the same name -- the same logical rank and shape,
+ * any encoding (a bf16 linear as llama.cpp's q8_0, say) -- so declare sees the sidecar's encoding
+ * (rad_weight_encoding) and the load reads the sidecar's planes. Numbers are chosen offline, by the
+ * quantiser rad-sidecar runs (abi/rad_abi.h: a lossy step is the quantiser's job), and served as
+ * stored. Refused at open: a file that is not a container, a sidecar written from a container of
+ * another size or architecture, an entry the container does not hold or holds at another rank or
+ * shape, a routed expert's entry (experts sit at a fixed stride the container's own expert
+ * directory addresses). Empty (the default): no second file, the container answers alone. */
+int Engine::open_weight_sidecar() {
+    side_.reset();
+    if (cfg_.weight_sidecar.empty()) return RAD_OK;
+    const char* path = cfg_.weight_sidecar.c_str();
+    if (!file_) {
+        RAD_ERR("--weight-sidecar %s: a sidecar replaces entries of a .rad container, and %s is a "
+                "checkpoint", path, cfg_.model.c_str());
+        return RAD_E_INVAL;
+    }
+    auto side = std::make_unique<RadFile>();
+    RAD_TRY(side->open(path));
+    int64_t of_bytes = -1;
+    if (!side->get_i("sidecar.container_bytes", &of_bytes) || of_bytes != file_->size()) {
+        RAD_ERR("--weight-sidecar %s: it was written from a container of %lld bytes, and %s holds %lld; "
+                "a sidecar serves only the container rad-sidecar read", path, (long long)of_bytes,
+                cfg_.model.c_str(), (long long)file_->size());
+        return RAD_E_FORMAT;
+    }
+    const std::string a_side = side->str(side->header().arch_id), a_main = file_->str(file_->header().arch_id);
+    if (a_side != a_main) {
+        RAD_ERR("--weight-sidecar %s: its architecture is '%s', the container's '%s'", path,
+                a_side.c_str(), a_main.c_str());
+        return RAD_E_FORMAT;
+    }
+    if (side->entry_count() <= 0) {
+        RAD_ERR("--weight-sidecar %s holds no entries", path);
+        return RAD_E_FORMAT;
+    }
+    int64_t bytes = 0, replaced = 0;
+    std::map<std::string, int> forms;
+    for (int64_t i = 0; i < side->entry_count(); ++i) {
+        const RadFileEntry& s = side->entry(i);
+        const std::string name = side->str(s.name);
+        const RadFileEntry* m = file_->find(name);
+        if (!m) {
+            RAD_ERR("--weight-sidecar %s: '%s' is not an entry of %s", path, name.c_str(), cfg_.model.c_str());
+            return RAD_E_NOTFOUND;
+        }
+        bool same = s.rank == m->rank;
+        for (uint32_t k = 0; same && k < s.rank && k < RAD_MAX_RANK; ++k) same = s.shape[k] == m->shape[k];
+        if (!same) {
+            RAD_ERR("--weight-sidecar %s: '%s' is a rank-%u weight there and a rank-%u one of another "
+                    "shape in the container; a sidecar re-encodes a weight, it does not reshape it", path,
+                    name.c_str(), (unsigned)s.rank, (unsigned)m->rank);
+            return RAD_E_SHAPE;
+        }
+        if (s.expert >= 0 || m->expert >= 0) {
+            RAD_ERR("--weight-sidecar %s: '%s' is a routed expert's weight, which the container's expert "
+                    "directory addresses at a fixed stride; a sidecar replaces only other weights", path,
+                    name.c_str());
+            return RAD_E_INVAL;
+        }
+        if (!rad_enc_valid(&side->encoding(s))) {
+            RAD_ERR("--weight-sidecar %s: '%s' carries a malformed encoding", path, name.c_str());
+            return RAD_E_FORMAT;
+        }
+        char e[160];
+        rad_enc_format(&side->encoding(s), e, sizeof e);
+        ++forms[e];
+        bytes += (int64_t)s.bytes;
+        replaced += (int64_t)m->bytes;
+    }
+    std::string fl;
+    for (const auto& [f, n] : forms) fl += fmt("%s%d x %s", fl.empty() ? "" : ", ", n, f.c_str());
+    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s, read from %s "
+             "(--weight-sidecar): %s", (long long)side->entry_count(), humanb(bytes).c_str(),
+             humanb(replaced).c_str(), path, fl.c_str());
+    side_ = std::move(side);
+    return RAD_OK;
+}
+
 int Engine::read_metadata() {
-    if (!is_container(cfg_.model)) return read_checkpoint_metadata();
+    if (!is_container(cfg_.model)) {
+        RAD_TRY(read_checkpoint_metadata());
+        return open_weight_sidecar();   /* --weight-sidecar: refused for a checkpoint; nothing when empty */
+    }
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
 
@@ -866,7 +966,7 @@ int Engine::read_metadata() {
              meta_.name && *meta_.name ? meta_.name : "(unnamed)",
              meta_.arch_id, meta_.quant && *meta_.quant ? meta_.quant : "bf16",
              (long long)meta_.n_layers, (long long)meta_.n_ctx_train);
-    return RAD_OK;
+    return open_weight_sidecar();   /* --weight-sidecar; empty = RAD_OK, nothing opened */
 }
 
 /* A checkpoint served directly (spec §4.3): config.json or the GGUF header is the metadata, read
@@ -974,6 +1074,12 @@ int Engine::load_plugins() {
         slot_base_ = base;
         reg_->set_tp_group(base);
     }
+    /* The kernel library's card-to-card count, where it keeps one (Ctx::LinkTraffic). */
+    Ctx::set_traffic_source(nullptr);
+    for (const Plugin& pl : reg_->plugins()) {
+        void* f = pl.handle ? dlsym(pl.handle, "r4d_ar_traffic_rank") : nullptr;
+        if (f) { Ctx::set_traffic_source(reinterpret_cast<Ctx::TrafficFn>(f)); break; }
+    }
     const Plugin* ap = reg_->plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
     arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
@@ -989,6 +1095,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.max_seqs   = cfg_.max_seqs;
     bc.max_ctx    = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     bc.max_spec   = cfg_.n_spec;
+    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
+    bc.expert_split = cfg_.expert_split.empty() ? nullptr : cfg_.expert_split.c_str();
+    bc.dspark_walk = cfg_.dspark_walk ? 1 : 0;
     bc.draft_tree = draft_tree_ ? 1 : 0;
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
@@ -1667,6 +1776,13 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
+    } else if (cfg_.n_spec > 0 && cfg_.spec_ngram > 0) {
+        /* --spec-ngram leaves the head out (RadBuildCtx::draft_head_off); the probe still names the
+         * container's head, by its stated depth, though nothing declared it. */
+        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- %s", cfg_.spec_ngram,
+                 arch_probe_.draft_depth > 0
+                 ? "the container's draft head is left out: not declared, loaded or placed"
+                 : "this container declares no draft head");
     } else if (cfg_.n_spec > 0) {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
@@ -2237,6 +2353,20 @@ int Engine::plan() {
                          ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
                          : "");
         }
+        /* A named card's larger reserve determines the common TP split. Other cards may spend
+         * their additional room on experts without changing the KV coverage shared by all ranks. */
+        if (!broker_ && !cfg_.card_headroom_mib.empty() && cfg_.placement == "expert_tiered") {
+            for (size_t i = 0; i < facts.size(); ++i) {
+                const int64_t spare = vram_budget_rank_spare_mib(cfg_, facts, i);
+                const int64_t cap = (facts[i].statics + expert_vram_floor(wfs[i], 0)) / kMiB;
+                const int64_t add = std::min(spare,
+                    std::max<int64_t>(cap - rank_cfg_[i].vram_weights_mib, 0));
+                if (add <= 0) continue;
+                rank_cfg_[i].vram_weights_mib += add;
+                RAD_INFO("card %d uses %lld MiB of room above its own headroom for resident experts",
+                         ranks_[i]->device, (long long)add);
+            }
+        }
     }
 
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
@@ -2411,6 +2541,20 @@ struct StagedWeight {
      * column share, a fused tensor's two blocks): its runs, gathered by the worker that relays it
      * into scratch of its own just before the relayout. Empty for a dense direct weight. */
     std::vector<LoadRun> gather;
+
+    /* Places the input's `n` planes one after another, each 64-byte aligned, and sets in_bytes
+     * and remaining. Returns the planes' dense bytes. */
+    int64_t lay_out_planes(const PlaneShare* sh, int n) {
+        int64_t at = 0, dense = 0;
+        for (int k = 0; k < n; ++k) {
+            plane_off[k] = at;
+            at += align_up(sh[k].dense_bytes(), 64);
+            dense += sh[k].dense_bytes();
+        }
+        in_bytes = at;
+        remaining = dense;
+        return dense;
+    }
 };
 
 /* Pinned staging kept between sweeps. Pinning faults and zeroes the pages and then locks them for
@@ -2570,21 +2714,7 @@ public:
                 return { base_ + off, n, seq0_ + (int64_t)live_.size() - 1 };
             }
             /* No room: the oldest piece goes back once its copies have run. */
-            Live& f = live_.front();
-            if (!f.given || f.syncing) { cv_.wait(lk); continue; }
-            f.syncing = true;
-            const RadEvent ev = f.ev;
-            const int dev = f.dev;
-            lk.unlock();
-            const int rc = ev ? rad_event_sync(ev) : RAD_OK;
-            if (rc < 0) {
-                fence_upload(dev);
-                if (ev) rad_event_destroy(ev);
-            }
-            lk.lock();
-            if (rc < 0) live_.front().ev = nullptr;
-            if (rc < 0 && status_ == RAD_OK) status_ = rc;
-            retire_front();
+            retire_oldest(lk);
         }
     }
 
@@ -2661,21 +2791,7 @@ public:
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return ready_; });
         while (!live_.empty()) {
-            Live& f = live_.front();
-            if (!f.given || f.syncing) { cv_.wait(lk); continue; }
-            f.syncing = true;
-            const RadEvent ev = f.ev;
-            const int dev = f.dev;
-            lk.unlock();
-            const int rc = ev ? rad_event_sync(ev) : RAD_OK;
-            if (rc < 0) {
-                fence_upload(dev);
-                if (ev) rad_event_destroy(ev);
-            }
-            lk.lock();
-            if (rc < 0) live_.front().ev = nullptr;
-            if (rc < 0 && status_ == RAD_OK) status_ = rc;
-            retire_front();
+            retire_oldest(lk);
         }
         return status_;
     }
@@ -2718,6 +2834,26 @@ private:
         ++seq0_;
         if (live_.empty()) head_ = 0;
         cv_.notify_all();
+    }
+
+    /* Under the lock, with a piece held: waits for the front piece's copies to be issued, or
+     * (the caller loops) syncs and retires it, recording the first failure. */
+    void retire_oldest(std::unique_lock<std::mutex>& lk) {
+        Live& f = live_.front();
+        if (!f.given || f.syncing) { cv_.wait(lk); return; }
+        f.syncing = true;
+        const RadEvent ev = f.ev;
+        const int dev = f.dev;
+        lk.unlock();
+        const int rc = ev ? rad_event_sync(ev) : RAD_OK;
+        if (rc < 0) {
+            fence_upload(dev);
+            if (ev) rad_event_destroy(ev);
+        }
+        lk.lock();
+        if (rc < 0) live_.front().ev = nullptr;
+        if (rc < 0 && status_ == RAD_OK) status_ = rc;
+        retire_front();
     }
 
     std::unique_ptr<Uplink[]> up_;
@@ -3848,6 +3984,39 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+/* --weight-sidecar: this rank's share of a sidecar entry's selected planes, out of the sidecar's mapping, laid
+ * out as the sweep lays a container entry's (each rectangle's rows packed, the planes at `offs`). */
+static int fill_from_sidecar(const RadFile& side, const RadFileEntry& se, const std::vector<PlaneShare>& shares,
+                             const std::vector<int>& sel, const std::vector<int64_t>& offs, const std::string& name,
+                             uint8_t* in) {
+    for (size_t k = 0; k < shares.size(); ++k) {
+        const PlaneShare& sh = shares[k];
+        const RadFilePlane& pk = side.plane(se, sel[k]);
+        const uint8_t* base = side.data(pk);
+        uint8_t* at = in + offs[k];
+        for (const PlaneShare::Rect& q : sh.rects) {
+            if (q.rows <= 0) continue;
+            const int64_t a = q.row0 * sh.row_bytes + q.byte0, len = (q.rows - 1) * sh.row_bytes + q.bytes;
+            if (a < 0 || a + len > (int64_t)pk.bytes) {
+                RAD_ERR("load: '%s' would read [%lld, %lld) of a %llu-byte '%s' plane of the weight sidecar %s",
+                        name.c_str(), (long long)a, (long long)(a + len), (unsigned long long)pk.bytes,
+                        side.encoding(se).plane[sel[k]].role, side.path());
+                return RAD_E_FORMAT;
+            }
+            if (q.byte0 == 0 && q.bytes == sh.row_bytes) {
+                std::memcpy(at, base + a, (size_t)(q.rows * q.bytes));
+                at += q.rows * q.bytes;
+                continue;
+            }
+            for (int64_t y = 0; y < q.rows; ++y) {
+                std::memcpy(at, base + a + y * sh.row_bytes, (size_t)q.bytes);
+                at += q.bytes;
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* The runs and the staged weight (when it is relaid, widened or narrowed) that fill weight `wi` of
  * `prog` on rank `rank` from container entry `ent`, its shares `sh`, into `dst0`: stored as is, the
  * share goes from the file to the destination; otherwise it is staged plane by plane for the
@@ -3863,7 +4032,6 @@ static int plan_container_weight(RadFile& file, const RadFileEntry& ent, const P
     const RadFileEntry* e = &ent;
     const int64_t file_bytes = file.size();
     int32_t stage = -1;
-    int64_t in_bytes = 0;
     if (!w.identity || w.widen || w.narrow) {
         stage = (int32_t)staged.size();
         staged.emplace_back();
@@ -3873,13 +4041,7 @@ static int plan_container_weight(RadFile& file, const RadFileEntry& ent, const P
         sw.device = device;
         sw.dst = dst0;
         sw.dev = dev;
-        for (int k = 0; k < w.n_sel; ++k) {
-            sw.plane_off[k] = in_bytes;
-            in_bytes += align_up(sh[k].dense_bytes(), 64);
-        }
-        sw.in_bytes = in_bytes;
-        sw.remaining = 0;
-        for (int k = 0; k < w.n_sel; ++k) sw.remaining += sh[k].dense_bytes();
+        (void)sw.lay_out_planes(sh, w.n_sel);
     } else if (sh[0].dense_bytes() != w.stored_bytes) {
         RAD_ERR("rank %d: '%s': this rank's share is %lld bytes and the slot %lld", rank,
                 w.name.c_str(), (long long)sh[0].dense_bytes(), (long long)w.stored_bytes);
@@ -3921,6 +4083,8 @@ int Engine::load_weights() {
     int64_t n_mapped = 0, mapped_bytes = 0;
     /* Of the container's own bytes, what the mapped tier reads: left in the page cache. */
     int64_t mapped_kept = 0;
+    /* --weight-sidecar: weights a sidecar's entry stands in for (also in n_loaded / total). */
+    int64_t n_side = 0, side_bytes = 0;
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -3978,10 +4142,13 @@ int Engine::load_weights() {
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
-             * giving the encoding and logical shape the share is cut in. */
-            const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
+             * giving the encoding and logical shape the share is cut in. With --weight-sidecar, a weight
+             * sidecar's entry stands in for the container's of the same name (open_weight_sidecar);
+             * its planes are staged like a checkpoint's, read by the workers, not the sweep. */
+            const RadFileEntry* se = side_ ? side_->find(w.source) : nullptr;
+            const RadFileEntry* e = se ? nullptr : file_ ? file_->find(w.source) : nullptr;
             const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
-            if (!e && !cw) {
+            if (!e && !cw && !se) {
                 if (w.decl.optional) continue;
                 const std::string why = ckpt_src_ ? ckpt_src_->missing(w.source) : std::string();
                 if (!why.empty())
@@ -3993,9 +4160,9 @@ int Engine::load_weights() {
                 ++n_missing;
                 continue;
             }
-            const RadEncoding& src_enc = e ? file_->encoding(*e) : cw->enc;
-            const uint32_t src_rank = e ? e->rank : cw->rank;
-            const int64_t* src_shape = e ? e->shape : cw->shape;
+            const RadEncoding& src_enc = se ? side_->encoding(*se) : e ? file_->encoding(*e) : cw->enc;
+            const uint32_t src_rank = se ? se->rank : e ? e->rank : cw->rank;
+            const int64_t* src_shape = se ? se->shape : e ? e->shape : cw->shape;
 
             /* The source must hold the encoding declare saw (rad_weight_encoding) and every layout
              * hook answered for; otherwise refuse rather than relayout the wrong bytes. */
@@ -4004,8 +4171,8 @@ int Engine::load_weights() {
                 rad_enc_format(&w.enc, want, sizeof want);
                 rad_enc_format(&src_enc, have, sizeof have);
                 RAD_ERR("rank %d: '%s' was declared against '%s' as %s, and %s holds it as %s",
-                        r->index, w.name.c_str(), w.source.c_str(), want, cfg_.model.c_str(),
-                        have);
+                        r->index, w.name.c_str(), w.source.c_str(), want,
+                        se ? side_->path() : cfg_.model.c_str(), have);
                 return RAD_E_FORMAT;
             }
 
@@ -4020,6 +4187,13 @@ int Engine::load_weights() {
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
             const bool direct = weight_file_direct(w, cfg_.tp);
+            if (se && (w.tier == Tier::Mapped || w.tier == Tier::SSD)) {
+                RAD_ERR("rank %d: '%s' comes from the weight sidecar %s (--weight-sidecar) and was "
+                        "placed on the %s tier, which reads the container where it lies; a sidecar's "
+                        "weight is loaded into a pool", r->index, w.name.c_str(), side_->path(),
+                        tier_name(w.tier));
+                return RAD_E_STATE;
+            }
             if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
@@ -4149,7 +4323,9 @@ int Engine::load_weights() {
             }
 
             /* From a checkpoint every weight is staged and read by its worker (no sweep); the pool
-             * stores it as is, widened, or relaid. */
+             * stores it as is, widened, or relaid. So is a weight a sidecar's entry stands in for
+             * (--weight-sidecar): its worker copies this rank's share out of the sidecar's mapping, and
+             * the sweep, which reads only the container, delivers it afterwards. */
             if (!e) {
                 StagedWeight sw;
                 sw.prog = &r->program;
@@ -4157,14 +4333,7 @@ int Engine::load_weights() {
                 sw.device = r->device;
                 sw.dst = (uint8_t*)slot->ptr;
                 sw.dev = dev;
-                int64_t in_bytes = 0;
-                for (int k = 0; k < w.n_sel; ++k) {
-                    sw.plane_off[k] = in_bytes;
-                    in_bytes += align_up(sh[k].dense_bytes(), 64);
-                    sw.remaining += sh[k].dense_bytes();
-                    total += sh[k].dense_bytes();
-                }
-                sw.in_bytes = in_bytes;
+                total += sw.lay_out_planes(sh, w.n_sel);
                 if (w.identity && !w.widen && !w.narrow &&
                     sh[0].dense_bytes() != w.stored_bytes) {
                     RAD_ERR("rank %d: '%s': this rank's share is %lld bytes and the slot %lld",
@@ -4176,9 +4345,18 @@ int Engine::load_weights() {
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
                 const std::string name = w.name;
-                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
-                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
-                };
+                if (se) {
+                    const RadFile* sf = side_.get();
+                    sw.fill = [sf, se, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_sidecar(*sf, *se, shares, sel, offs, name, in);
+                    };
+                    ++n_side;
+                    for (int k = 0; k < w.n_sel; ++k) side_bytes += sh[k].dense_bytes();
+                } else {
+                    sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+                    };
+                }
                 staged.push_back(std::move(sw));
                 ++n_loaded;
                 continue;
@@ -4212,6 +4390,14 @@ int Engine::load_weights() {
     int sw_st = RAD_OK;
     if (file_) {
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        /* --weight-sidecar: the sidecar's weights, which no sweep run delivers (they alone carry a fill
+         * in a container's load), to the workers once the container is read. */
+        for (size_t k = 0; k < staged.size() && sw_st == RAD_OK && !pool.failed(); ++k) {
+            if (!staged[k].fill) continue;
+            const int64_t n = staged[k].remaining;
+            pool.reserve((int)k);
+            pool.arrived((int)k, n);
+        }
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -4238,6 +4424,10 @@ int Engine::load_weights() {
     RAD_INFO("load: %lld weights, %s placed from %s of %s read", (long long)n_loaded,
              humanb(total).c_str(), humanb(read_bytes).c_str(),
              file_ ? "container" : "checkpoint");
+    if (side_)
+        RAD_INFO("load: %lld weight share(s), %s, read from the weight sidecar %s instead of the container "
+                 "(--weight-sidecar; summed over ranks)", (long long)n_side, humanb(side_bytes).c_str(),
+                 side_->path());
     if (n_mapped)
         /* Summed over ranks, which map the same file, so under TP the resident bytes are this
          * divided by --tp; the message says so. */
@@ -4292,18 +4482,45 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
             const WeightSlot* slot = r->mover.residency()->lookup((rad_weight)i);
             const uint8_t* at = slot ? (const uint8_t*)slot->ptr : nullptr;
             if (!at || !touches(at, w.stored_bytes)) continue;
-            const RadFileEntry* e = file_->find(w.source);
-            if (!e) {
+            /* --weight-sidecar: a weight the sidecar stood in for at load is refilled from the sidecar too. */
+            const RadFileEntry* se = side_ ? side_->find(w.source) : nullptr;
+            const RadFileEntry* e = se ? nullptr : file_->find(w.source);
+            if (!e && !se) {
                 RAD_ERR("restore: '%s' is in memory paged back empty and its source '%s' is not in %s",
                         w.name.c_str(), w.source.c_str(), cfg_.model.c_str());
                 return RAD_E_NOTFOUND;
             }
             PlaneShare sh[RAD_ENC_MAX_PLANES];
             std::string why;
-            if (weight_share(w, file_->encoding(*e), e->rank, e->shape, cfg_.tp, r->index, sh, &why) != RAD_OK) {
+            if (weight_share(w, se ? side_->encoding(*se) : file_->encoding(*e), se ? se->rank : e->rank,
+                             se ? se->shape : e->shape, cfg_.tp, r->index, sh, &why) != RAD_OK) {
                 RAD_ERR("restore: rank %d: '%s' at --tp %d: %s", r->index, w.name.c_str(), cfg_.tp,
                         why.c_str());
                 return RAD_E_SHAPE;
+            }
+            if (se) {
+                /* Staged as load_weights stages it, its worker copying the share out of the
+                 * sidecar's mapping, and clipped to this refill's stretches like any staged weight;
+                 * delivered after the sweep, which reads only the container. */
+                StagedWeight sw;
+                sw.prog = &r->program;
+                sw.wi = i;
+                sw.device = r->device;
+                sw.dst = const_cast<uint8_t*>(at);
+                sw.dev = true;
+                sw.clip = &on;
+                total += sw.lay_out_planes(sh, w.n_sel);
+                std::vector<PlaneShare> shares(sh, sh + w.n_sel);
+                std::vector<int> sel(w.sel, w.sel + w.n_sel);
+                std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
+                const std::string name = w.name;
+                const RadFile* sf = side_.get();
+                sw.fill = [sf, se, shares, sel, offs, name](uint8_t* in) -> int {
+                    return fill_from_sidecar(*sf, *se, shares, sel, offs, name, in);
+                };
+                staged.push_back(std::move(sw));
+                ++n_weights;
+                continue;
             }
             const size_t run0 = runs.size(), staged0 = staged.size();
             RAD_TRY(plan_container_weight(*file_, *e, r->program, i, sh, r->index, r->device,
@@ -4360,8 +4577,21 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
     const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
     pool.start(workers, kRefillStaging, host_only);
     int64_t read_bytes = 0;
-    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes,
-                                     host_only ? std::function<int()>{} : before_writes);
+    int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes,
+                               host_only ? std::function<int()>{} : before_writes);
+    /* --weight-sidecar: the sidecar's weights after the sweep, as load_weights delivers them. A sweep with
+     * no runs never called before_writes, so it is called here before their first write. */
+    bool side_first = runs.empty();
+    for (size_t k = 0; k < staged.size() && sw_st == RAD_OK && !pool.failed(); ++k) {
+        if (!staged[k].fill) continue;
+        if (side_first && !host_only && before_writes) {
+            side_first = false;
+            if ((sw_st = before_writes()) != RAD_OK) break;
+        }
+        const int64_t n = staged[k].remaining;
+        pool.reserve((int)k);
+        pool.arrived((int)k, n);
+    }
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
@@ -4633,6 +4863,28 @@ int Engine::configure_kv() {
         for (const KVGroupPlan& p : ranks_[0]->kv.plans()) linear = linear || p.stateful();
         const char* what = !ranks_[0]->kv.has_window_snapshot() ? "linear-state"
                            : linear ? "linear-state + sliding-window" : "sliding-window";
+        /* The drafter's window in the slot (--checkpoint-draft-window, or a model with no linear
+         * state): say what it costs, and when the flag asked for it and nothing carries it. */
+        {
+            int64_t dwin = 0;
+            for (const KVGroupPlan& p : ranks_[0]->kv.plans())
+                if (p.win_snap && p.drafter && !p.zero && p.n_layers > 0)
+                    dwin += p.window_blocks * p.bytes_per_block;
+            /* The flag changed something only where the model has no window snapshot of its own
+             * to carry the drafter's window. */
+            const bool flag_changed = cfg_.checkpoint_draft_window &&
+                                      !window_snapshots(ranks_[0]->program, cfg_);
+            if (drafter_snap_)
+                RAD_INFO("checkpoint slots: the drafter's sliding window rides in each slot "
+                         "(%s of the %s a slot, per rank 0)%s; a prefix hit restores it and needs "
+                         "no draft refill", humanb(dwin).c_str(),
+                         humanb(ranks_[0]->kv.checkpoint_bytes()).c_str(),
+                         flag_changed ? " (--checkpoint-draft-window)" : "");
+            else if (cfg_.checkpoint_draft_window)
+                RAD_WARN("--checkpoint-draft-window has no effect here: it needs a block drafter with a "
+                         "window KV group of its own, speculation on, the prefix cache on and "
+                         "--checkpoint-interval above 0");
+        }
         const bool sized_auto = cfg_.checkpoint_slots < 0;
         if (sized_auto) RAD_TRY(size_checkpoint_store(slot, what));
         const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
@@ -4910,7 +5162,8 @@ int Engine::start() {
     log_rank_tags(cfg_.tp > 1);
 
     std::vector<std::string> dev_names;
-    int s = usable_devices(&devs, &inventory, &devnote, &dev_names);
+    int s = usable_devices(&devs, &inventory, &devnote, &dev_names,
+                           cfg_.devices.empty() ? -1 : cfg_.devices.front());
     /* Before any refusal, so a failed startup's report still identifies the cards. */
     identify_devices(dev_names);
     if (!devnote.empty()) RAD_WARN("device: %s", devnote.c_str());
@@ -4939,12 +5192,11 @@ int Engine::start() {
     if (cfg_.max_ctx == 0)
         decide("--max-model-len", std::to_string(meta_.n_ctx_train),
                "the model's training context (--max-model-len 0)");
-    /* The vocabulary and the plugins are independent reads of what read_metadata set up
-     * (the container's sections or the checkpoint's fields, meta_, cfg_), and both are
-     * seconds of file and CPU work a startup used to pay back to back: vocab on its own
-     * thread while the plugin libraries dlopen here, joined before declare, which is the
-     * first step that needs both. A vocab failure is still the one reported, as when it
-     * ran first; an exception crosses back unchanged. */
+    /* The vocabulary and the plugins are independent reads of what read_metadata set up (the
+     * container's sections or the checkpoint's fields, meta_, cfg_), and each is seconds of file
+     * and CPU work: vocab runs on its own thread while the plugin libraries dlopen here, joined
+     * before declare, the first step that needs both. A vocab failure is the one reported; an
+     * exception crosses back unchanged. */
     int              vocab_st = RAD_OK;
     std::exception_ptr vocab_ex;
     std::thread      vocab_thread;
@@ -5495,10 +5747,12 @@ int Engine::start() {
      * Too much means VRAM left unused, costly when experts do not fit; up to 256 MiB of slack
      * (MiB rounding, plugin workspaces) is silent. */
     const int64_t MiB = 1024 * 1024;
-    const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
     const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
+        const int64_t headroom = vram_budget_headroom_mib(cfg_, ri) * MiB;
+        const bool named_headroom = cfg_.card_headroom_mib.count(r->device) != 0;
+        const char* reserve_name = named_headroom ? "memory.card-headroom-mib" : "--gpu-headroom-mib";
         LogRank lr(r->index);
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
@@ -5510,14 +5764,17 @@ int Engine::start() {
         const int64_t got  = props.vram_free;
         const int64_t room = got - late;
         const std::string asked =
-            late > 0 ? fmt("%s (the %s --gpu-headroom-mib and %s kept for the step staging and "
+            late > 0 ? fmt("%s (the %s %s and %s kept for the step staging and "
                            "for what is built on first use)", humanb(want).c_str(),
-                           humanb(headroom).c_str(), humanb(late).c_str())
-                     : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
+                           humanb(headroom).c_str(), reserve_name, humanb(late).c_str())
+                     : fmt("%s %s", humanb(want).c_str(), reserve_name);
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
-            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
-            const std::string fix = cfg_.gpu_memory_mib > 0
+            const int64_t need_head = vram_budget_headroom_mib(cfg_, ri) + raise_mib;
+            const std::string fix = named_headroom
+                ? fmt("Set memory.card-headroom-mib for card %d to at least %lld.", r->device,
+                      (long long)need_head)
+                : cfg_.gpu_memory_mib > 0
                 ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
                       "for one.",
                       (long long)(props.vram_bytes / MiB - need_head))

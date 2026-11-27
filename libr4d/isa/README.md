@@ -6,7 +6,7 @@ run. The trace tools are the exception: they need the GPU, and they are the only
 that report the geometry a kernel was launched with rather than every geometry it could have had.
 
     BUILD=/path/to/build ./res.sh | head -40        # every kernel: vgpr/lds/scratch
-    BUILD=... ./dis.sh r4d_gemm_fp8a8 gemm_8a8_prefill_kernelILb0E
+    BUILD=... ./dis.sh r4d_gemm_i8a8 gemm_8a8_prefill_kernelILi0ELj128E
     BUILD=... ./waterfall.sh                        # divergent VGPR indices, per kernel
     ./loop.sh                                       # its K loop, classified
     ./trace.sh traces/dec -- ./bin/radiance --config radiance.yaml   # then: ./tsum.sh traces/dec/k_kernel_trace.csv
@@ -18,9 +18,9 @@ instrument is a failed run, not a clean tree. A HIP translation unit that carrie
 `.hip_fatbin` and is skipped rather than failed.
 
 `res.sh` prints mangled names; the substring `dis.sh` takes picks one template instantiation, and
-the parameter order is in the kernel's declaration (`gemm_fp8a8_kernel` is
-`<Full, NT, MW, FK, GATED, I8, BIAS>`, so `ILb1ELj4ELj8ELj256ELb0E` is the narrow tile at four token
-tiles and eight waves; `gemm_8a8_prefill_kernelILb0E` is the fp8 prefill tile).
+the parameter order is in the kernel's declaration (`gemm_i8a8_narrow_kernel` is
+`<Full, NT, MW, FK, SB>`, so `ILb1ELj4ELj8ELj256ELj128E` is the full narrow tile at four token
+tiles and eight waves; `gemm_8a8_prefill_kernelILi0ELj128E` is the per-row int8 prefill tile).
 `loop.sh` anchors on `v_wmma` by default and takes the smallest backward branch containing every
 anchor, because a largest-loop search finds the epilogue, a long unrolled store chain.
 

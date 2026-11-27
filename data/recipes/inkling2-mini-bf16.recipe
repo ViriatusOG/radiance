@@ -1,0 +1,22 @@
+# inkling2-mini-bf16.recipe -- Inkling 2 Mini (`inkling2_loop`) with every weight bf16: the
+# calibration container that records the Hessians data/recipes/inkling2-mini-iq4r-v4.recipe reads.
+# Served by arch/inkling2.
+#
+#   rad-convert <Inkling-2-Mini directory> -o inkling2-mini-bf16.rad \
+#       --recipe data/recipes/inkling2-mini-bf16.recipe
+#
+#   - The release stores its routed experts NVFP4 (layers 0..19: e2m1 codes, an e4m3 scale per 16
+#     of K and the expert's f32 level) and MXFP8 (layers 20..23: e4m3 codes with an e8m0 exponent
+#     per 32 of K), as its hf_quant_config.json's parameter groups name them. rad-convert
+#     dequantises each in f32 and the rules below round it to bf16 once, to nearest even (an MXFP8
+#     value is exact in bf16; an NVFP4 value under its f32 level is rounded). Everything else is
+#     bf16 as shipped (the AttnRes queries and the router stay f32), so no other rule is needed.
+#   - Serve it with `calib-corpus` and `calib-dir` (docs/TOOLS.md, the calibration mode); about
+#     53 GB, so at `tp: 2`. arch/inkling2 writes the routed experts' gate_up input pooled over each
+#     layer's experts, every expert's down input and their sum, and the attention linears' inputs,
+#     as data/recipes/inkling2-mini-iq4r-v4.recipe describes.
+#   - The rules name the expert tensors as the plugin declares them: `blk.L.eE.gu` (gate and up,
+#     [2 F, H]) and `blk.L.eE.dn` (down, [H, F]), one weight per expert.
+
+blk.*.e*.gu                      cast dtype=bf16
+blk.*.e*.dn                      cast dtype=bf16

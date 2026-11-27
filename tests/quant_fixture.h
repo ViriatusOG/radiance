@@ -39,10 +39,8 @@ inline const RadQuantizerInfo* quantizer(const char* name) {
 
 #define NEED_LIBQUANT()                                                                       \
     do {                                                                                      \
-        if (!::qfix::quantizer("rtn")) {                                                      \
-            std::fprintf(stderr, "  SKIP no libquant under %s\n", ::home().c_str());          \
-            return;                                                                           \
-        }                                                                                     \
+        if (!::qfix::quantizer("rtn"))                                                        \
+            ARTIFACT_MISSING(::home() + "/quantizers/libquant.so");                           \
     } while (0)
 
 /* Parameters as a caller hands them over: text for strings, typed for the rest. The keys and
@@ -156,10 +154,7 @@ inline Quantised quantise(const RadQuantizerInfo* q, Opts& o, const char* name, 
 /* An empty directory of its own under the test's temporary directory, which the harness removes. */
 struct TempDir {
     std::string path;
-    explicit TempDir(const char* stem) {
-        std::string t = radtest::tmp_path(std::string(stem) + "_XXXXXX");
-        path = mkdtemp(t.data()) ? t : std::string();
-    }
+    explicit TempDir(const char* stem) : path(radtest::make_tmp_dir(stem)) {}
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
 };

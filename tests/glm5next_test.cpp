@@ -16,6 +16,11 @@
 /* GLM-5.3-Flash: its blocks (through the plugin's includes) and the plugin. */
 #include "../arch/glm5next/glm5next.cpp"
 
+/* Why the cases written against GLM-5.3's own container skip. */
+static const char* const kGlmContainerUnserved =
+    "GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; "
+    "the case returns with an int8 container";
+
 /* ==================================================================== the 2.x container */
 
 /* The 2.x container's encodings: an IQ8R trunk (rotated int8, a u8 scale a 256 of K under a bf16
@@ -401,7 +406,7 @@ TEST(absorbed_mla_shards_complete_heads_and_reads_one_latent_cache) {
  * the gather sends whole runs into an output of world runs. Below the threshold, and at TP1, the
  * head form is unchanged, as it is unless the row form is opted into (the default). */
 TEST(glm_mla_splits_a_prefill_by_rows_over_ranks_from_the_row_threshold) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     using namespace rad::arch;
     for (int world : { 1, 2, 4, 8 })
         for (int rank = 0; rank < world; ++rank) {
@@ -429,7 +434,7 @@ TEST(glm_mla_splits_a_prefill_by_rows_over_ranks_from_the_row_threshold) {
             kd.head_dim = 256;
             const rad_kvgroup kv = rad_decl_kv_group(&b, "latent", &kd);
             const int64_t T = 512, R = GlmMla::rows_for(T, world), H = 64 / world;
-            auto act = [&](ActFP8& a, const char* name, int64_t rows, int64_t width) {
+            auto act = [&](ActQ& a, const char* name, int64_t rows, int64_t width) {
                 a.x = decl_b(&b, name, RAD_BF16, { rows, width });
                 return a.declare_qs(&b, nm, g, name, width, rows);
             };
@@ -579,7 +584,7 @@ TEST(glm_mla_splits_a_prefill_by_rows_over_ranks_from_the_row_threshold) {
 
 TEST(
     glm53_native_graph_declares_all_layers_preserves_mixed_formats_and_runs_mtp_only_in_draft_passes) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     using namespace rad::arch;
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -620,7 +625,7 @@ TEST(
             CHECK(m.have_mtp);
             CHECK_EQ(b.drafter.kind, RAD_DRAFT_SERIAL);
             CHECK_EQ(b.drafter.depth, 3);
-            CHECK_EQ(m.layers.size(), (size_t)45);
+            REQUIRE_EQ(m.layers.size(), (size_t)45);
             int full = 0;
             for (int l = 0; l < 45; ++l) {
                 const auto& layer = m.layers[l];
@@ -832,7 +837,7 @@ TEST(
  * into planes that hold every run. The query side (projection, cast, quantiser, head gates) runs
  * on the run's rows that exist. Below the threshold the indexer stays replicated. */
 TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     using namespace rad::arch;
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -1122,7 +1127,7 @@ TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
 /* Each deployment or checkpoint the plugin cannot serve is refused with a line that names the
  * setting and the reason, not a bare status. */
 TEST(glm53_refusals_name_what_was_refused) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1186,7 +1191,7 @@ TEST(glm53_refusals_name_what_was_refused) {
  * name fp8_e4m3, and the index tail, DSA index and KDA groups keep their dtypes. Under bf16 the
  * attention states no kv_dtype, the op it always declared. */
 TEST(glm53_fp8_kv_cache_narrows_the_latent_group_only) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1251,7 +1256,7 @@ TEST(glm53_fp8_kv_cache_narrows_the_latent_group_only) {
  * launches it replaces are gone, with the step lint clean throughout. The sort writes each slot's
  * row (`moe_scatter_inv`) and the gather reads it (`moe_gather_inv`) in every MoE pass. */
 TEST(glm53_moe_decode_fusions_replace_their_launches_where_they_fit) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1534,7 +1539,7 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
 }
 
 TEST(glm_dense_ffn_keeps_clipping_and_disables_the_unclipped_fp8_epilogue) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     using namespace rad::arch;
     RadBuilder b;
     Names nm("");
@@ -1545,15 +1550,15 @@ TEST(glm_dense_ffn_keeps_clipping_and_disables_the_unclipped_fp8_epilogue) {
     g.world = 4;
     const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
     b.encs = { { "ffn_gate_up", fp8 }, { "ffn_down", fp8 } };
-    MlpFP8::Wire w;
+    MlpQ::Wire w;
     w.x = decl_b(&b, "x", RAD_BF16, { 32, 4096 });
     w.h.x = decl_b(&b, "h", RAD_BF16, { 32, 4096 });
     REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", 4096), RAD_OK);
     w.gate_up = decl_b(&b, "gate_up", RAD_BF16, { 32, 6144 });
     w.ffn.x = decl_b(&b, "ffn", RAD_BF16, { 32, 3072 });
     REQUIRE_EQ(w.ffn.declare_qs(&b, nm, g, "ffn", 3072), RAD_OK);
-    MlpFP8 block;
-    MlpFP8::Src src{ "post_attention_layernorm.weight", "mlp.gate_proj.weight",
+    MlpQ block;
+    MlpQ::Src src{ "post_attention_layernorm.weight", "mlp.gate_proj.weight",
                      "mlp.up_proj.weight", "mlp.down_proj.weight" };
     REQUIRE_EQ(block.declare(&b, nm, g, 0, w, src, false, false, kArNone, false, 10), RAD_OK);
     CHECK_EQ(block.op_gated, 0u);
@@ -1818,7 +1823,7 @@ TEST(kda_state_core_splits_mixed_batches_and_preserves_absolute_prefill_offsets)
  * after history, a mixed step, a decode step, a verify and its draft passes, at eight in both
  * MLA forms. */
 TEST(glm53_is_the_pinned_graph_and_steps) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -2265,7 +2270,7 @@ TEST(glm53_v2_protected_bf16_experts_need_a_full_pair) {
 /* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
  * and up, because a plain bf16 expert, even one protected among MXFP4 ones, cannot be sliced. */
 TEST(glm53_lays_out_its_experts_by_their_format) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -2418,7 +2423,7 @@ TEST(glm53_declares_its_latent_and_index_caches_replicated) {
  * frequencies an axis, gate and up joined gate first; one scatter over the trunk's embedding and
  * one over the draft head's. */
 TEST(glm53_declares_its_vision_tower_when_the_engine_asks_for_it) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     MetaKV mk = glm53_vl_meta();
     for (int world : { 1, 8 }) {
         const int rank = world - 1;
@@ -2528,7 +2533,7 @@ TEST(glm53_declares_its_vision_tower_when_the_engine_asks_for_it) {
 
 /* What the tower does not serve is refused by name at declare, not computed as another model. */
 TEST(glm53_refuses_a_vision_tower_it_does_not_serve) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const struct { const char* key; const char* val; int rc; } kCases[] = {
         { "vision_config.hidden_act", "gelu", RAD_E_UNSUPPORTED },
         { "vision_config.rope_parameters.rope_type", "default", RAD_E_UNSUPPORTED },
@@ -2550,7 +2555,7 @@ TEST(glm53_refuses_a_vision_tower_it_does_not_serve) {
  * downsample's unfold and GEMM, and the merger, over two pictures of 8 x 8 patches. The rotary
  * reads the row and column planes, attention and the unfold the segment bounds. */
 TEST(a_glm53_encoder_pass_issues_the_tower_and_nothing_else) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     MetaKV mk = glm53_vl_meta();
     for (int world : { 1, 8 }) {
         const int rank = world - 1;
@@ -2619,7 +2624,7 @@ TEST(a_glm53_encoder_pass_issues_the_tower_and_nothing_else) {
  * before the embedding's all-reduce, and so does the draft head's history pass over its own
  * lookup; a text-only step on the same program issues no scatter. */
 TEST(a_glm53_step_with_a_picture_scatters_its_rows_in_the_trunk_and_the_draft_head) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     MetaKV mk = glm53_vl_meta();
     for (int world : { 1, 4 }) {
         RadBuilder b;
@@ -2665,7 +2670,7 @@ TEST(a_glm53_step_with_a_picture_scatters_its_rows_in_the_trunk_and_the_draft_he
 /* A sizing declare with the tower is the real graph at fewer rows: the same ops with the same
  * fixed parameters (the attention's longest segment included), and nothing declared to the core. */
 TEST(glm53_sizing_declares_with_the_vision_tower_match_the_real_graph) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     MetaKV mk = glm53_vl_meta();
     for (int64_t R : { 256 }) {
         RadBuildCtx c = glm53_vl_ctx(3, 8, 16384);
@@ -2712,7 +2717,7 @@ TEST(glm53_sizing_declares_with_the_vision_tower_match_the_real_graph) {
 }
 
 TEST(glm53_declaring_without_streamed_ops_ignores_the_flag) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -2750,7 +2755,7 @@ TEST(glm53_declaring_without_streamed_ops_ignores_the_flag) {
 }
 
 TEST(glm53_streamed_decode_resolves_after_select_and_before_attention_with_the_entry_count) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -3291,7 +3296,7 @@ std::string as_expert_zero(std::string n) {
  * from the table, as the container would answer. A full-width view declared as its own weight
  * at `fp8a8` passed every host test and left 88 bands with no kernel at the eight-card start. */
 TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
-    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
+    SKIP("%s", kGlmContainerUnserved);
     const Glm53Container& c = glm53_container();
     MetaKV mk = glm53_vl_meta();
     for (int world : { 8, 1 }) {
@@ -3371,9 +3376,7 @@ TEST(glm_plugin_declines_a_machine_with_only_another_familys_cards) {
     auto check = (int (*)(const char*))dlsym(h, "rad_glm_machine_check");
     REQUIRE(check != nullptr);
     REQUIRE(dlsym(h, "rad_plugin_open") != nullptr);
-    char tmpl[] = "/tmp/glm_kfd_XXXXXX";
-    REQUIRE(mkdtemp(tmpl) != nullptr);
-    const std::string root = tmpl;
+    const std::string root = radtest::make_tmp_dir("glm_kfd");
     int n = 0;
     auto node = [&](const char* gfx) {
         const std::string dir = root + "/" + std::to_string(n++);
@@ -3390,6 +3393,5 @@ TEST(glm_plugin_declines_a_machine_with_only_another_familys_cards) {
     CHECK_EQ(check(root.c_str()), (int)RAD_E_UNSUPPORTED);
     node("120001");                               /* gfx1201 beside it */
     CHECK_EQ(check(root.c_str()), (int)RAD_OK);
-    std::filesystem::remove_all(root);
     dlclose(h);
 }

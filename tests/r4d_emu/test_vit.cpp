@@ -1,6 +1,9 @@
 /* tests/r4d_emu: Muse Glimmer's vision-tower coordinate ops (r4d_vit_muse.hip) on the host SIMT
  * emulator.
  *
+ * posemb_resample: held to hand-computed constants on a 4 x 4 table (identity, a 2 x 2 blend,
+ * clamped corners of an 8 x 8 grid, bf16 output).
+ *
  * grid_embed_pad: held to hand-computed constants -- a side-4 table resampled to an 8 x 8 grid,
  * whose last row and column reach taps off the table (zero-weight, grid_sample's zeros padding),
  * and an in-range 4 x 4 grid that reads the table whole. window_order: held to an independent host
@@ -211,9 +214,79 @@ static int test_window(int window, const std::vector<std::pair<int, int>>& grids
     return bad ? 1 : 0;
 }
 
+// ------------------------------------------------------------------ posemb_resample
+
+/* posemb_resample on the emulator, against hand-computed values. The table is a 4 x 4 grid of
+ * two channels, t(h, w, c) = (4h + w) + 0.5c, in f32 so its values are exact. The same grid is
+ * the table; a 2 x 2 grid of 4 x 4 blends each quadrant's four rows (coordinate 0.5 and 2.5); a
+ * 8 x 8 grid's first and last cells clamp to the table's corners; and a bf16 output rounds once. */
+static int test_posemb() {
+    const int64_t side = 4, n = 2;
+    std::vector<float> tab((size_t)(side * side * n));
+    for (int h = 0; h < side; ++h)
+        for (int w = 0; w < side; ++w)
+            for (int c = 0; c < n; ++c) tab[(size_t)((h * side + w) * n + c)] = (float)(4 * h + w) + 0.5f * c;
+    int bad = 0;
+    auto run_pr = [&](const std::vector<float>& src, int64_t Th, int64_t Tw, uint32_t ydt,
+                      std::vector<float>* outf, std::vector<uint16_t>* outb) {
+        RadTensor t[2];
+        t[0] = rows((void*)src.data(), RAD_F32, side * side, n, n);
+        if (ydt == RAD_F32) {
+            outf->assign((size_t)(Th * Tw * n), -99.0f);
+            t[1] = rows(outf->data(), RAD_F32, Th * Tw, n, n);
+        } else {
+            outb->assign((size_t)(Th * Tw * n), 0);
+            t[1] = rows(outb->data(), RAD_BF16, Th * Tw, n, n);
+        }
+        RadParam p[6] = { pi_("S_h", side), pi_("S_w", side), pi_("T_h", Th), pi_("T_w", Tw),
+                          pi_("n", n), ps_("dtype", ydt == RAD_F32 ? "f32" : "bf16") };
+        RadArgs a{}; a.t = t; a.n_t = 2; a.p = p; a.n_p = 6;
+        return r4d_rad_posemb_resample(&a, nullptr);
+    };
+
+    /* The same grid: the table, bit for bit. */
+    std::vector<float> same;
+    if (run_pr(tab, side, side, RAD_F32, &same, nullptr) != RAD_OK) { std::puts("posemb_resample: launch failed"); return 1; }
+    for (size_t i = 0; i < tab.size(); ++i)
+        if (same[i] != tab[i]) { ++bad; std::printf("posemb_resample identity: i %zu got %g want %g\n", i, same[i], tab[i]); }
+
+    /* 2 x 2: cell (0, 0) blends rows and columns {0, 1}, cell (1, 1) {2, 3}; mean of the four
+     * products at weight 1/4, so y = 2.5 + 0.5c and 12.5 + 0.5c. */
+    std::vector<float> two;
+    if (run_pr(tab, 2, 2, RAD_F32, &two, nullptr) != RAD_OK) { std::puts("posemb_resample 2x2: launch failed"); return 1; }
+    for (int c = 0; c < n; ++c) {
+        const float want00 = 2.5f + 0.5f * c, want11 = 12.5f + 0.5f * c;
+        if (two[(size_t)(0 * n + c)] != want00) { ++bad; std::printf("posemb_resample 2x2 (0,0) ch %d: got %g want %g\n", c, two[(size_t)(0 * n + c)], want00); }
+        if (two[(size_t)((1 * 2 + 1) * n + c)] != want11) { ++bad; std::printf("posemb_resample 2x2 (1,1) ch %d: got %g want %g\n", c, two[(size_t)((1 * 2 + 1) * n + c)], want11); }
+    }
+
+    /* 8 x 8: the first cell's coordinate is -0.25 and clamps to the table's corner; the last is
+     * 3.0 and reads the corner too. Both are one tap at weight 1. */
+    std::vector<float> eight;
+    if (run_pr(tab, 8, 8, RAD_F32, &eight, nullptr) != RAD_OK) { std::puts("posemb_resample 8x8: launch failed"); return 1; }
+    for (int c = 0; c < n; ++c) {
+        const float first = eight[(size_t)c], last = eight[(size_t)((8 * 8 - 1) * n + c)];
+        if (first != 0.0f + 0.5f * c) { ++bad; std::printf("posemb_resample 8x8 first ch %d: got %g\n", c, first); }
+        if (last != 15.0f + 0.5f * c) { ++bad; std::printf("posemb_resample 8x8 last ch %d: got %g\n", c, last); }
+    }
+
+    /* A bf16 output: 3 x 5 onto the table's f32 values, each cell rounded once to bf16. The
+     * same arithmetic as the f32 output, so each stored value is that value rounded. */
+    std::vector<float> f32out;
+    std::vector<uint16_t> bf16out;
+    if (run_pr(tab, 3, 5, RAD_F32, &f32out, nullptr) != RAD_OK) { std::puts("posemb_resample 3x5 f32: launch failed"); return 1; }
+    if (run_pr(tab, 3, 5, RAD_BF16, nullptr, &bf16out) != RAD_OK) { std::puts("posemb_resample 3x5 bf16: launch failed"); return 1; }
+    for (size_t i = 0; i < bf16out.size(); ++i) {
+        const float want = rb(f32out[i]);
+        if (b2f(bf16out[i]) != want) { ++bad; std::printf("posemb_resample 3x5 bf16 i %zu: got %g want %g\n", i, b2f(bf16out[i]), want); }
+    }
+    return bad ? 1 : 0;
+}
+
 int main() {
     int rc = 0;
     rc |= test_pad();
+    rc |= test_posemb();
     /* One 48 x 40 segment, window 32: ragged right and bottom, windows 32x32, 32x8, 16x32, 16x8. */
     rc |= test_window(32, { { 48, 40 } });
     /* Video-style: two segments back to back, window 16. */

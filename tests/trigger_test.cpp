@@ -207,8 +207,7 @@ TEST(scanner_work_is_linear_in_the_stream) {
  * token. Not held under a sanitizer, which slows the loop by an order of magnitude. */
 TEST(perf_scanner_throughput_has_a_floor) {
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-    std::printf("  SKIP: the floor is for an unsanitised build\n");
-    return;
+    SKIP("the floor is for an unsanitised build");
 #endif
     const WordScanner sc = built({ "<tool_call>\n", "<function=" });
     const size_t n = scan_text().size();
@@ -439,8 +438,7 @@ TEST(lazy_grammar_waiting_work_does_not_grow_with_the_reply) {
 /* The wait's cost in wall time, for the serial performance tier: flat, and under 5 us a token. */
 TEST(perf_lazy_grammar_waiting_cost_has_a_ceiling) {
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-    std::printf("  SKIP: the ceiling is for an unsanitised build\n");
-    return;
+    SKIP("the ceiling is for an unsanitised build");
 #endif
     Vocab vb;
     auto g = make(vb, true, { "<tool_call>\n" }, {});

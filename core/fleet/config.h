@@ -106,6 +106,9 @@ struct FleetConfig {
     /* memory.pinned-numa-node: the NUMA node GPU-accessible pinned host memory prefers in place
      * of the node nearest each card (dev_pinned_numa_node); -1, the default, names none. */
     int         pinned_numa_node = -1;
+    /* memory.queue-reserve: the hardware queues each card keeps ready for its next stream. 0 is
+     * the default (fleet.cpp kReserveQueues). Each one costs about 41 MiB of its card. */
+    int64_t     queue_reserve = 0;
     /* memory.card-headroom-mib: a card's own reserve, in MiB by card ordinal, in place of the
      * gpu-headroom-mib every other card keeps (the card that drives a desktop). */
     std::map<int, int64_t> card_headroom_mib;
@@ -140,6 +143,10 @@ int parse(const std::string& text, const std::string& origin, FleetConfig* out);
  * flags as one model named after the container, server and memory keys at their levels. A word
  * that is not an option is kept as a model key, so loading the result refuses it by name. */
 std::string yaml_from_args(int argc, char** argv);
+
+/* A name a request may give as `model` (a model id or alias): not empty, and no ':' (reserved for
+ * base:adapter), whitespace or control character. */
+bool valid_name(const std::string& n);
 
 /* The option keys a level holds ("server" or "memory"), without the fleet's own keys. */
 std::vector<std::string> level_keys(const std::string& level);

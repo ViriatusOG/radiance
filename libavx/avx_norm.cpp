@@ -525,7 +525,9 @@ static void cpe_taps(int64_t at, int64_t d, int64_t side, int64_t t[2], float w[
     w[0] = 1.0f - w[1];
 }
 
-AVX_KERNEL(grid_embed_cpe) {
+/* grid_embed_cpe and grid_embed_hw differ only in each axis's target: the square of the grid's
+ * larger side (cropped), or the grid's own height and width. */
+static int grid_embed_bilinear(const RadArgs* a, bool square) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
     const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
@@ -551,7 +553,8 @@ AVX_KERNEL(grid_embed_cpe) {
             const int64_t k = g[1] < 0 ? 0 : (g[1] >= npre ? npre - 1 : g[1]);
             const int64_t xb0 = rowoff(x, r, n), xs0 = laststride(x);
             for (int64_t i = 0; npre > 0 && i < n; ++i) {
-                const float pe = round_act(x->dtype, ldt(pre, rowoff(pre, k, n) + i * laststride(pre)));
+                const float pe = round_act(x->dtype,
+                                           ldt(pre, rowoff(pre, k, n) + i * laststride(pre)));
                 stt(x, xb0 + i * xs0, ldt(x, xb0 + i * xs0) + pe);
             }
             continue;
@@ -559,8 +562,8 @@ AVX_KERNEL(grid_embed_cpe) {
         const int64_t d = g[2] > g[3] ? g[2] : g[3];
         int64_t th[2], tw[2];
         float wh[2], ww[2];
-        cpe_taps(g[0], d, side, th, wh);
-        cpe_taps(g[1], d, side, tw, ww);
+        cpe_taps(g[0], square ? d : g[2], side, th, wh);
+        cpe_taps(g[1], square ? d : g[3], side, tw, ww);
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
         auto at = [&](int64_t y, int64_t c, int64_t i) {
             return ldt(tab, rowoff(tab, y * side + c, n) + i * ts);
@@ -575,8 +578,59 @@ AVX_KERNEL(grid_embed_cpe) {
     return RAD_OK;
 }
 
+AVX_KERNEL(grid_embed_cpe) { return grid_embed_bilinear(a, true); }
+
+/* grid_embed_hw: each axis onto the grid's own extent (Inkling 2's position embedding). */
+AVX_KERNEL(grid_embed_hw) { return grid_embed_bilinear(a, false); }
+
+/* ------------------------------------------------------------------ posemb_resample */
+/* The table resampled to a T_h x T_w grid as its own table (libref's posemb_resample), operation
+ * for operation: per axis the coordinate S * (i + 0.5) / T - 0.5 clamped into [0, S - 1], taps
+ * floor and the next clamped at S - 1, the four products summed in f32 in libref's order and
+ * stored once. Scalar, one output row per grid cell, as the other resamples are. */
+static void posemb_taps_avx(int64_t i, int64_t S, int64_t T, int64_t* lo, int64_t* hi,
+                            float* frac) {
+    const float c = (float)S * ((float)i + 0.5f) / (float)T - 0.5f;
+    const float cc = c < 0.0f ? 0.0f : (c > (float)(S - 1) ? (float)(S - 1) : c);
+    const int64_t f = (int64_t)std::floor(cc);
+    *lo = f;
+    *hi = f + 1 < S ? f + 1 : S - 1;
+    *frac = cc - (float)f;
+}
+
+AVX_KERNEL(posemb_resample) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *tab = &a->t[0], *y = &a->t[1];
+    const int64_t Sh = p_int(a, "S_h", 0), Sw = p_int(a, "S_w", 0);
+    const int64_t Th = p_int(a, "T_h", 0), Tw = p_int(a, "T_w", 0);
+    const int64_t n = p_int(a, "n", 0);
+    if (Sh <= 0 || Sw <= 0 || Th < 1 || Tw < 1 || n <= 0) return RAD_E_SHAPE;
+    if (tab->rank != 2 || tab->shape[0] != Sh * Sw || tab->shape[1] != n) return RAD_E_SHAPE;
+    if (numel(y) < Th * Tw * n) return RAD_E_SHAPE;
+    const int64_t ts = laststride(tab), ys = laststride(y), rows = Th * Tw;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t h[2], w[2];
+        float fh, fw;
+        posemb_taps_avx(r / Tw, Sh, Th, &h[0], &h[1], &fh);
+        posemb_taps_avx(r % Tw, Sw, Tw, &w[0], &w[1], &fw);
+        const float wh[2] = { 1.0f - fh, fh }, ww[2] = { 1.0f - fw, fw };
+        const int64_t yb = rowoff(y, r, n);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int p = 0; p < 2; ++p)
+                for (int q = 0; q < 2; ++q)
+                    acc += ldt(tab, rowoff(tab, h[p] * Sw + w[q], n) + i * ts) * (wh[p] * ww[q]);
+            stt(y, yb + i * ys, acc);
+        }
+    }
+    return RAD_OK;
+}
+
 /* l2_clip: libref's ref_l2_clip. The group norm is taken in double, as libref takes it, before any
- * element of the group is stored, and each element is read before it is written, so y may alias x. */
+ * element of the group is stored, and each element is read before it is written, so y may alias
+ * x. */
 AVX_KERNEL(l2_clip) {
     if (!a || a->n_t < 4 || !a->t[0].data || !a->t[3].data) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[3];

@@ -225,7 +225,7 @@ static std::string wav_of(const std::vector<int16_t>& x, uint32_t rate) {
  * a reference without its text or clip or with an unknown field, a clip past the budget, and
  * instructions beside them. */
 TEST(a_cloning_model_takes_references_as_clips_and_transcripts_in_its_prompt) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("audio decoder unavailable");
     Speech s;
     s.gen.inf.tmpl_plain = "<s>{input}";
     s.gen.inf.tmpl_ref = "<s>R{references}|{input}";
@@ -312,7 +312,7 @@ TEST(a_cloning_model_takes_references_as_clips_and_transcripts_in_its_prompt) {
 
 /* ================================================================== the response */
 TEST(breeze_cloning_uses_one_reference_and_direction_is_opt_in) {
-    if (!mm::decoder_available()) { SKIP("audio decoder unavailable"); return; }
+    if (!mm::decoder_available()) SKIP("audio decoder unavailable");
     Speech s;
     auto& info = s.gen.inf;
     info.max_prompt = 512;

@@ -67,7 +67,7 @@ TEST(fmt_sizes_its_own_buffer) {
      * cap; a regression to a stack buffer would truncate here, and fmt formats whole selection
      * tables. */
     const std::string big = fmt("%s", std::string(10000, 'x').c_str());
-    CHECK_EQ(big.size(), (size_t)10000);
+    REQUIRE_EQ(big.size(), (size_t)10000);
     CHECK_EQ(big.front(), 'x');
     CHECK_EQ(big.back(), 'x');
 }
@@ -88,16 +88,16 @@ TEST(rad_mono_ns_moves_forward_and_is_not_the_wall_clock) {
  * RAD_CIN("dtype", "bf16,fp8") and one writing "bf16 fp8" mean the same set. */
 TEST(split_ws_takes_spaces_tabs_and_commas) {
     auto v = split_ws("a b c");
-    CHECK_EQ(v.size(), 3u);
+    REQUIRE_EQ(v.size(), 3u);
     CHECK_EQ(std::string(v[0]), std::string("a"));
     CHECK_EQ(std::string(v[2]), std::string("c"));
 
     v = split_ws("bf16,fp8");
-    CHECK_EQ(v.size(), 2u);
+    REQUIRE_EQ(v.size(), 2u);
     CHECK_EQ(std::string(v[1]), std::string("fp8"));
 
     v = split_ws("\ta ,, b\t,c  ");
-    CHECK_EQ(v.size(), 3u);
+    REQUIRE_EQ(v.size(), 3u);
     CHECK_EQ(std::string(v[0]), std::string("a"));
     CHECK_EQ(std::string(v[1]), std::string("b"));
     CHECK_EQ(std::string(v[2]), std::string("c"));
@@ -562,7 +562,7 @@ TEST(a_short_or_narrow_loop_runs_inline_in_order) {
         elsewhere = elsewhere || std::this_thread::get_id() != self;
     }, 32);
     CHECK(!elsewhere);
-    CHECK_EQ((int64_t)order.size(), (int64_t)31);
+    REQUIRE_EQ((int64_t)order.size(), (int64_t)31);
     bool sorted = true;
     for (size_t i = 0; i < order.size(); ++i) sorted = sorted && order[i] == (int64_t)i;
     CHECK(sorted);
@@ -574,7 +574,7 @@ TEST(a_short_or_narrow_loop_runs_inline_in_order) {
 /* Callers on several threads at once each get all their rows, with workers shared between them,
  * and a slow row in one loop does not hold up another caller's. */
 TEST(concurrent_callers_share_the_row_pool) {
-    if (row_pool_workers() == 0) return;
+    if (row_pool_workers() == 0) SKIP("the row pool has no worker threads on this machine");
     constexpr int kCallers = 6;
     constexpr int64_t kRows = 4000;
     std::vector<std::vector<std::atomic<int>>> hits(kCallers);

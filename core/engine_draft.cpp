@@ -11,6 +11,7 @@
 #include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
 #include "device/device.h"
+#include "rad_gdn_anchor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -79,16 +80,24 @@ int Engine::step_state_init() {
             return RAD_E_UNSUPPORTED;
         }
         const Program& prog = ranks_[0]->program;
-        for (size_t i = 0; i < prog.buffers.size(); ++i) {
-            const std::string& name = prog.buffers[i].name;
-            auto ends = [&](const char* suffix) {
-                const size_t n = std::strlen(suffix);
-                return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
-            };
-            if (ends("mtp_couple_draws")) couple_draws_buf_ = (rad_buf)i;
-            if (ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+        /* By name in each rank's own program: handles index the program that declared them
+         * (advance_all), and the draws are staged on every rank. */
+        couple_draws_rank_.assign(ranks_.size(), 0);
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            const Program& pr = ranks_[r]->program;
+            for (size_t i = 0; i < pr.buffers.size(); ++i) {
+                const std::string& name = pr.buffers[i].name;
+                auto ends = [&](const char* suffix) {
+                    const size_t n = std::strlen(suffix);
+                    return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+                };
+                if (ends("mtp_couple_draws")) couple_draws_rank_[r] = (rad_buf)i;
+                if (r == 0 && ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+            }
         }
-        if (!couple_draws_buf_ || !couple_state_buf_) {
+        bool all_draws = true;
+        for (rad_buf h : couple_draws_rank_) all_draws = all_draws && h;
+        if (!all_draws || !couple_state_buf_) {
             RAD_ERR("--draft-coupling on, but the architecture declared no coupled MTP planes; "
                     "this model's drafter cannot couple");
             return RAD_E_STATE;
@@ -276,10 +285,15 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
         if (from_proposal) {
-            a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
-                                                                  : rk.ctx.buf_ptr(rk.tok_buf));
-            a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
-                              ? drafter_.proposal_pitch : 1;
+            /* This rank's own handle: a buffer handle indexes the program that declared it, and a
+             * plugin may declare a different buffer list on each rank (DeepSeek-V4.1's drafter
+             * source rows exist on its attention ranks only), so rank 0's handle can name another
+             * buffer here, and an attention-zero rank would verify garbage proposals at positions
+             * of its own while the other ranks verify the head's. */
+            const RadDrafterDecl& dd = rk.program.drafter;
+            a.src = static_cast<const int32_t*>(dd.proposal ? rk.ctx.buf_ptr(dd.proposal)
+                                                            : rk.ctx.buf_ptr(rk.tok_buf));
+            a.src_pitch = (dd.proposal && dd.proposal_pitch > 0) ? dd.proposal_pitch : 1;
             /* A tree drafter's parents, at the proposal's pitch (rad_drafter_tree). */
             if (tree_ && mode == ADV_BTAKE) {
                 a.par = static_cast<const int32_t*>(rk.ctx.buf_ptr(tree_parents_));
@@ -302,7 +316,10 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 }
 
 /* ADV_COMPACT on every rank, against the scheduler's latest build (the tree step just accepted):
- * the accepted paths' K and V into place in every paged group. Each rank's pools are its own. */
+ * the accepted paths' K and V into place in every paged group, and the accepted paths' conv
+ * window entries and anchor replay records to the front of every recurrent group's window and
+ * factor block (AdvPoolKind), so the next step's `num_accepted` names a prefix again. Each rank's
+ * pools are its own. */
 int Engine::tree_compact(int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
@@ -312,32 +329,74 @@ int Engine::tree_compact(int rows) {
         a.st   = rk.step_slots;
         const Program& p = rk.program;
         for (size_t g = 1; g < p.kv_groups.size() && (int)g < a.n_groups; ++g) {
-            const int kind = p.kv_groups[g].decl.kind;
-            if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) continue;
+            const RadKVGroupDecl& d = p.kv_groups[g].decl;
+            const int kind = d.kind;
+            if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW && kind != RAD_KV_CONV &&
+                kind != RAD_KV_LINEAR)
+                continue;
             const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
-            if (!b || !b->base || b->rank != 4) continue;   /* a zero group on this rank */
+            if (!b || !b->base) continue;   /* a zero group on this rank */
             const int bits = rad_dtype_bits(b->dtype);
-            const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
             int32_t layers = 0;
             for (int32_t s : b->layer_slot) layers += s >= 0;
-            if (row <= 0 || row % 4 || (bits != 8 && bits != 16 && bits != 32) ||
-                (b->bytes && (int64_t)layers * b->layer_stride > b->bytes)) {
-                RAD_ERR("speculation: KV group %zu's cache (%s, %lld-byte rows) is not one a tree's "
-                        "acceptance can move", g, rad_dtype_name(b->dtype), (long long)row);
-                return RAD_E_UNSUPPORTED;
-            }
             if (a.n_pool >= kAdvMaxPools) {
-                RAD_ERR("speculation: more than %d paged KV groups for a tree's acceptance",
+                RAD_ERR("speculation: more than %d KV groups for a tree's acceptance",
                         (int)kAdvMaxPools);
                 return RAD_E_UNSUPPORTED;
             }
-            AdvPool& q = a.pool[a.n_pool++];
+            AdvPool q{};
             q.base         = static_cast<char*>(b->base);
             q.layer_stride = b->layer_stride;
             q.n_layers     = layers;
-            q.n_head       = (int32_t)b->shape[1];
-            q.row_bytes    = (int32_t)row;
             q.grp          = (int32_t)g;
+            if (kind == RAD_KV_FULL || kind == RAD_KV_WINDOW) {
+                if (b->rank != 4) continue;
+                const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
+                if (row <= 0 || row % 4 || (bits != 8 && bits != 16 && bits != 32) ||
+                    (b->bytes && (int64_t)layers * b->layer_stride > b->bytes)) {
+                    RAD_ERR("speculation: KV group %zu's cache (%s, %lld-byte rows) is not one a "
+                            "tree's acceptance can move", g, rad_dtype_name(b->dtype),
+                            (long long)row);
+                    return RAD_E_UNSUPPORTED;
+                }
+                q.kind      = ADV_POOL_PAGED;
+                q.n_head    = (int32_t)b->shape[1];
+                q.row_bytes = (int32_t)row;
+            } else if (kind == RAD_KV_CONV) {
+                /* The rolling window (docs/OPS.md, gdn_conv_update): conv_width - 2 entries of
+                 * history, then one per row of the step. */
+                if (b->rank != 3 || d.conv_width < 2 || (bits != 16 && bits != 32)) {
+                    RAD_ERR("speculation: conv group %zu's window (%s, width %lld) is not one a "
+                            "tree's acceptance can move", g, rad_dtype_name(b->dtype),
+                            (long long)d.conv_width);
+                    return RAD_E_UNSUPPORTED;
+                }
+                q.kind      = ADV_POOL_CONV;
+                q.row_bytes = bits / 8;
+                q.hist      = (int32_t)(d.conv_width - 2);
+                q.n_chan    = (int32_t)b->shape[1];
+                q.n_ent     = (int32_t)b->shape[2];
+                q.n_head    = (int32_t)((b->shape[1] + kAdvConvChunk - 1) / kAdvConvChunk);
+            } else {
+                /* A recurrent state under the anchor form (two copies: the state and the replay
+                 * records, abi/rad_gdn_anchor.h). A group kept per candidate has no records. */
+                const KVGroupPlan* pl = rk.kv.plan((int32_t)g);
+                if (!pl || pl->state_copies != 2) continue;
+                if (b->rank != 4 || (bits != 16 && bits != 32)) {
+                    RAD_ERR("speculation: state group %zu (%s, rank %u) is not one a tree's "
+                            "acceptance can move", g, rad_dtype_name(b->dtype), b->rank);
+                    return RAD_E_UNSUPPORTED;
+                }
+                const int64_t H = b->shape[1], V = b->shape[2], K = b->shape[3];
+                q.kind       = ADV_POOL_ANCHOR;
+                q.row_bytes  = bits / 8;
+                q.n_head     = (int32_t)H;
+                q.copy_off   = (int32_t)pl->n_seq_states();
+                q.rec_elems  = (int32_t)rad_gdn_anchor_fstr(K, V);
+                q.head_elems = V * K;
+                q.slot_elems = H * V * K;
+            }
+            a.pool[a.n_pool++] = q;
         }
         RAD_TRY(step_compact(a, rk.ctx.stream()));
     }
@@ -955,7 +1014,7 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
         return stg;
     }
     for (auto& rk : ranks_) {
-        void* dst = rk->ctx.buf_ptr(couple_draws_buf_);
+        void* dst = rk->ctx.buf_ptr(couple_draws_rank_[(size_t)rk->index]);
         if (!dst) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
                                  n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));
@@ -1068,13 +1127,36 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
      * drafter will need, and skipping would leave a permanent hole in its cache. A tree verify's
      * context rows store only the accepted path, at its committed positions (ADV_CTXTREE). */
-    if (const RadBatch* cb = sched_.block_context(step)) {
+    const RadBatch* const cb = sched_.block_context(step);
+    if (cb) {
         if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
         RAD_TRY(block_pass(cb, "context", step));
     }
     /* A snapshot carrying the drafter's window is saved now, with the step's context rows stored
      * and before the query pass and the step issued ahead (save_checkpoints). */
-    if (drafter_snap_) RAD_TRY(save_checkpoints());
+    if (drafter_snap_) {
+        /* This skip applies only under --checkpoint-draft-window. No context pass behind a step
+         * that saves a snapshot (every row reaped or cancelled, say) would leave the drafter's
+         * window in the slot as the previous tenant's pages. Such a checkpoint is not committed
+         * (Scheduler::skip_ckpt_commit), so no hit resumes from it, and is counted; warned once. */
+        if (cfg_.checkpoint_draft_window && !cb) {
+            for (const StepEntry& e : sched_.plan().e)
+                if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) {
+                    sched_.skip_ckpt_commit(e.seq, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+                    if (!ckpt_stale_warned_) {
+                        ckpt_stale_warned_ = true;
+                        RAD_WARN("step %d saves a checkpoint (slot %d) with no drafter context pass "
+                                 "behind it, so the drafter's window in that slot would be stale: "
+                                 "not committed (radiance:draft_window_stale_ckpt_total; "
+                                 "--checkpoint-draft-window; warned once)", step, (int)e.ckpt_slot);
+                    }
+                }
+        }
+        ckpt_save_skip_ = cfg_.checkpoint_draft_window && !cb;
+        const int ss = save_checkpoints();
+        ckpt_save_skip_ = false;
+        RAD_TRY(ss);
+    }
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
     if (!qb) return RAD_OK;

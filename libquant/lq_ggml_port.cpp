@@ -1846,13 +1846,15 @@ typedef struct {
     uint64_t * grid;
     int      * map;
     uint16_t * neighbours;
+    int        map_size;
+    int        neighbours_size;
 } iq2_entry_t;
 
 static iq2_entry_t iq2_data[4] = {
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
+    {NULL, NULL, NULL, 0, 0},
+    {NULL, NULL, NULL, 0, 0},
+    {NULL, NULL, NULL, 0, 0},
+    {NULL, NULL, NULL, 0, 0},
 };
 
 static inline int iq2_data_index(enum ggml_type type) {
@@ -2222,6 +2224,8 @@ void iq2xs_init_impl(enum ggml_type type) {
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q2xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq2_data[gindex].neighbours = kneighbors_q2xs;
+    iq2_data[gindex].map_size = kmap_size;
+    iq2_data[gindex].neighbours_size = num_neighbors + num_not_in_map;
 
     int * offsets = (int *)malloc(kmap_size*sizeof(int));
     GGML_ASSERT(offsets);
@@ -2699,11 +2703,13 @@ typedef struct {
     uint32_t * grid;
     int      * map;
     uint16_t * neighbours;
+    int        map_size;
+    int        neighbours_size;
 } iq3_entry_t;
 
 static iq3_entry_t iq3_data[2] = {
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
+    {NULL, NULL, NULL, 0, 0},
+    {NULL, NULL, NULL, 0, 0},
 };
 
 static inline int iq3_data_index(int grid_size) {
@@ -2859,6 +2865,8 @@ void iq3xs_init_impl(int grid_size) {
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq3_data[gindex].neighbours = kneighbors_q3xs;
+    iq3_data[gindex].map_size = kmap_size;
+    iq3_data[gindex].neighbours_size = num_neighbors + num_not_in_map;
 
     int * offsets = (int *)malloc(kmap_size*sizeof(int));
     GGML_ASSERT(offsets);
@@ -3009,7 +3017,7 @@ static void quantize_row_iq3_xxs_impl(int grid_size, const float * GGML_RESTRICT
             const float * xb = xbl + 32*ib;
             if (quant_weights) {
                 const float * qw = quant_weights + QK_K*ibl + 32*ib;
-                for (int i = 0; i < 32; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
+            for (int i = 0; i < 32; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
             } else {
                 for (int i = 0; i < 32; ++i) weight[i] = xb[i]*xb[i];
             }
@@ -4275,6 +4283,33 @@ bool ggml_quantize_requires_imatrix(enum ggml_type type) {
         type == GGML_TYPE_IQ2_XS  ||
         type == GGML_TYPE_IQ1_S;//   ||
         //type == GGML_TYPE_IQ1_M;
+}
+
+bool ggml_search_tables(enum ggml_type type, SearchTables * out) {
+    if (!out) return false;
+    if (type == GGML_TYPE_IQ2_XXS) {
+        const iq2_entry_t& d = iq2_data[iq2_data_index(GGML_TYPE_IQ2_XXS)];
+        if (!d.grid || !d.map || !d.neighbours) return false;
+        out->grid = d.grid;
+        out->map = d.map;
+        out->neighbours = d.neighbours;
+        out->grid_size = iq2_grid_size(GGML_TYPE_IQ2_XXS);
+        out->map_size = d.map_size;
+        out->neighbours_size = d.neighbours_size;
+        return true;
+    }
+    if (type == GGML_TYPE_IQ3_XXS) {
+        const iq3_entry_t& d = iq3_data[iq3_data_index(256)];
+        if (!d.grid || !d.map || !d.neighbours) return false;
+        out->grid = d.grid;
+        out->map = d.map;
+        out->neighbours = d.neighbours;
+        out->grid_size = 256;
+        out->map_size = d.map_size;
+        out->neighbours_size = d.neighbours_size;
+        return true;
+    }
+    return false;
 }
 
 }  /* namespace lq::ggml */

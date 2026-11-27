@@ -16,7 +16,7 @@
  *
  * ============================== THE LATENT FEED-FORWARD ==============================
  *
- * MoeFP8 serves the routed arm with its Geom at the latent width: its input is fc1's output
+ * MoeQ serves the routed arm with its Geom at the latent width: its input is fc1's output
  * (quantised here), the router reads the hidden state over Config::router_k, and its gather writes
  * the routed sum back into the latent plane. fc2 has no bias and is linear, so under tensor
  * parallelism each rank applies it (replicated) to its partial latent sum and adds its slice of the
@@ -25,8 +25,8 @@
  *
  * ============================== THE MAMBA-2 MIXER ==============================
  *
- * in_proj's rows are z | x | B | C | dt (8192, 8192, 1024, 1024, 128). It is served as three linears
- * over row maps of the one tensor: z, x|B|C (the convolution's input) and dt. Under tensor
+ * in_proj's rows are z | x | B | C | dt (8192, 8192, 1024, 1024, 128). It is served as three
+ * linears over row maps of the one tensor: z, x|B|C (the convolution's input) and dt. Under tensor
  * parallelism each rank takes whole heads and their groups' B and C, and dt's 128 rows split 32 a
  * rank at four, which is no whole 128-row scale block; dt is its own linear so a recipe can keep
  * it bf16 while the others are block fp8.
@@ -41,15 +41,15 @@
  *
  * ============================== RANKS, SPECULATION, VISION ==============================
  *
- * One, two or four ranks. At four each of the 2 KV heads is replicated over a rank pair (AttnFP8's
+ * One, two or four ranks. At four each of the 2 KV heads is replicated over a rank pair (AttnQ's
  * spans), the LiLiCorr drafter's 2 the same way (Dflash2's spans). Speculating, the scan keeps its
  * state in ssd_update's anchor form (one committed state and a scratch of per-token records), at
  * most 31 drafts a step; the convolution's window is ple_conv's rolling one. Pictures and video go
  * through the C-RADIO tower (radio.h) when the container holds it. A finite `time_step_limit` is
  * refused by name, and so is every other geometry the release does not have.
  * docs/ARCHITECTURES.md describes the model. */
-#include <arch/rad_block_attn_fp8.h>
-#include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_attn_q.h>
+#include <arch/rad_block_moe_q.h>
 #include <arch/rad_block_vit.h>
 #include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_lilicorr.h>
@@ -93,13 +93,13 @@ static rad_op reduce(RadBuilder* b, const Geom& g, rad_buf x, bool exact = false
 
 struct Mamba {
     struct Wire {
-        ActFP8 input{};       /* [T, n_embd]  the normed hidden state */
+        ActQ input{};       /* [T, n_embd]  the normed hidden state */
         rad_buf z = 0;        /* [T, W] */
         rad_buf xbc = 0;      /* [T, W + 2 GN]  the convolution's input */
         rad_buf conv = 0;     /* [T, W + 2 GN]  its output */
         rad_buf dt = 0;       /* [T, H] */
         rad_buf y = 0;        /* [T, W]  the scan's output */
-        ActFP8 core_out{};    /* [T, W]  the gated norm's, the out-projection's input */
+        ActQ core_out{};    /* [T, W]  the gated norm's, the out-projection's input */
         rad_buf out = 0;      /* [T, n_embd] */
     };
     Geom g{};
@@ -108,8 +108,8 @@ struct Mamba {
     /* This rank's heads, groups and widths. */
     int64_t H = 0, P = 0, N = 0, G = 0, W = 0, GN = 0;
     rad_kvgroup state = 0, history = 0;
-    LinearFP8 in_z{}, in_xbc{}, in_dt{}, output{};
-    QuantFP8 out_quant{};
+    LinearQ in_z{}, in_xbc{}, in_dt{}, output{};
+    QuantAct out_quant{};
     rad_weight taps = 0, bias = 0, alog = 0, dtb = 0, dskip = 0, gain = 0;
     rad_op op_conv = 0, op_prefill = 0, op_verify = 0, op_gate = 0, op_norm = 0, op_gain = 0,
            op_ar = 0;
@@ -149,7 +149,8 @@ struct Mamba {
         RAD_ARCH_TRY(in_dt.declare(b, nm, g, nm.f("blk.%d.ssm_dt", l), H, g.n_embd, RAD_SHARD_ROW,
                                    grp, { src }, w.input, w.dt));
 
-        const char *tn = nm.f("blk.%d.ssm_conv1d.weight", l), *bn = nm.f("blk.%d.ssm_conv1d.bias", l),
+        const char *tn = nm.f("blk.%d.ssm_conv1d.weight", l),
+                   *bn = nm.f("blk.%d.ssm_conv1d.bias", l),
                    *an = nm.f("blk.%d.ssm_a_log", l), *dn = nm.f("blk.%d.ssm_dt.bias", l),
                    *sn = nm.f("blk.%d.ssm_d", l), *gn = nm.f("blk.%d.ssm_norm.weight", l);
         RAD_ARCH_TRY(map_copy(b, tn, nm.ckpt("%s.conv1d.weight", pre)));
@@ -268,27 +269,27 @@ struct Mamba {
     }
 };
 
-/* The latent feed-forward around MoeFP8 (see the header). */
+/* The latent feed-forward around MoeQ (see the header). */
 struct LatentMoe {
     struct Wire {
-        ActFP8 h{};           /* [T, n_embd]  the normed hidden state */
-        ActFP8 lat{};         /* [T, latent]  fc1's output, then the routed sum */
+        ActQ h{};           /* [T, n_embd]  the normed hidden state */
+        ActQ lat{};         /* [T, latent]  fc1's output, then the routed sum */
         rad_buf routed = 0;   /* [T, n_embd]  fc2's output, then the block's delta */
         rad_buf sup = 0;      /* [T, ff_shared / world] */
-        ActFP8 sff{};         /* [T, ff_shared / world] */
+        ActQ sff{};         /* [T, ff_shared / world] */
         rad_buf sout = 0;     /* [T, n_embd] */
-        MoeFP8::Wire moe{};   /* the routed arm's own planes; its h and route are set here */
+        MoeQ::Wire moe{};   /* the routed arm's own planes; its h and route are set here */
     };
     Geom g{};
     Wire w{};
-    LinearFP8 fc1{}, fc2{}, sh_up{}, sh_down{};
-    QuantFP8 lat_in{}, lat_out{};
-    GateQuantFP8 sh_act{};
-    MoeFP8 moe{};
+    LinearQ fc1{}, fc2{}, sh_up{}, sh_down{};
+    QuantAct lat_in{}, lat_out{};
+    GateQuant sh_act{};
+    MoeQ moe{};
     rad_op op_join = 0, op_ar = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& geom, const Shape& s, int l,
-                const Wire& wire, const char* pre, MoeFP8::Src& ms, int64_t sh_lo, int64_t sh_hi,
+                const Wire& wire, const char* pre, MoeQ::Src& ms, int64_t sh_lo, int64_t sh_hi,
                 int64_t sh_w) {
         g = geom;
         w = wire;
@@ -296,14 +297,15 @@ struct LatentMoe {
         RAD_ARCH_TRY(fc1.declare(b, nm, g, nm.f("blk.%d.ffn_latent_in", l), s.latent, g.n_embd,
                                  RAD_SHARD_NONE, grp,
                                  { nm.ckpt("%s.fc1_latent_proj.weight", pre) }, w.h, w.lat.x));
-        /* The routed arm reads the latent's E4M3 codes unless its experts are bf16 or rotated
-         * (rotated ones read the int8 copy MoeFP8 writes, `hr`). */
-        if (!ms.cfg.expert_bf16 && !ms.cfg.expert_rot)
+        /* The routed arm reads the latent's E4M3 codes unless its experts are bf16 or
+         * llama.cpp's blocks (both read the bf16 plane) or rotated (rotated ones read the int8
+         * copy MoeQ writes, `hr`). */
+        if (!ms.cfg.expert_bf16 && !ms.cfg.expert_ggml && !ms.cfg.expert_rot)
             RAD_ARCH_TRY(lat_in.declare(b, g, w.lat, s.latent));
         Geom ge = g;
         ge.n_embd = s.latent;
         ge.n_ff_all = s.ff[(size_t)l];
-        MoeFP8::Wire mw = w.moe;
+        MoeQ::Wire mw = w.moe;
         mw.h = w.lat;
         mw.route = w.h.x;
         RAD_ARCH_TRY(moe.declare(b, nm, ge, l, mw, ms, false, false));
@@ -315,8 +317,9 @@ struct LatentMoe {
         /* The shared expert over the hidden state, this rank's slice of its 5376 columns. */
         if (sh_w > 0) {
             const char* dn = nm.f("blk.%d.ffn_down_shexp", l);
-            RAD_ARCH_TRY(sh_down.probe(b, nm, g, dn,
-                                       { nm.ckpt("%s.shared_experts.down_proj.weight", pre) }));
+            if (!sh_down.mapped)   /* the model probes it first, for the shared expert's slice */
+                RAD_ARCH_TRY(sh_down.probe(b, nm, g, dn,
+                                           { nm.ckpt("%s.shared_experts.down_proj.weight", pre) }));
             RAD_ARCH_TRY(sh_up.declare(b, nm, g, nm.f("blk.%d.ffn_up_shexp", l), sh_w, g.n_embd,
                                        RAD_SHARD_ROW, grp,
                                        { nm.ckpt("%s.shared_experts.up_proj.weight", pre) }, w.h,
@@ -359,10 +362,10 @@ struct LatentMoe {
 struct Layer {
     Kind kind = kMamba;
     rad_weight gain = 0;
-    NormQuantFP8 norm{};
+    NormQuant norm{};
     Mamba mamba{};
     LatentMoe moe{};
-    AttnFP8 attn{};
+    AttnQ attn{};
     rad_op op_add = 0;
 };
 struct Model {
@@ -372,18 +375,20 @@ struct Model {
     std::vector<Layer> layers;
     rad_kvgroup kv_attn = 0, kv_state = 0, kv_conv = 0;
     rad_buf x = 0, y = 0, final_hidden = 0, logit_input = 0, logits = 0;
-    ActFP8 act{};
+    ActQ act{};
     /* An int8 trunk (i8 codes with a bf16 scale a [1 x 128], or IQ8R's 256): every activation a
      * trunk linear reads declares the int8 pair too, which that linear's own quant_act_i8g writes
      * from the bf16 plane. From the first Mamba block's out projection, probed in declare(). */
     bool    trunk_i8 = false;
-    int64_t trunk_g8 = RAD_FP8_BLOCK;
+    int64_t trunk_g8 = RAD_SCALE_GROUP;
     Mamba::Wire mw{};
-    AttnFP8::Wire aw{};
+    AttnQ::Wire aw{};
     LatentMoe::Wire ew{};
     /* The routed arm's planes by (experts, width): layers of one class share them. */
-    std::map<std::pair<int64_t, int64_t>, MoeFP8::Wire> classes;
+    std::map<std::pair<int64_t, int64_t>, MoeQ::Wire> classes;
     rad_weight token = 0, head = 0, final_gain = 0;
+    /* The llama.cpp block type the head is stored as (rad_ggml.h); null for a plain weight. */
+    const char* head_type = nullptr;
     rad_op embed = 0, embed_ar = 0, norm = 0, gather = 0, head_op = 0;
     /* The vision encoder (C-RADIO and its projector) and the scatter of its rows over the token
      * embeddings they replace. */
@@ -446,7 +451,7 @@ static int read_shape(const RadModelMeta* meta, Shape& s) {
         s.top_k[(size_t)l] = per("num_experts_per_tok", "num_experts_per_tok");
         moe_ok = moe_ok && s.experts[(size_t)l] > 0 && s.ff[(size_t)l] > 0 &&
                  s.top_k[(size_t)l] > 0 && s.top_k[(size_t)l] <= s.experts[(size_t)l] &&
-                 s.experts[(size_t)l] <= 512 && s.ff[(size_t)l] % RAD_FP8_BLOCK == 0;
+                 s.experts[(size_t)l] <= 512 && s.ff[(size_t)l] % RAD_SCALE_GROUP == 0;
     }
     /* A clamp the scan does not apply: present only when the limit is a list of numbers. */
     bool unclamped = true;
@@ -480,9 +485,9 @@ static int read_shape(const RadModelMeta* meta, Shape& s) {
         { "relu2 experts", !std::strcmp(act, "relu2") },
         { "routed layers with experts, width and top-k", moe_ok },
         { "a latent of whole 128-column blocks",
-          s.latent > 0 && s.latent % RAD_FP8_BLOCK == 0 },
+          s.latent > 0 && s.latent % RAD_SCALE_GROUP == 0 },
         { "one shared expert of whole 128-column blocks",
-          cfg(meta, "n_shared_experts", 0) == 1 && s.ff_shared % RAD_FP8_BLOCK == 0 },
+          cfg(meta, "n_shared_experts", 0) == 1 && s.ff_shared % RAD_SCALE_GROUP == 0 },
         { "sigmoid scoring",
           !std::strcmp(rad_meta_gets(meta, "scoring_func", ""), "sigmoid") },
         { "ungrouped routing", cfg(meta, "n_group", 1) == 1 && cfg(meta, "topk_group", 1) == 1 },
@@ -526,7 +531,7 @@ static int buffers(RadBuilder* b, Model& m) {
     m.act.x = bf("normed", { T, E });
     /* An int8 trunk's linears read the int8 pair, each quantising the bf16 plane itself, so the
      * activations below declare no E4M3 pair. The block norms still write E4M3 codes here, which
-     * no linear of an int8 trunk reads: NormQuantFP8 has no unrotated int8 form. */
+     * no linear of an int8 trunk reads: NormQuant has no unrotated int8 form. */
     RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E, 0, m.trunk_i8, true, m.trunk_g8));
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, E });
@@ -557,7 +562,7 @@ static int buffers(RadBuilder* b, Model& m) {
 }
 
 /* The latent feed-forward's planes, and the routed arm's per (experts, width) class. */
-static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& msrc,
+static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeQ::Src>& msrc,
                        int64_t sh_w) {
     auto& g = m.g;
     auto& s = m.s;
@@ -568,7 +573,7 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
     };
     auto& ew = m.ew;
     ew.h = m.act;
-    /* The latent keeps its E4M3 pair on an int8 trunk too: MoeFP8 takes it as a prepared input
+    /* The latent keeps its E4M3 pair on an int8 trunk too: MoeQ takes it as a prepared input
      * and checks that it carries codes, also where rotated experts read their own copy `hr`
      * and lat_in writes none. */
     ew.lat.x = bf("latent", { T, L });
@@ -585,13 +590,13 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
     gl.n_embd = L;
     for (int64_t l = 0; l < s.n_layer; ++l) {
         if (s.kind[(size_t)l] != kMoe) continue;
-        const MoeFP8::Config& c = msrc[(size_t)l].cfg;
+        const MoeQ::Config& c = msrc[(size_t)l].cfg;
         const auto key = std::make_pair(c.n_expert_all, c.n_ff_exp);
         if (m.classes.count(key)) continue;
         const int64_t F = c.n_ff_exp, k = c.top_k, rows = c.rows > 0 ? c.rows : T;
         char tag[64];
         std::snprintf(tag, sizeof tag, "e%lldf%lld", (long long)c.n_expert_all, (long long)F);
-        MoeFP8::Wire w{};
+        MoeQ::Wire w{};
         w.logits = decl_b(b, nm.f("%s.router_logits", tag), RAD_F32, { T, c.n_expert_all });
         w.ids = decl_b(b, nm.f("%s.expert_ids", tag), RAD_I32, { T, k });
         w.ew = decl_b(b, nm.f("%s.expert_weights", tag), RAD_F32, { T, k });
@@ -605,13 +610,13 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
          * had_quant_act_i8g. This build has no rotated E4M3 quantiser. */
         const bool i8arm = c.expert_rot != 0;
         RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gl, nm.f("%s.expert_ff", tag), F, rows * k, i8arm,
-                                      !i8arm, RAD_FP8_BLOCK));
+                                      !i8arm, RAD_SCALE_GROUP));
         w.eff.q8_fed = w.eff.q8_rot = i8arm;
         w.edn = bf(nm.f("%s.expert_down", tag), { rows * k, L });
         if (i8arm) {
             w.hr.q8 = decl_b(b, nm.f("%s.latent_rot.q8", tag), RAD_I8, { T, L });
-            w.hr.s8 = decl_b(b, nm.f("%s.latent_rot.s8", tag), RAD_F32, { T, L / RAD_FP8_BLOCK });
-            w.hr.g8 = RAD_FP8_BLOCK;
+            w.hr.s8 = decl_b(b, nm.f("%s.latent_rot.s8", tag), RAD_F32, { T, L / RAD_SCALE_GROUP });
+            w.hr.g8 = RAD_SCALE_GROUP;
             w.hr.q8_fed = w.hr.q8_rot = true;
             if (!w.hr.q8 || !w.hr.s8) return RAD_E_INVAL;
         }
@@ -722,12 +727,12 @@ static int declare_lilicorr(RadBuilder* b, const RadModelMeta* meta, const RadBu
     dw.ffn     = decl_b(b, nm.f("df_ffn"),  A, {qr, dg.n_ff});
     /* The codes the backbone's linears read: int8 with one f32 scale per (row, group) for linears
      * stored rotated int8, which the drafter's `fc` tells (Dflash2::probe_i8, as gemma4_bf16 asks
-     * it); E4M3 with a scale per 128 for block fp8 or MXFP4 ones (rad_fp8.h's DenseFP8). radiance
+     * it); E4M3 with a scale per 128 for block fp8 or MXFP4 ones (rad_linear.h's DenseQ). radiance
      * 2.0 serves no block fp8, so a 2.0 container's backbone is the int8 form. */
     RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
     dc.fc_mapped = true;
     const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
-    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_SCALE_GROUP;
     if (dc.act_i8 && ((dc.n_taps * E) % dqg || E % dqg || qd % dqg || dg.n_ff % dqg)) {
         fprintf(stderr, "radiance: nemotronh: a rotated int8 LiLiCorr backbone takes widths in "
                         "whole %lld-column scale groups; this one is n_embd %lld, q %lld, n_ff "
@@ -778,7 +783,7 @@ static int declare_lilicorr(RadBuilder* b, const RadModelMeta* meta, const RadBu
     lw.ast    = decl_b(b, nm.f("lili_ast"),   A, {dg.max_seqs, lc.hs});
     lw.an     = decl_b(b, nm.f("lili_an"),    A, {dg.max_seqs, lc.hs});
     lw.aout   = decl_b(b, nm.f("lili_aout"),  A, {dg.max_seqs, lc.fdim});
-    RAD_ARCH_TRY(m.lili.declare(b, nm, dg, lc, m.head, m.token, "draft", lw));
+    RAD_ARCH_TRY(m.lili.declare(b, nm, dg, lc, m.head, m.token, "draft", lw, m.head_type));
     m.have_df = true;
 
     RadDrafterDecl drf{};
@@ -840,13 +845,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* Each routed layer's experts: its own count and width; the slice of each expert this rank
      * holds, even, or by slice_of at four ranks (2, 2, 1, 1 of six blocks, by number mod 4). */
-    std::vector<MoeFP8::Src> msrc((size_t)s.n_layer);
+    std::vector<MoeQ::Src> msrc((size_t)s.n_layer);
     bool calib = calib_dir() != nullptr, any_bf16 = false;
     for (int l = 0; l < (int)s.n_layer; ++l) {
         if (s.kind[(size_t)l] != kMoe) continue;
         const char* pre = nm.ckpt("language_model.backbone.layers.%d.mixer", l);
-        MoeFP8::Src& ms = msrc[(size_t)l];
-        MoeFP8::Config& c = ms.cfg;
+        MoeQ::Src& ms = msrc[(size_t)l];
+        MoeQ::Config& c = ms.cfg;
         const int64_t ne = s.experts[(size_t)l], ff = s.ff[(size_t)l];
         c.n_expert = c.n_expert_all = ne;
         c.top_k = s.top_k[(size_t)l];
@@ -860,7 +865,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* RADIANCE_CALIB_LAYERS splits the calibration over runs (calib_layer_on). */
         c.calib = calib && calib_layer_on(l) ? 1 : 0;
         c.probed_expert = (int64_t)g.rank * (ne / world);
-        const int64_t eb = ff / RAD_FP8_BLOCK;
+        const int64_t eb = ff / RAD_SCALE_GROUP;
         if (eb % world == 0) {
             c.n_ff_exp = ff / world;
         } else if (world == 4) {
@@ -868,8 +873,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             for (int q = 0; q < 4; ++q) {
                 int64_t lo, hi;
                 slice_of(eb, world, g.rank, q, &lo, &hi);
-                c.ff_lo4[q] = lo * RAD_FP8_BLOCK;
-                c.ff_hi4[q] = hi * RAD_FP8_BLOCK;
+                c.ff_lo4[q] = lo * RAD_SCALE_GROUP;
+                c.ff_hi4[q] = hi * RAD_SCALE_GROUP;
                 widest = std::max(widest, c.ff_hi4[q] - c.ff_lo4[q]);
             }
             c.n_ff_exp = widest;
@@ -881,11 +886,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.router = nm.ckpt("%s.gate.weight", pre);
         ms.router_bias = nm.ckpt("%s.gate.e_score_correction_bias", pre);
         ms.experts = nm.ckpt("%s.experts", pre);
-        RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, ms, &c));
-        any_bf16 = any_bf16 || c.expert_bf16;
+        RAD_ARCH_TRY(MoeQ::probe(b, nm, l, ms, &c));
+        any_bf16 = any_bf16 || c.expert_bf16 || c.expert_ggml;
     }
-    /* Whole experts per rank for a calibration run and for bf16 experts: rank r owns experts
-     * [r E/W, (r+1) E/W) of each layer. */
+    /* Whole experts per rank for a calibration run, for bf16 experts and for experts stored as
+     * llama.cpp's blocks (one table of whole experts too): rank r owns experts [r E/W, (r+1) E/W)
+     * of each layer. */
     if (world > 1 && (calib || any_bf16))
         for (int l = 0; l < (int)s.n_layer; ++l) {
             if (s.kind[(size_t)l] != kMoe) continue;
@@ -903,7 +909,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.layers.resize((size_t)s.n_layer);
     for (int l = 0; l < (int)s.n_layer; ++l) {
         if (s.kind[(size_t)l] != kMamba) continue;
-        LinearFP8& out = m.layers[(size_t)l].mamba.output;
+        LinearQ& out = m.layers[(size_t)l].mamba.output;
         RAD_ARCH_TRY(out.probe(b, nm, g, nm.f("blk.%d.ssm_out", l),
                                { nm.ckpt("language_model.backbone.layers.%d.mixer.out_proj.weight",
                                          l) }));
@@ -914,8 +920,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The shared expert's slice: even, or slice_of's whole scale groups. Its down projection
      * reads the slice along K, and an int8 trunk keeps one scale a group of K there: 128 columns,
      * or IQ8R's 256 (asked after the probe above). Bolt's 5376 is 42 blocks of 128 but 21 groups
-     * of 256, so two ranks hold 11 and 10 groups, not 2688 columns each. */
-    const int64_t sg = m.trunk_i8 ? m.trunk_g8 : (int64_t)RAD_FP8_BLOCK;
+     * of 256, so two ranks hold 11 and 10 groups, not 2688 columns each.
+     *
+     * A down projection stored as llama.cpp's blocks is read in whole blocks along K as well
+     * (gemm_nt_ggml), so the unit is then also a multiple of the block: NVIDIA's 2-bit release
+     * stores it IQ2_XXS, 256 values a block. Each layer's is probed here, before the layers, which
+     * makes its name map. */
+    int64_t sg = m.trunk_i8 ? m.trunk_g8 : (int64_t)RAD_SCALE_GROUP;
+    for (int l = 0; s.ff_shared > 0 && l < (int)s.n_layer; ++l) {
+        if (s.kind[(size_t)l] != kMoe) continue;
+        const char* dn = nm.f("blk.%d.ffn_down_shexp", l);
+        RAD_ARCH_TRY(m.layers[(size_t)l].moe.sh_down.probe(
+            b, nm, g, dn,
+            { nm.ckpt("language_model.backbone.layers.%d.mixer.shared_experts.down_proj.weight",
+                      l) }));
+        RadEncoding e{};
+        int64_t blk = 0;
+        if (weight_enc(b, nm.f("%s.weight", dn), &e) && ggml_type_of(e, &blk))
+            sg = std::lcm(sg, blk);
+    }
     if (s.ff_shared % sg) {
         fprintf(stderr, "radiance: nemotronh: the shared expert's %lld columns are not whole "
                         "%lld-column scale groups\n", (long long)s.ff_shared, (long long)sg);
@@ -965,8 +988,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           nm.ckpt("language_model.backbone.norm_f.weight")));
     m.token = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, { g.n_vocab, g.n_embd },
                      RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
-    m.head = decl_w(b, nm.f("output.weight"), RAD_BF16, { g.n_vocab, g.n_embd }, RAD_ACCESS_VOCAB,
-                    RAD_SHARD_ROW, grp_model());
+    /* The head as the release holds it: when its planes are a llama.cpp block type (rad_ggml.h) it
+     * is declared at the codes' dtype and served by logits_gemm_ggml; m.head_type names the type
+     * for the op, and stays null for a plain weight. */
+    RadEncoding he{};
+    m.head_type = weight_enc(b, nm.f("output.weight"), &he) ? ggml_type_of(he) : nullptr;
+    m.head = decl_w(b, nm.f("output.weight"),
+                    m.head_type ? ggml_codes_dtype(he) : (uint32_t)RAD_BF16,
+                    { g.n_vocab, g.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     m.final_gain = decl_w(b, nm.f("output_norm.weight"), RAD_F32, { g.n_embd },
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     m.embed = rw(b,
@@ -999,11 +1028,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
             m.dfsrc = decl_b(b, nm.f("dflash_src"), RAD_BF16,
                              { g.max_tok, (int64_t)m.n_taps * g.n_embd });
-            m.op_tap = rw(b, RAD_OP(b, "cast",
-                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                                               RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                    RAD_NOWEIGHTS),
-                          { m.x }, { m.dfsrc });
+            m.op_tap = cast_op(b, g.max_tok, g.n_embd, "bf16", "bf16", m.x, m.dfsrc);
             if (!m.dfsrc || !m.op_tap) return RAD_E_INVAL;
         }
     }
@@ -1014,7 +1039,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const char* pre = nm.ckpt("language_model.backbone.layers.%d", l);
         const char* mx = nm.ckpt("%s.mixer", pre);
         if (lay.kind == kAttn) {
-            AttnFP8::Src as{};
+            AttnQ::Src as{};
             as.norm = nm.ckpt("%s.norm.weight", pre);
             as.q = nm.ckpt("%s.q_proj.weight", mx);
             as.k = nm.ckpt("%s.k_proj.weight", mx);
@@ -1024,8 +1049,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, l, m.kv_attn, 0, m.aw, as));
             continue;
         }
-        const char* nn = nm.f(lay.kind == kMoe ? "blk.%d.ffn_norm.weight" : "blk.%d.attn_norm.weight",
-                              l);
+        const char* nn = nm.f(lay.kind == kMoe ? "blk.%d.ffn_norm.weight"
+                                               : "blk.%d.attn_norm.weight", l);
         RAD_ARCH_TRY(map_copy(b, nn, nm.ckpt("%s.norm.weight", pre)));
         lay.gain = decl_w(b, nn, RAD_F32, { g.n_embd }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                           grp_layer(l));
@@ -1034,7 +1059,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(lay.mamba.declare(b, nm, g, s, l, m.mw, mx, m.kv_state, m.kv_conv));
         } else {
             LatentMoe::Wire ew = m.ew;
-            const MoeFP8::Config& c = msrc[(size_t)l].cfg;
+            const MoeQ::Config& c = msrc[(size_t)l].cfg;
             ew.moe = m.classes[std::make_pair(c.n_expert_all, c.n_ff_exp)];
             RAD_ARCH_TRY(lay.moe.declare(b, nm, g, s, l, ew, mx, msrc[(size_t)l], sh_lo, sh_hi,
                                          sh_w));
@@ -1059,13 +1084,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                     RAD_STR("dtype", "bf16")),
                          RAD_NOWEIGHTS),
                   { m.final_hidden }, { m.logit_input });
-    m.head_op =
-        rw(b,
-           RAD_OP(b, "logits_gemm",
-                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
-                             RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", "bf16")),
-                  RAD_WEIGHTS(m.head)),
-           { m.logit_input }, { m.logits });
+    if (m.head_type)
+        m.head_op =
+            rw(b,
+               RAD_OP(b, "logits_gemm_ggml",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                                 RAD_INT("n_embd", g.n_embd), RAD_STR("type", m.head_type),
+                                 RAD_STR("dtype", "bf16")),
+                      RAD_WEIGHTS(m.head)),
+               { m.logit_input }, { m.logits });
+    else
+        m.head_op =
+            rw(b,
+               RAD_OP(b, "logits_gemm",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                                 RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", "bf16")),
+                      RAD_WEIGHTS(m.head)),
+               { m.logit_input }, { m.logits });
     if (!m.embed || !m.norm || !m.gather || !m.head_op) return RAD_E_INVAL;
     if (m.n_taps > 0) RAD_ARCH_TRY(declare_lilicorr(b, meta, ctx, m, (int)s.n_layer));
     int64_t n_m = 0, n_e = 0, n_a = 0;
@@ -1176,7 +1211,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE_N(c, m.norm, T, brows(m.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.gather, batch->n_out, brows(m.final_hidden, T),
-                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
+                    praw(batch->out_ids, RAD_I32, batch->n_out),
+                    brows(m.logit_input, batch->n_out));
         RAD_ISSUE_N(c, m.head_op, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
                     brows(m.logits, batch->n_out));
     }
@@ -1187,8 +1223,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     /* LiLiCorr proposes exactly its trained block less the anchor. */
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "LiLiCorr")) {
-        const long long bs = rad_meta_geti(meta, "draft.block_size",
-                                           rad_meta_geti(meta, "draft.dflash_config.block_size", 8));
+        const long long bs = rad_meta_geti(
+            meta, "draft.block_size", rad_meta_geti(meta, "draft.dflash_config.block_size", 8));
         out->draft_depth = bs > 1 ? (int)(bs - 1) : 7;
         out->draft_depth_fixed = 1;
     }
@@ -1206,5 +1242,6 @@ RAD_ARCH_PROBE(nemotronh)
 /* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(nemotronh, "nemotronh", "", "0.1.0",
-                "Nemotron-H (nemotron_h_omni/puzzle): Mamba-2, latent relu^2 MoE and NoPE attention")
+                "Nemotron-H (nemotron_h_omni/puzzle): Mamba-2, latent relu^2 MoE and NoPE "
+                "attention")
 #endif

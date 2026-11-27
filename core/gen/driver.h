@@ -123,7 +123,7 @@ private:
     enum { R_TOK, R_POS, R_ROPE, R_CU, R_MMROW, R_ENCPIX, R_ENCCRD, R_ENCCU, R_SRC, R_GROPE,
            R_SEG, R_SLOT, R_PX, R_MASK, R_SIG, R_SIGN, R_CFG, R_PAIR, R_LANE, R_FLAGS, R_SEED,
            R_BT, R_USED, R_ROPEF, R_ICU, R_IROWS, R_MCU, R_VCU, R_MROWS, R_MSRC, R_MCCU, R_MROPE,
-           R_AUX, R_SIGP, R_TSTEP, R_SAMP, R_STEPI, R_SIZE, R_N };
+           R_AUX, R_SIGP, R_TSTEP, R_SAMP, R_STEPI, R_SIZE, R_REF_BIAS, R_MODE_SIGMA, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -150,6 +150,7 @@ private:
     const RadBatch* build_decode(int32_t lane, bool preview, int step);
 
     RadGeneratorDecl      decl_{};
+    bool                  grounded_joint_ = false;
     std::vector<double>   fixed_;
     /* A discrete-time model's sigma table (RadGeneratorDecl::train_steps), empty otherwise. */
     DiscreteTable         table_;

@@ -65,8 +65,13 @@ bool plan_room(const std::vector<CardRoom>& cards, const std::vector<Resident>& 
         if (!r.pin && !r.keep && r.priority <= priority) order.push_back(&r);
     std::sort(order.begin(), order.end(),
               [](const Resident* a, const Resident* b) { return leaves_before(*a, *b); });
+    /* A together group is one resident, so it is forced when any of its members is. */
     auto is_forced = [&](const Resident& r) {
-        return std::find(forced.begin(), forced.end(), r.id) != forced.end();
+        auto named = [&](size_t id) {
+            return std::find(forced.begin(), forced.end(), id) != forced.end();
+        };
+        return r.members.empty() ? named(r.id)
+                                 : std::any_of(r.members.begin(), r.members.end(), named);
     };
 
     std::vector<std::vector<int>> sets;

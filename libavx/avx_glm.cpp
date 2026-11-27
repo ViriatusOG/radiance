@@ -119,6 +119,72 @@ AVX_KERNEL(router_sigmoid_topk) {
     return RAD_OK;
 }
 
+/* router_sigmoid_topk with the score function named (libref's router_scored_topk): "sigmoid",
+ * "sqrtsoftplus" (sqrt(softplus(logit)), softplus linear above 20) or "softmax" over all n_expert
+ * logits. The scores are libref's expressions, transcendentals included, so the biased ranking and
+ * the ids are libref's exactly. */
+namespace {
+enum class Score { Sigmoid, SqrtSoftplus, Softmax };
+float softplus20(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }
+}
+
+AVX_KERNEL(router_scored_topk) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const char* name = p_str(a, "score", "");
+    Score score;
+    if (!std::strcmp(name, "sigmoid")) score = Score::Sigmoid;
+    else if (!std::strcmp(name, "sqrtsoftplus")) score = Score::SqrtSoftplus;
+    else if (!std::strcmp(name, "softmax")) score = Score::Softmax;
+    else return RAD_E_UNSUPPORTED;
+    const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
+    const int64_t ne = p_int(a, "n_expert", 0), k = p_int(a, "top_k", 0);
+    const float factor = p_f32(a, "route_scale", 0);
+    const bool norm = p_int(a, "norm", 0) != 0;
+    if (ne < 1 || ne > 512 || k < 1 || k > ne || !std::isfinite(factor) || factor <= 0 ||
+        lg.rank != 2 || lg.shape[0] < 1 || lg.shape[1] != ne || bias.rank != 1 ||
+        bias.shape[0] != ne || bias.dtype != RAD_F32 || ids.dtype != RAD_I32 ||
+        !matrix(ids, lg.shape[0], k) || !matrix(w, lg.shape[0], k) || !lg.data || !bias.data)
+        return RAD_E_SHAPE;
+    /* Serial, as router_sigmoid_topk: a row with fewer than top_k rankable experts refuses the
+     * call where libref does, after the rows before it. */
+    for (int64_t r = 0; r < lg.shape[0]; ++r) {
+        float scores[512], ranked[512], chosen[512];
+        int index[512];
+        float mx = -INFINITY, den = 0;
+        for (int64_t e = 0; e < ne; ++e) {
+            scores[e] = ldt(&lg, rowoff(&lg, r, ne) + e * laststride(&lg));
+            mx = std::max(mx, scores[e]);
+        }
+        for (int64_t e = 0; e < ne; ++e) {
+            if (score == Score::Sigmoid) scores[e] = 1.0f / (1.0f + sc_exp(-scores[e]));
+            else if (score == Score::SqrtSoftplus) scores[e] = std::sqrt(softplus20(scores[e]));
+            else { scores[e] = std::exp(scores[e] - mx); den += scores[e]; }
+        }
+        for (int64_t e = 0; e < ne; ++e) {
+            if (score == Score::Softmax) scores[e] /= den;
+            ranked[e] = scores[e] + ldt(&bias, e * laststride(&bias));
+        }
+        float total = 0;
+        for (int64_t j = 0; j < k; ++j) {
+            int winner = -1;
+            for (int64_t e = 0; e < ne; ++e)
+                if (ranked[e] > -INFINITY && (winner < 0 || ranked[e] > ranked[winner]))
+                    winner = (int)e;
+            if (winner < 0) return RAD_E_SHAPE;
+            index[j] = winner;
+            chosen[j] = scores[winner];
+            total += chosen[j];
+            ranked[winner] = -INFINITY;
+        }
+        const float mult = norm ? factor / (total + 1e-20f) : factor;
+        for (int64_t j = 0; j < k; ++j) {
+            st_int_dt(ids.dtype, ids.data, rowoff(&ids, r, k) + j * laststride(&ids), index[j]);
+            stt(&w, rowoff(&w, r, k) + j * laststride(&w), chosen[j] * mult);
+        }
+    }
+    return RAD_OK;
+}
+
 AVX_KERNEL(swiglu_clamped) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const auto &gu = a->t[0], &y = a->t[1];
@@ -242,10 +308,12 @@ bool pre_outputs(const RadTensor& h, const RadTensor& scale, const RadTensor& ba
            matrix(x, rows, n) && matrix(post, rows, hc) && matrix(comb, rows, hc * hc) &&
            post.dtype == RAD_F32 && comb.dtype == RAD_F32;
 }
-/* Row r from its RMS-scaled coefficients and the widened residual row hv. */
+/* Row r from its RMS-scaled coefficients and the widened residual row hv: the gates, the Sinkhorn
+ * mixing, and the collapse of hv into `x` (mhc_pre) or the pre gates into `pre_out` (mhc_mix). */
 void finish_row(const float* coeff, const float* hv, const RadTensor& scale, const RadTensor& base,
-                const RadTensor& x, const RadTensor& post, const RadTensor& comb, int64_t r,
-                int64_t n, int64_t hc, int64_t iters, float heps) {
+                const RadTensor* x, const RadTensor& post, const RadTensor& comb, int64_t r,
+                int64_t n, int64_t hc, int64_t iters, float heps,
+                const RadTensor* pre_out = nullptr) {
     float pre[8], c[64];
     for (int64_t j = 0; j < hc; ++j) {
         pre[j] =
@@ -262,10 +330,14 @@ void finish_row(const float* coeff, const float* hv, const RadTensor& scale, con
     sinkhorn(c, (int)hc, (int)iters, heps);
     for (int64_t j = 0; j < hc * hc; ++j)
         stt(&comb, rowoff(&comb, r, hc * hc) + j * laststride(&comb), c[j]);
+    if (pre_out)
+        for (int64_t j = 0; j < hc; ++j)
+            stt(pre_out, rowoff(pre_out, r, hc) + j * laststride(pre_out), pre[j]);
+    if (!x) return;
     for (int64_t i = 0; i < n; ++i) {
         float v = 0;
         for (int64_t j = 0; j < hc; ++j) v += pre[j] * hv[j * n + i];
-        stt(&x, rowoff(&x, r, n) + i * laststride(&x), v);
+        stt(x, rowoff(x, r, n) + i * laststride(x), v);
     }
 }
 /* fn row j over columns [lo, lo+len), contiguous or through the scratch fw. */
@@ -302,7 +374,7 @@ AVX_KERNEL(mhc_pre) {
         const float norm = 1.0f / std::sqrt(dot(hv, hv, width) / (float)width + eps);
         float coeff[80];
         for (int64_t j = 0; j < mix; ++j) coeff[j] = fn_dot(hv, fn, j, width, 0, width, fw) * norm;
-        finish_row(coeff, hv, scale, base, x, post, comb, r, n, hc, iters, heps);
+        finish_row(coeff, hv, scale, base, &x, post, comb, r, n, hc, iters, heps);
     }
     return RAD_OK;
 }
@@ -369,7 +441,7 @@ AVX_KERNEL(mhc_pre_finish) {
             for (int64_t c = 0; c < chunks; ++c) d += ldt(&part, pb + (c * S + j) * ps);
             coeff[j] = d * norm;
         }
-        finish_row(coeff, hv, scale, base, x, post, comb, r, n, hc, iters, heps);
+        finish_row(coeff, hv, scale, base, &x, post, comb, r, n, hc, iters, heps);
     }
     return RAD_OK;
 }
@@ -417,6 +489,73 @@ AVX_KERNEL(mhc_contract) {
                 v += ldt(&h, rowoff(&h, r, hc * n) + (j * n + i) * laststride(&h));
             stt(&x, rowoff(&x, r, n) + i * laststride(&x), v / (float)hc);
         }
+    return RAD_OK;
+}
+
+/* mhc_pre without the collapse (libref's mhc_mix): the gates and the Sinkhorn mixing of h, with
+ * the pre gates written to `pre` for a later mhc_collapse. */
+AVX_KERNEL(mhc_mix) {
+    if (!rad_args_have(a, 7)) return RAD_E_INVAL;
+    int64_t n, hc, iters;
+    float eps, heps;
+    if (!pre_params(a, &n, &hc, &iters, &eps, &heps)) return RAD_E_SHAPE;
+    const auto &h = a->t[0], &fn = a->t[1], &scale = a->t[2], &base = a->t[3];
+    const auto &pre = a->t[4], &post = a->t[5], &comb = a->t[6];
+    if (h.rank != 2) return RAD_E_SHAPE;
+    const int64_t rows = h.shape[0], width = hc * n, mix = hc * (hc + 2);
+    if (rows < 1 || !matrix(fn, mix, width) || fn.dtype != RAD_F32 || !matrix(pre, rows, hc) ||
+        pre.dtype != RAD_F32 || !matrix(h, rows, width) || scale.rank != 1 ||
+        scale.dtype != RAD_F32 || numel(&scale) != 3 || base.rank != 1 ||
+        base.dtype != RAD_F32 || numel(&base) != mix || !matrix(post, rows, hc) ||
+        !matrix(comb, rows, hc * hc) || post.dtype != RAD_F32 || comb.dtype != RAD_F32)
+        return RAD_E_SHAPE;
+    AVX_PARALLEL_FOR_IF(rows * width * mix >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* scratch = scratch_f32((size_t)(2 * width));
+        float* hv = scratch;
+        float* fw = hv + width;
+        widen(h, r, width, hv);
+        const float norm = 1.0f / std::sqrt(dot(hv, hv, width) / (float)width + eps);
+        float coeff[80];
+        for (int64_t j = 0; j < mix; ++j) coeff[j] = fn_dot(hv, fn, j, width, 0, width, fw) * norm;
+        finish_row(coeff, hv, scale, base, nullptr, post, comb, r, n, hc, iters, heps, &pre);
+    }
+    return RAD_OK;
+}
+
+/* x[i] = sum over the hc streams of pre[s] h[s, i] (libref's mhc_collapse), the streams in order,
+ * eight or sixteen columns at a time. */
+AVX_KERNEL(mhc_collapse) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    if (n < 1 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    const auto &h = a->t[0], &pre = a->t[1], &x = a->t[2];
+    if (h.rank != 2 || h.shape[0] < 1 || !matrix(h, h.shape[0], hc * n) ||
+        !matrix(pre, h.shape[0], hc) || pre.dtype != RAD_F32 || !matrix(x, h.shape[0], n))
+        return RAD_E_SHAPE;
+    const int64_t width = hc * n;
+    AVX_PARALLEL_FOR_IF(h.shape[0] * width >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < h.shape[0]; ++r) {
+        float* buf = scratch_f32((size_t)(width + n));
+        float* hv = buf;
+        float* xv = hv + width;
+        const float* hr = in_row(&h, rowoff(&h, r, width), width, hv);
+        float g[8];
+        for (int64_t j = 0; j < hc; ++j)
+            g[j] = ldt(&pre, rowoff(&pre, r, hc) + j * laststride(&pre));
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N) {
+            vf v = vf_zero();
+            for (int64_t j = 0; j < hc; ++j) v = vf_fma(vf_set1(g[j]), vf_loadu(hr + j * n + i), v);
+            vf_storeu(xv + i, v);
+        }
+        for (; i < n; ++i) {
+            float v = 0;
+            for (int64_t j = 0; j < hc; ++j) v += g[j] * hr[j * n + i];
+            xv[i] = v;
+        }
+        out_row(&x, rowoff(&x, r, n), n, xv);
+    }
     return RAD_OK;
 }
 

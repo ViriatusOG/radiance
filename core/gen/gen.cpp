@@ -252,15 +252,20 @@ void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, 
 
 int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
                        const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
-                       std::string* why) {
+                       std::string* why, bool grounded, int32_t target_h, int32_t target_w,
+                       const Request::Outfill& outfill) {
     *out = Layout{};
     const int64_t T = (int64_t)b.tokens.size();
     if (b.n_drop < 0 || b.n_drop >= T) {
         if (why) *why = "the conditioning prompt is no longer than its fixed prefix";
         return RAD_E_INVAL;
     }
-    if (b.media) {
+    if (b.media && !grounded) {
         if (why) *why = "the joint layout reads no pictures in the prompt";
+        return RAD_E_INVAL;
+    }
+    if (grounded && !outfill.w && (b.media ? b.media->rope.runs.size() : 0) != ref_hw.size()) {
+        if (why) *why = "the prompt must ground every reference picture";
         return RAD_E_INVAL;
     }
     const int64_t text = T - b.n_drop;
@@ -285,7 +290,22 @@ int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, b
         const int32_t h = ref_hw[k].first, w = ref_hw[k].second;
         const int64_t n = (int64_t)h * w;
         std::vector<float> pl((size_t)(4 * n));
-        grid_rope_f(hw_scale, -(float)(1 + k), h, w, pl.data(), n);
+        grid_rope_f(hw_scale, grounded ? 0.0f : -(float)(1 + k), h, w, pl.data(), n);
+        if (grounded) {
+            const float dy = (float)(hw_scale * (target_h - h) / 2.0);
+            const float dx = (float)(hw_scale * (target_w - w) / 2.0);
+            for (int64_t i = 0; i < n; ++i) {
+                pl[i] = (float)(1 + k);
+                pl[n + i] += dy;
+                pl[2 * n + i] += dx;
+                if (outfill.w) {
+                    pl[n + i] = (float)(hw_scale *
+                        ((outfill.y + (i / w + 0.5) * outfill.h / h) / 16.0 - 0.5));
+                    pl[2 * n + i] = (float)(hw_scale *
+                        ((outfill.x + (i % w + 0.5) * outfill.w / w) / 16.0 - 0.5));
+                }
+            }
+        }
         for (int cc = 0; cc < 4; ++cc)
             std::memcpy(&out->rope_f[(size_t)(cc * rows + row)], &pl[(size_t)(cc * n)],
                         (size_t)n * sizeof(float));

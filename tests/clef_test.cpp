@@ -211,7 +211,7 @@ TEST(the_words_cut_the_prompt_at_every_span_and_carry_the_option_tokens) {
     CHECK((int32_t)w.size() <= rad_clef_max_words());
     /* The head's three values an option land in three stretches of the logits row. */
     const std::vector<int32_t> ids = clef_score_ids(6);
-    CHECK_EQ(ids.size(), (size_t)18);
+    REQUIRE_EQ(ids.size(), (size_t)18);
     CHECK_EQ(ids[6], (int32_t)RAD_CLEF_MAX_OPTIONS);
     CHECK_EQ(ids[17], (int32_t)(2 * RAD_CLEF_MAX_OPTIONS + 5));
 }

@@ -54,6 +54,10 @@ public:
     /* Exact reads and writes: a short transfer is RAD_E_IO, never a partial success, so callers
      * need no byte-count check. */
     int  read_at(void* dst, int64_t off, int64_t bytes);
+    /* An extent rounded out to the alignment, which may end past end of file: the rounding of a
+     * range in the file's last, partial block. Reads `bytes` (or to end of file) and succeeds when
+     * at least the first `need` bytes arrived, so the rounding never needs the file to be padded. */
+    int  read_covering(void* dst, int64_t off, int64_t bytes, int64_t need);
     int  write_at(const void* src, int64_t off, int64_t bytes);
 
     /* The alignment every fast-path extent must satisfy. A fixed 4096 rather than the device's

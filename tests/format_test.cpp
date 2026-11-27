@@ -1191,7 +1191,8 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
     }
     CHECK(slurp(b.path) == before);
 
-    /* Another process has the file open: refused before writing. */
+    /* Another process has the file open: refused before writing. The holder is killed and reaped
+     * when the case leaves, whichever way. */
     int ready[2];
     REQUIRE_EQ(::pipe(ready), 0);
     const pid_t child = ::fork();
@@ -1203,6 +1204,17 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
         ::pause();
         ::_exit(0);
     }
+    struct Holder {
+        pid_t pid;
+        bool live = true;
+        void reap() {
+            if (!live) return;
+            live = false;
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, nullptr, 0);
+        }
+        ~Holder() { reap(); }
+    } holder{child};
     char c = 0;
     CHECK_EQ(::read(ready[0], &c, 1), (ssize_t)1);
     CHECK_EQ(c, 'y');
@@ -1212,8 +1224,7 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
         RadWriter w;
         CHECK_EQ(w.begin_append(b.path.c_str(), old), (int)RAD_E_STATE);
     }
-    ::kill(child, SIGKILL);
-    ::waitpid(child, nullptr, 0);
+    holder.reap();
     ::close(ready[0]);
     ::close(ready[1]);
     CHECK(slurp(b.path) == before);
@@ -1839,8 +1850,7 @@ TEST(a_tune_cache_line_of_blanks_is_a_blank_line) {
     };
     for (const char* body : bodies) {
         FILE* f = std::fopen(path.c_str(), "wb");
-        CHECK(f != nullptr);
-        if (!f) return;
+        REQUIRE(f != nullptr);
         std::fputs(body, f);
         std::fclose(f);
 
@@ -1945,8 +1955,7 @@ TEST(safetensors_decodes_a_surrogate_pair_as_one_codepoint) {
     /* U+1F600 as a JSON surrogate pair. */
     const std::string path = st_write(
         "{\"a\\uD83D\\uDE00b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}");
-    CHECK(!path.empty());
-    if (path.empty()) return;
+    REQUIRE(!path.empty());
 
     SafeTensorsFile st;
     CHECK_OK(st.open(path));
@@ -1966,8 +1975,7 @@ TEST(safetensors_decodes_the_escape_widths_either_side_of_it) {
         " \"\\u07FF\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},"
         " \"\\u0800\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},"
         " \"\\uD800x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}");
-    CHECK(!path.empty());
-    if (path.empty()) return;
+    REQUIRE(!path.empty());
 
     SafeTensorsFile st;
     CHECK_OK(st.open(path));
@@ -1990,11 +1998,12 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[-1,-1],\"data_offsets\":[0,4]}}",
         /* fewer elements than the span */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+        /* an E8M0 scale is one byte: nine of them are not four bytes */
+        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : bad) {
         const std::string path = st_write(h);
-        CHECK(!path.empty());
-        if (path.empty()) return;
+        REQUIRE(!path.empty());
         SafeTensorsFile st;
         CHECK_EQ(st.open(path), RAD_E_FORMAT);
     }
@@ -2003,13 +2012,13 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[],\"data_offsets\":[0,4]}}",        /* a scalar */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[0,4]}}",
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[0,7],\"data_offsets\":[4,4]}}",     /* empty */
+        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[4],\"data_offsets\":[0,4]}}",   /* four 1-byte scales */
         /* an unsized dtype is left to consumers, which refuse it by name */
-        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
+        "{\"t\":{\"dtype\":\"F64\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : good) {
         const std::string path = st_write(h);
-        CHECK(!path.empty());
-        if (path.empty()) return;
+        REQUIRE(!path.empty());
         SafeTensorsFile st;
         CHECK_OK(st.open(path));
         CHECK_EQ(st.tensors().size(), (size_t)1);
@@ -2039,7 +2048,7 @@ TEST(the_shard_index_reads_every_entry_of_a_real_weight_map) {
     CHECK(!p.empty());
     std::unordered_map<std::string, std::string> m;
     CHECK_OK(st_load_index(p, &m));
-    CHECK_EQ(m.size(), 4u);
+    REQUIRE_EQ(m.size(), 4u);
     CHECK_EQ(m["model.embed_tokens.weight"], std::string("model-00001-of-00003.safetensors"));
     CHECK_EQ(m["lm_head.weight"], std::string("model-00003-of-00003.safetensors"));
     CHECK_EQ(m.count("model.layers.47.mlp.down_proj.weight"), 1u);
@@ -2245,7 +2254,7 @@ TEST(importance_is_invariant_to_a_uniform_scale_of_the_row) {
     std::vector<float> wa, wb;
     CHECK(ia.importance("t", 0, &wa));
     CHECK(ib.importance("t", 0, &wb));
-    CHECK_EQ(wa.size(), wb.size());
+    REQUIRE_EQ(wa.size(), wb.size());
     for (size_t i = 0; i < wa.size() && i < wb.size(); ++i) CHECK_NEAR(wa[i], wb[i], 1e-4);
 }
 

@@ -32,13 +32,15 @@ namespace {
 
 void usage() {
     std::printf(
-        "rad-tune -- benchmark each kernel's tunable space at this model's shapes, on this machine\n"
+        "rad-tune -- benchmark each kernel's tunable space at this model's shapes, "
+        "on this machine\n"
         "\n"
         "usage: rad-tune -m <model.rad> [options]\n"
         "\n"
         "  -m, --model FILE   the .rad whose declared graph supplies the shapes\n"
         "      --home DIR     $RADIANCE_HOME; the cache is written to <home>/tune/<machine>.tune\n"
-        "      --kernels A:B  the kernel libraries to load, first wins; default every library found\n"
+        "      --kernels A:B  the kernel libraries to load, first wins; default every "
+        "library found\n"
         "      --op NAME      tune only ops whose name starts with NAME\n"
         "      --machine KEY  override the machine key (for writing a cache for another box)\n"
         "      --reps N       timing reps, median reported (default 5)\n"
@@ -54,7 +56,8 @@ void usage() {
         "      --tp-wire MODE exact (default) or wht6 -- selects the all-reduce family.\n"
         "      --tp-wire-min-kb N  the message size from which the lossy wire is used.\n"
         "      --num-speculative-tokens N|auto\n"
-        "                     draft depth to declare at (default auto: the container's own). It puts\n"
+        "                     draft depth to declare at (default auto: the container's "
+        "own). It puts\n"
         "                     the drafter's kernels in the measured graph.\n"
         "      --dry-run      list what would be measured and stop\n"
         "  -v, --verbose      print every candidate, not just the winner\n"
@@ -340,11 +343,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](const char* w) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "rad-tune: %s needs a value\n", w);
-                                 std::exit(2); }
-            return argv[++i];
-        };
+        auto next = [&](const char* w) { return rad_flag_value("rad-tune", argc, argv, &i, w); };
         auto num = [&](const char* w, int64_t lo, int64_t hi) {
             return rad_flag_int("rad-tune", w, next(w), lo, hi);
         };
@@ -396,32 +395,8 @@ int main(int argc, char** argv) {
     if (rad_tools_load_plugins(home, hierarchy, f.str(f.header().arch_id),
                                f.str(f.header().quant), &plugins) < 0) return 1;
 
-    RadModelMeta meta{};
-    meta.arch_id = f.str(f.header().arch_id);
-    meta.name    = f.str(f.header().model_name);
-    meta.quant   = f.str(f.header().quant);
-    auto mi = [&](const char* k, int64_t d) { int64_t v = d; f.get_i(k, &v); return v; };
-    auto mf = [&](const char* k, double d) { double v = d; f.get_f(k, &v); return (float)v; };
-    meta.n_layers = mi("n_layers", 0);  meta.n_embd = mi("n_embd", 0);
-    meta.n_head   = mi("n_head", 0);    meta.n_head_kv = mi("n_head_kv", 0);
-    meta.head_dim = mi("head_dim", 0);  meta.n_ff = mi("n_ff", 0);
-    meta.n_vocab  = mi("n_vocab", 0);   meta.n_ctx_train = mi("n_ctx_train", 0);
-    meta.n_expert = mi("n_expert", 0);  meta.n_expert_used = mi("n_expert_used", 0);
-    meta.n_expert_shared = mi("n_expert_shared", 0);
-    meta.rms_eps = mf("rms_eps", 1e-6); meta.rope_theta = mf("rope_theta", 10000.f);
-    meta.rope_scale = 1.f;   /* the rotary's scaling is the free-form rope keys (rad_builder.h) */
-
-    std::vector<std::string> kk, kv;
-    std::vector<const char*> kp, vp;
-    for (int64_t i = 0; i < f.meta_count(); ++i) {
-        const RadFileKV& e = f.meta_at(i);
-        if (e.type != RAD_P_STR) continue;
-        kk.push_back(f.str(e.key));
-        kv.push_back(f.str(e.v.s));
-    }
-    for (auto& s : kk) kp.push_back(s.c_str());
-    for (auto& s : kv) vp.push_back(s.c_str());
-    meta.n_kv = (int)kk.size(); meta.kv_key = kp.data(); meta.kv_val = vp.data();
+    const ContainerMeta cm(f);
+    const RadModelMeta& meta = cm.meta;
 
     /* Declare the graph the deployment runs: the tensor-parallel width sets every sharded N, and
      * the speculative depth decides whether the drafter (and its shapes) is in the graph. */
@@ -434,6 +409,10 @@ int main(int argc, char** argv) {
     RadArchProbe probe{};
     (void)rad_tools_probe(plugins, meta, &probe);
     ctx.max_spec = spec >= 0 ? spec : probe.draft_depth;
+    /* Trees where the engine would ask for them (Engine::declare: the plugin's probe says they
+     * pay and a drafter decodes speculatively): the verify's tree rows and the wider block are
+     * then the graph that is tuned. */
+    ctx.draft_tree = ctx.max_spec > 0 && probe.tree_pays != 0;
     ctx.max_seqs = max_seqs; ctx.max_ctx = meta.n_ctx_train; ctx.scope = "";
 
     /* Peer access, measured before selection, as Engine does: collectives constrain device.p2p
@@ -533,7 +512,7 @@ int main(int argc, char** argv) {
             continue;
         }
         const std::string op = row->info->op;
-        if (!op_filter.empty() && op.rfind(op_filter, 0) != 0) continue;
+        if (!op_filter.empty() && !op.starts_with(op_filter)) continue;
 
         /* A kernel with at most one candidate has nothing to choose; no row is written. */
         int64_t space = 0;
@@ -553,7 +532,8 @@ int main(int argc, char** argv) {
 
         int64_t M = 1;
         long long mv = 0;
-        for (const char* k : { "M", "q_len" }) if (tr.geom.get_i(k, &mv)) { M = (int64_t)mv; break; }
+        for (const char* k : { "M", "q_len" })
+            if (tr.geom.get_i(k, &mv)) { M = (int64_t)mv; break; }
         if (M <= 0) M = 1;
 
         /* Operand shapes as rad-kbench takes them: the reference library's description (which
@@ -604,9 +584,9 @@ int main(int argc, char** argv) {
         }
         const int64_t vocab_rows = kf_vocab_rows(kop);
 
-        /* One set of operands per rank: a collective's ranks contribute their own bytes on their own
-         * card, with the instance their own declare made. Each rank draws different bytes, so a
-         * kernel that read its own contribution twice cannot pass. `rs` is sized once and never
+        /* One set of operands per rank: a collective's ranks contribute their own bytes on their
+         * own card, with the instance their own declare made. Each rank draws different bytes, so
+         * a kernel that read its own contribution twice cannot pass. `rs` is sized once and never
          * grown: a moved DevBuf would leave its old handle to free the buffer too. */
         const int world = row->collective && tp > 1 ? tp : 1;
         std::string scale;
@@ -718,7 +698,8 @@ int main(int argc, char** argv) {
         std::vector<Geometry> gv((size_t)n_var);
         for (int v = 0; v < n_var; ++v) {
             gv[(size_t)v] = tr.geom;
-            for (const auto& kv : cands[(size_t)v]) gv[(size_t)v].set_i(kv.first.c_str(), kv.second);
+            for (const auto& kv : cands[(size_t)v])
+                gv[(size_t)v].set_i(kv.first.c_str(), kv.second);
         }
 
         /* Median over `reps`, with the spread. */

@@ -232,3 +232,121 @@ int ref_seg_mean_bf16_sum(const RadArgs* a, RadStream) {
         }
     return RAD_OK;
 }
+
+/* ================================================================== DeepSeek V4.1's tower ops */
+
+/* ds41_vit_rope2d: rotate-half on the Q and K halves of a fused qkv [M, 3*H*D]. Both axes ride
+ * ONE ladder, theta^(-2j/(D/2)); pixtral_rope interleaves a second ladder for the column, which is
+ * a different function of the same position. Half the rotary width tracks the patch row (the first
+ * quadrant of the rotary dims) and half the column. The products are f32 and rounded once to the
+ * stored dtype, as the reference's apply_rotary does (it rounds only on `.to(dtype)`). */
+int ref_ds41_vit_rope2d(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *rc = &a->t[1];
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0;
+    const int64_t D = p_int(a, "head_dim", 0), H = p_int(a, "n_head", 0);
+    const float theta = p_f32(a, "theta", 0);
+    if (M <= 0 || M > p_int(a, "M", 0) || D <= 0 || D % 4 || H <= 0 || !(theta > 0) ||
+        !std::isfinite(theta) || x->rank != 2 || x->shape[0] < M || x->shape[1] != 3 * H * D ||
+        rc->rank != 2 || rc->shape[0] != 2 || rc->shape[1] != M)
+        return RAD_E_SHAPE;
+    if (rc->dtype != RAD_I32 || (x->dtype != RAD_BF16 && x->dtype != RAD_F32)) return RAD_E_DTYPE;
+    const int64_t rot = D / 2, quad = D / 4;
+    for (int64_t r = 0; r < 2; ++r)
+        for (int64_t p = 0; p < M; ++p)
+            if (ld_int(rc->dtype, rc->data, r * rc->stride[0] + p * rc->stride[1]) < 0)
+                return RAD_E_INVAL;
+    REF_PAR_FOR(M * rot)
+    for (int64_t p = 0; p < M; ++p)
+        for (int64_t i = 0; i < rot; ++i) {
+            const int64_t axis = i / quad, j = i % quad;
+            const float pos = (float)ld_int(rc->dtype, rc->data,
+                                            axis * rc->stride[0] + p * rc->stride[1]);
+            const float inv = 1.0f / ref_pow(theta, (float)(2 * j) / (float)rot);
+            const float ang = pos * inv;
+            const float c = ref_cos(ang), s = ref_sin(ang);
+            /* q is heads [0, H), k is heads [H, 2H); v is untouched. */
+            for (int64_t h = 0; h < 2 * H; ++h) {
+                const int64_t u = rowoff(x, p, 3 * H * D) + (h * D + i) * laststride(x);
+                const int64_t v = u + rot * laststride(x);
+                const float x0 = ldt(x, u), x1 = ldt(x, v);
+                stt(x, u, round_dt(x->dtype, x0 * c - x1 * s));
+                stt(x, v, round_dt(x->dtype, x1 * c + x0 * s));
+            }
+        }
+    return RAD_OK;
+}
+
+/* ds41_pack3x3: the aligner's zero-padded 3x3 unfold. Complete raster grids (row, col, h, w per
+ * patch); a segment's grid is padded to a multiple of `merge` with zeros, and each cell of the
+ * padded grid becomes one row of merge*merge patch rows in (dy, dx) order, a cell's width whole.
+ * Padded cells are zeros -- the reference pads the value plane with zeros before unfold. */
+int ref_ds41_pack3x3(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *rc = &a->t[1], *y = &a->t[2];
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0;
+    const int64_t N = p_int(a, "n", 0), K = p_int(a, "merge", 0);
+    if (M <= 0 || M > p_int(a, "M", 0) || N <= 0 || K < 2 || x->rank != 2 || x->shape[0] != M ||
+        x->shape[1] != N || rc->rank != 2 || rc->shape[0] != 4 || rc->shape[1] != M ||
+        y->rank != 2 || y->shape[1] != N * K * K)
+        return RAD_E_SHAPE;
+    if (rc->dtype != RAD_I32 || x->dtype != y->dtype ||
+        (x->dtype != RAD_BF16 && x->dtype != RAD_F32))
+        return RAD_E_DTYPE;
+    const auto coord = [&](int axis, int64_t p) {
+        return ld_int(rc->dtype, rc->data, axis * rc->stride[0] + p * rc->stride[1]);
+    };
+    int64_t r0 = 0;
+    for (int64_t p = 0; p < M;) {
+        const int64_t h = coord(2, p), w = coord(3, p);
+        if (h <= 0 || w <= 0 || h * w > M - p) return RAD_E_INVAL;
+        const int64_t oh = (h + K - 1) / K, ow = (w + K - 1) / K;
+        if (r0 + oh * ow > y->shape[0]) return RAD_E_SHAPE;
+        for (int64_t oy = 0; oy < oh; ++oy)
+            for (int64_t ox = 0; ox < ow; ++ox) {
+                const int64_t r = r0 + oy * ow + ox;
+                /* `conv2d_unfold` column order: (channel, kernel row, kernel column), so the
+                 * block's row is pixel-major over the K x K patches. */
+                for (int64_t j = 0; j < N; ++j)
+                    for (int64_t dy = 0; dy < K; ++dy)
+                        for (int64_t dx = 0; dx < K; ++dx) {
+                            const int64_t yy = oy * K + dy, xx = ox * K + dx;
+                            const int64_t dst =
+                                rowoff(y, r, N * K * K) + (j * K * K + dy * K + dx) * laststride(y);
+                            if (yy < h && xx < w) {
+                                const int64_t src = rowoff(x, p + yy * w + xx, N);
+                                stt(y, dst, ldt(x, src + j * laststride(x)));
+                            } else {
+                                stt(y, dst, 0.0f);
+                            }
+                        }
+            }
+        r0 += oh * ow;
+        p += h * w;
+    }
+    if (r0 != y->shape[0]) return RAD_E_SHAPE;
+    return RAD_OK;
+}
+
+/* ds41_span_rows: the three learned vectors an image span's typed rows take (start at row 0,
+ * newline at row 2, end at row 3; row 1 is the encoder's own rows and left untouched). A copy of
+ * each row weight into its slot: no arithmetic, so every byte reaches the table as one bf16 pair
+ * (the table is read by the core's span staging, not by a kernel). */
+int ref_ds41_span_rows(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *s = &a->t[0], *nl = &a->t[1], *e = &a->t[2], *y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0 || rad_tensor_numel(s) < n || rad_tensor_numel(nl) < n ||
+        rad_tensor_numel(e) < n || y->rank != 2 || y->shape[0] != 4 || y->shape[1] != n)
+        return RAD_E_SHAPE;
+    if (y->dtype != RAD_BF16 || s->dtype != y->dtype || nl->dtype != y->dtype ||
+        e->dtype != y->dtype)
+        return RAD_E_DTYPE;
+    const RadTensor* src[3] = { s, nl, e };
+    const int64_t row[3] = { 0, 2, 3 };
+    for (int k = 0; k < 3; ++k) {
+        const int64_t sb = src[k]->stride[0], yb = rowoff(y, row[k], n);
+        for (int64_t i = 0; i < n; ++i) stt(y, yb + i * laststride(y), ldt(src[k], i * sb));
+    }
+    return RAD_OK;
+}

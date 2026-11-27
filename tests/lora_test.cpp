@@ -4,9 +4,9 @@
  * Host only, and it never reaches the device layer: no kernel plugin is loaded, because a Registry
  * that loads one brackets the dlopen with the device backend's code mark, which in a HIP build
  * starts the AQL backend. The Programs are made by the core Builder over an empty Registry, driven
- * by the arch/common code that declares the weights: LinearFP8::declare (rad_fp8.h) with the
- * arguments the blocks pass (rad_block_attn_fp8.h, rad_block_mlp_fp8.h, rad_block_attn_gated_fp8.h,
- * rad_block_gdn_fp8.h), over a Geom from geom_from(), and the delta net's uneven head split as
+ * by the arch/common code that declares the weights: LinearQ::declare (rad_linear.h) with the
+ * arguments the blocks pass (rad_block_attn_q.h, rad_block_mlp_q.h, rad_block_attn_gated_q.h,
+ * rad_block_gdn_q.h), over a Geom from geom_from(), and the delta net's uneven head split as
  * qwen4exp_fp8.cpp computes it (remainder_place). With no schema in the Registry the GEMM ops do
  * not resolve, so each is appended to the Program as decl_op would record it (op name, parameters,
  * weights, schema operand positions); everything a site is read from is what the builder records.
@@ -24,7 +24,7 @@
 #include "rad_plugin.h"
 
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
 #include "util/json.h"
 
@@ -198,7 +198,7 @@ OpInfo gemm_op(const char* name, int64_t N, int64_t K, const char* dtype, int64_
     o.op = name;
     o.base.set_i("N", N);
     o.base.set_i("K", K);
-    if (grouped) o.base.set_i("group", AR::RAD_FP8_BLOCK);
+    if (grouped) o.base.set_i("group", AR::RAD_SCALE_GROUP);
     o.base.set_s("dtype", dtype);
     o.ranged_key = "M";
     o.range_lo = lo;
@@ -213,17 +213,17 @@ uint32_t push_op(Builder& b, OpInfo o) {
     return (uint32_t)b.program().ops.size() - 1;
 }
 
-/* LinearFP8::declare as a block calls it, then the GEMM it would have declared over the two
+/* LinearQ::declare as a block calls it, then the GEMM it would have declared over the two
  * views: gemm_nt_q fp8a8 (`b`, `b_scale` at schema positions 2, 3). `m1` adds the decode matvec
- * LinearFP8 declares beside it when fp8_matvec_rows() > 0 (the same two views, a lower band). */
+ * LinearQ declares beside it when fp8_matvec_rows() > 0 (the same two views, a lower band). */
 int linear(Builder& b, AR::Names& nm, const AR::Geom& g, const char* base, int64_t N, int64_t K,
            int shard, int layer, std::initializer_list<const char*> src,
            std::initializer_list<int64_t> parts = {}, int64_t span_lo = 0, int64_t span_hi = 0,
-           std::initializer_list<int64_t> rot = {}, AR::LinearFP8* keep = nullptr, bool m1 = false) {
-    AR::LinearFP8 lin{};
-    AR::ActFP8 act{};
+           AR::LinearQ* keep = nullptr, bool m1 = false) {
+    AR::LinearQ lin{};
+    AR::ActQ act{};
     const int st = lin.declare(&b, nm, g, base, N, K, shard, AR::grp_layer(layer), src, act, 0, 0,
-                               parts, span_lo, span_hi, rot);
+                               parts, span_lo, span_hi);
     if (st < 0 || !lin.w || !lin.ws) return st < 0 ? st : RAD_E_INVAL;
     if (m1)
         push_op(b, gemm_op("gemm_nt_q", N, K, "fp8a16", 1, 16, { lin.w, lin.ws }, { 2, 3 }, true));
@@ -266,20 +266,20 @@ int build_llama(int rank, int world, RankProg* out) {
     const int64_t q_all = g.n_head_all * g.head_dim, kv_all = g.n_head_kv_all * g.head_dim;
     for (int l = 0; l < (int)meta.n_layers; ++l) {
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
-        /* rad_block_attn_fp8.h */
+        /* rad_block_attn_q.h */
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.attn_qkv", l), q_dim + 2 * kv_dim, g.n_embd,
                             RAD_SHARD_ROW, l, { ck("self_attn.q_proj"), ck("self_attn.k_proj"),
                                                 ck("self_attn.v_proj") },
                             { q_dim, kv_dim, kv_dim }));
-        /* rad_block_attn_fp8.h */
+        /* rad_block_attn_q.h */
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                             RAD_SHARD_COL, l, { ck("self_attn.o_proj") }));
-        /* rad_block_mlp_fp8.h */
-        AR::LinearFP8 gu{};
+        /* rad_block_mlp_q.h */
+        AR::LinearQ gu{};
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.ffn_gate_up", l), 2 * g.n_ff, g.n_embd,
                             RAD_SHARD_ROW, l, { ck("mlp.gate_proj"), ck("mlp.up_proj") },
-                            { g.n_ff, g.n_ff }, 0, 0, {}, &gu));
-        /* rad_block_mlp_fp8.h */
+                            { g.n_ff, g.n_ff }, 0, 0, &gu));
+        /* rad_block_mlp_q.h */
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.ffn_down", l), g.n_embd, g.n_ff, RAD_SHARD_COL,
                             l, { ck("mlp.down_proj") }));
 
@@ -366,7 +366,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
     const GdnSplit sp = gdn_split(g);
     const int64_t k_dim = sp.nk * kHK, v_dim = sp.nv * kHV, k_all = kNK * kHK, v_all = kNV * kHV;
 
-    /* ---- layer 0: the gated delta net (rad_block_gdn_fp8.h) */
+    /* ---- layer 0: the gated delta net (rad_block_gdn_q.h) */
     {
         const int l = 0;
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
@@ -376,13 +376,12 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
                                           { 2 * sp.nv, g.n_embd }, RAD_ACCESS_PER_TOKEN,
                                           RAD_SHARD_ROW, AR::grp_layer(l), 0, { sp.nv, sp.nv });
         if (!w_ab) return RAD_E_INVAL;
-        AR::LinearFP8 in{};
-        AR::ActFP8 act{};
+        AR::LinearQ in{};
+        AR::ActQ act{};
         RAD_ARCH_TRY(in.declare(&b, nm, g, nm.f("blk.%d.ssm_inz", l), 2 * k_dim + 2 * v_dim,
                                 g.n_embd, RAD_SHARD_ROW, AR::grp_layer(l),
                                 { ck("linear_attn.in_proj_qkv"), ck("linear_attn.in_proj_z") }, act,
-                                0, 0, { k_dim, k_dim, v_dim, v_dim }, 0, 0,
-                                { 2 * k_dim + v_dim, v_dim }));
+                                0, 0, { k_dim, k_dim, v_dim, v_dim }, 0, 0));
         if (sp.uneven) {
             const int64_t kl = sp.kf * kHK, vl = sp.vf * kHV;
             const int64_t lo[4] = { kl, kl, vl, vl };
@@ -428,7 +427,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
         out->truth["blk.0.ssm_out.weight"] = so;
     }
 
-    /* ---- layer 1: gated attention (rad_block_attn_gated_fp8.h) */
+    /* ---- layer 1: gated attention (rad_block_attn_gated_q.h) */
     {
         const int l = 1;
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
@@ -478,7 +477,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
         out->truth["blk.1.attn_output.weight"] = o;
     }
 
-    /* ---- the dense MLP of both layers (rad_block_mlp_fp8.h) */
+    /* ---- the dense MLP of both layers (rad_block_mlp_q.h) */
     for (int l = 0; l < 2; ++l) {
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.ffn_gate_up", l), 2 * g.n_ff, g.n_embd,
@@ -962,11 +961,11 @@ TEST(non_capable_consumers_are_reported_never_skipped) {
     AR::Geom g{};
     REQUIRE_EQ(AR::geom_from(g, &meta, &ctx, "bf16", RAD_BF16), RAD_OK);
     AR::Names nm("");
-    AR::LinearFP8 gu{};
+    AR::LinearQ gu{};
     REQUIRE_EQ(linear(b, nm, g, "blk.0.ffn_gate_up", 2 * g.n_ff, g.n_embd, RAD_SHARD_ROW, 0,
                       { "model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.up_proj.weight" },
-                      { g.n_ff, g.n_ff }, 0, 0, {}, &gu), RAD_OK);
-    /* the fused gated fold over the same views (rad_block_mlp_fp8.h): live -> reported */
+                      { g.n_ff, g.n_ff }, 0, 0, &gu), RAD_OK);
+    /* the fused gated fold over the same views (rad_block_mlp_q.h): live -> reported */
     OpInfo gated;
     gated.op = "gemm_nt_q_gated";
     gated.base.set_i("N", gu.N); gated.base.set_i("K", gu.K); gated.base.set_s("act", "silu");

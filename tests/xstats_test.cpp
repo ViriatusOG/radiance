@@ -49,13 +49,6 @@ void issued_all(ExpertStats& xs, int n_rank, int step, int draft_pass, int64_t n
         if (XsTally* t = xs.tally(r)) t->issued(step, draft_pass, n_seq, n_seq_decode, n_tok, n_tok_decode);
 }
 
-std::string slurp(const std::string& path) {
-    std::ifstream f(path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
 uint64_t sum(const std::vector<uint64_t>& v) {
     uint64_t s = 0;
     for (uint64_t x : v) s += x;
@@ -230,7 +223,7 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
     ExpertStats xs;
     CHECK_OK(xs.init(path, m, info, 0.05));
 
-    Json j = Json::parse(slurp(path), nullptr, false);
+    Json j = Json::parse(read_file(path), nullptr, false);
     REQUIRE(!j.is_discarded());
     CHECK_EQ(j["format"].get<std::string>(), std::string("radiance-expert-stats/1"));
     CHECK_EQ(j["model"].get<std::string>(), info.model);
@@ -246,7 +239,7 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
     xs.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     xs.stop();
-    j = Json::parse(slurp(path), nullptr, false);
+    j = Json::parse(read_file(path), nullptr, false);
     REQUIRE(!j.is_discarded());
     CHECK(j["counts"]["decode"][0] == Json({ 0, 1, 1, 0 }));
     CHECK_EQ(j["selections"]["decode"][0].get<uint64_t>(), (uint64_t)2);
@@ -255,7 +248,7 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
     CHECK(j["uptime_s"].get<double>() > 0.0);
 
     CHECK_OK(xs.write(true));
-    j = Json::parse(slurp(path), nullptr, false);
+    j = Json::parse(read_file(path), nullptr, false);
     REQUIRE(!j.is_discarded());
     CHECK_EQ(j["final"].get<bool>(), true);
 

@@ -210,27 +210,6 @@ under "What is served": 0.0717 / 93.34% against 0.0789 / 92.85%, for -19% prefil
 accumulators and differ only in the GEMM's dtype, so a recipe may put any projection of any layer
 in any of them, and the MoE block reads each layer's two forms from that layer's experts.
 
-## NVFP4 experts: `nvfp4a8i8`
-
-The NVFP4 release (ModelOpt's, and Inkling 2's routed experts) stores each expert as e2m1 codes, an
-E4M3 scale per 16 of K and one f32 level per expert (amax over the release's divisor). Served as
-shipped, its codes are unchanged and its value is `e2m1 * e4m3 * level`. The e2m1 magnitudes double to
-the integers 0, 1, 2, 3, 4, 6, 8, 12, which an int8 activation multiplies exactly, so unlike `w4nl`'s
-codebook (read at the nearest of one int8 set, `kW4nlI8`) this form has no approximation in the
-weight: the only roundings are the activation's int8 codes and the bf16 output. The GEMM applies no
-rotation, since the checkpoints are unrotated.
-
-The planes and the kernel are in [OPS.md](OPS.md) (`moe_gemm_q` at `nvfp4a8i8`). libr4d's kernel is a
-plain one, a column per thread and a block per sorted row, with no WMMA and no run map, so it is
-correct at every band and is the reference the performance work starts from. libref and libavx read
-the codes through the codebook path with the sixteen e2m1 levels as the table.
-
-Tests: `op_moe_gemm_q_nvfp4a8i8_matches_the_oracle` (ref_test, the joined stored form and the plain
-logical one), the `nvfp4a8i8` hand case in `avx_check_hand` and the random cases in `avx_cases`,
-`r4d_emu_nvfp4` (the kernel on the host emulator, stacked and pointer-table scales, token and sorted
-order, a dropped slot), and `r4d_selftest --case moe_gemm_nvfp4a8i8` on a card (three shapes, against
-the same f64 decode of the planes).
-
 ## Rotation without GPTQ
 
 A rotation fixes range, and a group-128 absmax already handles range. On the 27B, Hadamard was 2x

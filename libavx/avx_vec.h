@@ -587,7 +587,8 @@ static inline const float* row_f32_in(uint32_t dt, const void* src, float* scrat
  * because normalisation cancels the relative error common to all terms.
  *
  * Hand-written because SVML's _mm512_exp_ps needs Intel's runtime, and GCC's libmvec only
- * vectorises expf where it can prove the call safe, which fails in kernels that mix integer work. */
+ * vectorises expf where it can prove the call safe, which fails in kernels that mix integer
+ * work. */
 static inline vf vf_exp(vf x) {
 #if AVX_LEVEL == 0
     return std::exp(x);
@@ -621,13 +622,15 @@ static inline vf vf_exp(vf x) {
     p = vf_fma(p, r2, vf_add(r, vf_set1(1.0f)));
     /* 2^n by building the exponent field directly. */
 #if AVX_LEVEL == 3
-    __m512i k = _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
+    __m512i k = _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)),
+                                  23);
     vf e = vf_mul(p, _mm512_castsi512_ps(k));
     e = _mm512_mask_mov_ps(e, _mm512_cmp_ps_mask(x0, lo, _CMP_LT_OQ), _mm512_setzero_ps());
     return _mm512_mask_mov_ps(e, _mm512_cmp_ps_mask(x0, x0, _CMP_UNORD_Q), x0);
 #else
 #if AVX_LEVEL == 2
-    __m256i k = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    __m256i k = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)),
+                                  23);
     vf e = vf_mul(p, _mm256_castsi256_ps(k));
 #else
     __m128i nlo = _mm_cvtps_epi32(_mm256_castps256_ps128(n));
@@ -676,10 +679,12 @@ static inline vf vf_exp_t4(vf x) {
     p = vf_fma(p, r, vf_set1(1.0f));
     p = vf_fma(p, r, vf_set1(1.0f));
 #if AVX_LEVEL == 3
-    __m512i k = _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
+    __m512i k = _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)),
+                                  23);
     return vf_mul(p, _mm512_castsi512_ps(k));
 #else
-    __m256i k = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    __m256i k = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)),
+                                  23);
     return vf_mul(p, _mm256_castsi256_ps(k));
 #endif
 }

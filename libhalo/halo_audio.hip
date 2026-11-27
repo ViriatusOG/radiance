@@ -242,6 +242,141 @@ __global__ __launch_bounds__(kT) void conv1d_direct_kernel(
     y[(size_t)row * y_ld + co] = f32_to_bf16(acc);
 }
 
+// The tiled form on WMMA, for cin a multiple of 8 and 16 output channels or more:
+// halo_gemm_bf16_nt_tiled's block (eight waves, a (BM/2) x (BN/4) patch a wave, a 64-wide K tile
+// staged through LDS, the next tile's loads in flight under the current WMMA) with its A gathered.
+// K is the (tap, cin) pairs, cin innermost, so a 16-byte chunk of a K tile is eight channels of
+// one tap of one input row: chunk (m, kk) reads x[m * stride + (kk / cin) * dil - pad][kk % cin],
+// zero outside m's sequence and past K (a K that is not whole tiles, 7 x 96). Every load is issued
+// at an address clamped into x and the zero selected after it, as Conv1dRows does. Rows past the
+// last output row or channels past cout re-read a valid one and are never stored. Its sums differ
+// from the direct form's in order only (fp32 WMMA products, one bf16 rounding at the end).
+// `res` may be `y` itself: each element is read by the lane that stores it, before the store.
+template <int TM, int TN>
+__global__ __launch_bounds__(256) void conv1d_wmma_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+    const uint16_t* __restrict__ bias, const uint16_t* res, const int* __restrict__ cu,
+    uint16_t* y, int n_seq, int rows, int x_rows, int cin, int cout, int k, int dil, int pad,
+    int stride, int cdiv, int x_ld, int y_ld, int res_ld, int act) {
+    constexpr int BM = 2 * TM * 16, BN = 4 * TN * 16;
+    constexpr int CPR = C1_BK / 8;                      // 16-byte chunks a staged row
+    constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
+    static_assert(AL >= 1 && WL >= 1 && BM * CPR % 256 == 0 && BN * CPR % 256 == 0,
+                  "a tile is whole 16-byte chunks for every thread");
+    __shared__ __attribute__((aligned(16))) unsigned short sA[BM * C1_PITCH];
+    __shared__ __attribute__((aligned(16))) unsigned short sW[BN * C1_PITCH];
+
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int wm = wave / 4, wn = wave % 4;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int K = k * cin;
+
+    // A chunk keeps its output row for the whole K walk: its sequence bounds and first input row
+    // are found once.
+    int abase[AL], as0[AL], as1[AL], ae[AL];
+    unsigned short* adst[AL];
+#pragma unroll
+    for (int i = 0; i < AL; ++i) {
+        const int c = tid + 256 * i, r = c / CPR, e = (c % CPR) * 8;
+        const int m = m0 + r, mc = m < rows ? m : rows - 1;
+        const int sq = seq_of(cu, n_seq, mc * stride * cdiv);
+        as0[i] = cu[sq] / cdiv;
+        as1[i] = m < rows ? cu[sq + 1] / cdiv : as0[i];   // a row past the end reads zeros
+        abase[i] = mc * stride - pad;
+        ae[i] = e;
+        adst[i] = sA + r * C1_PITCH + e;
+    }
+    unsigned woff[WL];
+    int we[WL];
+    unsigned short* wdst[WL];
+#pragma unroll
+    for (int i = 0; i < WL; ++i) {
+        const int c = tid + 256 * i, r = c / CPR, e = (c % CPR) * 8;
+        const int gr = n0 + r < cout ? n0 + r : cout - 1;
+        woff[i] = (unsigned)gr * (unsigned)K + (unsigned)e;
+        we[i] = e;
+        wdst[i] = sW + r * C1_PITCH + e;
+    }
+    const halo_u32x4 zero = { 0u, 0u, 0u, 0u };
+    auto load_a = [&](int i, int k0) -> halo_u32x4 {
+        const int kk = k0 + ae[i];
+        const int kc = kk < K ? kk : K - 8;
+        const int t = kc / cin, ci = kc - t * cin;
+        const int ir = abase[i] + t * dil;
+        const int irc = ir < 0 ? 0 : (ir >= x_rows ? x_rows - 1 : ir);
+        const halo_u32x4 v = *(const halo_u32x4*)(x + (size_t)irc * x_ld + ci);
+        return kk < K && ir >= as0[i] && ir < as1[i] ? v : zero;
+    };
+    auto load_w = [&](int i, int k0) -> halo_u32x4 {
+        const int kk = k0 + we[i];
+        const halo_u32x4 v = *(const halo_u32x4*)(w + woff[i] + (kk < K ? k0 : K - 8 - we[i]));
+        return kk < K ? v : zero;
+    };
+
+    const unsigned short* fa = sA + (wm * TM * 16 + (lane & 15)) * C1_PITCH;
+    const unsigned short* fw = sW + (wn * TN * 16 + (lane & 15)) * C1_PITCH;
+    v8f acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
+
+    halo_u32x4 ra[AL], rw[WL];
+#pragma unroll
+    for (int i = 0; i < AL; ++i) ra[i] = load_a(i, 0);
+#pragma unroll
+    for (int i = 0; i < WL; ++i) rw[i] = load_w(i, 0);
+    const int nk = (K + C1_BK - 1) / C1_BK;
+    for (int kt = 0; kt < nk; ++kt) {
+        __syncthreads();                                // the previous tile's fragments are read
+#pragma unroll
+        for (int i = 0; i < AL; ++i) *(halo_u32x4*)adst[i] = ra[i];
+#pragma unroll
+        for (int i = 0; i < WL; ++i) *(halo_u32x4*)wdst[i] = rw[i];
+        __syncthreads();
+        if (kt + 1 < nk) {
+            const int k1 = (kt + 1) * C1_BK;
+#pragma unroll
+            for (int i = 0; i < AL; ++i) ra[i] = load_a(i, k1);
+#pragma unroll
+            for (int i = 0; i < WL; ++i) rw[i] = load_w(i, k1);
+        }
+#pragma unroll
+        for (int s = 0; s < C1_BK / 16; ++s) {
+            v16bf af[TM], bf[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) af[i] = fragP(fa + i * 16 * C1_PITCH + s * 16);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) bf[j] = fragP(fw + j * 16 * C1_PITCH + s * 16);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+            __builtin_amdgcn_sched_group_barrier(0x100, TM + TN, 0);    /* DS reads */
+            __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);    /* WMMA */
+        }
+    }
+
+    // Lane l holds column (l & 15) of a tile and rows accRow(l, e).
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+            const int mb = m0 + (wm * TM + i) * 16;
+            if (n >= cout) continue;
+            const float bv = bias ? bf2f(bias[n]) : 0.0f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int m = mb + accRow(lane, e);
+                if (m >= rows) continue;
+                float v = acc[i][j][e] + bv;
+                if (res) v += bf2f(res[(size_t)m * res_ld + n]);
+                y[(size_t)m * y_ld + n] = f32_to_bf16(conv_act(v, act));
+            }
+        }
+}
+
 // ---------------------------------------------------------------------------- conv_t1d
 // The transposed convolution of kernel `taps` s (two taps or one), stride s, padding P
 // ((k - s) / 2, or 0 for the causal form) as s convolutions of `taps` taps, one a grid slice
@@ -1126,13 +1261,31 @@ extern "C" int halo_rad_conv1d(const RadArgs* a, RadStream s) {
      * it on the left less the stride for the causal form, or the explicit `pad`. */
     const int pad = (int)(padded ? pp : (causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2));
     const int cdiv = (int)(padded ? 1 : cd);
-    /* gfx1151 port: libr4d's im2col path for this op is built on the gfx1201 WMMA fragment
-     * (8 x 16-bit a lane); the direct kernel below is the whole convolution and is what runs
-     * here until the tiled form is rebuilt on halo::mma. */
-    const bool tiled = false;   /* see the note above: the tiled im2col form is libr4d's
-                                 * gfx1201 WMMA body and is not ported yet. */
     const uint16_t* rp = res ? (const uint16_t*)res->data : nullptr;
-    (void)tiled;
+    /* The WMMA form (conv1d_wmma_kernel) wherever its 16-byte chunks are aligned whole channel
+     * runs: cin and x's pitch multiples of 8, x 16-byte aligned, 16 output channels or more. The
+     * direct kernel takes the rest (a vocoder's last convolution, one channel out); it was the whole
+     * convolution on gfx1151 before, at ~30 GFLOP/s, 134 ms for one of Breeze-TTS-2's 512-row
+     * 768-channel k7 layers. */
+    const long long x_rows = rx;
+    const bool tiled = cin % 8 == 0 && xl % 8 == 0 && cout >= 16 && x_rows > 0 &&
+                       halo_aligned(x->data, 16) && halo_aligned(w->data, 16) &&
+                       cout * cin * k < (1ll << 32);
+    if (tiled) {
+        const long long g = ((cout + 127) / 128) * ((ry + 127) / 128);
+        const bool big = g >= 32;            /* halo_gemm_bf16_nt_tiled_arm's rule */
+        const int bm = big ? 128 : 64, bn = big ? 128 : 64;
+        const dim3 grid((unsigned)((cout + bn - 1) / bn), (unsigned)((ry + bm - 1) / bm));
+#define C1_LAUNCH(TM, TN)                                                                          \
+        hipLaunchKernelGGL((conv1d_wmma_kernel<TM, TN>), grid, dim3(256), 0, (hipStream_t)s,       \
+                           (const uint16_t*)x->data, (const uint16_t*)w->data, bp, rp,             \
+                           (const int*)cu->data, (uint16_t*)y->data, (int)n_seq, (int)ry,          \
+                           (int)x_rows, (int)cin, (int)cout, (int)k, (int)dil, pad, (int)st,       \
+                           cdiv, (int)xl, (int)yl, (int)rl, act)
+        if (big) C1_LAUNCH(4, 2); else C1_LAUNCH(2, 1);
+#undef C1_LAUNCH
+        return st_of(hipGetLastError());
+    }
     hipLaunchKernelGGL(conv1d_direct_kernel, dim3(blocks_for(ry * cout)), dim3(kT), 0,
                        (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)w->data,
                        bp, rp, (const int*)cu->data, (uint16_t*)y->data,

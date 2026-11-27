@@ -263,7 +263,7 @@ static const std::vector<Case>& cases_qwen3e() {
 static void check_table(const char* name, std::shared_ptr<const Vocab> v,
                         const std::vector<Case>& cases) {
     if (!v) {
-        fprintf(stderr, "  SKIP tokenize_against_llama_cpp[%s]: vocab not available\n", name);
+        radtest::skip("tokenize_against_llama_cpp[%s]: vocab not available", name);
         return;
     }
     Tokenizer t;
@@ -480,14 +480,14 @@ TEST(bytelevel_alphabet_is_exact) {
         CHECK(g >= 0);
         std::vector<int32_t> ids;
         CHECK_OK(t.encode(" ", ids, false, true));
-        CHECK_EQ(ids.size(), (size_t)1);
+        REQUIRE_EQ(ids.size(), (size_t)1);
         CHECK_EQ(ids[0], g);
 
         /* Newline (0x0A) is the eleventh remapped byte, U+010A 'Ċ'. */
         const int32_t nl = nv.v->find("\xc4\x8a");
         ids.clear();
         CHECK_OK(t.encode("\n", ids, false, true));
-        CHECK_EQ(ids.size(), (size_t)1);
+        REQUIRE_EQ(ids.size(), (size_t)1);
         CHECK_EQ(ids[0], nl);
         /* llama.cpp prints it as the LF token, id 198 in Qwen3-Embedding. */
         if (nv.name == "qwen3e") CHECK_EQ(nl, 198);
@@ -555,10 +555,7 @@ TEST(unicode_normalisation) {
 
 TEST(gguf_reader) {
     GgufFile g;
-    if (g.open(gguf_path()) < 0) {
-        fprintf(stderr, "  SKIP gguf_reader: no file at %s\n", gguf_path());
-        return;
-    }
+    if (g.open(gguf_path()) < 0) SKIP("no file at %s", gguf_path());
     CHECK(g.version() >= 2);
     CHECK(!g.kv().empty());
     CHECK(!g.tensors().empty());
@@ -933,7 +930,7 @@ TEST(vocab_section_round_trip) {
     CHECK_EQ(out.add_eos, in.add_eos);
     CHECK_EQ(out.ignore_merges, in.ignore_merges);
     CHECK_EQ(out.chat_template, in.chat_template);
-    CHECK_EQ(out.steps.size(), in.steps.size());
+    REQUIRE_EQ(out.steps.size(), in.steps.size());
     for (size_t i = 0; i < out.steps.size(); ++i) {
         CHECK_EQ(out.steps[i].kind, in.steps[i].kind);
         CHECK_EQ(out.steps[i].flags, in.steps[i].flags);
@@ -948,7 +945,7 @@ TEST(vocab_section_round_trip) {
     CHECK_OK(t.init(v));
     std::vector<int32_t> ids;
     CHECK_OK(t.encode("ab", ids, false, false));
-    CHECK_EQ(ids.size(), (size_t)1);
+    REQUIRE_EQ(ids.size(), (size_t)1);
     CHECK_EQ(ids[0], 3);      /* the merge fired */
 }
 
@@ -978,7 +975,7 @@ TEST(parse_tokenizer_json_chain) {
     CHECK_EQ(vb.merges.size(), (size_t)1);
     CHECK_EQ(vb.types[4], (uint8_t)RAD_TT_CONTROL);
 
-    CHECK_EQ(vb.steps.size(), (size_t)5);
+    REQUIRE_EQ(vb.steps.size(), (size_t)5);
     CHECK_EQ(vb.steps[0].kind, (uint32_t)RAD_NORM_NFC);
     CHECK_EQ(vb.steps[1].kind, (uint32_t)RAD_NORM_REPLACE);
     CHECK_EQ(vb.steps[1].arg0, std::string("  "));
@@ -1087,7 +1084,7 @@ TEST(parse_tokenizer_json_refuses_ids_and_values_it_cannot_place) {
 
     /* A sparse but sane table still loads: the gap is empty text. */
     CHECK_OK(parse_tokenizer_json_buf(bpe(R"({"a": 0, "b": 5})", ""), "test.json", vb));
-    CHECK_EQ(vb.tokens.size(), (size_t)6);
+    REQUIRE_EQ(vb.tokens.size(), (size_t)6);
     CHECK_EQ(vb.tokens[5], std::string("b"));
 }
 
@@ -1114,7 +1111,7 @@ TEST(unigram_viterbi) {
     std::vector<int32_t> ids;
     CHECK_OK(t.encode("hello", ids, false, false));
     /* "_he" (-1) + "llo" (-2) = -3 beats "_h"(-5)+"e"(-6)+... by a wide margin. */
-    CHECK_EQ(ids.size(), (size_t)2);
+    REQUIRE_EQ(ids.size(), (size_t)2);
     CHECK_EQ(ids[0], 2);
     CHECK_EQ(ids[1], 6);
     /* HuggingFace's Metaspace decoder drops the replacement the prepend added on the first
@@ -1266,7 +1263,7 @@ TEST(step_chain_units) {
         CHECK_OK(t.init(make({ n, w })));
         std::vector<int32_t> ids;
         CHECK_OK(t.encode("AB", ids, false, false));
-        CHECK_EQ(ids.size(), (size_t)1);      /* "ab" is one token */
+        REQUIRE_EQ(ids.size(), (size_t)1);      /* "ab" is one token */
         CHECK_EQ(ids[0], 128);
     }
     /* Prepend + Strip. */
@@ -1277,7 +1274,7 @@ TEST(step_chain_units) {
         CHECK_OK(t.init(make({ pre, w })));
         std::vector<int32_t> ids;
         CHECK_OK(t.encode("b", ids, false, false));
-        CHECK_EQ(ids.size(), (size_t)1);
+        REQUIRE_EQ(ids.size(), (size_t)1);
         CHECK_EQ(ids[0], 128);                /* "a" + "b" merged into "ab" */
     }
 }
@@ -1454,11 +1451,11 @@ TEST(decompose_and_compose_are_inverses_over_the_canonical_forms) {
     /* e-acute decomposes to e + combining acute and composes back. */
     std::vector<uint32_t> v = { 0x00E9 };
     unorm_decompose(v, /*compat=*/false);
-    CHECK_EQ(v.size(), 2u);
+    REQUIRE_EQ(v.size(), 2u);
     CHECK_EQ(v[0], (uint32_t)'e');
     CHECK_EQ(v[1], 0x0301u);
     unorm_compose(v);
-    CHECK_EQ(v.size(), 1u);
+    REQUIRE_EQ(v.size(), 1u);
     CHECK_EQ(v[0], 0x00E9u);
 
     /* Canonical ordering is part of decomposition: the two accents come back in ccc order
@@ -1477,7 +1474,7 @@ TEST(decompose_and_compose_are_inverses_over_the_canonical_forms) {
     CHECK_EQ(lig.size(), 1u);                      /* it has no canonical decomposition */
     std::vector<uint32_t> ligk = { 0xFB01 };
     unorm_decompose(ligk, /*compat=*/true);
-    CHECK_EQ(ligk.size(), 2u);
+    REQUIRE_EQ(ligk.size(), 2u);
     CHECK_EQ(ligk[0], (uint32_t)'f');
     CHECK_EQ(ligk[1], (uint32_t)'i');
     /* Composition does not put it back: NFKC is lossy by design. */
@@ -1501,7 +1498,7 @@ TEST(decompose_and_compose_are_inverses_over_the_canonical_forms) {
        folded into whatever precedes it in the buffer. */
     std::vector<uint32_t> lone = { 0x0301 };
     unorm_compose(lone);
-    CHECK_EQ(lone.size(), 1u);
+    REQUIRE_EQ(lone.size(), 1u);
     CHECK_EQ(lone[0], 0x0301u);
 }
 

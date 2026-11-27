@@ -70,7 +70,7 @@ typedef struct RadKVGroupBatch {
     int64_t     max_blocks;
     /* Null unless this group streams (RadKVStream). */
     const RadKVStream* stream;
-    /* ABI 35: host mirror of seqused, retained through this batch for exact sliced-launch bounds. */
+    /* ABI 35: host mirror of seqused, kept through this batch for exact sliced-launch bounds. */
     const int32_t* seqused_h;
 } RadKVGroupBatch;
 
@@ -177,7 +177,7 @@ typedef struct RadBatch {
      * banding the decode half with it would give eight rows a thousand-row GEMM's band.
      *
      * The decode value is read by the GDN blocks and the fp8 gated attention's per-band issue
-     * (rad_block_attn_gated_fp8.h), which also bands its prefill half on the prefill value; the
+     * (rad_block_attn_gated_q.h), which also bands its prefill half on the prefill value; the
      * GDN prefill ops band on the step's total tokens, taken from their operands. */
     int32_t max_q_len_decode;
     int32_t max_q_len_prefill;
@@ -288,7 +288,8 @@ typedef struct RadBatch {
     /* ---- appended in ABI 26 (control vectors) */
     /* Host-side: nonzero when some row of this pass takes the loaded control vector (its
      * `projection_on_rows` entry is 1). A projection skips a zero row anyway, so a block issues
-     * no projection op when this is 0 and the pass is the one a deployment without a vector runs. */
+     * no projection op when this is 0 and the pass is the one a deployment without a vector
+     * runs. */
     int32_t control_vector;
 
     /* ---- appended in ABI 26 (per-segment encoder grids) */
@@ -376,6 +377,12 @@ typedef struct RadBatch {
      * ckpt_cut is 0. */
     int32_t        ckpt_cut;
     const int32_t* ckpt_cu;
+    /* ---- appended in ABI 44 (image-span rows) ---- */
+    /* [n_tok] i32 device: 1 for a token inside an image span (every row of the span -- the aligner
+     * row, image_start, image_end and image_newline), 0 for text. The MoE gate selects experts by
+     * `bias_vl` on those rows and by `bias` elsewhere. Null on a step with no image span, and the
+     * gate then runs its unmasked select. Trailing, so ABI 43's checkpoint fields stay put. */
+    const int32_t* vl_mask;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -420,7 +427,8 @@ typedef struct RadGenBatch {
     int64_t        n_px;
     const void*    px;
     const int32_t* px_h;
-    /* [n_px, 2] each block's own cu_seqlens over its latent tokens: {0, (h / scale) (w / scale)}. */
+    /* [n_px, 2] each block's own cu_seqlens over its latent tokens: {0, (h / scale) (w / scale)}.
+     */
     const int32_t* px_cu;
     int32_t        inpaint;
     /* [image tokens] f32: 1 where the image is repainted, 0 where the picture is kept. */
@@ -515,6 +523,14 @@ typedef struct RadGenBatch {
     /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
      * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
+    /* ---- appended Krea 2 reference attention (release assigns the ABI version) */
+    /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
+     * Finite biases are in [-16, 16]; zero leaves dense attention unchanged.
+     * The driver uses negative infinity internally to isolate outfill reference queries. */
+    const float*   ref_log_bias;
+    /* DENOISE: three timesteps a sequence, one per text/reference/target span.
+     * Registered outfill leaves the source reference at timestep zero. */
+    const float*   mode_sigma;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
@@ -533,7 +549,7 @@ enum {
     RAD_GEN_F_FIRST   = 1,   /* the image's first step: its latent is the noise its seed draws */
     RAD_GEN_F_INPAINT = 2,   /* repaint: after the step, the kept region goes back to the picture,
                               * noised to sigma_next with the image's own noise */
-    RAD_GEN_F_PREVIEW = 4    /* write the step's estimate of the clean latent to the lane's preview */
+    RAD_GEN_F_PREVIEW = 4    /* write the step's clean-latent estimate to the lane's preview */
 };
 
 /* What an audio generator's pass carries beside the step batch's own fields (rad_builder.h,
@@ -818,7 +834,7 @@ enum {
     RAD_ENC_VAUDIO = 3,     /* the soundtrack of reference video `enc_slot`; Aencode */
     RAD_ENC_AUDIO = 4,      /* a standalone soundtrack; Aencode */
     RAD_ENC_KEYFRAME = 5,   /* a first or last frame; Vencode */
-    RAD_ENC_GUIDE = 6       /* a song guide, the soundtrack of a keyframe without a picture; Aencode */
+    RAD_ENC_GUIDE = 6       /* a song guide: a keyframe's soundtrack with no picture; Aencode */
 };
 
 /* RadVideoGenBatch::ref_tab: a reference's kind. */
@@ -893,7 +909,8 @@ typedef struct RadOperand {
  * expert per issue and no copy. */
 #define RAD_WTAB(h, n)      ((RadOperand){ RAD_OPK_WTAB,   RAD_DT_INVALID, (h), 0, 0, (n), 0 })
 #define RAD_KV(g, layer)    ((RadOperand){ RAD_OPK_KV,     RAD_DT_INVALID, (g), 0, (layer), 0, 0 })
-#define RAD_P(ptr)          ((RadOperand){ RAD_OPK_RAW,    RAD_DT_INVALID, 0, (void*)(ptr), 0, 0, 0 })
+#define RAD_P(ptr) \
+    ((RadOperand){ RAD_OPK_RAW, RAD_DT_INVALID, 0, (void*)(ptr), 0, 0, 0 })
 #define RAD_P_T(ptr, dt)    ((RadOperand){ RAD_OPK_RAW,    (dt), 0, (void*)(ptr), 0, 0, 0 })
 /* A raw pointer to a dense 2-D array, [rows, cols], packed. On a raw operand `cols` is the second
  * extent, not a column slice (there is no declared width to slice). This is how a two-dimensional
@@ -1011,13 +1028,13 @@ int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert);
  * in a pinned pool and the device backend can spare a DMA engine; a pass of more than 16 rows
  * makes no prediction. The three calls are no-ops otherwise.
  *
- * `parts` names, for each of the next layer's experts, the weights its unit is made of (at most four,
- * e.g. the gate-up matrix and its scales and the down matrix and its scales), as the routed GEMMs
- * read them through weight tables; 0 where an expert has fewer or none. An expert is prefetched only
- * where each of its weights is in exactly one table and all of them sit in one pool slot. The arrays
- * must outlive the context; the core reads the routing counts only to rank and count, never to choose
- * an expert's bytes. `layer` is the next layer's index as rad_route_report and
- * rad_expert_prefetch_step name it; `router` is its router, [n_expert, n_embd] bf16. */
+ * `parts` names, for each of the next layer's experts, the weights its unit is made of (at most
+ * four, e.g. the gate-up matrix and its scales and the down matrix and its scales), as the routed
+ * GEMMs read them through weight tables; 0 where an expert has fewer or none. An expert is
+ * prefetched only where each of its weights is in exactly one table and all of them sit in one pool
+ * slot. The arrays must outlive the context; the core reads the routing counts only to rank and
+ * count, never to choose an expert's bytes. `layer` is the next layer's index as rad_route_report
+ * and rad_expert_prefetch_step name it; `router` is its router, [n_expert, n_embd] bf16. */
 typedef struct RadPrefetchNext {
     int               layer;
     rad_weight        router;
@@ -1025,7 +1042,8 @@ typedef struct RadPrefetchNext {
     int64_t           n_parts;
     const rad_weight* parts;      /* [n_expert * n_parts] */
     const int32_t*    count_at;   /* [n_expert]: where the expert's count is in the layer's routing
-                                     counts (rad_route_counts), -1 for nowhere; null when at its index */
+                                     counts (rad_route_counts), -1 for nowhere; null when each
+                                     expert's count is at its own index */
 } RadPrefetchNext;
 
 /* At this layer's router input: `h` rows [r0, r0 + rows) of n_embd bf16, read in place on another

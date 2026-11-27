@@ -8,7 +8,7 @@
  * Elsewhere the previous block issues its own `all_reduce` and this norm issues `add` then
  * `rmsnorm`: the three ops as before.
  *
- * The bf16 counterpart of rad_fp8.h's NormQuantFP8 fold. The previous block asks takes_ar() on the
+ * The bf16 counterpart of rad_linear.h's NormQuant fold. The previous block asks takes_ar() on the
  * same rows before skipping its collective (its `ar_out`), so both decide on ar_wire_is_exact.
  * Where the folds go is layer_fold()'s rule, as for the fp8 trunk.
  */
@@ -16,7 +16,7 @@
 #define RAD_NORM_BF16_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"   /* ar_wire_is_exact */
+#include "rad_linear.h"   /* ar_wire_is_exact */
 
 namespace rad {
 namespace arch {

@@ -106,6 +106,8 @@ set(R4D_UNITS
   "r4d_vit_bf16|"
   # Muse Glimmer's vision-tower coordinate ops: grid_embed_pad, window_order.
   "r4d_vit_muse|"
+  # The position table resampled to a grid as a table of its own (the vision tower's grid change).
+  "r4d_posemb|"
   # The same biased GEMM over f32 operands (a diffusion transformer's patch projections and heads,
   # a video decoder's 1x1 projections), on the f32 FMA tile r4d_audio's f32 convolutions share.
   "r4d_gemm_f32_nt_bias|"
@@ -161,10 +163,10 @@ set(R4D_UNITS
   "r4d_gemm_mxfp4a8_tiled|"
   "r4d_gemm_mxfp4a8_decode|"
   "r4d_gemm_mxfp4a8_gemv|"
-  # Block-scaled FP8 (the format Qwen3.8-27B-FP8 ships in). The 128x128 block is fixed by the
-  # checkpoint, and the entry points reject a mismatch.
-  "r4d_gemm_fp8a16_nt_m1|"
-  "r4d_gemm_fp8a8|"
+  # The int8 fragment-order GEMMs and the 8-bit lm_head. The scale group is fixed at 128 (256 at
+  # IQ8R), and the entry points reject a mismatch.
+  "r4d_logits_gemm_i8|"
+  "r4d_gemm_i8a8|"
   "r4d_gemm_iqr|"
   "r4d_gemm_iqr_p1|"
   "r4d_gemm_iqr_p2|"
@@ -173,8 +175,8 @@ set(R4D_UNITS
   "r4d_iqr_embed|"
   "r4d_logits_vocab|"
   "r4d_quant_act_fp8|"
-  "r4d_fused_quant_fp8|"
-  "r4d_gram_accum_fp8|"
+  "r4d_fused_quant|"
+  "r4d_gram_accum|"
   "r4d_qsa_block_key_bf16|"
   "r4d_qsa_score_bf16|"
   "r4d_qsa_select_bf16|"
@@ -188,6 +190,7 @@ set(R4D_UNITS
   "r4d_sample_ngram_f32|"
   "r4d_quant_act_i8|"
   "r4d_rmsnorm_quant_i8|"
+  "r4d_ar_mhc_pcn|"
   "r4d_qkv_norm_rope|"
   # A batch's context lengths less a runtime trim (the 31B's per-slice prefill attention).
   "r4d_kv_len_trim|"
@@ -198,8 +201,6 @@ set(R4D_UNITS
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"
   "r4d_gated_had_quant_i8|"
-  # gated_quant_i8: the unrotated grouped int8 sibling, one workgroup a row for any row count.
-  "r4d_gated_quant_i8|"
   "r4d_qk_norm_rope_gate|"
   "r4d_gdn_gated_norm_had_quant_i8|"
   "r4d_dequant_w4_bf16|"
@@ -225,13 +226,30 @@ set(R4D_UNITS
   "r4d_dflash_select_bf16|"
   "r4d_dflash_markov_bf16|"
   "r4d_dflash_tree_bf16|"
-  # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
+  # Routed MoE: router, scatter, the grouped expert GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
-  # NVFP4 experts against an int8 activation: a plain per-column kernel (no WMMA).
-  "r4d_moe_nvfp4|"
+  # Inkling 2 loop controller and plane-copy fusions (device-only).
+  "r4d_inkling|"
+  # The GEMMs over llama.cpp's native blocks (GGUF imports): gemm_nt_ggml, moe_gemm_ggml,
+  # logits_gemm_ggml and embed_lookup_ggml.
+  "r4d_ds41_ggml|"
+  # gemm_nt_ggml / logits_gemm_ggml at decode heights over IQ2_XXS and Q8_0 blocks: the bf16 WMMA
+  # with the weight as the B operand (called from r4d_ds41_ggml's gg_gemm).
+  "r4d_ggml_wmma|"
   # Blocks a row keeps for an output buffer, freed with the memory they serve (r4d_keyed.h).
   "r4d_keyed|"
+  # DeepSeek-V4.1-Flash: the elementwise and small ops, and the sparse attention and its indexer.
+  "r4d_ds41_elem|"
+  "r4d_ds41_sparse|"
+  # gemm_nt_ggml / logits_gemm_ggml's decode band in the multi-row form (every weight block dequantised once for
+  # all the call's rows, the stock kernel's bits), taken at the shapes of the measured table where it is faster; the
+  # wave64 unit is the same source compiled -mwavefrontsize64, reached only through its bench pin.
+  "r4d_ds41_ggml_mr|"
+  "r4d_ds41_ggml_mr64|-mwavefrontsize64"
+  # The DSpark Markov walk over the whole vocabulary, a step on a vocabulary shard (dspark_walk_step); declared by
+  # deepseek41 only with the `dspark-walk` setting on.
+  "r4d_ds41_walk|"
 )
 
 set(R4D_SRC "")
@@ -264,11 +282,24 @@ rad_simd_level_objects(r4d_hsimd ${CMAKE_CURRENT_SOURCE_DIR}/r4d_hsimd_kernels.c
                        DEFINE R4D_HSIMD_LEVEL INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
 list(APPEND R4D_DECLARATION ${R4D_HSIMD_OBJS})
 
+# The native-block GEMMs' layout (planes -> llama.cpp's blocks) uses libquant's one definition of the
+# blocks, compiled in when libquant's sources are beside libr4d (in radiance's tree).
+set(R4D_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+if(EXISTS ${R4D_GGML_DIR}/lq_ggml_planes.cpp)
+  list(APPEND R4D_DECLARATION r4d_ds41_ggml_layout.cpp ${R4D_GGML_DIR}/lq_ggml_planes.cpp
+       ${R4D_GGML_DIR}/lq_ggml_dequant.cpp ${R4D_GGML_DIR}/lq_ggml_tables.cpp)
+  set(R4D_HAVE_GGML 1)
+endif()
+
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}
   HIP_SOURCES ${R4D_SRC}
   GPU_TARGETS ${R4D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
+if(R4D_HAVE_GGML)
+  target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
+  target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})
+endif()
 
 # Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
 # catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol

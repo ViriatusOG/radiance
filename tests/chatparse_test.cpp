@@ -213,7 +213,7 @@ TEST(rendered_replies_read_back_identically_under_every_request) {
                                     "\n" + compare(*b, reply).detail);
                 const ReplyMessage r = b->new_parse(reply);
                 const size_t ncalls = msg.contains("tool_calls") ? msg["tool_calls"].size() : 0;
-                CHECK_EQ(r.calls.size(), ncalls);
+                REQUIRE_EQ(r.calls.size(), ncalls);
                 for (size_t k = 0; k < std::min(ncalls, r.calls.size()); ++k) {
                     const json& want = msg["tool_calls"][k]["function"];
                     CHECK_EQ(r.calls[k].name, want["name"].get<std::string>());
@@ -989,6 +989,58 @@ TEST(a_required_call_grammar_is_the_whole_reply) {
     log_set_level(Log::Warn);
 }
 
+/* Tool names that differ only in punctuation spell one rule name; each call still reaches its own
+ * tool's rule. */
+TEST(tools_named_alike_keep_their_own_grammar_rules) {
+    log_set_level(Log::Error);
+    static const SimpleVocab vocab = [] {
+        SimpleVocab v;
+        for (int c = 32; c < 127; ++c) v.add(std::string(1, (char)c));
+        v.add("\n");
+        return v;
+    }();
+    auto tool = [](const char* name, const char* param) {
+        json props = json::object(), params = json::object(), fn = json::object(),
+             t = json::object();
+        props[param] = { { "type", "string" } };
+        params["type"] = "object";
+        params["properties"] = props;
+        params["required"] = json::array({ param });
+        fn["name"] = name;
+        fn["parameters"] = params;
+        t["type"] = "function";
+        t["function"] = fn;
+        return t;
+    };
+    const json tools = json::array({ tool("get_user", "id"), tool("get-user", "label") });
+    int checked = 0;
+    for (const Model& m : models()) {
+        Bench* b = bench(m, ChatRequest{});
+        if (!b || b->prompt().grammar.empty()) continue;
+        const std::string gp = b->prompt().generation_prompt;
+        ChatGrammarRequest gq;
+        gq.tools = &tools;
+        gq.generation_prompt = gp;
+        gq.require_call = true;
+        ChatGrammar g;
+        std::string why;
+        CHECK_OK(chat_format_grammar(b->format(), gq, &g, &why));
+        auto admits = [&](const std::string& reply) {
+            std::unique_ptr<GbnfGrammar> x;
+            std::string err;
+            if (GbnfGrammar::create(g.text, "root", &vocab, false, {}, {}, &x, &err) < 0) return -1;
+            if (x->accept_str(gp) < 0 || x->accept_str(reply) < 0) return 0;
+            return x->complete() ? 1 : 0;
+        };
+        const std::string T = "Thinking it over.\n</think>\n\n";
+        CHECK_EQ(admits(T + C(m, "get_user", { { "id", "7" } })), 1);
+        CHECK_EQ(admits(T + C(m, "get-user", { { "label", "bob" } })), 1);
+        ++checked;
+    }
+    CHECK(checked > 0);
+    log_set_level(Log::Warn);
+}
+
 /* ================================================================== the description */
 
 TEST(the_derived_formats_are_the_ones_in_service) {
@@ -1385,7 +1437,7 @@ TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
             CHECK_EQ(content, want.content);
             CHECK_EQ(reasoning, want.reasoning);
             CHECK_EQ(p.content, want.content);
-            CHECK_EQ(names.size(), want.calls.size());
+            REQUIRE_EQ(names.size(), want.calls.size());
             for (size_t k = 0; k < std::min(names.size(), want.calls.size()); ++k) {
                 CHECK_EQ(names[k], want.calls[k].name);
                 CHECK_EQ(args[k], want.calls[k].arguments);
@@ -2149,6 +2201,54 @@ TEST(deepseek41_reads_the_dsml_its_encoder_writes) {
     CHECK_OK(chat_format_grammar(f, gq, &gr, &why));
     CHECK(gr.lazy);
     CHECK(gr.trigger_words == std::vector<std::string>{ "<｜DSML｜ calls>" });
+}
+
+TEST(deepseek41_reads_unconstrained_dsml_tags) {
+    /* A reply the model writes unconstrained: prose, then a bare tool-name opener, the model's
+     * DSML marker on the argument tags, and no `invoke` prefix on the first call. The format
+     * grammar opens a call only at name_prefix, so the reader has to recover this shape after
+     * finish(). */
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(rad::arch::deepseek41_chat_format(), &f, &why));
+    CHECK_OK(chat_format_check(f, &why));
+    const json tools = json::parse(R"([
+      {"type":"function","function":{"name":"skill_view","parameters":{"type":"object",
+       "properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},
+      {"type":"function","function":{"name":"read_file","parameters":{"type":"object",
+       "properties":{"limit":{"type":"integer"}},"required":["limit"]}}}])");
+    ReplyOptions ro;
+    ro.tools = &tools;
+    ro.generation_prompt = "</think>";
+    const auto chat = parser_of(f, ro);
+    REQUIRE(chat != nullptr);
+    const std::string D = "\xEF\xBD\x9C" "DSML" "\xEF\xBD\x9C";
+    const std::string reply =
+        "Looking at the template.\n"
+        "<skill_view\">\n"
+        "<" + D + " parameter name=\"file_path\" string=\"true\">/home/don/x</" + D + " parameter>\n"
+        "</invoke>\n"
+        "<" + D + " invoke name=\"read_file\">\n"
+        "<" + D + " parameter name=\"limit\" string=\"false\">40</" + D + " parameter>\n"
+        "</invoke>\n"
+        "</calls>";
+    const ReplyMessage m = reply_parse(*chat, reply);
+    CHECK_EQ(m.content, std::string("Looking at the template."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].name, std::string("skill_view"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"file_path\":\"/home/don/x\"}"));
+    CHECK_EQ(m.calls[1].name, std::string("read_file"));
+    CHECK_EQ(m.calls[1].arguments, std::string("{\"limit\":40}"));
+    CHECK(m.calls[0].closed && m.calls[1].closed);
+
+    /* With no section close every call is cut out of the content, and a reply that ends inside
+     * the last `</invoke` is read without running past its end. */
+    const std::string open_ended = reply.substr(0, reply.size() - std::string("</calls>").size());
+    for (const std::string& text : { open_ended, open_ended.substr(0, open_ended.size() - 2) }) {
+        const ReplyMessage o = reply_parse(*chat, text);
+        CHECK_EQ(o.content, std::string("Looking at the template."));
+        CHECK_EQ(o.calls.size(), size_t(2));
+    }
 }
 
 TEST(json_arguments_behind_a_name_tag_read_as_one_object) {

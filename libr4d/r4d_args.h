@@ -232,9 +232,9 @@ enum {
     R4D_MXFP4_GROUP = 32, /* K per E8M0 exponent, fixed by the OCP MX format      */
     /* The block-scaled fp8 family's block, on both axes. Not a quantiser choice: it is the
      * checkpoint's `quantization_config.weight_block_size`, and the bytes on disk follow it. It
-     * cannot be static_asserted against `r4d_gemm_fp8a8_block()` (a function, not a macro), so
-     * r4d_gemm_fp8a8.hip checks it at launch. */
-    R4D_FP8_BLOCK = 128,
+     * cannot be static_asserted against `r4d_gemm_i8a8_group()` (a function, not a macro), so
+     * r4d_gemm_i8a8.hip checks it at launch. */
+    R4D_I8_GROUP = 128,
     /* IQR's 8-bit format (IQ8R): int8 codes rotated 128 wide, one bf16 scale per row per 256 of K
      * against an int8 activation with one f32 scale per (token, 256). Twice the int8 block, so a
      * fold covers two 128-wide rotation blocks. */
@@ -262,9 +262,6 @@ enum {
      * codes' low four bits (the magnitude), then the sign bits, one dword per 32 elements in the order the
      * kernel merges them (r4d_layout.cpp, moew5_row). A row is 5K/8 bytes. */
     R4D_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8,
-    /* The M2XFP4 GEMMs' stored weight: R4D_DT_MXFP4_FRAG's fragment-order e2m1 codes, then the
-     * [K/32][N] meta plane the kernel reads beside the E8M0 exponents (r4d_layout.cpp, m2xfp4). */
-    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9,
     /* Six-bit expert codes: row-major permuted low nibbles followed by the transposed fifth
      * magnitude bit and sign bit, one dword per 32 elements in each bit plane. */
     R4D_DT_MOEW6      = RAD_DT_PLUGIN_BASE + 10,

@@ -37,15 +37,15 @@ typedef struct RadMtpCoupleState {
     int32_t  status, round, x, count;
     int32_t  ids[8];
     double   q[8];
-    /* The node drafted `nkids` children, sampled without replacement from q, and ids[0 .. nkids) are
-     * them in draft order (x == ids[0]; ids[nkids .. count) the rest of the support). nkids <= 1 is
-     * the linear chain's single draw, whose ids keep the shortlist's order, and what the serial
-     * MTP head writes (abi/rad_mtp_rrs.h states the siblings' law; the traversal walk of
+    /* The node drafted `nkids` children, sampled without replacement from q, and ids[0 .. nkids)
+     * are them in draft order (x == ids[0]; ids[nkids .. count) the rest of the support).
+     * nkids <= 1 is the linear chain's single draw, whose ids keep the shortlist's order, and what
+     * the serial MTP head writes (abi/rad_mtp_rrs.h states the siblings' law; the traversal walk of
      * abi/rad_mtp_traversal.h reads it). Zero from every writer that is not a sibling draw. */
     int32_t  nkids;
     /* The sibling scheme of those children: 0 = Gumbel-top-k without replacement (the only one a
-     * writer in this engine produces), m + 1 = RheoSampling's m deterministic top-q children plus one
-     * sampled from the tail law (abi/rad_mtp_rrs.h). Zero from every other writer. */
+     * writer in this engine produces), m + 1 = RheoSampling's m deterministic top-q children plus
+     * one sampled from the tail law (abi/rad_mtp_rrs.h). Zero from every other writer. */
     int32_t  scheme;
     /* --draft-verify block (abi/rad_mtp_block.h): the length g of the block this row's chain is
      * verified as one (the rows 0 .. g-1 bound to rounds 1 .. g, staged on every row of it); 0 for
@@ -118,7 +118,8 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_state_valid(const RadMtpCoupleS
         has_x |= s.ids[i] == s.x;
     }
     if (s.nkids < 0 || s.nkids > s.count || (s.nkids >= 2 && s.ids[0] != s.x)) return false;
-    if (s.scheme < 0 || s.scheme > RAD_MTP_COUPLE_MAX_RHEO_M + 1 || (s.scheme && s.nkids >= 1 && s.ids[0] != s.x))
+    if (s.scheme < 0 || s.scheme > RAD_MTP_COUPLE_MAX_RHEO_M + 1 ||
+        (s.scheme && s.nkids >= 1 && s.ids[0] != s.x))
         return false;
     return has_x && (sum - 1) <= 1e-12 && (1 - sum) <= 1e-12;
 }
@@ -199,9 +200,9 @@ static inline RAD_SPECHUB_HD int rad_mtp_couple_pick(const RadMtpCoupleState& s,
 
 /* Residual mass r(y) = max(0, P(y) - Q(y)) of one candidate. Q tokens use their P aggregated over
  * duplicate candidates, counted once at the first occurrence (`seen`). */
-static inline RAD_SPECHUB_HD double rad_mtp_couple_mass(const RadMtpCoupleState& s, const double* pq,
-                                                        int32_t id, float v, float top, double sum,
-                                                        unsigned* seen) {
+static inline RAD_SPECHUB_HD double rad_mtp_couple_mass(const RadMtpCoupleState& s,
+                                                        const double* pq, int32_t id, float v,
+                                                        float top, double sum, unsigned* seen) {
     if (id < 0 || v == -INFINITY) return 0;
     for (int k = 0; k < s.count; ++k)
         if (s.ids[k] == id) {
@@ -297,14 +298,15 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_decide(const RadMtpCoupleState&
  *           ids are in the vocabulary (rad_mtp_couple_build_q), x_l ~ Q_l at the draw's
  *           (seed, base, KEY_DRAFT + l + 1), and pid = x_l for position l + 1.
  *
- * Q_l depends on the committed text (through the drafter's pass and the anchor) and on x_0..x_{l-1},
- * never on the target's verification, and it is stored exactly in the state row the verify reads,
- * which is all the maximal coupling needs to be exact (rad_mtp_couple_decide). The pairwise term is
- * what makes Q_l follow the walk's own earlier samples rather than the drafter's marginal.
+ * Q_l depends on the committed text (through the drafter's pass and the anchor) and on
+ * x_0..x_{l-1}, never on the target's verification, and it is stored exactly in the state row the
+ * verify reads, which is all the maximal coupling needs to be exact (rad_mtp_couple_decide). The
+ * pairwise term is what makes Q_l follow the walk's own earlier samples rather than the drafter's
+ * marginal.
  *
  * Bit-identical on host and device: each candidate's edge is RAD_DFLASH_EDGE_PARTS partial sums,
- * each a serial fmaf chain over a contiguous slice of the rank, added in order and then to the unary
- * score. The plugin builds with -ffp-contract=off, so nothing else is fused. */
+ * each a serial fmaf chain over a contiguous slice of the rank, added in order and then to the
+ * unary score. The plugin builds with -ffp-contract=off, so nothing else is fused. */
 #define RAD_DFLASH_EDGE_PARTS 8
 #define RAD_DFLASH_COUPLE_MAX_K 32
 #define RAD_DFLASH_COUPLE_MAX_R 512
@@ -337,11 +339,9 @@ static inline RAD_SPECHUB_HD float rad_dflash_edge_part(const float* a, const ui
  *
  * The eight are taken in descending score, ties to the lower index, among candidates with an id
  * in [0, vocab); a NaN score is never taken (build_q would refuse it). */
-static inline RAD_SPECHUB_HD int32_t rad_dflash_couple_step(const float* sc, const int32_t* id,
-                                                            int K, float q_temp,
-                                                            const RadMtpCoupleDraw& d, bool card_ok,
-                                                            int round, int64_t vocab,
-                                                            int32_t greedy_x, RadMtpCoupleState* s) {
+static inline RAD_SPECHUB_HD int32_t rad_dflash_couple_step(
+    const float* sc, const int32_t* id, int K, float q_temp, const RadMtpCoupleDraw& d,
+    bool card_ok, int round, int64_t vocab, int32_t greedy_x, RadMtpCoupleState* s) {
     s->draw = d;
     s->pos = 0;
     s->round = round;
@@ -424,7 +424,8 @@ static inline void rad_dflash_couple_walk(const int32_t* cand, const float* unar
                 sc[c] = un[c] + acc;
             }
         }
-        pid = rad_dflash_couple_step(sc, id, K, q_temp, d, card_ok, (int)l + 1, vocab, tokens[l], s);
+        pid = rad_dflash_couple_step(sc, id, K, q_temp, d, card_ok, (int)l + 1, vocab, tokens[l],
+                                     s);
         tokens[l] = pid;
     }
 }

@@ -28,6 +28,11 @@ int gpu_set_devices(const int* ids, int n);
 /* Whether gpu_set_devices named any card. */
 bool gpu_enabled();
 
+/* The cards gpu_set_devices named: count, and id at index i (or -1). The GGML path uses these to
+ * give each converter worker one card; a host-only build reports zero. */
+int gpu_device_count();
+int gpu_device(int index);
+
 /* gptq_quantise over a trellis grid (lq_gptq.cpp's gptq_quantise_tcq) on the cards: the same
  * codes, the same decoded `w` and the same `scales`. RAD_OK, or a failure with the reason in
  * *why; nothing is written to `codes` then. */

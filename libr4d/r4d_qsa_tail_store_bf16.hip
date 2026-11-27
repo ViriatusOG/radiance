@@ -17,7 +17,7 @@
 // writing all of a prefill chunk would race. The last `ring` positions hit distinct rows, giving
 // what a token-by-token loop would leave; older tokens' blocks are built from the chunk itself.
 //
-// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a RAD status rather than throwing, for the reason given in r4d_gemm_i8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"
@@ -31,11 +31,14 @@ namespace {
 
 constexpr int kThreads = 256;
 
+/* A store that moves element bits: E is uint16_t for bf16, uint32_t for f32 (a compressor that keeps
+ * its window state at full precision). */
 #define QSA_TAIL_STORE_PARAMS                                                                   \
-    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,                            \
+    const E* __restrict__ k, const int32_t* __restrict__ pos,                                   \
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,                           \
-    uint16_t* __restrict__ state, int T, int n, int ring, int seqs, int slots, int k_ld,        \
+    E* __restrict__ state, int T, int n, int ring, int seqs, int slots, int k_ld,               \
     int s_slot, int s_row, int sidx_ld
+template <typename E>
 __device__ __forceinline__ void qsa_tail_store_body(QSA_TAIL_STORE_PARAMS) {
 
     const int t = (int)blockIdx.x;
@@ -63,12 +66,12 @@ __device__ __forceinline__ void qsa_tail_store_body(QSA_TAIL_STORE_PARAMS) {
 
 /* The kernel around the body, whose blocks and threads return where their work ends: CH `r4dchain`
  * is the chained form (r4d_chain.h). */
-template <class CH>
+template <class CH, typename E>
 __global__ __launch_bounds__(kThreads)
 void qsa_tail_store_kernel(QSA_TAIL_STORE_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    qsa_tail_store_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row,
-                        sidx_ld);
+    qsa_tail_store_body<E>(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row,
+                           sidx_ld);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_TAIL_STORE_PARAMS
@@ -83,7 +86,7 @@ void qsa_tail_store_kernel(QSA_TAIL_STORE_PARAMS) {
 //                                keep their contents
 static int r4d_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, long state, int T,
                                        int n, int ring, int seqs, int slots, int k_ld, int s_slot,
-                                       int s_row, int sidx_ld, RadStream stream,
+                                       int s_row, int sidx_ld, bool wide, RadStream stream,
                                        bool chain) {
     if (!k || !pos || !cu || !sidx || !state) return R4D_NO(RAD_E_INVAL);
     if (T <= 0 || n <= 0 || ring <= 0 || seqs <= 0 || slots <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -91,11 +94,12 @@ static int r4d_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, lo
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
     /* Each form named at its own launch: a test reads the kernel a launch site names. */
-#define R4D_QTAIL(CH_)                                                                          \
-    R4D_EMIT(stream, qsa_tail_store_kernel<CH_>, dim3((unsigned)T), dim3(kThreads), 0,          \
-             (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu, (const int32_t*)sidx, \
-             (uint16_t*)state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld)
-    const int rc = chain ? R4D_QTAIL(r4dchain) : R4D_QTAIL(R4dUnchained);
+#define R4D_QTAIL(CH_, E_)                                                                      \
+    R4D_EMIT(stream, (qsa_tail_store_kernel<CH_, E_>), dim3((unsigned)T), dim3(kThreads), 0,    \
+             (const E_*)k, (const int32_t*)pos, (const int32_t*)cu, (const int32_t*)sidx,       \
+             (E_*)state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld)
+    const int rc = wide ? (chain ? R4D_QTAIL(r4dchain, uint32_t) : R4D_QTAIL(R4dUnchained, uint32_t))
+                        : (chain ? R4D_QTAIL(r4dchain, uint16_t) : R4D_QTAIL(R4dUnchained, uint16_t));
 #undef R4D_QTAIL
     return rc;
 }
@@ -131,11 +135,12 @@ extern "C" int r4d_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
     if (sxp < 1 || r4d_dim(sx, 0) < seqs) return R4D_NO(RAD_E_SHAPE);
     const long long kp = r4d_row_pitch(k);
     if (kp < 0) return R4D_NO(RAD_E_STRIDE);
-    if (k->dtype != RAD_BF16 || st->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if ((k->dtype != RAD_BF16 && k->dtype != RAD_F32) || st->dtype != k->dtype)
+        return R4D_NO(RAD_E_DTYPE);
     return r4d_qsa_tail_store_bf16_emit(r4d_addr(k), r4d_addr(po), r4d_addr(cu), r4d_addr(sx),
                                         r4d_addr(st), (int)T, (int)n, (int)ring, (int)seqs,
                                         (int)st->shape[0], (int)kp, (int)st->stride[0],
-                                        (int)st->stride[2], (int)sxp, stream,
+                                        (int)st->stride[2], (int)sxp, k->dtype == RAD_F32, stream,
                                         r4d_geti_or(a, "chain", 0) != 0);
 }
 

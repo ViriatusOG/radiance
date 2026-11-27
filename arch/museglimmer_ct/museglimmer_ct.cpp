@@ -13,7 +13,7 @@
  *
  * Rotated i8a8h trunks are whole-trunk forms, detected from layer 0's q projection before any
  * activation is declared. IQ8R uses a 256-column scale group; computed-trellis IQR (including
- * IQ4R-V4) uses 128. Both reuse LinearFP8's encoding-aware IQR views and GEMMs. The two centered
+ * IQ4R-V4) uses 128. Both reuse LinearQ's encoding-aware IQR views and GEMMs. The two centered
  * pre-norms produce rotated int8 pairs, the gated product produces the down-projection pair, and
  * o_proj quantises its gated attention input. q, gate, k and v share one pair. Every trunk linear
  * must use the same rotated family; mixed encodings fail at declaration with the offending name.
@@ -23,15 +23,15 @@
  * kernel. The drafter reads the same declared head.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 #include <arch/rad_block_museglimmer_vision.h>
 #include <arch/rad_block_muse_dflash.h>
 #include <arch/rad_calib_full.h>
 #include <arch/rad_museglimmer_chat.h>
 #include "../museglimmer/dflash2.h"
 
-#include <cmath>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace museglimmer_ct {
@@ -44,12 +44,6 @@ using namespace rad::arch;
  * qk_scale_factor on the query; a weightless embedding norm; a plain-gain final norm carrying
  * output_multiplier before the tanh softcap.
  */
-
-/* ---- the checkpoint's config. A multimodal model keeps the trunk under `text_config.`; accept
- * the bare spelling too, so a text-only GGUF container of the same family reads the same way. */
-namespace {
-
-}  // namespace
 
 /* ---- one trunk linear, encoding-aware. The gemma3 G3Linear shape with gemma4_bf16's grids: the
  * weight's container encoding picks the op.
@@ -88,17 +82,6 @@ struct MlLinear {
     bool       a4 = false;
     bool       w5 = false;      /* true with a4: the same grid at five bits */
     bool       grouped() const { return i8g || a4; }
-    /* Block-scaled fp8 (fp8_e4m3 codes, a bf16 scale per [128 x 128]) or OCP-MXFP4 (e2m1 codes, an
-     * e8m0 exponent per [1 x 32]), read by gemm_nt_q at fp8a8 / mxfp4a8 over an E4M3 activation
-     * pair. These are what NVIDIA's ModelOpt NVFP4 release leaves behind once the recipe imports
-     * its FP8 projections and makes its NVFP4 MLPs MXFP4. */
-    bool       fp8b = false;
-    bool       mx = false;
-    bool       fp8_f32 = false; /* block fp8 with an f32 rather than a bf16 weight scale */
-    rad_weight wref = 0;        /* mx: the e8m0 plane again as the per-row reference operand */
-    rad_buf    fq = 0, fs = 0;  /* the E4M3 activation pair the quantiser writes */
-    /* the pair's scales a row: one, or one per 128 columns */
-    int64_t    scale_w() const { return grouped() ? K / RAD_FP8_BLOCK : 1; }
     rad_buf    in = 0;            /* the bf16 input row `a` given at declare */
     static constexpr int64_t kA4Split = 64;
     int64_t    a4_split = 0;      /* rows up to which op_dec serves; 0: no decode band */
@@ -139,97 +122,24 @@ inline int MlLinear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
     if (plain) {
         w = decl_w(b, wn, RAD_BF16, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, 0, row_parts);
         if (!w) return RAD_E_INVAL;
-        op = rw(b, RAD_OP(b, "gemm_nt",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_WEIGHTS(w)),
-                { a }, { y });
+        op = decl_gemm_nt(b, g, N, K, w, a, y);
         return op ? RAD_OK : RAD_E_INVAL;
     }
 
-    const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
-    const RadEncPlane* zp = rad_enc_plane(&enc, "zero");
     const uint32_t cdt = known && enc.n_planes > 0 ? enc.plane[0].dtype : 0;
-    quant = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
-            (cdt == RAD_I4 || cdt == RAD_I8) && enc.plane[0].block[1] == 1 &&
-            sc && sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == 128;
+    quant = known && linear_is_grid_w4(enc);
     i8g = known && linear_is_w8(enc);
-    a4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 3 && !enc.transform[0] &&
-         (cdt == RAD_U4 || cdt == RAD_U5) && enc.plane[0].block[1] == 1 &&
-         sc && sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK && zp &&
-         zp->dtype == RAD_U8 && zp->block[0] == 1 && zp->block[1] == RAD_FP8_BLOCK;
+    a4 = known && (linear_is_asym(enc, RAD_U4) || linear_is_asym(enc, RAD_U5));
     w5 = a4 && cdt == RAD_U5;
-    fp8b = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
-           cdt == RAD_F8E4M3 && enc.plane[0].block[1] == 1 &&
-           sc && (sc->dtype == RAD_BF16 || sc->dtype == RAD_F32) &&
-           sc->block[0] == RAD_FP8_BLOCK && sc->block[1] == RAD_FP8_BLOCK;
-    fp8_f32 = fp8b && sc && sc->dtype == RAD_F32;
-    mx = known && linear_is_mxfp4(enc);
     /* Block fp8 and MXFP4 are forms this build does not serve, in any plugin. */
     if (known)
         if (const char* gone = linear_retired(enc)) return linear_refuse_retired(base, gone);
 
-    if (fp8b || mx) {
-        if (N % 16 || K % RAD_FP8_BLOCK) {
-            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a %s weight takes rows in 16s "
-                            "and K in whole %d-column activation scale groups\n", base,
-                    (long long)N, (long long)K, mx ? "MXFP4" : "block fp8", RAD_FP8_BLOCK);
-            return RAD_E_INVAL;
-        }
-        const char* sn = nm.f("%s.scale", base);
-        if (mx) {
-            w    = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, RAD_ACCESS_PER_TOKEN,
-                             shard, grp, parts, np);
-            ws   = decl_view(b, sn, wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
-                             RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
-            wref = decl_view(b, nm.f("%s.ref", base), wn, "scale", RAD_E8M0,
-                             { N, K / RAD_MX_GROUP }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
-            if (!w || !ws || !wref) return RAD_E_INVAL;
-        } else {
-            w  = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K }, RAD_ACCESS_PER_TOKEN,
-                           shard, grp, parts, np);
-            ws = decl_view(b, sn, wn, "scale", fp8_f32 ? RAD_F32 : RAD_BF16,
-                           { fp8_blocks(N), fp8_blocks(K) },
-                           RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
-            if (!w || !ws) return RAD_E_INVAL;
-        }
-        if (in_from && in_from->fp8b == fp8b && in_from->mx == mx && in_from->fq &&
-            in_from->K == K) {
-            fq = in_from->fq;
-            fs = in_from->fs;
-            shared_in = true;
-        } else {
-            fq = decl_b(b, nm.f("%s.q8", base), RAD_F8E4M3, { g.max_tok, K });
-            fs = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, K / RAD_FP8_BLOCK });
-            if (!fq || !fs) return RAD_E_INVAL;
-            /* quant_act_fp8: the E4M3 codes and an f32 scale per (row, 128), which the fp8a8 and
-             * mxfp4a8 GEMMs read. */
-            op_q = rw(b, RAD_OP(b, "quant_act_fp8",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
-                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-                    { a }, { fq, fs });
-            if (!op_q) return RAD_E_INVAL;
-        }
-        op = mx ? rw(b, RAD_OP(b, "gemm_nt_q",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
-                        RAD_WEIGHTS(w, ws, wref)),
-                    { fq, fs }, { y })
-                : rw(b, RAD_OP(b, "gemm_nt_q",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_INT("group", RAD_FP8_BLOCK),
-                                   RAD_STR("dtype", fp8_f32 ? "fp8a8f32" : "fp8a8")),
-                        RAD_WEIGHTS(w, ws)),
-                    { fq, fs }, { y });
-        return op ? RAD_OK : RAD_E_INVAL;
-    }
-
     if (quant || i8g || a4) {
-        if (N % 16 || K % (quant ? 128 : RAD_FP8_BLOCK)) {
+        if (N % 16 || K % (quant ? 128 : RAD_SCALE_GROUP)) {
             fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; it takes rows in 16s and K in "
                             "whole %d-column activation scale groups\n", base, (long long)N,
-                    (long long)K, quant ? 128 : RAD_FP8_BLOCK);
+                    (long long)K, quant ? 128 : RAD_SCALE_GROUP);
             return RAD_E_INVAL;
         }
         if (quant) {
@@ -245,7 +155,7 @@ inline int MlLinear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         } else {
             w  = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, RAD_ACCESS_PER_TOKEN, shard,
                            grp, parts, np);
-            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK },
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_BF16, { N, K / RAD_SCALE_GROUP },
                            RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         }
         if (!w || !ws) return RAD_E_INVAL;
@@ -259,44 +169,28 @@ inline int MlLinear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         } else {
             q8 = decl_b(b, nm.f("%s.q8", base), RAD_I8, { g.max_tok, K });
             s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32,
-                        { g.max_tok, quant ? 1 : K / RAD_FP8_BLOCK });
+                        { g.max_tok, quant ? 1 : K / RAD_SCALE_GROUP });
             if (!q8 || !s8) return RAD_E_INVAL;
             /* quant_act_i8 for the symmetric grid: row-major codes with ONE f32 scale a row,
              * which the w4a8 / w8a8 GEMMs read (docs/OPS.md). quant_act_i8g for the grouped
              * grids (a scale per (row, 128)); paired the other way round they produce NaN
              * logits. `group` only sizes the optional code sums, which the symmetric grid does
              * not take. */
-            op_q = rw(b, RAD_OP(b, quant ? "quant_act_i8" : "quant_act_i8g",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
-                                   RAD_INT("group", quant ? 128 : RAD_FP8_BLOCK),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-                    { a }, { q8, s8 });
+            op_q = decl_quant_act(b, quant ? "quant_act_i8" : "quant_act_i8g", g.max_tok, K,
+                                  quant ? 128 : RAD_SCALE_GROUP, a, q8, s8);
             if (!op_q) return RAD_E_INVAL;
         }
-        op = rw(b, RAD_OP(b, "gemm_nt_q",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
-                               RAD_INT("group", quant ? 128 : RAD_FP8_BLOCK),
-                               RAD_STR("dtype", quant ? (cdt == RAD_I8 ? "w8a8" : "w4a8")
-                                       : w5 ? "w5a8i8" : a4 ? "w4a8i8_asym" : "i8a8")),
-                    RAD_WEIGHTS(w, ws)),
-                { q8, s8 }, { y });
+        op = decl_gemm_q(b, g.max_tok, N, K, quant ? 128 : RAD_SCALE_GROUP,
+                         quant ? (cdt == RAD_I8 ? "w8a8" : "w4a8") : w5 ? "w5a8i8" : a4 ? "w4a8i8_asym" : "i8a8",
+                         w, ws, { q8, s8 }, y);
         if (!op) return RAD_E_INVAL;
         if (a4) {
             a4_split = std::min<int64_t>(kA4Split, g.max_tok);
             a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { a4_split, K });
             if (!a16) return RAD_E_INVAL;
-            op_a16 = rw(b, RAD_OP(b, "cast",
-                           RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("n", K),
-                                      RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
-                           RAD_NOWEIGHTS),
-                        { a }, { a16 });
-            op_dec = rw(b, RAD_OP(b, "gemm_nt_q",
-                            RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("N", N), RAD_INT("K", K),
-                                       RAD_INT("group", RAD_FP8_BLOCK),
-                                       RAD_STR("dtype", w5 ? "w5a16" : "w4a16_asym")),
-                            RAD_WEIGHTS(w, ws)),
-                        { a16 }, { y });
+            op_a16 = cast_op(b, a4_split, K, g.dtype, "f16", a, a16);
+            op_dec = decl_gemm_q(b, a4_split, N, K, RAD_SCALE_GROUP, w5 ? "w5a16" : "w4a16_asym", w,
+                                 ws, { a16 }, y);
             if (!op_a16 || !op_dec) return RAD_E_INVAL;
         }
         return RAD_OK;
@@ -312,9 +206,7 @@ inline int MlLinear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
     }
     fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, symmetric "
                     "int4 or int8 a 128 (w4a8 / w8a8), asymmetric int4 or int5 a 128 "
-                    "(w4a8i8_asym / w5a8i8), int8 a 128 (i8a8), block fp8 e4m3 with a bf16 "
-                    "scale a 128x128 (fp8a8) or MXFP4 e2m1 with an e8m0 exponent a 32 "
-                    "(mxfp4a8) -- none matches\n", wn, en);
+                    "(w4a8i8_asym / w5a8i8) or int8 a 128 (i8a8) -- none matches\n", wn, en);
     return RAD_E_DTYPE;
 }
 
@@ -326,14 +218,8 @@ inline void MlLinear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
         if (!shared_in)
             RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
         gemm(c, y, T);
-    } else if (fp8b || mx) {
-        /* quant_act_fp8 takes x, q, scale: an E4M3 pair at group 128. The mx form reads the e8m0
-         * plane again as its per-row reference, so the GEMM carries a third weight operand. */
-        if (!shared_in)
-            RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(fq, T), brows(fs, T));
-        gemm(c, y, T);
     } else if (a4 && T <= a4_split) {
-        /* the decode band: f16 copy of the input, the skinny kernel; operands as LinearFP8's w4 */
+        /* the decode band: f16 copy of the input, the skinny kernel; operands as LinearQ's w4 */
         RAD_ISSUE_N(c, op_a16, T, brows(a, T), brows(a16, T));
         RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
                     RAD_NONE, RAD_NONE);
@@ -347,16 +233,6 @@ inline void MlLinear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
 }
 
 inline void MlLinear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
-    if (fp8b || mx) {
-        /* the caller wrote the E4M3 pair itself (a fused norm + quantiser): issue the GEMM only */
-        if (mx)
-            RAD_ISSUE_N(c, op, T, brows(fq, T), brows(fs, T), RAD_W(w), RAD_W(ws), brows(y, T),
-                        RAD_NONE, RAD_W(wref));
-        else
-            RAD_ISSUE_N(c, op, T, brows(fq, T), brows(fs, T), RAD_W(w), RAD_W(ws), brows(y, T),
-                        RAD_NONE, RAD_NONE);
-        return;
-    }
     if (a4 && T <= a4_split) {
         RAD_ISSUE_N(c, op_a16, T, brows(in, T), brows(a16, T));
         RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
@@ -381,9 +257,9 @@ struct Layer {
      * write their int8 pair as rmsnorm_had_quant_i8g when available; the gated product writes the
      * down-projection pair as gated_had_quant_i8g. Otherwise the first consumer quantises with
      * had_quant_act_i8g. `rot_group` is 256 for IQ8R, 128 for computed-trellis IQR. */
-    LinearFP8    rq, rgate, rk, rv, ro, rgu, rdown;
-    NormQuantFP8 nq_attn, nq_ffn;
-    GateQuantFP8 gq_ffn;
+    LinearQ    rq, rgate, rk, rv, ro, rgu, rdown;
+    NormQuant nq_attn, nq_ffn;
+    GateQuant gq_ffn;
 
     rad_op op_norm = 0, op_qn = 0, op_kn = 0, op_rq = 0, op_rk = 0;
     rad_op op_kv = 0, op_attn = 0, op_sig = 0, op_mul = 0, op_ar = 0;
@@ -411,11 +287,11 @@ struct Model {
     rad_buf b_q = 0, b_gate = 0, b_k = 0, b_v = 0, b_attn = 0;
     rad_buf b_gu = 0, b_ffn = 0;
 
-    /* A whole-trunk rotated-int8 mode selected from layer 0's q projection. `iq8r` keeps the
-     * legacy wide-group case explicit; IQR-V4 is computed trellis/MAD at group 128. */
+    /* A whole-trunk rotated-int8 mode selected from layer 0's q projection. `iq8r` is the
+     * wide-group (256) case; IQR-V4 is computed trellis/MAD at group 128. */
     bool   rotated_i8 = false, iq8r = false, iqr_v4 = false;
-    int64_t rot_group = RAD_FP8_BLOCK;
-    ActFP8 a_h{}, a_attn{}, a_ffn{};
+    int64_t rot_group = RAD_SCALE_GROUP;
+    ActQ a_h{}, a_attn{}, a_ffn{};
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_embed_norm = 0;
@@ -534,9 +410,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         size_t i = 0;
         for_each_token(thetas, [&](const char* t, size_t n) {
             if (i >= theta.size()) return false;
+            const std::string tok(t, n);
             char* e = nullptr;
-            const double v = std::strtod(std::string(t, n).c_str(), &e);
-            theta[i++] = e == t ? -1.0f : (float)v;
+            const double v = std::strtod(tok.c_str(), &e);
+            theta[i++] = e == tok.c_str() ? -1.0f : (float)v;
             return true;
         });
         if (i < theta.size()) {
@@ -681,12 +558,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                               RAD_NOWEIGHTS),
-                           {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
     /* The embedding norm, after the vocabulary shard's reduction: a weightless RMS norm at
      * rms_norm_eps, in place. Weightless because MuseGlimmerTextNormedEmbedding has no gain. */
     m.op_embed_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -712,15 +584,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                std::max({g.n_embd, q_dim * g.world, g.n_ff * g.world})));
 
     /* ---- the layers. */
-    const int64_t attn_scale_num = 1;   /* attention scale stays 1/sqrt(head_dim): the query's
-                                         * qk_scale_factor rides the q norm's `mult`. */
-    (void)attn_scale_num;
+    /* The attention scale stays 1/sqrt(head_dim): the query's qk_scale_factor rides the q norm's
+     * `mult`. */
 
-    /* One rotated linear: IQ8R must stay IQ8R; IQR-V4 must be a computed MAD trellis. LinearFP8
+    /* One rotated linear: IQ8R must stay IQ8R; IQR-V4 must be a computed MAD trellis. LinearQ
      * selects the stored code/trellis/scale views and gemm_nt_q i8a8h at the proper scale group. */
-    auto rot_linear = [&](int64_t l, LinearFP8& L, const char* base,
+    auto rot_linear = [&](int64_t l, LinearQ& L, const char* base,
                           std::initializer_list<const char*> src, int64_t n_out, int64_t n_in,
-                          int shard, const ActFP8& a, rad_buf y,
+                          int shard, const ActQ& a, rad_buf y,
                           std::initializer_list<int64_t> parts) -> int {
         if (!L.mapped) RAD_ARCH_TRY(L.probe(b, nm, g, base, src));
         const char* wn = nm.f("%s.weight", base);
@@ -741,12 +612,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return L.declare(b, nm, g, base, n_out, n_in, shard, grp_layer((int)l), src, a, y, 0,
                          parts);
     };
-    /* The pre-norms' geometry for NormQuantFP8, which reads `wadd` from it: this family's input
+    /* The pre-norms' geometry for NormQuant, which reads `wadd` from it: this family's input
      * and pre-feed-forward norms are centered, x_hat * (1 + w), at rms_norm_eps. */
     Geom gn = g;
     gn.wadd = 1.0f;
 
-    for (int64_t l = 0; l < g.n_layer; ++l) {
+    for (int l = 0; l < g.n_layer; ++l) {
         Layer&   lay  = m.layers[(size_t)l];
         lay.full     = full[(size_t)l];
         lay.rope     = theta[(size_t)l] > 0.0f;
@@ -796,7 +667,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.rotated_i8) {
             /* q, gate, k and v read one int8 pair of the norm output: the norm's, or q's own
              * quantiser's where the norm writes none. The three after q read it as fed. */
-            ActFP8 h_shared = m.a_h;
+            ActQ h_shared = m.a_h;
             h_shared.q8_fed = h_shared.q8_rot = true;
             RAD_ARCH_TRY(rot_linear(l, lay.rq, nm.f("blk.%d.attn_q", (int)l), {src_q}, q_dim,
                                     g.n_embd, RAD_SHARD_ROW, m.a_h, m.b_q, {}));
@@ -893,13 +764,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               g.n_embd, q_dim, RAD_SHARD_COL, grp_layer(l), m.b_attn, m.b_h));
 
         if (g.world > 1)
-            lay.op_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                          RAD_INT("min_bytes", g.wire_min_bytes)),
-                               RAD_NOWEIGHTS),
-                           {m.b_h}, {m.b_h});
+            lay.op_ar = decl_all_reduce(b, g, m.b_h);
         /* The branch's own norm, at post_norm_eps, before the residual add. */
         lay.op_post = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -959,13 +824,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               g.n_embd, g.n_ff, RAD_SHARD_COL, grp_layer(l), m.b_ffn, m.b_h));
         }
         if (g.world > 1)
-            lay.op_far = rw(b, RAD_OP(b, "all_reduce",
-                                RAD_PARAMS(RAD_INT("world_size", g.world),
-                                           RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                           RAD_INT("min_bytes", g.wire_min_bytes)),
-                                RAD_NOWEIGHTS),
-                            {m.b_h}, {m.b_h});
+            lay.op_far = decl_all_reduce(b, g, m.b_h);
         lay.op_fpost = rw(b, RAD_OP(b, "rmsnorm",
                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                          RAD_F64("eps", m.post_eps), RAD_F64("wadd", 1.0),
@@ -1174,7 +1033,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const int32_t* table = kvb ? kvb->block_table  : nullptr;
         const int32_t* used  = kvb ? kvb->seqused      : nullptr;
 
-        /* -- attention. An IQ8R layer issues LinearFP8's ops over the int8 pairs; a linear that
+        /* -- attention. An IQ8R layer issues LinearQ's ops over the int8 pairs; a linear that
          * declared a quantiser (op_q) issues it first, over the pair's bf16 plane. */
         if (l.nq_attn.op) l.nq_attn.step(c, T);
         else RAD_ISSUE(c, l.op_norm, brows(m.b_x, T), RAD_W(l.w_norm), brows(m.b_h, T));

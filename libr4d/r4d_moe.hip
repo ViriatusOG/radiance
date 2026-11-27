@@ -639,22 +639,17 @@ __device__ __forceinline__ uint32_t u16_load_w(const uint16_t* p) {
  *
  * (128 columns over eight waves where the weight's parts allow: see kPrefillCols.)
  *
- * At prefill a block serves one run (AL), averaging T / n_expert rows (forty at a 2048 chunk on
- * Qwen3.8-Flash-Next). A 128-row tile is then mostly dead rows, masked at load and store but still
- * computed; reshaping it only moves the staging depth. Two changes remove the dead work, both
- * bit-identical:
+ * At prefill a block serves one run (AL), averaging T / n_expert rows (forty at a 2048-row chunk).
+ * A 128-row tile is then mostly dead rows, masked at load and store but still computed; reshaping
+ * it only moves the staging depth. Two changes remove the dead work, both bit-identical:
  *
  *   SK     a wave skips fragment reads, WMMA and scale fold for M tiles starting at or past its
  *          run's end (wave-uniform; it still stages and meets every barrier).
  *   FM 32  the tile matches a typical run; a longer run spans blocks and re-stages from L2.
  *
- * Measured (us per call, gate_up / down, 40 rows per run): 128 x 64 with 8 waves 3346 / 2081;
+ * At 40 rows per run (gate_up / down, us per call), 128 x 64 with 8 waves takes 3346 / 2081 and
  * 32 x 64 with 4 waves and SK 1552 / 987. 16- and 64-row tiles at 128 columns, and 32 x 128 at
  * small runs, are slower, so the tile keeps 64 columns (and the op's "N a multiple of 64").
- *
- * At prefill the link is not the bottleneck: per-layer GEMM time does not correlate with how many
- * experts are pooled. The deployment uses a 2048 chunk; larger chunks do not help (the checkpoint
- * interval clamps them, and a larger activation arena costs expert residency).
  *
  * ES   one run per block instead of all of a tile's runs (below).
  *
@@ -667,11 +662,6 @@ __device__ __forceinline__ uint32_t u16_load_w(const uint16_t* p) {
  * order are unchanged, so output is bit-identical. A tile has at most FM runs (each owns a row), so
  * FM blocks per tile suffice; extra blocks exit at the loop head. The split is unconditional inside
  * the decode band (r4d_moe_decode_band).
- *
- * At decode the link binds, not this kernel: a gate/up dispatch reads ~19.7 MB; the fastest run at
- * the part's 576 GB/s cold-stream peak, and the mean (270 GB/s) gap is entirely experts not
- * resident in the slab, streamed over the link at ~26 GB/s (~63 us per 1.64 MB expert). The lever
- * is the miss rate, not this kernel's arithmetic.
  */
 /* One class of experts: even- or odd-numbered, with separate weight tables because every entry of
  * one table has one geometry. Expert e is entry e / 2 of class e % 2. The classes differ when a rank
@@ -2255,9 +2245,9 @@ constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots 
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
-template <uint32_t NW>
+template <uint32_t NW, bool F32 = false>
 __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
@@ -2275,13 +2265,20 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
      * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
-    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    int32_t wl;
+    if constexpr (F32) {
+        const float wf = ((const float*)ew)[(size_t)t * ew_ld + jl];
+        wl = __float_as_int(wf);
+    } else {
+        wl = (int32_t)((const uint16_t*)ew)[(size_t)t * ew_ld + jl];
+    }
     int32_t si[kGatherWideSlots];
     float   sw[kGatherWideSlots];
 #pragma unroll
     for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
         si[j] = __builtin_amdgcn_readlane(il, (int)j);
-        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+        const int32_t wj_raw = __builtin_amdgcn_readlane(wl, (int)j);
+        sw[j] = F32 ? __int_as_float(wj_raw) : bf16_to_f32((uint16_t)wj_raw);
     }
     if (c >= n) return;
     /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
@@ -2314,8 +2311,13 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
             const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
 #pragma unroll
             for (uint32_t q = 0; q < 4; ++q) {
-                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
-                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                if constexpr (F32) {
+                    acc[2 * q]     = fmaf(wj, bf16_to_f32((uint16_t)(d[q] & 0xFFFFu)), acc[2 * q]);
+                    acc[2 * q + 1] = fmaf(wj, bf16_to_f32((uint16_t)(d[q] >> 16)), acc[2 * q + 1]);
+                } else {
+                    acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
+                    acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                }
             }
         }
     }
@@ -3460,7 +3462,8 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
-    const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
+    const bool wide_ok = (ew->dtype == RAD_BF16 || ew->dtype == RAD_F32) && !small &&
+                         top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     const int gpin = g_moe_gather_pin;
@@ -3469,14 +3472,25 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     if ((gpin == 0 && wide_ok) || gpin >= 2) {
         constexpr uint32_t NW = 8;
         const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
-        hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
-                           dim3(NW * kWave), 0, (hipStream_t)s,
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
-                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
-                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
-                           sh ? (const uint16_t*)sh->data : nullptr,
-                           sh ? (const uint16_t*)sg->data : nullptr,
-                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        if (ew->dtype == RAD_F32) {
+            hipLaunchKernelGGL((gather_wide_kernel<NW, true>), dim3((unsigned)((M + NW - 1) / NW), gw),
+                               dim3(NW * kWave), 0, (hipStream_t)s,
+                               (const uint16_t*)ye->data, (const void*)ew->data, inv,
+                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
+                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
+                               sh ? (const uint16_t*)sh->data : nullptr,
+                               sh ? (const uint16_t*)sg->data : nullptr,
+                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        } else {
+            hipLaunchKernelGGL((gather_wide_kernel<NW, false>), dim3((unsigned)((M + NW - 1) / NW), gw),
+                               dim3(NW * kWave), 0, (hipStream_t)s,
+                               (const uint16_t*)ye->data, (const void*)ew->data, inv,
+                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
+                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
+                               sh ? (const uint16_t*)sh->data : nullptr,
+                               sh ? (const uint16_t*)sg->data : nullptr,
+                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        }
         R4D_MOE_CHK();
         return RAD_OK;
     }
@@ -3560,12 +3574,12 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
 /* ================================================================== router GEMM + router_topk_scatter
  *
  * The router GEMM, its selection and its sort in one launch, plus, where the layer has a shared
- * expert, that expert's one-column gate. rad_block_moe_fp8.h issues it up to kRgMaxM rows wherever
- * it declares router_topk_scatter.
+ * expert, that expert's one-column gate. The architecture's MoE block issues it up to kRgMaxM
+ * rows wherever it declares router_topk_scatter.
  *
  * At decode the router GEMM and router_topk_scatter are two dependent dispatches per routed layer
  * with almost no work in the second. The selection needs a row's every logit, so it runs in the
- * workgroup that finishes last, named by an arrival counter (the pattern of gemm_fp8a8's split-K
+ * workgroup that finishes last, named by an arrival counter (the pattern of gemm_i8a8's split-K
  * finisher and hc_up_mix's quantiser: self-resetting, never shared by concurrent launches). Here
  * the counter is the op instance's, taken at init (see the arrival-counter note).
  *
@@ -3729,7 +3743,7 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
  *
  * It must persist between launches, zeroed (the last block resets it; a non-zero start would rank
  * before the GEMM finished), so scratch cannot hold it: other ops write the arena between
- * launches. Allocating on first use (as gemm_fp8a8's split_ctr and hc_bf16's mix counters do)
+ * launches. Allocating on first use (as gemm_i8a8's split_ctr and hc_bf16's mix counters do)
  * escapes the VRAM budget. Init runs once per resolved instance
  * during declare, before the engine measures free VRAM, so its allocation is counted.
  *

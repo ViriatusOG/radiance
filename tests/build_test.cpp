@@ -15,6 +15,7 @@
 
 #include "build/rad_build.h"
 #include "build/startup.h"
+#include "mem/kv.h"
 #include "rad_internal.h"
 
 #include <cstdlib>
@@ -138,8 +139,7 @@ TEST(bucket_table_resolves_per_band) {
     CHECK_EQ((int)b.errors().size(), 0);
 
     const OpInfo* o = b.program().op(h);
-    CHECK_EQ((int)o->bands.size(), 3);
-    if (o->bands.size() != 3) return;
+    REQUIRE_EQ((int)o->bands.size(), 3);
     CHECK_EQ(o->bands[0].hi, 16);
     CHECK_EQ(o->bands[1].hi, 64);
     CHECK_EQ(o->bands[2].hi, 8192);
@@ -180,7 +180,7 @@ TEST(an_op_with_no_ranged_parameter_is_one_band) {
     /* build_bands returns one band with hi = INT64_MAX, so the issue path's band scan needs no
      * special case. */
     const OpInfo* o = b.program().op(h);
-    CHECK_EQ((int)o->bands.size(), 1);
+    REQUIRE_EQ((int)o->bands.size(), 1);
     CHECK_EQ(o->bands[0].hi, INT64_MAX);
     CHECK(o->ranged_key.empty());
     /* Ties break on declaration order. */
@@ -671,8 +671,7 @@ TEST(a_hole_in_the_range_is_reported_as_that_band) {
     CHECK_EQ(b.status(), RAD_OK);
 
     const OpInfo& o = b.program().ops[1];
-    CHECK(o.bands.size() >= 3);
-    if (o.bands.size() < 3) return;
+    REQUIRE(o.bands.size() >= 3);
     CHECK(o.bands[0].dom[RAD_DOMAIN_DEVICE]);          /* M <= 64 */
     CHECK(!o.bands[1].dom[RAD_DOMAIN_DEVICE]);         /* the hole */
     CHECK(o.bands[2].dom[RAD_DOMAIN_DEVICE]);          /* M >= 4096 */
@@ -1386,7 +1385,7 @@ TEST(the_declared_enums_all_have_names_and_an_unknown_value_says_so) {
     CHECK_EQ(std::string(bld_buf_kind_name(-1)), std::string("?"));
     /* Every KV kind the ABI defines is named. */
     for (int k : { RAD_KV_FULL, RAD_KV_WINDOW, RAD_KV_LINEAR, RAD_KV_CONV }) {
-        const char* n = bld_kv_kind_name(k);
+        const char* n = kv_kind_name(k);
         CHECK(n && *n);
         CHECK(std::strcmp(n, "?") != 0);
     }

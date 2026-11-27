@@ -185,18 +185,26 @@ public:
      * (detect_import). ModelOpt: NVIDIA ModelOpt's NVFP4, FP8, or both per layer
      * (MIXED_PRECISION). In an Nvfp4, CtFp8 or ModelOpt release every weight without the NVFP4
      * tensors reads stock, so FP8 and bf16 linears beside the NVFP4 ones read by their own form.
+     * Gguf: a GGUF holding llama.cpp block types (K-, I- and legacy quants): every such tensor is
+     * imported block for block as the affine planes libquant's `ggml` quantiser writes for the
+     * same blocks (libquant/lq_ggml_planes.h); its float tensors read as they are.
+     * Fp8Mx: DeepSeek-V4's release form (quant_method fp8, scale_fmt ue8m0, expert_dtype fp4):
+     * block-FP8 linears with an e8m0 scale per weight_block_size block, read stock beside their
+     * `X.scale` (DeepSeek's spelling of the scale plane), and routed experts as `X.weight` I8
+     * [N, K/2] (two e2m1 codes a byte, element 2j in the low nibble) with `X.scale` e8m0
+     * [N, K/32]: `fp4_e2m1*e8m0[1x32]` byte for byte, as Quark's MXFP4.
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
      * describe the tool, not a served format. */
     /* PerTensor: hf_quant_config.json's per-tensor parameter groups (Inkling 2's release), which
      * decide each tensor's form and take precedence over config.json's quantization_config. */
     enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
-                        ModelOpt, PerTensor };
+                        ModelOpt, PerTensor, Gguf, Fp8Mx };
     Import imports() const { return import_; }
     /* The form `name` is read in: a drafter merged by add_draft ships its own quantisation (a
      * ModelOpt NVFP4 drafter beside a bf16 target), so names under its prefix take that one. */
     Import imports_at(const std::string& name) const {
-        return draft_import_ != Import::None && name.rfind(draft_prefix_, 0) == 0 ? draft_import_
+        return draft_import_ != Import::None && name.starts_with(draft_prefix_) ? draft_import_
                                                                                   : import_;
     }
     const std::string& import_refusal() const { return import_why_; }
@@ -250,6 +258,10 @@ private:
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_, tok_dir_, meta_dir_;
     GgufFile    gguf_;
+    /* A split GGUF's shards after the first (llama.cpp's gguf-split): tensors only. */
+    std::vector<std::unique_ptr<GgufFile>> gguf_more_;
+    /* Long integer metadata arrays as tensor bytes (open_gguf); a deque, so data never moves. */
+    std::deque<std::vector<uint8_t>> gguf_arrays_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
     std::vector<std::unique_ptr<TorchZipFile>>    torch_;
@@ -265,6 +277,11 @@ private:
     std::string import_why_;
     /* add_draft's drafter, when it ships a quantisation of its own: the form and the prefix. */
     Import      draft_import_ = Import::None;
+    /* ModelOpt MIXED_PRECISION: a layer's base name -> the GGUF type of its `.weight` blocks
+     * (IQ2_XXS 16, Q8_0 8), from quantized_layers; retag_modelopt_blocks reads them as GGUF block
+     * tensors. */
+    std::unordered_map<std::string, uint32_t> mo_blocks_;
+    void retag_modelopt_blocks();
     std::string draft_prefix_;
     int64_t     ct_group_ = 0;   /* CtInt4: the group every weight's config states */
     bool        ct_asym_  = false;   /* CtInt4: the config states asymmetric weights */

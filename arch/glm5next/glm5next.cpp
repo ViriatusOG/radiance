@@ -11,7 +11,7 @@
  *   rad_block_glm_kda.h       GlmKda         the 34 linear layers, KdaState their recurrence
  *   rad_block_glm_mla.h       GlmMla         the 11 sparse MLA layers, MlaLatent their core
  *   rad_block_glm_indexer.h   GlmIndexer     the DSA indexer, DsaCache its key cache and selection
- *   rad_block_glm_router.h    GlmRouter      the correction-bias router (through MoeFP8)
+ *   rad_block_glm_router.h    GlmRouter      the correction-bias router (through MoeQ)
  *   rad_block_glm_mtp.h       GlmMtp         the draft head around the plugin's layer 45
  *   rad_block_glm_vision.h    GlmVision      the tower, MediaRows its rows over the embeddings
  *   rad_glm_tp.h              GlmTp          the shards, the row runs and the split thresholds
@@ -26,8 +26,10 @@
 #include <arch/rad_block_glm_indexer.h>
 #include <arch/rad_block_glm_mtp.h>
 #include <arch/rad_block_glm_vision.h>
-#include <arch/rad_block_mlp_fp8.h>
-#include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_mlp_q.h>
+#include <arch/rad_block_moe_q.h>
+#include <arch/rad_expert_split.h>
+#include <cstdio>
 #include <memory>
 
 namespace glm5next {
@@ -36,12 +38,12 @@ using namespace rad::arch;
 struct Layer {
     bool full = false, draft = false;
     ManifoldConn attn_hc{}, ffn_hc{};
-    NormQuantFP8 norm{};
+    NormQuant norm{};
     GlmKda kda{};
     GlmMla mla{};
     GlmIndexer index{};
-    MlpFP8 dense{};
-    MoeFP8 moe{};
+    MlpQ dense{};
+    MoeQ moe{};
 };
 struct Model {
     Names nm{};
@@ -57,10 +59,13 @@ struct Model {
      * the drive.
      * Anything else stays whole: a plain bf16 expert cannot be sliced at all. */
     bool whole_experts = false;
+    /* With whole experts, this rank's run of them [ne_base, ne_base + ne_rank) of the checkpoint's
+     * numbering: 288/world each, or the expert-split list (rad_expert_split.h). */
+    int64_t ne_rank = 0, ne_base = 0;
     std::vector<Layer> layers;
     /* Each routed layer's source and config, probed before any buffer is sized: the expert
      * format decides the routed arm's code pair. Indexed by layer; 0..2 are dense and unused. */
-    std::vector<MoeFP8::Src> moe_src;
+    std::vector<MoeQ::Src> moe_src;
     /* An IQ8R trunk (rotated int8 linears, one scale a `trunk_g8` of K), read from layer 0's dense
      * gate_up before any buffer is sized: every activation a trunk linear reads then carries
      * rotated int8 codes, and the routed experts read rotated int8 too (IQR). KDA, the indexer,
@@ -68,19 +73,19 @@ struct Model {
      * codes themselves (rmsnorm_had_quant_i8g); where they cannot, each linear quantises the bf16
      * plane. */
     bool trunk_rot = false;
-    int64_t trunk_g8 = RAD_FP8_BLOCK;
+    int64_t trunk_g8 = RAD_SCALE_GROUP;
     bool norm_fed = false;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
     rad_buf h0 = 0, h1 = 0, x = 0, y = 0, post = 0, comb = 0, final_hidden = 0, logit_input = 0,
             logits = 0;
-    ActFP8 act{};
+    ActQ act{};
     /* The blocks' wires: one set of activations, shared by every layer of a kind. */
     GlmKda::Wire kw{};
     GlmMla::Wire aw{};
     GlmIndexer::Wire iw{};
-    MlpFP8::Wire dw{};
-    MoeFP8::Wire mw{};
+    MlpQ::Wire dw{};
+    MoeQ::Wire mw{};
     rad_weight token = 0, head = 0, final_gain = 0;
     rad_op embed = 0, embed_ar = 0, expand = 0, contract = 0, norm = 0, gather = 0, head_op = 0;
     /* The draft head and its layer, declared only when the deployment speculates. */
@@ -110,7 +115,7 @@ static bool experts_split_by_width(RadBuilder* b, Names& nm) {
                                      "blk.%d.ffn_down_exps.%d.weight" }) {
                 RadEncoding e{};
                 if (!weight_enc(b, nm.f(fmt, l, ge), &e)) return false;
-                const int f = MoeFP8::format_of(e);
+                const int f = MoeQ::format_of(e);
                 if (f != 8 && f != 11) return false;
             }
     return true;
@@ -122,12 +127,7 @@ static int64_t cfg(const RadModelMeta* m, const char* key, int64_t fallback) {
     return rad_meta_geti(m, key, rad_meta_geti(m, nested, fallback));
 }
 static rad_op copy(RadBuilder* b, const Geom& g, rad_buf x, rad_buf y) {
-    return rw(b,
-              RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 4096),
-                                RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                     RAD_NOWEIGHTS),
-              { x }, { y });
+    return cast_op(b, g.max_tok, 4096, "bf16", "bf16", x, y);
 }
 static rad_op norm(RadBuilder* b, const Geom& g, rad_weight w, rad_buf x, rad_buf y) {
     return rw(b,
@@ -141,8 +141,8 @@ static rad_op norm(RadBuilder* b, const Geom& g, rad_weight w, rad_buf x, rad_bu
 /* ------------------------------------------------------------------ the shared activations */
 /* A norm's code pair: E4M3 for a block-fp8 or bf16 trunk; for an IQ8R one rotated int8 codes at the
  * trunk's group, written by the norm where `norm_fed`, else an E4M3 pair no linear reads beside
- * int8 codes each linear writes from the bf16 plane (ActFP8::declare_pair). */
-static int norm_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64_t n) {
+ * int8 codes each linear writes from the bf16 plane (ActQ::declare_pair). */
+static int norm_pair(RadBuilder* b, Model& m, ActQ& a, const char* name, int64_t n) {
     if (!m.trunk_rot) return a.declare_qs(b, m.nm, m.g, name, n);
     RAD_ARCH_TRY(a.declare_qs(b, m.nm, m.g, name, n, 0, true, !m.norm_fed, m.trunk_g8));
     a.q8_fed = a.q8_rot = m.norm_fed;
@@ -150,7 +150,7 @@ static int norm_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64
 }
 /* A quantiser's code pair (the MLA's expanded output, the clamped products): for an IQ8R trunk the
  * rotated int8 codes the block's own had_quant_act_i8g writes at `group`, and no E4M3 pair. */
-static int quant_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64_t n,
+static int quant_pair(RadBuilder* b, Model& m, ActQ& a, const char* name, int64_t n,
                       int64_t rows = 0, int64_t group = 0) {
     if (!m.trunk_rot) return a.declare_qs(b, m.nm, m.g, name, n, rows);
     const int64_t g8 = group > 0 ? group : m.trunk_g8;
@@ -324,13 +324,13 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * FE });
     mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, FE });
     /* An IQ8R trunk's routed arm is rotated int8 throughout: the gated product's codes at one
-     * scale a 128 of K, which the IQR grouped GEMM reads (MoeFP8::a8). Its gate_up reads the
+     * scale a 128 of K, which the IQR grouped GEMM reads (MoeQ::a8). Its gate_up reads the
      * norm's own codes where the norm writes them, else a rotated copy of the block input that
-     * MoeFP8 writes once a layer (Wire::hr). */
-    RAD_ARCH_TRY(quant_pair(b, m, mw.eff, "expert_ff", FE, T * 8, RAD_FP8_BLOCK));
+     * MoeQ writes once a layer (Wire::hr). */
+    RAD_ARCH_TRY(quant_pair(b, m, mw.eff, "expert_ff", FE, T * 8, RAD_SCALE_GROUP));
     if (m.trunk_rot && !m.norm_fed) {
         RAD_ARCH_TRY(mw.hr.declare_qs(b, nm, g, "normalized_rot", 4096, 0, true, false,
-                                      RAD_FP8_BLOCK));
+                                      RAD_SCALE_GROUP));
         mw.hr.q8_fed = mw.hr.q8_rot = true;
     }
     mw.edn = decl_b(b, nm.f("expert_down"), RAD_BF16, { T * 8, 4096 });
@@ -378,10 +378,10 @@ static int kv_groups(RadBuilder* b, Model& m) {
 
 /* ------------------------------------------------------------------ one layer */
 /* A routed layer's source and config, before its probe. */
-static MoeFP8::Src moe_source(const Model& m, Names& nm, int l) {
+static MoeQ::Src moe_source(const Model& m, Names& nm, int l) {
     const auto& g = m.g;
     const char* pre = nm.ckpt("model.language_model.layers.%d", l);
-    MoeFP8::Src s;
+    MoeQ::Src s;
     s.norm = nm.ckpt("%s.post_attention_layernorm.weight", pre);
     s.router = nm.ckpt("%s.mlp.gate.weight", pre);
     s.router_bias = nm.ckpt("%s.mlp.gate.e_score_correction_bias", pre);
@@ -396,16 +396,16 @@ static MoeFP8::Src moe_source(const Model& m, Names& nm, int l) {
     // outside the window (moe_scatter schema: "which is how EXPERT PARALLELISM is
     // expressed"); the shared expert stays width-sharded on its own declaration path; the
     // block's all-reduce sums the partials exactly as width TP did. At world 1 this
-    // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
+    // degenerates to the whole-model declaration (n_expert == n_expert_all, no spans).
     s.cfg.n_expert_all = 288;
     s.cfg.top_k = 8;
     s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
     if (m.whole_experts) {
-        s.cfg.n_expert = 288 / g.world;
-        // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
-        // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
-        const int ep_rank = g.rank < g.world ? g.rank : 0;
-        s.cfg.expert_base = ep_rank * (288 / g.world);
+        // The window is 288/world experts a rank, or the expert-split list's count in rank order
+        // (declare, rad_expert_split.h). A shape probe may pass rank >= world (arch_test's
+        // parallel declares reuse i % 4); it takes rank 0's window.
+        s.cfg.n_expert = m.ne_rank;
+        s.cfg.expert_base = m.ne_base;
         s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
         s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
     } else {
@@ -483,7 +483,7 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
     if (l < 3) {
         auto w = m.dw;
         w.x = input;
-        MlpFP8::Src s{ nm.ckpt("%s.post_attention_layernorm.weight", pre),
+        MlpQ::Src s{ nm.ckpt("%s.post_attention_layernorm.weight", pre),
                        nm.ckpt("%s.mlp.gate_proj.weight", pre),
                        nm.ckpt("%s.mlp.up_proj.weight", pre),
                        nm.ckpt("%s.mlp.down_proj.weight", pre) };
@@ -494,10 +494,10 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         w.x = input;
         /* The trunk's routed layers were probed before the buffers (declare); the draft layer is
          * probed here, through its own names. */
-        MoeFP8::Src s;
+        MoeQ::Src s;
         if (draft) {
             s = moe_source(m, nm, l);
-            RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
+            RAD_ARCH_TRY(MoeQ::probe(b, nm, l, s, &s.cfg));
         } else {
             s = m.moe_src[(size_t)l];
         }
@@ -600,16 +600,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
     m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
                                                    !experts_split_by_width(b, nm)));
+    if (m.whole_experts) {
+        /* Even counts, as the quantised GEMM's two parity tables need. A rank given few enough
+         * experts to hold them all in VRAM streams none over its link. */
+        bool given = false;
+        if (!rad_expert_split(288, world, g.rank, 2, ctx->expert_split, &m.ne_rank, &m.ne_base, &given)) {
+            if (given)
+                fprintf(stderr, "radiance: glm5next: expert-split %s does not split 288 experts over %d "
+                                "ranks (one even count a rank, comma-separated, summing to 288)\n",
+                        ctx->expert_split, world);
+            else
+                fprintf(stderr, "radiance: glm5next: 288 experts do not split over %d ranks (an even "
+                                "count of whole experts each)\n", world);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (given)
+            rad_note(b, "routed experts split unevenly (expert-split): rank %d holds %lld of 288 a layer, "
+                        "from %lld", g.rank, (long long)m.ne_rank, (long long)m.ne_base);
+    } else if (ctx->expert_split && *ctx->expert_split && world > 1) {
+        fprintf(stderr, "radiance: glm5next: expert-split names whole experts a rank, and at %d ranks this "
+                        "container's experts are split by width\n", world);
+        return RAD_E_UNSUPPORTED;
+    }
     /* ---- each routed layer's expert format, read before any buffer is declared: the format
      * decides the routed arm's code pair (ffn_buffers). The probe declares the layer's first
      * experts' name maps, which the layer's declare skips. */
-    m.moe_src.assign(45, MoeFP8::Src{});
+    m.moe_src.assign(45, MoeQ::Src{});
     for (int l = 3; l < 45; ++l) {
         m.moe_src[(size_t)l] = moe_source(m, nm, l);
-        RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, m.moe_src[(size_t)l], &m.moe_src[(size_t)l].cfg));
+        RAD_ARCH_TRY(MoeQ::probe(b, nm, l, m.moe_src[(size_t)l], &m.moe_src[(size_t)l].cfg));
     }
     /* ---- the trunk's stored form, read from layer 0's dense gate_up through that layer's own
-     * LinearFP8 (MlpFP8 then does not map it again). */
+     * LinearQ (MlpQ then does not map it again). */
     m.layers.resize(45);
     {
         const char* pre = nm.ckpt("model.language_model.layers.%d", 0);
@@ -619,10 +641,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RadEncoding enc{};
         m.trunk_rot = weight_enc(b, nm.f("blk.0.ffn_gate_up.weight"), &enc) &&
                       linear_is_w8h(enc) && !linear_is_wnh(enc);
-        m.trunk_g8 = m.trunk_rot ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
+        m.trunk_g8 = m.trunk_rot ? linear_w8h_group(enc) : (int64_t)RAD_SCALE_GROUP;
     }
     for (int l = 3; l < 45; ++l) {
-        const MoeFP8::Config& c = m.moe_src[(size_t)l].cfg;
+        const MoeQ::Config& c = m.moe_src[(size_t)l].cfg;
         const bool int8_experts = c.expert_iqr || c.expert_i8;
         if (m.trunk_rot && (c.expert_bf16 || !int8_experts)) {
             fprintf(stderr, "radiance: glm5next: the trunk is IQ8R and layer %d's routed experts are "
@@ -707,7 +729,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_INT("n_embd", 4096), RAD_STR("dtype", "bf16")),
                   RAD_WEIGHTS(m.head)),
            { m.logit_input }, { m.logits });
-    if (g.max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         GlmMtp::Wire tw{ m.final_hidden, m.logits, m.token, m.head };
         RAD_ARCH_TRY(m.mtp.declare_inputs(b, g, tw, m.media));
         RAD_ARCH_TRY(layer(b, m, m.draft, m.mtp.nm, 45, true));

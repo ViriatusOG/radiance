@@ -15,7 +15,8 @@
 #include <string>
 #include <vector>
 
-static const char kUsage[] = "usage: rad-yaml FLAGS...   print the YAML file these radiance flags configure\n";
+static const char kUsage[] =
+    "usage: rad-yaml FLAGS...   print the YAML file these radiance flags configure\n";
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -33,7 +34,8 @@ int main(int argc, char** argv) {
     const std::string y = rad::fleet::yaml_from_args(argc, argv);
     rad::fleet::FleetConfig fc;
     if (rad::fleet::parse(y, "rad-yaml output", &fc) != RAD_OK) {
-        fprintf(stderr, "rad-yaml: the file below does not load; please report this command line\n%s", y.c_str());
+        fprintf(stderr, "rad-yaml: the file below does not load; please report this command "
+                        "line\n%s", y.c_str());
         return 1;
     }
     fputs(y.c_str(), stdout);

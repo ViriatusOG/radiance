@@ -54,6 +54,8 @@ using namespace lq;
 const RadQuantOption kRtnOptions[] = { LQ_GRID_OPTIONS };
 const RadQuantOption kGptqOptions[] = {
     LQ_GRID_OPTIONS,
+    { "gpu", RAD_P_INT, "1",
+      "0: this trellis rule's GPTQ stays on the host loop, not on --gpus (split work)" },
     LQ_CALIB_OPTION("every value is rounded to nearest"),
     { "damp", RAD_P_F64, "0.01", "the Hessian's damping, a fraction of its mean diagonal" },
     { "act_order", RAD_P_INT, "0",

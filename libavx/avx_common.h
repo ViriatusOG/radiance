@@ -79,7 +79,8 @@ static inline int avx_team_size() {
             int first = c;
             if (FILE* f = std::fopen(path, "r")) {
                 int v = -1;
-                if (std::fscanf(f, "%d", &v) == 1 && v >= 0 && v < CPU_SETSIZE && CPU_ISSET(v, &set))
+                if (std::fscanf(f, "%d", &v) == 1 && v >= 0 && v < CPU_SETSIZE &&
+                    CPU_ISSET(v, &set))
                     first = v;
                 std::fclose(f);
             }
@@ -135,7 +136,9 @@ static inline int64_t numel(const RadTensor* t) {
     return n;
 }
 
-static inline int64_t laststride(const RadTensor* t) { return t->rank ? t->stride[t->rank - 1] : 1; }
+static inline int64_t laststride(const RadTensor* t) {
+    return t->rank ? t->stride[t->rank - 1] : 1;
+}
 
 /* Element offset of the `lin`-th element in row-major logical order. */
 static inline int64_t offlin(const RadTensor* t, int64_t lin) {
@@ -397,7 +400,9 @@ static inline void st_int_dt(uint32_t dt, void* p, int64_t i, int64_t v) {
     }
 }
 
-static inline int64_t ldi(const RadTensor* t, int64_t off) { return ld_int_dt(t->dtype, t->data, off); }
+static inline int64_t ldi(const RadTensor* t, int64_t off) {
+    return ld_int_dt(t->dtype, t->data, off);
+}
 
 /* Address of the byte holding element i, for dtypes whose element is not a whole byte. Packed
  * codes are otherwise read through row_to_f32; `dequant` uses this to address a group start. */

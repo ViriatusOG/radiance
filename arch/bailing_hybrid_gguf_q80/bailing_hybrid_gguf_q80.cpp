@@ -1,7 +1,7 @@
-/* bailing_hybrid_gguf_q80 -- the GGUF variant of bailing_hybrid for the tiny family's Q8_0 release: the same
- * declaration and step, claiming the ftype-7 descriptor so the quantised GGUF converts
- * and serves. As in hyv3_gguf, a thin include over the family's implementation with the
- * namespace, the plugin name and the quant redefined. */
+/* bailing_hybrid_gguf_q80 -- the GGUF variant of bailing_hybrid for the tiny family's
+ * Q8_0 release: the same declaration and step, claiming the ftype-7 descriptor so the
+ * quantised GGUF converts and serves. As in hyv3_gguf, a thin include over the family's
+ * implementation with the namespace, the plugin name and the quant redefined. */
 #define bailing_hybrid bailing_hybrid_gguf_q80
 #define BAILING_HYBRID_PLUGIN "bailing_hybrid_gguf_q80"
 #define BAILING_HYBRID_QUANT "gguf_ftype_7"

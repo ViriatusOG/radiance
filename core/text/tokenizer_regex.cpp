@@ -4,7 +4,6 @@
 #include "util/simd.h"
 
 #include <algorithm>
-#include <cstring>
 #include <unordered_map>
 
 namespace rad {

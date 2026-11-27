@@ -34,10 +34,7 @@ namespace {
 /* A machine of its own: an empty directory under the test's temporary directory. */
 struct Root {
     std::string dir;
-    Root() {
-        std::string tmpl = radtest::tmp_path("root.XXXXXX");
-        dir = mkdtemp(tmpl.data()) ? tmpl : "";
-    }
+    Root() : dir(radtest::make_tmp_dir("root")) {}
     void put(const std::string& rel, const std::string& text) const {
         const fs::path p = fs::path(dir) / rel.substr(1);
         fs::create_directories(p.parent_path());
@@ -209,8 +206,7 @@ TEST(every_display_device_is_listed_with_its_kfd_target) {
     CHECK_EQ((int)f.cards.size(), 3);
     const diag::CardFacts* a = card(f, "0000:03:00.0");
     const diag::CardFacts* i = card(f, "0000:1b:00.0");
-    CHECK(a && i);
-    if (!a || !i) return;
+    REQUIRE(a && i);
     CHECK_EQ(a->gfx, std::string("gfx1201"));
     CHECK_EQ(a->simd, 128);
     CHECK_EQ(i->gfx, std::string("gfx1036"));
@@ -226,7 +222,7 @@ TEST(every_display_device_is_listed_with_its_kfd_target) {
     CHECK_EQ(a->power_cap_uw, (int64_t)300000000);
     CHECK_EQ(a->power_cap_max_uw, (int64_t)330000000);
     CHECK_EQ(a->vddgfx_offset, std::string("-75 mV"));
-    CHECK_EQ((int)a->dpm_pcie.size(), 3);
+    REQUIRE_EQ((int)a->dpm_pcie.size(), 3);
     CHECK_EQ(a->dpm_pcie_cur, 2);
     CHECK_EQ(a->dpm_pcie[1], std::string("1: 16.0GT/s, x8 616Mhz"));
 }
@@ -238,10 +234,8 @@ TEST(the_whole_pcie_path_is_read_root_port_first) {
     machine(r);
     const diag::Facts f = diag::collect(r.dir);
     const diag::CardFacts* b = card(f, "0000:07:00.0");
-    CHECK(b);
-    if (!b) return;
-    CHECK_EQ((int)b->chain.size(), 4);
-    if (b->chain.size() != 4) return;
+    REQUIRE(b);
+    REQUIRE_EQ((int)b->chain.size(), 4);
     CHECK_EQ(b->chain[0].bdf, std::string("0000:00:01.3"));
     CHECK_EQ(b->chain[0].cur_speed, std::string("16.0 GT/s PCIe"));
     CHECK_EQ(b->chain[0].max_speed, std::string("32.0 GT/s PCIe"));
@@ -294,8 +288,7 @@ TEST(a_kfd_value_too_large_for_a_signed_read_does_not_hide_the_rest) {
           "domain 0\ngfx_target_version 120001\n");
     const diag::Facts f = diag::collect(r.dir);
     const diag::CardFacts* a = card(f, "0000:03:00.0");
-    CHECK(a);
-    if (!a) return;
+    REQUIRE(a);
     CHECK_EQ(a->gfx, std::string("gfx1201"));
     CHECK_EQ(a->simd, 128);
 }
@@ -310,8 +303,7 @@ TEST(only_the_managed_cards_power_files_are_read) {
     CHECK_EQ((int)f.cards.size(), 3);
     const diag::CardFacts* a = card(f, "0000:03:00.0");
     const diag::CardFacts* b = card(f, "0000:07:00.0");
-    CHECK(a && b);
-    if (!a || !b) return;
+    REQUIRE(a && b);
     CHECK_EQ(a->busy_percent, 3);
     CHECK_EQ(a->power_cap_uw, (int64_t)300000000);
     CHECK_EQ(a->vddgfx_offset, std::string("-75 mV"));
@@ -332,8 +324,7 @@ TEST(environment_names_and_never_their_values) {
     char d[] = "RADIANCE_SECRETISH=sk-not-for-the-log";
     char* env[] = { a, b, c, d, nullptr };
     const std::vector<std::string> n = diag::env_names(env, "RADIANCE_");
-    CHECK_EQ(n.size(), (size_t)3);
-    if (n.size() != 3) return;
+    REQUIRE_EQ(n.size(), (size_t)3);
     CHECK_EQ(n[0], std::string("RADIANCE_LOG"));
     CHECK_EQ(n[1], std::string("RADIANCE_SECRETISH"));
     CHECK_EQ(n[2], std::string("RADIANCE_TUNE"));
@@ -502,8 +493,7 @@ TEST(a_run_started_anyway_says_so_at_the_top) {
     CHECK(text.find("INCOMPATIBLE cwsr-off") != std::string::npos);
     const Json j =
         Json::parse(diag::to_json({}, {}, f, run, found), nullptr, false);
-    CHECK(!j.is_discarded());
-    if (j.is_discarded()) return;
+    REQUIRE(!j.is_discarded());
     CHECK(j["unsupported_configuration"] == true);
     CHECK(j["findings"][0]["level"] == "incompatible");
     /* Without the flag the report carries no banner. */
@@ -583,8 +573,8 @@ TEST(every_option_in_the_table_is_reported) {
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     const std::vector<diag::ConfigRow> rows = diag::config_rows(c);
     const std::vector<std::string> names = diag::config_option_names();
-    CHECK_EQ(rows.size(), names.size());
-    CHECK(names.size() > 80);
+    REQUIRE_EQ(rows.size(), names.size());
+    REQUIRE(names.size() > 80);
     for (size_t i = 0; i < rows.size() && i < names.size(); ++i) {
         CHECK_EQ(rows[i].flag, names[i]);
         if (rows[i].value == "(not shown)") {
@@ -650,7 +640,7 @@ TEST(sources_and_secrets) {
     CHECK(row("--num-speculative-tokens")->source == "auto");
     CHECK(row("--num-speculative-tokens")->why == "revised");
     CHECK(row("--tp")->source == "command line");
-    CHECK_EQ(derived.size(), (size_t)1);
+    REQUIRE_EQ(derived.size(), (size_t)1);
     CHECK(!derived.empty() && derived[0].key == "vram split");
 
     const std::string text = diag::render(rows, derived, diag::Facts{}, diag::RunFacts{}, {});
@@ -680,8 +670,7 @@ TEST(a_value_that_is_not_utf8_does_not_break_the_json) {
     try { out = diag::to_json(rows, {}, f, diag::RunFacts{}, {}); } catch (...) { threw = true; }
     CHECK(!threw);
     const Json j = Json::parse(out, nullptr, false);
-    CHECK(!j.is_discarded());
-    if (j.is_discarded()) return;
+    REQUIRE(!j.is_discarded());
     CHECK(j["configuration"][0]["value"].get<std::string>() == "/m/caf\xef\xbf\xbd.rad");
 }
 
@@ -738,8 +727,7 @@ TEST(the_json_carries_every_section) {
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     const Json j = Json::parse(
         diag::to_json(diag::config_rows(c), {}, f, diag::RunFacts{}, found), nullptr, false);
-    CHECK(!j.is_discarded());
-    if (j.is_discarded()) return;
+    REQUIRE(!j.is_discarded());
     CHECK(j["configuration"].is_array() && j["configuration"].size() == diag::config_option_names().size());
     CHECK(j["hardware"]["cards"].size() == 3);
     CHECK(j["hardware"]["cards"][1]["link_chain"].size() == 4);

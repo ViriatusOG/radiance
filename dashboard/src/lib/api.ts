@@ -58,13 +58,18 @@ export interface RunningRequest {
 }
 export interface DraftPosition { reached: number; rate: number }
 export interface ExpertTier { name: string; units: number; bytes: number }
-export interface Experts { n_units: number; tiers: ExpertTier[]; layer_units?: number[]; layer_resident?: number[] }
+export interface Experts { n_units: number; tiered?: boolean; tiers: ExpertTier[]; layer_units?: number[]; layer_resident?: number[] }
 export interface Stats {
   model: string; uptime_s: number
   in_flight: number; max_num_seqs?: number
   jobs: { running: number; done: number; failed: number; total_ms: number; last_ms: number }
   running?: number; waiting?: number
   kv_bytes_used?: number; kv_bytes_total?: number
+  // The pool in tokens: held now, what it holds at present, and the most it could hold if every block
+  // of its carve (VRAM lent to the experts included) were the cache's.
+  kv_tokens_used?: number; kv_tokens_total?: number; kv_tokens_max?: number
+  // The step running now (0 prefill, 1 decode, 2 mixed; -1 none) and its age in seconds.
+  step_open_phase?: number; step_open_s?: number
   prefix_hit_rate?: number; prefill_tps?: number; decode_tps?: number
   total_requests?: number; preemptions?: number
   step_ns_decode_best?: number

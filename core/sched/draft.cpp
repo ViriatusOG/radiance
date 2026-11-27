@@ -3,6 +3,7 @@
  */
 #include "draft.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -45,10 +46,40 @@ int DraftController::configure(const Params& p) {
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) prior_[j] = 0.0f;
     for (int d = 0; d <= RAD_SCHED_MAX_SPEC; ++d) by_depth_[d] = 0;
     cost_.reset(kRowCost);
+    timed_ = 0;
+    /* Depth 0 (draft.h): reset whether or not it is on, so off it never leaves these values. */
+    depth0_ = p.depth0;
+    probe_every_ = p.probe_every > 0 ? p.probe_every : kProbeEvery;
+    zero_ = false;
+    zero_held_ = kHold;
+    probe_left_ = 0;
+    probe_d_ = 0;
+    since_probe_ = 0;
+    zero_run_ = 0;
+    cycles_ = 0;
+    plain_.reset(kRowCost);
+    for (int c = 0; c < kCostClasses; ++c) {
+        plain_n_[c] = plain_at_[c] = 0;
+        dn_[c] = dtn_[c] = 0;
+        dtok_[c] = dms_[c] = 0.0;
+    }
+    plain_probe_at_ = -(int64_t)RAD_SCHED_MAX_SPEC * 4096;
+    n_zero_ = n_probe_ = n_zero_moves_ = 0;
+    set_backoff(p.backoff);
     if (adapt_)
         RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
                  "than %.0f%% of the time, and the depth moves at +%.0f%% at most every %d steps",
-                 kMinDepth, p_.max_depth, 100.0 * kDraftMinChance, 100.0 * kHyst, kHold);
+                 depth0_ ? 0 : kMinDepth, p_.max_depth, 100.0 * kDraftMinChance, 100.0 * kHyst,
+                 kHold);
+    if (adapt_ && depth0_)
+        RAD_INFO("draft depth 0: a step drafts nothing and verifies nothing where a plain step, "
+                 "measured, emits %.0f%% more tokens a millisecond than the window; at 0, %d "
+                 "cycles of the drafting depth every %d keep its estimates measured",
+                 100.0 * kHyst, kProbeSteps, probe_every_);
+    if (adapt_ && depth0_ && backoff_max_ > 0)
+        RAD_INFO("draft probe back-off: each probe that leaves depth 0 in place doubles the "
+                 "interval to the next, up to %d cycles; a move between 0 and drafting starts it "
+                 "over", (int)std::min<int64_t>((int64_t)probe_every_ << backoff_max_, 4096));
     return RAD_OK;
 }
 
@@ -73,9 +104,40 @@ void DraftController::observe(int drafted, int accepted) {
 }
 
 /* ------------------------------------------------------------------ the step's cost */
-void DraftController::step_time(int q_rows, double ms) {
+void DraftController::step_time(int q_rows, double ms, int n_rows, double tokens) {
     if (!adapt_) return;
     cost_.sample(q_rows, ms);
+    if (q_rows < 1 || !(ms > 0.0) || !std::isfinite(ms)) return;
+    ++timed_;
+    /* Depth 0's view of the drafting steps, per row class (draft.h). */
+    if (n_rows < 1) return;
+    const int c = cost_class(n_rows);
+    ++dn_[c];
+    if (tokens > 0.0 && std::isfinite(tokens)) {
+        double t = ms;
+        if (dtn_[c] >= StepCost::kClipAfter && t > StepCost::kOutlier * dms_[c])
+            t = StepCost::kOutlier * dms_[c];
+        const double w = settle_weight(StepCost::kHalfLife, dtn_[c]);
+        dtok_[c] = dtn_[c] ? dtok_[c] + w * (tokens - dtok_[c]) : tokens;
+        dms_[c]  = dtn_[c] ? dms_[c] + w * (t - dms_[c]) : t;
+        ++dtn_[c];
+    }
+}
+
+void DraftController::plain_time(int n_rows, double ms) {
+    if (!adapt_ || !depth0_ || n_rows < 1 || !(ms > 0.0) || !std::isfinite(ms)) return;
+    /* A plain step still warming up (kPlainWarm) is no sample. */
+    if (zero_run_ <= 1 + kPlainWarm) return;
+    const int c = cost_class(n_rows);
+    plain_.sample(n_rows, ms);
+    ++plain_n_[c];
+    plain_at_[c] = cycles_;
+}
+
+int DraftController::cost_class(int n_rows) {
+    int c = 0;
+    for (int r = n_rows; r > 1 && c < kCostClasses - 1; r >>= 1) ++c;
+    return c;
 }
 
 int64_t DraftController::cost_samples(int q_rows) const {
@@ -128,9 +190,10 @@ double DraftController::yield(const DraftAdapt& s, int d) const {
 }
 
 int DraftController::window_of(const DraftAdapt& s) const {
-    if (!adapt_) return next_depth();
-    if (s.depth <= 0) return 0;
-    const int D = step_d_ > 0 ? step_d_ : p_.max_depth;
+    if (!adapt_) return p_.max_depth;
+    if (s.depth <= 0 || zero_now()) return 0;
+    const int d = step_depth();
+    const int D = d > 0 ? d : p_.max_depth;
     return s.depth < D ? s.depth : D;
 }
 
@@ -230,7 +293,91 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
         }
     }
     step_w_ = step_d_ < top ? step_d_ : top;
-    return step_d_;
+    if (depth0_) {
+        plan_zero(tok, drafts, plain, n_rows);
+        zero_run_ = zero_now() ? (zero_run_ < INT32_MAX ? zero_run_ + 1 : zero_run_) : 0;
+    }
+    return step_depth();
+}
+
+/* Depth 0, after the drafting depth is chosen: whether this cycle runs at D = 0 instead. The
+ * drafting depth step_w_ is the window the step would verify; its yield per millisecond is weighed
+ * against the measured plain step's, with the same hold and hysteresis as a move of D. Both sides
+ * are priced on the row-count costs (StepCost), not on a separate table per depth and row class. */
+void DraftController::plan_zero(const double* tok, const int* drafts, double plain, int n_rows) {
+    ++cycles_;
+    if (zero_held_ < INT32_MAX) ++zero_held_;
+    const int c  = cost_class(n_rows);
+    const int dd = step_w_ > 0 ? step_w_ : kMinDepth;
+
+    /* A probe runs its cycles out first, and the decision below reads what it measured. */
+    bool probed = false;   /* a probe at the drafting depth ran out at this cycle */
+    if (probe_left_ > 0) {
+        if (--probe_left_ > 0) {
+            if (probe_d_ > 0) probe_d_ = dd;
+            ++n_probe_;
+            return;
+        }
+        probed = probe_d_ > 0;
+    }
+
+    /* The hold counts every cycle, probes included, and starts spent: the first measured plain
+     * step decides at once, as the first drafting step takes the best depth outright. Both sides
+     * in ms: a plain step measured in this row class, and drafting steps timed. */
+    const bool measured = plain_n_[c] > 0 && timed_ > 0;
+    bool moved = false;
+    if (measured) {
+        /* The drafting side is the lower of the model's yield at the drafting depth and the
+         * yield drafting steps measured here: E(D) comes from estimates a new sequence starts
+         * optimistic, and a plain step's yield is n_rows a step by construction. Erring toward 0
+         * corrects itself, since at 0 every plain step is a sample and every probe a drafting
+         * one; erring toward drafting does not, since while drafting only plain probes sample
+         * the plain step. */
+        double g_d = (tok[dd] + plain) / step_cost(n_rows + drafts[dd]);
+        if (dtn_[c] >= StepCost::kClipAfter && dms_[c] > 0.0)
+            g_d = std::fmin(g_d, dtok_[c] / dms_[c]);
+        const double g_0 = (double)n_rows / plain_.cost(n_rows);
+        const bool want = zero_ ? !(g_d > g_0 * (1.0 + kHyst)) : g_0 > g_d * (1.0 + kHyst);
+        if (want != zero_ && zero_held_ >= kHold) {
+            RAD_DEBUG("draft window: head depth %d -> %d over %d rows (%.3f -> %.3f tokens a ms)",
+                      zero_ ? 0 : dd, want ? 0 : dd, n_rows, want ? g_d : g_0, want ? g_0 : g_d);
+            zero_ = want;
+            zero_held_ = 0;
+            since_probe_ = 0;
+            ++n_zero_moves_;
+            backoff_k_ = 0;
+            moved = true;
+        }
+    }
+    /* Probe back-off: a probe that ran out with 0 still chosen doubles the interval to the next. */
+    if (probed && !moved && zero_ && backoff_k_ < backoff_max_) ++backoff_k_;
+
+    if (zero_) {
+        /* At 0: every probe_interval() cycles (probe_every, or more under the back-off),
+         * kProbeSteps at the drafting depth. */
+        if (++since_probe_ >= probe_interval()) {
+            since_probe_ = 0;
+            probe_d_ = dd;
+            probe_left_ = kProbeSteps;
+            ++n_probe_;
+            return;
+        }
+        ++n_zero_;
+        return;
+    }
+    /* Drafting: a plain probe where this class has no plain step measured, or only an old one,
+     * once drafting steps are measured here (otherwise the comparison has nothing to weigh it
+     * against). Its first kPlainWarm plain steps are no samples; it takes 3 the first time in a
+     * class and 1 at a refresh. At most one every probe_every cycles: a probe whose steps all
+     * carried a prefill chunk measured nothing, and must not be followed by another at once. */
+    const bool stale = plain_n_[c] <= 0 ||
+                       cycles_ - plain_at_[c] > (int64_t)kPlainStale * probe_every_;
+    if (stale && dn_[c] >= StepCost::kClipAfter && cycles_ - plain_probe_at_ >= probe_every_) {
+        plain_probe_at_ = cycles_;
+        probe_d_ = 0;
+        probe_left_ = 1 + kPlainWarm + (plain_n_[c] > 0 ? 1 : 3);
+        ++n_probe_;
+    }
 }
 
 }  /* namespace rad */

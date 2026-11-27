@@ -59,19 +59,13 @@
 #include <arch/rad_museglimmer_chat.h>
 #include "dflash2.h"
 
-#include <cmath>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace museglimmer {
 
 using namespace rad::arch;
-
-/* ---- the checkpoint's config. A multimodal model keeps the trunk under `text_config.`; accept
- * the bare spelling too, so a text-only GGUF container of the same family reads the same way. */
-namespace {
-
-}  // namespace
 
 /* One trunk layer. The rope ops exist only where layer_rope_theta says so; the branch is fixed
  * per layer by the model. */
@@ -226,9 +220,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         size_t i = 0;
         for_each_token(thetas, [&](const char* t, size_t n) {
             if (i >= theta.size()) return false;
+            const std::string tok(t, n);
             char* e = nullptr;
-            const double v = std::strtod(std::string(t, n).c_str(), &e);
-            theta[i++] = e == t ? -1.0f : (float)v;
+            const double v = std::strtod(tok.c_str(), &e);
+            theta[i++] = e == tok.c_str() ? -1.0f : (float)v;
             return true;
         });
         if (i < theta.size()) {
@@ -339,12 +334,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
     if (g.world > 1)
-        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                               RAD_NOWEIGHTS),
-                           {m.b_x}, {m.b_x});
+        m.op_embed_ar = decl_all_reduce_exact(b, g, m.b_x);
     /* The embedding norm, after the vocabulary shard's reduction: a weightless RMS norm at
      * rms_norm_eps, in place. Weightless because MuseGlimmerTextNormedEmbedding has no gain. */
     m.op_embed_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -370,11 +360,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                std::max({g.n_embd, q_dim * g.world, g.n_ff * g.world})));
 
     /* ---- the layers. */
-    const int64_t attn_scale_num = 1;   /* attention scale stays 1/sqrt(head_dim): the query's
-                                         * qk_scale_factor rides the q norm's `mult`. */
-    (void)attn_scale_num;
+    /* The attention scale stays 1/sqrt(head_dim): the query's qk_scale_factor rides the q norm's
+     * `mult`. */
     m.layers.resize((size_t)g.n_layer);
-    for (int64_t l = 0; l < g.n_layer; ++l) {
+    for (int l = 0; l < g.n_layer; ++l) {
         Layer&   lay  = m.layers[(size_t)l];
         lay.full     = full[(size_t)l];
         lay.rope     = theta[(size_t)l] > 0.0f;
@@ -523,13 +512,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           RAD_WEIGHTS(lay.w_o)),
                       {m.b_attn}, {m.b_h});
         if (g.world > 1)
-            lay.op_ar = rw(b, RAD_OP(b, "all_reduce",
-                               RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                          RAD_INT("min_bytes", g.wire_min_bytes)),
-                               RAD_NOWEIGHTS),
-                           {m.b_h}, {m.b_h});
+            lay.op_ar = decl_all_reduce(b, g, m.b_h);
         /* The branch's own norm, at post_norm_eps, before the residual add. */
         lay.op_post = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -566,13 +549,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           RAD_WEIGHTS(lay.w_down)),
                       {m.b_ffn}, {m.b_h});
         if (g.world > 1)
-            lay.op_far = rw(b, RAD_OP(b, "all_reduce",
-                                RAD_PARAMS(RAD_INT("world_size", g.world),
-                                           RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                           RAD_INT("min_bytes", g.wire_min_bytes)),
-                                RAD_NOWEIGHTS),
-                            {m.b_h}, {m.b_h});
+            lay.op_far = decl_all_reduce(b, g, m.b_h);
         lay.op_fpost = rw(b, RAD_OP(b, "rmsnorm",
                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                          RAD_F64("eps", m.post_eps), RAD_F64("wadd", 1.0),

@@ -278,29 +278,9 @@ static const RadPlanesHeader* cb_joined(const RadTensor& t) {
     return rad_planes_header(t.data);
 }
 
-/* NVFP4's e2m1 levels as the 16-entry table the u4 decode reads (libref's kE2m1Table): the code's
- * sign is bit 3, so code 8 is negative zero. */
-static const float kCbE2m1[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
-
 /* An expert's codes from its joined form: 1, 0 for a plain plane (any dtype but u4 and u5),
- * RAD_E_DTYPE for planes these kernels do not read, RAD_E_SHAPE for codes not covering [n, k].
- * With `fp4` the expert is an NVFP4 plane instead: a plain e2m1 plane, two codes a byte, read
- * through kCbE2m1 as a u4 codebook; it must be dense (a row is k / 2 bytes). */
-static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out, bool fp4 = false) {
-    if (fp4) {
-        if (w.dtype != RAD_FP4E2M1) return RAD_E_DTYPE;
-        if (!w.data || w.rank < 2 || w.shape[0] < n || w.shape[1] < k || k % 2 ||
-            w.stride[1] != 1 || w.stride[0] != k)
-            return RAD_E_SHAPE;
-        out->codes = (const uint8_t*)w.data;
-        out->row_bytes = k / 2;
-        out->n = n;
-        out->k = k;
-        out->bits = 4;
-        std::memcpy(out->tab, kCbE2m1, sizeof kCbE2m1);
-        return 1;
-    }
+ * RAD_E_DTYPE for planes these kernels do not read, RAD_E_SHAPE for codes not covering [n, k]. */
+static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out) {
     if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
@@ -640,7 +620,6 @@ static inline void cb_block(const float* const* A, const float* B, int64_t ldb, 
 
 /* A call's operands and geometry, as moe_gemm_impl read them. */
 struct CbCall {
-    bool fp4 = false;   /* NVFP4 codes (cb_codes) rather than u4 or u5 */
     const RadTensor *A = nullptr, *sorted = nullptr, *off = nullptr, *Y = nullptr;
     const RadTensor* Wq[4] = {};
     const RadTensor* wsq[4] = {};
@@ -909,7 +888,7 @@ static int moe_codebook(const CbCall& c) {
         }
         CbExp& x = ex[e];
         x = CbExp{};
-        const int jc = cb_codes(w, n, k, &x, c.fp4);
+        const int jc = cb_codes(w, n, k, &x);
         if (jc < 0) return jc;
         if (jc == 0) return RAD_E_DTYPE;
         const int js = cb_scale(c.wsq[q] ? &s : nullptr, &x);
@@ -1063,11 +1042,9 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     const int64_t y_cs = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
 
     /* u4 or u5 codes are the codebook experts' joined form, which only their own path reads. */
-    const bool fp4 = quant && std::strcmp(p_str(a, "dtype", ""), "nvfp4a8i8") == 0;
-    if (quant && (Wq[0]->dtype == RAD_U4 || Wq[0]->dtype == RAD_U5 || fp4)) {
+    if (quant && (Wq[0]->dtype == RAD_U4 || Wq[0]->dtype == RAD_U5)) {
         CbCall c;
         c.A = A; c.sorted = sorted; c.off = off; c.Y = Y;
-        c.fp4 = fp4;
         for (int q = 0; q < 4; ++q) {
             c.Wq[q] = Wq[q]; c.wsq[q] = wsq[q]; c.Nq[q] = Nq[q]; c.Kq[q] = Kq[q];
         }

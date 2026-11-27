@@ -25,10 +25,10 @@
 //
 // The kernel reads the logits through explicit row and column strides, so nothing is
 // model-specific. The entry point takes flat scalars and returns a negative code instead of
-// throwing, for the reason given in r4d_gemm_fp8a8.hip. `f32` in the name is the logits dtype.
+// throwing, for the reason given in r4d_gemm_i8a8.hip. `f32` in the name is the logits dtype.
 
 #include "r4d.h"
-#include "r4d_fp8_args.h"
+#include "r4d_quant_args.h"
 
 #include <hip/hip_runtime.h>
 #include <cmath>
@@ -347,7 +347,7 @@ extern "C" int r4d_sample_chain_f32(long logits, long query, long u, long out,
 
 // ============================================================== the plugin ABI entry points
 //
-// The shared operand reader is r4d_fp8_args.h. See libr4d/r4d_args.h on why there is no adapter
+// The shared operand reader is r4d_quant_args.h. See libr4d/r4d_args.h on why there is no adapter
 // layer.
 /* ================================================================== the device sampler */
 

@@ -1,42 +1,24 @@
-/* r4d_fp8_layout.cpp -- the stored form of libr4d's FP8 and int8 weights, and the relayouts that
- * produce it from the weight's canonical planes (spec.md §4.3). Pure host C++: nothing here
- * includes r4d.h or <hip/hip_runtime.h>, so packing can be tested without ROCm.
+/* r4d_fp8_layout.cpp -- the stored form of libr4d's 8-bit-code weights and the relayouts that
+ * produce it from the weight's canonical planes (spec §4.3). Pure host C++: nothing here includes
+ * r4d.h or <hip/hip_runtime.h>, so packing can be tested without ROCm.
  *
- * ================================================================= what they read
+ * Int8 linears (gemm_nt_q): codes `i8 [N][K]` with a bf16 scale per row per 128 K (256 at IQ8R).
+ * The codes move into WMMA fragment order (r4d_fp8_frag.h), so a lane reads its own bytes from one
+ * coalesced load; the scale plane is stored tile-major, [N/16][K/group][16], so a lane's eight
+ * accumulator rows read their scales as one 16-byte load.
  *
- * The block-scaled linears read the encoding a block-FP8 checkpoint ships, `fp8_e4m3*bf16[128x128]`:
+ * The lm_head is a single row-sharded operand, so each row carries its scales in its own tail:
+ * [K codes][K/128 bf16 scales], padded to 16 bytes so a uint4 load of the next row is aligned
+ * (r4d_lm_row.h). hc_read's mixing matrices and mtp_enter's fc are E4M3 rows with an f32 scale per
+ * group of the row in the same form (r4d_hc_fp8.h).
  *
- *   codes   F8_E4M3, [N][K]                       -- as safetensors stores `X.weight`
- *   scale   BF16,    [ceil(N/128)][ceil(K/128)]   -- as `X.weight_scale_inv`
- *
- * E.g. Qwen3.8-27B-FP8 `mlp.gate_proj.weight` is F8_E4M3 [17408, 5120] with a BF16 [136, 40]
- * scale. The kernels index `S[(row / 128) * sc_cols + (c / 128)]`, so the scale plane is stored
- * unchanged and only the codes move: into WMMA fragment order for the fp8a8 GEMMs (a lane reads
- * its own bytes from one coalesced load), and not at all for the fp8a16 matvec, which reads
- * sixteen consecutive k of one row. The two forms differ, so a weight is declared for one or the
- * other and the builder refuses the pair.
- *
- * The lm_head is a single row-sharded operand, so each row carries its block scales in its own
- * tail: [K codes][K/128 bf16 scales], padded to 16 bytes so a uint4 load of the next row is
- * aligned (r4d_fp8_lm.h). hc_read's mixing matrices and mtp_enter's fc use the same form with an
- * f32 scale per group of the row (r4d_hc_fp8.h).
- *
- * ================================================================= BF16 scales, not UE8M0
- *
- * Some block-FP8 checkpoints carry a UE8M0 exponent byte per tile instead of a bf16. Converting to
- * UE8M0 rounds each scale to a power of two, which changes the tile's gain and would mean
- * requantising every E4M3 byte. Decoding either costs one shift and one bitcast, and the bf16
- * plane is 0.02% of its weight.
- *
- * This file chooses no numbers: a checkpoint's planes are served as they are, and anything
- * quantised (e.g. a bf16 lm_head made fp8) was quantised before the container was written, by
- * libquant's `rtn` over `fp8_e4m3` with a 128x128 bf16 block. Its rule matches these kernels'
- * activation quantiser: amax/448 rounded to bf16, a zero block scaled by one.
+ * This file chooses no numbers: a weight's planes are served as they are, quantised before the
+ * container was written.
  */
 
 #include "r4d_plugin.h"
 #include "r4d_fp8_frag.h"
-#include "r4d_fp8_lm.h"
+#include "r4d_lm_row.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_enc.h"
 #include "r4d_hsimd.h"
@@ -52,14 +34,14 @@
 enum { FL_A = 0, FL_ASCALE = 1, FL_B = 2, FL_BSCALE = 3, FL_Y = 4 };
 
 /* K span of one fragment-order tile, compiled into libr4d. */
-enum { R4D_FP8_SUPER_K = r4d_fp8::kSuperK };
+enum { R4D_SUPER_K = r4d_fp8::kSuperK };
 
 namespace {
 
 /* Walks the fragment-order plane front to back, eight bytes at a time, passing each word's
  * row-major offset in the [N][K] weight; used in both directions. A fragment is eight consecutive
  * k of one row (r4d_fp8_frag.h frag_src over j = 0..7), so it moves as one word. Placing each byte
- * separately would dominate the CPU cost of loading a block-FP8 model. */
+ * separately would dominate the CPU cost of loading a model. */
 template <typename Move>
 void frag_walk(long long N, long long K, Move move) {
     constexpr int kLanes = r4d_fp8::kTileBytes / r4d_fp8::kLaneBytes;
@@ -77,7 +59,7 @@ void frag_walk(long long N, long long K, Move move) {
 }
 
 /* frag_walk's forward direction a 16-row tile at a time (r4d_hsimd, by CPU level): the load
- * path of every block-FP8 and int8 GEMM weight. */
+ * path of every int8 GEMM weight. */
 void frag_tiles(const uint8_t* s, long long N, long long K, uint8_t* d) {
     const long long ksuper = K / r4d_fp8::kSuperK;
     for (long long rt = 0; rt < N / r4d_fp8::kFragRows; ++rt)
@@ -85,7 +67,7 @@ void frag_tiles(const uint8_t* s, long long N, long long K, uint8_t* d) {
                                  d + rt * r4d_fp8::kFragRows * K);
 }
 
-struct FGeom { long long N, K, sn, sk; };
+struct FGeom { long long N, K, sk; };
 
 int fgeom(const RadParam* p, int n_p, FGeom* g) {
     g->N = r4d_pgeti_or(p, n_p, "N", 0);
@@ -93,9 +75,8 @@ int fgeom(const RadParam* p, int n_p, FGeom* g) {
     if (g->N <= 0 || g->K <= 0) return RAD_E_SHAPE;
     /* The block is compiled into the kernels as `>> 7`. The constraint table already refuses
      * other groups; this catches a caller that invokes the hook without selection. */
-    if (r4d_pgeti_or(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_SHAPE;
-    g->sn = (g->N + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
-    g->sk = (g->K + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
+    if (r4d_pgeti_or(p, n_p, "group", R4D_I8_GROUP) != R4D_I8_GROUP) return RAD_E_SHAPE;
+    g->sk = (g->K + R4D_I8_GROUP - 1) / R4D_I8_GROUP;
     return RAD_OK;
 }
 
@@ -107,7 +88,7 @@ void ffill(RadLayout* out, const char* tag, uint32_t dt, long long d0, long long
     out->rank = 2;
     out->shape[0] = d0;
     out->shape[1] = d1;
-    out->align = 16;   /* 16-byte loads; see the padding note in r4d_fp8_lm.h */
+    out->align = 16;   /* 16-byte loads; see the padding note in r4d_lm_row.h */
     out->bytes = bytes;
 }
 
@@ -117,9 +98,8 @@ int lgeom(const RadParam* p, int n_p, FGeom* g) {
     g->N = r4d_pgeti_or(p, n_p, "n_vocab", 0);
     g->K = r4d_pgeti_or(p, n_p, "n_embd", 0);
     if (g->N <= 0 || g->K <= 0) return RAD_E_SHAPE;
-    if (g->K % R4D_FP8_BLOCK) return RAD_E_SHAPE;
-    g->sn = (g->N + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
-    g->sk = g->K / R4D_FP8_BLOCK;
+    if (g->K % R4D_I8_GROUP) return RAD_E_SHAPE;
+    g->sk = g->K / R4D_I8_GROUP;
     return RAD_OK;
 }
 
@@ -161,15 +141,6 @@ int mgeom(const RadParam* p, int n_p, int operand, HGeom* g) {
  * Each checks the encoding its kernel reads and refuses any other with RAD_E_DTYPE (the
  * declare-time error for a mis-converted container). They move bits and choose none. */
 
-namespace {
-
-/* gemm_nt_q's block-fp8 weight: e4m3 codes with a bf16 scale per 128x128 block. */
-bool fp8_block_enc(const RadEncoding* e) {
-    return r4d_enc::affine(e, RAD_F8E4M3, RAD_BF16, R4D_FP8_BLOCK, R4D_FP8_BLOCK);
-}
-
-}  /* namespace */
-
 /* ---- the int8 twin: i8 codes in the same fragment order as E4M3, with a bf16 scale per row per
  * 128 K.
  *
@@ -194,7 +165,7 @@ bool i8_rotated(const RadParam* p, int n_p) {
 
 /* int8 codes with a bf16 scale per (row, 128), at transform `tr`. */
 bool i8_codes(const RadEncoding* enc, const char* tr) {
-    return r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK, RAD_DT_INVALID, tr);
+    return r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_I8_GROUP, RAD_DT_INVALID, tr);
 }
 
 /* IQ8R: int8 codes rotated 128 wide, a u8 scale per (row, 256) under one bf16 scale a row
@@ -221,10 +192,9 @@ int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     FGeom g;
     g.N = r4d_pgeti_or(p, n_p, "N", 0);
     g.K = r4d_pgeti_or(p, n_p, "K", 0);
-    const long long group = r4d_pgeti_or(p, n_p, "group", R4D_FP8_BLOCK);
-    if (g.N <= 0 || g.K <= 0 || (group != R4D_FP8_BLOCK && group != R4D_I8_GROUP_WIDE))
+    const long long group = r4d_pgeti_or(p, n_p, "group", R4D_I8_GROUP);
+    if (g.N <= 0 || g.K <= 0 || (group != R4D_I8_GROUP && group != R4D_I8_GROUP_WIDE))
         return RAD_E_SHAPE;
-    g.sn = (g.N + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
     g.sk = (g.K + group - 1) / group;
     if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
     const bool rot = i8_rotated(p, n_p);
@@ -244,7 +214,7 @@ int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     }
     if (!r4d_enc::selects(enc, sel, n, "codes") || !r4d_enc::dims(pl[0], g.N, g.K))
         return RAD_E_SHAPE;
-    if (g.K % R4D_FP8_SUPER_K || g.N % r4d_fp8::kFragRows) return RAD_E_SHAPE;
+    if (g.K % R4D_SUPER_K || g.N % r4d_fp8::kFragRows) return RAD_E_SHAPE;
     ffill(out, rot ? "r4d.i8h.w.frag64" : "r4d.i8.w.frag64", RAD_I8, g.N, g.K,
           r4d_fp8::frag_bytes(g.N, g.K));
     return RAD_OK;
@@ -255,6 +225,66 @@ extern "C" int r4d_rad_layout_i8_block(const RadParam* p, int n_p, int operand,
                                        const RadEncoding* enc, const int* sel,
                                        const RadTensor* pl, int n, RadLayout* out) {
     return i8_enc_layout(p, n_p, operand, enc, sel, pl, n, out);
+}
+
+/* gemm_nt_q_multi's weights: operand 6 + 2 i is slice i's codes and 7 + 2 i its scale
+ * (oGemmNtQMulti in r4d_rows.cpp), each in gemm_nt_q's stored form at that slice's N, so a
+ * weight the single linear also reads is stored once. */
+namespace {
+int i8_multi_args(const RadParam* p, int n_p, int operand, std::vector<RadParam>* pp, int* opd) {
+    static const char* const kN[5] = { "N0", "N1", "N2", "N3", "N4" };
+    const int i = (operand - 6) / 2;
+    if (operand < 6 || i >= 5) return RAD_E_UNSUPPORTED;
+    const long long Ni = r4d_pgeti_or(p, n_p, kN[i], 0);
+    if (Ni <= 0) return RAD_E_SHAPE;
+    pp->assign(p, p + n_p);
+    bool set = false;
+    for (RadParam& q : *pp)
+        if (q.key && std::strcmp(q.key, "N") == 0) { q.kind = RAD_P_INT; q.ival = Ni; set = true; }
+    if (!set) {
+        RadParam q{};
+        q.key = "N";
+        q.kind = RAD_P_INT;
+        q.ival = Ni;
+        pp->push_back(q);
+    }
+    *opd = (operand - 6) % 2 ? FL_BSCALE : FL_B;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_i8_multi(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout* out) {
+    std::vector<RadParam> pp;
+    int opd = 0;
+    const int rc = i8_multi_args(p, n_p, operand, &pp, &opd);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_layout_i8_block(pp.data(), (int)pp.size(), opd, enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_i8_multi(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes) {
+    std::vector<RadParam> pp;
+    int opd = 0;
+    const int rc = i8_multi_args(p, n_p, operand, &pp, &opd);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_relayout_i8_block(pp.data(), (int)pp.size(), opd, enc, sel, pl, n, dst,
+                                     dst_bytes);
+}
+
+extern "C" int r4d_rad_unrelayout_i8_multi(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const void* src, int64_t src_bytes,
+                                           const RadTensor* pl, int n) {
+    std::vector<RadParam> pp;
+    int opd = 0;
+    const int rc = i8_multi_args(p, n_p, operand, &pp, &opd);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_unrelayout_i8_block(pp.data(), (int)pp.size(), opd, enc, sel, src, src_bytes,
+                                       pl, n);
 }
 
 /* The same int8 weight at one scale per (row, 128 of K), both planes row-major as stored: what
@@ -335,32 +365,22 @@ extern "C" int r4d_rad_unrelayout_i8_block(const RadParam* p, int n_p, int opera
     return RAD_OK;
 }
 
-/* ---- the lm_head: codes and scales in one row, the scales of the row's 128-row block repeated
- * into its tail. */
+/* ---- the lm_head: each row's int8 codes, then its bf16 scales, then the alignment pad. */
 namespace {
-/* `i8` selects the int8 head (logits_gemm_i8): i8 codes with a bf16 scale per row per 128
- * columns. Same stored row, but each row's tail holds its own scales instead of its block's. */
+/* The int8 head (logits_gemm_i8): i8 codes with a bf16 scale per row per 128 columns, each row's
+ * tail holding its own scales. */
 int lm_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
-                  const RadTensor* pl, int n, RadLayout* out, FGeom* gout, bool i8 = false) {
+                  const RadTensor* pl, int n, RadLayout* out, FGeom* gout) {
     if (!out || !pl) return RAD_E_INVAL;
     if (operand != LGL_W) return RAD_E_UNSUPPORTED;
     FGeom g;
     const int rc = lgeom(p, n_p, &g);
     if (rc != RAD_OK) return rc;
-    if (i8) {
-        if (!i8_codes(enc, "")) return RAD_E_DTYPE;
-        if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
-        if (!r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], g.N, g.sk))
-            return RAD_E_SHAPE;
-    } else {
-        if (!fp8_block_enc(enc)) return RAD_E_DTYPE;
-        if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
-        if (!r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], g.sn, g.sk))
-            return RAD_E_SHAPE;
-    }
-    const long long stride = r4d_fp8::lm_row_bytes(g.K);
-    ffill(out, i8 ? "r4d.i8lm.r128" : "r4d.fp8lm.b128", i8 ? RAD_I8 : RAD_F8E4M3, g.N, stride,
-          g.N * stride);
+    if (!i8_codes(enc, "")) return RAD_E_DTYPE;
+    if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
+    if (!r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], g.N, g.sk)) return RAD_E_SHAPE;
+    const long long stride = r4d_lm::lm_row_bytes(g.K);
+    ffill(out, "r4d.i8lm.r128", RAD_I8, g.N, stride, g.N * stride);
     if (gout) *gout = g;
     return RAD_OK;
 }
@@ -369,7 +389,7 @@ int lm_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
 extern "C" int r4d_rad_layout_i8_logits(const RadParam* p, int n_p, int operand,
                                         const RadEncoding* enc, const int* sel,
                                         const RadTensor* pl, int n, RadLayout* out) {
-    return lm_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr, true);
+    return lm_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
 }
 
 extern "C" int r4d_rad_relayout_i8_logits(const RadParam* p, int n_p, int operand,
@@ -378,10 +398,10 @@ extern "C" int r4d_rad_relayout_i8_logits(const RadParam* p, int n_p, int operan
                                           int64_t dst_bytes) {
     RadLayout L;
     FGeom g;
-    const int rc = lm_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g, true);
+    const int rc = lm_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (dst_bytes != L.bytes || !pl[0].data || !pl[1].data) return RAD_E_SHAPE;
-    const long long stride = r4d_fp8::lm_row_bytes(g.K);
+    const long long stride = r4d_lm::lm_row_bytes(g.K);
     const uint8_t* codes = (const uint8_t*)pl[0].data;
     const uint16_t* sc = (const uint16_t*)pl[1].data;
     uint8_t* d = (uint8_t*)dst;
@@ -403,10 +423,10 @@ extern "C" int r4d_rad_unrelayout_i8_logits(const RadParam* p, int n_p, int oper
                                             const RadTensor* pl, int n) {
     RadLayout L;
     FGeom g;
-    const int rc = lm_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g, true);
+    const int rc = lm_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (src_bytes != L.bytes || !pl[0].data || !pl[1].data) return RAD_E_SHAPE;
-    const long long stride = r4d_fp8::lm_row_bytes(g.K);
+    const long long stride = r4d_lm::lm_row_bytes(g.K);
     const uint8_t* s = (const uint8_t*)src;
     uint8_t* codes = (uint8_t*)pl[0].data;
     uint16_t* sc = (uint16_t*)pl[1].data;

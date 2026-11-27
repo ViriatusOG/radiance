@@ -47,7 +47,7 @@
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
-#include "r4d_fp8_lm.h"
+#include "r4d_lm_row.h"
 #include "r4d_chain.h"
 #include "r4d_iqr.h"
 #include <hip/hip_bf16.h>
@@ -431,7 +431,7 @@ __device__ __forceinline__ void r4d_logit_rerank_body(R4D_LOGIT_RERANK_PARAMS) {
         acc = r4d_wave_sum(acc);
       }
     } else if (own) {
-      /* The stored row, as logits_gemm_fp8 reads it (r4d_fp8_lm.h): K E4M3 codes then K/128 bf16
+      /* The stored row, as logits_gemm_fp8 reads it (r4d_lm_row.h): K E4M3 codes then K/128 bf16
        * block scales in the row's tail. A lane owns a strided subset of columns and applies each
        * column's block scale locally, so the fold is a plain sum whose order depends only on the
        * lane count. */
@@ -564,7 +564,7 @@ static int logit_rerank_emit(long x, long idx_in, long head, long outi, long out
                              bool i8, uint32_t tb = 0, bool chain = false, bool bf = false) {
   r4d_iqr::Form tf;
   tf.bits = tb;
-  const long w_ld = bf ? 2 * K : tb ? (long)r4d_iqr::lm_row(tf, K) : r4d_fp8::lm_row_bytes(K);
+  const long w_ld = bf ? 2 * K : tb ? (long)r4d_iqr::lm_row(tf, K) : r4d_lm::lm_row_bytes(K);
   // R <= PT2 makes the re-sort exact for any scores (one lane holds the whole answer), so it is
   // checked, not clamped.
   if (M < 1 || R < 1 || K < 1 || nv < 1 || R > R4D_TOPK_PT2) return R4D_NO(RAD_E_SHAPE);
@@ -770,4 +770,190 @@ extern "C" int r4d_rad_logit_rerank_iqr(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_logit_rerank_bf16(const RadArgs* a, RadStream stream) {
     return rad_logit_rerank(a, stream, false, false, true);
+}
+
+
+
+/* ================================================================== row_topk over f32
+ *
+ * The same op over an f32 matrix: a GGUF head's logits (logits_gemm_ggml stores f32), as DSpark's
+ * drafter reads them. It computes ref_row_topk's answer for any data but NaN:
+ *
+ *   * Exact by construction. A chunk keeps its top-R (RC = R) and every lane's list is PT >= R
+ *     deep, so no distribution of a chunk's top-R over the lanes can lose one; stage 2 is PT2 = 32
+ *     >= R deep for the same reason. No tunable trades that away.
+ *   * libref compares floats, so -0 and +0 are one value and tie on the lower column. The key
+ *     orders -0 as +0 (tk_key_f32z), and stage 2 reads the winner's value back from `x`, so the
+ *     reported value keeps its own sign.
+ *   * An unfilled slot (N < R) reports libref's id -1 in `idx` and `pairs` and -inf in `val`;
+ *     `vocab_off` shifts real columns only.
+ *   * Any N: shards of an uneven vocabulary need not be a multiple of the vector width. Each chunk
+ *     reads its 16-byte-aligned middle as float4 with a scalar head and tail; any row pitch.
+ *
+ * NaN is outside the contract: the key orders a positive NaN above +inf, while ref_row_topk's float
+ * compares give no total order with one present. */
+#define R4D_TOPK_F32_CH 1024   // columns a stage-1 chunk: 4 KB, eight float4 loads a lane
+
+__device__ __forceinline__ unsigned long long tk_key_f32z(float v, unsigned idx) {
+  unsigned u = __float_as_uint(v);
+  if ((u << 1) == 0u) u = 0u;                       // -0 orders as +0, as a float compare sees it
+  u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  return ((unsigned long long)u << 32) | (unsigned)(0xFFFFFFFFu - idx);
+}
+
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_f32_stage1_kernel(
+    const float* __restrict__ X, unsigned long long* __restrict__ P, long long ld, int N, int R,
+    int NCH, int CH) {
+  const int m = blockIdx.y;
+  const int c = blockIdx.x * R4D_TOPK_WPB + (int)(threadIdx.x >> 5);
+  if (c >= NCH) return;
+  const int lane = threadIdx.x & 31;
+  const int c0 = c * CH;
+  const int c1 = c0 + CH < N ? c0 + CH : N;
+
+  unsigned long long t[PT];
+#pragma unroll
+  for (int q = 0; q < PT; q++) t[q] = 0ull;
+
+  const float* const row = X + (size_t)m * (size_t)ld;
+  // The aligned middle [h, h + 4 nv) as float4, the columns either side one at a time.
+  int h = c0 + (int)(((16u - (unsigned)((uintptr_t)(row + c0) & 15u)) & 15u) >> 2);
+  if (h > c1) h = c1;
+  const int nv = (c1 - h) >> 2;
+  const int tail = h + 4 * nv;
+  for (int i = c0 + lane; i < h; i += R4D_TOPK_WAVE)
+    tk_insert<PT>(t, tk_key_f32z(row[i], (unsigned)i));
+  const float4* const rv = (const float4*)(row + h);
+  const int step = R4D_TOPK_WAVE * R4D_TOPK_UNROLL;
+  int v = lane;
+  for (; v + step - R4D_TOPK_WAVE < nv; v += step) {
+    float4 p[R4D_TOPK_UNROLL];
+#pragma unroll
+    for (int u = 0; u < R4D_TOPK_UNROLL; u++) p[u] = rv[v + u * R4D_TOPK_WAVE];
+#pragma unroll
+    for (int u = 0; u < R4D_TOPK_UNROLL; u++) {
+      const unsigned base = (unsigned)(h + 4 * (v + u * R4D_TOPK_WAVE));
+      tk_insert<PT>(t, tk_key_f32z(p[u].x, base));
+      tk_insert<PT>(t, tk_key_f32z(p[u].y, base + 1));
+      tk_insert<PT>(t, tk_key_f32z(p[u].z, base + 2));
+      tk_insert<PT>(t, tk_key_f32z(p[u].w, base + 3));
+    }
+  }
+  for (; v < nv; v += R4D_TOPK_WAVE) {
+    const float4 p = rv[v];
+    const unsigned base = (unsigned)(h + 4 * v);
+    tk_insert<PT>(t, tk_key_f32z(p.x, base));
+    tk_insert<PT>(t, tk_key_f32z(p.y, base + 1));
+    tk_insert<PT>(t, tk_key_f32z(p.z, base + 2));
+    tk_insert<PT>(t, tk_key_f32z(p.w, base + 3));
+  }
+  for (int i = tail + lane; i < c1; i += R4D_TOPK_WAVE)
+    tk_insert<PT>(t, tk_key_f32z(row[i], (unsigned)i));
+
+  unsigned long long* const out = P + ((size_t)m * NCH + c) * R;
+  for (int r = 0; r < R; r++) {
+    const unsigned long long w = tk_round<PT>(t);
+    if (lane == 0) out[r] = w;
+  }
+}
+
+__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_f32_stage2_kernel(
+    const unsigned long long* __restrict__ P, const float* __restrict__ X, long long ld,
+    float* __restrict__ OV, int* __restrict__ OI, float* __restrict__ OP, long long off, int R,
+    int n) {
+  const int m = blockIdx.x;
+  const int lane = threadIdx.x;
+
+  unsigned long long t[R4D_TOPK_PT2];
+#pragma unroll
+  for (int q = 0; q < R4D_TOPK_PT2; q++) t[q] = 0ull;
+  const unsigned long long* const p = P + (size_t)m * n;
+  for (int i = lane; i < n; i += R4D_TOPK_WAVE) tk_insert<R4D_TOPK_PT2>(t, p[i]);
+
+  for (int r = 0; r < R; r++) {
+    const unsigned long long w = tk_round<R4D_TOPK_PT2>(t);
+    if (lane == 0) {
+      // A zero key is an empty slot (the row has fewer than R columns), libref's id -1.
+      const int   col = w ? tk_idx(w) : -1;
+      const float v   = w ? X[(size_t)m * (size_t)ld + col] : -INFINITY;
+      const int   id  = w ? (int)((long long)col + off) : -1;
+      OV[(size_t)m * R + r] = v;
+      OI[(size_t)m * R + r] = id;
+      if (OP) {
+        float* const q = OP + ((size_t)m * R + r) * 2;
+        __builtin_memcpy(q, &id, sizeof(int));
+        q[1] = v;
+      }
+    }
+  }
+}
+
+/* Reads the operands (or, for the scratch sizer at declare, the M/N params). */
+static int topk_f32_params(const RadArgs* a, const RadTensor** x, long long* M, long long* N,
+                           long long* ld, long long* R) {
+  *x = r4d_opt(a, T_X);
+  *R = r4d_geti_or(a, "R", 0);
+  if (*x) {
+    if ((*x)->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    *N = r4d_geti_or(a, "N", (*x)->rank >= 1 ? (*x)->shape[(*x)->rank - 1] : 0);
+    if (*N < 1) return R4D_NO(RAD_E_SHAPE);
+    *ld = r4d_rows_pitch(*x, *N, M);
+    if (*ld < 0) return R4D_NO(RAD_E_STRIDE);
+  } else {
+    *M = r4d_geti_or(a, "M", 0);
+    *N = r4d_geti_or(a, "N", 0);
+    *ld = *N;
+  }
+  if (*M < 1 || *M > 65535 || *N < 1 || *N > 0x7FFFFFFFLL - R4D_TOPK_F32_CH)
+    return R4D_NO(RAD_E_SHAPE);
+  if (*R < 1 || *R > R4D_TOPK_PT2) return R4D_NO(RAD_E_SHAPE);
+  return RAD_OK;
+}
+
+extern "C" int64_t r4d_rad_rowtopk_f32_scratch(const RadArgs* a) {
+  const RadTensor* x;
+  long long M, N, ld, R;
+  const int rc = topk_f32_params(a, &x, &M, &N, &ld, &R);
+  if (rc != RAD_OK) return rc;
+  const long long nch = (N + R4D_TOPK_F32_CH - 1) / R4D_TOPK_F32_CH;
+  return (int64_t)M * nch * R * (int64_t)sizeof(unsigned long long);
+}
+
+extern "C" int r4d_rad_rowtopk_f32(const RadArgs* a, RadStream stream) {
+  const RadTensor* x;
+  long long M, N, ld, R;
+  int rc = topk_f32_params(a, &x, &M, &N, &ld, &R);
+  if (rc != RAD_OK) return rc;
+  const RadTensor* idx   = r4d_opt(a, T_IDX);
+  const RadTensor* val   = r4d_opt(a, T_VAL);
+  const RadTensor* pairs = r4d_opt(a, T_PAIRS);
+  if (!x || !idx || !val) return R4D_NO(RAD_E_INVAL);
+  if (idx->dtype != RAD_I32 || val->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+  if (!r4d_contig(idx) || !r4d_contig(val)) return R4D_NO(RAD_E_STRIDE);
+  if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
+  if (pairs) {
+    if (pairs->dtype != RAD_F32 || !r4d_contig(pairs)) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_numel(pairs) < M * R * 2) return R4D_NO(RAD_E_SHAPE);
+  }
+  const long long off = r4d_geti_or(a, "vocab_off", 0);
+
+  const int nch = (int)((N + R4D_TOPK_F32_CH - 1) / R4D_TOPK_F32_CH);
+  const int64_t need = (int64_t)M * nch * R * (int64_t)sizeof(unsigned long long);
+  if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
+  unsigned long long* const part = (unsigned long long*)a->scratch;
+
+  const dim3 g1((unsigned)((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB), (unsigned)M);
+  const dim3 b1(R4D_TOPK_WAVE * R4D_TOPK_WPB);
+  if (R <= 16)
+    rc = R4D_EMIT(stream, r4d_rowtopk_f32_stage1_kernel<16>, g1, b1, 0, (const float*)x->data,
+                  part, ld, (int)N, (int)R, nch, (int)R4D_TOPK_F32_CH);
+  else
+    rc = R4D_EMIT(stream, r4d_rowtopk_f32_stage1_kernel<32>, g1, b1, 0, (const float*)x->data,
+                  part, ld, (int)N, (int)R, nch, (int)R4D_TOPK_F32_CH);
+  if (rc != RAD_OK) return rc;
+  return R4D_EMIT(stream, r4d_rowtopk_f32_stage2_kernel, dim3((unsigned)M), dim3(R4D_TOPK_WAVE), 0,
+                  (const unsigned long long*)part, (const float*)x->data, ld, (float*)val->data,
+                  (int*)idx->data, pairs ? (float*)pairs->data : (float*)nullptr, off, (int)R,
+                  nch * (int)R);
 }

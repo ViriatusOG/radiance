@@ -248,7 +248,8 @@ AVX_KERNEL(gate_add) {
         const float* xv = in_row(X, rowoff(X, r, n), n, xs);
         const float* t = gate + seq_of(cu, n_seq, r) * n;
         int64_t i = 0;
-        for (; i + VF_N <= n; i += VF_N) vf_storeu(p + i, vf_mul(vf_loadu(t + i), vf_loadu(yv + i)));
+        for (; i + VF_N <= n; i += VF_N)
+            vf_storeu(p + i, vf_mul(vf_loadu(t + i), vf_loadu(yv + i)));
         for (; i < n; ++i) p[i] = t[i] * yv[i];
         narrow_row(X->dtype, p, n, tmp);
         add_rows(p, xv, n);
@@ -265,9 +266,10 @@ AVX_KERNEL(gate_add) {
 /* Both forms: with `gated` the branch added through the gate row (no tanh) and the residual stored
  * in x's dtype; then n1 = rd(x rsqrt(mean(x^2) + eps)), n2 = rd(n1 w), m = rd(n2 rd(1 + scale)),
  * z = rd(m + shift), rd the norm chain's dtype (z's for rms_mod, bf16 for the quantised form,
- * libref's rule); `norm` none takes n2 = x. The sum of squares is the vector reduction, held to the tolerance table; every
- * rounding is a pass through the stored dtype, so the rest is libref's arithmetic. The per-entry
- * rows (1 + scale rounded, the shift and the gate) and the gain are built once a launch. */
+ * libref's rule); `norm` none takes n2 = x. The sum of squares is the vector reduction, held to
+ * the tolerance table; every rounding is a pass through the stored dtype, so the rest is
+ * libref's arithmetic. The per-entry rows (1 + scale rounded, the shift and the gate) and the
+ * gain are built once a launch. */
 static int rms_mod_run(const RadArgs* a, bool quant) {
     if (a->n_t < (quant ? 9 : 7)) return RAD_E_INVAL;
     const RadTensor *Yv = rad_arg_in(a, 0), *G = rad_arg_in(a, 1), *S = &a->t[2];
@@ -470,7 +472,8 @@ AVX_KERNEL(lane_gather) {
         if (b1 > b0 && (b0 < 0 || b1 > y_rows)) return RAD_E_SHAPE;
     }
     for (int64_t e = 0; e < n_seq; ++e) {
-        const int64_t L = ldi(lane, offlin(lane, e)), b0 = cu_at(cu, e), len = cu_at(cu, e + 1) - b0;
+        const int64_t L = ldi(lane, offlin(lane, e)), b0 = cu_at(cu, e),
+            len = cu_at(cu, e + 1) - b0;
         AVX_PARALLEL_FOR_IF(len * n >= AVX_PAR_MIN)
         for (int64_t k = 0; k < len; ++k) {
             float* scr = scratch_f32((size_t)n + 16);
@@ -598,7 +601,8 @@ AVX_KERNEL(flow_euler) {
                 for (; c < n; ++c) vv[c] -= vn[c];
                 narrow_row(dt, vv, n, tmp);
                 const vf vw = vf_set1(w);
-                for (c = 0; c + VF_N <= n; c += VF_N) vf_storeu(vv + c, vf_mul(vw, vf_loadu(vv + c)));
+                for (c = 0; c + VF_N <= n; c += VF_N)
+                    vf_storeu(vv + c, vf_mul(vw, vf_loadu(vv + c)));
                 for (; c < n; ++c) vv[c] *= w;
                 narrow_row(dt, vv, n, tmp);
                 add_rows(vv, vn, n);
@@ -628,7 +632,8 @@ AVX_KERNEL(flow_euler) {
                 const float one_m = 1.0f - m;
                 const float* src = in_row(inp, rowoff(inp, L * stride + k, n), n, xs);
                 philox_normals(sd, (uint64_t)(k * n), n, nz);
-                const vf v1 = vf_set1(one_sn), v2 = vf_set1(sn), vm = vf_set1(m), v3 = vf_set1(one_m);
+                const vf v1 = vf_set1(one_sn), v2 = vf_set1(sn), vm = vf_set1(m),
+                    v3 = vf_set1(one_m);
                 int64_t c = 0;
                 for (; c + VF_N <= n; c += VF_N) {
                     const vf kept = vf_add(keep(vf_mul(v1, vf_loadu(src + c))),
@@ -766,7 +771,8 @@ AVX_KERNEL(kd_input) {
             const int64_t yb = rowoff(Y, b0 + k, n), ys = laststride(Y);
             const int64_t pb = pr >= 0 ? rowoff(Y, p0 + k, n) : 0;
             for (int64_t c = 0; c < n; ++c) {
-                if (first) stt(st, sb + c * ss, rad_philox_normal(sd, (uint64_t)(k * n + c)) * init);
+                if (first)
+                    stt(st, sb + c * ss, rad_philox_normal(sd, (uint64_t)(k * n + c)) * init);
                 const float v = ldt(st, sb + c * ss) * cin;
                 stt(Y, yb + c * ys, v);
                 if (pr >= 0) stt(Y, pb + c * ys, v);
@@ -836,7 +842,8 @@ AVX_KERNEL(kd_step) {
                 if (f & kPreview)
                     stt(pv, rowoff(pv, L * stride + k, n) + c * laststride(pv), D);
                 const float nz = sm == kSamplerEulerAncestral && K.sn > 0.0f
-                                     ? rad_philox_normal_s(sd, stream, (uint64_t)(k * n + c)) : 0.0f;
+                                     ? rad_philox_normal_s(sd, stream, (uint64_t)(k * n + c))
+                                         : 0.0f;
                 stt(st, sb + c * ss, kd_next(K, sm, x, D, ldt(hs, hb + c * hss), nz));
                 stt(hs, hb + c * hss, D);
             }
@@ -885,7 +892,8 @@ AVX_KERNEL(flow_x0_step) {
 
 /* x' = f32(f32(r x) + f32(hb1 d) + f32(hb2 x0)) when order >= 2, else the Euler form
  * f32(f32(r x) + f32((1 - r) d)), with d = f32(x + f32(sigma v)): libref's step bit for bit, `keep`
- * holding each product to its own rounding. x0 is the previous estimate (read here, d written back). */
+ * holding each product to its own rounding. x0 is the previous estimate (read here, d written
+ * back). */
 AVX_KERNEL(flow_res_multistep) {
     if (!rad_args_have(a, 8)) return RAD_E_INVAL;
     const RadTensor *V = &a->t[0], *X0 = &a->t[1], *SG = &a->t[2], *RR = &a->t[3];
@@ -906,7 +914,8 @@ AVX_KERNEL(flow_res_multistep) {
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
     for (int64_t k = 0; k < rows; ++k) {
         float* buf = scratch_f32((size_t)(5 * n + 64));
-        float *vs = buf, *xs = buf + n + 16, *h0s = xs + n + 16, *o = h0s + n + 16, *o0 = o + n + 16;
+        float *vs = buf, *xs = buf + n + 16, *h0s = xs + n + 16, *o = h0s + n + 16,
+            *o0 = o + n + 16;
         const float* v = in_row(V, rowoff(V, k, n), n, vs);
         const float* x = in_row(X, rowoff(X, k, n), n, xs);
         const float* h0 = in_row(X0, rowoff(X0, k, n), n, h0s);
@@ -917,7 +926,8 @@ AVX_KERNEL(flow_res_multistep) {
             const vf xv = vf_loadu(x + c);
             const vf d = vf_add(xv, keep(vf_mul(vsg, vf_loadu(v + c))));
             const vf a = keep(vf_mul(vr, xv));
-            vf xo = two ? vf_add(vf_add(a, keep(vf_mul(vb1, d))), keep(vf_mul(vb2, vf_loadu(h0 + c))))
+            vf xo = two ? vf_add(vf_add(a, keep(vf_mul(vb1, d))),
+                                 keep(vf_mul(vb2, vf_loadu(h0 + c))))
                         : vf_add(a, keep(vf_mul(vo, d)));
             vf_storeu(o + c, xo);
             vf_storeu(o0 + c, d);
@@ -1157,7 +1167,8 @@ AVX_KERNEL(conv2d_nhwc) {
                         }
                         const int64_t xo = (iy / up) * xr + (ix / up) * cin;
                         if (xb) std::memcpy(d, (const uint16_t*)X->data + xo, (size_t)cin * 2);
-                        else    row_to_f32(X->dtype, byte_at(X->data, X->dtype, xo), (float*)d, cin);
+                        else    row_to_f32(X->dtype, byte_at(X->data, X->dtype, xo), (float*)d,
+                                           cin);
                     }
                 }
             }
@@ -1394,7 +1405,8 @@ AVX_KERNEL(to_rgba8) {
 #elif AVX_LEVEL == 2
             for (; c + 8 <= n; c += 8) {
                 const __m256i q = _mm256_cvtps_epi32(_mm256_loadu_ps(u + c));
-                __m128i p = _mm_packus_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+                __m128i p = _mm_packus_epi32(_mm256_castsi256_si128(q),
+                                             _mm256_extracti128_si256(q, 1));
                 p = _mm_packus_epi16(p, p);
                 _mm_storel_epi64((__m128i*)(out + yb + c), p);
             }

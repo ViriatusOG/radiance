@@ -144,6 +144,28 @@ struct LinkStat {
     int64_t kv_stream_bytes = 0;
     bool    kv_streaming = false;
     bool    kv_stream_active = false;
+    /* The same counters rank by rank, in rank order: on a machine whose cards sit on unequal links,
+     * and under an uneven expert split, the sum hides which link carries the traffic.
+     * `units`, `units_vram` and `units_pinned` are the rank's routed-expert units and where they are
+     * now; `ar_bytes` is the rank's own all-reduce payload (Ctx::ar_bytes). */
+    struct Rank {
+        int64_t ar_calls = 0, ar_bytes = 0;
+        int64_t h2d_bytes = 0, d2h_bytes = 0, stream_bytes = 0, prefetch_bytes = 0, staged_bytes = 0;
+        int64_t promotions = 0, demotions = 0, routed = 0, routed_resident = 0;
+        int64_t units = 0, units_vram = 0, units_pinned = 0;
+        /* Card to card: the bytes this rank's collectives sent to each rank, in rank order, and
+         * their sums out and in. From the kernel library's own count of the route it took for
+         * each message (r4d_ar_traffic); empty where the library keeps none. */
+        std::vector<int64_t> ar_to;
+        int64_t ar_out_bytes = 0, ar_in_bytes = 0;
+    };
+    std::vector<Rank> ranks;
+    /* The collectives by route: calls and payload bytes (a message's size, once), and the calls of
+     * the fused collectives the card-to-card table leaves out. `ar_traffic` false: no table. */
+    struct Route { const char* name = ""; int64_t calls = 0, bytes = 0; };
+    std::vector<Route> ar_routes;
+    int64_t ar_uncounted_calls = 0;
+    bool    ar_traffic = false;
 };
 
 /* How the ranks ran their passes, summed over ranks (see Ctx::PassCounts). A played pass costs

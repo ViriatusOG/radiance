@@ -8,7 +8,8 @@
  * beside what hipMalloc can still reach; they disagree where the driver failed to credit memory
  * back.
  *
- * Build: hipcc -O1 --offload-arch=<gfx> -I/opt/rocm/include -L/opt/rocm/lib -o vmemprobe vmemprobe.cpp
+ * Build: hipcc -O1 --offload-arch=<gfx> -I/opt/rocm/include -L/opt/rocm/lib \
+ *        -o vmemprobe vmemprobe.cpp
  * Run on an idle card: other allocations skew every reading. */
 #include <hip/hip_runtime.h>
 #include <cstdio>
@@ -17,7 +18,11 @@
 static size_t G = 0;
 static hipMemAllocationProp prop{};
 static hipMemAccessDesc desc{};
-static double freem() { size_t fr = 0, tot = 0; (void)hipMemGetInfo(&fr, &tot); return fr / 1048576.0; }
+static double freem() {
+    size_t fr = 0, tot = 0;
+    (void)hipMemGetInfo(&fr, &tot);
+    return fr / 1048576.0;
+}
 static double reach(int cap_gib) {
     std::vector<void*> got; size_t n = 0; const size_t step = 128ull << 20;
     for (;;) { void* p = nullptr;
@@ -30,7 +35,10 @@ static double reach(int cap_gib) {
 static void trial(const char* what, bool keep_handle, bool piecewise, bool free_va) {
     const size_t bytes = (4ull << 30) / G * G;
     void* base = nullptr;
-    if (hipMemAddressReserve(&base, bytes, G, nullptr, 0) != hipSuccess) { printf("%-34s reserve failed\n", what); return; }
+    if (hipMemAddressReserve(&base, bytes, G, nullptr, 0) != hipSuccess) {
+        printf("%-34s reserve failed\n", what);
+        return;
+    }
     const double f0 = freem();
     hipMemGenericAllocationHandle_t h{};
     /* A failed trial gives back what it took, or later trials read less free memory. */
@@ -58,7 +66,8 @@ static void trial(const char* what, bool keep_handle, bool piecewise, bool free_
     const double f2 = freem();
     if (free_va) (void)hipMemAddressFree(base, bytes);
     const double f3 = freem();
-    printf("%-34s free: %8.1f -> %8.1f (mapped) -> %8.1f (let go) -> %8.1f (va freed)  reach %8.1f\n",
+    printf("%-34s free: %8.1f -> %8.1f (mapped) -> %8.1f (let go) -> %8.1f (va freed)  "
+           "reach %8.1f\n",
            what, f0, f1, f2, f3, reach(24));
     if (!free_va) (void)hipMemAddressFree(base, bytes);
 }
@@ -68,13 +77,23 @@ static void cycle(int n) {
     const size_t total = (8ull << 30) / G * G;
     const size_t part  = (2ull << 30) / G * G;
     void* base = nullptr;
-    if (hipMemAddressReserve(&base, total, G, nullptr, 0) != hipSuccess) { printf("cycle: reserve failed\n"); return; }
+    if (hipMemAddressReserve(&base, total, G, nullptr, 0) != hipSuccess) {
+        printf("cycle: reserve failed\n");
+        return;
+    }
     printf("\ncycle: %.1f GiB reservation held, %.1f GiB mapped and unmapped inside it\n",
            total / 1073741824.0, part / 1073741824.0);
     for (int i = 0; i < n; ++i) {
         hipMemGenericAllocationHandle_t h{};
-        if (hipMemCreate(&h, part, &prop, 0) != hipSuccess) { printf("  pass %d: create failed\n", i); break; }
-        if (hipMemMap(base, part, 0, h, 0) != hipSuccess) { (void)hipMemRelease(h); printf("  pass %d: map failed\n", i); break; }
+        if (hipMemCreate(&h, part, &prop, 0) != hipSuccess) {
+            printf("  pass %d: create failed\n", i);
+            break;
+        }
+        if (hipMemMap(base, part, 0, h, 0) != hipSuccess) {
+            (void)hipMemRelease(h);
+            printf("  pass %d: map failed\n", i);
+            break;
+        }
         (void)hipMemRelease(h);
         (void)hipMemSetAccess(base, part, &desc, 1);
         const double fm = freem();

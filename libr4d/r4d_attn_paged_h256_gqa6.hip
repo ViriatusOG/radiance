@@ -172,6 +172,55 @@ static int decode_launch(const R4DArgs* a, hipStream_t s) {
     return 0;
 }
 
+// A tree verify (attn_paged_tree, R4DArgs::spec_parent): the same kernel with the tree's mask
+// (O_TREE), at up to 16 query rows a sequence -- a block-8 DFlash2 drafter's 15-node tree and its
+// anchor row. 96 (row, head) pairs is six waves, where the chain's band stops at four; the split
+// law, the partial layout, the merge and the chained forms are the chain's.
+#define A_MAX_TREE_ROWS 96
+template <int KVP, int XOPT = 0>
+static int decode_tree_launch(const R4DArgs* a, hipStream_t s) {
+    if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
+    if (a->q_heads / a->kv_heads != A_GQA) return -2;
+    const int rows = a->q_len * A_GQA;
+    if (rows > A_MAX_TREE_ROWS) return -4;
+    const int nw = (rows + 15) / 16;
+    const int splits = r4d_decode_splits(a, D_TILE);
+#define D_LAUNCH_K(K_, NW)                                                                    \
+    hipLaunchKernelGGL((K_<NW, D_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, KVP,                  \
+                           D_OPT | XOPT | O_TREE>),                                           \
+                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
+#define D_LAUNCH(NW)                                                                          \
+    do { if (a->chain) D_LAUNCH_K(r4dchain_attn_decode, NW);                                  \
+         else          D_LAUNCH_K(r4d_attn_decode_kernel, NW); } while (0)
+    if      (nw == 1) D_LAUNCH(1);
+    else if (nw == 2) D_LAUNCH(2);
+    else if (nw == 3) D_LAUNCH(3);
+    else if (nw == 4) D_LAUNCH(4);
+    else if (nw == 5) D_LAUNCH(5);
+    else              D_LAUNCH(6);
+#undef D_LAUNCH
+#undef D_LAUNCH_K
+    CHK();
+    const int jobs3 = r4d_q_total(*a) * a->q_heads;
+    if (splits <= 64 && jobs3 >= D_VECMIN) {
+        const int blocks = (jobs3 + D_JPB - 1) / D_JPB;
+        if (a->chain)
+            hipLaunchKernelGGL((r4dchain_attn_splitkv_combine_vec<A_HEAD_DIM, 4, 1, D_JPB>),
+                               dim3(blocks), dim3(32 * D_JPB), 0, s, *a, splits, D_TILE);
+        else
+            hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<A_HEAD_DIM, 4, 1, D_JPB>),
+                               dim3(blocks), dim3(32 * D_JPB), 0, s, *a, splits, D_TILE);
+    } else if (a->chain)
+        hipLaunchKernelGGL((r4dchain_attn_splitkv_combine<A_HEAD_DIM, 4, 1>), dim3(jobs3),
+                           dim3(256), splits * sizeof(float), s, *a, splits, D_TILE);
+    else
+        hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<A_HEAD_DIM, 4, 1>), dim3(jobs3),
+                           dim3(256), splits * sizeof(float), s, *a, splits, D_TILE);
+    CHK();
+    return 0;
+}
+static_assert(D_OPT & 32, "the tree launch merges f16 partials");
+
 extern "C" int r4d_attn_decode_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
     return decode_launch<1>(a, s);
 }
@@ -451,6 +500,25 @@ extern "C" int r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs* a, Ra
     if (rc == RAD_OK) rc = tree_operand(a, &r);
     if (rc != RAD_OK) return rc;
     return r4d_attn_decode_h256_gqa2_qld_tree_bf16kv(&r, (hipStream_t)s);
+}
+
+/* attn_paged_tree at this unit's own geometry (h256, gqa 6, dense q): Qwen3.8-27B's verify of a
+ * DFlash2 tree, over the int8 and bf16 caches. The scratch hooks are the chain rows': the split
+ * law and the partial layout are the same, sized from the row's own q_len band. */
+template <int KVP, int XOPT>
+static int tree_decode_h256(const RadArgs* a, RadStream s, long long row) {
+    if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 0, row);
+    if (rc == RAD_OK) rc = tree_operand(a, &r);
+    if (rc != RAD_OK) return rc;
+    return decode_tree_launch<KVP, XOPT>(&r, (hipStream_t)s);
+}
+extern "C" int r4d_rad_attn_tree_decode_h256_i8(const RadArgs* a, RadStream s) {
+    return tree_decode_h256<0, O_V4 | O_K6 | O_I8>(a, s, 516);
+}
+extern "C" int r4d_rad_attn_tree_decode_h256_bf16(const RadArgs* a, RadStream s) {
+    return tree_decode_h256<1, 0>(a, s, 0);
 }
 
 /* Head_dim 128 at 8 queries per kv head, any window, causal or not, q_len up to 16, under

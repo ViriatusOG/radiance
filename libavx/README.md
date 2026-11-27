@@ -3,8 +3,8 @@
 The conventional op vocabulary in hand-written x86 SIMD, dispatched at run time by CPU feature.
 
 libavx is a kernel plugin beside `libref` and `libr4d`. libref is the only other host
-implementation, and it is a slow reference. libavx implements all 161 of libref's ops with the
-same schemas and the same answers to a tolerance, the image generator's included (below).
+implementation, and it is a slow reference. libavx implements every op libref implements, with
+the same schemas and the same answers to a tolerance, the image generator's included (below).
 
     cmake -S libavx -B build-avx -DCMAKE_PREFIX_PATH=<radiance prefix> && cmake --build build-avx -j4
     K=build-avx/radiance_home/kernels; R=<radiance prefix>/share/radiance/kernels
@@ -175,7 +175,10 @@ once without. Others cover formats libref does not describe: MXFP4 weights with 
 4-bit experts, activation scale grids finer than the weight's, packed-code stores, and
 `gdn_recurrent_update`'s anchor state form, both against libref and against itself: over four steps
 the anchor replay must give the per-candidate form's `o` bit for bit, which is what lets greedy
-speculation emit the same text as greedy decode.
+speculation emit the same text as greedy decode. The gdn decode ops' tree forms (`_tree`,
+`spec_parent` appended) are drawn by libref as chains, every row causal; their hand-built cases
+branch, with siblings, a second root, a causal row and an out-of-range parent, under both state
+forms.
 
 The codebook experts reach both libraries in the joined form, which no description draws. Their
 cases draw canonical planes (codes over the whole code range, the shipped w4nl and w5nl tables,
@@ -651,6 +654,19 @@ f32 steps), `patch_fold` and `flow_renoise` (`rad_philox_normal_s` a Philox bloc
 libref's bit for bit and held to zero error by the hand-built cases. The convolution has not been
 tuned: MiniMax-H3 is not served on the CPU.
 
+### Wan 2.2 TI2V
+
+Wan adds twelve ops (`avx_wan.cpp`), validated with libref's abi/ helpers (`rad_wan_dit.h`,
+`rad_wan_vae.h`, `rad_umt5_attention.h`, `rad_unipc_math.h`) in libref's order, so both libraries
+refuse a geometry with the same code. The copies (`wan_unpatch`, `wan_vae_history`,
+`wan_vae_expand`, `wan_vae_frame_cu`), the f64 trigonometry of `wan_rope_table` and
+`timestep_embed_f64` (each distinct angle evaluated once, in libref's expression), `wan_rope`,
+`wan_gated_add` and `flow_unipc_step` (each product kept to its own rounding) are libref's bit for
+bit and held to zero error by the hand-built cases. `wan_mod_norm` sums its statistics in vector
+order; `gelu_umt5` rounds every intermediate to bf16 a lane at a time with its tanh on `vf_exp`;
+`attn_umt5` is one task per (head, sequence) over keys and values widened once, its bias laid out
+by distance so a query's biases are one run. Those three are held to the tolerance table.
+
 ## Design choices
 
 Each choice below was measured on the platform above. The variants that did not pay are recorded
@@ -716,6 +732,8 @@ and spills a 16-register file, costing more than the FMA saves, so the AVX and A
     avx_video.cpp      the video decoder's patch unfold, tiles, stitch and positions, and the
                        latent upscaler's convolutions, norm, resize, fold and re-noise; compiled 4x
     avx_vsa.cpp        video sparse attention: the tile selection and the attention; compiled 4x
+    avx_wan.cpp        Wan 2.2: UMT5's attention and gelu, the DiT's embedding, rotary, norm,
+                       residual and unpatch, the UniPC step, the VAE's history and expand; compiled 4x
     avx_audio.cpp      the audio generator's vocoder, sampler, embeddings and window ops; compiled 4x
     avx_harness.h      plugin loading, row selection, the operand draw, guarded buffers, the
                        geometry table -- shared by both tools

@@ -40,7 +40,7 @@ static const int64_t k_range_max = 16384;
  *
  * Floor of 1024 tokens: every crossing re-records each pass kind twice (recording plus audit), a
  * few hundred microseconds of rank thread each, which a 256 floor makes frequent at short context.
- * Not higher, because a block may pick its path by this bound: rad_block_attn_gated_fp8.h keeps
+ * Not higher, because a block may pick its path by this bound: rad_block_attn_gated_q.h keeps
  * dense attention while every sequence is inside the indexer's budget; with a 2048 floor, a
  * verify step's attention at eight sequences costs 48 us a layer instead of 15. */
 static const int64_t k_bound_tokens = 1024;
@@ -139,6 +139,7 @@ void BatchBuilder::carve(Set& s, char* h) {
      * moves a rotary position off the token index. */
     pair(&s.h_rope,  &s.d_rope,  mm_on_ ? 3 * T : 0);
     pair(&s.h_mmrow, &s.d_mmrow, mm_on_ ? T : 0);
+    pair(&s.h_vl,    &s.d_vl,    mm_on_ ? T : 0);
     pair(&s.h_bidi,  &s.d_bidi,  bidi_on_ ? 4 * T : 0);
     /* Each row's adapter slot, carved only when the engine serves adapters, so an engine without
      * them lays the slab out as if the array did not exist. */
@@ -580,7 +581,7 @@ void BatchBuilder::free_media() {
  * by one); rows inside a media run take that run's encoder row instead. Consecutive tokens of a
  * run are consecutive rows of its item, so each run is one copy. */
 int64_t BatchBuilder::stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift, int64_t n_rows,
-                                    int32_t* rows) {
+                                    int32_t* rows, int32_t* vl, int64_t* vl_rows) {
     const mm::PromptMedia& pm = *e.req->media;
     const int64_t prompt = (int64_t)e.req->prompt.size();
     int64_t added = 0;
@@ -601,6 +602,12 @@ int64_t BatchBuilder::stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift
         const int64_t row = (int64_t)run->row0 + (ti - run->tok);
         std::memcpy(mm_host_ + (n_rows + added) * n_embd_, it.embd.data() + row * n_embd_,
                     (size_t)(take * n_embd_) * sizeof(uint16_t));
+        if (!it.types.empty() && vl) {
+            /* A typed span is one flat run of placeholder positions: every position is inside an
+             * image span, so the gate selects by bias_vl on all of them. */
+            for (int64_t q = 0; q < take; ++q) vl[k + j + q] = 1;
+            if (vl_rows) *vl_rows = 1;
+        }
         for (int64_t q = 0; q < take; ++q) rows[n_rows + added + q] = (int32_t)(k + j + q);
         added += take;
         j += (int32_t)take;
@@ -983,7 +990,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
-    int64_t n_bidi = 0;
+    int64_t n_bidi = 0, vl_rows = 0;
+    if (mm_on_ && s.h_vl) std::memset(s.h_vl, 0, (size_t)max_tok_ * sizeof(int32_t));
     bool lora_rows = false;
     int32_t cvec_rows = 0;
     int64_t n_pw = 0;
@@ -1006,7 +1014,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             return nullptr;
         }
         /* Token shift (StepPlan::tok_shift): the MTP head pairs hidden state i with the token
-         * at i + 1 and predicts i + 2 (rad_block_mtp_fp8.h). Applied only here, so no kernel or
+         * at i + 1 and predicts i + 2 (rad_block_mtp_q.h). Applied only here, so no kernel or
          * plugin carries it; token_at() reaches earlier draft rounds through `draft`. DFlash2
          * passes use 0. */
         const int64_t shift = plan.tok_shift;
@@ -1068,7 +1076,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                     if (rad_event_sync(mm_ev_) < 0) return nullptr;
                     mm_ev_live_ = false;
                 }
-                const int64_t got = stage_mm_rows(e, k, shift, n_mm, s.h_mmrow);
+                const int64_t got = stage_mm_rows(e, k, shift, n_mm, s.h_mmrow, s.h_vl, &vl_rows);
                 if (got < 0) return nullptr;
                 n_mm += got;
             }
@@ -1365,6 +1373,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.bidi_n    = n_bidi ? s.h_bidi + 2 * max_tok_ : nullptr;
         B.bidi_seq  = n_bidi ? s.h_bidi + 3 * max_tok_ : nullptr;
         B.mm_embd = n_mm ? mm_dev_[r] : nullptr;
+        B.vl_mask = vl_rows ? on_rank(base, b0, s.d_vl) : nullptr;
         /* Null on a step with no adapter row: the core then issues no adapter op, and the step
          * runs the same pass as an engine serving no adapters. */
         B.lora_slot = lora_rows ? on_rank(base, b0, s.d_lora) : nullptr;

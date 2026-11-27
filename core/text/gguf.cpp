@@ -361,6 +361,9 @@ int GgufFile::open(const char* path) {
     }
 
     data_off_ = align_up((int64_t)c.off, (int64_t)alignment_);
+    /* A split GGUF's first shard may carry the metadata alone (llama.cpp's gguf-split); its padded
+     * data section then starts past the end of the file and holds nothing, which is not damage. */
+    if (data_off_ > file_bytes_ && tensors_.empty()) data_off_ = file_bytes_;
     if (data_off_ > file_bytes_) {
         RAD_ERR("gguf: %s: data section starts at %llu, past the end of a %llu-byte file",
                 path_.c_str(), (unsigned long long)data_off_, (unsigned long long)file_bytes_);

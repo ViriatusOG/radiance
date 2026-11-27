@@ -58,11 +58,12 @@ static int ring_probe() {
 static const char* const kRingMemory = "io_uring ring memory refused (ENOMEM); the locked-memory "
                                        "limit is shared with this user's other processes";
 
-/* embed_lookup_q's init must refuse a process that cannot create an io_uring ring, and say why
- * (Docker's default seccomp profile returns EPERM for io_uring_setup). A child installs that
- * refusal as a seccomp filter; init must then refuse a bf16 gather (read through the ring), name
- * the Docker option on stderr, and accept an f32 gather (read as memory). This process must then be
- * accepted where a ring can be created and refused where it cannot, as in a build sandbox. */
+/* embed_lookup_q's init must accept a process that cannot create an io_uring ring and say why its
+ * table reads are slower (Docker's default seccomp profile returns EPERM for io_uring_setup). A
+ * child installs that refusal as a seccomp filter; init must then accept a bf16 gather (its table
+ * read through synchronous pread instead of the ring), name the Docker option and the pread
+ * fallback on stderr, and accept an f32 gather (read as memory). This process must then be accepted
+ * whether a ring can be created or not, as in a build sandbox. */
 bool ngram_init_case(const Lib& lib) {
     const char* what = "embed_lookup_q's init";
     const RadKernelInfo* r = lib.row("embed_lookup_q");
@@ -103,7 +104,7 @@ bool ngram_init_case(const Lib& lib) {
         const int a = r->init(bf16, 2, 0, 1, &inst);
         const int b = r->init(f32, 2, 0, 1, &inst);
         std::fflush(nullptr);
-        ::_exit(a == RAD_E_UNSUPPORTED && b == RAD_OK ? 0 : 1);
+        ::_exit(a == RAD_OK && b == RAD_OK ? 0 : 1);
     }
     ::close(out[1]);
     std::string said;
@@ -117,31 +118,26 @@ bool ngram_init_case(const Lib& lib) {
     }
     bool ok = true;
     if (WEXITSTATUS(ws) == 3) {
-        std::printf("  %s, where io_uring is refused: SKIPPED -- no seccomp filter can be installed "
-                    "here\n", what);
+        std::printf("  %s, where io_uring is refused: SKIPPED -- no seccomp filter can be "
+                    "installed here\n", what);
     } else if (WEXITSTATUS(ws) != 0 ||
-               said.find("--security-opt seccomp=unconfined") == std::string::npos) {
+               said.find("--security-opt seccomp=unconfined") == std::string::npos ||
+               said.find("synchronous pread") == std::string::npos) {
         std::printf("  %s, where io_uring is refused: FAIL -- %s; it said: %s\n", what,
                     WEXITSTATUS(ws) ? "the statuses were wrong" : "the reason was not named",
                     said.c_str());
         ok = false;
     } else {
-        std::printf("  %s, where io_uring is refused: refused, naming the Docker option\n", what);
+        std::printf("  %s, where io_uring is refused: accepted, naming the Docker option and "
+                    "pread\n", what);
     }
 
-    /* The init tests the ring once per process, so the probes bracket it. */
-    const int before = ring_probe();
+    const bool here = ring_probe() == 0;
     void* inst = nullptr;
     const int st = r->init(bf16, 2, 0, 1, &inst);
-    const int after = ring_probe();
-    if (st == RAD_E_UNSUPPORTED && (before == ENOMEM || after == ENOMEM)) {
-        std::printf("  %s, in this process: SKIPPED -- %s\n", what, kRingMemory);
-        return ok;
-    }
-    const bool here = before == 0;
-    const bool right = here ? st == RAD_OK : st == RAD_E_UNSUPPORTED;
+    const bool right = st == RAD_OK;
     std::printf("  %s, in this process (io_uring %s): %s\n", what, here ? "available" : "refused",
-                right ? (here ? "accepted" : "refused") : "FAIL");
+                right ? "accepted" : "FAIL");
     return ok && right;
 }
 
@@ -214,7 +210,8 @@ static RowTable* row_table(const std::string& dir, bool bf16, int64_t V, int64_t
 bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint64_t seed,
                      bool verbose, bool bf16) {
     const RadKernelInfo* r = lib.row("embed_lookup_q");
-    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
+    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table"
+        : "embed_lookup_q from a file";
     if (!r || !r->launch) {
         std::printf("  %s: no row\n", what);
         return false;

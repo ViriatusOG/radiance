@@ -85,7 +85,7 @@ struct StepPlan {
      * is a history pass. */
     int     draft_pass = 0;
     /* How far past its position a row reads its token. The MTP head pairs hidden state i with
-     * the token at i + 1 (rad_block_mtp_fp8.h), so its passes use 1. Do not derive this from
+     * the token at i + 1 (rad_block_mtp_q.h), so its passes use 1. Do not derive this from
      * `draft_pass`: DFlash2's query block embeds the token at its own position and uses 0. */
     int     tok_shift = 0;
     int     n_spec = 0;               /* the batch-wide speculative window */
@@ -241,6 +241,8 @@ private:
          * mm_rows): carved only when the program declared an encoder, empty otherwise. */
         int32_t   *h_rope = nullptr, *d_rope = nullptr;
         int32_t   *h_mmrow = nullptr, *d_mmrow = nullptr;
+        /* [max_tok] i32: 1 inside a typed media span (RadBatch::vl_mask), mm_off only. */
+        int32_t   *h_vl = nullptr, *d_vl = nullptr;
         /* [4][max_tok] the runs read both ways (RadBatch::n_bidi): their key counts (the one plane
          * the device reads), first rows, rows and sequences; carved only when the program's
          * encoder asks for them (RadEncoderDecl::bidirectional). */
@@ -400,7 +402,7 @@ private:
     /* Stage the encoder rows of one entry's media tokens, starting at row `n_rows`. Returns how
      * many it added, or negative on error. */
     int64_t stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift, int64_t n_rows,
-                          int32_t* rows);
+                          int32_t* rows, int32_t* vl, int64_t* vl_rows);
 
     /* Derive the members init() needs from the program and config, without allocating. */
     int  layout(Program& prog, const Config& cfg);

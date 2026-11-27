@@ -185,7 +185,7 @@ TEST(pack_plain_matches_the_three_segment_order) {
     Ref2VAPack p;
     Ref2VAGeom g{ 3, 8, 10, 4 };
     CHECK_EQ(ref2va_build(5, g, {}, {}, &p), 0);
-    CHECK_EQ(p.segs.size(), 3u);
+    REQUIRE_EQ(p.segs.size(), 3u);
     CHECK_EQ(p.segs[0].kind, kR2VText);
     CHECK_EQ(p.segs[1].kind, kR2VAudio);
     CHECK_EQ(p.segs[2].kind, kR2VVideo);
@@ -261,7 +261,7 @@ TEST(pack_mod_groups_images_collapse_to_four) {
     /* Cells: text and the video target read the video schedule (r0 = 0), the photos the
      * video-pinned block (2S), the soundtrack the audio schedule (S). */
     CHECK(grp.r0 == std::vector<int64_t>({ 0, 2 * S, S, 0 }));
-    CHECK_EQ(grp.bound.size(), 5u);
+    REQUIRE_EQ(grp.bound.size(), 5u);
     CHECK_EQ(grp.bound.front(), 0);
     CHECK_EQ(grp.bound.back(), p.rows);
     /* The photo group spans the whole run of reference rows, from the prompt's end to the
@@ -298,7 +298,7 @@ TEST(pack_mod_groups_invariants_over_the_goldens) {
         ref2va_mod_groups(p, 1, {}, &a);
         ref2va_mod_groups(p, 64, {}, &b);
         CHECK(a.bound == b.bound);
-        CHECK(!a.bound.empty());
+        REQUIRE(!a.bound.empty());
         CHECK_EQ(a.bound.front(), 0);
         CHECK_EQ(a.bound.back(), p.rows);
         for (size_t i = 0; i + 1 < a.bound.size(); ++i)

@@ -53,7 +53,6 @@ const std::string& calib_dir() {
     static const struct Dir {
         TempDir t{ "rad_tcq_gpu" };
         Dir() {
-            if (t.path.empty()) return;
             for (int64_t K : { 128, 256, 320, 384, 512 }) {
                 const std::string stem = "blk.0.k" + std::to_string(K);
                 write_gram(t.path + "/gram.r0." + stem + ".bin", K, 2048, gram(K, 2048, 300 + K));
@@ -154,6 +153,48 @@ TEST(the_card_writes_the_hosts_bytes) {
     for (const Case& c : cases) {
         std::vector<float> w = draw(c.N * c.K, 500 + (uint64_t)c.L * 16 + (uint64_t)c.k, 6.0f);
         for (float& v : w) v *= c.scale;
+        const std::string name = "blk.0.k" + std::to_string(c.K) + ".weight";
+        Opts o = opts(c);
+        REQUIRE_EQ(fn(nullptr, 0), (int)RAD_OK);
+        const Quantised host = quantise(quantizer("gptq"), o, name.c_str(), c.N, c.K, w);
+        REQUIRE_EQ(fn(zero, 1), (int)RAD_OK);
+        const Quantised card = quantise(quantizer("gptq"), o, name.c_str(), c.N, c.K, w);
+        REQUIRE_EQ(host.status, RAD_OK);
+        REQUIRE_EQ(card.status, RAD_OK);
+        std::string where;
+        const bool ok = same(host, card, &where);
+        std::fprintf(stderr, "    %-44s %s%s\n", c.what, ok ? "same bytes" : "DIFFERS at ",
+                     ok ? "" : where.c_str());
+        CHECK(ok);
+    }
+
+    /* A tall weight still fits one card's free VRAM only in row chunks; the chunk boundaries must
+     * not move a scale or a run's seam. */
+    {
+        const Case c = { "L12 k4 V2 form, rows in 2048-row chunks", 12, 4, 0, 4096 + 100, 128,
+                         true, true };
+        std::vector<float> w = draw(c.N * c.K, 881, 6.0f);
+        const std::string name = "blk.0.k" + std::to_string(c.K) + ".weight";
+        Opts o = opts(c);
+        REQUIRE_EQ(fn(nullptr, 0), (int)RAD_OK);
+        const Quantised host = quantise(quantizer("gptq"), o, name.c_str(), c.N, c.K, w);
+        REQUIRE_EQ(fn(zero, 1), (int)RAD_OK);
+        const Quantised card = quantise(quantizer("gptq"), o, name.c_str(), c.N, c.K, w);
+        REQUIRE_EQ(host.status, RAD_OK);
+        REQUIRE_EQ(card.status, RAD_OK);
+        std::string where;
+        const bool ok = same(host, card, &where);
+        std::fprintf(stderr, "    %-44s %s%s\n", c.what, ok ? "same bytes" : "DIFFERS at ",
+                     ok ? "" : where.c_str());
+        CHECK(ok);
+    }
+
+    /* RTN (no Hessian) leaves out du and derr, so its chunks are taller; the same seam and scale
+     * checks must hold at that width. */
+    {
+        const Case c = { "L12 k4 no Hessian, 3584-row chunks", 12, 4, 0, 4096 + 100, 128,
+                         false, false };
+        std::vector<float> w = draw(c.N * c.K, 882, 6.0f);
         const std::string name = "blk.0.k" + std::to_string(c.K) + ".weight";
         Opts o = opts(c);
         REQUIRE_EQ(fn(nullptr, 0), (int)RAD_OK);

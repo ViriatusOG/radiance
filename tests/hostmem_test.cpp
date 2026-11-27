@@ -21,10 +21,7 @@ namespace {
 
 struct TmpTree {
     std::string root;
-    TmpTree() {
-        std::string t = radtest::tmp_path("tree.XXXXXX");
-        root = mkdtemp(t.data()) ? t : "";
-    }
+    TmpTree() : root(radtest::make_tmp_dir("tree")) {}
     void put(const std::string& rel, const std::string& text) const {
         std::filesystem::create_directories(std::filesystem::path(root + rel).parent_path());
         std::ofstream(root + rel) << text;
@@ -39,7 +36,6 @@ constexpr int64_t GiB = (int64_t)1 << 30;
  * "max" is no limit, and so is a missing file. */
 TEST(a_v2_cgroups_room_is_its_limit_less_unreclaimable_usage) {
     TmpTree t;
-    REQUIRE(!t.root.empty());
     t.put("/a/memory.max", "8589934592\n");
     t.put("/a/memory.current", "3221225472\n");
     t.put("/a/memory.stat", "anon 1073741824\nfile 1073741824\nkernel 4096\n");
@@ -63,7 +59,6 @@ TEST(a_v2_cgroups_room_is_its_limit_less_unreclaimable_usage) {
  * the near-INT64_MAX value v1 reports for no limit is no limit. */
 TEST(a_v1_cgroups_room_reads_its_cache_and_its_no_limit_sentinel) {
     TmpTree t;
-    REQUIRE(!t.root.empty());
     t.put("/a/memory.limit_in_bytes", "4294967296\n");
     t.put("/a/memory.usage_in_bytes", "2147483648\n");
     t.put("/a/memory.stat", "cache 536870912\nrss 1073741824\ntotal_cache 1073741824\n");
@@ -87,7 +82,6 @@ TEST(a_v1_cgroups_room_reads_its_cache_and_its_no_limit_sentinel) {
  * asked. */
 TEST(the_cgroup_walk_visits_every_limited_level_up_to_the_root) {
     TmpTree t;
-    REQUIRE(!t.root.empty());
     t.put("/memory.max", "max\n");                       /* the root: no limit */
     t.put("/memory.current", "1\n");
     t.put("/docker/memory.max", "4294967296\n");

@@ -303,7 +303,8 @@ static int gemm_q_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Sc
  * each step read from and stored to the output's dtype (the unfused chain, as in libref). */
 static void gemm_epilogue(const RadTensor* Y, const RadTensor* res, int act, int64_t M, int64_t N) {
     const int64_t ys = laststride(Y), yr = Y->rank >= 2 ? Y->stride[Y->rank - 2] : N;
-    const int64_t rs = res ? laststride(res) : 0, rr = res && res->rank >= 2 ? res->stride[res->rank - 2] : N;
+    const int64_t rs = res ? laststride(res) : 0;
+    const int64_t rr = res && res->rank >= 2 ? res->stride[res->rank - 2] : N;
     AVX_PARALLEL_FOR_IF(M * N >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m)
         for (int64_t n = 0; n < N; ++n) {
@@ -1238,6 +1239,140 @@ static int embed_impl(const RadArgs* a) {
 }
 
 AVX_KERNEL(embed_lookup)   { return embed_impl<false>(a); }
+
+/* ================================================================== a table's affine planes
+ *
+ * embed_lookup_planes: x[m, i] = v * scale[id, i / group] * mult, v = table[code] when a table is
+ * given, else the code (ref_embed_lookup_planes). Both multiplies run in libref's order on the
+ * same f32 operands, so every value -- and the output's one rounding of it -- is libref's.
+ *
+ * The form a GPU deployment runs on the host, every step, is a table too large for any device pool
+ * read in place from the container's mapping: DeepSeek-V4.1's Engram, IQ4_NL imported as u4 codes,
+ * a 16-entry table and a scale per 32 values. At AVX-512 that form decodes 16 codes at a time: the
+ * call's table, widened to f32 once, sits in one register; eight code bytes, each repeated, widen
+ * to sixteen dwords whose odd lanes shift down a nibble, and vpermps looks the codes up. Every
+ * other form, and every level below, takes the element loop. The row's pages are libref's either
+ * way: the core reads them ahead (core/runtime/rowprefetch.cpp). */
+static int embed_planes_impl(const RadArgs* a) {
+    if (a->n_t < 5 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) ||
+        !rad_arg_in(a, 4))
+        return RAD_E_INVAL;
+    const RadTensor* tok = &a->t[0];
+    const RadTensor* cd  = &a->t[1];
+    const RadTensor* sc  = &a->t[2];
+    const RadTensor* tb  = &a->t[3];
+    const RadTensor* x   = &a->t[4];
+    const bool tab = tb->data != nullptr;
+    const int64_t E = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0), G = p_int(a, "group", 0);
+    const int64_t voff = p_int(a, "vocab_offset", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (E <= 0 || V <= 0 || G <= 0 || E % G || voff < 0 || cd->rank != 2 || cd->shape[0] < V ||
+        cd->shape[1] != E || sc->rank != 2 || sc->shape[0] < V || sc->shape[1] != E / G)
+        return RAD_E_SHAPE;
+    const uint32_t cdt = cd->dtype;
+    const int bits = (cdt == RAD_U4 || cdt == RAD_I4) ? 4 : (cdt == RAD_U8 || cdt == RAD_I8) ? 8
+        : 0;
+    if (!bits) return RAD_E_DTYPE;
+    /* A table is indexed by an unsigned code and must hold every one of them. */
+    if (tab && (cdt == RAD_I4 || cdt == RAD_I8 || numel(tb) < (int64_t)1 << bits))
+        return RAD_E_DTYPE;
+    const int64_t rb = rad_dtype_bytes(cdt, E);
+    const int64_t M = numel(x) / E;
+    if (rb <= 0 || M <= 0 || numel(tok) < M) return RAD_E_SHAPE;
+    /* Validated before the loop; an OpenMP body cannot return. */
+    if (voff == 0 && a->world_size <= 1)
+        for (int64_t m = 0; m < M; ++m)
+            if (ldi(tok, offlin(tok, m)) >= V) return RAD_E_INVAL;
+
+    /* The table's values as f32, read the way libref reads them (element `code`). */
+    float lut[256];
+    const int nl = tab ? 1 << bits : 0;
+    for (int c = 0; c < nl; ++c) lut[c] = ld_elem(tb->data, tb->dtype, c);
+    const int64_t ss = laststride(sc);
+#if AVX_LEVEL >= 3
+    const bool vec = cdt == RAD_U4 && tab && E % 16 == 0 && G % 16 == 0;
+#endif
+
+#ifdef _OPENMP
+    const int ws = a->world_size > 1 ? a->world_size : 1;
+    const int ep_team = avx_par_forced() ? avx_team_size() : std::max(1, avx_team_size() / ws);
+#else
+    const int ep_team = 1;
+#endif
+    const bool par_decode = M >= 192 && M * E >= 30720 && ep_team > 1;
+#if AVX_LEVEL >= 1
+    const int64_t sb_bytes = ss > 0
+        ? ((E / G - 1) * ss + 1) * std::max<int64_t>(1, rad_dtype_bits(sc->dtype) / 8)
+        : 0;
+#endif
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(par_decode || avx_par_forced()) num_threads(ep_team)
+#else
+    (void)par_decode;
+#endif
+    for (int64_t m = 0; m < M; ++m) {
+#if AVX_LEVEL >= 1
+        if (m + 4 < M) {
+            const int64_t pf_id = ldi(tok, offlin(tok, m + 4)) - voff;
+            if (pf_id >= 0 && pf_id < V) {
+                const uint8_t* pf_row = (const uint8_t*)cd->data + pf_id * rb;
+                for (int64_t off = 0; off < rb; off += 64)
+                    _mm_prefetch((const char*)(pf_row + off), _MM_HINT_T0);
+                const uint8_t* pf_sc =
+                    (const uint8_t*)byte_at(sc->data, sc->dtype, rowoff(sc, pf_id, E / G));
+                for (int64_t off = 0; off < sb_bytes; off += 64)
+                    _mm_prefetch((const char*)(pf_sc + off), _MM_HINT_T0);
+            }
+        }
+#endif
+        const int64_t id = ldi(tok, offlin(tok, m)) - voff;
+        const int64_t xb = rowoff(x, m, E);
+        float* s = scratch_f32((size_t)E);
+        if (id < 0 || id >= V) {
+            for (int64_t i = 0; i < E; ++i) s[i] = 0.0f;
+            out_row(x, xb, E, s);
+            continue;
+        }
+        const uint8_t* row = (const uint8_t*)cd->data + id * rb;
+        const int64_t sb = rowoff(sc, id, E / G);
+#if AVX_LEVEL >= 3
+        if (vec) {
+            const __m512 tv = _mm512_loadu_ps(lut);
+            const __m512 mv = _mm512_set1_ps(mult);
+            const __m512i odd = _mm512_set_epi32(4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0);
+            const __m512i lo4 = _mm512_set1_epi32(15);
+            for (int64_t i = 0; i < E; i += 16) {
+                uint64_t w;
+                std::memcpy(&w, row + i / 2, sizeof w);
+                const __m128i b = _mm_cvtsi64_si128((long long)w);
+                const __m512i d = _mm512_cvtepu8_epi32(_mm_unpacklo_epi8(b, b));
+                const __m512i ix = _mm512_and_si512(_mm512_srlv_epi32(d, odd), lo4);
+                const __m512 v = _mm512_permutexvar_ps(ix, tv);
+                const __m512 sv = _mm512_set1_ps(ldt(sc, sb + (i / G) * ss));
+                _mm512_storeu_ps(s + i, _mm512_mul_ps(_mm512_mul_ps(v, sv), mv));
+            }
+            out_row(x, xb, E, s);
+            continue;
+        }
+#endif
+        for (int64_t i = 0; i < E; ++i) {
+            int code;
+            if (bits == 8) {
+                code = cdt == RAD_I8 ? (int)(int8_t)row[i] : (int)row[i];
+            } else {
+                const int u = (row[i >> 1] >> ((i & 1) * 4)) & 15;
+                code = cdt == RAD_I4 ? (u ^ 8) - 8 : u;
+            }
+            const float v = tab ? lut[code] : (float)code;
+            s[i] = v * ldt(sc, sb + (i / G) * ss) * mult;
+        }
+        out_row(x, xb, E, s);
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(embed_lookup_planes) { return embed_planes_impl(a); }
 
 /* ================================================================== the E4M3 table into bf16
  *

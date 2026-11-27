@@ -11,6 +11,7 @@
 #include "server/oai.h"
 #include "server/http.h"
 #include "diag/diag.h"
+#include "fleet/config.h"
 #include "util/kernel_list.h"
 #include "place/planner.h"
 
@@ -24,9 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <set>
-#include <sstream>
 #include <sys/stat.h>
 
 namespace rad {
@@ -80,6 +79,8 @@ static const Flag g_flags[] = {
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
                                         "completed mixed steps; 0 (default) is off" },
+    { "--long-prefill-token-threshold", "N", "cap a long prefill's chunk at N tokens when other\n"
+                                        "requests exist; adaptive floor budget/eligible; 0 (default) off" },
     { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
                                         "decode position fits beside every runner; off (the default)\n"
                                         "admits a prompt when its first chunk fits" },
@@ -98,7 +99,8 @@ static const Flag g_flags[] = {
                                         "Not with --gpu-memory-mib" },
     { "--kv-cache-dtype",     "T",      "bf16 (default) | i8 | fp8 -- i8 halves what a token of\n"
                                         "context costs: K and V as int8 with one scale each per token\n"
-                                        "and head. fp8 (E4M3) is GLM-5.3's latent cache only" },
+                                        "and head. fp8 (E4M3): GLM-5.3's latent cache; DeepSeek-V4.1's\n"
+                                        "compressed latent and index keys, exact (the bf16 cache's bits)" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
                                         "and is lossy; the qwen35 plugins serve it" },
@@ -213,6 +215,11 @@ static const Flag g_flags[] = {
     "                                    one, for each of --max-num-seqs, within an eighth of host\n"
     "                                    memory. N fixes the total; 0 keeps none" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
+    { "--checkpoint-draft-window", nullptr, "keep a block drafter's own sliding-window KV in the checkpoint\n"
+    "                                    slots of a model with linear state (no effect elsewhere), so\n"
+    "                                    a prefix hit restores it rather than re-prefilling for it.\n"
+    "                                    One drafter window more pinned host memory per slot (fewer\n"
+    "                                    auto slots). Needs the prefix cache" },
     { "--prefix-resume",      "MODE",   "where a prefix hit resumes: exact (default) only where\n"
     "                                    an idle server's cold prefill of the prompt starts a\n"
     "                                    chunk, so the hit answers bit-identically to a cold run;\n"
@@ -238,6 +245,43 @@ static const Flag g_flags[] = {
                                         "from N decoding sequences on (0 never): the long block pays\n"
                                         "at one sequence, the short one at many. auto (the default):\n"
                                         "never for a chain, from 2 for a tree drafter" },
+    { "--draft-max-lanes",    "K",      "a block drafter drafts only while at most K sequences decode;\n"
+                                        "above K the scheduler runs the plain target step for all of\n"
+                                        "them (the drafter's context pass still runs, so drafting\n"
+                                        "resumes at once when load falls back to K). Steps gated off\n"
+                                        "are counted in radiance:draft_gated_steps_total. 0 (default)\n"
+                                        "never gates" },
+    { "--draft-depth0",       "MODE",   "off (default) | on -- under --draft-window adaptive the window\n"
+                                        "may also choose depth 0: no query pass and no verify row, the\n"
+                                        "plain step (a block drafter's context pass still runs), where\n"
+                                        "the measured plain step emits more tokens a millisecond than\n"
+                                        "the drafting depth. The output is the same" },
+    { "--draft-probe",        "N",      "with --draft-depth0 on, a step at the drafting depth every N\n"
+                                        "cycles at depth 0 keeps its estimate measured (default 16,\n"
+                                        "2 to 4096)" },
+    { "--draft-probe-backoff", "N",     "with --draft-depth0 on, each probe that leaves depth 0 in place\n"
+                                        "doubles the probe interval, up to N doublings; a move starts it\n"
+                                        "over. 0 (default) keeps the interval, at most 8" },
+    { "--draft-hybrid",       "MODE",   "off (default) | on -- beside a chain draft head (serial or\n"
+                                        "block, not a tree), a sequence whose prompt lookup matches at\n"
+                                        "least --draft-hybrid-match tokens back verifies the lookup's\n"
+                                        "proposal instead of the head's, and its next step is planned\n"
+                                        "after the commit. The output is the same" },
+    { "--draft-hybrid-match", "N",      "the lookup match --draft-hybrid needs, in tokens (default 8,\n"
+                                        "1 to 256)" },
+    { "--dspark-walk",        "MODE",   "off (default) | on -- DeepSeek-V4.1's DSpark drafter walks its\n"
+                                        "Markov tables over the whole vocabulary, as the reference\n"
+                                        "implementation does, instead of re-ranking the draft head's top\n"
+                                        "candidates. The trunk verifies, so the output is the same" },
+    { "--draft-min-accept",   "X",      "a block drafter stops drafting for a sequence whose smoothed\n"
+                                        "tokens per verify step (1 + accepted drafts) falls below X,\n"
+                                        "and resumes above X + 0.4. A plain step gives 1 token, so X\n"
+                                        "is a value above 1 at which a draft step pays for its extra\n"
+                                        "cost; that depends on the model and the load, so measure it.\n"
+                                        "While stopped, one block is proposed after 128 generated\n"
+                                        "tokens (doubling after each failed try, up to 1024) to\n"
+                                        "measure again; the context pass keeps running. Counted in\n"
+                                        "radiance:draft_acc_gated_steps_total. 0 (default) never gates" },
     { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
     "                                    samples each proposal from its own shortlist and the sampler\n"
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
@@ -340,11 +384,13 @@ static const Flag g_flags[] = {
     "                                    The value goes to the model's chat template verbatim, so the legal\n"
     "                                    set is the template's: Qwen3.8 takes xhigh|medium|low and defaults\n"
     "                                    to xhigh, which on a short task can spend the whole token budget\n"
-    "                                    inside <think> and answer nothing. \"none\" turns thinking off" },
+    "                                    inside <think> and answer nothing. \"none\" turns thinking off, or is\n"
+    "                                    passed as the level where the template has one by that name" },
     { "--reasoning-effort-map", "MAP",  "FROM=TO[,FROM=TO...]: a `reasoning_effort` a request sends, replaced before\n"
     "                                    the chat template sees it -- high=xhigh lets a client that always sends\n"
     "                                    OpenAI's top level reach Qwen3.8's. TO is checked against the template at\n"
-    "                                    startup; none and minimal turn thinking off. Repeatable" },
+    "                                    startup; none and minimal turn thinking off, or are passed where the\n"
+    "                                    template has levels by those names. Repeatable" },
     { "--thinking-token-budget", "N",   "default `thinking_token_budget` for chat requests that do not set one: at\n"
     "                                    N reasoning tokens the reasoning block is closed and the answer follows,\n"
     "                                    so a client's max_tokens is not spent on reasoning alone. Unset is no\n"
@@ -467,6 +513,13 @@ static const Flag g_flags[] = {
     "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
     "                                    JSON every 30 s and at shutdown. From the routing histograms the core\n"
     "                                    already copies back: no device work, no synchronisation" },
+    { "--expert-split",       "LIST",   "the routed experts a layer each rank holds, comma-separated in\n"
+                                        "rank order, even counts summing to the model's (deepseek41,\n"
+                                        "glm5next). A rank given few enough to hold them all in VRAM\n"
+                                        "streams none over its link. Empty (default): the even split" },
+    { "--weight-sidecar",     "FILE",   "a second container whose entries replace the model container's\n"
+                                        "of the same name and logical shape, in another encoding\n"
+                                        "(rad-sidecar writes one). Empty (default): none" },
     { "--expert-profile",     "FILE",   "rank the expert plane by this radiance-expert-stats JSON's `decode`\n"
     "                                    counts instead of the container's activation profile, which is\n"
     "                                    prefill-heavy: decode-hot experts differ. The planner keeps the\n"
@@ -605,15 +658,12 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
     std::string text = v;
     std::string src = "--chat-template-kwargs";
     if (!text.empty() && text[0] == '@') {
-        std::ifstream f(text.substr(1), std::ios::binary);
-        if (!f) {
-            RAD_ERR("--chat-template-kwargs %s: cannot read %s", v, text.c_str() + 1);
+        const std::string path = text.substr(1);
+        if (!read_file_bytes(path, &text)) {
+            RAD_ERR("--chat-template-kwargs %s: cannot read %s", v, path.c_str());
             return false;
         }
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        src += " " + text.substr(1);
-        text = ss.str();
+        src += " " + path;
     }
     const Json j = Json::parse(text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) {
@@ -633,18 +683,6 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
         }
         /* The template context takes JSON text, so strings stay quoted. */
         (*out)[it.key()] = it.value().dump();
-    }
-    return true;
-}
-
-/* A name a request may give as `model`, by the rule a fleet applies to model ids and aliases
- * (fleet::valid_name, in a file this one does not include): not empty, and no ':' (reserved for
- * base:adapter), whitespace or control character. */
-static bool plain_name(const char* s) {
-    if (!*s) return false;
-    for (; *s; ++s) {
-        const unsigned char ch = (unsigned char)*s;
-        if (ch == ':' || std::isspace(ch) || std::iscntrl(ch)) return false;
     }
     return true;
 }
@@ -715,6 +753,7 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "off"))  c->busy_prefill_chunk = 0;
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
+        else if (S("--long-prefill-token-threshold")) { if (!num(0, INT64_MAX, &c->long_prefill_token_threshold)) return RAD_E_INVAL; }
         else if (S("--prefill-interleave"))    {
             if (!(v = need(i))) return RAD_E_INVAL;
             c->prefill_interleave_set = true;
@@ -915,7 +954,7 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--control-vector-variant")) {
             if (!(v = need(i))) return RAD_E_INVAL;
-            if (!plain_name(v)) {
+            if (!fleet::valid_name(v)) {
                 RAD_ERR("--control-vector-variant takes a name with no ':' or whitespace -- "
                         "got '%s'", v);
                 return RAD_E_INVAL;
@@ -969,6 +1008,7 @@ int config_parse(int argc, char** argv, Config* c) {
             }
         }
         else if (S("--no-prefix-cache"))       c->prefix_cache = false;
+        else if (S("--checkpoint-draft-window")) c->checkpoint_draft_window = true;
         else if (S("--prefix-resume")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "exact"))        c->prefix_exact = true;
@@ -1017,6 +1057,41 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!std::strcmp(v, "auto")) c->draft_short_from = -1;
             else if (!parse_int(a.c_str(), v, 0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL;
         }
+        else if (S("--draft-min-accept")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d >= 0.0 && d <= 16.0)) {
+                RAD_ERR("--draft-min-accept must be in [0, 16] tokens per verify step, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            /* A verify yields at least the one token a plain step does, so a threshold at or below
+             * 1 never stops a sequence: refused rather than accepted as a gate that never acts. */
+            if (d > 0.0 && d <= 1.0) {
+                RAD_ERR("--draft-min-accept %s never gates: a verify yields at least 1 token; give "
+                        "0 (off) or a value above 1", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_min_accept = d;
+        }
+        else if (S("--draft-max-lanes")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_int(a.c_str(), v, 0, INT32_MAX, &c->draft_max_lanes)) return RAD_E_INVAL;
+        }
+        else if (S("--draft-depth0") || S("--draft-hybrid") || S("--dspark-walk")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            bool* to = S("--draft-depth0") ? &c->draft_depth0 : S("--draft-hybrid") ? &c->draft_hybrid
+                                                                                  : &c->dspark_walk;
+            if      (!std::strcmp(v, "off")) *to = false;
+            else if (!std::strcmp(v, "on"))  *to = true;
+            else {
+                RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-probe"))           { if (!num(2, 4096, &c->draft_probe)) return RAD_E_INVAL; }
+        else if (S("--draft-probe-backoff"))   { if (!num(0, 8, &c->draft_probe_backoff)) return RAD_E_INVAL; }
+        else if (S("--draft-hybrid-match"))    { if (!num(1, 256, &c->draft_hybrid_match)) return RAD_E_INVAL; }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -1414,7 +1489,9 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--proceed-with-incompatible-configuration")) c->proceed_incompatible = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
-        else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; c->expert_profile_given = true; }
+        else if (S("--expert-split"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_split = v; }
+        else if (S("--weight-sidecar"))        { if (!(v = need(i))) return RAD_E_INVAL; c->weight_sidecar = v; }
+        else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; }
         else if (S("--expert-pin-top"))        {
             if (!(v = need(i))) return RAD_E_INVAL;
             char* e = nullptr;
@@ -1424,7 +1501,6 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->expert_pin_top = (float)d;
-            c->expert_pin_top_given = true;
         }
         else if (S("--draft-expert-placement")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1600,8 +1676,9 @@ int config_parse(int argc, char** argv, Config* c) {
         }
     }
 
-    /* --reasoning-effort is a template variable ("none" also sets enable_thinking false), so
-     * either key in --chat-template-kwargs as well would give two defaults for one setting. */
+    /* --reasoning-effort is a template variable ("none" sets enable_thinking false instead,
+     * unless the template takes the word), so either key in --chat-template-kwargs as well
+     * would give two defaults for one setting. */
     if (!c->reasoning_effort.empty() &&
         (c->chat_template_kwargs.count("reasoning_effort") ||
          c->chat_template_kwargs.count("enable_thinking"))) {
@@ -1762,6 +1839,9 @@ const ShowRow kShow[] = {
     { "--prefill-room-gate", [](const Config& c) {
           return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
+    { "--long-prefill-token-threshold", [](const Config& c) {
+          return c.long_prefill_token_threshold > 0 ? num(c.long_prefill_token_threshold)
+                                                    : std::string("0 (off)"); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },
@@ -1816,6 +1896,7 @@ const ShowRow kShow[] = {
           return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {
           return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
+    { "--checkpoint-draft-window", [](const Config& c) { return onoff(c.checkpoint_draft_window); } },
     { "--prefix-resume",      [](const Config& c) {
           return std::string(c.prefix_exact ? "exact" : "nearest"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
@@ -1828,6 +1909,16 @@ const ShowRow kShow[] = {
     { "--draft-short-from",   [](const Config& c) {
           return c.draft_short_from < 0 ? std::string("auto")
                : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
+    { "--draft-min-accept",   [](const Config& c) {
+          return c.draft_min_accept > 0 ? fnum(c.draft_min_accept) : std::string("0 (no gating)"); } },
+    { "--draft-max-lanes",    [](const Config& c) {
+          return c.draft_max_lanes > 0 ? num(c.draft_max_lanes) : std::string("0 (no gating)"); } },
+    { "--draft-depth0",       [](const Config& c) { return onoff(c.draft_depth0); } },
+    { "--draft-probe",        [](const Config& c) { return num(c.draft_probe); } },
+    { "--draft-probe-backoff", [](const Config& c) { return num(c.draft_probe_backoff); } },
+    { "--draft-hybrid",       [](const Config& c) { return onoff(c.draft_hybrid); } },
+    { "--draft-hybrid-match", [](const Config& c) { return num(c.draft_hybrid_match); } },
+    { "--dspark-walk",        [](const Config& c) { return onoff(c.dspark_walk); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-verify",       [](const Config& c) {
           return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },
@@ -1962,6 +2053,8 @@ const ShowRow kShow[] = {
     { "--proceed-with-incompatible-configuration", [](const Config& c) { return onoff(c.proceed_incompatible); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
+    { "--expert-split",       [](const Config& c) { return or_none(c.expert_split, "even"); } },
+    { "--weight-sidecar",     [](const Config& c) { return or_none(c.weight_sidecar, "none"); } },
     { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },
     { "--expert-pin-top",     [](const Config& c) { return fmt("%.4g", c.expert_pin_top); } },
     { "--draft-expert-placement", [](const Config& c) { return c.draft_expert_placement; } },

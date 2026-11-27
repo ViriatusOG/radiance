@@ -211,7 +211,8 @@ void print_directory(const RadFile& f, bool verbose) {
 
     for (int64_t k = 0; k < f.entry_count(); ++k) {
         const RadFileEntry& e = f.entry(k);
-        for (uint32_t p = 0; p < e.n_planes; ++p) total_payload += (int64_t)f.plane(e, (int)p).bytes;
+        for (uint32_t p = 0; p < e.n_planes; ++p)
+            total_payload += (int64_t)f.plane(e, (int)p).bytes;
         auto& a = by_enc[enc_name(f.encoding(e))];
         ++a.first; a.second += (int64_t)e.bytes;
         auto& b = by_prov[provenance(f, e)];
@@ -272,7 +273,8 @@ void print_directory(const RadFile& f, bool verbose) {
                 humanb(blob - total_payload).c_str(), RAD_ALIGN_UNIT, RAD_ALIGN_SUB);
     std::printf("      data blob      %14s\n", humanb(blob).c_str());
 
-    auto table = [&](const char* title, const std::map<std::string, std::pair<int64_t, int64_t>>& m) {
+    auto table = [&](const char* title,
+                     const std::map<std::string, std::pair<int64_t, int64_t>>& m) {
         std::printf("\n  %s\n", title);
         std::vector<std::pair<std::string, std::pair<int64_t, int64_t>>> v(m.begin(), m.end());
         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
@@ -295,7 +297,8 @@ void print_vocab(const RadFile& f) {
     std::printf("  kind          %s\n", tok_kind(v.h->kind));
     std::printf("  tokens        %u\n", v.h->n_tokens);
     std::printf("  merges        %u\n", v.h->n_merges);
-    std::printf("  specials      bos=%d eos=%d eot=%d pad=%d unk=%d sep=%d  add_bos=%u add_eos=%u\n",
+    std::printf("  specials      bos=%d eos=%d eot=%d pad=%d unk=%d sep=%d  add_bos=%u "
+                "add_eos=%u\n",
                 v.h->bos, v.h->eos, v.h->eot, v.h->pad_id, v.h->unk, v.h->sep,
                 v.h->add_bos, v.h->add_eos);
     const char* ct = f.str(v.h->chat_template);
@@ -328,7 +331,8 @@ void print_vocab(const RadFile& f) {
     }
 
     /* Every control and user-defined token with its id: these decide where a turn ends. A model
-     * that ends its turn on a token not declared eos or eot runs on into a hallucinated next turn. */
+     * that ends its turn on a token not declared eos or eot runs on into a hallucinated next
+     * turn. */
     if (v.tok_type && v.tok_text) {
         std::printf("  control/user  (the tokens a turn can end on; eos/eot marked)\n");
         for (uint32_t i = 0; i < v.h->n_tokens; ++i) {
@@ -397,7 +401,8 @@ int print_plugins(const std::string& home) {
         } else {
             std::string names;
             for (const auto& q : reg.quantizers())
-                if (q.plugin == p.name && q.info) names += (names.empty() ? "" : " ") + std::string(q.info->name);
+                if (q.plugin == p.name && q.info)
+                    names += (names.empty() ? "" : " ") + std::string(q.info->name);
             what = "quantizers    " + names;
         }
         std::printf("  %2d %-16s %-8s %s\n     %s\n", p.order, p.name.c_str(), p.version.c_str(),
@@ -415,7 +420,9 @@ int print_plugins(const std::string& home) {
 int print_unreferenced(const RadFile& f, int64_t min_bytes) {
     const RadFileHeader& h = f.header();
     std::vector<std::pair<uint64_t, uint64_t>> live;   /* [first, last) */
-    auto add = [&](uint64_t off, uint64_t bytes) { if (bytes) live.emplace_back(off, off + bytes); };
+    auto add = [&](uint64_t off, uint64_t bytes) {
+        if (bytes) live.emplace_back(off, off + bytes);
+    };
     add(0, sizeof(RadFileHeader));
     add(h.str_off,   h.str_bytes);
     add(h.meta_off,  h.meta_count * sizeof(RadFileKV));
@@ -478,7 +485,8 @@ int print_planes(const RadFile& f, const std::string& glob) {
 
 int main(int argc, char** argv) {
     std::string path;
-    bool verbose = false, only_meta = false, only_vocab = false, only_recipe = false, plugins = false;
+    bool verbose = false, only_meta = false, only_vocab = false, only_recipe = false;
+    bool plugins = false;
     std::string home = rad_home();
     int  top = 20;
     int64_t unref_min = -1;
@@ -486,17 +494,15 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "rad-info: %s needs a value\n", what);
-                                 std::exit(2); }
-            return argv[++i];
+        auto next = [&](const char* what) {
+            return rad_flag_value("rad-info", argc, argv, &i, what);
         };
         if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a == "-v" || a == "--verbose") verbose = true;
         else if (a == "--meta")  only_meta = true;
         else if (a == "--vocab") only_vocab = true;
-        else if (a == "--profile") top = (int)rad_flag_int("rad-info", "--profile", next("--profile"),
-                                                           0, INT32_MAX);
+        else if (a == "--profile")
+            top = (int)rad_flag_int("rad-info", "--profile", next("--profile"), 0, INT32_MAX);
         else if (a == "--recipe") only_recipe = true;
         else if (a == "--unreferenced") {
             unref_min = 1 << 20;

@@ -354,7 +354,8 @@ static inline int rad_enc_valid(const RadEncoding* e) {
         const int64_t np = rad_enc_givens_parts(e);
         if (ip <= 0 || ia <= 0 || np < 1) return 0;
         if (e->plane[ip].kind != RAD_PLANE_TABLE || e->plane[ia].kind != RAD_PLANE_TABLE) return 0;
-        if (e->plane[ip].extent[0] % np || e->plane[ia].extent[0] != e->plane[ip].extent[0]) return 0;
+        if (e->plane[ip].extent[0] % np || e->plane[ia].extent[0] != e->plane[ip].extent[0])
+            return 0;
         if (e->plane[ia].extent[1] * 2 != e->plane[ip].extent[1]) return 0;
         if (is > 0 && (e->plane[is].kind != RAD_PLANE_TABLE || e->plane[is].extent[0] != np ||
                        e->plane[is].extent[1] != e->plane[ip].extent[1])) return 0;

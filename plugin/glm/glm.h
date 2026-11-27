@@ -4,7 +4,7 @@
  * - One op of its own, `swiglu_clamped_had_quant_i8g`: GLM's clamped SwiGLU (`swiglu_clamped`) and
  *   the rotated int8 quantiser an i8a8h consumer reads (`had_quant_act_i8g`) in one pass. Its bytes
  *   are the chain's: each element is swiglu_clamped's expression rounded to bf16, then the 128-wide
- *   Hadamard and the codes and scale had_quant_act_i8g writes over that bf16 row. GateQuantFP8
+ *   Hadamard and the codes and scale had_quant_act_i8g writes over that bf16 row. GateQuant
  *   issues it only where a loaded library declares it (fuse_clamped, rad_op_declared), for a clamped
  *   gate (not `swiglu_step`) feeding a rotated int8 pair, so loading this plugin changes no other
  *   model's graph today.

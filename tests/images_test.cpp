@@ -9,6 +9,7 @@
  * and skip without it.
  */
 #include "server_fakes.h"
+#include "server/front.h"
 
 #include "mm/media.h"
 
@@ -117,7 +118,7 @@ TEST(an_image_model_names_the_images_endpoints_and_its_capabilities) {
  * one under 2^53 (returned for reuse, and JavaScript reads JSON numbers as doubles), and each
  * image's seed counting up from it. */
 TEST(the_generator_gets_rounded_sizes_quality_steps_and_a_readable_seed) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const json a = s.gen({ { "prompt", "x" }, { "size", "300x200" }, { "quality", "low" },
                            { "seed", 5 }, { "n", 2 } });
@@ -151,7 +152,7 @@ TEST(the_generator_gets_rounded_sizes_quality_steps_and_a_readable_seed) {
  * twice with guidance (the negative prompt is a second conditioning). An edit's pictures are
  * resized to the model's reference area at their own aspect before the encoder sees them. */
 TEST(usage_counts_each_pictures_tokens_in_every_branch) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const std::string pic = png(40, 20, 255, 255);
     REQUIRE(!pic.empty());
@@ -347,7 +348,7 @@ TEST(guidance_follows_the_model_cards_terms_and_its_default_negative) {
 }
 
 TEST(an_auto_background_follows_the_pictures_alpha) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const std::string opaque = png(40, 20, 255, 255), half = png(40, 20, 0, 255);
     REQUIRE(!opaque.empty() && !half.empty());
@@ -370,7 +371,7 @@ TEST(an_auto_background_follows_the_pictures_alpha) {
  * same type. A prompt the model's template does not open with its fixed turn is the server's
  * failure, a 500 typed as one. */
 TEST(a_generators_failure_is_a_400_or_a_500_streamed_or_not) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.submit_status = RAD_E_INVAL;
     s.img.submit_why = "too long for the cache";
@@ -407,7 +408,7 @@ TEST(a_generators_failure_is_a_400_or_a_500_streamed_or_not) {
 /* An upload as multipart form-data: fields arrive as text (n as "2") and pictures as `image[]`
  * parts. */
 TEST(a_multipart_edit_reads_text_fields_and_picture_parts) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     const std::string pic = png(40, 20, 255, 255);
     HttpRequest q;
@@ -428,7 +429,7 @@ TEST(a_multipart_edit_reads_text_fields_and_picture_parts) {
 /* A stream sends each preview as a partial_image event numbered from 0, then the image as
  * `completed` with its usage, per image. */
 TEST(a_streamed_generation_sends_previews_then_the_image) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     HttpResponse r = s.post("/v1/images/generations",
                             { { "prompt", "x" }, { "stream", true }, { "partial_images", 2 } });
@@ -445,7 +446,7 @@ TEST(a_streamed_generation_sends_previews_then_the_image) {
 }
 
 TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
-    if (!mm::decoder_available()) return;
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
     Images s;
     s.img.inf.default_width = s.img.inf.default_height = 1024;
     s.img.inf.max_tokens = 4096;
@@ -456,6 +457,101 @@ TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
     REQUIRE_EQ(res.status, 200);
     CHECK_EQ(s.last().width, 1152);
     CHECK_EQ(s.last().height, 896);
+}
+
+
+/* A model whose references fit the output (Krea's instruction edit): `ref_boost` is a finite
+ * number in 0.0001..16 on an edit only, masks are refused, a reference is resized to the output's
+ * grid (near-matched aspects fill it, others fit inside it), and the grounding picture is cut
+ * to 768 px on its long side. */
+TEST(a_reference_fitting_edit_bounds_ref_boost_refuses_masks_and_resizes_references) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    const std::string pic = png(100, 100, 255, 255);
+    REQUIRE(!pic.empty());
+    auto edit = [&](const json& extra, int status) {
+        json b = { { "prompt", "x" }, { "image", data_url(pic) }, { "size", "256x128" } };
+        for (auto it = extra.begin(); it != extra.end(); ++it) b[it.key()] = it.value();
+        HttpResponse r = s.post("/v1/images/edits", b);
+        CHECK_EQ(r.status, status);
+        return json::parse(r.body, nullptr, false);
+    };
+    /* No boost leaves the bias at 0; in range it is the natural log. */
+    edit(json::object(), 200);
+    CHECK_EQ(s.last().ref_log_bias, 0.0f);
+    edit({ { "ref_boost", 1.0 } }, 200);
+    CHECK_EQ(s.last().ref_log_bias, 0.0f);
+    edit({ { "ref_boost", 2.0 } }, 200);
+    CHECK(std::fabs(s.last().ref_log_bias - std::log(2.0f)) < 1e-6f);
+    edit({ { "ref_boost", 16 } }, 200);
+    CHECK(std::fabs(s.last().ref_log_bias - std::log(16.0f)) < 1e-6f);
+    edit({ { "ref_boost", 0.0001 } }, 200);
+    CHECK(std::fabs(s.last().ref_log_bias - std::log(0.0001f)) < 1e-5f);
+    const size_t accepted = s.img.got.size();
+    /* Out of range, not a number, or not finite: refused under the field. */
+    const json bad[] = { 0.00009, 0.0, -1.0, 16.1, 1e300, "2", true, nullptr, json::array() };
+    for (const json& v : bad) {
+        const json e = edit({ { "ref_boost", v } }, 400);
+        CHECK_EQ(str_at(e["error"], "param"), std::string("ref_boost"));
+    }
+    /* A form field arrives as text: "nan" and "inf" parse as doubles and are still refused. */
+    for (const char* v : { "nan", "inf", "-inf", "16.5", "0" }) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/edits";
+        q.form = { FormPart{ "prompt", "", "", "x" }, FormPart{ "ref_boost", "", "", v },
+                   FormPart{ "image", "a.png", "image/png", pic } };
+        CHECK_EQ(s.f->srv->router().dispatch(q).status, 400);
+    }
+    {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/edits";
+        q.form = { FormPart{ "prompt", "", "", "x" }, FormPart{ "ref_boost", "", "", "3" },
+                   FormPart{ "image", "a.png", "image/png", pic } };
+        CHECK_EQ(s.f->srv->router().dispatch(q).status, 200);
+        CHECK(std::fabs(s.last().ref_log_bias - std::log(3.0f)) < 1e-6f);
+    }
+    CHECK_EQ(s.img.got.size(), accepted + 1);   /* nothing refused reached the generator */
+    /* Only an edit on a reference-fitting model takes it. */
+    CHECK_EQ(str_at(s.gen({ { "prompt", "x" }, { "ref_boost", 2.0 } }, 400)["error"], "param"),
+             std::string("ref_boost"));
+    s.img.inf.refs_fit_output = false;
+    CHECK_EQ(str_at(edit({ { "ref_boost", 2.0 } }, 400)["error"], "param"), std::string("ref_boost"));
+    s.img.inf.refs_fit_output = true;
+
+    /* A mask is refused (the first picture is not repainted under it). */
+    const json m = edit({ { "mask", data_url(png(100, 100, 0, 255)) } }, 400);
+    CHECK_EQ(str_at(m["error"], "param"), std::string("mask"));
+    CHECK(has(m["error"].value("message", ""), "instruction edits"));
+
+    /* The reference: a near-matched aspect fills the output grid, another fits inside it on the
+     * model's multiple, never above the output. Output is 256 x 128 here. */
+    edit(json::object(), 200);
+    REQUIRE(s.last().refs.size() == 1);
+    CHECK_EQ(s.last().refs[0].w, 128);
+    CHECK_EQ(s.last().refs[0].h, 128);
+    CHECK_EQ(s.last().refs[0].bf16.size(), (size_t)128 * 128 * s.last().refs[0].ch);
+    const std::string wide = png(512, 256, 255, 255);
+    edit({ { "image", data_url(wide) } }, 200);
+    CHECK_EQ(s.last().refs[0].w, 256);
+    CHECK_EQ(s.last().refs[0].h, 128);
+    const std::string tall = png(64, 256, 255, 255);
+    edit({ { "image", data_url(tall) } }, 200);
+    CHECK_EQ(s.last().refs[0].w, 32);
+    CHECK_EQ(s.last().refs[0].h, 128);
+    /* The grounding picture keeps the original aspect, cut to 768 on its long side. */
+    s.img.frames.clear();
+    edit({ { "image", data_url(png(1536, 768, 255, 255)) } }, 200);
+    REQUIRE(s.img.frames.size() == 1);
+    CHECK_EQ(s.img.frames[0].first, 768);
+    CHECK_EQ(s.img.frames[0].second, 384);
+    s.img.frames.clear();
+    edit({ { "image", data_url(wide) } }, 200);
+    REQUIRE(s.img.frames.size() == 1);
+    CHECK_EQ(s.img.frames[0].first, 512);
+    CHECK_EQ(s.img.frames[0].second, 256);
 }
 
 
@@ -629,6 +725,198 @@ TEST(stopping_the_server_releases_all_image_adapter_waiters) {
     CHECK_EQ(first.get(), 429);
     CHECK_EQ(second.get(), 429);
     CHECK_EQ(f.srv->in_flight(), 0);
+}
+TEST(adapter_validation_uses_the_selected_model_without_generating_or_holding_a_slot) {
+    int validations = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps&) {
+        o.api_key = "fixture";
+        o.gen_lora_validate = [&](const auto& choices, std::string* why) {
+            ++validations;
+            if (choices.front().first != "turbo") {
+                *why = "unmatched adapter";
+                return RAD_E_NOTFOUND;
+            }
+            CHECK_EQ(choices.front().second, 0.6);
+            return RAD_OK;
+        };
+    }});
+    auto validate = [&](const char* model, const json& adapters) {
+        return f.post("/v1/loras/validate", json{{"model", model}, {"loras", adapters}}.dump());
+    };
+    CHECK_EQ(validate("missing", {"turbo"}).status, 404);
+    CHECK_EQ(validate("test-model", json::array()).status, 400);
+    CHECK_EQ(validations, 0);
+    const auto answer = validate("test-model", {{"turbo", 0.6}});
+    REQUIRE_EQ(answer.status, 200);
+    CHECK_EQ(json::parse(answer.body)["compatibility"].get<std::string>(), std::string("compatible"));
+    CHECK_EQ(validate("test-model", {"unknown"}).status, 404);
+    CHECK_EQ(f.srv->in_flight(), 0);
+    CHECK_EQ(validations, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+TEST(fleet_validation_targets_the_parsed_model_or_alias_without_waking_a_cold_model) {
+    Front front(TransportOptions{}, 0);
+    Fixture image(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        o.model_id = "image";
+        o.api_key = "fixture";
+        d.front = &front;
+        o.gen_lora_validate = [](const auto&, std::string*) { return RAD_OK; };
+    }});
+    front.add("cold", {"default"}, 0, false);
+    front.attach("image", {"edit"}, image.srv.get());
+    auto validate = [&](std::string body) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/loras/validate";
+        q.body = std::move(body);
+        return front.forward(std::move(q)).status;
+    };
+    CHECK_EQ(validate(R"({"mod\u0065l":"edit","loras":["style"]})"), 200);
+    CHECK_EQ(validate(R"({"model":"cold","model":"image","loras":["style"]})"), 200);
+    CHECK_EQ(validate(R"({"model":"cold","loras":["style"]})"), 409);
+    CHECK_EQ(validate(R"({"model":"image:missing","loras":["style"]})"), 404);
+    CHECK_EQ(front.activity("image").uses, 0);
+}
+
+
+TEST(krea_outfill_scales_the_long_edge_and_preserves_the_source_in_the_canvas) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    const json request = { {"prompt", "A portrait in a studio"}, {"size", "1024x1024"},
+                           {"image", data_url(png(48, 64, 255, 255))},
+                           {"outfill", { {"horizontal", "right"} }} };
+    const HttpResponse response = s.post("/v1/images/edits", request);
+    REQUIRE_EQ(response.status, 200);
+    CHECK_EQ(s.last().outfill.x, 256);
+    CHECK_EQ(s.last().outfill.y, 0);
+    CHECK_EQ(s.last().outfill.w, 768);
+    CHECK_EQ(s.last().outfill.h, 1024);
+    REQUIRE_EQ(s.last().refs.size(), (size_t)1);
+    CHECK_EQ(s.last().refs[0].w, 336);
+    CHECK_EQ(s.last().refs[0].h, 448);
+    CHECK(s.img.frames.empty());
+    const json answer = json::parse(response.body);
+    std::vector<uint8_t> png_bytes;
+    REQUIRE(base64_decode(answer["data"][0]["b64_json"].get<std::string>(), &png_bytes));
+    mm::FrameRGBA result;
+    std::string why;
+    REQUIRE_EQ(mm::decode_image_rgba(png_bytes.data(), png_bytes.size(), 1024 * 1024, &result, &why),
+               RAD_OK);
+    const auto red = [&](int x, int y) { return (int)result.rgba[((size_t)y * 1024 + x) * 4]; };
+    CHECK_EQ(red(10, 100), 0);
+    CHECK_EQ(red(256, 100), 0);
+    CHECK_EQ(red(272, 100), 100);
+    CHECK_EQ(red(288, 100), 200);
+    json other = request;
+    other["size"] = "768x768";
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+    other = request;
+    other["ref_boost"] = 4.0;
+    CHECK_EQ(s.post("/v1/images/edits", other).status, 400);
+}
+
+/* Only sides that border generated area fade into the model's output; a source side on the canvas
+ * boundary keeps its pixels bit-identical to the scaled source. */
+TEST(krea_outfill_keeps_source_pixels_on_canvas_edge_sides) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    auto run = [&](const json& place, std::vector<uint8_t>* rgba) {
+        const HttpResponse r = s.post("/v1/images/edits",
+            { {"prompt", "x"}, {"size", "1024x1024"}, {"image", data_url(png(48, 64, 255, 255))},
+              {"outfill", place} });
+        REQUIRE_EQ(r.status, 200);
+        std::vector<uint8_t> file;
+        REQUIRE(base64_decode(json::parse(r.body)["data"][0]["b64_json"].get<std::string>(), &file));
+        mm::FrameRGBA out;
+        std::string why;
+        REQUIRE_EQ(mm::decode_image_rgba(file.data(), file.size(), 1024 * 1024, &out, &why), RAD_OK);
+        *rgba = out.rgba;
+    };
+    auto red = [](const std::vector<uint8_t>& p, int x, int y) { return (int)p[((size_t)y * 1024 + x) * 4]; };
+    std::vector<uint8_t> p;
+    /* Placed right (x = 256, 768 x 1024): left is the only generated side. The source's right,
+     * top and bottom borders are the source's 200 right up to the canvas edge. */
+    run({ {"horizontal", "right"} }, &p);
+    for (int y : { 0, 1, 31, 500, 1022, 1023 })
+        for (int x : { 1023, 1022, 1000, 992 }) CHECK_EQ(red(p, x, y), 200);
+    for (int x : { 288, 300, 600, 1000 })
+        for (int y : { 0, 1, 31, 1023 }) CHECK_EQ(red(p, x, y), 200);
+    CHECK_EQ(red(p, 256, 500), 0);    /* the left seam still fades from the generated side */
+    CHECK_EQ(red(p, 272, 500), 100);
+    CHECK_EQ(red(p, 288, 500), 200);
+    CHECK_EQ(red(p, 255, 500), 0);    /* outside the source: generated */
+    /* Centered: both side seams fade, the top and bottom (canvas edge) rows do not. */
+    run({ {"horizontal", "center"} }, &p);
+    CHECK_EQ(red(p, 512, 0), 200);
+    CHECK_EQ(red(p, 512, 1023), 200);
+    CHECK_EQ(red(p, 128, 500), 0);
+    CHECK_EQ(red(p, 128 + 767, 500), 0);
+    CHECK_EQ(red(p, 128 + 16, 500), 100);
+    CHECK_EQ(red(p, 128 + 767 - 16, 500), 100);
+    CHECK_EQ(red(p, 128 + 16, 0), 100);   /* the left ramp only: no top ramp on the canvas edge */
+}
+
+/* Malformed outfill input is a 400 under the field at fault, before anything is queued. */
+TEST(krea_outfill_refuses_malformed_input_before_the_generator) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    Images s;
+    s.img.inf.refs_fit_output = true;
+    s.img.inf.size_multiple = 16;
+    const std::string portrait = data_url(png(48, 64, 255, 255));
+    auto body = [&](const json& outfill) {
+        return json{ {"prompt", "x"}, {"size", "1024x1024"}, {"image", portrait}, {"outfill", outfill} };
+    };
+    auto refused = [&](json b, const char* param) {
+        const HttpResponse r = s.post("/v1/images/edits", b);
+        CHECK_EQ(r.status, 400);
+        CHECK_EQ(str_at(json::parse(r.body, nullptr, false)["error"], "param"), std::string(param));
+    };
+    refused(body("left"), "outfill");
+    refused(body(json::array({ "left" })), "outfill");
+    refused(body(5), "outfill");
+    refused(body(nullptr), "outfill");
+    refused(body({ {"horizontal", "left"}, {"diagonal", "up"} }), "outfill");
+    refused(body({ {"x", 10} }), "outfill");
+    refused(body({ {"horizontal", "middle"} }), "outfill");
+    refused(body({ {"horizontal", "top"} }), "outfill");
+    refused(body({ {"vertical", "left"} }), "outfill");
+    refused(body({ {"horizontal", 1} }), "outfill");
+    refused(body({ {"horizontal", "RIGHT"} }), "outfill");
+    json b = body(json::object());
+    b["size"] = "auto";
+    refused(b, "size");
+    b = body(json::object());
+    b["image"] = json::array({ portrait, portrait });
+    refused(b, "outfill");
+    b = body(json::object());
+    b["mask"] = data_url(png(48, 64, 0, 255));
+    refused(b, "mask");
+    b = body(json::object());
+    b["image"] = data_url(png(64, 64, 255, 255));   /* scales to fill the 1024 canvas */
+    refused(b, "image");
+    b = body(json::object());
+    b["ref_boost"] = 2.0;
+    refused(b, "outfill");
+    /* A plain edit endpoint model with no reference fitting has no outfill at all. */
+    s.img.inf.refs_fit_output = false;
+    refused(body(json::object()), "outfill");
+    /* Well-formed placements of every word are accepted (the generations endpoint takes none). */
+    s.img.inf.refs_fit_output = true;
+    CHECK(s.img.got.empty());
+    for (const char* h : { "left", "center", "right" })
+        for (const char* v : { "top", "center", "bottom" })
+            CHECK_EQ(s.post("/v1/images/edits", body({ {"horizontal", h}, {"vertical", v} })).status, 200);
+    CHECK_EQ(s.img.got.size(), (size_t)9);
+    CHECK_EQ(s.post("/v1/images/edits", body(json::object())).status, 200);
+    CHECK_EQ(s.last().outfill.x, 0);
+    CHECK_EQ(s.last().outfill.y, 0);
+    CHECK_EQ(str_at(s.gen({ {"prompt", "x"}, {"outfill", json::object()} }, 400)["error"], "param"),
+             std::string("outfill"));
 }
 
 RAD_TEST_MAIN()

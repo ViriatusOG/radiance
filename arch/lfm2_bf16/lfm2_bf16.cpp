@@ -23,7 +23,7 @@
  *
  * ============================== 8-BIT LINEARS ==============================
  *
- * Every linear is a LinearFP8 (rad_fp8.h), so the container's encoding of each weight decides the
+ * Every linear is a LinearQ (rad_linear.h), so the container's encoding of each weight decides the
  * GEMM: plain bf16 is `gemm_nt` over the bf16 activation, exactly as a bf16 model runs; a recipe's
  * block E4M3 (`codes=fp8_e4m3 block=128x128 scale=bf16`) is `gemm_nt_q` at fp8a8 over the
  * activation quantised per 128 columns (one quant_act_fp8 per activation, shared by the linears
@@ -35,9 +35,9 @@
  * the linears are 5.8 of the 6.3 GB a token reads, so 8-bit codes nearly halve decode and short
  * prefill, both bound by that read.
  *
- * A block-fp8 trunk also takes the fused producers (rad_fp8.h), which matter once the GEMMs are
+ * A block-fp8 trunk also takes the fused producers (rad_linear.h), which matter once the GEMMs are
  * this cheap: each norm quantises in its own pass and does the preceding block's residual add
- * (rmsnorm_quant_fp8 with a fold), and the feed-forward is MlpFP8, whose gate|up GEMM applies
+ * (rmsnorm_quant_fp8 with a fold), and the feed-forward is MlpQ, whose gate|up GEMM applies
  * SiLU(gate) * up and quantises in its epilogue at decode and short-prompt rows. Six launches a
  * layer become two; the last layer's feed-forward keeps its add for the final norm. The fused
  * kernels are byte-identical to the chains they replace.
@@ -49,8 +49,8 @@
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_vit.h>
-#include <arch/rad_block_mlp_fp8.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_block_mlp_q.h>
+#include <arch/rad_linear.h>
 
 #include "siglip2.h"
 
@@ -66,7 +66,7 @@ struct Layer {
     bool    attention = false;
     rad_weight w_norm = 0;
     /* in is q (attention) or the convolution's in_proj; out is the mixer's out-projection */
-    LinearFP8 in, out;
+    LinearQ in, out;
     /* conv */
     rad_weight w_conv = 0;
     rad_op op_gate_in = 0, op_conv = 0, op_gate_out = 0;
@@ -74,7 +74,7 @@ struct Layer {
      * (bf16, int8, or no library serving it), op_gate_out and q_mix run the pair. */
     rad_op op_gate_q = 0;
     /* attention: k, v and the two head norms */
-    LinearFP8 k, v;
+    LinearQ k, v;
     rad_weight w_q_norm = 0, w_k_norm = 0;
     rad_op op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op op_store = 0, op_attn = 0;
@@ -82,14 +82,14 @@ struct Layer {
     rad_op op_norm = 0, op_add = 0;
     /* the feed-forward: norm, gate|up (w1 | w3), SiLU(gate) * up, down (w2), residual add */
     rad_weight w_ffn_norm = 0;
-    LinearFP8 gate_up, down;
+    LinearQ gate_up, down;
     rad_op op_ffn_norm = 0, op_act = 0, op_ffn_add = 0;
     /* fp8a8 only: the activation quantisers, one per activation the linears read */
-    QuantFP8 q_h, q_mix, q_ffn_h, q_ffn;
+    QuantAct q_h, q_mix, q_ffn_h, q_ffn;
     /* fp8a8 fused: the mixer's norm (quantising, and adding the previous feed-forward's delta
      * from layer 1 on) and the whole feed-forward */
-    NormQuantFP8 nq_mix;
-    MlpFP8       mlp8;
+    NormQuant nq_mix;
+    MlpQ       mlp8;
 };
 
 struct Model {
@@ -103,12 +103,12 @@ struct Model {
     rad_buf b_hout = 0, b_logits = 0;
     /* The linears' inputs: the bf16 plane plus, for an 8-bit trunk, its codes. a_mix is the
      * mixer's output (attention or convolution), the out-projection's input. */
-    ActFP8 a_h{}, a_attn{}, a_conv{}, a_ffn{};
+    ActQ a_h{}, a_attn{}, a_conv{}, a_ffn{};
     /* The trunk's format, read off layer 0's first linear. `fused`: the fp8 trunk's fused
      * producers (see the head of the file). */
     bool q_fp8 = false, q_i8 = false, fused = false;
-    /* An int8 trunk's scale group along K, which its activation pairs share (ActFP8::g8). */
-    int64_t g8 = RAD_FP8_BLOCK;
+    /* An int8 trunk's scale group along K, which its activation pairs share (ActQ::g8). */
+    int64_t g8 = RAD_SCALE_GROUP;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_gather = 0, op_final_norm = 0, op_logits = 0;
@@ -126,9 +126,7 @@ static Model g_model[MAX_SLOTS];
 /* A text_config key first, then the top level: a VL checkpoint nests the text model's settings
  * and a text checkpoint does not. */
 static const char* text_key(const RadModelMeta* m, const char* key) {
-    const std::string nested = std::string("text_config.") + key;
-    const char* v = rad_meta_gets(m, nested.c_str(), nullptr);
-    return v ? v : rad_meta_gets(m, key, nullptr);
+    return meta_text_gets(m, key, nullptr);
 }
 static int64_t text_int(const RadModelMeta* m, const char* key, int64_t dflt) {
     const char* v = text_key(m, key);
@@ -312,8 +310,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.a_conv.declare_qs(b, nm, g, "conv_out", g.n_embd, 0, m.q_i8, true, m.g8));
     RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.q_i8, true, m.g8));
     /* An E4M3 activation is quantised once by the model and read by every linear on it; an int8
-     * linear quantises its own input (LinearFP8::op_q), and a bf16 one reads the bf16 plane. */
-    auto quant = [&](QuantFP8& q, const ActFP8& a, int64_t n) {
+     * linear quantises its own input (LinearQ::op_q), and a bf16 one reads the bf16 plane. */
+    auto quant = [&](QuantAct& q, const ActQ& a, int64_t n) {
         return m.q_fp8 ? q.declare(b, g, a, n) : RAD_OK;
     };
 
@@ -340,10 +338,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       grp_layer(l));
     };
     /* One linear: `base` is the declared name without `.weight`. Every linear must have the
-     * trunk's format; LinearFP8 refuses a bf16 weight in an 8-bit trunk with no bf16 plane, and
+     * trunk's format; LinearQ refuses a bf16 weight in an 8-bit trunk with no bf16 plane, and
      * this refuses the other mixes. */
-    auto linear = [&](LinearFP8& lin, int l, const char* base_fmt, int64_t N, int64_t K,
-                      std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
+    auto linear = [&](LinearQ& lin, int l, const char* base_fmt, int64_t N, int64_t K,
+                      std::initializer_list<const char*> src, const ActQ& a, rad_buf y,
                       std::initializer_list<int64_t> parts) -> int {
         const char* base = nm.f(base_fmt, l);
         RAD_ARCH_TRY(lin.declare(b, nm, g, base, N, K, RAD_SHARD_NONE, grp_layer(l), src, a, y, 0,
@@ -456,7 +454,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 L.op_gate_q = rw(b, RAD_OP(b, "gate_quant_fp8",
                                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                                RAD_INT("n", g.n_embd),
-                                               RAD_INT("group", RAD_FP8_BLOCK),
+                                               RAD_INT("group", RAD_SCALE_GROUP),
                                                RAD_STR("dtype", g.dtype),
                                                RAD_STR("act", "none")),
                                     RAD_NOWEIGHTS),
@@ -476,9 +474,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.fused) {
             /* The feed-forward's norm adds the mixer's delta; its own add is left to the next
              * layer's norm, except after the last layer, whose output the final norm reads. */
-            MlpFP8::Wire mw{};
+            MlpQ::Wire mw{};
             mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
-            MlpFP8::Src ms{};
+            MlpQ::Src ms{};
             ms.norm = nm.ckpt("%s.layers.%d.ffn_norm.weight", pre, l);
             ms.gate = nm.ckpt(ffn_fmt, pre, l, "w1.weight");
             ms.up   = nm.ckpt(ffn_fmt, pre, l, "w3.weight");

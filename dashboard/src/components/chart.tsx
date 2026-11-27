@@ -28,6 +28,9 @@ export interface ChartProps {
   integer?: boolean   // counts: whole ticks only
   bytes?: boolean     // sizes: ticks at binary multiples
   join?: boolean      // sparse events: join the values across the gaps between them
+  // Join gaps of up to `seconds` in the drawn line (tooltips keep the real samples); with `while`,
+  // only where that column is positive at every sample around and inside the gap.
+  joinGap?: { seconds: number; while?: string }
   overlay?: Overlay
   bands?: number[][]  // [from, to] times shaded behind the lines
   className?: string
@@ -56,7 +59,7 @@ function niceMax(v: number): number {
   return 10 * p
 }
 
-export function Chart({ data, version, lines, range, fmt, height = 220, stack, max, tight, integer, bytes, join, overlay, bands, className }: ChartProps) {
+export function Chart({ data, version, lines, range, fmt, height = 220, stack, max, tight, integer, bytes, join, joinGap, overlay, bands, className }: ChartProps) {
   const host = useRef<HTMLDivElement>(null)
   const tip = useRef<HTMLDivElement>(null)
   const plot = useRef<uPlot | null>(null)
@@ -94,6 +97,23 @@ export function Chart({ data, version, lines, range, fmt, height = 220, stack, m
         return acc[i]
       }))
     }
+    if (joinGap && !stack) {
+      const busy = joinGap.while ? (data.col(joinGap.while) ?? []).slice(lo) : null
+      drawn = drawn.map((c) => {
+        const out = c.slice()
+        let a = -1
+        for (let i = 0; i < c.length; ++i) {
+          if (c[i] === null) continue
+          if (a >= 0 && i - a > 1 && t[i] - t[a] <= joinGap.seconds) {
+            let all = true
+            if (busy) for (let k = a; k <= i && all; ++k) all = (busy[k] ?? 0) > 0
+            if (all) for (let k = a + 1; k < i; ++k) out[k] = (c[a] as number) + ((c[i] as number) - (c[a] as number)) * ((t[k] - t[a]) / (t[i] - t[a]))
+          }
+          a = i
+        }
+        return out
+      })
+    }
     const over: (number | null)[][] = []
     const od = overlay?.data
     if (od) for (const l of overlay.lines) {
@@ -105,7 +125,7 @@ export function Chart({ data, version, lines, range, fmt, height = 220, stack, m
     }
     return { t, cols, drawn, over, end, any }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, version, range, shape, stack, overlay?.data, overlay?.version, oShape])
+  }, [data, version, range, shape, stack, joinGap?.seconds, joinGap?.while, overlay?.data, overlay?.version, oShape])
 
   useLayoutEffect(() => {
     const el = host.current

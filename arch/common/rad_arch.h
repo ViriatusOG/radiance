@@ -228,7 +228,7 @@ inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const c
 }
 
 /* A selected architecture tap may use the build context's directory directly, rather than the
- * legacy process environment helper above. */
+ * process environment helper above. */
 inline bool calib_write_to(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
                            uint32_t domain, const char* dir) {
     if (!dir || !*dir || !b || k <= 0) return false;
@@ -379,6 +379,18 @@ private:
             return _s;                                                                      \
         }                                                                                   \
     } while (0)
+
+/* The status of a block whose declaration got no handle for the names in `what` (an op that
+ * resolves to no kernel is recorded and handed back null, an error only if the block issues it, so
+ * without this a missing kernel surfaces as a bare "invalid argument" at startup). The builder
+ * has said why in its own words; this names which handle did not come back, so that message reads
+ * against a line of the block. */
+inline int declare_refused(const char* block, std::initializer_list<const char*> what) {
+    std::string list;
+    for (const char* w : what) { if (!list.empty()) list += ", "; list += w; }
+    std::fprintf(stderr, "%s: the builder gave no handle for %s\n", block, list.c_str());
+    return RAD_E_INVAL;
+}
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in
@@ -552,6 +564,16 @@ inline int map_tap(RadBuilder* b, const char* declared, const char* src, int dim
     return rad_decl_name_map(b, &m);
 }
 
+/* The elementwise product of two checkpoint tensors of one shape (RAD_MAP_MUL): a gain shipped as
+ * two factors. */
+inline int map_mul(RadBuilder* b, const char* declared, const char* a, const char* c) {
+    RadNameMap m = map_base(declared, RAD_MAP_MUL);
+    m.n_src  = 2;
+    m.src[0] = a;
+    m.src[1] = c;
+    return rad_decl_name_map(b, &m);
+}
+
 /* An EMA codebook: the embedding sums over max(cluster usage, 1e-5), row by row (RAD_MAP_EMA). */
 inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const char* usage) {
     RadNameMap m = map_base(declared, RAD_MAP_EMA);
@@ -567,6 +589,14 @@ inline int map_copy(RadBuilder* b, const char* declared, const char* src) {
     m.n_src    = 1;
     m.src[0]   = src;
     return rad_decl_name_map(b, &m);
+}
+
+/* A checkpoint tensor copied through unchanged and declared replicated on every rank, in the
+ * movement group of layer `group`. Null when the copy or the declaration is refused. */
+inline rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
+                        std::initializer_list<int64_t> shape, int access, int group) {
+    if (map_copy(b, dn, src) < 0) return 0;
+    return decl_w(b, dn, dtype, shape, access, RAD_SHARD_NONE, grp_layer(group));
 }
 
 /* A copy with an alternative source; the first one the container holds wins. Expresses a tied
@@ -677,6 +707,89 @@ inline rad_op rw(RadBuilder* b, rad_op h,
     return h;
 }
 
+/* y = a + c over `rows` rows of `n`, at `dtype`. */
+inline rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, const char* dtype, rad_buf a,
+                     rad_buf c, rad_buf y) {
+    return rw(b, RAD_OP(b, "add",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                   RAD_STR("dtype", dtype)),
+                        RAD_NOWEIGHTS),
+              { a, c }, { y });
+}
+inline rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf a, rad_buf c, rad_buf y) {
+    return add_op(b, rows, n, "bf16", a, c, y);
+}
+
+/* An elementwise op `op` (silu, gelu, ...) of one input over `rows` rows of `n`, at `dtype`. */
+inline rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, const char* dtype,
+                    rad_buf in, rad_buf out) {
+    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                          RAD_STR("dtype", dtype)),
+                        RAD_NOWEIGHTS),
+              { in }, { out });
+}
+inline rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, rad_buf in,
+                    rad_buf out) {
+    return unary(b, op, rows, n, "bf16", in, out);
+}
+
+/* A dtype conversion (also a plain copy, from == to) of `rows` rows of `n`. */
+inline rad_op cast_op(RadBuilder* b, int64_t rows, int64_t n, const char* from, const char* to,
+                      rad_buf x, rad_buf y) {
+    return rw(b, RAD_OP(b, "cast",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                   RAD_STR("from", from), RAD_STR("to", to)),
+                        RAD_NOWEIGHTS),
+              { x }, { y });
+}
+
+/* The same op over several operands, bf16. */
+inline rad_op rows_op(RadBuilder* b, const char* op, int64_t rows, int64_t n,
+                      std::initializer_list<rad_buf> in, std::initializer_list<rad_buf> out) {
+    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                          RAD_STR("dtype", "bf16")),
+                        RAD_NOWEIGHTS),
+              in, out);
+}
+
+/* y = x * w (a per-channel weight of `n`) over `rows` rows, bf16. */
+inline rad_op mulw_op(RadBuilder* b, int64_t rows, int64_t n, rad_weight w, rad_buf x,
+                      rad_buf y) {
+    return rw(b, RAD_OP(b, "mul_weight",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                   RAD_STR("dtype", "bf16")),
+                        RAD_WEIGHTS(w)),
+              { x }, { y });
+}
+
+/* y = x * w^T over `rows` rows, bf16: `gemm_nt` of an [N, K] weight, and `gemm_nt_bias` with a
+ * bias vector added in the epilogue. */
+inline rad_op gemm_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w, rad_buf x,
+                      rad_buf y) {
+    return rw(b, RAD_OP(b, "gemm_nt",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                                   RAD_STR("dtype", "bf16")),
+                        RAD_WEIGHTS(w)),
+              { x }, { y });
+}
+inline rad_op gemm_bias_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
+                           rad_weight bias, rad_buf x, rad_buf y) {
+    return rw(b, RAD_OP(b, "gemm_nt_bias",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                                   RAD_STR("dtype", "bf16")),
+                        RAD_WEIGHTS(w, bias)),
+              { x }, { y });
+}
+
+/* y[i] = start + i * step over `rows` rows. */
+inline rad_op iota_op(RadBuilder* b, int64_t rows, int64_t start, int64_t step, rad_buf y) {
+    return rw(b, RAD_OP(b, "iota",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("start", start),
+                                   RAD_INT("step", step)),
+                        RAD_NOWEIGHTS),
+              {}, { y });
+}
+
 /* ---- A weight read into the on-die cache beside a collective (libr4d `prefetch`, docs/OPS.md).
  * At decode heights a GEMM streams its weight once from memory, and a collective in front of it
  * leaves the card's memory idle for its round trip. prefetch_beside issues `op`, a `prefetch` of
@@ -711,8 +824,9 @@ inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
  * none where the deployment turns the reads off (RadBuildCtx::weight_prefetch_off). */
 inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes, int64_t blocks = 0) {
     if (!w || bytes <= 0 || !rad_op_declared(b, "prefetch")) return 0;
-    /* `blocks`: the workgroups reading, where the architecture measured its own count (docs/OPS.md);
-     * 0 leaves the kernel's. Stated only when asked, so a declaration without it is what it was. */
+    /* `blocks`: the workgroups reading, where the architecture measured its own count
+     * (docs/OPS.md); 0 leaves the kernel's. Stated only when asked, so a declaration without it
+     * is what it was. */
     if (blocks > 0)
         return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes), RAD_INT("blocks", blocks)),
                       RAD_WEIGHTS(w));
@@ -741,7 +855,7 @@ struct Geom {
     int64_t n_head_all = 0;
     int64_t n_head_kv_all = 0;
     /* This rank's first row in the checkpoint's unsharded k/v projection, in container rows (the
-     * unit of a LinearFP8 span, passed as `span_lo`). Nonzero when KV heads are replicated over
+     * unit of a LinearQ span, passed as `span_lo`). Nonzero when KV heads are replicated over
      * ranks (world > n_head_kv_all) or under a smaller attention world; zero on a plain split. */
     int64_t kv_off   = 0;
     /* The attention world. When world neither divides nor is a multiple of the KV head count
@@ -805,14 +919,14 @@ struct Geom {
      * kv_store rows band on it verbatim. */
     const char* kv_dtype = "bf16";
     /* The linears are plain bf16 weights read by `gemm_nt`, in a model built from the fp8 blocks
-     * (rad_fp8.h): a dense bf16 checkpoint converted without a quantising recipe. Producers in
-     * front of a linear then quantise nothing, so an `ActFP8` is its bf16 plane alone. A model-wide
+     * (rad_linear.h): a dense bf16 checkpoint converted without a quantising recipe. Producers in
+     * front of a linear then quantise nothing, so an `ActQ` is its bf16 plane alone. A model-wide
      * setting because producers and consumers must agree; the plugin reads it off a trunk weight's
      * encoding and every linear checks its own against it. */
     bool    w_bf16 = false;
-    /* The linears are rotated int8 (rad_fp8.h's linear_is_w8h: IQ8R, or the 128-group form) with
+    /* The linears are rotated int8 (rad_linear.h's linear_is_w8h: IQ8R, or the 128-group form) with
      * one activation scale per `w_i8_group` columns, for a plugin whose producers are declared away
-     * from its probe: each then declares an int8 code pair (ActFP8::declare_pair). Model-wide as
+     * from its probe: each then declares an int8 code pair (ActQ::declare_pair). Model-wide as
      * w_bf16 is. */
     bool    w_i8h = false;
     int64_t w_i8_group = 128;
@@ -822,6 +936,42 @@ struct Geom {
     int64_t qkv_dim() const { return q_dim() + 2 * kv_dim(); }
     int64_t gqa()     const { return n_head_kv ? n_head / n_head_kv : 0; }
 };
+
+/* gemm_nt of a plain weight at the step height (`M` ranging 1..g.max_tok), read at g.dtype. */
+inline rad_op decl_gemm_nt(RadBuilder* b, const Geom& g, int64_t N, int64_t K, rad_weight w,
+                           rad_buf a, rad_buf y) {
+    return rw(b, RAD_OP(b, "gemm_nt",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_WEIGHTS(w)),
+              { a }, { y });
+}
+
+/* An int8 activation quantiser: bf16 `a` of `rows` rows of `K` into the codes `q8` and the f32
+ * scales `s8`. `op` is quant_act_i8 (one scale a row), quant_act_i8g (one a `group` columns) or
+ * had_quant_act_i8g (the same after a Hadamard rotation of each group). */
+inline rad_op decl_quant_act(RadBuilder* b, const char* op, int64_t rows, int64_t K, int group,
+                             rad_buf a, rad_buf q8, rad_buf s8) {
+    return rw(b, RAD_OP(b, op,
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", K),
+                                   RAD_INT("group", group), RAD_STR("dtype", "bf16")),
+                        RAD_NOWEIGHTS),
+              { a }, { q8, s8 });
+}
+
+/* gemm_nt_q of the weight planes (w, ws) against `in`, the activation operands (an int8 pair,
+ * or an f16 copy); `dtype` names the operand combination (w4a8, i8a8, w4a16_asym, ...) and
+ * `group` the columns a scale covers. */
+inline rad_op decl_gemm_q(RadBuilder* b, int64_t rows, int64_t N, int64_t K, int group,
+                          const char* dtype, rad_weight w, rad_weight ws,
+                          std::initializer_list<rad_buf> in, rad_buf y) {
+    return rw(b, RAD_OP(b, "gemm_nt_q",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
+                                   RAD_INT("group", group), RAD_STR("dtype", dtype)),
+                        RAD_WEIGHTS(w, ws)),
+              in, { y });
+}
+
 
 /* A linear of the bf16 blocks (rad_block_mlp.h, rad_block_attn_gated.h, rad_block_gdn.h): its
  * weight, declared at what the model holds, and the `gemm_nt` dtype that reads it. A `bf16x12`
@@ -847,6 +997,65 @@ inline LinearBF16 decl_linear_bf16(RadBuilder* b, const Geom& g, const char* nam
     return l;
 }
 
+/* ================================================================== all-reduce declarations */
+/* An in-place all-reduce of `x`, `rows` rows of `n` at `dtype`, over g.world ranks; `numel` ranges
+ * n .. rows * n. The wire is the serve's (--tp-wire): exact or lossy as g.wire_exact says, and
+ * g.wire_min_bytes the size below which a lossy wire is not used. The caller declares it only
+ * where the graph has a collective (world > 1). */
+inline rad_op decl_all_reduce(RadBuilder* b, const Geom& g, rad_buf x, int64_t n, int64_t rows,
+                              const char* dtype) {
+    return rw(b, RAD_OP(b, "all_reduce",
+                        RAD_PARAMS(RAD_INT("world_size", g.world),
+                                   RAD_RANGE("numel", n, rows * n),
+                                   RAD_STR("dtype", dtype), RAD_INT("exact", g.wire_exact),
+                                   RAD_INT("min_bytes", g.wire_min_bytes)),
+                        RAD_NOWEIGHTS),
+              { x }, { x });
+}
+
+/* ... a block's residual stream at the full step height, in the geometry's dtype. */
+inline rad_op decl_all_reduce(RadBuilder* b, const Geom& g, rad_buf x) {
+    return decl_all_reduce(b, g, x, g.n_embd, g.max_tok, g.dtype);
+}
+
+/* The same collective for a caller that issues it beside other work: at `overlap` 1 it gets the
+ * launch that holds fewer CUs while waiting on the link. */
+inline rad_op decl_all_reduce_overlap(RadBuilder* b, const Geom& g, rad_buf x, int64_t n,
+                                      int64_t rows, const char* dtype, int overlap) {
+    return rw(b, RAD_OP(b, "all_reduce",
+                        RAD_PARAMS(RAD_INT("world_size", g.world),
+                                   RAD_RANGE("numel", n, rows * n),
+                                   RAD_STR("dtype", dtype), RAD_INT("exact", g.wire_exact),
+                                   RAD_INT("min_bytes", g.wire_min_bytes),
+                                   RAD_INT("overlap", overlap)),
+                        RAD_NOWEIGHTS),
+              { x }, { x });
+}
+inline rad_op decl_all_reduce_overlap(RadBuilder* b, const Geom& g, rad_buf x, int overlap) {
+    return decl_all_reduce_overlap(b, g, x, g.n_embd, g.max_tok, g.dtype, overlap);
+}
+
+/* The collective after a tensor-parallel block of a bf16 model: no op (0) at one rank. */
+inline rad_op decl_all_reduce_tp(RadBuilder* b, const Geom& g, rad_buf x, int64_t rows) {
+    if (g.world <= 1) return 0;
+    return decl_all_reduce(b, g, x, g.n_embd, rows, "bf16");
+}
+
+/* A collective that is always exact, with no size threshold: the sum of disjoint rows (each
+ * token's row from one rank, zeros from the others), where a lossy wire would only add error. */
+inline rad_op decl_all_reduce_exact(RadBuilder* b, const Geom& g, rad_buf x, int64_t n,
+                                    int64_t rows, const char* dtype) {
+    return rw(b, RAD_OP(b, "all_reduce",
+                        RAD_PARAMS(RAD_INT("world_size", g.world),
+                                   RAD_RANGE("numel", n, rows * n),
+                                   RAD_STR("dtype", dtype), RAD_INT("exact", 1)),
+                        RAD_NOWEIGHTS),
+              { x }, { x });
+}
+inline rad_op decl_all_reduce_exact(RadBuilder* b, const Geom& g, rad_buf x) {
+    return decl_all_reduce_exact(b, g, x, g.n_embd, g.max_tok, g.dtype);
+}
+
 /* The KV cache dtype: RadBuildCtx::kv_dtype (--kv-cache-dtype), or `dflt` when it is
  * RAD_DT_INVALID (not given). Every architecture in this tree passes RAD_BF16 as the default. */
 static inline uint32_t rad_kv_cache_dtype(const RadBuildCtx* c, uint32_t dflt) {
@@ -869,7 +1078,7 @@ inline int divide_or_fail(int64_t v, int world, const char* what, int64_t* out) 
  * §13), so a ragged shard is free, while padding would need a fake token id masked everywhere.
  *
  * A vocabulary world divides keeps the even share. Otherwise each rank takes ceil(total / world)
- * rounded up to a 128-row block (RAD_FP8_BLOCK), the last rank short: a block-scaled fp8 lm_head
+ * rounded up to a 128-row block (RAD_SCALE_GROUP), the last rank short: a block-scaled fp8 lm_head
  * is stored in 128x128 tiles and a row span that cuts a tile is refused (rad_weight_shard_span).
  * Example: 248320 over 3 ranks gives 82816, 82816, 82688. core/engine.cpp restates this rule and
  * checks it against the declared width; keep the two in step. */
@@ -888,6 +1097,24 @@ inline int64_t shard_begin(int64_t total, int world, int rank) {
     const int64_t per = vocab_per_rank(total, world);
     const int64_t beg = per * rank;
     return beg < total ? beg : total;
+}
+
+/* A rank's contiguous slice of `n` units over `parts` ranks, the remainder going to the first
+ * ranks one unit each: [first, first + count). */
+struct Span {
+    int64_t first = 0, count = 0;
+};
+inline Span split_span(int64_t n, int parts, int rank) {
+    const int64_t base = n / parts, rem = n % parts;
+    return {base * rank + std::min<int64_t>(rank, rem), base + (rank < rem ? 1 : 0)};
+}
+
+/* The same split of a width, in whole 128-column scale groups (RAD_SCALE_GROUP): rank's columns
+ * [*lo, *hi). */
+inline void block_slice_128(int64_t width, int world, int rank, int64_t* lo, int64_t* hi) {
+    const Span s = split_span(width / 128, world, rank);
+    *lo = s.first * 128;
+    *hi = (s.first + s.count) * 128;
 }
 
 /* A container-header integer under its GGUF (`qwen35.ssm.state_size`) or HuggingFace
@@ -926,6 +1153,17 @@ inline const char* meta_text_gets(const RadModelMeta* m, const char* key, const 
     char k[192];
     return rad_meta_gets(m, meta_text_key(m, key, pre, k), dflt);
 }
+/* A boolean: a JSON boolean reaches the meta as 1/0 or as true/false, depending on the
+ * converter's path. */
+inline bool meta_text_getb(const RadModelMeta* m, const char* key, bool dflt,
+                           const char* pre = "") {
+    const char* s = meta_text_gets(m, key, nullptr, pre);
+    if (!s) return dflt;
+    if (!std::strcmp(s, "true") || !std::strcmp(s, "True")) return true;
+    if (!std::strcmp(s, "false") || !std::strcmp(s, "False") || !std::strcmp(s, "null"))
+        return false;
+    return std::atoll(s) != 0;
+}
 
 /* ================================================================== config arrays */
 /* Calls fn(token, length) for each token of a flattened config array until fn returns false.
@@ -934,7 +1172,9 @@ inline const char* meta_text_gets(const RadModelMeta* m, const char* key, const 
 template <class F>
 inline void for_each_token(const char* s, F&& fn) {
     if (!s) return;
-    auto sep = [](char ch) { return ch == ' ' || ch == ',' || ch == '[' || ch == ']' || ch == '"'; };
+    auto sep = [](char ch) {
+        return ch == ' ' || ch == ',' || ch == '[' || ch == ']' || ch == '"';
+    };
     for (const char* p = s; *p;) {
         while (*p && sep(*p)) ++p;
         if (!*p) return;
@@ -942,6 +1182,21 @@ inline void for_each_token(const char* s, F&& fn) {
         while (*p && !sep(*p)) ++p;
         if (!fn(t, (size_t)(p - t))) return;
     }
+}
+
+/* A numeric config array as doubles: the numbers of the flattened value (see for_each_token), any
+ * other character skipped. */
+inline std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
+    std::vector<double> v;
+    const char* s = rad_meta_gets(m, key, nullptr);
+    while (s && *s) {
+        char* e = nullptr;
+        const double x = std::strtod(s, &e);
+        if (e == s) { ++s; continue; }
+        v.push_back(x);
+        s = e;
+    }
+    return v;
 }
 
 inline bool token_is(const char* t, size_t n, const char* word) {
@@ -966,8 +1221,9 @@ inline int parse_layer_ids(const char* s, int64_t n_layer, int* out, int max) {
 
 /* A `layer_types` array as one flag per entry: 1 for any name in `one`, 0 for `zero`. Any other
  * name is refused, naming `arch`. */
-inline int parse_layer_kinds(const char* arch, const char* s, std::initializer_list<const char*> one,
-                             const char* zero, std::vector<int>* out) {
+inline int parse_layer_kinds(const char* arch, const char* s,
+                             std::initializer_list<const char*> one, const char* zero,
+                             std::vector<int>* out) {
     out->clear();
     int rc = RAD_OK;
     for_each_token(s, [&](const char* t, size_t n) {
@@ -1021,7 +1277,7 @@ inline int check_layer_schedule(const char* arch, const char* s, int64_t n_layer
 
 /* A rank's place in the remainder-first order. Head-sized work that does not divide evenly (the
  * extra delta-net head) goes first to attention-zero ranks, which pay only a fill for attention
- * (rad_block_attn_gated_fp8.h) and keep no attention cache, so the slowest rank is not also given
+ * (rad_block_attn_gated_q.h) and keep no attention cache, so the slowest rank is not also given
  * the extra head. An expert's extra block is not head-sized and stays on the rotation
  * (qwen4exp_fp8.cpp). Attention-zero ranks take places 0..n-1 regardless of `parity`; attention
  * ranks follow, rotated by `parity`. With no attention-zero rank the place is
@@ -1041,7 +1297,7 @@ inline int64_t remainder_place(const Geom& g, int rank, int parity) {
  *
  * `attn_world_ok`: the plugin's attention block supports a smaller attention world
  * (Geom::attn_world): it declares the attention-zero fill and zero KV group and spans projections
- * by `attn_rank`. Only rad_block_attn_gated_fp8.h does. Otherwise a world the KV head count
+ * by `attn_rank`. Only rad_block_attn_gated_q.h does. Otherwise a world the KV head count
  * neither divides nor is a multiple of is refused. */
 inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
                      const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false,
@@ -1082,9 +1338,9 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.dtype     = dtype;
     g.act_dtype = act_dtype;
     {
-        const char* sec = rad_meta_gets(m, "rope_parameters.mrope_section",
-                                        rad_meta_gets(m, "text_config.rope_parameters.mrope_section",
-                                                      ""));
+        const char* sec = rad_meta_gets(
+            m, "rope_parameters.mrope_section",
+            rad_meta_gets(m, "text_config.rope_parameters.mrope_section", ""));
         if (sec && *sec) {
             const bool inter =
                 rad_meta_geti(m, "rope_parameters.mrope_interleaved",
@@ -1460,15 +1716,19 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
     /* `truncate` is a JSON boolean; the converter writes 1 or 0, and true/false are accepted. */
     double truncate = 1.0;
     if (const char* t = rad_meta_gets(meta, (home + "truncate").c_str(), nullptr))
-        truncate = !std::strcmp(t, "true") ? 1.0 : !std::strcmp(t, "false") ? 0.0 : get("truncate", 1.0);
-    const double factor = get("factor", 0.0), original = get("original_max_position_embeddings", 0.0);
+        truncate = !std::strcmp(t, "true")    ? 1.0
+                   : !std::strcmp(t, "false") ? 0.0
+                                              : get("truncate", 1.0);
+    const double factor = get("factor", 0.0);
+    const double original = get("original_max_position_embeddings", 0.0);
     const double fast = get("beta_fast", 32.0), slow = get("beta_slow", 1.0);
-    const double magnitude = get("attention_factor", factor > 1.0 ? 1.0 + 0.1 * std::log(factor) : 1.0);
+    const double magnitude =
+        get("attention_factor", factor > 1.0 ? 1.0 + 0.1 * std::log(factor) : 1.0);
     if (!std::isfinite(factor) || factor < 1.0 || !std::isfinite(original) || original < 1.0 ||
         original != std::floor(original) || (truncate != 0.0 && truncate != 1.0) ||
         !std::isfinite(fast) || !std::isfinite(slow) || slow <= 0.0 || fast < slow ||
-        !std::isfinite(magnitude) || magnitude <= 0.0 || !std::isfinite(g.theta) || g.theta <= 1.0f ||
-        rot < 2 || (rot & 1)) {
+        !std::isfinite(magnitude) || magnitude <= 0.0 || !std::isfinite(g.theta) ||
+        g.theta <= 1.0f || rot < 2 || (rot & 1)) {
         fprintf(stderr, "radiance: %s YaRN (%s) needs a finite factor >= 1, an integral "
                         "original_max_position_embeddings > 0, beta_fast >= beta_slow > 0, "
                         "attention_factor > 0 and truncate true or false\n", who, home.c_str());
@@ -1528,7 +1788,7 @@ inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_de
     }
 }
 
-/* What a step's attention reads of the QSA selection (AttnGatedFP8::qsa_use), which decides what
+/* What a step's attention reads of the QSA selection (AttnGatedQ::qsa_use), which decides what
  * the indexer issues for the layer (QsaIndexer::step, docs/QSA.md "Below the bound"):
  *
  *   kQsaSelect  score and select, per layer: a step past the exactness bound, a streamed group,
@@ -1622,7 +1882,10 @@ inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, 
     dg = target;
     const char* pre = drafter_layer_prefix(meta);
     char key[160];
-    auto k = [&](const char* name) { std::snprintf(key, sizeof key, "%s%s", pre, name); return key; };
+    auto k = [&](const char* name) {
+        std::snprintf(key, sizeof key, "%s%s", pre, name);
+        return key;
+    };
     dg.n_layer       = rad_meta_geti(meta, k("num_hidden_layers"), 0);
     dg.head_dim      = rad_meta_geti(meta, k("head_dim"), 0);
     dg.n_head_all    = rad_meta_geti(meta, k("num_attention_heads"), 0);
@@ -1642,7 +1905,8 @@ inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, 
         return RAD_E_INVAL;
     }
     RAD_ARCH_TRY(yarn_from(dg, meta, pre, dg.head_dim));
-    RAD_ARCH_TRY(divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head));
+    RAD_ARCH_TRY(divide_or_fail(dg.n_head_all, dg.world, "draft num_attention_heads",
+                                &dg.n_head));
     /* The target's kv_off is the target's; the drafter's is set here or zero. */
     dg.kv_off = 0;
     if (kv_repl_ok && dg.world > dg.n_head_kv_all && dg.world % dg.n_head_kv_all == 0) {

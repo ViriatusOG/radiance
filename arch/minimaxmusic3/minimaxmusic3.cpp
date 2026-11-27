@@ -50,7 +50,7 @@
  * rank draws the same codes from the same logits and seeds, and plays the same samples.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
 #include <algorithm>
 #include <cctype>
@@ -102,13 +102,13 @@ enum : int {
 /* ================================================================== the networks */
 /* A Qwen3 layer over a paged cache: q, k and v as three projections (paged attention reads a
  * contiguous query), per-head RMS norms, NeoX rotary, an output projection and a SwiGLU. Every
- * linear is a LinearFP8, which reads bf16 or block fp8 as the container holds it. The depth
+ * linear is a LinearQ, which reads bf16 or block fp8 as the container holds it. The depth
  * decoder's layers are the same without the norms on q and k, the rotary or the cache. */
 struct LmLayer {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  q{}, k{}, v{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  q{}, k{}, v{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_n1 = 0, op_qn = 0, op_kn = 0, op_rq = 0, op_rk = 0, op_kv = 0, op_attn = 0;
     rad_op     op_attn_p = 0;   /* a prompt chunk: its own rows causally, its earlier ones cached */
     rad_op     op_ar1 = 0, op_add1 = 0, op_n2 = 0, op_ar2 = 0, op_add2 = 0;
@@ -119,8 +119,8 @@ struct LmLayer {
  * feed-forward. */
 struct DitLayer {
     rad_weight w_n1 = 0, w_b1 = 0, w_n2 = 0, w_b2 = 0, w_fi = 0, w_fib = 0, w_fo = 0, w_fob = 0;
-    LinearFP8  qkv{}, o{};
-    QuantFP8   q_h{}, q_attn{};
+    LinearQ  qkv{}, o{};
+    QuantAct   q_h{}, q_attn{};
     rad_op     op_ln1 = 0, op_rope = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_ln2 = 0, op_fi = 0, op_act = 0, op_fo = 0, op_ar2 = 0, op_add2 = 0;
 };
@@ -155,9 +155,9 @@ struct Model {
 
     /* ---- the language model */
     rad_weight w_tok = 0, w_norm = 0, w_head = 0;
-    rad_op  op_embed = 0, op_norm = 0, op_head = 0;
+    rad_op  op_embed = 0, op_norm = 0;
     rad_buf b_x = 0, b_q = 0, b_k = 0, b_v = 0, b_h2 = 0, b_gu = 0, b_last = 0;
-    ActFP8  a_h{}, a_attn{}, a_ffn{};
+    ActQ  a_h{}, a_attn{}, a_ffn{};
     std::vector<LmLayer> lm;
 
     /* ---- the frame: the lanes' last hidden states, the logits, the codes, the depth decoder */
@@ -168,14 +168,14 @@ struct Model {
     rad_buf b_idx = 0;            /* [8, S] i32: depth row e * 8 + p for each position p */
     rad_buf b_planes = 0;         /* [8 * S, n_embd]: the frame's eight conditioning planes */
     rad_op  op_hsel = 0, op_sem = 0, op_status = 0, op_iota[kCodes] = {};
-    rad_op  op_mix = 0, op_fb = 0, op_store = 0, op_plast = 0, op_pnorm = 0, op_pstore = 0;
+    rad_op  op_mix = 0, op_fb = 0, op_store = 0, op_plast = 0, op_pnorm = 0;
     rad_weight w_dproj = 0, w_dpos = 0, w_dnorm = 0, w_dheads = 0, w_demb = 0;
-    rad_op  op_dpos0 = 0, op_de1 = 0, op_dproj[kCodes] = {}, op_dscat = 0, op_dgather = 0;
+    rad_op  op_dproj[kCodes] = {}, op_dscat = 0, op_dgather = 0;
     rad_op  op_dnorm = 0, op_dhead = 0, op_dsamp[kCodes] = {}, op_demb[kCodes] = {};
     rad_buf b_dseq = 0, b_dx = 0, b_dq = 0, b_dk = 0, b_dv = 0, b_dh2 = 0, b_dgu = 0;
     rad_buf b_dsel = 0, b_drow = 0, b_dlog = 0, b_demb = 0, b_dcu = 0;
     rad_op  op_dcu = 0;
-    ActFP8  a_dh{}, a_dattn{}, a_dffn{};
+    ActQ  a_dh{}, a_dattn{}, a_dffn{};
     std::vector<LmLayer> dep;
     rad_buf b_mix = 0;            /* [lanes * kMaxFrames, n_embd] PERSIST */
     rad_weight w_mixl = 0, w_mixs = 0;
@@ -191,16 +191,16 @@ struct Model {
     rad_op  op_four = 0, op_t1 = 0, op_tsilu = 0, op_t2 = 0, op_hscat = 0, op_tscat = 0;
     rad_op  op_hgather = 0, op_pout = 0, op_post = 0;
     rad_buf b_din = 0, b_dpre = 0, b_hl = 0, b_tf = 0, b_te1 = 0, b_te1s = 0, b_temb = 0;
-    rad_buf b_h = 0, b_qkv = 0, b_ao = 0, b_th2 = 0, b_ff = 0, b_ffa = 0, b_ho = 0, b_po = 0;
+    rad_buf b_h = 0, b_qkv = 0, b_th2 = 0, b_ff = 0, b_ffa = 0, b_ho = 0, b_po = 0;
     rad_buf b_vel = 0;
-    ActFP8  a_th{}, a_tattn{};
+    ActQ  a_th{}, a_tattn{};
     std::vector<DitLayer> dit;
     int64_t C = 128, Dc = 2048;
 
     /* ---- the vocoder */
     VConv   v_in{}, v_conv{}, v_out{};
     rad_weight v_aout = 0;
-    rad_op  op_vsplit = 0, op_vsout = 0, op_vcu0 = 0, op_vcu_out = 0, op_vmix = 0;
+    rad_op  op_vsplit = 0, op_vsout = 0, op_vcu0 = 0, op_vmix = 0;
     VBlock  vb[4];
     int64_t v_ups[4] = { 8, 8, 4, 2 };
     rad_buf b_vx = 0, b_vin = 0, b_vout = 0;
@@ -220,52 +220,6 @@ static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_we
               { x }, { y });
 }
 
-static rad_op add_op(RadBuilder* b, int64_t rows, int64_t n, rad_buf a, rad_buf c, rad_buf y) {
-    return rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { a, c }, { y });
-}
-
-static rad_op ar_op(RadBuilder* b, const Geom& g, rad_buf x, int64_t rows) {
-    if (g.world <= 1) return 0;
-    return rw(b, RAD_OP(b, "all_reduce",
-                        RAD_PARAMS(RAD_INT("world_size", g.world),
-                                   RAD_RANGE("numel", g.n_embd, rows * g.n_embd),
-                                   RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
-                                   RAD_INT("min_bytes", g.wire_min_bytes)),
-                        RAD_NOWEIGHTS),
-              { x }, { x });
-}
-
-static rad_op gemm_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w, rad_buf x,
-                      rad_buf y) {
-    return rw(b, RAD_OP(b, "gemm_nt",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w)),
-              { x }, { y });
-}
-
-static rad_op gemm_bias_op(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
-                           rad_weight bias, rad_buf x, rad_buf y) {
-    return rw(b, RAD_OP(b, "gemm_nt_bias",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(w, bias)),
-              { x }, { y });
-}
-
-static rad_op rows_op(RadBuilder* b, const char* op, int64_t rows, int64_t n,
-                      std::initializer_list<rad_buf> in, std::initializer_list<rad_buf> out) {
-    return rw(b, RAD_OP(b, op,
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              in, out);
-}
-
 /* A plain weight copied from the checkpoint, declared at `dtype`. */
 static rad_weight wcopy(RadBuilder* b, Names& nm, const char* dn, const char* src, uint32_t dtype,
                         std::initializer_list<int64_t> shape, int group, int shard = RAD_SHARD_NONE,
@@ -279,9 +233,9 @@ static rad_weight wcopy(RadBuilder* b, Names& nm, const char* dn, const char* sr
 /* One Qwen3 layer's weights and ops over `rows` rows, `pre` the checkpoint's prefix. */
 static int declare_qwen3_layer(RadBuilder* b, Names& nm, const Geom& g, LmLayer& L, int li,
                                const char* dn, const char* pre, int group, int64_t rows,
-                               bool qk_norm, bool paged, rad_kvgroup kv, rad_buf x, ActFP8& ah,
-                               rad_buf bq, rad_buf bk, rad_buf bv, ActFP8& aattn, rad_buf h2,
-                               rad_buf gu, ActFP8& affn, const char* n1, const char* n2,
+                               bool qk_norm, bool paged, rad_kvgroup kv, rad_buf x, ActQ& ah,
+                               rad_buf bq, rad_buf bk, rad_buf bv, ActQ& aattn, rad_buf h2,
+                               rad_buf gu, ActQ& affn, const char* n1, const char* n2,
                                const char* qn, const char* kn, const char* qs, const char* ks,
                                const char* vs, const char* os, const char* gs, const char* us,
                                const char* ds, rad_buf x_in) {
@@ -360,7 +314,7 @@ static int declare_qwen3_layer(RadBuilder* b, Names& nm, const Geom& g, LmLayer&
     RAD_ARCH_TRY(L.o.declare(b, nm, g, nm.f("%s.%d.attn_output", dn, li), g.n_embd, q_dim,
                              RAD_SHARD_COL, grp_layer(group), { nm.ckpt("%s.%d.%s", pre, li, os) },
                              aattn, h2, rows));
-    L.op_ar1 = ar_op(b, g, h2, rows);
+    L.op_ar1 = decl_all_reduce_tp(b, g, h2, rows);
     L.op_add1 = add_op(b, rows, g.n_embd, x_in, h2, x);
     L.op_n2 = norm_op(b, rows, g.n_embd, g.eps, L.w_n2, x, ah.x);
     RAD_ARCH_TRY(L.q_h2.declare(b, g, ah, g.n_embd));
@@ -372,16 +326,16 @@ static int declare_qwen3_layer(RadBuilder* b, Names& nm, const Geom& g, LmLayer&
     RAD_ARCH_TRY(L.down.declare(b, nm, g, nm.f("%s.%d.ffn_down", dn, li), g.n_embd, g.n_ff,
                                 RAD_SHARD_COL, grp_layer(group), { nm.ckpt("%s.%d.%s", pre, li, ds) },
                                 affn, h2, rows));
-    L.op_ar2 = ar_op(b, g, h2, rows);
+    L.op_ar2 = decl_all_reduce_tp(b, g, h2, rows);
     L.op_add2 = add_op(b, rows, g.n_embd, x, h2, x);
     return RAD_OK;
 }
 
 static void step_qwen3_layer(RadCtx* c, const Model& m, const Geom& g, const LmLayer& L,
                              const RadBatch* batch, int64_t T, rad_buf x, rad_buf x_in,
-                             const ActFP8& ah, rad_buf bq, rad_buf bk, rad_buf bv,
-                             const ActFP8& aattn, rad_buf h2, rad_buf gu, const ActFP8& affn,
-                             const RadOperand& cu, int64_t n_seq) {
+                             const ActQ& ah, rad_buf bq, rad_buf bk, rad_buf bv,
+                             const ActQ& aattn, rad_buf h2, rad_buf gu, const ActQ& affn,
+                             const RadOperand& cu) {
     const int layer = (int)(&L - (L.op_kv ? m.lm.data() : m.dep.data()));
     RAD_ISSUE(c, L.op_n1, brows(x_in, T), RAD_W(L.w_n1), brows(ah.x, T));
     L.q_h.step(c, T);
@@ -416,7 +370,6 @@ static void step_qwen3_layer(RadCtx* c, const Model& m, const Geom& g, const LmL
     } else {
         RAD_ISSUE_N(c, L.op_attn, T, brows(bq, T), brows(bk, T), brows(bv, T), cu, brows(aattn.x, T));
     }
-    (void)n_seq;
     L.q_attn.step(c, T);
     L.o.step(c, aattn, h2, T);
     if (L.op_ar1) RAD_ISSUE_N(c, L.op_ar1, T * g.n_embd, brows(h2, T), RAD_NONE);
@@ -436,7 +389,7 @@ static int declare_lm(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx
     const int64_t T = g.max_tok;
     (void)meta;
     /* bf16 or block fp8, as the container holds the first projection: every linear of the three
-     * transformers follows it (rad_fp8.h, Geom::w_bf16). */
+     * transformers follows it (rad_linear.h, Geom::w_bf16). */
     m.lm.resize((size_t)g.n_layer);
     RAD_ARCH_TRY(m.lm[0].q.probe(b, nm, g, "lm.0.attn_q", { "model.layers.0.self_attn.q_proj.weight" }));
     RadEncoding e{};
@@ -735,11 +688,7 @@ static int declare_window(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                               RAD_WEIGHTS(m.w_cconv, m.w_cbias)),
                     { m.b_mix, m.b_ccu }, { m.b_cc });
     m.op_cres = rows_op(b, "resample_nearest", kWinLat, Dc, { m.b_cc }, { m.b_wcond });
-    m.op_cjoin = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kOverlap), RAD_INT("n", Dc),
-                                         RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                              RAD_NOWEIGHTS),
-                    { m.b_pcond }, { m.b_wcond });
+    m.op_cjoin = cast_op(b, (int64_t)kOverlap, Dc, "bf16", "bf16", m.b_pcond, m.b_wcond);
 
     /* ---- the window step's front: noise and overlap, the input rows, the projections */
     m.op_prep = rw(b, RAD_OP(b, "win_prep",
@@ -858,7 +807,7 @@ static int declare_window(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         RAD_ARCH_TRY(L.o.declare(b, nm, gt, nm.f("dit.%d.attn_output", li), H, q_dim, RAD_SHARD_COL,
                                  grp_layer(grp), { nm.ckpt("%s.%d.attn.to_out.0.weight", pre, li) },
                                  m.a_tattn, m.b_th2));
-        L.op_ar1 = ar_op(b, gt, m.b_th2, T);
+        L.op_ar1 = decl_all_reduce_tp(b, gt, m.b_th2, T);
         L.op_add1 = add_op(b, T, H, m.b_h, m.b_th2, m.b_h);
         L.op_ln2 = layernorm(L.w_n2, L.w_b2);
         /* The feed-forward's halves are [value | gate], each row-sharded as its own part, and its
@@ -880,7 +829,7 @@ static int declare_window(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                       { m.b_ff }, { m.b_ffa });
         L.op_fo = gt.rank == 0 ? gemm_bias_op(b, T, H, gt.n_ff, L.w_fo, L.w_fob, m.b_ffa, m.b_th2)
                                : gemm_op(b, T, H, gt.n_ff, L.w_fo, m.b_ffa, m.b_th2);
-        L.op_ar2 = ar_op(b, gt, m.b_th2, T);
+        L.op_ar2 = decl_all_reduce_tp(b, gt, m.b_th2, T);
         L.op_add2 = add_op(b, T, H, m.b_h, m.b_th2, m.b_h);
         if (!L.op_ln1 || !L.op_rope || !L.op_attn || !L.op_ln2 || !L.op_fi || !L.op_act || !L.op_fo)
             return RAD_E_INVAL;
@@ -1153,17 +1102,15 @@ static void step_lm(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1);
     for (const LmLayer& L : m.lm)
         step_qwen3_layer(c, m, g, L, batch, T, m.b_x, m.b_x, m.a_h, m.b_q, m.b_k, m.b_v, m.a_attn,
-                         m.b_h2, m.b_gu, m.a_ffn, cu, batch->n_seq);
+                         m.b_h2, m.b_gu, m.a_ffn, cu);
 }
 
 static void store_hidden(RadCtx* c, const Model& m, const RadAudioGenBatch* A, int64_t S,
                          const int32_t* last_rows, int64_t T) {
-    const int64_t D = m.gl.n_embd;
     RAD_ISSUE_N(c, m.op_plast, S, brows(m.b_x, T), praw(last_rows, RAD_I32, S), brows(m.b_dsel, S));
     RAD_ISSUE_N(c, m.op_pnorm, S, brows(m.b_dsel, S), RAD_W(m.w_norm), brows(m.b_last, S));
     RAD_ISSUE_N(c, m.op_store, S, brows(m.b_last, S), praw(A->slot, RAD_I32, S),
                 brows(m.b_hid, 2 * m.lanes));
-    (void)D;
 }
 
 static void step_prompt(RadCtx* c, const RadBatch* batch, const Model& m) {
@@ -1221,7 +1168,7 @@ static void step_frame(RadCtx* c, const RadBatch* batch, const Model& m) {
         for (const LmLayer& L : m.dep)
             step_qwen3_layer(c, m, m.gd, L, batch, R, m.b_dx, &L == &m.dep[0] ? m.b_dseq : m.b_dx,
                              m.a_dh, m.b_dq, m.b_dk, m.b_dv, m.a_dattn, m.b_dh2, m.b_dgu, m.a_dffn,
-                             cu8, S);
+                             cu8);
         RAD_ISSUE_N(c, m.op_dgather, S, brows(m.b_dx, R), idx_s(p), brows(m.b_dsel, S));
         RAD_ISSUE_N(c, m.op_dnorm, S, brows(m.b_dsel, S), RAD_W(m.w_dnorm), plane(p));
         RadOperand head = RAD_W(m.w_dheads);
@@ -1252,7 +1199,7 @@ static void step_frame(RadCtx* c, const RadBatch* batch, const Model& m) {
 static void step_window(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadAudioGenBatch* A = batch->agen_b;
     const int64_t S = batch->n_seq, R = batch->n_tok, NL = A->lat_rows;
-    const int64_t C = m.C, Dc = m.Dc, D = m.gl.n_embd, H = m.gt.n_embd;
+    const int64_t Dc = m.Dc, D = m.gl.n_embd, H = m.gt.n_embd;
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const RadOperand lcu = praw(A->lat_cu, RAD_I32, S + 1);
     const RadOperand wl = praw(A->win_lane, RAD_I32, S), pair = praw(A->pair, RAD_I32, S);
@@ -1332,12 +1279,11 @@ static void step_window(RadCtx* c, const RadBatch* batch, const Model& m) {
                 praw(A->seed, RAD_U32, 2 * S), lcu, RAD_NONE, RAD_NONE, brows(m.b_lat, LS), RAD_NONE);
     RAD_ISSUE_N(c, m.op_finish, NL, fl, pair, wl, lcu, brows(m.b_wcond, LS), brows(m.b_lat, LS),
                 brows(m.b_prev, LO), brows(m.b_pcond, LO));
-    (void)C;
 }
 
 static void step_vocode(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadAudioGenBatch* A = batch->agen_b;
-    const int64_t nl = A->voc_latents, half = m.C / 2;
+    const int64_t nl = A->voc_latents;
     int64_t rows[5];
     rows[0] = 2 * nl;
     for (int i = 0; i < 4; ++i) rows[i + 1] = rows[i] * m.v_ups[i];
@@ -1378,7 +1324,6 @@ static void step_vocode(RadCtx* c, const RadBatch* batch, const Model& m) {
     const int64_t n = (int64_t)(A->voc_latents - A->voc_left - A->voc_right) * kSamplesPerLatent;
     RAD_ISSUE_N(c, m.op_vmix, n, brow_slice(m.b_vout, off, n, 1), brow_slice(m.b_vout, L5 + off, n, 1),
                 brows(m.b_audio, n));
-    (void)half;
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {

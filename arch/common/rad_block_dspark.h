@@ -96,9 +96,9 @@
  *   what the recipe made them            fc, q/k/v/o, gate_up, down -- every linear
  *   bf16, no plane                       every norm, and both Markov codebooks
  *
- * The checkpoint is dense bf16; the linears are rad_fp8.h's DenseFP8 over weights the recipe
+ * The checkpoint is dense bf16; the linears are rad_linear.h's DenseQ over weights the recipe
  * quantises, because the drafter is read whole every decode step (324M parameters: 648 MB at
- * bf16, 324 MB at eight bits). DenseFP8 reads block fp8 or MXFP4 against E4M3 activations, or a
+ * bf16, 324 MB at eight bits). DenseQ reads block fp8 or MXFP4 against E4M3 activations, or a
  * rotated int8 form (IQ8R and the narrower grids under the same rotation) against int8 ones
  * (Config::act_i8); one format for all of them, since they share the activation pairs. This can
  * only change acceptance.
@@ -110,7 +110,7 @@
  *
  *   The q/k norms and ropes are four launches per layer where `qk_norm_rope` would be one. That
  *   op takes a fused [q|k] row; the query pass would need a [q_dim + kv_dim] buffer, a column-
- *   slice store and a contiguous q copy, as in rad_block_attn_fp8.h. Worth twenty launches a step.
+ *   slice store and a contiguous q copy, as in rad_block_attn_q.h. Worth twenty launches a step.
  *
  *   The all-reduce is not folded into the following norm (kArNone), so a TP2 query pass issues
  *   ten collectives. At 28 KiB per message for one sequence (under the lossy floor), a fold
@@ -120,7 +120,7 @@
 #define RAD_BLOCK_DSPARK_H
 
 #include "rad_arch.h"
-#include "rad_fp8.h"
+#include "rad_linear.h"
 
 namespace rad {
 namespace arch {
@@ -138,13 +138,13 @@ struct Dspark {
         int64_t top_k  = 0;     /* candidates the Markov walk re-ranks */
         int64_t window = 0;     /* sliding attention width, 0 for none */
         int     causal = 0;
-        /* The drafter's linears are served at i8a8h (DenseFP8::w8h: IQ8R, or a rotated int8 or
+        /* The drafter's linears are served at i8a8h (DenseQ::w8h: IQ8R, or a rotated int8 or
          * narrower form at group 128), learned by the plugin from `probe_i8` before it declares the
          * activation pairs: they are then int8 codes with one f32 scale per (row, act_g8), written
          * by had_quant_act_i8g and the rotating norm. Every linear must agree. `fc_mapped`:
          * probe_i8 made `dspark.fc.weight`'s name map. */
         bool    act_i8    = false;
-        int64_t act_g8    = RAD_FP8_BLOCK;
+        int64_t act_g8    = RAD_SCALE_GROUP;
         bool    fc_mapped = false;
         /* Every row predicts, so `block`, not `block - 1` (see ROW ALIGNMENT). */
         int64_t steps() const { return block; }
@@ -161,7 +161,7 @@ struct Dspark {
         rad_buf ck  = 0;   /* [max_tok, kv_dim]           one layer's K, reused across layers */
         rad_buf cv  = 0;   /* [max_tok, kv_dim]           one layer's V, reused across layers */
         /* The codes and scales the linears read: e4m3 | f32 [.., /128], or with Config::act_i8
-         * i8 | f32 [.., /act_g8]. The same holds for the three ActFP8 pairs below, whose `q` and
+         * i8 | f32 [.., /act_g8]. The same holds for the three ActQ pairs below, whose `q` and
          * `s` are then the int8 pair. */
         rad_buf srcq = 0, srcs = 0;
         rad_buf cq   = 0, cs   = 0;
@@ -169,15 +169,15 @@ struct Dspark {
         /* ---- the query pass, `block` rows per sequence */
         rad_buf x = 0;     /* [qrows, n_embd]  the drafter's residual stream */
         /* Normed input and the block's delta share one activation, as in the trunk
-         * (rad_block_attn_fp8.h): o_proj and down_proj write `h.x`, and the next norm folds it
+         * (rad_block_attn_q.h): o_proj and down_proj write `h.x`, and the next norm folds it
          * into the stream before norming, writing `h` again. */
-        ActFP8  h{};       /* [qrows, n_embd] */
+        ActQ  h{};       /* [qrows, n_embd] */
         rad_buf q = 0;     /* [qrows, q_dim] */
         rad_buf k = 0;     /* [qrows, kv_dim]   separate from v, see `ck` */
         rad_buf v = 0;     /* [qrows, kv_dim] */
-        ActFP8  attn{};    /* [qrows, q_dim] */
+        ActQ  attn{};    /* [qrows, q_dim] */
         rad_buf gate_up = 0; /* [qrows, 2 * n_ff] */
-        ActFP8  ffn{};     /* [qrows, n_ff] */
+        ActQ  ffn{};     /* [qrows, n_ff] */
 
         /* ---- the head and the Markov walk, one row per draft position */
         rad_buf sel_h = 0; /* [srows, n_embd]  the gathered final hidden states */
@@ -208,7 +208,7 @@ struct Dspark {
     rad_kvgroup kv = 0;
 
     /* ---- model-scope weights */
-    DenseFP8   w_fc{};
+    DenseQ   w_fc{};
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_mk1 = 0, w_mk2 = 0;         /* markov_w1 (pred), markov_w2 (succ) */
     rad_weight w_tok = 0;                    /* the target's embedding table */
@@ -218,9 +218,9 @@ struct Dspark {
      * block-scaled weight's layout follows its op's N, so k and v cannot be one weight issued a
      * half at a time. */
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
-    DenseFP8   w_q[MAX_LAYERS]{}, w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
+    DenseQ   w_q[MAX_LAYERS]{}, w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
     rad_weight w_qn[MAX_LAYERS] = {}, w_kn[MAX_LAYERS] = {};
-    DenseFP8   w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
+    DenseQ   w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
 
     /* ---- context-pass ops */
     rad_op op_qsrc = 0, op_cfc = 0, op_cnorm = 0, op_qc = 0, op_crope = 0, op_cstore = 0;
@@ -230,8 +230,8 @@ struct Dspark {
      * are per layer because a weight's prefetch interval and residency class come from the op
      * that declares it. */
     rad_op op_embed = 0, op_embed_ar = 0;
-    /* The fused norm / residual add / quantise, declared directly rather than via rad_fp8.h's
-     * NormQuantFP8: this block uses none of its fused-collective forms, and an array of the wrapper
+    /* The fused norm / residual add / quantise, declared directly rather than via rad_linear.h's
+     * NormQuant: this block uses none of its fused-collective forms, and an array of the wrapper
      * (which nests a Geom) makes g++ 16.1 ICE in build_vec_init when the plugin assigns
      * `m = Model{}`. */
     rad_op op_anorm[MAX_LAYERS] = {}, op_fnorm[MAX_LAYERS] = {}, op_outnorm = 0;
@@ -257,7 +257,7 @@ struct Dspark {
         RAD_ARCH_TRY(map_linear(b, fwn, { nm.ckpt("%s.fc.weight", ck) }));
         RadEncoding fe{};
         *i8 = weight_enc(b, fwn, &fe) && linear_is_w8h(fe);
-        *g8 = *i8 ? linear_w8h_group(fe) : (int64_t)RAD_FP8_BLOCK;
+        *g8 = *i8 ? linear_w8h_group(fe) : (int64_t)RAD_SCALE_GROUP;
         return RAD_OK;
     }
 
@@ -334,7 +334,7 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     w_mk2 = decl_w(b, nm.f("dspark.markov_w2"), RAD_BF16, {g.n_vocab_all, cfg.rank},
                    RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
 
-    /* The 2-bit draft head over the target's lm_head (as in rad_block_mtp_fp8.h):
+    /* The 2-bit draft head over the target's lm_head (as in rad_block_mtp_q.h):
      * `dspark.draft_head.weight` is that tensor under its own name, quantised by the recipe to u2
      * codes with an f16 scale and u8 zero per group of 128. One checkpoint tensor, two views.
      *
@@ -412,15 +412,15 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
 
     /* ---------------------------------------------------------------- the context pass
      *
-     * Every linear is a DenseFP8 GEMM over the pair its quantiser writes: `quant_act_fp8` codes
+     * Every linear is a DenseQ GEMM over the pair its quantiser writes: `quant_act_fp8` codes
      * for block fp8 or MXFP4, had_quant_act_i8g's at the weights' scale group for a rotated int8
      * drafter (cfg.act_i8). The linears read one activation pair, so they are all i8a8h forms at
      * one group or none is. There is no `fp8a16` band: that kernel is M <= 1, and neither pass
      * runs at one row. */
     const char* const qop = cfg.act_i8 ? "had_quant_act_i8g" : "quant_act_fp8";
-    const int64_t     qgr = cfg.act_i8 ? cfg.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    const int64_t     qgr = cfg.act_i8 ? cfg.act_g8 : (int64_t)RAD_SCALE_GROUP;
     {
-        auto fits = [&](const DenseFP8& d) {
+        auto fits = [&](const DenseQ& d) {
             return d.w8h == cfg.act_i8 && (!d.w8h || d.g8 == cfg.act_g8);
         };
         bool same = fits(w_fc);
@@ -498,15 +498,10 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * each row comes from one rank and the others add zero, so a lossy wire would only lose
      * precision. */
     if (g.world > 1)
-        op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                            RAD_PARAMS(RAD_INT("world_size", g.world),
-                                       RAD_RANGE("numel", g.n_embd, qrows * g.n_embd),
-                                       RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                            RAD_NOWEIGHTS),
-                        {w.x}, {w.x});
+        op_embed_ar = decl_all_reduce_exact(b, g, w.x, g.n_embd, qrows, g.dtype);
 
-    /* Norm, residual add and quantise are one op, `rmsnorm_quant_fp8` (what rad_fp8.h's
-     * NormQuantFP8 wraps), or its rotating int8 twin `rmsnorm_had_quant_i8g` for a rotated int8
+    /* Norm, residual add and quantise are one op, `rmsnorm_quant_fp8` (what rad_linear.h's
+     * NormQuant wraps), or its rotating int8 twin `rmsnorm_had_quant_i8g` for a rotated int8
      * drafter, which takes the same operands. Layer 0 has no delta to fold, each later norm folds the previous
      * block's delta, and op_outnorm folds the last into the final norm, so there is no `add` op.
      * The final norm's fp8 output is unused (the head runs its own i8 quantiser), a few KiB of
@@ -567,7 +562,7 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         if (!op_fnorm[i]) return RAD_E_INVAL;
         op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.h.q, w.h.s}, {w.gate_up});
         /* The fold is an fp8a8 tile, so any other gate_up takes the pair. */
-        if (!w_gu[i].mx && !w_gu[i].m2x && !w_gu[i].w8h)
+        if (!w_gu[i].mx && !w_gu[i].w8h)
             op_gug[i] = decl_gated_fold(b, qrows, 2 * g.n_ff, g.n_embd, w_gu[i].w, w_gu[i].s,
                                         {w.h.q, w.h.s}, {w.ffn.q, w.ffn.s}, &gated_rows);
         op_dn[i] = w_dn[i].gemm(b, qrows, g.n_embd, g.n_ff, {w.ffn.q, w.ffn.s}, {w.h.x});
@@ -607,13 +602,7 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     /* One collective, issued after both the out and the down projection (same shape, same buffer).
      * Exact or lossy per the deployment, as for the trunk. */
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                      RAD_PARAMS(RAD_INT("world_size", g.world),
-                                 RAD_RANGE("numel", g.n_embd, qrows * g.n_embd),
-                                 RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                 RAD_INT("min_bytes", g.wire_min_bytes)),
-                      RAD_NOWEIGHTS),
-                  {w.h.x}, {w.h.x});
+        op_ar = decl_all_reduce(b, g, w.h.x, g.n_embd, qrows, g.dtype);
     op_outnorm = decl_norm(w_norm, true);
     if (!op_outnorm) return RAD_E_INVAL;
 
@@ -632,12 +621,8 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                  RAD_INT("group", DS_W2_GROUP), RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.sel_h}, {w.dq, w.ds, w.dsum});
-    op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                       RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                                  RAD_INT("K", g.n_embd), RAD_INT("group", DS_W2_GROUP),
-                                  RAD_STR("dtype", "w2a8")),
-                       RAD_WEIGHTS(w_dh, w_dhs)),
-                   {w.dq, w.ds, w.dsum}, {w.dlog});
+    op_dlogits = decl_gemm_q(b, srows, head_rows(g), g.n_embd, DS_W2_GROUP, "w2a8", w_dh, w_dhs,
+                             { w.dq, w.ds, w.dsum }, w.dlog);
     /* Sharded, the top-R runs over this rank's plane, reports global ids and also writes the pair
      * plane the gather moves. Replicated, `vocab_off` is omitted: an optional parameter present
      * with value 0 is a different declaration from an absent one. */

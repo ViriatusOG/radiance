@@ -30,10 +30,7 @@ namespace {
 /* An empty directory of its own under the test's temporary directory. */
 struct TempDir {
     std::string path;
-    TempDir() {
-        std::string t = radtest::tmp_path("dir.XXXXXX");
-        path = mkdtemp(t.data()) ? t : "";
-    }
+    TempDir() : path(radtest::make_tmp_dir("dir")) {}
     void touch(const std::string& name) const {
         if (FILE* f = std::fopen((path + "/" + name).c_str(), "w")) std::fclose(f);
     }
@@ -71,7 +68,6 @@ TEST(a_missing_model_file_is_not_sent_to_the_hub) {
 
 TEST(a_path_that_exists_is_never_a_repo) {
     TempDir t;
-    CHECK(!t.path.empty());
     const std::string cwd = fs::current_path().string();
     CHECK_EQ(chdir(t.path.c_str()), 0);
     fs::create_directories("owner/name");
@@ -206,7 +202,6 @@ TEST(a_restart_serves_the_complete_copy_when_the_hub_cannot_be_reached) {
     NEED_ARTIFACT(hfget_beside_this_binary());
     if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
     TempDir root;
-    REQUIRE(!root.path.empty());
     const std::string repo = "radiance-test-owner/radiance-test-model";
     const std::string dest = root.path + "/" + repo;
     fs::create_directories(dest);
@@ -266,7 +261,6 @@ TEST(a_pth_that_is_not_the_weights_again_is_fetched_beside_the_safetensors) {
     NEED_ARTIFACT(hfget_beside_this_binary());
     if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
     TempDir root;
-    REQUIRE(!root.path.empty());
     FakeCurl curl(kCodecRepo);
     const std::string cmd = "sh '" + hfget_beside_this_binary() +
                             "' radiance-test-owner/radiance-test-model '" + root.path +
@@ -293,7 +287,6 @@ TEST(a_listing_naming_a_path_outside_the_destination_is_refused) {
     NEED_ARTIFACT(hfget_beside_this_binary());
     if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
     TempDir root;
-    REQUIRE(!root.path.empty());
     FakeCurl curl(kEscapeListing);
     const std::string cmd = "sh '" + hfget_beside_this_binary() +
                             "' radiance-test-owner/radiance-test-model '" + root.path +
@@ -327,7 +320,6 @@ TEST(a_listing_name_that_curl_would_truncate_is_refused_whole) {
     NEED_ARTIFACT(hfget_beside_this_binary());
     if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
     TempDir root;
-    REQUIRE(!root.path.empty());
     FakeCurl curl(kFragmentListing);
     const std::string cmd = "sh '" + hfget_beside_this_binary() +
                             "' radiance-test-owner/radiance-test-model '" + root.path +
@@ -345,7 +337,6 @@ TEST(a_listing_name_that_curl_would_truncate_is_refused_whole) {
 TEST(the_child_screen_refuses_trailing_dotdot_and_curl_terminator_names) {
     NEED_ARTIFACT(hfget_beside_this_binary());
     TempDir root;
-    REQUIRE(!root.path.empty());
     for (const char* name : {"model.bin#x", "model.bin?y", "sub/.."}) {
         const std::string cmd =
             "HFGET_CHILD=1 HFGET_DEST='" + root.path + "' sh '" + hfget_beside_this_binary() +
@@ -394,7 +385,6 @@ TEST(an_lfs_file_that_does_not_hash_to_its_oid_is_not_kept) {
     if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
     if (!on_path("sha256sum")) SKIP("no sha256sum on PATH, which hfget.sh needs");
     TempDir root;
-    REQUIRE(!root.path.empty());
     const std::string fetch = "sh '" + hfget_beside_this_binary() +
                               "' radiance-test-owner/radiance-test-model '" + root.path +
                               "' >/dev/null 2>'" + root.path + "/err'";
@@ -442,7 +432,6 @@ TEST(the_pinned_revision_is_the_revision_fetched) {
     NEED_ARTIFACT(hfget_beside_this_binary());
     if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
     TempDir root;
-    REQUIRE(!root.path.empty());
     FakeCurl curl(kPinnedOnly);
     const std::string repo = "radiance-test-owner/radiance-test-model";
     auto resolve = [&](const char* rev, std::string* model) {

@@ -33,7 +33,7 @@
 #ifndef RAD_BLOCK_HC_H
 #define RAD_BLOCK_HC_H
 
-#include "rad_fp8.h"
+#include "rad_linear.h"
 
 namespace rad {
 namespace arch {
@@ -78,11 +78,11 @@ struct HyperConn {
          * input buffer, so this saves a launch. */
         int     reduce  = 0;
         /* Whether the read also emits Hadamard-rotated codes of the block input, for a consumer
-         * whose weight carries the rotation (MoeFP8's rotated expert plane). Produced in the
+         * whose weight carries the rotation (MoeQ's rotated expert plane). Produced in the
          * plain codes' finisher, so requires `quant`; the consumer declares no quantiser. */
         int     rotate  = 0;
         /* Whether the plain codes are int8 (q8/s8) rather than E4M3 (q/s), for int8 trunk linears
-         * (LinearFP8::i8). The rotated codes take the same dtype (had_quant_act_i8g's beside int8,
+         * (LinearQ::i8). The rotated codes take the same dtype (had_quant_act_i8g's beside int8,
          * had_quant_act_fp8's beside E4M3), so `Wire::rq` is declared to match. */
         int     codes_i8 = 0;
         /* The most rows one read is declared for, 0 for max_tok; a wider step reads in pieces
@@ -94,7 +94,7 @@ struct HyperConn {
 
     struct Wire {
         rad_buf h   = 0;    /* [max_tok, hc * n_embd]  the wide stream, updated in place */
-        ActFP8  x{};        /* [max_tok, n_embd]       the block input; q/s unused if !quant */
+        ActQ  x{};        /* [max_tok, n_embd]       the block input; q/s unused if !quant */
         rad_buf inj = 0;    /* [max_tok, hc]           the per-branch write gains */
         rad_buf rq  = 0;    /* [max_tok, n_embd]       the rotated codes, when `rotate` */
         rad_buf rs  = 0;    /* [max_tok, n_embd/128]   and their scales */
@@ -116,7 +116,7 @@ struct HyperConn {
      * `mix`), read from their encoding at declare. */
     bool       mix_e4m3 = false;
     rad_op     op_read = 0, op_write = 0;
-    /* The block input's own int8 pair is the rotated one (ActFP8::q8_rot, a trunk stored rotated):
+    /* The block input's own int8 pair is the rotated one (ActQ::q8_rot, a trunk stored rotated):
      * the read writes its rotated codes there and its plain ones into `pq` / `ps`, a pair of this
      * connection's that nothing reads. */
     bool       xrot = false;
@@ -211,14 +211,14 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
     }
     if (c.quant && (c.codes_i8 ? (!w.x.q8 || !w.x.s8) : (!w.x.q || !w.x.s))) return RAD_E_INVAL;
     /* A trunk whose int8 linears are stored rotated reads the rotated codes alone: `x`'s int8 pair
-     * is then that pair (ActFP8::q8_rot), and every reader of the block input -- the trunk's
+     * is then that pair (ActQ::q8_rot), and every reader of the block input -- the trunk's
      * projections and the rotated experts -- takes it. The read derives the rotated codes in its
      * plain codes' finisher, so the plain ones still have somewhere to go: a pair of this
      * connection's own that nothing reads. */
     xrot = c.quant && c.codes_i8 && w.x.q8_rot;
     if (xrot && c.rotate) {
         fprintf(stderr, "radiance: %s: the block input's own codes are the rotated ones "
-                        "(ActFP8::q8_rot), so there is no second rotated pair to ask for\n", name);
+                        "(ActQ::q8_rot), so there is no second rotated pair to ask for\n", name);
         return RAD_E_INVAL;
     }
     if (c.rotate && (!c.quant || !w.rq || !w.rs)) {
@@ -278,8 +278,8 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
     if (c.inject) wr[n_wr++] = w.inj;
     if (xrot) {
         pq = decl_b(b, nm.f("%s.plain.q8", name), RAD_I8, { g.max_tok, g.n_embd });
-        ps = decl_b(b, nm.f("%s.plain.s8", name), RAD_F32, { g.max_tok, fp8_blocks(g.n_embd) });
-        if (!pq || !ps || w.x.g8 != RAD_FP8_BLOCK) return RAD_E_INVAL;
+        ps = decl_b(b, nm.f("%s.plain.s8", name), RAD_F32, { g.max_tok, scale_groups(g.n_embd) });
+        if (!pq || !ps || w.x.g8 != RAD_SCALE_GROUP) return RAD_E_INVAL;
         wr[n_wr++] = pq;     wr[n_wr++] = ps;
         wr[n_wr++] = w.x.q8; wr[n_wr++] = w.x.s8;
     } else {
@@ -294,7 +294,7 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                              RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
                              RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
                              RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
-                             RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                             RAD_INT("group", c.quant ? RAD_SCALE_GROUP : 0),
                              RAD_INT("rotate", (c.rotate || xrot) ? 1 : 0),
                              RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16")),
                   wts, n_wts);
@@ -397,11 +397,11 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                 c.quant  ? brow_slice(xrot ? pq : c.codes_i8 ? w.x.q8 : w.x.q, r0, rows,
                                       g.n_embd) : RAD_NONE,
                 c.quant  ? brow_slice(xrot ? ps : c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
-                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                                      scale_groups(g.n_embd)) : RAD_NONE,
                 (c.rotate || xrot) ? brow_slice(xrot ? w.x.q8 : w.rq, r0, rows, g.n_embd)
                                    : RAD_NONE,
                 (c.rotate || xrot) ? brow_slice(xrot ? w.x.s8 : w.rs, r0, rows,
-                                                fp8_blocks(g.n_embd)) : RAD_NONE);
+                                                scale_groups(g.n_embd)) : RAD_NONE);
 }
 
 /* ================================================================== the control-vector projection

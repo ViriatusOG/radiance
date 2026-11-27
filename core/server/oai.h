@@ -48,6 +48,9 @@ ApiError err_forbidden(const std::string& why);
 ApiError err_not_implemented(const std::string& what);
 ApiError err_overloaded(const std::string& why);
 ApiError err_internal(const std::string& why);
+/* The refusal for a failed gen_lora_acquire: a bad request, 404 for an unknown adapter, 503 for
+ * any other failure. */
+ApiError err_lora_acquire(int status, const std::string& why);
 
 /* DRY's sequence breakers when a request names none: the deployment's when it set any (`set`, even
  * to an empty list), otherwise llama.cpp's four (newline, colon, quote, asterisk). */
@@ -115,7 +118,10 @@ struct OaiRequest {
      * name ("<namespace>__<name>") to its namespace and name, which a function_call item reports
      * apart. Empty for the other shapes. */
     std::map<std::string, std::pair<std::string, std::string>> tool_namespace;
-    /* llama-server's native /completion: the generated token ids beside the text. */
+    /* The generated token ids beside the text: llama-server's `return_tokens` on its native
+     * /completion, and `return_tokens` or vLLM's `return_token_ids` on the OpenAI endpoints,
+     * where each choice carries them as `token_ids` (a stream chunk, the ids since the last
+     * chunk). */
     bool            return_tokens = false;
     /* The reasoning block's closer when the reply starts inside the block, else "": the stop
      * strings then apply only after it (IDetokenizer::defer_stops_until). */
@@ -172,6 +178,11 @@ struct OaiRequest {
     int  n_choices() const { return (int)prompts.size() * n; }
 };
 
+/* The most questions one System One or Mica request may carry. Each question is a prompt of its
+ * own (the whole shared state again), so the count bounds what one request can allocate before
+ * it is admitted. Clef's own limit is the same number (RAD_CLEF_MAX_QUESTIONS). */
+constexpr size_t kMaxDecisionQuestions = 64;
+
 /* What the server needs to know about itself to validate a request. */
 struct OaiLimits {
     std::string model_id = "radiance";
@@ -205,6 +216,15 @@ struct OaiLimits {
      * or nothing was probed. A refused effort is answered with this set instead of the
      * template's traceback (template_refusal). */
     std::vector<std::string> reasoning_efforts;
+
+    /* Which of "none" and "minimal" the template takes as `reasoning_effort` levels of its own
+     * (probe_off_efforts). The server reads the two words as enable_thinking = false, which is how
+     * most templates turn thinking off; a template that never reads enable_thinking and has the
+     * words on its own ladder (Inkling 2's maps none to 0 and minimal to 0.1) would otherwise
+     * render its default level for a caller who asked for none. A word listed here goes to the
+     * template as the effort and leaves enable_thinking alone. Empty for every template that
+     * reads enable_thinking, which renders as it always has. */
+    std::vector<std::string> template_off_efforts;
 
     /* --reasoning-effort-map: a request's effort word replaced by the deployment's before the
      * template sees it, e.g. OpenAI's "high" to a template's "xhigh". */
@@ -258,10 +278,31 @@ RequestThinking request_thinking(const json& b);
 void apply_template_defaults(const json& b, const OaiLimits& lim, ChatRenderOptions* opt);
 
 /* --reasoning-effort-map, applied to the effort chat_template_kwargs put in `opt`: a mapped word
- * replaces it, and one mapped to "none" or "minimal" turns thinking off instead. The chat endpoint
- * maps the top-level `reasoning_effort` itself; this handles the kwargs spelling for it and for
+ * replaces it, and one mapped to "none" or "minimal" turns thinking off instead, unless the
+ * template takes that word itself (OaiLimits::template_off_efforts). The chat endpoint maps the
+ * top-level `reasoning_effort` itself; this handles the kwargs spelling for it and for
  * /tokenize. */
 void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt);
+
+/* Which of "none" and "minimal" this template wants as `reasoning_effort` rather than as
+ * enable_thinking = false, found by rendering a one-message chat: a template whose render
+ * enable_thinking = false leaves untouched does not read it, and a word it then accepts with a
+ * different render is a level on its own ladder. Anything else (the switch changes the render,
+ * the word is refused, or it changes nothing) leaves the word to enable_thinking, so a template
+ * that reads the switch is never probed into another behaviour. No model is named: the template
+ * answers. */
+std::vector<std::string> probe_off_efforts(const IChatTemplate& chat);
+
+/* An off word ("none" or "minimal") onto a render: the template's own level when it takes the
+ * word, enable_thinking = false otherwise. A `reasoning_effort` already in the kwargs is kept
+ * unless `replace`. Shared with `radiance diagnose`, which renders the deployment's default
+ * without a server. */
+void apply_off_effort(const std::vector<std::string>& template_off, const std::string& word,
+                      bool replace, ChatRenderOptions* opt);
+
+/* What "none" and "minimal" do on this deployment, as a clause for the startup log and for the
+ * 400 that lists the levels: they turn thinking off, or are the template's own levels. */
+std::string off_efforts_note(const std::vector<std::string>& template_off);
 
 /* The 400 for a template that refused a render. An effort outside OaiLimits::reasoning_efforts is
  * reported against `reasoning_effort` with the set in `supported`, as OpenAI reports an
@@ -298,6 +339,12 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
  * token ids mixed as one prompt, as llama-server reads it. */
 int parse_completion_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err, bool native = false);
+/* The checks of a chat or completion request that need no model: the body is a JSON object, its
+ * fields are served (vet_keys), and the sampling and stream fields parse. A fleet runs it before it
+ * waits for a parked or cold model to load, so a request the model would refuse is answered with
+ * the same 4xx whether or not the model is resident, and does not wake it. The model's own limits
+ * (n, stops, the context) are not applied here; its server applies them when it parses. */
+int precheck_request(const std::string& body, Endpoint ep, bool native, ApiError* err);
 /* A media part's bytes out of a data: URL; any other URL is refused, never fetched. */
 int decode_media_url(const std::string& url, const std::string& field,
                      std::vector<uint8_t>* out, ApiError* err);
@@ -348,6 +395,7 @@ struct ChoiceOut {
     ParsedMessage msg;           /* chat: content / reasoning / tool_calls after parsing */
     Finish        finish = Finish::None;
     std::vector<LogprobEntry> logprobs;
+    std::vector<int32_t> tokens; /* the generated ids, with OaiRequest::return_tokens */
 };
 
 struct UsageOut {
@@ -489,6 +537,9 @@ public:
     /* Logprobs entries (logprobs_content's elements) for the next chunk written, for the shapes
      * that carry them; the others drop them. */
     virtual void add_logprobs(const std::string&) {}
+    /* Generated token ids for the next chunk written (`token_ids`, OaiRequest::return_tokens),
+     * for the shapes that carry them; the others drop them. */
+    virtual void add_token_ids(const int32_t*, size_t) {}
 
 protected:
     /* The bytes for the increments one push completed. Each emitter folds every increment into
@@ -550,11 +601,14 @@ public:
     /* OpenAI's `logprobs.content` on the next chunk out. Entries wait for a chunk because a
      * push may complete no delta (a tool call's opening, a held-back byte). */
     void add_logprobs(const std::string& elems) override;
+    /* `token_ids` on the next chunk out; they wait for a chunk as the logprobs do. */
+    void add_token_ids(const int32_t* ids, size_t n) override;
 
 private:
     std::string emit(const std::vector<ReplyDelta>& ev) override;
     std::string chunk(json delta, const char* finish_reason, const TimingsOut* t = nullptr);
     std::string lp_;       /* pending logprobs entries, comma-joined */
+    std::string ids_;      /* pending token ids, comma-joined */
 
     /* Delta chunks are written, not built: the frame around the delta object is serialised once
      * and the delta written with json_quote_append. The bytes match what chunk() writes. */
@@ -666,8 +720,19 @@ int         parse_request_object(const std::string& body, const OaiLimits& lim, 
 int64_t     json_value_budget(int64_t max_ctx);
 constexpr int kJsonMaxDepth = 1024;
 
+/* A string member of `o`, or `def` when it is absent, null or of another type (where later
+ * validation checks the type; json::value() would throw). */
+std::string str_or(const json& o, const char* k, const std::string& def = std::string());
+
+/* Whether a body's `model`, when it has one, is the one model this endpoint serves; a 400 naming
+ * `model_id` otherwise. */
+bool names_loaded_model(const json& b, const std::string& model_id, ApiError* err);
+
 std::string random_id(const char* prefix);
 int64_t     unix_now();
+/* `s` with every occurrence of `from` replaced by `to`; text a replacement brings in is not
+ * scanned again. */
+std::string replace_all(std::string s, const std::string& from, const std::string& to);
 
 }  /* namespace server */
 }  /* namespace rad */

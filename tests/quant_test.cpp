@@ -238,7 +238,6 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
                 h[(size_t)(i * C + j)] += x[(size_t)(t * C + i)] * x[(size_t)(t * C + j)];
 
     const TempDir td("rad_quant_test");
-    REQUIRE(!td.path.empty());
     const char* dir = td.path.c_str();
     const std::string path = std::string(dir) + "/gram.r0.blk.3.ffn_down_exps.bin";
     REQUIRE(write_gram(path, C, T, h));
@@ -288,7 +287,6 @@ TEST(w6nl_gptq_and_coordinate_descent_accept_bf16_domain_hessians) {
     std::vector<float> h((size_t)(C * C), (float)T * 0.25f);
     for (int64_t i = 0; i < C; ++i) h[(size_t)(i * C + i)] += (float)T;
     const TempDir td("rad_w6nl_gptq");
-    REQUIRE(!td.path.empty());
     REQUIRE(write_gram(td.path + "/gram.r0.blk.3.ffn_down_exps.bin", C, T, h));
     Opts o;
     o.s("table", "w6nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32")
@@ -367,7 +365,6 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
     std::string dir = __FILE__;
     dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
     const TempDir calib("rad_quant_recipes");
-    REQUIRE(!calib.path.empty());
     const char* old = std::getenv("CALIB");
     const std::string saved = old ? old : "";
     const char* old_mtp = std::getenv("MTP_CALIB");
@@ -545,7 +542,6 @@ TEST(gptq_chooses_the_codes_of_textbook_gptq) {
             for (int64_t j = 0; j < K; ++j) h[(size_t)(i * K + j)] += xr[i] * xr[j];
     }
     const TempDir td("rad_quant_gptq");
-    REQUIRE(!td.path.empty());
     REQUIRE(write_gram(td.path + "/gram.r0.blk.4.ffn_up.bin", K, T, h));
     const char* name = "blk.4.ffn_up.weight";
 
@@ -1242,10 +1238,7 @@ TEST(a_grid_the_options_do_not_describe_is_refused) {
 TEST(a_quantisers_own_scheme_decodes_through_its_hook_and_only_while_it_is_loaded) {
     const std::string so = home() + "/testquant/radtest_quant.so";
     struct stat st {};
-    if (stat(so.c_str(), &st) != 0) {
-        std::fprintf(stderr, "  SKIP no %s\n", so.c_str());
-        return;
-    }
+    if (stat(so.c_str(), &st) != 0) ARTIFACT_MISSING(so);
     const int64_t R = 8, C = 64;
     const std::vector<float> w = draw(R * C, 7, 4.0f);
     Quantised q;

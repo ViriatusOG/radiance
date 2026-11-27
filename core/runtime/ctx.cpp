@@ -34,6 +34,10 @@ int Ctx::init(const CtxDesc& d) {
     arch_step_ = d.arch_step;
     arch_pass_key_ = d.arch_pass_key;
     profiling_ = d.profile_ops;
+    /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
+     * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
+    row_prefetch_on_ = d.row_prefetch;
+    rowpf_.reserve(4096);
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -70,6 +74,8 @@ void Ctx::shutdown() {
         fatal("refusing to free a runtime context whose compute streams did not drain");
     oracle_close();
     xp_close();
+    row_prefetch_done();
+    rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
@@ -367,6 +373,7 @@ int Ctx::bind_ops() {
         }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
+        p.row_gather = row_gather_op(oi.op);
         p.collective = p.billed;
         p.lora_site  = oi.lora_site;
         p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
@@ -954,6 +961,11 @@ void Ctx::dump_profile() const {
         waited += wait;
     }
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
+    if (rowpf_calls_)
+        fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
+                        "page(s) ahead of their kernel, %lld of them beside it "
+                        "(runtime/rowprefetch.h; --row-prefetch off turns it off)\n\n",
+                (long long)rowpf_calls_, (long long)rowpf_pages_, (long long)rowpf_beside_calls_);
 }
 
 /* ================================================================== the step driver */
@@ -1007,8 +1019,9 @@ int Ctx::lane_join(int from, int to) {
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
+ * `vl_mask`: an image span is never recorded.
  */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 496,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 504,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1017,7 +1030,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some (and the second attention over a run read both
      * ways, n_bidi, only on such a pass). */
-    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
+    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0 || b->vl_mask) return 0;
     /* A plugin with no pass-key callback cannot key a launch that splits its KV by the live
      * context, so a prefill or mixed pass of a program holding such a launcher is not recorded.
      * Its decode, verify and draft passes are: their launches get the keyed context bound in
@@ -1106,6 +1119,38 @@ void Ctx::tape_drop(PassTape& t) {
     t.dev = nullptr;
 }
 
+/* The kernel library's card-to-card count (Ctx::LinkTraffic). */
+namespace { std::atomic<Ctx::TrafficFn> g_traffic_fn{nullptr}; }
+void Ctx::set_traffic_source(TrafficFn fn) { g_traffic_fn.store(fn, std::memory_order_relaxed); }
+
+/* This rank's row of the library's count, as it stands. False when the library keeps none. */
+bool Ctx::traffic_lib(LinkTraffic* out) const {
+    *out = LinkTraffic{};
+    const TrafficFn fn = g_traffic_fn.load(std::memory_order_relaxed);
+    if (!fn) return false;
+    long long to[kTrafficRanks] = {}, routes[2 * kTrafficRoutes] = {}, unc = 0;
+    if (fn(rank_, to, kTrafficRanks, routes, kTrafficRoutes, &unc) <= 0) return false;
+    for (int i = 0; i < kTrafficRanks; ++i) out->to[i] = to[i];
+    for (int i = 0; i < kTrafficRoutes; ++i) {
+        out->route_calls[i] = routes[2 * i];
+        out->route_bytes[i] = routes[2 * i + 1];
+    }
+    out->uncounted = unc;
+    out->present = true;
+    return true;
+}
+
+Ctx::LinkTraffic Ctx::traffic() const {
+    LinkTraffic t;
+    if (!traffic_lib(&t)) return t;
+    for (int i = 0; i < kTrafficRanks; ++i) t.to[i] += tr_to_[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kTrafficRoutes; ++i) {
+        t.route_calls[i] += tr_calls_[i].load(std::memory_order_relaxed);
+        t.route_bytes[i] += tr_bytes_[i].load(std::memory_order_relaxed);
+    }
+    return t;
+}
+
 /* Issues the pass for real, through the architecture, recording it. Returns 1 when `out` holds a
  * tape, 0 when the pass ran but cannot be recorded. */
 int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
@@ -1113,6 +1158,8 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->key = key;
     if (tape_begin() < 0) { arch_step_(this, b); return 0; }
     const int64_t i0 = n_issues_, c0 = ar_calls_.load(), y0 = ar_bytes_.load();
+    LinkTraffic tr0;
+    const bool tr = traffic_lib(&tr0);
     rec_ = out;
     rec_mark_ = 0;
     haz_ops_.clear();
@@ -1133,11 +1180,20 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->issues = n_issues_ - i0;
     out->ar_calls = ar_calls_.load() - c0;
     out->ar_bytes = ar_bytes_.load() - y0;
+    if (LinkTraffic tr1; tr && traffic_lib(&tr1)) {
+        out->traffic.present = true;
+        for (int i = 0; i < kTrafficRanks; ++i) out->traffic.to[i] = tr1.to[i] - tr0.to[i];
+        for (int i = 0; i < kTrafficRoutes; ++i) {
+            out->traffic.route_calls[i] = tr1.route_calls[i] - tr0.route_calls[i];
+            out->traffic.route_bytes[i] = tr1.route_bytes[i] - tr0.route_bytes[i];
+        }
+    }
     out->touch_pending[0] = host_touch_pending_[0];
     out->touch_pending[1] = host_touch_pending_[1];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
-    if (haz_mark(*out) < 0) {
+    const int hm = haz_mark(*out);
+    if (hm < 0) {
         tape_destroy(t);
         out->dev = nullptr;
         return 0;
@@ -1204,7 +1260,9 @@ int Ctx::haz_mark(PassTape& t) {
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
-        if (kind != 0) { q->infl.clear(); q->opaque = true; q->run = 0; continue; }
+        if (kind != 0) {
+            q->infl.clear(); q->opaque = true; q->run = 0; continue;
+        }
         ++t.dispatches;
 
         const int32_t op = first_of[(size_t)i];
@@ -1325,7 +1383,9 @@ int Ctx::play_pass(PassTape& t) {
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;
+                if (th.rp.n) row_prefetch_run(th.rp, th.t, th.n);
                 rc = th.launch(&th.args, cur_stream());
+                row_prefetch_done();
                 rad_dev_host_wrote();
             }
             lane_ = l0;
@@ -1369,6 +1429,14 @@ int Ctx::play_pass(PassTape& t) {
     n_issues_ += t.issues;
     ar_calls_.fetch_add(t.ar_calls, std::memory_order_relaxed);
     ar_bytes_.fetch_add(t.ar_bytes, std::memory_order_relaxed);
+    if (t.traffic.present) {
+        for (int i = 0; i < kTrafficRanks; ++i)
+            if (t.traffic.to[i]) tr_to_[i].fetch_add(t.traffic.to[i], std::memory_order_relaxed);
+        for (int i = 0; i < kTrafficRoutes; ++i) {
+            if (t.traffic.route_calls[i]) tr_calls_[i].fetch_add(t.traffic.route_calls[i], std::memory_order_relaxed);
+            if (t.traffic.route_bytes[i]) tr_bytes_[i].fetch_add(t.traffic.route_bytes[i], std::memory_order_relaxed);
+        }
+    }
     host_touch_pending_[0] = t.touch_pending[0];
     host_touch_pending_[1] = t.touch_pending[1];
     scratch_open_[0] = t.scratch_open[0];

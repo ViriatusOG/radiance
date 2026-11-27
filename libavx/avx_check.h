@@ -16,8 +16,8 @@ struct Check {
     const Lib* lib = nullptr;
     /* The library under test is libavx and is held to libavx's contract: every op libref
      * implements (avx_check.cpp lists those not yet implemented), and the file-backed gather of
-     * embed_lookup_q with its init. Any other host library is checked op for op against libref, and what it does not
-     * implement is reported rather than failed. */
+     * embed_lookup_q with its init. Any other host library is checked op for op against libref,
+     * and what it does not implement is reported rather than failed. */
     bool own = false;
     /* Team size of the parallel rerun (avx_par_force), or 0 for none. */
     int threads = 0;

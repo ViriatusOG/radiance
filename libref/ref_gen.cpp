@@ -205,7 +205,8 @@ int ref_rms_mod(const RadArgs* a, RadStream) {
         std::vector<float> o((size_t)n);
         int64_t e = seq_of(cu, n_seq, r);
         if (cm) e = (int64_t)ldt(cm, e);
-        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, z->dtype, o.data(), wadd, once, layer, none);
+        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, z->dtype, o.data(), wadd, once, layer,
+                    none);
         const int64_t zb = rowoff(z, r, n), zs = laststride(z);
         for (int64_t i = 0; i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
     }
@@ -357,7 +358,8 @@ int ref_randn_lanes(const RadArgs* a, RadStream) {
         const int64_t L = ld_int(lane->dtype, lane->data, offlin(lane, e));
         const int64_t len = cu_at(cu, e + 1) - cu_at(cu, e);
         if (L < 0 || len > stride || (L + 1) * stride > dst_rows) return RAD_E_SHAPE;
-        const uint64_t sd = (uint64_t)(uint32_t)ld_int(seed->dtype, seed->data, offlin(seed, 2 * e)) |
+        const uint64_t sd = (uint64_t)(uint32_t)ld_int(seed->dtype, seed->data,
+            offlin(seed, 2 * e)) |
                             ((uint64_t)(uint32_t)ld_int(seed->dtype, seed->data, offlin(seed, 2 * e + 1)) << 32);
         REF_PAR_FOR(len * n * 8)
         for (int64_t k = 0; k < len; ++k) {
@@ -405,7 +407,8 @@ int ref_flow_euler(const RadArgs* a, RadStream) {
         const float s  = ldt(sg, offlin(sg, e)), sn = ldt(sgn, offlin(sgn, e));
         const float w  = ldt(cfg, offlin(cfg, e));
         const int64_t f = ld_int(fl->dtype, fl->data, offlin(fl, e));
-        const uint64_t sd = (uint64_t)(uint32_t)ld_int(seed->dtype, seed->data, offlin(seed, 2 * e)) |
+        const uint64_t sd = (uint64_t)(uint32_t)ld_int(seed->dtype, seed->data,
+            offlin(seed, 2 * e)) |
                             ((uint64_t)(uint32_t)ld_int(seed->dtype, seed->data, offlin(seed, 2 * e + 1)) << 32);
         const float dts = round_dt(dt, sn - s);
         if ((f & kInpaint) && (!inp || !mask)) return RAD_E_INVAL;
@@ -639,7 +642,8 @@ int ref_kd_input(const RadArgs* a, RadStream) {
             const int64_t yb = rowoff(y, b0 + k, n), ys = laststride(y);
             const int64_t pb = pr >= 0 ? rowoff(y, p0 + k, n) : 0;
             for (int64_t c = 0; c < n; ++c) {
-                if (first) stt(st, sb + c * ss, rad_philox_normal(sd, (uint64_t)(k * n + c)) * init);
+                if (first)
+                    stt(st, sb + c * ss, rad_philox_normal(sd, (uint64_t)(k * n + c)) * init);
                 const float v = ldt(st, sb + c * ss) * cin;
                 stt(y, yb + c * ys, v);
                 if (pr >= 0) stt(y, pb + c * ys, v);
@@ -656,9 +660,9 @@ int ref_kd_input(const RadArgs* a, RadStream) {
  *
  * then by the entry's sampler: 0 Euler, x + (sigma_next - sigma)(x - D) / sigma; 1 Euler ancestral
  * (eta 1): the step to sigma_down plus sigma_up times the seed's stream 1 + step; 2 DPM++ 2M:
- * (sigma_next / sigma) x - expm1(-h) D', D' blending D with the lane's last estimate after the first
- * step, and D itself at sigma_next 0. Flag 4 writes D to the preview; every step leaves D in
- * `hist` for the next. */
+ * (sigma_next / sigma) x - expm1(-h) D', D' blending D with the lane's last estimate after the
+ * first step, and D itself at sigma_next 0. Flag 4 writes D to the preview; every step leaves D
+ * in `hist` for the next. */
 int ref_kd_step(const RadArgs* a, RadStream) {
     if (!have(a, 14)) return RAD_E_INVAL;
     const RadTensor *O = &a->t[0], *sg = &a->t[1], *sgn = &a->t[2], *sgp = &a->t[3];
@@ -720,7 +724,8 @@ int ref_kd_step(const RadArgs* a, RadStream) {
                 if (f & kPreview)
                     stt(pv, rowoff(pv, L * stride + k, n) + c * laststride(pv), D);
                 const float nz = sm == kSamplerEulerAncestral && K.sn > 0.0f
-                                     ? rad_philox_normal_s(sd, stream, (uint64_t)(k * n + c)) : 0.0f;
+                                     ? rad_philox_normal_s(sd, stream, (uint64_t)(k * n + c))
+                                         : 0.0f;
                 stt(st, sb + c * ss, kd_next(K, sm, x, D, ldt(hs, hb + c * hss), nz));
                 stt(hs, hb + c * hss, D);
             }
@@ -953,7 +958,8 @@ int ref_s2d_avg_add(const RadArgs* a, RadStream) {
                 float acc = 0.0f;
                 for (int64_t gg = 0; gg < gs; ++gg) {
                     const int64_t g = o * gs + gg;
-                    const int64_t c = g / F, rem = g % F, t = rem / 4, i = (rem % 4) / 2, j = rem % 2;
+                    const int64_t c = g / F, rem = g % F, t = rem / 4, i = (rem % 4) / 2,
+                        j = rem % 2;
                     if (ft == 2 && t == 0) continue;
                     acc += ldt(x, (2 * oy + i) * xr + (2 * ox + j) * cin + c);
                 }
@@ -1053,7 +1059,8 @@ int ref_scatter_add_rows(const RadArgs* a, RadStream) {
         if (r < 0) continue;
         const int64_t vb = rowoff(v, m, n), vs = laststride(v);
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
-        for (int64_t i = 0; i < n; ++i) stt(x, xb + i * xs, ldt(x, xb + i * xs) + ldt(v, vb + i * vs));
+        for (int64_t i = 0; i < n; ++i)
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + ldt(v, vb + i * vs));
     }
     return RAD_OK;
 }
@@ -1084,9 +1091,11 @@ int ref_attn_prefix_self(const RadArgs* a, RadStream) {
     /* The paged prefix (cache, block table, per-sequence prefix lengths), all three or none: with
      * none every sequence's prefix is empty. */
     const RadTensor *kv = t_in(a, 3), *bt = t_in(a, 4), *su = t_in(a, 5);
-    if ((kv == nullptr) != (bt == nullptr) || (kv == nullptr) != (su == nullptr)) return RAD_E_INVAL;
+    if ((kv == nullptr) != (bt == nullptr) || (kv == nullptr) != (su == nullptr))
+        return RAD_E_INVAL;
     const RadTensor *kdes = t_in(a, 7), *vdes = t_in(a, 8);
-    /* The int8 Q.K form: own keys' codes and scales are given; everything else is quantised here. */
+    /* The int8 Q.K form: own keys' codes and scales are given; everything else is quantised
+     * here. */
     const RadTensor *k8 = t_in(a, 9), *ks = t_in(a, 10);
     const char* qk = p_str(a, "qk", "bf16");
     const bool i8 = std::strcmp(qk, "i8") == 0;
@@ -1123,9 +1132,12 @@ int ref_attn_prefix_self(const RadArgs* a, RadStream) {
     const int64_t bt_cs = bt && bt->rank >= 2 ? bt->stride[1] : 1;
     /* Every prefix key must have a block-table entry. */
     for (int64_t s = 0; su && s < n_seq; ++s)
-        if (ld_int(su->dtype, su->data, offlin(su, s)) > max_blocks * block_size) return RAD_E_SHAPE;
-    const int64_t q_rs = row_stride(q, q_heads * head_dim), k_rs = row_stride(k, kv_heads * head_dim);
-    const int64_t v_rs = row_stride(v, kv_heads * head_dim), o_rs = row_stride(o, q_heads * head_dim);
+        if (ld_int(su->dtype, su->data, offlin(su, s)) > max_blocks * block_size)
+            return RAD_E_SHAPE;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim),
+        k_rs = row_stride(k, kv_heads * head_dim);
+    const int64_t v_rs = row_stride(v, kv_heads * head_dim),
+        o_rs = row_stride(o, q_heads * head_dim);
     const int64_t k8_rs = i8 ? row_stride(k8, kv_heads * head_dim) : 0;
     const int64_t ks_rs = i8 ? row_stride(ks, kv_heads) : 0;
     const int64_t sb = kv ? kv->stride[0] : 0, sh = kv ? kv->stride[1] : 0;

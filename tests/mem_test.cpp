@@ -1822,7 +1822,7 @@ TEST(kv_preemption_by_recompute_and_the_undeadlockable_request) {
     std::vector<uint64_t> victims = { hog, 1 };
     std::vector<uint64_t> preempted;
     CHECK_OK(f.kv.make_room(newcomer, per, victims, &preempted));
-    CHECK(!preempted.empty());
+    REQUIRE(!preempted.empty());
     /* seq_tokens() == 0 means "needs re-prefill" (see KVManager::preempt). */
     CHECK_EQ(f.kv.seq_tokens(preempted[0]), 0ll);
     CHECK(f.kv.block_table(preempted[0], G_FULL).empty());
@@ -1882,9 +1882,10 @@ TEST(kv_window_snapshot_rows_and_seed) {
     kv.free_sequence(2);
 }
 
-/* A window is snapshotted only where a hit resumes from it: the trunk's window, with or without
- * linear state beside it. A drafter's window is recomputed by draft refill, so a window section
- * there would be copied and never read. */
+/* A window is snapshotted where a hit resumes from it: the trunk's window, with or without linear
+ * state beside it. A drafter's window rides along only where the engine says so
+ * (set_drafter_window_snapshot); otherwise draft refill recomputes it and a window section there
+ * would be copied and never read. */
 TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
     KVGroupInfo w = paged_group("swa", RAD_KV_WINDOW, 2, 16, { 6 }, 64);
     const Config cfg = small_config();
@@ -1929,7 +1930,32 @@ TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
         REQUIRE(d && d->win_snap && d->drafter);
         CHECK_EQ(kv.checkpoint_bytes(), d->window_blocks * d->bytes_per_block);
     }
-    {   /* beside linear state the flag changes nothing: a hit there re-prefills the window */
+    /* Linear state + a trunk window + a drafter window (Inkling 2 with its DFlash2 drafter). The
+     * drafter's window rides in the slot exactly where the engine asks for it
+     * (--checkpoint-draft-window): KVManager applies no linear-state rule of its own. */
+    for (const bool on : { false, true }) {
+        std::vector<KVGroupInfo> g = hybrid_groups();
+        g.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 6 }, 64));   /* the trunk's window */
+        KVGroupInfo dw = paged_group("dswa", RAD_KV_WINDOW, 2, 16, { 7 }, 64);
+        dw.drafter = true;
+        g.push_back(dw);
+        Pools p;
+        CHECK_OK(configure_pools(p, cfg));
+        KVManager kv;
+        kv.set_drafter_window_snapshot(on);
+        CHECK_OK(kv.configure(g, cfg, p.kv()));
+        CHECK(kv.has_window_snapshot());
+        CHECK_EQ(kv.drafter_window_snapshot(), on);
+        const KVGroupPlan* tp = kv.plan(3);
+        const KVGroupPlan* dp = kv.plan(4);
+        REQUIRE(tp && tp->win_snap && !tp->drafter);
+        REQUIRE(dp && dp->drafter);
+        CHECK_EQ(dp->win_snap, on);
+        CHECK_EQ(kv.checkpoint_bytes(),
+                 16384ll + tp->window_blocks * tp->bytes_per_block +
+                     (on ? dp->window_blocks * dp->bytes_per_block : 0ll));
+    }
+    {   /* beside linear state and no trunk window, the flag alone gives a drafter-only snapshot */
         std::vector<KVGroupInfo> g = hybrid_groups();
         w.drafter = true;
         g.push_back(w);
@@ -1938,8 +1964,8 @@ TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
         KVManager kv;
         kv.set_drafter_window_snapshot(true);
         CHECK_OK(kv.configure(g, cfg, p.kv()));
-        CHECK(!kv.has_window_snapshot());
-        CHECK(!kv.drafter_window_snapshot());
+        CHECK(kv.has_window_snapshot());
+        CHECK(kv.drafter_window_snapshot());
     }
 }
 
@@ -2468,13 +2494,13 @@ TEST(tip_only_keeps_a_snapshot_below_the_drafter_floor) {
     std::vector<int64_t> keep;
     KeepTipOnly bare;
     bare.select({64, 128, 192, 256}, &keep);
-    CHECK_EQ(keep.size(), (size_t)1);
+    REQUIRE_EQ(keep.size(), (size_t)1);
     CHECK_EQ(keep[0], 256ll);
 
     KeepTipOnly floored;
     floored.set_floor(100);
     floored.select({64, 128, 192, 256}, &keep);
-    CHECK_EQ(keep.size(), (size_t)2);
+    REQUIRE_EQ(keep.size(), (size_t)2);
     CHECK_EQ(keep[0], 128ll);                 /* the deepest at or below 256 - 100 */
     CHECK_EQ(keep[1], 256ll);
     floored.select({200, 256}, &keep);        /* nothing below the floor: the tip alone */
@@ -2502,7 +2528,7 @@ TEST(a_refill_capped_hit_after_tip_only_retention_still_gives_the_drafter_its_wi
     int32_t s = -1;
     CHECK_OK(f.pc.reserve_checkpoint(2, 64, ho[3], &s));
     const std::vector<int64_t> left = f.pc.checkpoints(1);
-    CHECK_EQ(left.size(), (size_t)2);
+    REQUIRE_EQ(left.size(), (size_t)2);
     CHECK_EQ(left[0], 128ll);
     CHECK_EQ(left[1], 256ll);
 
@@ -4368,7 +4394,7 @@ TEST(the_session_view_says_what_a_return_reuses_and_what_is_off_the_card) {
 
     IdleTiers::Occupancy occ;
     std::vector<IdleTiers::SessionInfo> s = t.sessions(&occ);
-    CHECK_EQ(s.size(), 2u);
+    REQUIRE_EQ(s.size(), 2u);
     CHECK_EQ(s[0].resume_tokens, 0);             /* no snapshot: nothing reused */
     CHECK_EQ(occ.host_bytes, 0);
     CHECK_EQ(occ.host_cap_bytes, 2048);
@@ -5639,11 +5665,8 @@ static void run_transfer(const TransferCase& tc) {
     else unsetenv("RADIANCE_DEBUG_TIER_VERIFY");
     /* Host backend only: the stand-in kernels copy rows on the CPU, where host-backend "device"
      * memory lives; on a card the staging buffer is VRAM and production kernels apply. */
-    if (!device_is_host()) {
-        std::printf("  SKIP  the tier transfer needs the host backend (%s here)\n",
-                    device_backend_name());
-        return;
-    }
+    if (!device_is_host())
+        SKIP("the tier transfer needs the host backend (%s here)", device_backend_name());
     Registry reg;
     REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
     CHECK_OK(reg.check_complete());
@@ -5859,8 +5882,7 @@ TEST(tier_verify_catches_a_follower_whose_replicated_group_differs) {
  * zero or did not declare replicated has no one window every rank can read, so bringup stops. */
 TEST(a_group_replicated_on_one_rank_only_is_refused_by_the_slot_layout) {
     if (!device_is_host()) {
-        std::printf("  SKIP  the tier layout fixture needs the host backend\n");
-        return;
+        SKIP("the tier layout fixture needs the host backend");
     }
     for (int bad : { 0, 1 }) {
         std::vector<std::unique_ptr<Fixture>> fx;
@@ -6339,9 +6361,8 @@ TEST(a_handed_out_state_slot_is_named_for_clearing_once_per_copy) {
     /* Zeroing the named slots, as the engine does (layer_bytes_per_state at state_ptr for every
      * layer), touches no other slot of either group. */
     if (!device_is_host()) {
-        std::printf("  SKIP  the state bytes are read on the host backend only (%s here)\n",
-                    device_backend_name());
-        return;
+        SKIP("the state bytes are read on the host backend only (%s here)",
+             device_backend_name());
     }
     f.kv.clear_state_clears();
     CHECK_OK(f.kv.preempt(1));
@@ -6833,8 +6854,8 @@ static std::vector<int32_t> slots_of(const KVManager& kv, uint64_t seq) {
 
 static bool host_backend_or_skip(const char* what) {
     if (device_is_host()) return true;
-    std::printf("  SKIP  %s reads pool bytes on the host backend only (%s here)\n", what,
-                device_backend_name());
+    radtest::skip("%s reads pool bytes on the host backend only (%s here)", what,
+                  device_backend_name());
     return false;
 }
 
@@ -7533,6 +7554,39 @@ TEST(gpu_memory_mib_is_the_inverse_of_gpu_headroom_mib) {
         CHECK_EQ(c.gpu_headroom_mib, 96ll);
         CHECK_EQ(c.vram_kv_mib, 300ll);
     }
+}
+
+/* A fleet with one TP model still bypasses the load broker. Its card override must reach the
+ * ordinary budget, or the desktop card will settle near the global 96 MiB reserve. */
+TEST(a_single_model_fleet_reserves_the_named_card_headroom) {
+    constexpr int64_t MiB = 1 << 20;
+    Config c = derive_config();
+    c.devices = { 0, 1 };
+    c.card_headroom_mib[1] = 1536;
+    VramBudget b;
+    CHECK_OK(vram_budget_trial(c, { hand_facts(false), hand_facts(false) }, &b));
+    CHECK_EQ(b.headroom, 1536 * MiB);
+    CHECK_EQ(b.claimable, 13656 * MiB);
+    CHECK_EQ(vram_budget_rank_spare_mib(c, { hand_facts(false), hand_facts(false) }, 0), 1440ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(c, { hand_facts(false), hand_facts(false) }, 1), 0ll);
+
+    Config global = c;
+    global.card_headroom_mib.clear();
+    global.gpu_headroom_mib = 1536;
+    VramBudget all;
+    CHECK_OK(vram_budget_trial(global, { hand_facts(false), hand_facts(false) }, &all));
+    CHECK_EQ(b.claimable, all.claimable);
+    CHECK_EQ(vram_budget_rank_spare_mib(global, { hand_facts(false), hand_facts(false) }, 0), 0ll);
+    CHECK_EQ(vram_budget_headroom_mib(c, 0), 96ll);
+    CHECK_EQ(vram_budget_headroom_mib(c, 1), 1536ll);
+
+    /* A broker grant has already left each card's reserve outside the claim. */
+    Config broker = c;
+    broker.vram_claim = 12000 * MiB;
+    VramBudget claimed;
+    CHECK_OK(vram_budget_trial(broker, { hand_facts(false), hand_facts(false) }, &claimed));
+    CHECK_EQ(claimed.headroom, 0ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(broker, { hand_facts(false), hand_facts(false) }, 0), 0ll);
 }
 
 /* Over random cards and programs the split either refuses by name or hands out no more than the

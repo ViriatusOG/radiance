@@ -82,17 +82,6 @@ const char* bld_buf_kind_name(int k) {
     }
 }
 
-const char* bld_kv_kind_name(int k) {
-    switch (k) {
-        case RAD_KV_FULL:   return "full";
-        case RAD_KV_WINDOW: return "window";
-        case RAD_KV_LINEAR: return "linear";
-        case RAD_KV_CONV:   return "conv";
-        case RAD_KV_RING:   return "ring";
-        default:            return "?";
-    }
-}
-
 static int64_t decl_numel(uint32_t rank, const int64_t* shape) {
     if (rank == 0 || rank > RAD_MAX_RANK) return 0;
     int64_t n = 1;
@@ -1046,7 +1035,7 @@ int Builder::decl_name_map(const RadNameMap* m) {
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
         m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
-        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS && m->mode != RAD_MAP_MUL) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -1055,6 +1044,11 @@ int Builder::decl_name_map(const RadNameMap* m) {
             m->declared, m->mode == RAD_MAP_EMA ? "codebook" : "weight-norm",
             m->mode == RAD_MAP_EMA ? "the embedding sums and the cluster usage"
                                    : "the magnitude and the direction", m->n_src);
+        return RAD_E_INVAL;
+    }
+    if (m->mode == RAD_MAP_MUL && m->n_src != 2) {
+        err(RAD_E_INVAL, "name map for '%s': a product map names its two factors, not %d",
+            m->declared, m->n_src);
         return RAD_E_INVAL;
     }
     if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&

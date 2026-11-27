@@ -116,12 +116,26 @@ static inline V3 conv_state_view(const RadTensor* cs, int64_t conv_dim, int64_t 
 struct ConvIO {
     const RadTensor *x, *w, *bias, *q, *k, *v;
     int64_t xrow, xcol, Hg, H, K, V, width;
+    /* A tree step's parents (the `_tree` ops' `spec_parent`), null for a chain. */
+    const RadTensor* par = nullptr;
 };
+
+/* The row a tree step's row `t` continues from, within its sequence's rows from `bos`
+ * (RadBatch::spec_parent, docs/OPS.md): -1 for the committed history, which the sequence's first
+ * row always continues. An ordinary causal row (-2), like every row without the operand, continues
+ * the row before it. */
+static inline int64_t tree_parent(const RadTensor* par, int64_t bos, int64_t t) {
+    if (t <= 0) return -1;
+    if (!par) return t - 1;
+    const int64_t p = ld_int(par->dtype, par->data, offlin(par, bos + t));
+    return (p < -1 || p >= t) ? t - 1 : p;
+}
 
 /* Channel `c` of the depthwise causal convolution with silu over one sequence's `slen` tokens
  * from row `bos`, `hist` holding its width - 1 entries of history. Channels are grouped in whole
  * heads, so a group never straddles the q/k/v boundaries at any tensor-parallel width. */
-static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen, const float* hist) {
+static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen,
+                         const float* hist) {
     const int64_t Hg = io.Hg, K = io.K, V = io.V, width = io.width;
     const RadTensor* out;
     V3 ov;
@@ -137,11 +151,28 @@ static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen,
     const float bs = io.bias ? ldt(io.bias, c * laststride(io.bias)) : 0.0f;
     for (int64_t t = 0; t < slen; ++t) {
         float acc = bs;
-        for (int64_t j = 0; j < width; ++j) {
-            const int64_t src = t - (width - 1) + j;
-            const float val = src >= 0 ? ldt(io.x, (bos + src) * io.xrow + c * io.xcol)
-                                       : hist[src + width - 1];
-            acc += val * ldt(io.w, at2(wv, c, j));
+        if (io.par) {
+            /* A tree: the taps behind row t are its ancestors' inputs, newest first, and past
+             * the block's first row the committed history from its newest entry back. */
+            float tap[REF_CONV_HIST_MAX + 1];
+            tap[width - 1] = ldt(io.x, (bos + t) * io.xrow + c * io.xcol);
+            int64_t anc = tree_parent(io.par, bos, t), used = 0;
+            for (int64_t i = 1; i < width; ++i) {
+                if (anc >= 0) {
+                    tap[width - 1 - i] = ldt(io.x, (bos + anc) * io.xrow + c * io.xcol);
+                    anc = tree_parent(io.par, bos, anc);
+                } else {
+                    tap[width - 1 - i] = hist[width - 2 - used++];
+                }
+            }
+            for (int64_t j = 0; j < width; ++j) acc += tap[j] * ldt(io.w, at2(wv, c, j));
+        } else {
+            for (int64_t j = 0; j < width; ++j) {
+                const int64_t src = t - (width - 1) + j;
+                const float val = src >= 0 ? ldt(io.x, (bos + src) * io.xrow + c * io.xcol)
+                                           : hist[src + width - 1];
+                acc += val * ldt(io.w, at2(wv, c, j));
+            }
         }
         stt(out, at3(ov, bos + t, oh, od), act_silu(acc));
     }
@@ -274,7 +305,7 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
         }
     }
 
-    /* ---- phase 4: rewrite the conv state from the sequence's last width-1 tokens -------------- */
+    /* ---- phase 4: rewrite the conv state from the sequence's last width-1 tokens ---- */
     /* After phase 1, which has read the history this overwrites. A sequence shorter than width-1
      * keeps the old state in front of its tokens, so a later prefill chunk continues from the
      * earlier one. */
@@ -305,7 +336,7 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
  * the read offset instead of recomputing (spec §10).
  *
  * No l2 norm: on the decode path the recurrent update does it, as in libr4d. */
-int ref_gdn_conv_update(const RadArgs* a, RadStream) {
+static int conv_update_impl(const RadArgs* a, const RadTensor* par) {
     if (a->n_t < 10) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cs = &a->t[3], *cu = &a->t[6];
     const RadTensor *q = &a->t[7], *k = &a->t[8], *v = &a->t[9];
@@ -345,7 +376,8 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
         if (width > 1 && (width - 2) + slen > state_len) return RAD_E_SHAPE;
     }
 
-    const ConvIO io{ x, w, bias, q, k, v, xrow, xcol, Hg, H, K, V, width };
+    if (par && numel(par) < T) return RAD_E_SHAPE;
+    const ConvIO io{ x, w, bias, q, k, v, xrow, xcol, Hg, H, K, V, width, par };
 
     REF_PAR_FOR(T * conv_dim * width)
     for (int64_t nc = 0; nc < N * conv_dim; ++nc) {
@@ -373,6 +405,18 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+int ref_gdn_conv_update(const RadArgs* a, RadStream) { return conv_update_impl(a, nullptr); }
+
+/* gdn_conv_update over a tree verify (rad_drafter_tree): operand 10, `spec_parent`, names each
+ * row's parent within its sequence's rows, and a row's taps are its ancestors' inputs with the
+ * committed history above the block's first row. The window is rewritten by row, as the chain's
+ * is: the core moves the accepted path's entries to the front afterwards (ADV_COMPACT). */
+int ref_gdn_conv_update_tree(const RadArgs* a, RadStream) {
+    const RadTensor* par = a->n_t > 10 ? t_in(a, 10) : nullptr;
+    if (!par || !par->data) return RAD_E_INVAL;
+    return conv_update_impl(a, par);
+}
+
 /* ------------------------------------------------------------------ gdn_kkt_solve */
 /* A = (I + strict_lower(diag(beta) . K K^T . e^{g_i - g_j}))^{-1}, per chunk, per v head.
  *
@@ -380,8 +424,8 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
  * i > j is kept and g decreases along the chunk, so the exponent is <= 0 and cannot overflow (see
  * the file header and libr4d's r4d_gdn_kkt_solve).
  *
- * The inverse is a forward substitution instead of libr4d's blocked 16 -> 32 -> 64 WMMA merge. I + M
- * is unit lower triangular, so its inverse is unique; both compute it in fp32. */
+ * The inverse is a forward substitution instead of libr4d's blocked 16 -> 32 -> 64 WMMA merge.
+ * I + M is unit lower triangular, so its inverse is unique; both compute it in fp32. */
 int ref_gdn_kkt_solve(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *beta = &a->t[1], *g = &a->t[2], *cu = &a->t[3], *A = &a->t[4];
@@ -663,7 +707,7 @@ struct AnchorLayout {
  * from the slot the last accepted token wrote, and every candidate token writes its own slot since
  * survivors are unknown until verification (ref_ops.h). The gated RMS norm is folded into the
  * epilogue, as in libr4d, whose workgroup owns the whole row. */
-int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
+static int recurrent_update_impl(const RadArgs* a, const RadTensor* par) {
     if (a->n_t < 14) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *av = &a->t[3], *bvt = &a->t[4];
     const RadTensor *state = &a->t[7], *o = &a->t[13];
@@ -713,6 +757,7 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     if (cu_at(cu, n_seq) != Tk) return RAD_E_SHAPE;
+    if (par && numel(par) < Tk) return RAD_E_SHAPE;
     const int64_t sw = sidx ? (sidx->rank >= 2 ? sidx->shape[sidx->rank - 1]
                                                : (numel(sidx) / n_seq > 0 ? numel(sidx) / n_seq
                                                                           : 1))
@@ -725,7 +770,8 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     const V4 stv = v4(state, Hv, V, K);
 
     /* The anchor form keeps its replay factors inside a head's [V, K] block of a state slot, at
-     * libr4d's offsets (AnchorLayout), so the block must be dense and hold every token's factors. */
+     * libr4d's offsets (AnchorLayout), so the block must be dense and hold every token's
+     * factors. */
     const AnchorLayout al(K, V);
     if (anchor) {
         if (!sidx || sw < 6) return RAD_E_SHAPE;
@@ -804,25 +850,44 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
             }
         };
 
+        /* One token's update from its stored factors at `f`. Each 32-row group of V replays
+         * from its own copy of k and its own (g, beta), as libr4d's kernel reads them. Every
+         * writer stores equal copies, so on a block a step wrote this is the same as reading one
+         * copy for all rows. */
+        auto replay = [&](int64_t f) {
+            for (int64_t gi = 0; gi < al.groups; ++gi) {
+                for (int64_t d = 0; d < K; ++d) kn[d] = ldt(state, f + gi * K + d);
+                update(ldt(state, f + al.gb + 2 * gi), ldt(state, f + al.gb + 2 * gi + 1),
+                       [&](int64_t e) { return ldt(state, f + al.vb + e); },
+                       32 * gi, std::min<int64_t>(V, 32 * gi + 32));
+            }
+        };
+
         if (anchor) {
             /* Replay the previous step's accepted tokens from their factors, publish the advanced
              * anchor at column 2, and stamp each factor copy with the column it sits in. */
-            for (int64_t t = 0; t < na; ++t) {
-                const int64_t f = fb + t * al.fstr;
-                /* Each 32-row group of V replays from its own copy of k and its own (g, beta),
-                 * as libr4d's kernel reads them. Every writer stores equal copies, so on a block
-                 * a step wrote this is the same as reading one copy for all rows. */
-                for (int64_t gi = 0; gi < al.groups; ++gi) {
-                    for (int64_t d = 0; d < K; ++d) kn[d] = ldt(state, f + gi * K + d);
-                    update(ldt(state, f + al.gb + 2 * gi), ldt(state, f + al.gb + 2 * gi + 1),
-                           [&](int64_t e) { return ldt(state, f + al.vb + e); },
-                           32 * gi, std::min<int64_t>(V, 32 * gi + 32));
-                }
-            }
+            for (int64_t t = 0; t < na; ++t) replay(fb + t * al.fstr);
             for (int64_t e = 0; e < V; ++e)
                 for (int64_t d = 0; d < K; ++d)
                     stt(state, at4(stv, col[2], h, e, d), St[d * V + e]);
             for (int c = 0; c < 3; ++c) stt(state, fbs[c] + al.mark, (float)(c + 1));
+        }
+
+        /* A tree step (`par`): a row continues from its parent's state, not the row before's, so
+         * each row's state is kept: snap[0] the state the block starts from, snap[t + 1] the one
+         * row t left. Under `anchor` the start is the published anchor as the cache holds it and
+         * a row is applied from its stored factors, so a row's state is the same whichever rows
+         * ran between it and its parent, at any state dtype (libr4d rebuilds a branch point from
+         * exactly those). */
+        std::vector<float> snap;
+        const bool tree = par != nullptr && q_len > 0;
+        if (tree) {
+            if (anchor)
+                for (int64_t e = 0; e < V; ++e)
+                    for (int64_t d = 0; d < K; ++d)
+                        St[d * V + e] = ldt(state, at4(stv, col[2], h, e, d));
+            snap.resize((size_t)((q_len + 1) * V * K));
+            std::copy(St, St + V * K, snap.begin());
         }
 
         for (int64_t t = 0; t < q_len; ++t) {
@@ -844,14 +909,6 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
                 kn[d] = ldt(k, at3(kv, tok, hk, d)) * ks;
             }
 
-            update(gv, bt, [&](int64_t e) { return ldt(v, at3(vv, tok, h, e)); }, 0, V);
-            for (int64_t e = 0; e < V; ++e) orow[e] = 0.0f;
-            for (int64_t d = 0; d < K; ++d) {
-                const float* sr = St + d * V;
-                const float qd = qn[d];
-                for (int64_t e = 0; e < V; ++e) orow[e] += sr[e] * qd;
-            }
-
             /* This token's factors, for the next step to replay: the normalised k once per
              * 32-row group, v, then the decay exponent and beta once per group. */
             if (anchor)
@@ -866,6 +923,20 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
                     for (int64_t e = 0; e < V; ++e)
                         stt(state, f + al.vb + e, ldt(v, at3(vv, tok, h, e)));
                 }
+
+            if (tree) {
+                const int64_t p = tree_parent(par, bos, t);
+                std::copy(snap.begin() + (p + 1) * V * K, snap.begin() + (p + 2) * V * K, St);
+            }
+            if (tree && anchor) replay(fb + t * al.fstr);
+            else update(gv, bt, [&](int64_t e) { return ldt(v, at3(vv, tok, h, e)); }, 0, V);
+            if (tree) std::copy(St, St + V * K, snap.begin() + (t + 1) * V * K);
+            for (int64_t e = 0; e < V; ++e) orow[e] = 0.0f;
+            for (int64_t d = 0; d < K; ++d) {
+                const float* sr = St + d * V;
+                const float qd = qn[d];
+                for (int64_t e = 0; e < V; ++e) orow[e] += sr[e] * qd;
+            }
 
             /* The gated RMS norm, over the head's V channels. */
             float sq2 = 0.0f;
@@ -882,7 +953,8 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
             }
 
             /* Quantise the stored `o`, not the f32 value, as the standalone quant_act_fp8 read it
-             * back from memory. One group per (token, head), since head_v is the fp8 block width. */
+             * back from memory. One group per (token, head), since head_v is the fp8 block
+             * width. */
             if (oq && osc) {
                 const int64_t qb = rowoff(oq, tok, Hv * V), qs = laststride(oq);
                 const float qsc = q8_group([&](int64_t e) { return ldt(o, at3(ov, tok, h, e)); },
@@ -891,14 +963,31 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
             }
 
             if (anchor) continue;
-            const int64_t so = sidx ? ld_int(sidx->dtype, sidx->data, at2(si, n, t < sw ? t : sw - 1))
+            const int64_t so = sidx ? ld_int(sidx->dtype, sidx->data,
+                                             at2(si, n, t < sw ? t : sw - 1))
                                     : n;
             if (so >= 0)
                 for (int64_t e = 0; e < V; ++e)
-                    for (int64_t d = 0; d < K; ++d) stt(state, at4(stv, so, h, e, d), St[d * V + e]);
+                    for (int64_t d = 0; d < K; ++d)
+                        stt(state, at4(stv, so, h, e, d), St[d * V + e]);
         }
     }
     return RAD_OK;
+}
+
+int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
+    return recurrent_update_impl(a, nullptr);
+}
+
+/* gdn_recurrent_update over a tree verify (rad_drafter_tree): operand 16, `spec_parent`, names
+ * each row's parent within its sequence's rows, and a row's state is its parent's with the row
+ * applied (the committed state's for the block's first row). The factor records are written by
+ * row; the core moves the accepted path's to the front afterwards (ADV_COMPACT), so the next
+ * step's `num_accepted` names a prefix as it does after a chain. */
+int ref_gdn_recurrent_update_tree(const RadArgs* a, RadStream) {
+    const RadTensor* par = a->n_t > 16 ? t_in(a, 16) : nullptr;
+    if (!par || !par->data) return RAD_E_INVAL;
+    return recurrent_update_impl(a, par);
 }
 
 /* ------------------------------------------------------------------ gdn_gated_rmsnorm */
@@ -949,7 +1038,7 @@ int ref_gdn_gated_rmsnorm(const RadArgs* a, RadStream) {
 /* gdn_conv_update into staging q, k and v, then gdn_recurrent_update over them; the fused op is
  * defined as the pair. Head geometry comes from `o` ([T, Hv, head_v]) and `x`
  * (2 Hg head_k + Hv head_v columns). */
-int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream st) {
+static int conv_recurrent_impl(const RadArgs* a, const RadTensor* par) {
     if (a->n_t < 16) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *o = &a->t[15];
     if (!x->data || !o->data || o->rank != 3 || x->rank < 2) return RAD_E_SHAPE;
@@ -985,15 +1074,27 @@ int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream st) {
                          tv };
     RadArgs ca = *a;
     ca.t = ct; ca.n_t = 10; ca.p = cp; ca.n_p = 4;
-    int rc = ref_gdn_conv_update(&ca, st);
+    int rc = conv_update_impl(&ca, par);
     if (rc != RAD_OK) return rc;
 
     /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
      * o_scale. The parameters pass as they are: the recurrence reads its own by name. */
     RadTensor rt[16] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
                          a->t[11], a->t[12], a->t[13], a->t[14], a->t[15],
-                         a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17] : RadTensor{} };
+                         a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17]
+                             : RadTensor{} };
     RadArgs ra = *a;
     ra.t = rt; ra.n_t = 16;
-    return ref_gdn_recurrent_update(&ra, st);
+    return recurrent_update_impl(&ra, par);
+}
+
+int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream) {
+    return conv_recurrent_impl(a, nullptr);
+}
+
+/* gdn_conv_update_tree then gdn_recurrent_update_tree: operand 18 is `spec_parent`. */
+int ref_gdn_conv_recurrent_update_tree(const RadArgs* a, RadStream) {
+    const RadTensor* par = a->n_t > 18 ? t_in(a, 18) : nullptr;
+    if (!par || !par->data) return RAD_E_INVAL;
+    return conv_recurrent_impl(a, par);
 }

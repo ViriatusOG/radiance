@@ -341,67 +341,6 @@ AVX_KERNEL(gated_had_quant_i8) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ gated_quant_i8 */
-/* gated_had_quant_i8 without the rotation: the same gated product (SiTU included), then symmetric
- * int8 per `group` contiguous elements (default 128) with one f32 scale each, as libref's
- * ref_gated_quant_i8 and quant_act_i8g write them: scale amax * (1/127), 1 for an all-zero group,
- * codes clamped to +-127. Scalar on the gated values: SiTU runs in libm, as in gated_had_quant_i8. */
-AVX_KERNEL(gated_quant_i8) {
-    if (a->n_t < 4) return RAD_E_INVAL;
-    const RadTensor *ga = &a->t[0], *q = &a->t[2], *s = &a->t[3];
-    const RadTensor* up = rad_arg_in(a, 1);
-    if (!ga->data || !q->data || !s->data) return RAD_E_INVAL;
-    const int64_t n = p_int(a, "n", 0);
-    int64_t g = p_int(a, "group", 128);
-    static const char* kActs[] = { "silu", "sigmoid", "situ" };
-    const int act = p_enum(a, "act", kActs, 3, (int)p_int(a, "mode", 0));
-    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
-    if (n <= 0) return RAD_E_SHAPE;
-    if (act < 0 || act > 2) return RAD_E_INVAL;
-    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
-        return RAD_E_INVAL;
-    if (g <= 0 || g > n) g = n;
-    const int64_t ngrp = (n + g - 1) / g;
-    const int64_t rows = numel(q) / n;
-    if (rows <= 0 || numel(s) < rows * ngrp) return RAD_E_SHAPE;
-    if (numel(ga) < rows * (up ? n : 2 * n)) return RAD_E_SHAPE;
-    if (up && numel(up) < rows * n) return RAD_E_SHAPE;
-    const int64_t gw = up ? n : 2 * n;
-
-    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
-    for (int64_t r = 0; r < rows; ++r) {
-        float* gbuf = scratch_f32((size_t)gw);
-        float* ubuf = scratch_f32_b((size_t)n);
-        float* out  = scratch_f32_c((size_t)n);
-        const float* gv = in_row(ga, rowoff(ga, r, gw), gw, gbuf);
-        const float* uv = up ? in_row(up, rowoff(up, r, n), n, ubuf) : gv + n;
-        for (int64_t i = 0; i < n; ++i) {
-            const float gt = gv[i];
-            if (act == 2) {
-                const float ga_ = gcap > 0 ? gcap * std::tanh(gt / gcap) : gt;
-                const float ua_ = ucap > 0 ? ucap * std::tanh(uv[i] / ucap) : uv[i];
-                out[i] = ga_ * (1.0f / (1.0f + std::exp(-gt))) * ua_;
-            } else {
-                const float sg = 1.0f / (1.0f + sc_exp(-gt));
-                out[i] = (act == 1 ? sg : gt * sg) * uv[i];
-            }
-        }
-        for (int64_t gi = 0; gi < ngrp; ++gi) {
-            const int64_t k0 = gi * g, len = (k0 + g < n ? g : n - k0);
-            const float amax = row_amax(out + k0, len);
-            const float sc = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
-            const float inv = 1.0f / sc;
-            for (int64_t i = 0; i < len; ++i) {
-                float c = out[k0 + i] * inv;
-                out[k0 + i] = c > 127.0f ? 127.0f : (c < -127.0f ? -127.0f : c);
-            }
-            out_row(q, rowoff(q, r, n) + k0, len, out + k0);
-            stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
-        }
-    }
-    return RAD_OK;
-}
-
 /* ------------------------------------------------------------------ dequant_w4 */
 /* The packed 4-bit weight back to row-major bf16 [N, K], as libref reads it (ref_quant.cpp): eight
  * nibbles a dword in fragment order [t][kb][lh][r][s], t = n / 16, r = n % 16, kb = k / 64,
@@ -713,9 +652,9 @@ AVX_KERNEL(had_quant_act_i8g) {
 /* Quantising form: the rotation as one dense 128 x 128 f16 matrix per (part, group) (`tdense`,
  * which rad-convert composes from the pairs and angles as the weight's "t.dense" table), then the
  * block-scaled quantiser named by `out`: "fp8" E4M3 with scale amax / 448, or "i8" with scale
- * amax / 127, rounded to nearest; scale 1 for an all-zero group, as libref. The matrices are widened
- * to f32 once per call. Each group is a matrix-vector product summed in f32 (libref uses f64), so a
- * code on a rounding edge can differ from libref's. */
+ * amax / 127, rounded to nearest; scale 1 for an all-zero group, as libref. The matrices are
+ * widened to f32 once per call. Each group is a matrix-vector product summed in f32 (libref uses
+ * f64), so a code on a rounding edge can differ from libref's. */
 /* ---------------------------------------------------------------- the Gram accumulator
  *
  * h[k1][k2] += sum over rows of x[m][k1] * x[m][k2], where x is the dequantised E4M3 input, or a
@@ -726,7 +665,8 @@ AVX_KERNEL(had_quant_act_i8g) {
  *
  * Accumulation is f64 here (f32 on the device), as in libref: the result is consumed offline by
  * the packer, and the kbench tolerance covers the gap. The f64 inner reduction stays scalar; only
- * the dequantisation is vectorised, once per row into a scratch plane rather than in the k2 loop. */
+ * the dequantisation is vectorised, once per row into a scratch plane rather than in the k2
+ * loop. */
 AVX_KERNEL(gram_accum) {
     /* `a_scale` is optional; without it `a` is read as is (the bf16 form). */
     if (a->n_t < 3) return RAD_E_INVAL;

@@ -67,6 +67,9 @@ struct KernelRow {
     /* rad_kernel_chain said 2: its chained forms' acquire covers their scalar loads too, so their
      * packets need no acquire from the packet processor. */
     bool                 chain_fenced = false;
+    /* rad_kernel_fetches_rows: a row-gathering kernel reads the container's rows itself (its own
+     * row cache), so the page cache is not asked to prefetch them. False when unsaid. */
+    bool                 fetches_rows = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
@@ -220,6 +223,9 @@ struct WeightInfo {
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
+    /* Each selected plane's offset in the container (file_offset is plane_offset[0]), for a
+     * file-tier weight the loader relayouts on every read (weight_file_relaid). */
+    uint64_t       file_plane_offset[RAD_ENC_MAX_PLANES] = {0};
 
     /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
      * scheduling rather than prediction (spec §5). */
@@ -249,6 +255,7 @@ inline bool weight_file_direct(const WeightInfo& w, int world_size) {
     return w.identity && !w.widen && !w.narrow &&
            (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
+
 
 struct BufferInfo {
     std::string name;
@@ -407,6 +414,11 @@ public:
         std::string module;
     };
     std::map<rad_weight, LoraReplacement> lora_replacements;
+    /* A generator's targeted modules (key) with a resolved reader on this rank that cannot apply
+     * the adapter's delta, and why (value). Captured once at the end of declaration, so
+     * POST /v1/loras/validate refuses a combination that would leave such a reader on the base
+     * weights; a module with no reader on this rank is not listed. */
+    std::map<std::string, std::string> lora_placement_issues;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -560,6 +572,28 @@ public:
 
 };
 
+/* The kernel whose layout hook settled `w`'s stored form, or null when it is stored as is or
+ * widened. */
+inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const WeightInfo& w) {
+    if (w.identity || w.widen || w.lay_op < 0 || (size_t)w.lay_op >= prog.ops.size()) return nullptr;
+    const OpInfo& op = prog.ops[(size_t)w.lay_op];
+    if (w.lay_band < 0 || (size_t)w.lay_band >= op.bands.size() || w.lay_dom < 0 ||
+        w.lay_dom >= RAD_N_DOMAINS)
+        return nullptr;
+    const KernelRow* row = op.bands[(size_t)w.lay_band].dom[w.lay_dom].row;
+    return row ? row->info : nullptr;
+}
+
+/* Whether the file tier can serve `w` by relayouting it on every read, as the loader does once
+ * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
+ * of the container), not widened, and a kernel that relayouts. */
+inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
+    if (w.identity || w.widen) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    const RadKernelInfo* ki = weight_layout_kernel(prog, w);
+    return ki && ki->relayout;
+}
+
 /* ================================================================== requests */
 
 enum class ReqState { Waiting, Running, Preempted, Finished, Failed, Cancelled };
@@ -577,6 +611,9 @@ struct ReasoningSpan {
     int32_t open = -1;            /* the token a reply opens its own block with; -1 for none */
     int32_t close = -1;           /* the token that ends the block; -1: no countable block */
     bool    starts_open = false;  /* the generation prompt left the reply inside the block */
+    /* A message header the reply writes before `open` (Inkling 2's <|message_model|>): passed
+     * over, not counted, while the reply has not yet opened its block; -1 for none. */
+    int32_t frame = -1;
     bool known() const { return close >= 0; }
 };
 
@@ -595,6 +632,7 @@ struct ReasoningCount {
     void push(const ReasoningSpan& s, int32_t tok) {
         if (st == Lead) {
             if (s.open >= 0 && tok == s.open) { st = Think; ++tokens; }
+            else if (s.frame >= 0 && tok == s.frame) {}   /* the header before the opener */
             else st = Done;
         } else if (st == Think) {
             ++tokens;
@@ -838,6 +876,9 @@ struct Config {
      * collectives (RadBuildCtx::weight_prefetch_off), for an engine that shares its cards with
      * another server, where the second lane's read costs a queue switch every decode step. */
     bool  weight_prefetch = true;
+    /* --row-prefetch: read a host gather's table rows on the mapped tier ahead of or beside its
+     * kernel (runtime/rowprefetch.h); CtxDesc::row_prefetch. */
+    bool  row_prefetch = true;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -862,6 +903,11 @@ struct Config {
      * steps for as long as a chunk step took) except under --deterministic, in KL mode and for a
      * generator; the Config default 0 is what a Scheduler built directly (tests) gets. */
     bool    prefill_interleave_set = false;
+    /* --long-prefill-token-threshold: cap a long prefill's chunk at N tokens while other
+     * requests exist. The effective cap is max(N, token budget / eligible requests), so a lone
+     * prefill still gets the whole budget. 0 (default) is off; this is the vLLM-style throttle
+     * that stops one long prompt from taking every token in a mixed step. */
+    int64_t long_prefill_token_threshold = 0;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
                                         * -1 auto (Scheduler::interleave_steps) */
     /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
@@ -894,15 +940,19 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* memory.card-headroom-mib, by card index: what that card keeps free in place of
+     * gpu_headroom_mib (a card that drives a display). Set by the fleet; no flag sets it. */
+    std::map<int, int64_t> card_headroom_mib;
     /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
      * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
     int64_t gpu_memory_mib = 0;
     /* --kv-cache-dtype bf16|i8|fp8. i8 keeps K and V as int8 codes with one f16 scale each per
      * (token, head) (abi/rad_builder.h); it halves the per-token cost, most of the KV pool at
      * production context. fp8 is an E4M3 cache, served only where the plugin's probe says so
-     * (RadArchProbe::kv_fp8_ok: GLM-5.3's latent attention). Each changes the model's output
-     * slightly, so it is explicit and bf16 is the default. No "auto": it would always resolve to
-     * bf16 and only add another name. */
+     * (RadArchProbe::kv_fp8_ok: GLM-5.3's latent attention; DeepSeek-V4.1's compressed latent
+     * and index keys, which E4M3 entries hold exactly). i8 and GLM-5.3's fp8 change the model's
+     * output slightly, so the dtype is explicit and bf16 is the default. No "auto": it would
+     * always resolve to bf16 and only add another name. */
     std::string kv_cache_dtype = "bf16";
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
     /* --kv-resident N: tokens of the sparse attention group's context its VRAM ring holds
@@ -1029,6 +1079,12 @@ struct Config {
      *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
      *   differ from a cold run in the last bits (a near-tie in greedy text). */
     bool    prefix_exact = true;
+    /* --checkpoint-draft-window: a block drafter's window KV group (a windowed DFlash/DSpark block,
+     * such as Inkling 2's DFlash2) also rides in the checkpoint slots of a model WITH
+     * linear state, so a prefix hit restores it instead of capping the hit for draft refill. Costs one
+     * drafter window of pinned host memory per slot (auto sizing then holds fewer slots). Off by
+     * default. Needs the prefix cache and --checkpoint-interval > 0. */
+    bool    checkpoint_draft_window = false;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
@@ -1083,6 +1139,33 @@ struct Config {
      * (rad_drafter_tree), whose nodes are verify rows every drafting sequence pays for. Ignored
      * without a drafter that declares a short block. */
     int64_t draft_short_from = -1;      /* --draft-short-from */
+    /* --draft-max-lanes K: a block drafter drafts only while at most K sequences decode; above K
+     * the step is the plain target step (no query pass, no drafts proposed) and drafting resumes
+     * when the load falls back. The context pass still runs, so the drafter's KV stays whole. 0
+     * (the default) never gates. Ignored without a block drafter. */
+    int64_t draft_max_lanes = 0;        /* --draft-max-lanes */
+    /* --draft-min-accept X: a block drafter stops proposing for a sequence whose smoothed tokens
+     * per verify step (1 + accepted drafts) is below X, resumes above X + 0.4, and while stopped
+     * proposes one block after 128 generated tokens to measure again (doubling after a failed
+     * probe, up to 1024). 0 (default) never gates. */
+    double  draft_min_accept = 0.0;     /* --draft-min-accept */
+    /* --draft-depth0: under --draft-window adaptive the window may also choose depth 0 (no query
+     * pass, no verify row) where the measured plain step emits more tokens a millisecond than the
+     * drafting depth (DraftController). --draft-probe N: a step at the drafting depth every N cycles
+     * at 0 keeps that estimate measured; --draft-probe-backoff N doubles the interval after each
+     * probe that leaves 0 in place, up to N doublings. Off by default. */
+    bool    draft_depth0 = false;
+    int     draft_probe = 16;
+    int     draft_probe_backoff = 0;
+    /* --draft-hybrid: beside a chain draft head, a sequence whose prompt lookup matches at least
+     * --draft-hybrid-match tokens back verifies the lookup's proposal instead of the head's (the
+     * scheduler's hybrid_). Off by default. */
+    bool    draft_hybrid = false;
+    int     draft_hybrid_match = 8;
+    /* --dspark-walk: DeepSeek-V4.1's DSpark drafter walks its Markov tables over the whole
+     * vocabulary (RadBuildCtx::dspark_walk). Off by default: the walk re-ranks the head's top
+     * candidates. */
+    bool    dspark_walk = false;
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify
@@ -1337,11 +1420,15 @@ struct Config {
      * rank the expert plane, instead of the container's activation profile. Empty serves the
      * container's profile. */
     std::string expert_profile;
-    bool    expert_profile_given = false;
+    /* --expert-split LIST: the routed experts a layer each rank holds, in rank order
+     * (RadBuildCtx::expert_split, arch/common/rad_expert_split.h); empty is the even split. */
+    std::string expert_split;
+    /* --weight-sidecar FILE: a container whose entries replace the model container's of the same
+     * name and logical shape in another encoding (Engine::open_weight_sidecar); empty is none. */
+    std::string weight_sidecar;
     /* --expert-pin-top F: pin the hottest F of the routed experts (0 < F <= 1) by the profile's
      * share, keeping them resident: heat never demotes them. 0 is off. */
     float   expert_pin_top = 0.0f;
-    bool    expert_pin_top_given = false;
     /* --draft-expert-placement auto|host. `host` pins a draft head's (MTP/DSpark) routed experts
      * in the host pool before any strategy runs, read in place like a pooled expert, so they fit
      * beside a trunk that already fills the card. `auto` (the default) leaves them to the

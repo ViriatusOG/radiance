@@ -13,8 +13,8 @@
  *   ulp more accurate and disagree with the oracle and the device kernels. The round trip uses a
  *   hot scratch buffer instead of the output operand.
  *
- * Broadcasting: `mul` broadcasts one row down the rows (a bias's shape); `scale_rows` broadcasts one
- * column across them (a per-token gate). They are separate ops because the two readings are
+ * Broadcasting: `mul` broadcasts one row down the rows (a bias's shape); `scale_rows` broadcasts
+ * one column across them (a per-token gate). They are separate ops because the two readings are
  * ambiguous when rows == n, and a wrong guess gives plausible numbers.
  */
 #include "avx_vec.h"
@@ -357,7 +357,8 @@ AVX_KERNEL(conv2d) {
                     for (int64_t co = 0; co < cout; ++co) acc[wo * cout + co] += bias[co];
             out_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
             if (gelu) {
-                /* The biased sum as y's dtype holds it, then the activation of the rounded value. */
+                /* The biased sum as y's dtype holds it, then the activation of the rounded
+                 * value. */
                 const float* yr = in_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
                 for (int64_t e = 0; e < rout; ++e) acc[e] = act_of(1, yr[e], RAD_F32);
                 out_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
@@ -414,7 +415,8 @@ AVX_KERNEL(conv2d_unfold) {
                         const int64_t wi = wo * st - pad + j;
                         const float* xv = xr[i] && wi >= 0 && wi < W ? xr[i] + wi * cin : nullptr;
                         for (int64_t ci = 0; ci < cin; ++ci) {
-                            const int64_t k = tlast ? (ci * kw + j) * kh + i : (ci * kh + i) * kw + j;
+                            const int64_t k = tlast ? (ci * kw + j) * kh + i
+                                : (ci * kh + i) * kw + j;
                             row[k] = xv ? xv[ci] : 0.0f;
                         }
                     }
@@ -509,7 +511,8 @@ AVX_KERNEL(rel_sinusoid) {
 AVX_KERNEL(seg_sinusoid) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *cu = &a->t[0], *Y = &a->t[1];
-    const int64_t n = p_int(a, "n", 0), period = p_int(a, "period", 0), cdiv = p_int(a, "cu_div", 1);
+    const int64_t n = p_int(a, "n", 0), period = p_int(a, "period", 0),
+        cdiv = p_int(a, "cu_div", 1);
     if (n <= 0 || n % 2 || period <= 0 || cdiv <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n), S = numel(cu) - 1;
     if (rows <= 0 || S <= 0 || ldi(cu, offlin(cu, S)) <= ldi(cu, offlin(cu, 0)))
@@ -589,7 +592,8 @@ AVX_KERNEL(seg_softmax_pool) {
         float one = 0.0f;
         float m = -INFINITY, z = 0.0f;
         for (int64_t r = b0; r < b1; ++r) m = std::max(m, in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0]);
-        for (int64_t r = b0; r < b1; ++r) z += std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m);
+        for (int64_t r = b0; r < b1; ++r)
+            z += std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m);
         for (int64_t i = 0; i < n; ++i) acc[i] = 0.0f;
         for (int64_t r = b0; r < b1; ++r) {
             const float w = std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m) / z;

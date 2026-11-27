@@ -3,9 +3,9 @@
  * A schema names operands and roles but not extents, which the run phase supplies at issue. Tools
  * that call an op cold (rad-kbench, rad-tune) need them to size buffers. The kernel's
  * RadKernelInfo::opd_shape hook is asked first (rad_operand_shapes_hook); the fallback recipes
- * (rad_operand_shapes) cover the docs/OPS.md ops whose shapes follow from their parameters. Ops covered by neither are
- * skipped and counted by the caller, never guessed: an invented extent tests bounds handling, not
- * correctness.
+ * (rad_operand_shapes) cover the docs/OPS.md ops whose shapes follow from their parameters. Ops
+ * covered by neither are skipped and counted by the caller, never guessed: an invented extent
+ * tests bounds handling, not correctness.
  *
  * Shared by rad-kbench and rad-tune so a tuning case and its correctness check use the same shape.
  */
@@ -32,7 +32,8 @@ struct OpdShape {
     /* Distinct indices for a scatter (`slot_mapping`): two tokens on one slot race, and ref and
      * the kernel resolve the race differently. Read-side indices may repeat. */
     bool                 idx_unique = false;
-    /* Cumulative sequence lengths [0, ..., T] (`cu` of the GDN ops): the batch shape, not a draw. */
+    /* Cumulative sequence lengths [0, ..., T] (`cu` of the GDN ops): the batch shape, not a
+     * draw. */
     bool                 idx_cu = false;
     /* A routing histogram's offsets [0, ..., idx_max - 1] (RAD_OPD_F_IDX_PREFIX). */
     bool                 idx_prefix = false;

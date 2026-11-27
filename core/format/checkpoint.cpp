@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <set>
 
 namespace rad {
 
@@ -86,7 +88,7 @@ static void flatten_json(const Json& j, const std::string& prefix, MetaOwn* out)
         const Json& v = it.value();
         /* Retain otherwise invisible Quark weight overrides so import validation can reject
          * null/empty schemes instead of accidentally inheriting global MXFP4 packing. */
-        if (key.rfind("quantization_config.layer_quant_config.", 0) == 0 &&
+        if (key.starts_with("quantization_config.layer_quant_config.") &&
             it.key() == "weight" && (v.is_null() || (v.is_object() && v.empty()))) {
             out->kv(key, v.is_null() ? "null" : "{}");
             continue;
@@ -218,7 +220,7 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
             const size_t len = std::strlen(pre);
             for (size_t i = 0; i < n; ++i) {
                 const std::string& k = out->keys[i];
-                if (k.rfind(pre, 0) != 0) continue;
+                if (!k.starts_with(pre)) continue;
                 const std::string bare = k.substr(len);
                 bool have = false;
                 for (size_t j2 = 0; j2 < out->keys.size(); ++j2)
@@ -513,7 +515,7 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
     /* Everything else, stringified, for the plugin. Arrays are summarised (small integer arrays
      * spelled out); tokenizer keys are skipped, since the vocab has its own section. */
     for (const GgufKV& kv : g.kv()) {
-        if (kv.key.rfind("tokenizer.", 0) == 0) continue;
+        if (kv.key.starts_with("tokenizer.")) continue;
         std::string v;
         if (kv.is_array) {
             v = fmt("[%zu values]", kv.type == GGUF_STR ? kv.s.size()
@@ -806,8 +808,7 @@ int Checkpoint::open_diffusers() {
                 a.resize(a.size() - suf.size());
                 break;
             }
-        for (char& ch : a) ch = (char)std::tolower((unsigned char)ch);
-        meta_.arch = a;
+        meta_.arch = ascii_lower(std::move(a));
     }
     if (tensors_.empty()) {
         RAD_ERR("%s: a diffusers pipeline with no component weights", dir_.c_str());
@@ -930,7 +931,7 @@ static bool hy3d_weights(const std::string& file) {
     bool dit = false, enc = false;
     for (const auto& t : probe.tensors()) {
         dit = dit || t.name == "model.latent_in.weight";
-        enc = enc || t.name.rfind("conditioner.main_image_encoder.", 0) == 0;
+        enc = enc || t.name.starts_with("conditioner.main_image_encoder.");
     }
     return dit && enc;
 }
@@ -979,13 +980,13 @@ int Checkpoint::open_sgm() {
         const std::string& n = t.name;
         if (n == "v_pred") { vpred = true; continue; }
         if (n == "ztsnr") { zsnr = true; continue; }
-        if (n.rfind(g_old, 0) == 0) {
+        if (n.starts_with(g_old)) {
             const std::string r = n.substr(g_old.size());
             if (r == "token_embedding.weight") {
                 rename(t, tm + "embeddings.token_embedding.weight");
             } else if (r == "positional_embedding") {
                 rename(t, tm + "embeddings.position_embedding.weight");
-            } else if (r.rfind("ln_final.", 0) == 0) {
+            } else if (r.starts_with("ln_final.")) {
                 rename(t, tm + "final_layer_norm." + r.substr(std::strlen("ln_final.")));
             } else if (r == "text_projection") {
                 /* x @ P in open_clip; a linear's weight is P^T. */
@@ -1009,7 +1010,7 @@ int Checkpoint::open_sgm() {
                 v.data = dst;
                 add.push_back(std::move(v));
                 drop.push_back(n);
-            } else if (r.rfind("transformer.resblocks.", 0) == 0) {
+            } else if (r.starts_with("transformer.resblocks.")) {
                 /* transformer.resblocks.N.<rest> */
                 const size_t p0 = std::strlen("transformer.resblocks.");
                 const size_t dot = r.find('.', p0);
@@ -1040,7 +1041,7 @@ int Checkpoint::open_sgm() {
                         { "ln_2.", "layer_norm2." }, { "mlp.c_fc.", "mlp.fc1." },
                         { "mlp.c_proj.", "mlp.fc2." } };
                     for (const auto& [from, to] : kMap)
-                        if (rest.rfind(from, 0) == 0) {
+                        if (rest.starts_with(from)) {
                             rename(t, layer + to + rest.substr(std::strlen(from)));
                             break;
                         }
@@ -1048,7 +1049,7 @@ int Checkpoint::open_sgm() {
             }
             continue;
         }
-        if (n.rfind(v_old + "decoder.", 0) == 0 || n.rfind(v_old + "post_quant_conv.", 0) == 0) {
+        if (n.starts_with(v_old + "decoder.") || n.starts_with(v_old + "post_quant_conv.")) {
             /* diffusers' convert_ldm_vae_checkpoint, the decoder's half. */
             std::string r = n.substr(v_old.size());
             auto sub = [&](const std::string& from, const std::string& to) {
@@ -1063,15 +1064,15 @@ int Checkpoint::open_sgm() {
             sub("decoder.mid.attn_1.v.", "decoder.mid_block.attentions.0.to_v.");
             sub("decoder.mid.attn_1.proj_out.", "decoder.mid_block.attentions.0.to_out.0.");
             sub("decoder.norm_out.", "decoder.conv_norm_out.");
-            if (r.rfind("decoder.up.", 0) == 0) {
+            if (r.starts_with("decoder.up.")) {
                 /* up.i runs at the i-th resolution from the bottom of the encoder's pyramid;
                  * up_blocks count in the order the decoder runs them. */
                 const size_t p0 = std::strlen("decoder.up."), dot = r.find('.', p0);
                 if (dot == std::string::npos) continue;
                 const int i = std::atoi(r.substr(p0, dot - p0).c_str());
                 std::string rest = r.substr(dot + 1);
-                if (rest.rfind("block.", 0) == 0) rest = "resnets." + rest.substr(6);
-                else if (rest.rfind("upsample.", 0) == 0) rest = "upsamplers.0." + rest.substr(9);
+                if (rest.starts_with("block.")) rest = "resnets." + rest.substr(6);
+                else if (rest.starts_with("upsample.")) rest = "upsamplers.0." + rest.substr(9);
                 r = "decoder.up_blocks." + std::to_string(3 - i) + "." + rest;
             }
             sub(".nin_shortcut.", ".conv_shortcut.");
@@ -1154,7 +1155,7 @@ int Checkpoint::open_safetensors(const std::string& path) {
             for (const auto& t : probe.tensors()) {
                 unet = unet || t.name == "model.diffusion_model.label_emb.0.0.weight";
                 bigg = bigg ||
-                       t.name.rfind("conditioner.embedders.1.model.transformer.resblocks.", 0) == 0;
+                       t.name.starts_with("conditioner.embedders.1.model.transformer.resblocks.");
             }
             if (unet && bigg) return open_sgm();
         }
@@ -1213,8 +1214,28 @@ int Checkpoint::open_safetensors(const std::string& path) {
         RAD_TRY(regroup_inkling_static_w());
     }
     detect_import();
+    retag_modelopt_blocks();
     meta_.finish();
     return RAD_OK;
+}
+
+/* ModelOpt's GGUF-block layers: `X.weight` is U8 [.., blocks, block_bytes]; read it as the GGUF block
+ * tensor of that type, logical [.., blocks * values per block]. */
+void Checkpoint::retag_modelopt_blocks() {
+    if (import_ != Import::ModelOpt || mo_blocks_.empty()) return;
+    for (const auto& kv : mo_blocks_) {
+        auto it = index_.find(kv.first + ".weight");
+        if (it == index_.end()) continue;
+        SrcTensor& t = tensors_[it->second];
+        const GgufDtype* gd = gguf_dtype(kv.second);
+        if (!gd || t.rad_dtype != RAD_U8 || t.shape.size() < 2 ||
+            t.shape.back() != (int64_t)gd->block_bytes)
+            continue;
+        t.shape.pop_back();
+        t.shape.back() *= gd->blck;
+        t.ggml = kv.second;
+        t.rad_dtype = RAD_DT_INVALID;
+    }
 }
 
 /* Companion models: a folder beside the model's own weights holding a model of its own (its
@@ -1259,7 +1280,7 @@ int Checkpoint::add_torch_files() {
         if (!de.is_regular_file(ec)) continue;
         const std::string f = de.path().filename().string();
         if (f.size() <= 4 || f.compare(f.size() - 4, 4, ".pth") != 0) continue;
-        if (f.rfind("pytorch_model", 0) == 0 || f.rfind("consolidated", 0) == 0) continue;
+        if (f.starts_with("pytorch_model") || f.starts_with("consolidated")) continue;
         files.push_back(f);
     }
     std::sort(files.begin(), files.end());
@@ -1406,11 +1427,21 @@ void Checkpoint::detect_import() {
     };
     auto any_under = [&](const std::string& prefix) {
         for (const std::string& k : meta_.keys)
-            if (k.rfind("quantization_config." + prefix, 0) == 0) return true;
+            if (k.starts_with("quantization_config." + prefix)) return true;
         return false;
     };
     const std::string qm = qc("quant_method");
-    if (qm == "auto-round") {
+    if (qm == "fp8") {
+        /* DeepSeek-V4's release: block-FP8 linears under `X.scale` e8m0 planes, and routed
+         * experts packed two e2m1 codes a byte under an e8m0 scale per 32 of K. */
+        if (qc("scale_fmt") == "ue8m0" && qc("expert_dtype") == "fp4" && fp8_br_ == 32 &&
+            fp8_bc_ == 32)
+            import_ = Import::Fp8Mx;
+        else
+            import_why_ = "fp8 here is neither ue8m0 block scales in 32x32 blocks with packed "
+                          "FP4 experts, which is the DeepSeek-V4 release form, nor a stock FP8 "
+                          "checkpoint";
+    } else if (qm == "auto-round") {
         /* AutoRound's GPTQ-compatible export; its own `auto_round` packing is not read. */
         const std::string pf = qc("packing_format");
         if (pf == "auto_round:auto_gptq") import_ = Import::Gptq;
@@ -1433,7 +1464,7 @@ void Checkpoint::detect_import() {
         const std::string suffix = ".weight.dtype";
         std::map<std::string, bool> layers;
         for (const auto& [k, v] : fields)
-            if (k.rfind(lp, 0) == 0 && k.size() > lp.size() + suffix.size() &&
+            if (k.starts_with(lp) && k.size() > lp.size() + suffix.size() &&
                 k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0)
                 layers.emplace(k.substr(0, k.size() - suffix.size()) + ".", true);
         bool overrides_ok = true;
@@ -1449,7 +1480,7 @@ void Checkpoint::detect_import() {
             overrides_ok = overrides_ok && (mx || fp8);
         }
         /* A partial/null weight override must not disappear merely because it has no dtype. */
-        for (const auto& [k, v] : fields) if (k.rfind(lp, 0) == 0) {
+        for (const auto& [k, v] : fields) if (k.starts_with(lp)) {
             bool covered = false;
             for (size_t dot = k.rfind('.'); dot != std::string::npos;
                  dot = dot ? k.rfind('.', dot - 1) : std::string::npos)
@@ -1482,7 +1513,7 @@ void Checkpoint::detect_import() {
         std::vector<std::string> groups;
         const std::string cg = "quantization_config.config_groups.";
         for (const std::string& k : meta_.keys)
-            if (k.rfind(cg, 0) == 0) {
+            if (k.starts_with(cg)) {
                 const std::string g = k.substr(cg.size(), k.find('.', cg.size()) - cg.size());
                 if (std::find(groups.begin(), groups.end(), g) == groups.end()) groups.push_back(g);
             }
@@ -1562,23 +1593,35 @@ void Checkpoint::detect_import() {
          * AWQ-scaled one ships a pre_quant_scale this does not apply) is refused by name. */
         std::vector<std::string> algos;
         const std::string ql = "quantization_config.quantized_layers.";
+        std::unordered_map<std::string, std::string> l_algo, l_gs;
         for (size_t i = 0; i < meta_.keys.size(); ++i) {
             const std::string& k = meta_.keys[i];
-            const std::string tail = ".quant_algo";
-            if (k.rfind(ql, 0) == 0 && k.size() > ql.size() + tail.size() &&
-                k.compare(k.size() - tail.size(), tail.size(), tail) == 0)
-                algos.push_back(meta_.vals[i]);
-            const std::string gtail = ".group_size";
-            if (k.rfind(ql, 0) == 0 && k.size() > ql.size() + gtail.size() &&
-                k.compare(k.size() - gtail.size(), gtail.size(), gtail) == 0 &&
-                meta_.vals[i] != "16" && import_why_.empty())
-                import_why_ = "ModelOpt's '" + k.substr(ql.size(), k.size() - ql.size() -
-                                                         gtail.size()) +
-                              "' has group_size " + meta_.vals[i] + "; NVFP4 is read in groups of 16";
+            if (!k.starts_with(ql)) continue;
+            for (const char* t : { ".quant_algo", ".group_size" }) {
+                const std::string tail = t;
+                if (k.size() > ql.size() + tail.size() &&
+                    k.compare(k.size() - tail.size(), tail.size(), tail) == 0)
+                    (tail == ".quant_algo" ? l_algo : l_gs)[k.substr(ql.size(), k.size() - ql.size() - tail.size())] =
+                        meta_.vals[i];
+            }
+        }
+        /* NVIDIA's 24GB release (MIXED_PRECISION): llama.cpp's IQ2_XXS for the experts and Q8_0 for the dense
+         * linears and the head, both as ggml blocks [N, K / block, bytes] in U8 (`packing: ggml`), and W4A16_NVFP4
+         * (the NVFP4 tensor form above) for the Mamba projections. A block type's group_size is its own (256,
+         * 32); only the FP4 layers are read in groups of 16. */
+        for (const auto& la : l_algo) {
+            algos.push_back(la.second);
+            const bool fp4 = la.second == "NVFP4" || la.second == "W4A16_NVFP4";
+            auto g = l_gs.find(la.first);
+            if (fp4 && g != l_gs.end() && g->second != "16" && import_why_.empty())
+                import_why_ = "ModelOpt's '" + la.first + "' has group_size " + g->second +
+                              "; NVFP4 is read in groups of 16";
+            if (la.second == "IQ2_XXS") mo_blocks_[la.first] = 16;
+            else if (la.second == "Q8_0") mo_blocks_[la.first] = 8;
         }
         const std::string top = qc("quant_algo");
         if (top != "MIXED_PRECISION") algos.push_back(top);
-        if (top == "NVFP4" && !qc("group_size").empty() && qc("group_size") != "16" &&
+        if ((top == "NVFP4" || top == "W4A16_NVFP4") && !qc("group_size").empty() && qc("group_size") != "16" &&
             import_why_.empty())
             import_why_ = "ModelOpt's NVFP4 here has group_size " + qc("group_size") +
                           "; it is read in groups of 16";
@@ -1587,10 +1630,15 @@ void Checkpoint::detect_import() {
         /* W4A16_NVFP4 is the same NVFP4 weight with bf16 activations, which is what this reader
          * serves either way: activations are quantised from their own values, never from a stored
          * input scale. NVIDIA's Muse Glimmer release states it per layer beside FP8. */
-        for (const std::string& a : algos)
-            if (a != "NVFP4" && a != "W4A16_NVFP4" && a != "FP8" && import_why_.empty())
-                import_why_ = "ModelOpt's quant_algo '" + a + "' is not one this reads; NVFP4, "
-                              "W4A16_NVFP4 and FP8 (per tensor), alone or per layer, are";
+        {
+            std::set<std::string> seen;
+            for (const std::string& a : algos)
+                if (a != "NVFP4" && a != "W4A16_NVFP4" && a != "FP8" && a != "IQ2_XXS" && a != "Q8_0" &&
+                    seen.insert(a).second && import_why_.empty())
+                    import_why_ = "ModelOpt's quant_algo '" + a + "' is not one this reads; NVFP4, "
+                                  "W4A16_NVFP4, FP8 (per tensor) and the GGUF blocks IQ2_XXS and Q8_0, "
+                                  "alone or per layer, are";
+        }
         if (import_why_.empty()) import_ = Import::ModelOpt;
         else import_why_ = "modelopt: " + import_why_;
     } else if (qm == "paroquant") {
@@ -1631,7 +1679,7 @@ void Checkpoint::detect_import() {
      * encoding. It stays in the container as provenance. */
     if (import_ != Import::None)
         for (std::string& k : meta_.keys)
-            if (k.rfind("quantization_config.", 0) == 0) k = "imported_" + k;
+            if (k.starts_with("quantization_config.")) k = "imported_" + k;
 }
 
 int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
@@ -1702,6 +1750,57 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
             *codes = p;
             *scale = &sliced_.back();
         }
+        imported_[name] = { *codes, *scale };
+        return RAD_OK;
+    }
+
+    if (im == Import::Fp8Mx) {
+        /* DeepSeek-V4 release form: every `X.weight` has its scale plane at `X.scale`.
+         * Block-FP8 codes (E4M3 [N, K]) read stock with that e8m0 block plane; routed
+         * experts are I8 [N, K/2], two e2m1 codes a byte (element 2j in the low nibble),
+         * and their `.scale` is e8m0 [N, K/32] -- the logical width is twice the packed
+         * one, `fp4_e2m1*e8m0[1x32]`. A tensor without a `.scale` (norms, biases, tables)
+         * is not this form. */
+        std::string base;
+        if (!weight_base(name, &base)) return RAD_E_NOTFOUND;
+        const SrcTensor* w = find(base + ".weight");
+        const SrcTensor* e = find(base + ".scale");
+        if (!w || !e) return RAD_E_NOTFOUND;
+        if (e->rad_dtype != RAD_E8M0 || e->shape.size() != 2)
+            return refuse(RAD_E_FORMAT, "'" + e->name + "' is not the e8m0 scale plane of '" +
+                                        w->name + "'");
+        if (w->rad_dtype == RAD_F8E4M3) {
+            /* Block-FP8 linears state [N/32, K/32]; the Engram table states one scale a
+             * row ([N, K/32]), which is a [1, 32] block. */
+            const bool blk = e->shape[0] == (w->shape[0] + 31) / 32 &&
+                             e->shape[1] == (w->shape[1] + 31) / 32;
+            const bool rowblk = e->shape[0] == w->shape[0] &&
+                                e->shape[1] == (w->shape[1] + 31) / 32;
+            if (w->shape.size() != 2 || !(blk || rowblk))
+                return refuse(RAD_E_SHAPE, "'" + e->name + "' is not the e8m0 " 
+                                          "block plane or per-row 32-wide scale plane of '" +
+                                          w->name + "'");
+            *codes = w;
+            *scale = e;
+            imported_[name] = { w, e };
+            return RAD_OK;
+        }
+        if (w->rad_dtype != RAD_I8 || w->shape.size() != 2 || w->shape[1] <= 0)
+            return RAD_E_NOTFOUND;  /* a bf16/f32 tensor beside the imported ones reads stock */
+        const int64_t N = w->shape[0], K = w->shape[1] * 2;
+        if (e->shape[0] != N || e->shape[1] * 32 != K)
+            return refuse(RAD_E_SHAPE, "'" + e->name + "' is not the [" + std::to_string(N) +
+                                       ", " + std::to_string(K / 32) + "] e8m0 exponent plane of '" +
+                                       w->name + "'");
+        SrcTensor c = *w;
+        c.rad_dtype = RAD_FP4E2M1;
+        c.shape = { N, K };
+        SrcTensor x = *e;
+        x.rad_dtype = RAD_E8M0;
+        sliced_.push_back(std::move(c));
+        *codes = &sliced_.back();
+        sliced_.push_back(std::move(x));
+        *scale = &sliced_.back();
         imported_[name] = { *codes, *scale };
         return RAD_OK;
     }
@@ -2141,13 +2240,37 @@ int Checkpoint::add_draft(const std::string& dir, const std::string& prefix) {
                 path_.c_str());
         return RAD_E_UNSUPPORTED;
     }
-    RAD_TRY(meta_merge_config_json(dir, prefix.empty() || prefix.back() != '.'
-                                            ? prefix
-                                            : prefix.substr(0, prefix.size() - 1), &meta_));
-    std::vector<std::string> shards;
-    std::unordered_map<std::string, std::string> owner;
-    RAD_TRY(shard_list(dir, dir + "/model.safetensors.index.json", false, &shards, &owner));
-    for (const auto& sh : shards) RAD_TRY(add_shard(sh, prefix, owner.empty() ? nullptr : &owner));
+    const std::string mprefix = prefix.empty() || prefix.back() != '.'
+                                ? prefix : prefix.substr(0, prefix.size() - 1);
+    /* Inkling 2 ships its own DSpark drafter inside the release: `mtp.safetensors` beside the
+     * model's shards, its geometry the `mtp_config` object of the model's own config.json. That
+     * drafter is not served (arch/inkling2 serves a DFlash2 drafter), and reading the directory as
+     * a drafter repository would merge the target's config and shards a second time, so it is
+     * refused by name. */
+    if (path_exists(dir + "/mtp.safetensors")) {
+        std::ifstream f(dir + "/config.json");
+        Json j;
+        try { if (f) f >> j; }
+        catch (const std::exception& e) {
+            RAD_ERR("%s/config.json: %s", dir.c_str(), e.what());
+            return RAD_E_FORMAT;
+        }
+        if (j.is_object() && j.contains("mtp_config") && j["mtp_config"].is_object()) {
+            RAD_ERR("%s is Inkling 2's release with its DSpark drafter (mtp.safetensors, "
+                    "config.json's mtp_config), which is not served; pass incoai's "
+                    "Inkling-2-Mini-DFlash2 directory as --draft-model "
+                    "(data/recipes/inkling2-mini-iq4r-v4.recipe)", dir.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    RAD_TRY(meta_merge_config_json(dir, mprefix, &meta_));
+    {
+        std::vector<std::string> shards;
+        std::unordered_map<std::string, std::string> owner;
+        RAD_TRY(shard_list(dir, dir + "/model.safetensors.index.json", false, &shards, &owner));
+        for (const auto& sh : shards)
+            RAD_TRY(add_shard(sh, prefix, owner.empty() ? nullptr : &owner));
+    }
     /* The drafter's own quantisation. One is read: ModelOpt's NVFP4 in groups of 16 (LiLiCorr
      * ships `modelopt_fp4` / `W4A16_NVFP4`: NVFP4 weights, bf16 activations, which a recipe rule
      * decodes like the target's NVFP4). Its names take that form (imports_at); anything else
@@ -2176,7 +2299,7 @@ int Checkpoint::add_draft(const std::string& dir, const std::string& prefix) {
         draft_prefix_ = prefix;
         /* As the target's: the tool's config is provenance, not a served format. */
         for (std::string& k : meta_.keys)
-            if (k.rfind(dq, 0) == 0) k = prefix + "imported_" + k.substr(prefix.size());
+            if (k.starts_with(dq)) k = prefix + "imported_" + k.substr(prefix.size());
     }
     meta_.finish();
     return RAD_OK;
@@ -2778,13 +2901,15 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
     }
     const RadNameMap& m = *maps.front();
     const bool ema = m.mode == RAD_MAP_EMA;
+    const bool mul = m.mode == RAD_MAP_MUL;
     const SrcTensor* a = ck.find(m.src[0]);
-    const SrcTensor* u = ema ? ck.find(m.src[1]) : nullptr;
-    if (!a || (ema && !u)) {
+    const SrcTensor* u = ema ? ck.find(m.src[1]) : mul ? ck.find(m.src[1]) : nullptr;
+    if (!a || ((ema || mul) && !u)) {
         if (optional && !a && !u) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
         return refuse(RAD_E_NOTFOUND, std::string("it needs checkpoint tensor") +
                                       (ema ? "s '" + std::string(m.src[0]) + "' and '" +
-                                                 m.src[1] + "'" : " '" + std::string(m.src[0]) +
+                                                 m.src[1] + "'" : mul ? "s '" + std::string(m.src[0]) +
+                                                 "' and '" + m.src[1] + "'" : " '" + std::string(m.src[0]) +
                                                                   "'") +
                                       ", not all in " + ck.path());
     }
@@ -2812,7 +2937,24 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
         return refuse(RAD_E_FORMAT, "'" + a->name + "' cannot be read as f32");
     out->rank = (uint32_t)rank;
     for (size_t i = 0; i < rank; ++i) out->shape[i] = a->shape[i];
-    if (m.mode == RAD_MAP_COLS) {
+    if (m.mode == RAD_MAP_MUL) {
+        /* A gain shipped as two equal factors: one elementwise product, flattened to the
+         * logical vector every model declares it as. */
+        if (a->shape.size() != u->shape.size() || a->shape != u->shape)
+            return refuse(RAD_E_SHAPE, "'" + a->name + "' and '" + u->name +
+                                       "' are not the same shape to multiply");
+        int64_t n = 1;
+        for (int64_t x : a->shape) n *= x;
+        std::vector<float> b((size_t)n);
+        if (piece_f32(*a, 0, n, src.data()) < 0 || piece_f32(*u, 0, n, b.data()) < 0)
+            return refuse(RAD_E_FORMAT, "a gain factor of '" + out->name + "' cannot be read as f32");
+        for (int64_t i = 0; i < n; ++i) src[(size_t)i] *= b[(size_t)i];
+        out->rank = 1;
+        out->shape[0] = n;
+        out->derived = std::move(src);
+        out->why = "it is the product of '" + a->name + "' and '" + u->name +
+                   "', at convert -- a recipe rule stores it";
+    } else if (m.mode == RAD_MAP_COLS) {
         const int64_t cb = a->shape[rank - 1], c0 = m.src_index[0], nc = m.src_rows[0];
         if (c0 < 0 || nc <= 0 || c0 + nc > cb)
             return refuse(RAD_E_SHAPE, "columns [" + std::to_string(c0) + ", " +
@@ -2905,7 +3047,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
     if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
-        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS)
+        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS ||
+        maps.front()->mode == RAD_MAP_MUL)
         return resolve_derived(ck, maps, optional, out, why);
     struct Src1 { const char* name; int index; int64_t rows; };
     std::vector<Src1> srcs;
@@ -2943,9 +3086,16 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                             [](char c) { return c >= '0' && c <= '9'; }))
                 if ((sc = ck.find(n.substr(0, at) + ".weight_scale"))) shard_scaled = true;
         }
-        /* A weight shipped in an imported form is read through that form's views. */
+        /* A weight shipped in an imported form is read through that form's views. A row piece
+         * of an NVFP4 import (e2m1 codes beside an f32 scale plane with one row a weight row, as
+         * import_piece makes ModelOpt's and compressed-tensors' NVFP4) takes those rows of both
+         * planes: a weight row's values depend on its own rows alone, and the second level is
+         * already folded into the f32 scale. Nemotron-H's in_proj, z | x|B|C | dt, is three row
+         * pieces of one NVFP4 tensor in NVIDIA's 2-bit release. Any other slice of an imported
+         * tensor is read whole. */
         const SrcTensor* lv = nullptr;
         bool per_tensor = false;
+        bool imported_rows = false;
         {
             const SrcTensor *ic = nullptr, *is = nullptr;
             std::string iw;
@@ -2967,29 +3117,68 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                 lv = el;
                 per_tensor = true;
             } else if (ir == RAD_OK) {
-                if (s1.index >= 0)
-                    return refuse(RAD_E_UNSUPPORTED, "it is a slice of '" + std::string(s1.name) +
-                                                     "', which the checkpoint ships quantised; an "
-                                                     "imported tensor is read whole");
+                if (s1.index >= 0) {
+                    const bool nvfp4_rows = row_pieces && ic->rad_dtype == RAD_FP4E2M1 && is &&
+                                            is->rad_dtype == RAD_F32 && ic->shape.size() == 2 &&
+                                            is->shape.size() == 2 && is->shape[0] == ic->shape[0];
+                    /* Any other row piece takes the codes' rows and the scale rows they cover
+                     * below, with a plain tensor's. */
+                    if (!nvfp4_rows && !row_pieces)
+                        return refuse(RAD_E_UNSUPPORTED, "it is a slice of '" + std::string(s1.name) +
+                                                         "', which the checkpoint ships quantised; "
+                                                         "an imported tensor is read whole");
+                    if (nvfp4_rows) {
+                        ic = ck.rows(*ic, s1.index, s1.rows, name.c_str());
+                        is = ic ? ck.rows(*is, s1.index, s1.rows, name.c_str()) : nullptr;
+                        if (!ic || !is) return refuse(RAD_E_SHAPE, "the rows it names are not there");
+                        imported_rows = true;
+                    }
+                }
                 st = ic;
                 sc = is;
             } else if (ir != RAD_E_NOTFOUND) {
                 return refuse(ir, iw);
             }
         }
-        /* A row piece (RAD_MAP_ROWS) of a plain tensor; a scale plane has no rows to match. */
-        if (st && row_pieces) {
-            if (sc)
-                return refuse(RAD_E_UNSUPPORTED, "it takes rows of '" + std::string(s1.name) +
-                                                 "', which the checkpoint ships block-scaled");
-            st = ck.rows(*st, s1.index, s1.rows, name.c_str());
+        /* A row piece (RAD_MAP_ROWS): rows [first, first + rows) of the codes, and of the
+         * scale plane they cover. A block plane's rows are [K/br]-wide blocks, so a cut of
+         * the codes must fall on a block boundary there. */
+        if (st && row_pieces && !imported_rows) {
+            const SrcTensor* whole = st;
+            const int64_t r0 = s1.index, nrows = s1.rows;
+            if (sc) {
+                const int64_t whole_rows = [&] {
+                    int64_t wh = 0, wc = 0;
+                    rad_enc_view((uint32_t)whole->shape.size(), whole->shape.data(), &wh, &wc);
+                    return wh;
+                }();
+                const int64_t br = ck.fp8_block_rows();
+                const int64_t srows = sc->shape.empty() ? 1 : sc->shape[0];
+                const int64_t blocks = br > 0 ? (whole_rows + br - 1) / br : 0;
+                if (srows == blocks && blocks != whole_rows) {
+                    if (r0 % br || nrows % br)
+                        return refuse(RAD_E_SHAPE, "rows [" + std::to_string(r0) + ", " +
+                                                   std::to_string(r0 + nrows) + ") of '" +
+                                                   std::string(s1.name) + "' do not fall on "
+                                                   + std::to_string(br) + "-row scale blocks");
+                    sc = ck.rows(*sc, r0 / br, nrows / br, name.c_str());
+                } else if (srows == whole_rows) {
+                    sc = ck.rows(*sc, r0, nrows, name.c_str());
+                } else {
+                    return refuse(RAD_E_SHAPE, "'" + sc->name + "' has " + std::to_string(srows) +
+                                               " rows for the " + std::to_string(whole_rows) +
+                                               " of '" + std::string(s1.name) + "'");
+                }
+                if (!sc) return refuse(RAD_E_SHAPE, "its scale rows are not there");
+            }
+            st = ck.rows(*whole, r0, nrows, name.c_str());
             if (!st) return refuse(RAD_E_SHAPE, "the rows it names are not there");
         }
         /* A sub-tensor index is always applied (ignoring it would give every expert the whole
          * stack). Its scale plane is sliced at the same index. A stack flattened into the rows of
          * a rank-2 tensor takes src_rows as the sub-tensor's row count. A per-tensor expert is
          * already one expert. */
-        else if (st && s1.index >= 0 && !per_tensor) {
+        else if (st && s1.index >= 0 && !per_tensor && !imported_rows) {
             if (s1.rows > 0 && st->shape.size() == 2)
                 st = ck.rows(*st, (int64_t)s1.index * s1.rows, s1.rows, name.c_str());
             else
@@ -3230,7 +3419,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
          * refuses them with `why`. */
         const int64_t br = ck.fp8_block_rows(), bc = ck.fp8_block_cols();
         const uint32_t sdt = out->scales[0]->rad_dtype;
-        int n_row = 0, n_blk = 0, n_one = 0;
+        int n_row = 0, n_blk = 0, n_one = 0, n_rowblk = 0;
         bool bad = false;
         for (size_t k = 0; k < out->pieces.size() && !bad; ++k) {
             const SrcTensor& pk = *out->pieces[k];
@@ -3246,6 +3435,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             const bool row1 = sk.shape.size() == 1 && sk.shape[0] == r;
             const bool blk = sk.shape.size() >= 2 && sr == want_r && scl == want_c;
             const bool row2 = sk.shape.size() >= 2 && sr == r && scl == 1;
+            const bool rowblk = sk.shape.size() >= 2 && sr == r && scl == want_c && !row2;
             if (sk.rad_dtype != sdt) {
                 bad = true;
                 out->why = "its FP8 pieces' scale planes differ in dtype";
@@ -3254,13 +3444,15 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                 ++n_one;
             } else if (row1) {
                 ++n_row;
+            } else if (row2) {
+                ++n_row;
             } else if (blk) {
                 ++n_blk;
                 if (out->why.empty() && k + 1 < out->pieces.size() && r % br)
                     out->why = "'" + pk.name + "' ends inside a scale block, so the next piece's "
                                "scales cannot follow it";
-            } else if (row2) {
-                ++n_row;
+            } else if (rowblk) {
+                ++n_rowblk;
             } else {
                 bad = true;
                 out->why = "'" + sk.name + "' is neither the [" + std::to_string(want_r) + ", " +
@@ -3269,7 +3461,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                            "scale per row";
             }
         }
-        if (!bad && n_row && n_blk) {
+        const int n_kind = (n_row ? 1 : 0) + (n_blk ? 1 : 0) + (n_rowblk ? 1 : 0);
+        if (!bad && n_kind > 1) {
             bad = true;
             out->why = "its FP8 pieces disagree: some scale per row, some per " +
                        std::to_string(br) + "x" + std::to_string(bc) + " block";
@@ -3303,6 +3496,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             if (n_row) rad_enc_add_plane(&out->enc, "scale", sdt, 1, 0);
+            else if (n_rowblk) rad_enc_add_plane(&out->enc, "scale", sdt, 1, bc);
             else rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
     } else if (p0.ct_group) {
@@ -3347,10 +3541,10 @@ namespace {
  *
  * ggml block types decodable to f32. Their geometry lives in core/text; decoding lives here, where
  * weights are read. Q4_K, Q5_K and Q6_K are the K-quants the GGUF releases ship, IQ4_NL the
- * non-linear 4-bit. */
+ * non-linear 4-bit, IQ2_XXS the 2-bit grid of NVIDIA's Nemotron-3.5-Bolt release. */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
-       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30,
-       GGML_IQ4_NL = 20 };
+       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_IQ2_XXS = 16,
+       GGML_BF16 = 30, GGML_IQ4_NL = 20 };
 
 /* IQ4_NL's non-linear levels (llama.cpp's kvalues_iq4nl), one per 4-bit code. */
 static const int8_t kIq4NlLevels[16] = {
@@ -3478,6 +3672,28 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                 }
             }
             return RAD_OK;
+        case GGML_IQ2_XXS: {
+            static const uint8_t kmask[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+            for (int64_t b = 0; b < n / 256; ++b, p += 66) {
+                const float d = half(p);
+                const uint8_t* qs = p + 2;
+                for (int ib = 0; ib < 8; ++ib) {
+                    uint32_t a0, a1;
+                    std::memcpy(&a0, qs + 8 * ib, 4);
+                    std::memcpy(&a1, qs + 8 * ib + 4, 4);
+                    const float db = d * (0.5f + (a1 >> 28)) * 0.25f;
+                    for (int l = 0; l < 4; ++l) {
+                        const uint8_t* g =
+                            (const uint8_t*)(ggml_planes::kIq2xxsGrid + ((a0 >> (8 * l)) & 0xFFu));
+                        const uint8_t s = ggml_planes::kSignsIq2xs[(a1 >> (7 * l)) & 127];
+                        for (int j = 0; j < 8; ++j)
+                            dst[b * 256 + ib * 32 + l * 8 + j] =
+                                db * g[j] * (s & kmask[j] ? -1.f : 1.f);
+                    }
+                }
+            }
+            return RAD_OK;
+        }
         default:
             return RAD_E_UNSUPPORTED;
     }
@@ -3866,20 +4082,28 @@ int Checkpoint::bailingmoe3_layouts() {
      * orientation (the shared expert, the KDA and the norms) needs only a name, which the
      * plugin takes from the gguf_source meta. */
     const int64_t n_layer = meta_.m.n_layers;
-    const char* grp_s = meta_.get("layer_group_size");
-    const int64_t group = grp_s ? std::stoll(grp_s) : 4;
-    const char* dense_s = meta_.get("first_k_dense_replace");
-    const int64_t dense = dense_s ? std::stoll(dense_s) : 1;
-    const char* heads_s = meta_.get("num_attention_heads");
-    const int64_t heads = heads_s ? std::stoll(heads_s) : 16;
-    const char* latent_s = meta_.get("kv_lora_rank");
-    const int64_t latent = latent_s ? std::stoll(latent_s) : 512;
-    const char* ff_s = meta_.get("moe_intermediate_size");
-    const int64_t ff = ff_s ? std::stoll(ff_s) : 512;
+    /* A metadata value that is not a whole number refuses the container, like an out-of-range
+     * one below (std::stoll would throw out of the open). */
+    int64_t group = 0, dense = 0, heads = 0, latent = 0, ff = 0, n_expert = 0;
+    auto number = [&](const char* key, int64_t fallback, int64_t* out) {
+        const char* v = meta_.get(key);
+        if (!v) { *out = fallback; return true; }
+        char* end = nullptr;
+        errno = 0;
+        const long long x = std::strtoll(v, &end, 10);
+        if (end == v || *end != '\0' || errno != 0) {
+            RAD_ERR("%s: '%s' is not a whole number", key, v);
+            return false;
+        }
+        *out = x;
+        return true;
+    };
+    if (!number("layer_group_size", 4, &group) || !number("first_k_dense_replace", 1, &dense) ||
+        !number("num_attention_heads", 16, &heads) || !number("kv_lora_rank", 512, &latent) ||
+        !number("moe_intermediate_size", 512, &ff) || !number("num_experts", 0, &n_expert))
+        return RAD_E_FORMAT;
     /* The experts' third axis is the embedding width, not the dense feed-forward's. */
     const int64_t emb = meta_.m.n_embd;
-    const char* nexp_s = meta_.get("num_experts");
-    const int64_t n_expert = nexp_s ? std::stoll(nexp_s) : 0;
     /* Every loop below walks to n_layer on the open path, so the counts must be bounded HERE:
      * a GGUF claiming 2^62 layers would spend centuries in name probes, never answering, never
      * refusing -- a hostile container's hang, not a slow load. No real model of this family is
@@ -3961,8 +4185,9 @@ int Checkpoint::bailingmoe3_layouts() {
          * source cannot be row-mapped, so split it into the plain nope and rope blocks. The
          * per-head boundary comes from the meta the reader republished, so the split only runs
          * when the geometry is the one the plugin will consume. */
-        const char* nps = meta_.get("qk_nope_head_dim"), *rps = meta_.get("qk_rope_head_dim");
-        const int64_t qn = nps ? std::stoll(nps) : 0, qr = rps ? std::stoll(rps) : 0;
+        int64_t qn = 0, qr = 0;
+        if (!number("qk_nope_head_dim", 0, &qn) || !number("qk_rope_head_dim", 0, &qr))
+            return RAD_E_FORMAT;
         const SrcTensor* qb = find(fmt("blk.%lld.attn_q_b.weight", (long long)l));
         /* The row product is checked, not trusted: heads and the two rope widths arrive from
          * the container, and a wrapped product that happened to equal the tensor's rows would
@@ -4218,16 +4443,30 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     }
     if (w.ggml_blocks) {
         /* GGUF blocks, split one row at a time into every plane's row: a call pays the whole row
-         * for the one plane it keeps, and rad-convert asks plane by plane. */
+         * for the one plane it keeps, and rad-convert asks plane by plane. A TABLE plane's row
+         * buffer holds the whole table (the split fills it on every call); its rows come out of
+         * it, so a tensor shorter than the table still yields the table in full. */
         int64_t at[RAD_ENC_MAX_PLANES + 1] = { 0 };
         for (int i = 0; i < w.enc.n_planes; ++i) {
             int64_t qr = 0, qc = 0;
             rad_enc_plane_dims(&w.enc.plane[i], 1, w.cols, &qr, &qc);
-            at[i + 1] = at[i] + rad_enc_row_bytes(w.enc.plane[i].dtype, qc);
+            int64_t bytes = rad_enc_row_bytes(w.enc.plane[i].dtype, qc);
+            if (w.enc.plane[i].kind == RAD_PLANE_TABLE)
+                bytes = rad_enc_plane_bytes(&w.enc.plane[i], 1, w.cols);
+            at[i + 1] = at[i] + bytes;
         }
         std::vector<uint8_t> split((size_t)at[w.enc.n_planes]);
         uint8_t* row[RAD_ENC_MAX_PLANES] = { nullptr };
         for (int i = 0; i < w.enc.n_planes; ++i) row[i] = split.data() + at[i];
+        const RadEncPlane& pk = w.enc.plane[k];
+        if (pk.kind == RAD_PLANE_TABLE) {
+            const SrcTensor& p0 = *w.pieces[0];
+            ggml_plane_row(p0.ggml, (const uint8_t*)p0.data, w.cols, row);
+            const int64_t trow = rad_enc_row_bytes(pk.dtype, pk.extent[1]);
+            for (int64_t r = 0; r < nr; ++r)
+                std::memcpy(o + r * trow, row[k] + (r0 + r) * trow, (size_t)trow);
+            return RAD_OK;
+        }
         int64_t base = 0;
         for (const SrcTensor* piece : w.pieces) {
             const int64_t prows = piece->numel() / w.cols, rb = piece->bytes / prows;

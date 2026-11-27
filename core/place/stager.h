@@ -227,9 +227,9 @@ private:
  * same drain did.
  *
  * A layer the count source cannot give counts for (the first pass, before any report) is read
- * whole, and since that read needs no counts it goes ahead of time as before: at the pass's
- * first op for the first routed layer, at a layer's trigger for the next one, into the buffer
- * just released.
+ * whole, and since that read needs no counts it goes ahead of time: at the pass's first op for
+ * the first routed layer, at a layer's trigger for the next one, into the buffer just
+ * released.
  *
  * So is every layer of a pass large enough that its rows route nearly every expert, kWholeRows
  * rows an expert on average by the model's expert count and top-k (whole_rows()). An exact read

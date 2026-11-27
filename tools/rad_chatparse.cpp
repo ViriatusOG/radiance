@@ -51,13 +51,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <random>
-#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -67,13 +64,6 @@ using namespace rad::chatdiff;
 using clk = std::chrono::steady_clock;
 
 namespace {
-
-std::string slurp(const std::string& p) {
-    std::ifstream f(p);
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
 
 bool is_dir(const std::string& p) {
     struct stat st;
@@ -111,7 +101,10 @@ struct Tok {
             return RAD_E_FORMAT;
         }
         vocab = std::make_shared<Vocab>();
-        if (vocab->load(std::move(vb)) < 0) { *why = "the vocabulary did not load"; return RAD_E_FORMAT; }
+        if (vocab->load(std::move(vb)) < 0) {
+            *why = "the vocabulary did not load";
+            return RAD_E_FORMAT;
+        }
         return tok.init(vocab);
     }
 
@@ -135,7 +128,7 @@ struct Tok {
 
 struct Tally {
     int replies = 0, same = 0, recovered = 0, bare_lift = 0, violations = 0;
-    int decoder_changed = 0;    /* the decoded text is not the text: a control token not preserved */
+    int decoder_changed = 0;    /* decoded text is not the text: a control token not preserved */
     int old_stream_disagrees = 0;
     int shown = 0, markers_lost = 0;
     size_t tokens = 0, bytes = 0;
@@ -155,10 +148,12 @@ bool old_stream_agrees(const Bench& b, const std::vector<std::string>& pieces, d
     s.push(acc, true);
     *secs += since(t0);
     const legacy::Answer a = b.old_parse(acc);
-    if (s.content() != a.content || s.reasoning() != a.reasoning || s.names().size() != a.calls.size())
+    if (s.content() != a.content || s.reasoning() != a.reasoning ||
+        s.names().size() != a.calls.size())
         return false;
     for (size_t i = 0; i < a.calls.size(); ++i)
-        if (s.names()[i] != a.calls[i].name || s.arguments()[i] != a.calls[i].arguments) return false;
+        if (s.names()[i] != a.calls[i].name || s.arguments()[i] != a.calls[i].arguments)
+            return false;
     return true;
 }
 
@@ -248,7 +243,8 @@ Timing time_new(const Bench& b, const std::vector<std::string>& pieces, int reps
             server::ChatDeltaStream st(req, 0, &bridge);
             size_t n = st.first_chunk().size();
             for (const std::string& p : pieces) n += st.push(p, false).size();
-            n += st.final_chunk(server::Finish::Stop, server::TimingsOut(), server::UsageOut()).size();
+            n += st.final_chunk(server::Finish::Stop, server::TimingsOut(), server::UsageOut())
+                     .size();
             if (n == 0) std::fprintf(stderr, "no output\n");
         }
         best.sse = std::min(best.sse, since(t0));
@@ -326,9 +322,10 @@ size_t sse_not_canonical(const std::string& out, size_t* events) {
 }
 
 /* Host cost of one streamed token by component, on the real tokenizer: decoder, server text
- * bookkeeping, reply reader, chunk JSON, and the tool-call grammar (accept_token, and fill_mask once
- * triggered). Each runs over the whole reply `reps` times; medians and spread are reported. Returns
- * the contract violations: non-canonical chunk JSON, or a grammar that refused the reply. */
+ * bookkeeping, reply reader, chunk JSON, and the tool-call grammar (accept_token, and fill_mask
+ * once triggered). Each runs over the whole reply `reps` times; medians and spread are
+ * reported. Returns the contract violations: non-canonical chunk JSON, or a grammar that refused
+ * the reply. */
 int breakdown(const Bench& b, const Tok& tk, const TokenView& view, int reps) {
     const Model& m = b.model();
     /* A long write with string values, and calls with integer and boolean values. */
@@ -586,7 +583,8 @@ int main(int argc, char** argv) {
         Tok tk;
         std::string why;
         if (tk.load(dir, &why) < 0) { std::fprintf(stderr, "  %s\n", why.c_str()); return 1; }
-        const std::string jinja = slurp(dir + "/chat_template.jinja");
+        std::string jinja;
+        read_file_bytes(dir + "/chat_template.jinja", &jinja);
         std::printf("   tokenizer: %d tokens; template: %zu bytes\n", tk.vocab->n_tokens(),
                     jinja.size());
 
@@ -660,7 +658,8 @@ int main(int argc, char** argv) {
             const std::string text = long_reply(*m, n);
             const std::vector<std::string> p = tk.pieces(text, b.prompt().preserved_tokens);
             const Timing nw = time_new(b, p, 3);
-            std::printf("   %9zu %8zu | %12s %12.3f %9s | %12s %12.3f   (%.1f ns/byte, %.2f us/token)\n",
+            std::printf("   %9zu %8zu | %12s %12.3f %9s | %12s %12.3f   "
+                        "(%.1f ns/byte, %.2f us/token)\n",
                         text.size(), p.size(), "-", nw.sse * 1e3, "", "-", nw.parser * 1e3,
                         nw.parser / text.size() * 1e9, nw.parser / p.size() * 1e6);
         }

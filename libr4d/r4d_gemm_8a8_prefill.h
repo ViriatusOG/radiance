@@ -1,5 +1,5 @@
-// r4d_gemm_8a8_prefill.h -- the int8 and fp8 prefill tile's body (gemm_8a8_prefill_body), shared
-// by r4d_gemm_fp8a8.hip's tiles and r4d_gemm_iqr.hip's, which decodes its weight in the body's
+// r4d_gemm_8a8_prefill.h -- the int8 prefill tile's body (gemm_8a8_prefill_body), shared
+// by r4d_gemm_i8a8.hip's tiles and r4d_gemm_iqr.hip's, which decodes its weight in the body's
 // `begin` hook. Included inside an anonymous namespace after the includer's kWave (32) and kBlock
 // (128), with r4d_fp8_wmma.h's names in scope.
 
@@ -31,7 +31,7 @@ constexpr uint32_t kPrefillLds = 2u * kPBM * (kPFK + 8u);
 // lane a tile (and the block's one weight scale), and the store is one 16-byte write.
 //
 // What decides the layout is LDS bandwidth. gfx1201 serves 64 bytes of LDS a clock per CU, loads
-// and stores alike, and issues an fp8 WMMA every 8 clocks per SIMD, so a CU has 256 bytes of LDS
+// and stores alike, and issues an 8-bit WMMA every 8 clocks per SIMD, so a CU has 256 bytes of LDS
 // per WMMA at the WMMA rate (libr4d/isa/wmmamix.hip). Staging both operands with one activation
 // tile x eight weight tiles a wave moves 288 bytes of fragment reads and 64 of stores per WMMA,
 // which alone caps a loop at ~73% of the WMMA rate (measured with nothing else in it). This layout
@@ -61,18 +61,18 @@ constexpr uint32_t kPrefillLds = 2u * kPBM * (kPFK + 8u);
 //   - four threads an activation row, 16 bytes each (whole 64-byte segments a load): neutral;
 //   - raw buffer loads with 32-bit offsets for both operands: 20% slower;
 //   - s_setprio around the WMMA run: neutral. CU mode (-mcumode): ~10% slower.
-/* RB (I8 only): the weight's scale is one per RB rows and 128 K, as a trellis on libquant's tcq_rb
- * grid widens (r4d_fp8_layout.cpp; the per-row plane holds the block's one value in each row):
- * RB 8, a lane's eight accumulator rows, one scale per lane per tile; RB 32, a wave's two tiles,
- * one scale per wave as the fp8 tile has. The fold is then the fp8 one, one fma per slot: the
- * int32 accumulator starts each 128-K block at 0x4B400000, so the slot read as an f32 is exactly
- * 12582912 + sum (|sum| <= 128 * 127 * 127 < 2^22) and needs no conversion. The scales are summed
- * in `corr` (per lane and tile at RB 8, per lane at RB 32), and 12582912 times them leaves `out`
- * every kRbFlush blocks and at the store, which keeps the f32 sum within a few bias terms of its
- * value (6.8e-4 of the output's rms against the exact fold, under bf16's own rounding).
+/* RB: the weight's scale is one per RB rows and 128 K, as a trellis on libquant's tcq_rb grid
+ * widens (r4d_fp8_layout.cpp; the per-row plane holds the block's one value in each row): RB 8, a
+ * lane's eight accumulator rows, one scale per lane per tile; RB 32, a wave's two tiles, one scale
+ * per wave. The fold is then a block fold, one fma per slot: the int32 accumulator starts each
+ * 128-K block at 0x4B400000, so the slot read as an f32 is exactly 12582912 + sum
+ * (|sum| <= 128 * 127 * 127 < 2^22) and needs no conversion. The scales are summed in `corr` (per
+ * lane and tile at RB 8, per lane at RB 32), and 12582912 times them leaves `out` every kRbFlush
+ * blocks and at the store, which keeps the f32 sum within a few bias terms of its value (6.8e-4 of
+ * the output's rms against the exact fold, under bf16's own rounding).
  *
- * M = 2048, one rank, the median of 7 interleaved rounds against the fp8 tile at the same clocks:
- * RB 32 -4..0% (gate_up, down, ssm_inz, o), RB 8 -1..+3%, the per-row int8 tile +15..19%. */
+ * At M = 2048 on one rank RB 32 is the fastest form, RB 8 is within a few percent of it, and the
+ * per-row tile is 15-20% slower. */
 constexpr int kRbBias = 0x4B400000;
 constexpr float kRbBiasF = 12582912.0f;
 constexpr uint32_t kRbFlush = 8;
@@ -84,7 +84,7 @@ __device__ __forceinline__ f8v rb_first() {
 
 /* What the tile does around its K loop besides the GEMM: `begin(bm, bn, lds)` once the block's
  * bands are known and before any weight load, with the activation's staging LDS (`kPrefillLds`
- * bytes) free to borrow; `end(bn)` after the block's stores. The int8 and fp8 tiles do nothing; the
+ * bytes) free to borrow; `end(bn)` after the block's stores. The int8 tiles do nothing; the
  * IQR tile decodes its weight there (r4d_gemm_iqr.hip). */
 struct PrefillPlain {
     __device__ void begin(uint32_t, uint32_t, uint8_t*) const {}
@@ -103,17 +103,17 @@ struct PrefillPlain {
  * eight scales are eight gathers a row apart. The MMA and the fold are the fragment tile's, so the
  * bf16 product is that tile's. Vision declares this form (`w_rb` 1): a per-request tower can sit
  * on the mapped tier, which reads the container where it lies and cannot take a relayout. */
-template <bool I8, int RB, class Pre, bool ROWF = false, uint32_t SB = kBlock, bool ROWM = false>
+template <int RB, class Pre, bool ROWF = false, uint32_t SB = kBlock, bool ROWM = false>
 __device__ __forceinline__ void gemm_8a8_prefill_body(
     const uint8_t* __restrict__ A, const float* __restrict__ Sa, const uint8_t* __restrict__ W,
     const uint16_t* __restrict__ Sw, uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
     uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld, const Pre& pre,
     const float* __restrict__ Rs = nullptr, const float* __restrict__ Cf = nullptr,
     uint32_t w_ld = 0) {
-    static_assert(!ROWM || (I8 && RB == 0 && !ROWF && SB == kBlock),
+    static_assert(!ROWM || (RB == 0 && !ROWF && SB == kBlock),
                   "the container-form tile is the per-row int8 one");
     static_assert(!ROWF || RB == 32, "a row's scale and a block's factor fold as RB 32's one scale");
-    static_assert(SB == kBlock || (I8 && RB == 0 && SB == 256u), "a 256 group is the per-row int8 tile's");
+    static_assert(SB == kBlock || (RB == 0 && SB == 256u), "a 256 group is the per-row tile's");
     constexpr uint32_t kTPB = SB / kPFK;   // staged tiles a scale block
     constexpr uint32_t P = lds_pitch<kPFK>();
     static_assert(kPBM * 2u == kPWaves * kWave, "two threads stage an activation row");
@@ -174,7 +174,6 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
     // Activation rows this wave reads from the staged tile, and the lane's column in each.
     const uint32_t arow = wa * kPTA * 16u;
 
-    static_assert(!RB || I8, "RB is the int8 tile's");
     static_assert(RB == 0 || RB == 8 || RB == 32, "a weight scale per 8 or 32 rows");
     static_assert(RB != 32 || kPTW * 16 == 32, "RB 32 is a wave's rows");
     constexpr uint32_t kCI = RB == 8 ? kPTW : 1u;   // corr's tiles: one per tile, or the wave's
@@ -225,8 +224,8 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
                 const i2v af = frag_of(cur[i], ks);
 #pragma unroll
                 for (uint32_t j = 0; j < kPTA; ++j)
-                    raw[i][j] = mma8<I8>(af, bf[j],
-                                         (half == 0u && ks == 0u) ? rb_first<RB>() : raw[i][j]);
+                    raw[i][j] = mma_i8(af, bf[j],
+                                        (half == 0u && ks == 0u) ? rb_first<RB>() : raw[i][j]);
             }
         }
     };
@@ -236,7 +235,7 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
         // for the block's 128 rows, or with I8 one per row, a lane's eight rows of a tile adjacent
         // in the tile-major [N/16][K/128][16] plane.
         float ws = 0.0f;
-        uint4 w8[I8 && !RB ? kPTW : 1u];
+        uint4 w8[!RB ? kPTW : 1u];
         float wb[RB == 8 ? kPTW : 1u];
         if constexpr (ROWF) {
             ws = Cf[kb];
@@ -247,7 +246,7 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
 #pragma unroll
             for (uint32_t i = 0; i < kPTW; ++i)
                 wb[i] = bscale(Sw[((size_t)(wt0 + i) * nkb + kb) * 16u + (lane >> 4) * 8u]);
-        } else if constexpr (I8) {
+        } else {
 #pragma unroll
             for (uint32_t i = 0; i < kPTW; ++i) {
                 if constexpr (ROWM) {
@@ -266,8 +265,6 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
                                             (lane >> 4) * 8u);
                 }
             }
-        } else {
-            ws = bscale(Sw[(size_t)(n0 / kBlock) * sw_ld + kb]);
         }
         tile(kb, 0u, w0, w1);
         tile(kb, 1u, w1, w0);
@@ -306,18 +303,13 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
                     continue;
                 }
                 float s[8];
-                if constexpr (I8) {
-                    const uint32_t d[4] = { w8[i].x, w8[i].y, w8[i].z, w8[i].w };
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t)
-                        s[t] = as * bscale((uint16_t)(d[t / 2] >> (16 * (t % 2))));
-                } else {
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t) s[t] = ws * as;
-                }
+                const uint32_t d[4] = { w8[i].x, w8[i].y, w8[i].z, w8[i].w };
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t)
-                    out[i][j][t] = __builtin_fmaf(acc_val<I8>(raw[i][j][t]), s[t], out[i][j][t]);
+                    s[t] = as * bscale((uint16_t)(d[t / 2] >> (16 * (t % 2))));
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t)
+                    out[i][j][t] = __builtin_fmaf(acc_i32(raw[i][j][t]), s[t], out[i][j][t]);
             }
         }
     }

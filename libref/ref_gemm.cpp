@@ -594,6 +594,66 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
     return embed_gather(a, &a->t[0], &a->t[1], &a->t[2], p_f32(a, "mult", 1.0f));
 }
 
+/* A gather from a table stored as single-level affine planes, read in place: no relayout, so a
+ * table too large to copy (an n-gram embedding of hundreds of GiB) is gathered from the
+ * container's own bytes on whatever tier holds them.
+ *
+ *   x[m, i] = v * scale[id, i / group] * mult,  v = table[code] with a table, else the code.
+ *
+ * Codes are i8 or u8, or 4-bit (u4 an unsigned index, i4 signed) elements of a bit stream along the
+ * row, lowest bits first (rad_encoding.h). This is how llama.cpp's Q8_0, Q4_0 and IQ4_NL blocks
+ * decode once imported as planes (libquant/lq_ggml_planes.h), product for product. Padding, bounds
+ * and `vocab_offset` behave as embed_lookup's. */
+int ref_embed_lookup_planes(const RadArgs* a, RadStream) {
+    if (a->n_t < 5 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) ||
+        !rad_arg_in(a, 4))
+        return RAD_E_INVAL;
+    const RadTensor &tok = a->t[0], &cd = a->t[1], &sc = a->t[2], &tb = a->t[3], &x = a->t[4];
+    const bool tab = tb.data != nullptr;
+    const int64_t E = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0), G = p_int(a, "group", 0);
+    const int64_t voff = p_int(a, "vocab_offset", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (E <= 0 || V <= 0 || G <= 0 || E % G || voff < 0 || cd.rank != 2 || cd.shape[0] < V ||
+        cd.shape[1] != E || sc.rank != 2 || sc.shape[0] < V || sc.shape[1] != E / G)
+        return RAD_E_SHAPE;
+    const uint32_t cdt = cd.dtype;
+    const int bits = (cdt == RAD_U4 || cdt == RAD_I4) ? 4 : (cdt == RAD_U8 || cdt == RAD_I8) ? 8
+        : 0;
+    if (!bits) return RAD_E_DTYPE;
+    /* A table is indexed by an unsigned code and must hold every one of them. */
+    if (tab && (cdt == RAD_I4 || cdt == RAD_I8 || numel(&tb) < (int64_t)1 << bits))
+        return RAD_E_DTYPE;
+    const int64_t rb = rad_dtype_bytes(cdt, E);
+    const int64_t M = numel(&x) / E;
+    if (rb <= 0 || M <= 0 || numel(&tok) < M) return RAD_E_SHAPE;
+    if (voff == 0 && a->world_size <= 1)
+        for (int64_t m = 0; m < M; ++m)
+            if (ld_int(tok.dtype, tok.data, offlin(&tok, m)) >= V) return RAD_E_INVAL;
+    REF_PAR_FOR(M * E)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t id = ld_int(tok.dtype, tok.data, offlin(&tok, m)) - voff;
+        const int64_t xb = rowoff(&x, m, E), xs = laststride(&x);
+        if (id < 0 || id >= V) {
+            for (int64_t i = 0; i < E; ++i) stt(&x, xb + i * xs, 0.0f);
+            continue;
+        }
+        const uint8_t* row = (const uint8_t*)cd.data + id * rb;
+        const int64_t sb = rowoff(&sc, id, E / G), ss = laststride(&sc);
+        for (int64_t i = 0; i < E; ++i) {
+            int code;
+            if (bits == 8) {
+                code = cdt == RAD_I8 ? (int)(int8_t)row[i] : (int)row[i];
+            } else {
+                const int u = (row[i >> 1] >> ((i & 1) * 4)) & 15;
+                code = cdt == RAD_I4 ? (u ^ 8) - 8 : u;
+            }
+            const float v = tab ? ld_dt(tb.dtype, tb.data, code) : (float)code;
+            stt(&x, xb + i * xs, v * ldt(&sc, sb + (i / G) * ss) * mult);
+        }
+    }
+    return RAD_OK;
+}
+
 /* A gather from a quantised table with one scale for the whole table.
  *
  * A separate op rather than a dtype on embed_lookup because operands are positional and this one
@@ -607,10 +667,12 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
  */
 int ref_embed_lookup_q(const RadArgs* a, RadStream) {
     /* `scale` (operand 2) is optional; the other three are required. */
-    if (a->n_t < 4 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3)) return RAD_E_INVAL;
+    if (a->n_t < 4 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3))
+        return RAD_E_INVAL;
     const RadTensor* sc = &a->t[2];
     /* An absent scale is 1, so a plain bf16 n-gram embedding read in place from a container takes
-     * the same op and host path, keeping a table too large for any device pool on the mapped tier. */
+     * the same op and host path, keeping a table too large for any device pool on the mapped
+     * tier. */
     const float scale = sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f;
     return embed_gather(a, &a->t[0], &a->t[1], &a->t[3], scale);
 }

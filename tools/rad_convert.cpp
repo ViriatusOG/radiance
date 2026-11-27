@@ -30,6 +30,8 @@
 #include "util/json.h"
 
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -45,6 +47,8 @@
 #include <deque>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -62,6 +66,90 @@ namespace {
 
 bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
 
+/* ---- resumable writes: a journal of finished large weights beside the output ---------------
+ * Without it a kill throws away every finished expert, because begin() truncates. The journal
+ * names each large weight after its planes are written, so the next run can keep those and
+ * re-quantise only the unfinished remainder. It is deleted when finish() succeeds. */
+std::mutex g_journal_mu;
+
+std::string journal_path(const std::string& out) { return out + ".journal"; }
+
+bool journal_write(const std::string& path, const std::string& text) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    const char* p = text.data();
+    int64_t left = (int64_t)text.size();
+    while (left > 0) {
+        const ssize_t n = ::write(fd, p, (size_t)left);
+        if (n < 0) { if (errno == EINTR) continue; ::close(fd); return false; }
+        p += n; left -= n;
+    }
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+bool journal_reset(const std::string& path, const std::string& header) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    const bool ok = ::write(fd, header.data(), header.size()) == (ssize_t)header.size() &&
+                    ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+/* FNV-1a over the plan, so a journal from another recipe or checkpoint is refused rather than
+ * silently resumed against planes it does not describe. */
+uint64_t journal_fnv(const std::string& s, uint64_t h) {
+    for (unsigned char c : s) { h ^= (uint64_t)c; h *= 1099511628211ull; }
+    return h;
+}
+
+std::string journal_fingerprint(const std::string& in, const std::string& out,
+                                const std::string& recipe_text,
+                                const std::vector<std::string>& names,
+                                const std::vector<int64_t>& bytes,
+                                const std::vector<std::string>& encs) {
+    uint64_t h = 1469598103934665603ull;
+    h = journal_fnv(in, h);
+    h = journal_fnv(out, h);
+    h = journal_fnv(recipe_text, h);
+    for (size_t i = 0; i < names.size(); ++i) {
+        h = journal_fnv(names[i], h);
+        h = journal_fnv(std::to_string(bytes[i]), h);
+        h = journal_fnv(encs[i], h);
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h);
+    return buf;
+}
+
+bool journal_read(const std::string& path, std::string* fp, std::set<std::string>* done) {
+    std::ifstream f(path);
+    std::string line;
+    if (!std::getline(f, line)) return false;
+    std::istringstream h(line);
+    std::string magic, tag, out;
+    if (!(h >> magic >> tag >> *fp >> out) || magic != "RADJOURNAL" || tag != "1") return false;
+    while (std::getline(f, line)) {
+        std::istringstream l(line);
+        std::string what, name;
+        if (!(l >> what >> name) || what != "DONE") continue;
+        done->insert(name);
+    }
+    return true;
+}
+
+/* The directory the head and encoder files are read from: --config, else the input checkpoint
+ * directory, else the directory holding the input file. */
+std::string checkpoint_dir(const std::string& in, const std::string& config_dir) {
+    if (!config_dir.empty()) return config_dir;
+    struct stat st{};
+    if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return in;
+    const size_t slash = in.find_last_of('/');
+    return slash == std::string::npos ? "." : in.substr(0, slash);
+}
+
 /* clef (decision.type=clef): the head's geometry from joint_head_config.json beside the
  * checkpoint, and its three learned scalars from the head's own tensors (joint_head.safetensors,
  * merged with --add), into the header. The plugin declares the head from the geometry
@@ -76,15 +164,7 @@ int clef_metadata(const std::string& in, const std::string& config_dir, const Ch
                 "container's architecture is '%s')", in.c_str(), meta.arch.c_str());
         return -1;
     }
-    std::string dir = config_dir;
-    if (dir.empty()) {
-        struct stat st{};
-        if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = in;
-        else {
-            const size_t slash = in.find_last_of('/');
-            dir = slash == std::string::npos ? "." : in.substr(0, slash);
-        }
-    }
+    const std::string dir = checkpoint_dir(in, config_dir);
     const std::string path = dir + "/joint_head_config.json";
     std::ifstream f(path);
     if (!f) {
@@ -97,7 +177,8 @@ int clef_metadata(const std::string& in, const std::string& config_dir, const Ch
         RAD_ERR("%s: %s", path.c_str(), e.what());
         return -1;
     }
-    for (const char* k : { "hidden_size", "width", "routing_layers", "layers", "heads", "feedforward" }) {
+    for (const char* k :
+         { "hidden_size", "width", "routing_layers", "layers", "heads", "feedforward" }) {
         if (!c.contains(k) || !c[k].is_number_integer() || c[k].get<long long>() <= 0) {
             RAD_ERR("%s: `%s` is missing or not a positive integer", path.c_str(), k);
             return -1;
@@ -162,18 +243,13 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
                 "model_type laya (this one's architecture is '%s')", in.c_str(), meta.arch.c_str());
         return -1;
     }
-    std::string dir = config_dir;
-    if (dir.empty()) {
-        struct stat st{};
-        if (stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = in;
-        else {
-            const size_t slash = in.find_last_of('/');
-            dir = slash == std::string::npos ? "." : in.substr(0, slash);
-        }
-    }
+    const std::string dir = checkpoint_dir(in, config_dir);
     auto read_json = [](const std::string& path, Json* j) {
         std::ifstream f(path);
-        if (!f) { RAD_ERR("%s: a Laya checkpoint carries it; cannot read it", path.c_str()); return -1; }
+        if (!f) {
+            RAD_ERR("%s: a Laya checkpoint carries it; cannot read it", path.c_str());
+            return -1;
+        }
         try { f >> *j; } catch (const std::exception& e) {
             RAD_ERR("%s: %s", path.c_str(), e.what());
             return -1;
@@ -186,7 +262,8 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
     MetaOwn enc;
     if (meta_from_config_json(dir + "/encoder", &enc) != RAD_OK) return -1;
     for (size_t i = 0; i < enc.keys.size(); ++i)
-        if (enc.keys[i] != "model_type" && enc.keys[i] != "architectures") meta.set(enc.keys[i], enc.vals[i]);
+        if (enc.keys[i] != "model_type" && enc.keys[i] != "architectures")
+            meta.set(enc.keys[i], enc.vals[i]);
     meta.m = enc.m;
 
     Json rl;
@@ -202,31 +279,40 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
     }
     if (rl.contains("option_layout") && rl["option_layout"] != "sequential") {
         RAD_ERR("%s/rl_agent_config.json: option_layout '%s'; the sequential layout every "
-                "published checkpoint uses is served", dir.c_str(), rl["option_layout"].dump().c_str());
+                "published checkpoint uses is served", dir.c_str(),
+                rl["option_layout"].dump().c_str());
         return -1;
     }
-    auto num = [](double v) { char s[32]; std::snprintf(s, sizeof s, "%.9g", v); return std::string(s); };
+    auto num = [](double v) {
+        char s[32];
+        std::snprintf(s, sizeof s, "%.9g", v);
+        return std::string(s);
+    };
     std::string temps = "1 1 1";
     if (rl.contains("temperature")) {
         const Json& t = rl["temperature"];
-        if (!t.is_array() || t.size() != 3 || !t[0].is_number() || !t[1].is_number() || !t[2].is_number()) {
+        if (!t.is_array() || t.size() != 3 || !t[0].is_number() || !t[1].is_number() ||
+            !t[2].is_number()) {
             RAD_ERR("%s/rl_agent_config.json: `temperature` is not three numbers (choice, score, "
                     "noul)", dir.c_str());
             return -1;
         }
-        temps = num(t[0].get<double>()) + " " + num(t[1].get<double>()) + " " + num(t[2].get<double>());
+        temps = num(t[0].get<double>()) + " " + num(t[1].get<double>()) + " " +
+                num(t[2].get<double>());
     }
     meta.set("decision.laya.temperature", temps);
     if (rl.contains("temperature_by_options") && rl["temperature_by_options"].is_object())
         for (const auto& kv : rl["temperature_by_options"].items())
             if (kv.value().is_number())
-                meta.set("decision.laya.temperature_by_options." + kv.key(), num(kv.value().get<double>()));
+                meta.set("decision.laya.temperature_by_options." + kv.key(),
+                         num(kv.value().get<double>()));
 
     /* The special tokens by name (tokenizer_config.json), their ids from tokenizer.json. */
     const std::string tdir = dir + "/tokenizer";
     if (tokjson->empty()) *tokjson = tdir + "/tokenizer.json";
     Json tc, tj;
-    if (read_json(tdir + "/tokenizer_config.json", &tc) < 0 || read_json(*tokjson, &tj) < 0) return -1;
+    if (read_json(tdir + "/tokenizer_config.json", &tc) < 0 || read_json(*tokjson, &tj) < 0)
+        return -1;
     for (const char* which : { "cls_token", "sep_token", "mask_token" }) {
         const Json* v = tc.contains(which) ? &tc[which] : nullptr;
         if (v && v->is_object() && v->contains("content")) v = &(*v)["content"];
@@ -238,12 +324,14 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
         long long id = -1;
         if (tj.contains("added_tokens"))
             for (const auto& a : tj["added_tokens"])
-                if (a.contains("content") && a["content"] == tok && a.contains("id")) id = a["id"].get<long long>();
-        if (id < 0 && tj.contains("model") && tj["model"].contains("vocab") && tj["model"]["vocab"].is_object() &&
-            tj["model"]["vocab"].contains(tok))
+                if (a.contains("content") && a["content"] == tok && a.contains("id"))
+                    id = a["id"].get<long long>();
+        if (id < 0 && tj.contains("model") && tj["model"].contains("vocab") &&
+            tj["model"]["vocab"].is_object() && tj["model"]["vocab"].contains(tok))
             id = tj["model"]["vocab"][tok].get<long long>();
         if (id < 0) {
-            RAD_ERR("%s: the %s '%s' is not in the vocabulary", tokjson->c_str(), which, tok.c_str());
+            RAD_ERR("%s: the %s '%s' is not in the vocabulary", tokjson->c_str(), which,
+                    tok.c_str());
             return -1;
         }
         const std::string base = std::string(which).substr(0, std::strlen(which) - 6);
@@ -261,7 +349,7 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
 
 /* `blk.12.attn_q.weight` -> 12; -1 for a model-level name (GGUF naming, as in an imatrix). */
 int32_t layer_from_name(const std::string& n) {
-    if (n.rfind("blk.", 0) != 0) return -1;
+    if (!n.starts_with("blk.")) return -1;
     size_t i = 4, v = 0;
     if (i >= n.size() || n[i] < '0' || n[i] > '9') return -1;
     while (i < n.size() && n[i] >= '0' && n[i] <= '9') v = v * 10 + (size_t)(n[i++] - '0');
@@ -326,7 +414,8 @@ void usage() {
         "      --list-quantizers  every quantiser loaded and the options each takes, then exit\n"
         "      --arch ID        override the architecture id from the checkpoint\n"
         "      --home DIR       $RADIANCE_HOME (kernels/, architectures/, quantizers/)\n"
-        "      --kernels A:B    the kernel libraries to load, first wins. Default $RADIANCE_KERNELS,\n"
+        "      --kernels A:B    the kernel libraries to load, first wins. Default "
+        "$RADIANCE_KERNELS,\n"
         "                       else every library found\n"
         "                       Declare checks the recipe against the kernels it resolves\n"
         "      --tokenizer F    tokenizer.json; its declared chain is baked instead of being\n"
@@ -343,7 +432,8 @@ void usage() {
         "                       error report\n"
         "      --chat-template F  a jinja template baked as the container's chat template,\n"
         "                       overriding the checkpoint's own (or its absence). A release that\n"
-        "                       ships none (DeepSeek's) needs one, or /v1/chat/completions answers\n"
+        "                       ships none (DeepSeek's) needs one, or "
+        "/v1/chat/completions answers\n"
         "                       501. Trailing newlines are stripped\n"
         "      --set K=V        a metadata key, seen by declare AND written into the container,\n"
         "                       so a convert-time choice that must also hold at serve time is\n"
@@ -360,17 +450,21 @@ void usage() {
         "      --max-spec N     the max_spec declare is run at (default 4, or the block a\n"
         "                       drafter states; a number given here is used as given); 0\n"
         "                       leaves a draft head out\n"
-        "      --reuse FILE     a container converted earlier from the SAME checkpoint (repeatable;\n"
+        "      --reuse FILE     a container converted earlier from the SAME checkpoint "
+        "(repeatable;\n"
         "                       the first is searched first). A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
-        "      --add-vision BASE.rad   add a Gemma 4 MoE vision tower to a text-only container.\n"
+        "      --add-vision BASE.rad   add the vision tower to a text-only Gemma 4 "
+        "MoE or Inkling 2\n"
+        "                       container.\n"
         "                       Input is the vision safetensors with its source config. Copy all\n"
         "                       base weight planes, vocab and metadata to a new output.\n"
         "                       Supports --config, --home, --kernels and --plan-only.\n"
         "      --reuse-only     with --reuse, refuse any weight not found with matching encoding,\n"
         "                       quantiser, options, shape and expert slot; no fresh conversion\n"
-        "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
+        "      --changed FILE   with --reuse: checkpoint tensors (one name a line) "
+        "that differ from\n"
         "                       the checkpoint the --reuse container was converted from. Every\n"
         "                       weight that reads one is converted; the rest are copied\n"
         "      --lora FILE|DIR  a PEFT adapter (.safetensors file or directory of them) merged\n"
@@ -381,8 +475,10 @@ void usage() {
         "      --lora-strength F\n"
         "                       the strength of every --lora (default 1)\n"
         "      --lora-map FILE  with --lora: a JSON map for adapters trained on module names this\n"
-        "                       checkpoint does not use. {\"strip\": [\"prefix\", ...], \"modules\":\n"
-        "                       {\"<pat>\": [\"<target>\", ...]}}: a pattern holds at most one '*',\n"
+        "                       checkpoint does not use. {\"strip\": [\"prefix\", ...], "
+        "\"modules\":\n"
+        "                       {\"<pat>\": [\"<target>\", ...]}}: a pattern holds at "
+        "most one '*',\n"
         "                       which matches one run (the block index) and is substituted into\n"
         "                       every target; several targets mean the module is their concate-\n"
         "                       nation (a fused qkv), and the adapter's rows split along them\n"
@@ -406,15 +502,36 @@ void usage() {
         "                       converts a layer at a time: the first run defers the layers\n"
         "                       whose tensors are not there yet, each later run adds some\n"
         "      --gpus LIST      the cards (HIP device numbers, comma separated) the quantisers\n"
-        "                       may run on, and large weights then run two at a time. A\n"
+        "                       may run on, and large weights then run one per card. A\n"
         "                       quantiser writes the same bytes on a card as on the host; with\n"
         "                       no quantiser plugin that has a device path, refused\n"
         "      --gpu-workers N  with --gpus, reserve N OpenMP workers for trellis GPTQ jobs;\n"
         "                       other workers process CPU jobs, either side can steal. N must\n"
-        "                       be less than OMP_NUM_THREADS and at most the cards in --gpus. Default: one shared queue\n"
+        "                       be less than OMP_NUM_THREADS and at most the cards in --gpus. "
+        "Default: one shared queue\n"
+        "      --cpu            force every quantiser's host path, even when --gpus is given\n"
+        "      --large-f32-bytes N  a weight of N f32 bytes or more is quantised across every\n"
+        "                       thread (and with --gpus a card each), a smaller one on one\n"
+        "                       thread. Default 33554432 (32 MiB)\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
+        "      --sources FILE   one JSON line a planned weight: its logical shape, the encoding\n"
+        "                       planned, how it is stored, and the checkpoint tensors (and rows\n"
+        "                       of them) its pieces and scales read -- the name map as resolved\n"
+        "      --dump-f32 SPEC:OUT  SPEC lists 'NAME ROW0 NROWS' a line; the f32 rows a quantiser\n"
+        "                       is handed for each are appended to OUT in that order (raw\n"
+        "                       little-endian), to check a checkpoint's decoding against another\n"
+        "                       converter's\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
+        "      --no-error       skip the error report: no quantised weight is decoded back to\n"
+        "                       measure it (the container's bytes are unchanged; an importing\n"
+        "                       quantiser, which encodes nothing, spends most of its run there)\n"
+        "      --resume         continue a killed write from its journal "
+        "(<out>.journal): finished\n"
+        "                       large weights are kept, unfinished ones re-quantised. "
+        "Default: resume\n"
+        "                       when the journal is there\n"
+        "      --no-resume      ignore a journal and truncate the output, a fresh write\n"
         "  -v, --verbose\n"
         "  -h, --help\n");
 }
@@ -453,11 +570,14 @@ int main(int argc, char** argv) {
     int      max_spec = kMaxSpecDefault;
     bool     max_spec_given = false;
     int      report_n = 20;
+    bool     no_error = false;
     bool     verbose = false, plan_only = false, list_quant = false;
-    std::string reuse_path, changed_path, vision_base;
+    int      resume_mode = 0;        /* --resume / --no-resume; 0 = by the journal's presence */
+    int64_t  checkpoint_at = -1;     /* --checkpoint-at N: keep the files after N large weights */
+    std::string reuse_path, changed_path, vision_base, sources_path, dump_spec, dump_out;
     std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
     std::vector<std::string> defer;        /* --defer: globs of the weights this run leaves out */
-    std::vector<std::string> replace;      /* --replace: globs of the weights --in-place may rewrite */
+    std::vector<std::string> replace;      /* --replace: globs --in-place may rewrite */
     std::vector<std::string> lora_paths;
     double      lora_strength = 1.0;
     std::string lora_map;
@@ -466,13 +586,13 @@ int main(int argc, char** argv) {
     std::vector<std::pair<std::string, std::string>> set_kv;
     std::vector<int> gpus;           /* --gpus: the cards the quantisers may run on */
     int gpu_workers = 0;             /* 0: the original shared OpenMP job queue */
+    bool        force_cpu = false;   /* --cpu: the host path, even with --gpus */
+    int64_t     large_f32_bytes = (int64_t)32 << 20;   /* --large-f32-bytes */
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "rad-convert: %s needs a value\n", what);
-                                 std::exit(2); }
-            return argv[++i];
+        auto next = [&](const char* what) {
+            return rad_flag_value("rad-convert", argc, argv, &i, what);
         };
         auto num = [&](const char* what, int64_t lo, int64_t hi) {
             return rad_flag_int("rad-convert", what, next(what), lo, hi);
@@ -500,7 +620,10 @@ int main(int argc, char** argv) {
             }
             set_kv.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
         }
-        else if (a == "--max-tok")   { max_tok = num("--max-tok", 1, INT64_MAX); max_tok_given = true; }
+        else if (a == "--max-tok")   {
+            max_tok = num("--max-tok", 1, INT64_MAX);
+            max_tok_given = true;
+        }
         else if (a == "--max-ctx")   max_ctx = num("--max-ctx", 0, INT64_MAX);
         else if (a == "--max-spec")  { max_spec = (int)num("--max-spec", 0, INT32_MAX);
                                        max_spec_given = true; }
@@ -514,7 +637,23 @@ int main(int argc, char** argv) {
             vision_base = path;
         }
         else if (a == "--plan-only") plan_only = true;
+        else if (a == "--resume")    resume_mode = 1;
+        else if (a == "--no-resume") resume_mode = -1;
+        else if (a == "--checkpoint-at") checkpoint_at = num("--checkpoint-at", 1, INT64_MAX);
+        else if (a == "--sources")   sources_path = next("--sources");
+        else if (a == "--dump-f32") {
+            const std::string v = next("--dump-f32");
+            const size_t c = v.find(':');
+            if (c == std::string::npos || c == 0 || c + 1 == v.size()) {
+                std::fprintf(stderr, "rad-convert: --dump-f32 wants SPEC:OUT, got '%s'\n",
+                             v.c_str());
+                return 2;
+            }
+            dump_spec = v.substr(0, c);
+            dump_out = v.substr(c + 1);
+        }
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
+        else if (a == "--no-error")  no_error = true;
         else if (a == "--reuse") {
             const std::string r = next("--reuse");
             if (reuse_path.empty()) reuse_path = r;
@@ -537,6 +676,9 @@ int main(int argc, char** argv) {
         else if (a == "--in-place")  in_place = true;
         else if (a == "--defer")     defer.push_back(next("--defer"));
         else if (a == "--replace")   replace.push_back(next("--replace"));
+        else if (a == "--cpu")       force_cpu = true;
+        else if (a == "--large-f32-bytes")
+            large_f32_bytes = num("--large-f32-bytes", 1, INT64_MAX);
         else if (a == "--gpus") {
             for (const std::string& d : rad_split_list(next("--gpus")))
                 gpus.push_back((int)rad_flag_int("rad-convert", "--gpus", d.c_str(), 0, 1023));
@@ -560,8 +702,8 @@ int main(int argc, char** argv) {
     }
 
     if (!vision_base.empty()) {
-        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() || reuse_only ||
-            !recipe_files.empty() || !quant_flags.empty() || !set_kv.empty() ||
+        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() ||
+            reuse_only || !recipe_files.empty() || !quant_flags.empty() || !set_kv.empty() ||
             !arch_override.empty() || !tokjson.empty() || !tokjson2.empty() || !chat_tmpl.empty() ||
             !add_files.empty() || !draft_dir.empty() || !imat_path.empty() || !lora_paths.empty() ||
             !lora_map.empty() || lora_strength != 1.0 || !changed_path.empty() || !gpus.empty() ||
@@ -580,14 +722,7 @@ int main(int argc, char** argv) {
     /* ---------------------------------------------------------------- --list-quantizers */
     if (list_quant) {
         Registry& reg = rad_tools_registry();
-        std::vector<std::string> qdirs;
-        for (const std::string& d : rad_home_dirs(home)) {
-            struct stat st {};
-            if (stat((d + "/quantizers").c_str(), &st) == 0 && S_ISDIR(st.st_mode))
-                qdirs.push_back(d + "/quantizers");
-        }
-        if (qdirs.empty()) qdirs.push_back(rad_home_dirs(home).front() + "/quantizers");
-        if (reg.load_dirs(qdirs, {}) < 0) return 1;
+        if (rad_load_quantizers(reg, home) < 0) return 1;
         for (const auto& qr : reg.quantizers()) {
             if (!qr.info) continue;
             std::printf("%s  (%s)\n    %s\n", qr.info->name, qr.plugin.c_str(), qr.info->doc);
@@ -624,7 +759,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "rad-convert: --gpu-workers needs --gpus\n"); return 2;
         }
         if ((size_t)gpu_workers > gpus.size()) {
-            std::fprintf(stderr, "rad-convert: --gpu-workers %d exceeds the %zu card(s) in --gpus\n",
+            std::fprintf(stderr,
+                         "rad-convert: --gpu-workers %d exceeds the %zu card(s) in --gpus\n",
                          gpu_workers, gpus.size());
             return 2;
         }
@@ -639,7 +775,8 @@ int main(int argc, char** argv) {
 #endif
     }
     if (reuse_only && (reuse_path.empty() || in_place)) {
-        std::fprintf(stderr, "rad-convert: --reuse-only needs --reuse without --in-place\n"); return 2;
+        std::fprintf(stderr, "rad-convert: --reuse-only needs --reuse without --in-place\n");
+        return 2;
     }
     if (!changed_path.empty() && (reuse_path.empty() || in_place)) {
         std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
@@ -692,11 +829,12 @@ int main(int argc, char** argv) {
         for (const std::string& q : quant_flags)
             if (recipe.add_flag(q, &why) < 0) { RAD_ERR("%s", why.c_str()); return 2; }
         for (const std::string& rf : recipe_files) {
-            std::ifstream f(rf);
-            if (!f) { RAD_ERR("--recipe %s: cannot read it", rf.c_str()); return 2; }
-            std::stringstream ss;
-            ss << f.rdbuf();
-            if (recipe.add_text(ss.str(), rf, &why) < 0) { RAD_ERR("%s", why.c_str()); return 2; }
+            std::string text;
+            if (!read_file_bytes(rf, &text)) {
+                RAD_ERR("--recipe %s: cannot read it", rf.c_str());
+                return 2;
+            }
+            if (recipe.add_text(text, rf, &why) < 0) { RAD_ERR("%s", why.c_str()); return 2; }
         }
     }
 
@@ -707,8 +845,9 @@ int main(int argc, char** argv) {
      * encoder/config.json beside rl_agent_config.json: the geometry is the encoder's, the
      * architecture laya (laya_metadata reads the rest). */
     struct stat in_st{};
-    const bool laya_dir = config_dir.empty() && stat(in.c_str(), &in_st) == 0 && S_ISDIR(in_st.st_mode) &&
-                          !file_exists(in + "/config.json") && file_exists(in + "/rl_agent_config.json") &&
+    const bool laya_dir = config_dir.empty() && stat(in.c_str(), &in_st) == 0 &&
+                          S_ISDIR(in_st.st_mode) && !file_exists(in + "/config.json") &&
+                          file_exists(in + "/rl_agent_config.json") &&
                           file_exists(in + "/encoder/config.json");
     if (laya_dir) ck.set_meta_dir(in + "/encoder");
     if (ck.open(in) < 0) return 1;
@@ -737,8 +876,9 @@ int main(int argc, char** argv) {
         (meta.arch == "laya" || (dt && !std::strcmp(dt, "laya"))) &&
         laya_metadata(in, config_dir, meta, &tokjson) < 0)
         return 1;
-    /* f16 to bf16 rounds, so it is a recipe's rule (spec §4.4). Every Laya checkpoint needs the same
-     * rules, so they follow any the caller gave, and the container records them with the rest. */
+    /* f16 to bf16 rounds, so it is a recipe's rule (spec §4.4). Every Laya checkpoint needs the
+     * same rules, so they follow any the caller gave, and the container records them with the
+     * rest. */
     if (meta.arch == "laya") {
         std::string why;
         if (recipe.add_text(kLayaBf16, "laya's f16 to bf16 (built in)", &why) < 0) {
@@ -751,7 +891,7 @@ int main(int argc, char** argv) {
      * whose recipe writes Qwen's block fp8 targets qwen35_fp8 by setting what that release
      * states. */
     for (const auto& kv : set_kv)
-        if (kv.first.rfind("quantization_config.", 0) == 0) {
+        if (kv.first.starts_with("quantization_config.")) {
             meta.quant = quant_descriptor(meta);
             meta.finish();
             break;
@@ -804,7 +944,7 @@ int main(int argc, char** argv) {
         for (int64_t i = 0; i < reuse.meta_count(); ++i) {
             const RadFileKV& kv = reuse.meta_at(i);
             const std::string k = reuse.str(kv.key);
-            if (k.rfind("radiance.", 0) != 0 || k == "radiance.encoder" || meta.has(k)) continue;
+            if (!k.starts_with("radiance.") || k == "radiance.encoder" || meta.has(k)) continue;
             std::string v;
             if (kv.type == RAD_P_STR)       v = reuse.str(kv.v.s);
             else if (kv.type == RAD_P_INT)  v = fmt("%lld", (long long)kv.v.i);
@@ -834,6 +974,12 @@ int main(int argc, char** argv) {
     if (!ck.import_refusal().empty())
         RAD_ERR("quantisation '%s' cannot be imported: %s", meta.quant.c_str(),
                 ck.import_refusal().c_str());
+    /* --cpu: no card list reaches the quantiser plugins, so none enables its device path and every
+     * rule, gpu=1 or not, runs the host loop. */
+    if (force_cpu) {
+        gpus.clear();
+        RAD_INFO("--cpu: quantisers run on the host; cards ignored");
+    }
     if (rad_tools_load_plugins(home, hierarchy, meta.arch, meta.quant, &plugins, imported) < 0) {
         RAD_ERR("rad-convert runs the architecture plugin's declare: its name map says which "
                 "checkpoint tensors make each weight, and the kernels it resolves are what the "
@@ -1109,7 +1255,8 @@ int main(int argc, char** argv) {
         std::unordered_set<std::string> read, stems;
         for (const RadNameMap& nm : prog.name_map) {
             const auto it = nm.declared ? logical.find(nm.declared) : logical.end();
-            if (it == logical.end() || !it->second.declared || it->second.status != RAD_OK) continue;
+            if (it == logical.end() || !it->second.declared || it->second.status != RAD_OK)
+                continue;
             for (int k = 0; k < nm.n_src; ++k)
                 if (nm.src[k]) { read.insert(nm.src[k]); stems.insert(stem(nm.src[k])); }
         }
@@ -1164,6 +1311,102 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* ---------------------------------------------------------------- --sources, --dump-f32 */
+    if (!sources_path.empty()) {
+        std::ofstream so(sources_path);
+        if (!so) { RAD_ERR("--sources %s: cannot write it", sources_path.c_str()); return 1; }
+        auto jstr = [](const std::string& x) {
+            std::string o = "\"";
+            for (char ch : x) {
+                if (ch == '"' || ch == '\\') o += '\\';
+                o += ch;
+            }
+            return o + "\"";
+        };
+        auto jshape = [](const std::vector<int64_t>& sh) {
+            std::string o = "[";
+            for (size_t i = 0; i < sh.size(); ++i) o += (i ? "," : "") + std::to_string(sh[i]);
+            return o + "]";
+        };
+        auto jtensors = [&](const std::vector<const SrcTensor*>& v) {
+            std::string o = "[";
+            for (size_t i = 0; i < v.size(); ++i) {
+                o += i ? "," : "";
+                o += v[i] ? "{\"name\":" + jstr(v[i]->name) + ",\"tensor\":" +
+                                jstr(ckpt_tensor_of(*v[i])) + ",\"dtype\":" +
+                                jstr(v[i]->rad_dtype == RAD_DT_INVALID
+                                         ? std::string("ggml") + std::to_string(v[i]->ggml)
+                                         : std::string(rad_dtype_name(v[i]->rad_dtype))) +
+                                ",\"shape\":" + jshape(v[i]->shape) + "}"
+                          : "null";
+            }
+            return o + "]";
+        };
+        for (const Logical* L : plan) {
+            const CkptWeight& c = L->src;
+            std::vector<int64_t> sh(c.shape, c.shape + c.rank);
+            const std::string how = L->rule ? L->rule->rule->quantizer + " " +
+                                                  L->rule->rule->options_text()
+                                  : L->import_rule ? std::string(kImportRule) + " " +
+                                                         L->import_rule->options_text()
+                                  : c.imported ? "imported" : "as is";
+            so << "{\"name\":" << jstr(c.name) << ",\"shape\":" << jshape(sh)
+               << ",\"rows\":" << c.rows << ",\"cols\":" << c.cols << ",\"encoding\":"
+               << jstr(enc_name(L->enc)) << ",\"stored\":" << jstr(how)
+               << ",\"form\":" << jstr(!c.derived.empty() ? "derived" : c.trivial ? "trivial"
+                                        : c.imported ? "imported" : "other")
+               << ",\"concat_dim\":" << c.concat_dim << ",\"pieces\":" << jtensors(c.pieces)
+               << ",\"scales\":" << jtensors(c.scales) << ",\"layer\":" << L->layer
+               << ",\"expert\":" << L->expert << "}\n";
+        }
+        so.close();
+        if (!so) { RAD_ERR("--sources %s: write failed", sources_path.c_str()); return 1; }
+        RAD_INFO("--sources: %zu weight(s) written to %s", plan.size(), sources_path.c_str());
+    }
+    if (!dump_spec.empty()) {
+        std::ifstream sf(dump_spec);
+        FILE* of = std::fopen(dump_out.c_str(), "wb");
+        if (!sf || !of) {
+            RAD_ERR("--dump-f32 %s:%s: cannot read the one or write the other", dump_spec.c_str(),
+                    dump_out.c_str());
+            if (of) std::fclose(of);
+            return 1;
+        }
+        std::string nm;
+        int64_t r0 = 0, nr = 0, n_req = 0, n_val = 0;
+        std::vector<float> buf;
+        while (sf >> nm >> r0 >> nr) {
+            auto it = logical.find(nm);
+            if (it == logical.end() || it->second.status != RAD_OK) {
+                RAD_ERR("--dump-f32: '%s' is not a planned weight", nm.c_str());
+                std::fclose(of);
+                return 1;
+            }
+            const CkptWeight& c = it->second.src;
+            buf.resize((size_t)(nr * c.cols));
+            std::string why;
+            if (ckpt_rows_f32(c, r0, nr, buf.data(), &why) != RAD_OK) {
+                RAD_ERR("--dump-f32: '%s' rows [%lld, %lld): %s", nm.c_str(), (long long)r0,
+                        (long long)(r0 + nr), why.c_str());
+                std::fclose(of);
+                return 1;
+            }
+            if (std::fwrite(buf.data(), sizeof(float), buf.size(), of) != buf.size()) {
+                RAD_ERR("--dump-f32 %s: write failed", dump_out.c_str());
+                std::fclose(of);
+                return 1;
+            }
+            ++n_req;
+            n_val += (int64_t)buf.size();
+        }
+        if (std::fclose(of) != 0) {
+            RAD_ERR("--dump-f32 %s: write failed", dump_out.c_str());
+            return 1;
+        }
+        RAD_INFO("--dump-f32: %lld request(s), %lld value(s) to %s", (long long)n_req,
+                 (long long)n_val, dump_out.c_str());
+    }
+
     if (plan_only) {
         int64_t bytes = 0;
         for (const Logical* L : plan) {
@@ -1186,8 +1429,20 @@ int main(int argc, char** argv) {
     }
 
     /* ---------------------------------------------------------------- write */
+    /* Resume when a journal is beside the output. A journal with a killed write means begin() must
+     * not truncate the planes it already holds; --no-resume opts out, --resume demands it. */
+    const std::string jpath = journal_path(out);
+    const bool jfile = file_exists(jpath);
+    bool resuming = !in_place && resume_mode != -1 && jfile;
+    if (resume_mode == 1 && !jfile && !in_place) {
+        RAD_ERR("--resume: no journal at %s; the write is not resumable", jpath.c_str());
+        return 1;
+    }
+    std::string jfp;
+    std::set<std::string> jdone;
     RadWriter w;
-    RAD_TRY(in_place ? w.begin_append(out.c_str(), reuse) : w.begin(out.c_str()));
+    RAD_TRY(in_place ? w.begin_append(out.c_str(), reuse)
+                     : resuming ? w.begin_resume(out.c_str()) : w.begin(out.c_str()));
 
     w.set_arch(meta.arch);
     /* An extended container keeps its name; this run's checkpoint need not be its original. */
@@ -1246,7 +1501,9 @@ int main(int argc, char** argv) {
     omp_set_max_active_levels(1);
 #endif
     constexpr int64_t kChunk = kQuantBandBytes;     /* copies and joins move this much at once */
-    constexpr int64_t kSmall = (int64_t)32 << 20;   /* f32 bytes one thread quantises alone */
+    const int64_t kSmall = large_f32_bytes;         /* f32 bytes one thread quantises alone
+                                                     * (--large-f32-bytes); an MoE tensor is much
+                                                     * wider than the default */
 
     struct Job {
         Logical*            L = nullptr;
@@ -1412,6 +1669,34 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+    /* The journal describes the plan: a missing or mismatched one is refused, not resumed over
+     * planes from another recipe. A fresh write creates it before the first band. */
+    if (!in_place) {
+        std::vector<std::string> jnames, jencs;
+        std::vector<int64_t> jbytes;
+        for (const Job& j : jobs) {
+            jnames.push_back(j.L->src.name);
+            jbytes.push_back(j.bytes);
+            jencs.push_back(enc_name(j.L->enc));
+        }
+        jfp = journal_fingerprint(in, out, recipe.text(), jnames, jbytes, jencs);
+        if (resuming) {
+            std::string fp;
+            if (!journal_read(jpath, &fp, &jdone) || fp != jfp) {
+                RAD_ERR("%s: the journal does not describe this plan (fingerprint %s, wanted %s); "
+                        "use --no-resume to write it from the start", jpath.c_str(), fp.c_str(),
+                        jfp.c_str());
+                w.abort();
+                return 1;
+            }
+            RAD_INFO("resume   %zu large weight(s) kept from the journal, the rest written",
+                     jdone.size());
+        } else {
+            if (!journal_reset(jpath, "RADJOURNAL 1 " + jfp + " " + out + "\n"))
+                RAD_WARN("resume   cannot write %s; a kill will restart from the beginning",
+                         jpath.c_str());
+        }
+    }
     /* A --changed name no weight reads is a typo or an unconverted tensor; refuse it. */
     if (!changed.empty()) {
         std::vector<std::string> unread;
@@ -1625,7 +1910,7 @@ int main(int argc, char** argv) {
         /* Error is measured through the decoder readers use: the core's for plain and affine, the
          * quantiser's hook for its own scheme (core/format/encoding.h). Quantiser decoders need
          * not be reentrant, so those rows are decoded in one call. */
-        bool core_decodes = true;
+        bool core_decodes = !no_error;   /* --no-error: io.band returns at once, L.err unset */
         const bool own_scheme = !rad_enc_is(&L.enc, "plain") && !rad_enc_is(&L.enc, "affine");
         std::vector<float> dec;
         double num = 0, den = 0, num_i = 0, den_i = 0;
@@ -1692,6 +1977,34 @@ int main(int argc, char** argv) {
         const bool big = !jobs[i].re && L.rule && L.src.rows * L.src.cols * 4 > kSmall;
         (big ? large : small).push_back(i);
     }
+    /* A journaled weight's planes are already at their offsets; mark them so finish()'s
+     * completeness check counts them, and skip the trellis for them below. */
+    for (size_t i : large)
+        if (jdone.count(jobs[i].L->src.name)) {
+            if (w.mark_weight_done(jobs[i].idx) != RAD_OK) {
+                RAD_ERR("resume: cannot mark '%s' done", jobs[i].L->src.name.c_str());
+                w.abort();
+                return 1;
+            }
+            written += jobs[i].bytes;
+        }
+    std::atomic<int64_t> done_large{0}, skipped_large{0};
+    std::atomic<bool> beat_stop{false};
+    const auto beat_t0 = std::chrono::steady_clock::now();
+    std::thread beat([&] {
+        int tick = 0;
+        while (!beat_stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (++tick < 30) continue;
+            tick = 0;
+            const auto sec = (long long)std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - beat_t0).count();
+            std::fprintf(stderr, "rad-convert: progress %lld/%zu large weights complete, %lld "
+                                 "resumed, %llds\n", (long long)done_large.load(), large.size(),
+                                 (long long)skipped_large.load(), sec);
+            std::fflush(stderr);
+        }
+    });
     std::atomic<int> failed{RAD_OK};
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<size_t> device_small, host_small;
@@ -1703,8 +2016,8 @@ int main(int argc, char** argv) {
         (device ? device_small : host_small).push_back(i);
     }
     if (gpu_workers && !device_small.empty()) {
-        RAD_INFO("gpu pipeline: %zu trellis job(s), %zu other job(s), %d preferred device worker(s)",
-                 device_small.size(), host_small.size(), gpu_workers);
+        RAD_INFO("gpu pipeline: %zu trellis job(s), %zu other job(s), %d preferred device "
+                 "worker(s)", device_small.size(), host_small.size(), gpu_workers);
         failed.store(convert_run_queues(device_small, host_small, gpu_workers,
                                         [&](size_t i) { return run_job(jobs[i]); }));
     } else {
@@ -1719,27 +2032,54 @@ int main(int argc, char** argv) {
         }
     }
     {
-        /* With the quantisers on cards (--gpus), large weights run two at a time, so one's host
-         * work (its rows read, its Hessian factored, its error measured) overlaps the other's on
-         * the card. Each runs on a thread of its own, whose OpenMP regions get a full team. */
+        /* With the quantisers on cards (--gpus), large weights run one per card. A Hessian
+         * chunk is one row window of a card's free VRAM, so it is split across cards; each
+         * worker pulls a whole weight, the journal keeps the finished ones across a kill. */
         std::atomic<size_t> next{0};
+        std::atomic<bool> paused{false};
         auto worker = [&] {
-            for (size_t i; failed.load() == RAD_OK && (i = next.fetch_add(1)) < large.size();) {
-                const int st = run_job(jobs[large[i]]);
+            for (size_t i; failed.load() == RAD_OK && !paused.load() &&
+                          (i = next.fetch_add(1)) < large.size();) {
+                const Job& j = jobs[large[i]];
+                if (jdone.count(j.L->src.name)) { ++done_large; ++skipped_large; continue; }
+                const int st = run_job(j);
                 if (st < 0) {
                     int ok = RAD_OK;
                     failed.compare_exchange_strong(ok, st);
+                    continue;
                 }
+                ++done_large;
+                if (!jpath.empty() && !journal_write(jpath, "DONE " + j.L->src.name + "\n")) {
+                    static std::mutex mw;
+                    std::lock_guard<std::mutex> lm(mw);
+                    std::fprintf(stderr, "rad-convert: the journal at %s cannot be written; a kill "
+                                         "will restart from the beginning\n", jpath.c_str());
+                    std::fflush(stderr);
+                }
+                if (checkpoint_at >= 0 && done_large.load() >= checkpoint_at) paused.store(true);
             }
         };
         if (gpus.empty()) {
             worker();
         } else {
-            std::thread side(worker);
+            const unsigned n = std::max(1u, (unsigned)gpus.size());
+            std::vector<std::thread> side;
+            side.reserve(n > 0 ? n - 1 : 0);
+            for (unsigned i = 1; i < n; ++i) side.emplace_back(worker);
             worker();
-            side.join();
+            for (std::thread& t : side) t.join();
+        }
+        if (paused.load()) {
+            beat_stop.store(true);
+            beat.join();
+            w.abort_keep();
+            RAD_INFO("checkpoint  %lld large weight(s) written; resume with the journal at %s",
+                     (long long)done_large.load(), jpath.c_str());
+            return 3;
         }
     }
+    beat_stop.store(true);
+    beat.join();
     if (failed.load() != RAD_OK) { w.abort(); return 1; }
     RAD_INFO("weights  %zu written in %.0f s: %zu a thread each, %zu across every thread",
              jobs.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
@@ -1747,6 +2087,7 @@ int main(int argc, char** argv) {
 
     const auto tf = std::chrono::steady_clock::now();
     if (w.finish() < 0) return 1;
+    if (!jpath.empty()) ::unlink(jpath.c_str());   /* sealed: no resume is needed */
     RAD_INFO("finish   %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - tf)
                                     .count());
 
@@ -1782,7 +2123,9 @@ int main(int argc, char** argv) {
     for (const Logical* L : plan) if (L->err >= 0) measured.push_back(L);
     if (!measured.empty()) {
         const bool by_imp = !imat_path.empty();
-        auto key = [&](const Logical* L) { return by_imp && L->err_imp >= 0 ? L->err_imp : L->err; };
+        auto key = [&](const Logical* L) {
+            return by_imp && L->err_imp >= 0 ? L->err_imp : L->err;
+        };
         std::sort(measured.begin(), measured.end(),
                   [&](const Logical* a, const Logical* b) { return key(a) > key(b); });
         std::map<std::string, std::pair<int64_t, double>> per_rule;

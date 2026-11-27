@@ -183,7 +183,7 @@ key.
 
 A staged pass reads the pool by block id, while `kv_store_streamed` writes the ring only where the
 map names a slot (none before the group's first decode), so a staged pass also stores at identity
-(`AttnGatedFP8::store_stage_identity`, GLM's plain store), after the mirror writer.
+(`AttnGatedQ::store_stage_identity`, GLM's plain store), after the mirror writer.
 
 **Volume.** A layer's copy moves only the blocks the step's own block tables name, not the whole
 context allocation: its list carries one range per run of those ids (`kvstream_runs`), read every
@@ -315,7 +315,7 @@ times; the mirror is the tier); the prefix cache's host tier (§3.8); the expert
 
 ### 4.4 Arch changes
 
-The gated attention block (`arch/common/rad_block_attn_gated_fp8.h`) declares the streamed store
+The gated attention block (`arch/common/rad_block_attn_gated_q.h`) declares the streamed store
 beside `kv_store`, issues it instead when the batch hands the group a stream, and issues the resolve
 after the store and before each sparse launch. GLM-5.3's MLA block (`rad_block_glm_mla.h`) declares
 the same pair and resolves at finish, after its indexer selects.

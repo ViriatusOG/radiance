@@ -665,7 +665,21 @@ int embed_view(const RadParam* p, int n_p, int operand, const RadEncoding* enc, 
     if (*rows <= 0 || *dim <= 0 || *dim % 128) return RAD_E_SHAPE;
     if (rad_enc_is(enc, "plain")) return RAD_E_DTYPE;
     const bool rot = !std::strncmp(enc->transform, "fwht128", RAD_ENC_STR);
-    if (!classify(enc, rot ? "fwht128" : "", f, entries)) return RAD_E_DTYPE;
+    /* The int8 grid (int8 codes under a bf16 scale per row and 128 columns) is the signed form at
+     * eight bits here. classify() leaves int8 codes to the GEMMs' own int8 forms, so the table's
+     * form is named before it. */
+    const RadEncPlane& cp = enc->plane[0];
+    uint32_t sc = 0;
+    if (!std::strncmp(cp.role, "codes", RAD_ENC_STR) && cp.dtype == RAD_I8 &&
+        rad_enc_is(enc, "affine") && cp.block[0] == 1 && cp.block[1] == 1 &&
+        scale_form(enc, 2, &sc) && sc == kBf16) {
+        *f = Form{};
+        *entries = 0;
+        f->kind = kSigned;
+        f->bits = 8;
+    } else if (!classify(enc, rot ? "fwht128" : "", f, entries)) {
+        return RAD_E_DTYPE;
+    }
     f->rot = rot ? 1u : 0u;
     if (!embed_built(word(*f))) return RAD_E_DTYPE;
     if (!planes_of(enc, sel, pl, n, v) || !v->codes || !v->scale) return RAD_E_SHAPE;

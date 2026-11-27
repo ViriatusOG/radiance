@@ -123,20 +123,18 @@ bool have_card() {
 }  /* namespace */
 
 TEST(the_fused_clamped_swiglu_quantiser_is_the_libr4d_chain_byte_for_byte) {
-    if (!have_card()) { fprintf(stderr, "  SKIP %s: no card\n", ::radtest::current()); return; }
+    if (!have_card()) SKIP("no card");
     Plugin r4d, glm;
     const char* pr = lib("RAD_R4D_LIB_OVERRIDE", RAD_R4D_LIB);
     const char* pg = lib("RAD_GLM_LIB_OVERRIDE", RAD_GLM_LIB);
-    if (!r4d.open(pr) || !glm.open(pg)) {
-        fprintf(stderr, "  SKIP: libraries did not load (%s, %s)\n", pr, pg);
-        return;
-    }
+    if (!r4d.open(pr) || !glm.open(pg))
+        ARTIFACT_MISSING(std::string(pr) + " or " + pg);
     const RadKernelInfo* fused = glm.row("glm_swiglu_clamped_had_quant_i8g");
     const RadKernelInfo* host = glm.row("ref_glm_swiglu_clamped_had_quant_i8g");
     const RadKernelInfo* clamp = r4d.row("swiglu_clamped_bf16");
     const RadKernelInfo* q128 = r4d.row("had_quant_act_i8g");
     const RadKernelInfo* q256 = r4d.row("had_quant_act_iq8r");
-    if (!fused) { fprintf(stderr, "  SKIP: the plugin has no device rows\n"); return; }
+    if (!fused) SKIP("the plugin has no device rows");
     REQUIRE(host && clamp && q128 && q256);
     RadStream s{};
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
@@ -225,17 +223,15 @@ float bf16f(uint16_t h) { uint32_t b = (uint32_t)h << 16; float f; std::memcpy(&
 }  /* namespace */
 
 TEST(the_int8_latent_reader_agrees_with_the_host_reader) {
-    if (!have_card()) { fprintf(stderr, "  SKIP %s: no card\n", ::radtest::current()); return; }
+    if (!have_card()) SKIP("no card");
     Plugin glm, ref;
     const char* pg = lib("RAD_GLM_LIB_OVERRIDE", RAD_GLM_LIB);
     const char* pr = lib("RAD_REF_LIB_OVERRIDE", RAD_REF_LIB);
-    if (!glm.open(pg) || !ref.open(pr)) {
-        fprintf(stderr, "  SKIP: libraries did not load (%s, %s)\n", pg, pr);
-        return;
-    }
+    if (!glm.open(pg) || !ref.open(pr))
+        ARTIFACT_MISSING(std::string(pg) + " or " + pr);
     const RadKernelInfo* dev = glm.row("glm_mla_attn_i8kv");
     const RadKernelInfo* host = ref.row("ref_mla_attn");
-    if (!dev) { fprintf(stderr, "  SKIP: the plugin has no device rows\n"); return; }
+    if (!dev) SKIP("the plugin has no device rows");
     REQUIRE(host);
     RadStream s{};
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);

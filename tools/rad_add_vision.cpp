@@ -1,5 +1,7 @@
-/* The Gemma 4 vision-only extension. The base container supplies the entire decoder and
- * drafter. The architecture's checkpoint maps are used only for the new encoder weights. */
+/* The vision-only extension, for Gemma 4 MoE and Inkling 2. The base container supplies the entire
+ * decoder and drafter. The architecture's checkpoint maps are used only for the new encoder
+ * weights, which are the checkpoint's bf16 tensors (an Inkling 2 tower's q and k rows permuted by
+ * its row-piece maps). */
 #include "iface.h"
 #include "format/checkpoint.h"
 #include "mm/processor.h"
@@ -65,8 +67,8 @@ int copy_vocab(RadWriter& writer, const RadFile& base, bool aux) {
     const VocabSection section = aux ? base.aux_vocab() : base.vocab();
     if (!section) return RAD_OK;
     if (section.h->flags & ~uint64_t(RAD_VOCAB_IGNORE_MERGES)) {
-        RAD_ERR("--add-vision: the container's %svocabulary carries flags 0x%llx this tool does not "
-                "copy", aux ? "auxiliary " : "", (unsigned long long)section.h->flags);
+        RAD_ERR("--add-vision: the container's %svocabulary carries flags 0x%llx this tool "
+                "does not copy", aux ? "auxiliary " : "", (unsigned long long)section.h->flags);
         return RAD_E_UNSUPPORTED;
     }
     VocabBuild vocab;
@@ -97,19 +99,27 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
     RadFile base;
     RAD_TRY(base.open(base_path.c_str()));
     const RadFileHeader& h = base.header();
-    if (std::strcmp(base.str(h.arch_id), "gemma4") || *base.str(h.quant) ||
+    /* The families this tool extends, each with its tower's vision_config.model_type. */
+    const std::string arch = base.str(h.arch_id);
+    const bool inkling = arch == "inkling2";
+    const char* tower = inkling ? "inkling2_vision" : "gemma4_vision";
+    if ((arch != "gemma4" && !inkling) || *base.str(h.quant) ||
         *base.get_s("radiance.encoder", "") || !base.vocab()) {
-        RAD_ERR("--add-vision requires a text-only gemma4 MoE container with its original vocab");
+        RAD_ERR("--add-vision requires a text-only gemma4 MoE or inkling2 container with its "
+                "original vocab");
         return RAD_E_UNSUPPORTED;
     }
     Checkpoint ck;
     if (!config_dir.empty()) ck.set_meta_dir(config_dir);
     RAD_TRY(ck.open(input));
     const MetaOwn& source = ck.meta();
-    if (ck.is_gguf() || source.arch != "gemma4" || !source.quant.empty() ||
+    /* Inkling 2 ships its experts NVFP4 and MXFP8 (the source states a quant); its tower is bf16
+     * all the same, which `provide` below insists on, weight by weight. */
+    if (ck.is_gguf() || source.arch != arch || (!source.quant.empty() && !inkling) ||
         source.m.n_expert <= 0 ||
-        std::string_view(rad_meta_gets(&source.m, "vision_config.model_type", "")) != "gemma4_vision") {
-        RAD_ERR("--add-vision requires a Gemma 4 MoE safetensors source with gemma4_vision config");
+        std::string_view(rad_meta_gets(&source.m, "vision_config.model_type", "")) != tower) {
+        RAD_ERR("--add-vision requires a %s safetensors source with %s config",
+                inkling ? "Inkling 2" : "Gemma 4 MoE", tower);
         return RAD_E_UNSUPPORTED;
     }
 
@@ -128,7 +138,10 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
             return RAD_E_INVAL;
         }
     }
-    if (!base.get_i("n_ctx_train", &meta.m.n_ctx_train) || meta.m.n_ctx_train <= 0)
+    /* Inkling 2's config states no trained context (the container holds 0); the declare below
+     * only needs a positive one to size its buffers. */
+    if (!base.get_i("n_ctx_train", &meta.m.n_ctx_train) || meta.m.n_ctx_train < 0 ||
+        (meta.m.n_ctx_train == 0 && !inkling))
         return RAD_E_FORMAT;
     base.get_i("n_expert_used", &meta.m.n_expert_used);
     base.get_i("n_expert_shared", &meta.m.n_expert_shared);
@@ -166,7 +179,10 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
         RAD_ERR("--add-vision: invalid processor metadata: %s", why.c_str());
         return RAD_E_INVAL;
     }
+    /* Gemma 4 numbers its media tokens in the config; Inkling 2's are vocabulary words the
+     * engine resolves at startup (mm::Processor::init). */
     for (int32_t id : {media.tok_image, media.tok_video, media.tok_start, media.tok_end}) {
+        if (inkling) break;
         if (id < 0 || (uint32_t)id >= base.vocab().h->n_tokens) {
             RAD_ERR("--add-vision: media token %d is outside the base vocabulary", id);
             return RAD_E_INVAL;
@@ -182,7 +198,7 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
     ctx.world_size = 1;
     ctx.max_tok = 2048;
     ctx.max_seqs = 1;
-    ctx.max_ctx = meta.m.n_ctx_train;
+    ctx.max_ctx = meta.m.n_ctx_train > 0 ? meta.m.n_ctx_train : 8192;
     ctx.max_spec = probe.draft_depth;
     ctx.max_enc_patches = 16384 - 16384 % probe.enc_merge;
     ctx.scope = "";
@@ -215,7 +231,7 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
     Program prog;
     RAD_TRY(rad_tools_declare(plugins, meta.m, ctx, &prog, {}, nullptr, provide, false));
     if (prog.encoder_name != "vision" ||
-        prog.encoder.modalities != (RAD_MM_IMAGE | RAD_MM_VIDEO) ||
+        prog.encoder.modalities != (inkling ? RAD_MM_IMAGE : (RAD_MM_IMAGE | RAD_MM_VIDEO)) ||
         prog.encoder.n_embd != meta.m.n_embd || prog.encoder.patch_dim != media.patch_dim() ||
         prog.encoder.merge != (int64_t)media.merge * media.merge ||
         (int64_t)std::max(media.image_soft_tokens, media.video_soft_tokens) * prog.encoder.merge >
@@ -326,7 +342,8 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
         if (job.base) {
             for (uint32_t k = 0; k < job.base->n_planes; ++k) {
                 const RadFilePlane& plane = base.plane(*job.base, (int)k);
-                if (writer.plane_bytes(job.index, (int)k) != (int64_t)plane.bytes) return RAD_E_FORMAT;
+                if (writer.plane_bytes(job.index, (int)k) != (int64_t)plane.bytes)
+                    return RAD_E_FORMAT;
                 for (int64_t off = 0; off < (int64_t)plane.bytes; off += chunk) {
                     const int64_t n = std::min(chunk, (int64_t)plane.bytes - off);
                     RAD_TRY(base.read_at(buf.data(), n, plane.offset + off));

@@ -190,7 +190,7 @@ __device__ __forceinline__ float ru_act(float z, int kind) {
 // workgroup arrives on a counter after reading; the last arriver rewrites the key head's q and k
 // channels and resets the counter (no waiting). A value head's v channels have one reader and are
 // rewritten by it. Two launches sharing a counter block must not overlap; blocks are keyed on
-// (stream, output), as split_ctr in r4d_gemm_fp8a8.hip.
+// (stream, output), as split_ctr in r4d_gemm_i8a8.hip.
 //
 // CV is also the weight's type: 1 bf16, 2 f32, read as gdn_conv_update reads it.
 struct RuConv {
@@ -201,23 +201,57 @@ struct RuConv {
   long cs_seq, cs_dim, cs_tok;
   const int* cidx; long ci_stride;        // conv state slot per sequence; negative is padding
   unsigned int* ctr;                      // one arrival counter per (sequence, key head)
+  // A tree step's parents (TREE; RadBatch::spec_parent, one int32 a row), with or without the
+  // convolution; null for a chain.
+  const int* par;
 };
 // NORM 4's arrival counters, one per (sequence, pair of value heads), are the same block's from
 // here on: the key heads' take the entries below it.
 constexpr unsigned kRuPairCtr = 2048;
 // Max tokens per sequence for the folded convolution (preloaded into registers, static indices).
+// A tree instance (TREE) holds RU_TMAX, a 15-node tree and its anchor row.
 #define RU_CVT 8
+
+// TREE: a tree verify (rad_drafter_tree; the `_tree` ops, docs/OPS.md). Row t of a sequence
+// continues from row par[t] rather than from row t - 1: -1 is the committed state, which a
+// sequence's first row always continues, and -2, an ordinary causal row, the row before.
+//
+// The workgroup holds one state and a tree needs one a branch, so the state in registers stays
+// the anchor S0 for the whole step and each row is computed from it in low-rank form. A row's
+// update is S <- e^g S + u k^T with u = beta (v - e^g S_parent k), so along a root path a_1..a_d
+//
+//     S_X w = e^{G_X} (S0 w) + sum_j e^{G_X - G_{a_j}} u_{a_j} (k_{a_j} . w)       G = the path's sum of g
+//
+// and both things a row needs of its parent's state, S_P k (for u) and S_P q (for the output), are
+// two dots against S0 in registers plus a few scalars a path row: each ancestor's u (one float a v
+// row, in LDS) and the k.k and k.q products of the block's rows (one Gram pass, a pair a thread).
+// No row waits on another's state traffic, no branch point is rebuilt, and the cost a row is two
+// 64-wide dots where the chain's update is four. The outputs equal the chain's up to rounding
+// (the sums associate differently), not to the byte. Anchor form only: the committed state moves
+// by the next step's replay of the records, exactly as after a chain, and the records are the
+// chain's (the same normalised k, v, g and beta, by row). NORM 4's paired-head codes are the
+// chain's epilogue as it stands: it reads the stored `o` after every row is written.
+//
+// A row's convolution taps are its ancestors' inputs, then the committed history. Records, conv
+// window entries and outputs stay indexed by row; the core moves the accepted path's to the front
+// afterwards (ADV_COMPACT), so the next step's `num_accepted` reads a prefix as after a chain.
+__device__ __forceinline__ int ru_tree_parent(const int* par, int bos, int t) {
+  if (t <= 0) return -1;
+  const int p = par ? par[bos + t] : -2;
+  return (p < -1 || p >= t) ? t - 1 : p;
+}
 
 // A channel's conv state rewritten as gdn_conv_update does: shifted by one, the old history's
 // tail then this step's tokens. The launcher requires the window split to be R4D_GDN_CONV_W - 2,
 // so these are the same stores.
+template <int CVT>
 __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsigned short* hist,
                                                 const unsigned short* xs, int T, long cs_tok) {
   constexpr int NH = R4D_GDN_CONV_W - 2;
 #pragma unroll
   for (int i = 0; i < NH; ++i) sp[(size_t)i * cs_tok] = hist[i + 1];
 #pragma unroll
-  for (int t = 0; t < RU_CVT; ++t)
+  for (int t = 0; t < CVT; ++t)
     if (t < T) sp[(size_t)(t + NH) * cs_tok] = xs[t];
 }
 
@@ -232,7 +266,7 @@ __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsign
   long zg_pitch, const float* __restrict__ nw, float neps, int nact, int H, int Hg, float     \
   scale, float sp_thr, const RuConv cv
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
+          int CV = 0, int TREE = 0>
 __device__ __forceinline__ void ru_update_body(RU_PARAMS)
 {
   using ST = typename ru_state<SDT>::T;
@@ -247,7 +281,10 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
-  const int bos = cu[n], T = cu[n + 1] - bos;
+  constexpr int CVT = TREE ? RU_TMAX : RU_CVT;
+  static_assert(!TREE || (ANC && NORM && VS == 1 && STG == 0),
+                "a tree rebuilds from the anchor's records, one workgroup a head");
+  const int bos = cu[n], T = TREE ? min(cu[n + 1] - bos, RU_TMAX) : cu[n + 1] - bos;
   // With ANC, T == 0 is valid: it folds the previous step's accepted prefix into the anchor before
   // something else reads the state cache. Without ANC there is nothing to do.
   const bool empty = (T <= 0);
@@ -265,24 +302,48 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
   static_assert(!CV || (NORM && VS == 1 && STG == 0), "the folded convolution is the decode shape");
   static_assert(RU_K == RU_V, "one LDS row pitch serves the q, k and v taps");
   constexpr int CW = R4D_GDN_CONV_W, CS = R4D_GDN_CONV_W - 1;
-  __shared__ unsigned short cvq[CV ? RU_CVT * RU_K : 1], cvk[CV ? RU_CVT * RU_K : 1];
-  __shared__ unsigned short cvv[CV ? RU_CVT * RU_V : 1];
+  __shared__ unsigned short cvq[CV ? CVT * RU_K : 1], cvk[CV ? CVT * RU_K : 1];
+  __shared__ unsigned short cvv[CV ? CVT * RU_V : 1];
   __shared__ int cvlast;
   /* The key head's history for the final rewrite (two newest history entries and this step's
    * inputs, one channel per thread), parked in LDS: in registers across the token loop they spill. */
-  __shared__ unsigned short cvh[CV ? (CS - 1 + RU_CVT) * THR : 1];
+  __shared__ unsigned short cvh[CV ? (CS - 1 + CVT) * THR : 1];
   /* The token loop's per-token global reads (a, b and the output gate row) are also staged: at
    * decode there is too little occupancy to hide a global load per token. They are issued here,
    * parked in LDS at the convolution's barrier and read from there: `ca_b` is one token's a
    * (tid < T) or b (T <= tid < 2T), `czg` this thread's strided share of the gate rows. */
-  constexpr int ZPT = (RU_CVT * RU_V + THR - 1) / THR;  // gate values a thread stages
-  __shared__ float sab[CV ? 2 * RU_CVT : 1];
-  __shared__ unsigned short szg[CV ? RU_CVT * RU_V : 1];
+  constexpr int ZPT = (CVT * RU_V + THR - 1) / THR;  // gate values a thread stages
+  __shared__ float sab[CV ? 2 * CVT : 1];
+  __shared__ unsigned short szg[CV ? CVT * RU_V : 1];
   float ca_b = 0.0f;
   unsigned short czg[ZPT];
   const int G = H / Hg;                                 // workgroups that read one key head
   float cwa[CW], cwb[CW], cba = 0.0f, cbb = 0.0f;
-  unsigned short cha[CS], chb[CS], cxa[RU_CVT], cxb[RU_CVT];
+  unsigned short cha[CS], chb[CS], cxa[CVT], cxb[CVT];
+  // TREE: each row's parent, staged by one lane ahead of the anchor's barrier (every return
+  // before it is uniform across the workgroup); then what the low-rank form reads, staged by the
+  // passes ahead of the rows: each row's scales, g, e^g, beta and its parent's path decay, and for
+  // a row X and each ancestor a the coefficients of u_a in S_parent k_X and S_parent q_X (the
+  // diagonal of the second holds the row's own k.q). Then each row's u a v row, written by the
+  // row's own lane pair: a wave's reads of what it wrote itself are in order, so the rows run with
+  // no barrier between them.
+  static_assert(!TREE || CV, "a tree's Gram pass reads the convolution's rows in LDS");
+  __shared__ int spar[TREE ? RU_TMAX : 1];
+  __shared__ float sgkk[TREE ? RU_TMAX * RU_TMAX : 1], sgkq[TREE ? RU_TMAX * RU_TMAX : 1];
+  __shared__ float sks[TREE ? RU_TMAX : 1], sqs[TREE ? RU_TMAX : 1], sg[TREE ? RU_TMAX : 1];
+  __shared__ float sbt[TREE ? RU_TMAX : 1], seg[TREE ? RU_TMAX : 1], scp[TREE ? RU_TMAX : 1];
+  __shared__ float su[TREE ? RU_TMAX * RU_V : 1];
+  // ...and what the epilogue's passes read: a row's output a v row, and a wave's partial of each
+  // row's sum of squares and of its amax.
+  __shared__ float son[TREE ? RU_TMAX * RU_V : 1];
+  __shared__ float swq[TREE ? RU_TMAX * (THR / 32) : 1], swm[TREE ? RU_TMAX * (THR / 32) : 1];
+  if constexpr (TREE) {
+    if (tid == 0 && !empty) {
+#pragma unroll
+      for (int t = 0; t < RU_TMAX; ++t)
+        if (t < T) spar[t] = ru_tree_parent(cv.par, bos, t);
+    }
+  }
   unsigned short* spa = nullptr;
   unsigned short* spb = nullptr;
   unsigned int arrived = 0;
@@ -299,7 +360,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       const CWT* const cw = (const CWT*)cv.w;
       const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
 #pragma unroll
-      for (int t = 0; t < RU_CVT; ++t)
+      for (int t = 0; t < CVT; ++t)
         if (t < T) cxa[t] = xr[(size_t)t * cv.xpitch + ca];
       {
         const cp_taps<CWT> w4 = *(const cp_taps<CWT>*)(cw + (size_t)ca * CW);
@@ -311,7 +372,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       for (int i = 0; i < CS; ++i) cha[i] = spa[(size_t)(off + i) * cv.cs_tok];
       if (tid < RU_V) {
 #pragma unroll
-        for (int t = 0; t < RU_CVT; ++t)
+        for (int t = 0; t < CVT; ++t)
           if (t < T) cxb[t] = xr[(size_t)t * cv.xpitch + cb];
         const cp_taps<CWT> w4 = *(const cp_taps<CWT>*)(cw + (size_t)cb * CW);
         cwb[0] = cp_tap(w4.x); cwb[1] = cp_tap(w4.y); cwb[2] = cp_tap(w4.z); cwb[3] = cp_tap(w4.w);
@@ -458,6 +519,37 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       float win[CW];
 #pragma unroll
       for (int i = 0; i < CS; ++i) win[i] = bf2f(hist[i]);
+      if constexpr (TREE) {
+        // A row's taps: its ancestors' inputs, newest first, then the committed history from its
+        // newest entry back. The row indices are selected, not indexed, so `xs` stays in
+        // registers; the sums are the chain's, tap for tap.
+        float hw[CS];
+#pragma unroll
+        for (int i = 0; i < CS; ++i) hw[i] = win[i];
+#pragma unroll
+        for (int t = 0; t < CVT; ++t) {
+          if (t < T) {
+            win[CW - 1] = bf2f(xs[t]);
+            int anc = spar[t], used = 0;
+#pragma unroll
+            for (int i = 1; i <= CS; ++i) {
+              unsigned short raw = 0;
+#pragma unroll
+              for (int j = 0; j < t; ++j) raw = (anc == j) ? xs[j] : raw;
+              float hv_ = hw[CS - 1];
+#pragma unroll
+              for (int j = 1; j < CS; ++j) hv_ = (used == j) ? hw[CS - 1 - j] : hv_;
+              win[CW - 1 - i] = anc >= 0 ? bf2f(raw) : hv_;
+              if (anc >= 0) anc = spar[anc]; else ++used;
+            }
+            float acc = bs;
+#pragma unroll
+            for (int i = 0; i < CW; ++i) acc += wt[i] * win[i];
+            dst[t * RU_K] = f2bf(cp_silu(acc));
+          }
+        }
+        return;
+      }
 #pragma unroll
       for (int t = 0; t < RU_CVT; ++t) {
         if (t < T) {
@@ -475,11 +567,11 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
 #pragma unroll
     for (int i = 1; i < CS; ++i) cvh[(i - 1) * THR + tid] = cha[i];
 #pragma unroll
-    for (int t = 0; t < RU_CVT; ++t)
+    for (int t = 0; t < CVT; ++t)
       if (t < T) cvh[(CS - 1 + t) * THR + tid] = cxa[t];
     if (tid < RU_V) {
       conv(cwb, cbb, chb, cxb, cvv + tid);
-      ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
+      ru_conv_rewrite<CVT>(spb, chb, cxb, T, cv.cs_tok);
     }
     if (tid < 2 * T) sab[tid] = ca_b;
 #pragma unroll
@@ -529,7 +621,220 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
     __syncthreads();
   }
 
-  for (int t = 0; t < T; ++t) {
+  if constexpr (TREE) {
+    // The Gram pass: thread (i, j), i <= j < T, the raw k_i.k_j and k_i.q_j of the convolution's
+    // rows (an ancestor's row is below its descendant's); thread (t, t) also row t's l2 scales,
+    // the chain's sums in the chain's order (a half, then the other), so the record's k is the
+    // chain's; thread t row t's g and beta.
+    const int gi = tid >> 4, gj = tid & 15;
+    const bool gpair = tid < RU_TMAX * RU_TMAX && gi <= gj && gj < T;
+    auto dot = [&](const unsigned short* a, const unsigned short* b) {
+      // Rolled: unrolled, the loads of three dots are hoisted ahead of their sums and the state
+      // in registers spills.
+      float hs[2];
+#pragma unroll
+      for (int p_ = 0; p_ < 2; ++p_) {
+        float acc = 0.0f;
+#pragma unroll 1
+        for (int e = p_ * RU_HK; e < (p_ + 1) * RU_HK; e += 8) {
+          const uint4 wa = *(const uint4*)(a + e), wb = *(const uint4*)(b + e);
+          const unsigned short* pa = (const unsigned short*)&wa;
+          const unsigned short* pb = (const unsigned short*)&wb;
+#pragma unroll
+          for (int d = 0; d < 8; ++d) acc += bf2f(pa[d]) * bf2f(pb[d]);
+        }
+        hs[p_] = acc;
+      }
+      return hs[0] + hs[1];
+    };
+    if (gpair) {
+      const float akk = dot(cvk + gi * RU_K, cvk + gj * RU_K);
+      sgkk[tid] = akk;
+      sgkq[tid] = dot(cvk + gi * RU_K, cvq + gj * RU_K);
+      if (gi == gj) {
+        sks[gi] = __frsqrt_rn(akk + 1e-6f);
+        sqs[gi] = __frsqrt_rn(dot(cvq + gj * RU_K, cvq + gj * RU_K) + 1e-6f) * scale;
+      }
+    }
+    if (tid < T) {
+      const float g = -alog * ru_softplus(sab[tid] + dtb, sp_thr);
+      sg[tid] = g;
+      seg[tid] = __expf(g);
+      sbt[tid] = 1.0f / (1.0f + __expf(-sab[T + tid]));
+    }
+    __syncthreads();
+    // The coefficients: thread (a, X) walks X's root path from its parent. Reaching a, the decay
+    // between them and the two normalised products; never reaching it, zero. Thread (X, X): the
+    // decay of the parent's whole path, and the row's own normalised k.q.
+    if (gpair) {
+      float acc = 0.0f;
+      bool hit = gi == gj;
+      for (int b = spar[gj], n_ = 0; b >= 0 && n_ < RU_TMAX; b = spar[b], ++n_) {
+        if (b == gi) { hit = true; break; }
+        acc += sg[b];
+      }
+      if (gi == gj) {
+        scp[gj] = __expf(acc);
+        sgkq[tid] = sgkq[tid] * sks[gj] * sqs[gj];
+      } else {
+        const float c = hit ? __expf(acc) * sks[gi] : 0.0f;
+        sgkk[tid] = c * sgkk[tid] * sks[gj];
+        sgkq[tid] = c * sgkq[tid] * sqs[gj];
+      }
+    }
+    __syncthreads();
+
+    // ---- pass 1: every row's u, its record and its output before the norm. No barrier: the
+    // record stores of all rows are in flight together and are waited on once.
+    const int wv = tid >> 5, ln = tid & 31;
+    const float nwr = nw[row];
+    for (int t = 0; t < T; ++t) {
+      const unsigned short* qp = cvq + t * RU_K + k0;
+      const unsigned short* kp = cvk + t * RU_K + k0;
+      // S0 k and S0 q against the state in registers, raw: the scales ride on the two dots.
+      float s0k = 0.0f, s0q = 0.0f;
+#pragma unroll
+      for (int j = 0; j < RU_HK; j += 8) {
+        const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
+        const unsigned short* sq = (const unsigned short*)&wq;
+        const unsigned short* sk = (const unsigned short*)&wk;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          s0k += h[j + e] * bf2f(sk[e]); s0q += h[j + e] * bf2f(sq[e]);
+        }
+      }
+      s0k += r4d_xor_lane<1>(s0k);
+      s0q += r4d_xor_lane<1>(s0q);
+      const float ks = sks[t], g = sg[t], bt = sbt[t], eg = seg[t], cp = scp[t];
+      // ...then the parent's root path, nearest ancestor first.
+      float spk = cp * (s0k * ks), spq = cp * (s0q * sqs[t]);
+      for (int a = spar[t], n_ = 0; a >= 0 && n_ < RU_TMAX; a = spar[a], ++n_) {
+        const float ua = su[a * RU_V + row];
+        spk += ua * sgkk[a * RU_TMAX + t];
+        spq += ua * sgkq[a * RU_TMAX + t];
+      }
+      const float vraw = bf2f(cvv[t * RU_V + row]);
+      const float u = (vraw - eg * spk) * bt;
+      // S_X q = e^g (S_parent q) + u (k.q)
+      const float on = eg * spq + u * sgkq[t * (RU_TMAX + 1)];
+      su[t * RU_V + row] = u;
+      son[t * RU_V + row] = on;
+
+      // The row's factors for the next step's replay, as the chain writes them.
+      ST* f  = fb  + (size_t)t * RU_FSTR;
+      ST* f0 = fb0 + (size_t)t * RU_FSTR;
+      ST* f2 = fb2 + (size_t)t * RU_FSTR;
+      if ((row & 31) == 0) {
+#pragma unroll
+        for (int j = 0; j < RU_HK; j += 8) {
+          // the group's lane pair reads its half of k again: held from the dots, it would
+          // cost every thread 64 registers beside the state
+          const uint4 wk = *(const uint4*)(kp + j);
+          const unsigned short* sk = (const unsigned short*)&wk;
+          float kn[8];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) kn[e] = bf2f(sk[e]) * ks;
+          ru_store8<0, SDT>(f + grp * RU_K + k0 + j, kn);
+          if (dup_f) {
+            ru_store8<0, SDT>(f0 + grp * RU_K + k0 + j, kn);
+            ru_store8<0, SDT>(f2 + grp * RU_K + k0 + j, kn);
+          }
+        }
+        if (half == 0) {
+          f[4 * RU_K + RU_V + 2 * grp]      = (ST)g;
+          f[4 * RU_K + RU_V + 2 * grp + 1]  = (ST)bt;
+          if (dup_f) {
+            f0[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+            f0[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+            f2[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+            f2[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+          }
+        }
+      }
+      if (half == 0) {
+        f[4 * RU_K + row] = (ST)vraw;
+        if (dup_f) { f0[4 * RU_K + row] = (ST)vraw; f2[4 * RU_K + row] = (ST)vraw; }
+      }
+
+      // this wave's part of the row's sum of squares, one channel a thread pair
+      float ss = (half == 0) ? on * on : 0.0f;
+      ss += r4d_xor_lane<16>(ss); ss += r4d_xor_lane<8>(ss); ss += r4d_xor_lane<4>(ss);
+      ss += r4d_xor_lane<2>(ss);  ss += r4d_xor_lane<1>(ss);
+      if (ln == 0) swq[t * (THR / 32) + wv] = ss;
+    }
+    __syncthreads();
+
+    // ---- pass 2: the gated norm of every row, its bf16 output, and the wave's part of its amax.
+    for (int t = 0; t < T; ++t) {
+      const int tok = bos + t;
+      float tot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < THR / 32; ++i) tot += swq[t * (THR / 32) + i];
+      const float sc = __frsqrt_rn(tot * (1.0f / RU_V) + neps);
+      float on = son[t * RU_V + row];
+      on *= sc * nwr * ru_act(bf2f(szg[t * RU_V + row]), nact);
+      const unsigned short ob = f2bf(on);
+      if (half == 0) o[((size_t)tok * H + hv) * RU_V + row] = ob;
+      const float ov = bf2f(ob);
+      son[t * RU_V + row] = ov;
+      if ((NORM == 1 || NORM == 2) && oq) {
+        float mv = (half == 0) ? fabsf(ov) : 0.0f;
+        mv = fmaxf(mv, r4d_xor_lane<16>(mv)); mv = fmaxf(mv, r4d_xor_lane<8>(mv));
+        mv = fmaxf(mv, r4d_xor_lane<4>(mv));  mv = fmaxf(mv, r4d_xor_lane<2>(mv));
+        mv = fmaxf(mv, r4d_xor_lane<1>(mv));
+        if (ln == 0) swm[t * (THR / 32) + wv] = mv;
+      }
+    }
+
+    // ---- pass 3: the out projection's codes, as the chain's epilogue forms them over `o`
+    // (NORM 4's below, shared with the chain).
+    if (NORM != 4 && oq) {
+      __syncthreads();
+      if constexpr (NORM == 3) {
+        // had_quant_act_i8g's rotation: a row's 128 values in one wave, a wave a row at a time.
+        for (int t = wv; t < T; t += THR / 32) {
+          const int tok = bos + t;
+          float rv[4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) rv[j] = son[t * RU_V + 4 * ln + j];
+          r4d_fwht_wave<128>(rv, ln);
+          float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+          m = r4d_wave_max(m);
+          const float cs_ = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+          if (ln == 0) os[(size_t)tok * os_ld + hv] = cs_;
+          const float inv = 1.0f / cs_;
+          uint32_t pk = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+          *(uint32_t*)(oq + (size_t)tok * oq_pitch + (size_t)hv * RU_V + 4 * ln) = pk;
+        }
+      } else if constexpr (NORM == 1 || NORM == 2) {
+        for (int t = 0; t < T; ++t) {
+          const int tok = bos + t;
+          float amax = 0.0f;
+#pragma unroll
+          for (int i = 0; i < THR / 32; ++i) amax = fmaxf(amax, swm[t * (THR / 32) + i]);
+          const float cs_ = amax > 0.0f ? amax * (1.0f / q8_top<NORM == 2>()) : 1.0f;
+          if (tid == 0) os[(size_t)tok * os_ld + hv] = cs_;
+          if (half == 0) {
+            const float ov = son[t * RU_V + row];
+            unsigned char code;
+            if constexpr (NORM == 2) {
+              code = (unsigned char)(int)rintf(fminf(fmaxf(ov * (1.0f / cs_), -127.0f), 127.0f));
+            } else {
+              const float cv_ = fminf(fmaxf(ov * (1.0f / cs_), -448.0f), 448.0f);
+              code = (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(cv_, cv_, 0, false) & 0xff);
+            }
+            oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = code;
+          }
+        }
+      }
+    }
+  }
+
+  // The chain: one row after another through the state in registers.
+  for (int t = 0; t < (TREE ? 0 : T); ++t) {
     const int tok = bos + t;
     const unsigned short* qp = CV ? cvq + t * RU_K + k0 : q + ((size_t)tok * Hg + hk) * RU_K + k0;
     const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
@@ -638,7 +943,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
     // work than its launch gap). The quant group (128) is the row and NORM gives one workgroup per
     // (token, head), so the amax is a workgroup reduction and the scale index is (tok, hv).
     // Bit-identical to the standalone quantiser: it quantises the stored bf16 `ob`, not the f32
-    // `on`, with r4d_fused_quant_fp8.hip's quant_group arithmetic (including the clamp that keeps
+    // `on`, with r4d_fused_quant.hip's quant_group arithmetic (including the clamp that keeps
     // the group maximum from becoming NaN). NORM == 2 writes int8 codes instead (quant_act_i8g:
     // scale amax / 127, round to nearest-even).
     // NORM == 3 writes had_quant_act_i8g's codes: the row's 128 stored bf16 values through
@@ -777,26 +1082,27 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       __syncthreads();
       if (!cvlast) return;
     }
-    unsigned short rh[CS], rx[RU_CVT];
+    unsigned short rh[CS], rx[CVT];
     rh[0] = 0;                                  /* never read: the oldest entry is shifted out */
 #pragma unroll
     for (int i = 1; i < CS; ++i) rh[i] = cvh[(i - 1) * THR + tid];
 #pragma unroll
-    for (int t = 0; t < RU_CVT; ++t)
+    for (int t = 0; t < CVT; ++t)
       rx[t] = t < T ? cvh[(CS - 1 + t) * THR + tid] : (unsigned short)0;
-    ru_conv_rewrite(spa, rh, rx, T, cv.cs_tok);
+    ru_conv_rewrite<CVT>(spa, rh, rx, T, cv.cs_tok);
   }
 }
 
 // The kernel around the body, whose workgroups return where their work ends: CH `r4dchain` is the
 // chained form (r4d_chain.h), every workgroup waiting before its first read and adding once after
 // its last write.
-template <int ABF16, int NORM, int VS, int NT, int ANC, int STG, int SDT, int CV, class CH>
+template <int ABF16, int NORM, int VS, int NT, int ANC, int STG, int SDT, int CV, class CH,
+          int TREE = 0>
 __global__ __launch_bounds__(RU_V / VS * 2)
 void r4d_gdn_recurrent_update_kernel(RU_PARAMS)
 {
   if (CH::on) r4d_chain_wait();
-  ru_update_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(
+  ru_update_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV, TREE>(
       q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch,
       os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr,
       cv);
@@ -942,7 +1248,7 @@ extern "C" int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // ============================================================== the folded convolution
 
 // Arrival counters for the folded convolution: one block per (stream, output), zeroed once and
-// reset by the last arriver of each group. As with split_ctr in r4d_gemm_fp8a8.hip, launches
+// reset by the last arriver of each group. As with split_ctr in r4d_gemm_i8a8.hip, launches
 // sharing a block must not overlap: different streams get different blocks, and launches on one
 // stream sharing an output are ordered by their dependency.
 constexpr unsigned kMaxConvCtr = 4096;
@@ -1004,6 +1310,49 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #undef RC_LAUNCH
 #undef RC_LAUNCH_NM
 #undef RC_LAUNCH_CH
+  return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+// The same over a tree verify (TREE): anchor form and bf16 conv weights only, up to RU_TMAX rows a
+// sequence. `cv.par` is the step's parents; `oq_i8` and `chain` as in ru_conv_recurrent_launch.
+static int ru_conv_recurrent_tree_launch(const RuConv& cv, const void* a, const void* b,
+                                         long ab_stride, const void* A_log, const void* dt_bias,
+                                         void* state, long st_slot, long st_head, void* o,
+                                         void* oq, void* os, long oq_pitch, long os_ld,
+                                         const void* cu, const void* sidx, long sidx_stride,
+                                         const void* nacc, const void* z, long z_pitch,
+                                         const void* nw, float neps, int nact, int N, int H,
+                                         int Hg, float scale, float thr, int state_fp16,
+                                         RadStream stream, int oq_i8, bool chain) {
+  if (sidx_stride < 6) return RAD_E_SHAPE;
+  if ((long)RU_TMAX * RU_FSTR > st_head) return RAD_E_SHAPE;
+  const int sdt = state_fp16 ? 1 : 0;
+  const long flood = (long)N * st_slot * (sdt ? 2 : 4);
+  const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
+  const dim3 grid(N, H, 1), blk(RU_V * 2);
+#define RT_LAUNCH_CH(NM, NTC, SDTC, CH_)                                                      \
+  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, 1, 0, SDTC, 1, CH_, 1>), \
+                     grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
+                     ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
+                     (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
+                     (unsigned char*)oq, (float*)os, oq_pitch, os_ld, (const int*)cu,          \
+                     (const int*)sidx, sidx_stride, (const int*)nacc,                          \
+                     (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg,   \
+                     scale, thr, cv)
+#define RT_LAUNCH(NM, NTC, SDTC)                                                              \
+  do { if (chain) RT_LAUNCH_CH(NM, NTC, SDTC, r4dchain);                                       \
+       else       RT_LAUNCH_CH(NM, NTC, SDTC, R4dUnchained); } while (0)
+#define RT_PICKNM(NTC, SDTC)                                                                  \
+  do { if (oq_i8 == 3) RT_LAUNCH(4, NTC, SDTC);                                               \
+       else if (oq_i8 == 2) RT_LAUNCH(3, NTC, SDTC);                                          \
+       else if (oq_i8) RT_LAUNCH(2, NTC, SDTC);                                               \
+       else            RT_LAUNCH(1, NTC, SDTC); } while (0)
+#define RT_PICKNT(SDTC) do { if (nt) RT_PICKNM(1, SDTC); else RT_PICKNM(0, SDTC); } while (0)
+  if (sdt) RT_PICKNT(1); else RT_PICKNT(0);
+#undef RT_PICKNT
+#undef RT_PICKNM
+#undef RT_LAUNCH
+#undef RT_LAUNCH_CH
   return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1100,7 +1449,7 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
         if (!r4d_contig(oq)) return R4D_NO(RAD_E_STRIDE);
     }
 
-    /* z may be a column view of the fused in-projection (rad_block_gdn_fp8.h): tokens are z_row
+    /* z may be a column view of the fused in-projection: tokens are z_row
      * elements apart, not H*V. */
     const long long z_row = z ? gn_row_pitch(z, H * V) : 0;
     if (z && z_row < 0) return R4D_NO(RAD_E_STRIDE);
@@ -1127,10 +1476,11 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
  * Inputs first, outputs last (docs/OPS.md). */
 enum { OPD_CR_X = 0, OPD_CR_CW, OPD_CR_CB, OPD_CR_CSTATE, OPD_CR_CIDX, OPD_CR_A, OPD_CR_B,
        OPD_CR_ALOG, OPD_CR_DTB, OPD_CR_STATE, OPD_CR_SIDX, OPD_CR_NACC, OPD_CR_CU, OPD_CR_Z,
-       OPD_CR_NORMW, OPD_CR_O, OPD_CR_OQ, OPD_CR_OS };
+       OPD_CR_NORMW, OPD_CR_O, OPD_CR_OQ, OPD_CR_OS, OPD_CR_PAR };
 
-/* `had`: gdn_conv_recurrent_update_had, whose codes are had_quant_act_i8g's over `o` (required). */
-static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
+/* `had`: gdn_conv_recurrent_update_had, whose codes are had_quant_act_i8g's over `o` (required).
+ * `tree`: the `_tree` forms, whose last operand is the step's parents (RadBatch::spec_parent). */
+static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had, bool tree = false) {
     if (gdn_dims_ok() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
     const RadTensor* x     = r4d_opt(a, OPD_CR_X);
     const RadTensor* cw    = r4d_opt(a, OPD_CR_CW);
@@ -1211,7 +1561,15 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
     if (r4d_geti_or(a, "conv_width", 0) != R4D_GDN_CONV_W) return R4D_NO(RAD_E_UNSUPPORTED);
     const long long mql = cst->shape[2] - (R4D_GDN_CONV_W - 2);
     if (mql < 1) return R4D_NO(RAD_E_SHAPE);
-    if (mql > RU_CVT) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (mql > (tree ? RU_TMAX : RU_CVT)) return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor* par = tree ? r4d_opt(a, OPD_CR_PAR) : nullptr;
+    if (tree) {
+        if (!par || !par->data) return R4D_NO(RAD_E_INVAL);
+        if (par->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+        if (r4d_numel(par) < T) return R4D_NO(RAD_E_SHAPE);
+        /* The tree instances are compiled for bf16 conv weights alone. */
+        if (cw->dtype != RAD_BF16) return R4D_NO(RAD_E_UNSUPPORTED);
+    }
 
     /* The recurrent half's checks, as in r4d_rad_gdn_recurrent_update. */
     const int anc = ru_state_form(a);
@@ -1235,6 +1593,19 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
     cv.ctr = ru_conv_ctr(s, o->data);
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
 
+    if (tree) {
+        if (anc != 1) return R4D_NO(RAD_E_UNSUPPORTED);
+        cv.par = (const int*)par->data;
+        return ru_conv_recurrent_tree_launch(
+            cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
+            (long)state->stride[0], (long)state->stride[1], o->data, oq ? oq->data : nullptr,
+            os ? os->data : nullptr, oq ? (long)r4d_row_pitch(oq) : 0,
+            os ? (long)r4d_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
+            nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
+            (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
+            wide ? 3 : had ? 2 : oq && oq->dtype == RAD_I8 ? 1 : 0,
+            r4d_geti_or(a, "chain", 0) != 0);
+    }
     return ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
         (long)state->stride[0], (long)state->stride[1], o->data, oq ? oq->data : nullptr,
@@ -1253,4 +1624,13 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
 
 extern "C" int r4d_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s) {
     return gdn_conv_recurrent_entry(a, s, true);
+}
+
+/* The fold over a tree verify (rad_drafter_tree): operand 18 is `spec_parent`. */
+extern "C" int r4d_rad_gdn_conv_recurrent_update_tree(const RadArgs* a, RadStream s) {
+    return gdn_conv_recurrent_entry(a, s, false, true);
+}
+
+extern "C" int r4d_rad_gdn_conv_recurrent_update_had_tree(const RadArgs* a, RadStream s) {
+    return gdn_conv_recurrent_entry(a, s, true, true);
 }

@@ -42,7 +42,11 @@
  */
 
 #include "r3d_plugin.h"
+#include "r3d_i8_gemm_rows.h"
 #include "rad_abi_layout.h"
+#ifdef R3D_EXPERT_IQR
+#include "r3dh_moe_iqr.h"
+#endif
 
 #ifndef R3D_BUILD_TARGET
 #define R3D_BUILD_TARGET "gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151"
@@ -205,8 +209,10 @@ static const RadOperandSpec oQsaTailStore[] = { { "k", RAD_OPD_IN, 0 },
                                                 { "cu", RAD_OPD_IN, 0 },
                                                 { "state", RAD_OPD_INOUT, 0 },
                                                 { "sidx", RAD_OPD_IN, 0 } };
+/* gate_cap and up_cap are SiTU's (docs/OPS.md); the kernel refuses them when set. */
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                                 P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
+                                                 P_STR("dtype"), P_STRO("act"), P_INTO("mode"),
+                                                 P_F64O("gate_cap"), P_F64O("up_cap") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
                                                    { "b", RAD_OPD_IN, 1 },
                                                    { "q", RAD_OPD_OUT, 0 },
@@ -234,18 +240,6 @@ static const RadParamSpec pGemm[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR(
  * libr4d's, and the loader compares positionally. */
 static const RadOperandSpec oGemm[] = { { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
                                         { "y", RAD_OPD_OUT, 0 } };
-
-/* `w_rb` is libr4d's (docs/OPS.md), accepted and ignored: an int8 weight's per-row scale plane
- * holds each block's value in every row, and the trellis forms that need it are IQR dtypes, which
- * no row here serves. */
-static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                       P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
-                                       P_INTO("split_n"), P_INTO("w_rb") };
-static const RadOperandSpec oGemmQ[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 1 },
-                                         { "b", RAD_OPD_WEIGHT, 0 },
-                                         { "b_scale", RAD_OPD_WEIGHT, 0 },
-                                         { "y", RAD_OPD_OUT, 0 }, { "a_sum", RAD_OPD_IN, 1 },
-                                         { "b_ref", RAD_OPD_WEIGHT, 1 } };
 
 /* --- gated-delta-net --- */
 static const RadParamSpec pGdnKktSolve[] = { P_INT("M"), P_INT("head_k"), P_CHUNK("chunk") };
@@ -766,7 +760,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gemm_nt_f32", pGemm, oGemm,
            "BF16 activations times F32 weights, F32 accumulation and output; preserves routing "
            "and index gate precision."),
-    SCHEMA("gemm_nt_q", pGemmQ, oGemmQ,
+    SCHEMA("gemm_nt_q", r3d_i8_gemm::params, r3d_i8_gemm::operands,
            "The same product against a quantised weight. `dtype` names the scheme: fp8a16 a bf16 "
            "activation against E4M3 codes, fp8a8 quant_act_fp8's codes and scales, i8a8 int8 on "
            "both axes. `group` is the activation's scale width; `pb1` and `pb2` the weight's block, "
@@ -1460,6 +1454,16 @@ static const RadConstraint cMoeGemmQ[] = { C_IN("dtype", "fp8a8f32"), C_GE("n_ex
                                            C_GE("top_k", 1) };
 static const RadConstraint cMoeGemmMxfp4[] = { C_IN("dtype", "mxfp4a8"), C_GE("n_expert", 1),
                                                C_GE("top_k", 1) };
+#ifdef R3D_EXPERT_IQR
+#define IQR_GATE_CONSTRAINTS(even, odd) { C_IN("dtype", "i8a8h"), C_IN("a_order", "token"), \
+       C_GE("M", 1), C_LE("M", 2048), C_EQ("N", even), C_EQ("N_odd", odd), C_EQ("K", 2560), \
+       C_EQ("K_odd", 2560), C_EQ("n_expert", 512), C_EQ("top_k", 10), C_EQ("group", 128), \
+       C_EQ("a_group", 128), C_EQ("parts", 2) }
+static const RadConstraint cIqrGateEvenWide[] = IQR_GATE_CONSTRAINTS(768, 512);
+static const RadConstraint cIqrGateOddWide[] = IQR_GATE_CONSTRAINTS(512, 768);
+static const RadConstraint cIqrGateFull[] = IQR_GATE_CONSTRAINTS(1280, 1280);
+#undef IQR_GATE_CONSTRAINTS
+#endif
 static const RadConstraint cMoeGemmQW4A8[] = { C_IN("dtype", "w4a8"), C_GE("n_expert", 1),
                                                C_GE("top_k", 1) };
 static const RadConstraint cMoeGemmW4A4[] = { C_IN("dtype", "w4a4"), C_GE("n_expert", 1),
@@ -1543,11 +1547,6 @@ static const RadConstraint cGemmQFp8a16[] = { C_IN("dtype", "fp8a16"),
 static const RadConstraint cGemmQFp8a8[]  = { C_IN("dtype", "fp8a8"),
                                               C_EQ("group", R3D_FP8_BLOCK), C_GE("M", 1),
                                               C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
-/* The int8 trunk GEMM: i8a8 and its rotated twin i8a8h are one launch (the rotation is in the
- * stored weight and in the activation's quantiser). Every M: the kernel tiles M itself. */
-static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8 i8a8h"),
-                                              C_EQ("group", R3D_W8_GROUP), C_GE("M", 1),
-                                              C_DIV("K", 128), C_GE("N", 1) };
 
 /* ================================================================== the rows
  *
@@ -1632,7 +1631,22 @@ static const RadConstraint cDflashSelect[] = { C_IN("dtype", "bf16"), C_GE("M", 
                                                C_LE("top_k", 256), C_GE("rank", 1),
                                                C_GE("n_vocab", 1) };
 
+#ifdef R3D_EXPERT_IQR
+template<size_t Count>
+static constexpr RadKernelInfo iqr_gate(const char* name, const RadConstraint (&constraints)[Count]) {
+       return {name, "moe_gemm_q", "moe", "Routed IQR gate and up projections in sorted slot order",
+              "even/odd expert tables; each half padded to the wider class; dropped rows zeroed",
+              "token i8 and f32 group scales; trellis u4, MAD16 and row/column f32 scales; bf16 result",
+              RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY, constraints, Count, nullptr, 0, nullptr, nullptr, nullptr,
+              r3dh_moe_iqr_launch, nullptr, r3dh_moe_iqr_layout, r3dh_moe_iqr_relayout,
+              r3dh_moe_iqr_shape, r3dh_moe_iqr_unrelayout};
+}
+#endif
+
 static const RadKernelInfo kKernels[] = {
+#ifdef R3D_DENSE_IQR
+    r3d_i8_gemm::packed,
+#endif
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
  *
  * One workgroup a row. The `shape` column states the geometry the grid is built for; the
@@ -2414,6 +2428,11 @@ static const RadKernelInfo kKernels[] = {
   * registers (the 256-entry decode table), the f16 wave-matrix, the even experts in `w` and the
   * odd in `w_odd`.
   */
+#ifdef R3D_EXPERT_IQR
+ iqr_gate("model_moe_iqr_768_512_strict", cIqrGateEvenWide),
+ iqr_gate("model_moe_iqr_512_768_strict", cIqrGateOddWide),
+ iqr_gate("model_moe_iqr_1280_1280_strict", cIqrGateFull),
+#endif
  { "moe_gemm_q_e4m3", "moe_gemm_q", "moe",
   "The grouped quantised GEMM over the model's fp8a8f32 experts: y[i] = a[sorted_tok[i]/top_k] @ "
   "w_e^T with a per-(row, grid-of-K) scale fold, e the expert of sorted row i",
@@ -2708,23 +2727,7 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r3d_rad_gemm_nt_q_w8a8_m64,
    nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_w8a8 },
 
-{ "gemm_nt_q_i8a8", "gemm_nt_q", "gemm",
-  "the int8 trunk grid (i8a8, and i8a8h, its rotated twin): signed int8 codes against row-major "
-  "int8 activations, the group's integer sub-sum scaled by the activation's (row, group) scale "
-  "and the weight's (row, group) scale",
-  "group 128, K a multiple of it, every M; below M = 128 a wave is a 16-column tile over one "
-  "16-row tile (M <= 16) or two, the weight read from global at each step; from M = 128 a block "
-  "is a 128x128 output tile with a group of both operands staged in LDS, so a prefill chunk "
-  "reads the weight once per 128 rows",
-  "I8 a row-major with an f32 scale per (row, 128 of K) -- quant_act_i8g's output, or "
-  "had_quant_act_i8g's at i8a8h; I8 codes b with a bf16 scale per (row, 128 of K), bf16 y, fp32 "
-  "accumulation in ascending group order; the sub-sums are exact integers under 2^24, and the "
-  "store is the only narrowing; each group term rounds as quant_dot's (two multiplies, an add, "
-  "none fused), so the row is bit-identical to the reference; no zero point, so no a_sum",
-  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
-  ROW(cGemmQI8), NOTUNE,
-  nullptr, nullptr, r3d_rad_gemm_nt_q_i8a8,
-  nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_i8a8 },
+    r3d_i8_gemm::native,
 
     { "silu_mul_bf16", "silu_mul", "elem",
       "silu(gate) * up over one fused gate_up plane, the gate the first half",

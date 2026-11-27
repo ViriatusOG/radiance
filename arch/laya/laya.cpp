@@ -389,11 +389,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", "bf16"), RAD_F64("value", -1e4)),
                                RAD_NOWEIGHTS),
                      {}, { m.b_sc });
-    m.op_out    = rw(b, RAD_OP(b, "cast",
-                               RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", P),
-                                          RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                               RAD_NOWEIGHTS),
-                     { m.b_sc }, { m.b_pooled });
+    m.op_out    = cast_op(b, 1, P, "bf16", "f32", m.b_sc, m.b_pooled);
     if (!m.op_embed || !m.op_emb_norm || !m.op_final_norm || !m.op_type || !m.op_add_type ||
         !m.op_gather || !m.op_sn || !m.op_s1 || !m.op_s2 || !m.op_fill || !m.op_out)
         return RAD_E_INVAL;

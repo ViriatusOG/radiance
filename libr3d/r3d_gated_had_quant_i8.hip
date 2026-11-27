@@ -138,8 +138,13 @@ int r3d_rad_gated_had_quant_i8(const RadArgs* a, RadStream s)
     if (had != 128 && had != 256 && had != 512) return R3D_NO(RAD_E_SHAPE);
     if (n != had) return R3D_NO(RAD_E_SHAPE);   // single-block form (gfx1102, see the header)
 
-    const long long mode = r3d_geti_or(a, "mode", 0);
-    if (mode != 0 && mode != 1) return R3D_NO(RAD_E_SHAPE);
+    // `act` names the gate ("silu" or "sigmoid"); `mode` is its integer spelling, read when `act`
+    // is absent. A name this kernel does not compute (SiTU) is refused rather than run as silu.
+    const int mode = r3d_act_code(a, "act", "mode", 0);
+    if (mode != 0 && mode != 1) return R3D_NO(RAD_E_INVAL);
+    // The caps belong to SiTU; with silu or sigmoid they would be silently ignored.
+    if (r3d_getf(a, "gate_cap", 0.0) != 0.0 || r3d_getf(a, "up_cap", 0.0) != 0.0)
+        return R3D_NO(RAD_E_UNSUPPORTED);
     const float rnorm = 1.0f / sqrtf((float)had);
     dim3 grid((unsigned)M), blk(kThreads);
     const uint32_t nn = (uint32_t)n;

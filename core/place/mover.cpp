@@ -333,12 +333,12 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          * through a dummy (a scale plane re-read, a dropped slot) sees zeros, which dequantise
          * finite -- pointing it at the staging buffer's base handed it real weight bytes whose
          * reinterpretation produced NaNs. */
-        calm_ = (char*)reserve("file-tier dummy region", 8 << 20, RAD_MEM_HOST_PINNED);
-        if (!calm_) {
+        zero_region_ = (char*)reserve("file-tier dummy region", 8 << 20, RAD_MEM_HOST_PINNED);
+        if (!zero_region_) {
             RAD_ERR("mover: no pinned memory for the file tier's dummy region");
             return RAD_E_NOMEM;
         }
-        std::memset(calm_, 0, 8 << 20);
+        std::memset(zero_region_, 0, 8 << 20);
     }
 
     /* ---- the file tier's cache cycle (stage_file_units) -------------------------------------
@@ -886,7 +886,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                     m2.slab_slot = -1;
                     m2.pool_slot = vs.pool_slot;
                     for (size_t k = 0; k < mv.weights.size(); ++k)
-                        res_.publish(mv.weights[k], calm_);
+                        res_.publish(mv.weights[k], zero_region_);
                     vs.tier = Tier::SSD;
                     vs.site = Site::DeviceStaged;
                     vs.pool_slot = -1;
@@ -958,7 +958,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     for (size_t k = skipped0; k < rd->skipped.size(); ++k) {
         const int32_t u = rd->skipped[k];
         const MoveUnit& mu = plan_->units[(size_t)u];
-        for (size_t j = 0; j < mu.weights.size(); ++j) res_.publish(mu.weights[j], calm_);
+        for (size_t j = 0; j < mu.weights.size(); ++j) res_.publish(mu.weights[j], zero_region_);
         stats_.ssd_skipped_bytes += (uint64_t)unit_[(size_t)u].bytes;
     }
     stats_.ssd_skipped_units += (uint64_t)(rd->skipped.size() - skipped0);

@@ -539,17 +539,6 @@ TEST(the_host_library_agrees_with_the_reference_on_drawn_sampler_requests) {
  * The timing pass on the host backend: no card numbers, but every path a card takes. The flags are
  * the cheap end of each: a 1 MiB rotation footprint, three batches of two launches, no warm-up. */
 
-std::string read_text(const std::string& path) {
-    std::string s;
-    FILE* f = std::fopen(path.c_str(), "r");
-    if (!f) return s;
-    char buf[4096];
-    size_t got;
-    while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, got);
-    std::fclose(f);
-    return s;
-}
-
 /* The cells of the speed table's row for `kernel` (and `geom`, when given), trimmed: [1] op ... [5]
  * device us, [6] host us, [9] n, [13] notes. Empty when there is none. */
 std::vector<std::string> speed_row(const std::string& md, const std::string& kernel,
@@ -597,7 +586,7 @@ TEST(device_rows_are_timed_after_the_checks_and_host_rows_where_checked) {
     CHECK_RUN(o, has(o.text, "6 checked, 6 passed, 0 failed"));
     CHECK_RUN(o, has(o.text, "timing: 6 case(s) timed, 1 of the 3 on the device behind a gate"));
     CHECK_RUN(o, has(o.text, "launch floor:"));
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     CHECK(has(md, "## Speed") && has(md, "launch floor:") && has(md, "cold: each launch reads"));
     const std::vector<std::string> gated = speed_row(md, "kbm_gather_rows_device");
     REQUIRE(gated.size() >= 14);
@@ -641,7 +630,7 @@ TEST(an_in_place_operand_is_restored_before_every_timed_launch) {
                                  fx + "' " + kQuickBench + " --report '" + report + "'");
     CHECK_RUN(o, o.code == 0);
     CHECK_RUN(o, has(o.text, "2 checked, 2 passed, 0 failed"));
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     const std::vector<std::string> host = speed_row(md, "kbm_scatter_rows");
     REQUIRE(host.size() >= 14);
     CHECK(num(host[6]) > 0);
@@ -663,7 +652,7 @@ TEST(warm_timing_rereads_one_set_of_operands) {
                                               "--bench-iters 2 --bench-reps 3 --bench-warm-ms 0 "
                                               "--report '" + report + "'"));
     CHECK_RUN(o, o.code == 0);
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     CHECK(has(md, "warm: every launch rereads the same operands"));
     CHECK(has(md, "read bandwidth: not probed"));
     CHECK(has(md, "every operand is reused"));
@@ -698,7 +687,7 @@ TEST(a_weight_table_is_timed_through_rotated_pointer_tables) {
     CHECK_RUN(o, has(o.text, "1 checked, 1 passed, 0 failed"));
     /* w and w_odd with their scale tables: four weight tables, every one rotated. */
     CHECK_RUN(o, has(o.text, "4 weight table(s) through pointer tables"));
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     const std::vector<std::string> row = speed_row(md, "ref_moe_gemm_q");
     REQUIRE(row.size() >= 14);
     CHECK(num(row[6]) > 0);
@@ -717,7 +706,7 @@ TEST(the_container_pass_times_its_cases_too) {
                              "'");
     CHECK_RUN(o, o.code == 0);
     CHECK_RUN(o, has(o.text, "timing: ") && has(o.text, "launch floor:"));
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     const std::vector<std::string> dev = speed_row(md, "kbm_add_device");
     REQUIRE(dev.size() >= 14);
     CHECK(num(dev[5]) > 0);
@@ -758,7 +747,7 @@ TEST(cases_that_differ_only_in_depth_are_reported_apart) {
                              "--fixture '" + fx + "' " + kQuickBench + " --report '" + report +
                              "'");
     CHECK_RUN(o, o.code == 0 && has(o.text, "2 checked, 2 passed"));
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     const size_t speed = md.find("## Speed");
     REQUIRE(speed != std::string::npos);
     int correctness_rows = 0, speed_rows = 0;
@@ -779,7 +768,7 @@ TEST(a_failing_case_is_not_timed) {
                                                      kQuickBench + " --report '" + report + "'"));
     CHECK_RUN(o, o.code == 1);
     CHECK_RUN(o, has(o.text, "timing: 2 case(s) timed"));
-    std::string md = read_text(report);
+    std::string md = read_file(report);
     CHECK(speed_row(md, "kbm_add").empty());
     CHECK(speed_row(md, "kbm_add_device").empty());
     CHECK(speed_row(md, "kbm_gather_rows_device").size() >= 14);
@@ -791,7 +780,7 @@ TEST(a_failing_case_is_not_timed) {
                              "--max-tok 4 --max-bytes 64 " + std::string(kQuickBench) +
                              " --report '" + creport + "'");
     CHECK_RUN(c, c.code == 1);
-    md = read_text(creport);
+    md = read_file(creport);
     CHECK(has(md, "## Speed"));
     CHECK(speed_row(md, "kbm_add_device").empty());
     CHECK(speed_row(md, "kbm_rmsnorm").size() >= 14);
@@ -807,7 +796,7 @@ TEST(timing_only_times_device_rows_and_checks_nothing) {
                              "' --report '" + report + "'");
     CHECK_RUN(o, o.code == 0);
     CHECK_RUN(o, has(o.text, "3 timed. Timing only"));
-    const std::string md = read_text(report);
+    const std::string md = read_file(report);
     CHECK(speed_row(md, "kbm_add_device").size() >= 14);
     CHECK(speed_row(md, "kbm_add").empty());
 }

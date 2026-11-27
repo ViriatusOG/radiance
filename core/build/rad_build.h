@@ -39,12 +39,11 @@ namespace rad {
  * deduplicated, never freed. Owning them in RadNameMap would be an ABI change. */
 const char* intern(std::string_view s);
 
-/* Names for the enums the graph dump prints; `bld_` prefixed to keep them apart from the
- * planner's tier_name and site_name in rad_core.h. */
+/* Names for the enums the graph dump prints (the KV kind's is mem/kv.h's kv_kind_name); `bld_`
+ * prefixed to keep them apart from the planner's tier_name and site_name in rad_core.h. */
 const char* bld_domain_name(int domain);
 const char* bld_access_name(int access);
 const char* bld_buf_kind_name(int kind);
-const char* bld_kv_kind_name(int kind);
 
 /* ------------------------------------------------------------------ the buffer plan */
 /* Packing results for the --debug-graph report. `sum_bytes` (no sharing) and `peak_live` (a

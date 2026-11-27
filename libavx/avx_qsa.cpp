@@ -516,10 +516,11 @@ static void select_row(const SelJob& j, int64_t m) {
 /* ------------------------------------------------------------------ qsa_select */
 /* The page-id table the sparse attention reads (docs/OPS.md): over the query's complete blocks
  * n = min(nc[seq], (pos + 1) / ratio, width), the live ones (page id >= 0, score > -1e30) ranked
- * by max(score, 0), or with `signed` 1 those with a finite score, ranked by it. All of them when `topk` or fewer are live, else every block above the topk-th
- * largest value in block order, then the blocks equal to it in block order until topk are taken.
- * The partial page bt[n] follows when (pos + 1) % ratio != 0 and n < width, and -1 pads the row
- * to topk + 1. A row no sequence holds reads sequence 0, as libref's and libr4d's do. */
+ * by max(score, 0), or with `signed` 1 those with a finite score, ranked by it. All of them when
+ * `topk` or fewer are live, else every block above the topk-th largest value in block order,
+ * then the blocks equal to it in block order until topk are taken. The partial page bt[n]
+ * follows when (pos + 1) % ratio != 0 and n < width, and -1 pads the row to topk + 1. A row no
+ * sequence holds reads sequence 0, as libref's and libr4d's do. */
 AVX_KERNEL(qsa_select) {
     if (!rad_args_have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];

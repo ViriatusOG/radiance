@@ -1,0 +1,83 @@
+# inkling2-mini-iq4r-v4.recipe -- Inkling 2 Mini (`inkling2_loop`) with its routed experts in
+# IQR-V4's four-bit form, rotated int8 attention, an int8 head and token embedding, and incoai's
+# DFlash2 drafter. Served by arch/inkling2 (the drafter: inkling2_dflash2.h).
+#
+#   CALIB=<calib dir> rad-convert <Inkling-2-Mini directory> -o t.rad \
+#       --recipe data/recipes/inkling2-mini-iq4r-v4.recipe \
+#       --draft-model <Inkling-2-Mini-DFlash2 directory> --max-ctx 200000
+#   rad-convert <Inkling-2-Mini directory> --add-vision t.rad -o inkling-2-mini-iq4r-v4.rad
+#
+#   - The experts (all 24 layers, gate_up and down) are rotated 128 wide by the unnormalised
+#     Hadamard (`transform=fwht128`) and fitted by GPTQ in act order (`tcq_order=1`) against the
+#     calibration Hessians in $CALIB. Their codes are a tail-biting trellis down each column whose
+#     2^16 states' values are computed from the state (`tcq=16 tcq_code=mad`), four bits a weight,
+#     under one f32 scale a row and one a 128-K block. arch/inkling2 serves them with moe_gemm_iqr
+#     at their codes' width, against a rotated int8 activation. The release's NVFP4 experts
+#     (layers 0..19) and MXFP8 experts (layers 20..23) are dequantised exactly first, so GPTQ fits
+#     the release's own weights.
+#   - A trellis run is whole rows of its weight. Under tensor parallelism each expert's 1152
+#     intermediate rows are split at 128-row blocks (five and four of nine at two ranks), so
+#     gate_up's runs are 128 rows (`tcq_rows=128`); down's 2304 rows are not split and take runs
+#     of 256.
+#   - The Hessians are recorded by arch/inkling2 (its CALIBRATION comment) over the bf16
+#     calibration container, the release's experts dequantised and rounded to bf16 and everything
+#     else as shipped (data/recipes/inkling2-mini-bf16.recipe):
+#
+#       rad-convert <Inkling-2-Mini directory> -o inkling2-mini-bf16.rad \
+#           --recipe data/recipes/inkling2-mini-bf16.recipe
+#       radiance --config CAL.yaml
+#
+#     CAL.yaml serves that container (about 53 GB, so `tp: 2`) with `calib-corpus: CORPUS` and
+#     `calib-dir: CALIB` (docs/TOOLS.md, the calibration mode): every corpus document goes through
+#     prefill once, and the plugin writes gate_up's input pooled over a layer's experts and the
+#     loop's applications of the layer (`blk.<l>.gu`, the pooled stem libquant reads for each
+#     expert), every expert's own down input (`blk.<l>.e<e>.dn`) and the layer's pooled down input
+#     (`blk.<l>.dn`, read for an expert routed too few rows), and the attention linears' inputs.
+#     `calib=$CALIB` below reads that directory.
+#   - The attention linears (q, k, v, r, the output gate and o) are rotated int8 at a bf16 scale
+#     per (row, 128 of K), round to nearest with a scale search: gemm_nt_q reads them at i8a8h
+#     against had_quant_act_i8g's activation, the five projections in one gemm_nt_q_multi launch
+#     at decode heights. The sink projection, the full layers' dynamic taps, the router, the
+#     controllers, the convolutions and the norms stay bf16.
+#   - The head is unrotated int8 at a bf16 scale per (row, 128), read by logits_gemm against the
+#     bf16 hidden state. The token embedding [201024 x 2304] is the same unrotated int8 form: a
+#     gather, which embed_lookup reads at the codes' width (libr4d embed_lookup_iqr),
+#     vocabulary-sharded under tensor parallelism like the bf16 table; the drafter gathers its
+#     rows from the same table.
+#   - The drafter's linears (fc, and each of its five layers' q, k, v, o and gate_up) are IQR's
+#     computed trellis at four bits under one f32 scale a row, rotated 128 wide, read at i8a8h
+#     against the rotated int8 activations (GPTQ's no-Gram fallback: there are no tapped Hessians
+#     for it). At two ranks gate_up's 6912 intermediate rows split into 3456 a rank (gate and up
+#     each), so its runs are 128 rows; q (2048 a rank), k and v (512), and the unsplit rows of fc
+#     and o take runs of 256.
+#   - The drafter's down is rotated int8 at a bf16 scale per (row, 128 of K), read at i8a8h like
+#     the others: at two ranks its K splits into 3456 columns a rank, which the IQR GEMMs (K in
+#     whole 256s) do not take and the int8 GEMM (K in whole 128s) does. 40 MB more than four bits
+#     over the five layers.
+#   - The drafter has no head of its own: it reads the target's int8 head. The candidate
+#     selector's codebooks and hidden projection, the convolution kernels and the norms stay bf16
+#     as shipped. Every draft is verified by the target.
+#   - `--max-ctx`: the release states no training context (n_ctx_train 0), and the drafter's
+#     split-KV attention sizes its scratch from the context bound the declare is given.
+#   - The vision tower is added bf16 by `--add-vision`, after the convert.
+
+blk.*.wq                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wk                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wv                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wr                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.gate                       rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wo                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+blk.*.e*.gu                      gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 calib=$CALIB tcq_order=1
+blk.*.e*.dn                      gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 calib=$CALIB tcq_order=1
+
+output.weight                    rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+token_embd.weight                rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+dflash.fc.weight                 gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_q.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_k.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_v.weight       gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.attn_output.weight  gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.ffn_gate_up.weight  gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01
+dflash.blk.*.ffn_down.weight     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search

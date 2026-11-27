@@ -51,7 +51,7 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
     out->ctx_blocks     = shape.ctx_blocks;
     if (!shape.streams()) return RAD_OK;
     /* Before anything is allocated: the group needs the ops its streamed path issues (KVStreamOps).
-     * The gated attention (rad_block_attn_gated_fp8.h) and GLM-5.3's MLA block
+     * The gated attention (rad_block_attn_gated_q.h) and GLM-5.3's MLA block
      * (rad_block_glm_mla.h) declare both. Without them the flag is ignored and the configuration is
      * exactly the one without it. */
     const KVStreamOps ops = kvstream_ops(prog, &gi);

@@ -42,10 +42,11 @@ int64_t prefill_shared_tok(const Config& cfg) {
 
 /* What a prefix hit restores beside the cached blocks: linear state, or a trunk's sliding window.
  * Only the trunk's window makes a model take window snapshots; a block drafter's rides in them
- * where they exist (KVManager::set_drafter_window_snapshot) and is recomputed by draft refill
- * where they do not. A RAD_KV_RING group has no snapshot at all
- * (KVManager::declare_runtime_window): its window is each sequence's own prompt length, which no
- * slot could describe, so it is sized for the context plus a ring and is never checkpointed. */
+ * where they exist (KVManager::set_drafter_window_snapshot; with linear state only under
+ * --checkpoint-draft-window) and is recomputed by draft refill where they do not. A RAD_KV_RING
+ * group has no snapshot at all (KVManager::declare_runtime_window): its window is each sequence's
+ * own prompt length, which no slot could describe, so it is sized for the context plus a ring and
+ * is never checkpointed. */
 static void restored_state(const Program& prog, bool* linear, bool* window) {
     *linear = *window = false;
     for (const KVGroupInfo& kg : prog.kv_groups) {

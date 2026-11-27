@@ -51,9 +51,9 @@ struct Group {
 static Group& group() { static Group g; return g; }
 
 /* How long a rank waits for its peers. A collective must block, but an unbounded wait would turn a
- * mismatched call sequence into a silent hang; the engine exits non-zero instead (spec §17). 30 s is
- * far longer than any correct step and shorter than a CI timeout. ref_collective_timeout_ms sets it
- * for a test. */
+ * mismatched call sequence into a silent hang; the engine exits non-zero instead (spec §17). The
+ * 30 s default is far longer than any correct step and shorter than a CI timeout.
+ * ref_collective_timeout_ms sets it for a test. */
 static std::atomic<int> g_timeout_ms{ 30000 };
 
 /* Returns false on timeout. A rank that gives up withdraws its arrival, so the group's count is

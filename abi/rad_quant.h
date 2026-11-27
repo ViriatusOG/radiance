@@ -32,7 +32,7 @@ extern "C" {
 
 /* What a quantiser is told about the weight it is quantising. */
 typedef struct RadQuantWeight {
-    const char* name;                 /* the logical (declared) name: "blk.7.ffn_down_exps.3.weight" */
+    const char* name;                 /* the declared name: "blk.7.ffn_down_exps.3.weight" */
     uint32_t    rank;
     int64_t     shape[RAD_MAX_RANK];  /* the logical shape */
     int64_t     rows, cols;           /* the [rows, cols] view every plane is laid over */

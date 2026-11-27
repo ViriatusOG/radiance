@@ -27,6 +27,7 @@
 #include "glm5_golden.h"
 #include "radio_golden.h"
 #include "imaging_golden.h"
+#include "inkling2_proc_golden.h"
 #include "lfm2_golden.h"
 #include "mm/resample.h"
 #include "mm_golden.h"
@@ -411,12 +412,11 @@ TEST(the_audio_front_end_is_the_references) {
     std::shared_ptr<mm::Item> it;
     std::string why;
     CHECK_EQ(p.audio_from(x, &it, &why), RAD_OK);
-    CHECK(it != nullptr);
-    if (!it) return;
+    REQUIRE(it != nullptr);
     CHECK_EQ(it->valid, 100);
     CHECK_EQ(it->seg_rows, 25);
     CHECK_EQ(it->grid_h, 100);
-    CHECK_EQ(it->expand.size(), (size_t)27);
+    REQUIRE_EQ(it->expand.size(), (size_t)27);
     CHECK_EQ(it->expand.front(), 256000);
     CHECK_EQ(it->expand.back(), 258883);
     struct Want { int frame, bin; float v; };
@@ -781,7 +781,7 @@ TEST(gemma4_frames_are_sampled_as_the_reference_does) {
         info.n_frames = g.total;
         info.fps = g.fps;
         const std::vector<int64_t> idx = sample_frames_gemma4(info, 1.0, g.max_frames);
-        CHECK_EQ((int32_t)idx.size(), g.n);
+        REQUIRE_EQ((int32_t)idx.size(), g.n);
         int off = 0;
         for (int32_t i = 0; i < std::min(g.n, (int32_t)idx.size()); ++i)
             off += idx[(size_t)i] != kGoldGemma4SampleIdx[g.first + i];
@@ -1208,6 +1208,192 @@ TEST(muse_pictures_patchify_as_the_reference_does) {
         CHECK_EQ(it->seg_at[0], 1);
         CHECK_EQ(it->n_rows(), (int64_t)rows);
     }
+}
+
+/* Inkling 2: no resize, the picture padded bottom and right to whole 40-pixel cells with the raw
+ * value -1, one zero class row ahead of the patches, (y, x, channel) patches in merge-block order,
+ * the reference's normalisation (inkling2_proc_golden.h: transformers' own Inkling2ImageProcessor,
+ * run by mkinkling2procgolden.py), and <|content_image|> then one placeholder a cell. */
+namespace {
+
+Processor ink2_processor() {
+    const char* keys[] = { "vision_config.model_type", "vision_config.native_patch_size",
+                           "vision_config.adapter_merge_size", "processor.image_token",
+                           "processor.image_processor.image_mean",
+                           "processor.image_processor.image_std" };
+    const char* vals[] = { "inkling2_vision", "20", "2", "<|unused_200054|>", "0.5 0.5 0.5",
+                           "0.5 0.5 0.5" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    Processor p;
+    if (c.from_meta(m, nullptr) < 0) return p;
+    c.max_patches = 16384;
+    p.init(c, [](const std::string&) { return std::vector<int32_t>{ 1 }; },
+           [](const std::string& t) {
+               return t == "<|unused_200054|>" ? 200054 : t == "<|content_image|>" ? 200005 : -1;
+           });
+    return p;
+}
+
+}  /* namespace */
+
+/* The reference's pixel_values, cast to bf16, bit for bit: the whole plane's FNV-1a and its first
+ * values, on pictures whose sides are and are not whole cells (a 1 x 1 one is all padding but a
+ * pixel). */
+TEST(inkling2_values_are_the_references_bit_for_bit) {
+    const Processor p = ink2_processor();
+    REQUIRE(p.config().family == Family::Inkling2);
+    for (const GoldInk2Image& g : kGoldInk2Image) {
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(g.f, (int)g.h, (int)g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->rows_h, g.rows);
+        CHECK_EQ(it->rows_w, g.cols);
+        REQUIRE_EQ(it->n_patch, (int64_t)1 + (int64_t)g.rows * g.cols * 4);
+        REQUIRE_EQ(it->pixels.size(), (size_t)it->n_patch * 1200);
+        for (int i = 0; i < 1200; ++i) CHECK_EQ(it->pixels[(size_t)i], (uint16_t)0);
+        for (int i = 0; i < 16; ++i) CHECK_EQ(it->pixels[(size_t)1200 + i], g.head[i]);
+        CHECK_EQ(fnv(it->pixels), g.fnv);
+    }
+}
+
+/* The reference's convert_to_rgb: alpha composited onto its checkerboard, in integers. */
+TEST(inkling2_alpha_is_the_references_checkerboard) {
+    FrameRGBA fa;
+    fa.w = kGoldInk2AlphaW;
+    fa.h = kGoldInk2AlphaH;
+    fa.rgba.resize((size_t)fa.w * fa.h * 4);
+    for (int y = 0; y < fa.h; ++y)
+        for (int x = 0; x < fa.w; ++x) {
+            uint8_t* q = &fa.rgba[((size_t)y * fa.w + x) * 4];
+            for (int ch = 0; ch < 3; ++ch) q[ch] = pix(0, (uint64_t)y, (uint64_t)x, (uint64_t)ch);
+            q[3] = pix(1, (uint64_t)y, (uint64_t)x, 0);
+        }
+    Frame f;
+    composite_checkerboard(fa, &f);
+    CHECK_EQ(f.w, fa.w);
+    CHECK_EQ(f.h, fa.h);
+    CHECK_EQ(fnv(f.rgb), kGoldInk2AlphaFnv);
+    /* An opaque picture is its RGB, a transparent one the board: 204 where the 8-pixel squares'
+     * row and column have the same parity, 153 elsewhere. */
+    for (size_t i = 3; i < fa.rgba.size(); i += 4) fa.rgba[i] = 255;
+    composite_checkerboard(fa, &f);
+    int64_t bad = 0;
+    for (size_t i = 0; i < (size_t)fa.w * fa.h; ++i)
+        for (int ch = 0; ch < 3; ++ch) bad += f.rgb[i * 3 + ch] != fa.rgba[i * 4 + ch];
+    CHECK_EQ(bad, (int64_t)0);
+    for (size_t i = 3; i < fa.rgba.size(); i += 4) fa.rgba[i] = 0;
+    composite_checkerboard(fa, &f);
+    bad = 0;
+    for (int y = 0; y < fa.h; ++y)
+        for (int x = 0; x < fa.w; ++x)
+            for (int ch = 0; ch < 3; ++ch)
+                bad += f.rgb[((size_t)y * fa.w + x) * 3 + ch] != ((y / 8 + x / 8) % 2 == 0 ? 204 : 153);
+    CHECK_EQ(bad, (int64_t)0);
+}
+
+/* A picture file through the whole processor: quad-alpha.png's alpha lands on the checkerboard,
+ * and an opaque file is its RGB (it takes the same decode). */
+TEST(inkling2_a_files_alpha_is_composited_before_the_patches) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const Processor p = ink2_processor();
+    REQUIRE(p.config().family == Family::Inkling2);
+    struct F { const char* name; uint64_t fnv; };
+    for (const F& fx : { F{ "quad-alpha.png", kGoldInk2FileAlphaFnv },
+                         F{ "quad.png", kGoldInk2FileOpaqueFnv } }) {
+        const std::vector<uint8_t> b = media_file(fx.name);
+        REQUIRE(!b.empty());
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image(b.data(), b.size(), 0, &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->rows_h, 1);
+        CHECK_EQ(it->rows_w, 1);
+        if (fnv(it->pixels) != fx.fnv) std::fprintf(stderr, "    %s: the plane differs\n", fx.name);
+        CHECK_EQ(fnv(it->pixels), fx.fnv);
+    }
+}
+
+TEST(inkling2_pictures_patchify_as_the_reference_does) {
+    const char* keys[] = { "vision_config.model_type", "vision_config.native_patch_size",
+                           "vision_config.adapter_merge_size", "processor.image_token",
+                           "processor.image_processor.image_mean",
+                           "processor.image_processor.image_std" };
+    const char* vals[] = { "inkling2_vision", "20", "2", "<|unused_200054|>", "0.5 0.5 0.5",
+                           "0.5 0.5 0.5" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    CHECK_OK(c.from_meta(m, &why));
+    CHECK(c.family == Family::Inkling2);
+    CHECK_EQ(c.patch_dim(), (int64_t)1200);
+    CHECK_EQ(c.factor(), 40);
+    CHECK_EQ(c.max_image_tokens, 4096);
+    c.max_patches = 16384;
+    Processor p;
+    REQUIRE(p.init(c, [](const std::string&) { return std::vector<int32_t>{ 1 }; },
+                   [](const std::string& t) {
+                       return t == "<|unused_200054|>" ? 200054 : t == "<|content_image|>" ? 200005 : -1;
+                   }) >= 0);
+    /* 50 x 90: 2 x 3 cells, 4 x 6 patches; every pixel (37, 128, 255). */
+    Frame f;
+    f.h = 50;
+    f.w = 90;
+    f.rgb.resize((size_t)f.h * f.w * 3);
+    for (size_t i = 0; i < f.rgb.size(); i += 3) { f.rgb[i] = 37; f.rgb[i + 1] = 128; f.rgb[i + 2] = 255; }
+    std::shared_ptr<Item> it;
+    CHECK_OK(p.image_from(f, &it, &why));
+    REQUIRE(it != nullptr);
+    CHECK_EQ(it->grid_h, 4);
+    CHECK_EQ(it->grid_w, 6);
+    CHECK_EQ(it->seg_prefix, 1);
+    CHECK_EQ(it->n_patch, (int64_t)25);
+    CHECK_EQ(it->n_rows(), (int64_t)6);
+    REQUIRE_EQ(it->pixels.size(), (size_t)25 * 1200);
+    const uint16_t* kIn = kGoldInk2FlatIn;
+    const uint16_t* kPad = kGoldInk2FlatPad;
+    for (int i = 0; i < 1200; ++i) CHECK_EQ(it->pixels[(size_t)i], 0);
+    int64_t bad = 0;
+    for (int k = 0; k < 24; ++k) {
+        const int blk = k / 4, py = (blk / 3) * 2 + (k / 2) % 2, px = (blk % 3) * 2 + k % 2;
+        for (int y = 0; y < 20; ++y)
+            for (int x = 0; x < 20; ++x)
+                for (int ch = 0; ch < 3; ++ch) {
+                    const bool in = py * 20 + y < 50 && px * 20 + x < 90;
+                    bad += it->pixels[(size_t)(1 + k) * 1200 + (y * 20 + x) * 3 + ch] !=
+                           (in ? kIn[ch] : kPad[ch]);
+                }
+    }
+    CHECK_EQ(bad, (int64_t)0);
+    REQUIRE_EQ(it->expand.size(), (size_t)7);
+    CHECK_EQ(it->expand[0], 200005);
+    for (int i = 1; i < 7; ++i) CHECK_EQ(it->expand[(size_t)i], 200054);
+    REQUIRE_EQ(it->seg_at.size(), (size_t)1);
+    CHECK_EQ(it->seg_at[0], 1);
+    /* The class row's coordinate is (-1, -1); patch 3 is (1, 1) of the 4 x 6 grid. */
+    std::vector<int32_t> crd(4 * 25);
+    it->coords(0, 25, crd.data());
+    CHECK_EQ(crd[0], -1);
+    CHECK_EQ(crd[25], -1);
+    CHECK_EQ(crd[4], 1);
+    CHECK_EQ(crd[25 + 4], 1);
+    CHECK_EQ(crd[50 + 4], 4);
+    CHECK_EQ(crd[75 + 4], 6);
+    /* Past the cap a picture shrinks, aspect kept, until its cells fit. */
+    int64_t h = 0, w = 0;
+    CHECK_OK(inkling2_size(4000, 3000, 40, 4096, &h, &w, &why));
+    CHECK(((h + 39) / 40) * ((w + 39) / 40) <= 4096);
+    CHECK(h > 2000 && w > 1500);
+    CHECK_OK(inkling2_size(50, 90, 40, 4096, &h, &w, &why));
+    CHECK_EQ(h, (int64_t)50);
+    CHECK_EQ(w, (int64_t)90);
 }
 
 TEST(muse_reads_its_processor_from_the_container) {
@@ -1838,13 +2024,12 @@ TEST(the_qwen3_asr_front_end_is_the_references) {
     std::string why;
 
     CHECK_EQ(p.audio_from(tone(23456), &it, &why), RAD_OK);
-    CHECK(it != nullptr);
-    if (!it) return;
+    REQUIRE(it != nullptr);
     CHECK_EQ(it->valid, 146);
     CHECK_EQ(it->seg_rows, 19);
     CHECK_EQ(it->grid_h, 152);
     CHECK_EQ(it->n_seg, 1);
-    CHECK_EQ(it->expand.size(), (size_t)21);
+    REQUIRE_EQ(it->expand.size(), (size_t)21);
     CHECK_EQ(it->expand.front(), 151669);
     CHECK_EQ(it->expand[1], 151676);
     CHECK_EQ(it->expand.back(), 151670);
@@ -1999,7 +2184,7 @@ TEST(a_resampled_stream_is_its_tone_whether_pushed_whole_or_in_pieces) {
     for (size_t i = 0, k = 1; i < in.size(); i += k, k = k % 997 + 13)
         parts.push(in.data() + i, std::min(k, in.size() - i), &b);
     parts.flush(&b);
-    CHECK_EQ(a.size(), (size_t)16000);
+    REQUIRE_EQ(a.size(), (size_t)16000);
     CHECK(a == b);
     const std::vector<float> want = tone(1000.0, 16000, 16000);
     double err = 0.0;
@@ -2023,7 +2208,7 @@ TEST(a_resampled_stream_is_its_tone_whether_pushed_whole_or_in_pieces) {
     std::vector<float> u;
     up.push(dc.data(), dc.size(), &u);
     up.flush(&u);
-    CHECK_EQ(u.size(), (size_t)8000);
+    REQUIRE_EQ(u.size(), (size_t)8000);
     for (size_t i = 100; i < 7900; ++i) CHECK_NEAR(u[i], 0.25f, 1e-4f);
 
     mm::Resampler same(16000, 16000);

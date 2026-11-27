@@ -19,7 +19,7 @@
  * RAD_FUSE_HAS(). Two alternatives are wrong:
  *
  *   - Deriving it from a parameter: there is none. `wadd` is GemmaRMSNorm's `1 +`, a property of
- *     the gain, and arch/common/rad_fp8.h passes it in both forms.
+ *     the gain, and the architecture blocks pass it in both forms.
  *   - Marking the operands RAD_FUSE_NONE: that marks an optional operand a step does not pass.
  *     Here the operands that vary are required ones (`add`'s `b`, `rmsnorm`'s `x`) and the chain
  *     length itself changes.
@@ -181,9 +181,9 @@ struct Step {
 };
 
 /* Whether a gated fold's `act` (vocabulary spelling) is `want`. `act` is optional and the shims
- * default it differently: r4d_fused_quant_fp8.hip uses `mode` 0 (silu) for `gated_quant_fp8`, which feeds
- * down_proj, and `mode` 1 (sigmoid) for `gate_quant_fp8`, which feeds a gated attention's o_proj.
- * Each hook passes its row's default. */
+ * default it differently: r4d_fused_quant.hip uses `mode` 0 (silu) for `gated_quant_fp8`, which
+ * feeds down_proj, and `mode` 1 (sigmoid) for `gate_quant_fp8`, which feeds a gated attention's
+ * o_proj. Each hook passes its row's default. */
 bool act_is(const RadParam* p, int n_p, const char* dflt, const char* want) {
     const char* a = r4d_pgets(p, n_p, "act");
     return std::strcmp(a ? a : dflt, want) == 0;
@@ -193,14 +193,14 @@ bool act_is(const RadParam* p, int n_p, const char* dflt, const char* want) {
  * descriptions test `group` against r4d_quant_act_fp8_group(). Any other group has no fused kernel
  * and so no chain. */
 bool fp8_geometry_ok(const RadParam* p, int n_p, int64_t M, int64_t n) {
-    return M > 0 && n > 0 && pi(p, n_p, "group", R4D_FP8_BLOCK) == R4D_FP8_BLOCK;
+    return M > 0 && n > 0 && pi(p, n_p, "group", R4D_I8_GROUP) == R4D_I8_GROUP;
 }
 
 }  /* namespace */
 
 /* ==========================================================================================
  * rmsnorm_quant_fp8 -- the RMS norm and the fp8 activation quantiser in one pass.
- * (kernel: libr4d/r4d_fused_quant_fp8.hip, rmsnorm_quant_fp8_kernel and its shim)
+ * (kernel: libr4d/r4d_fused_quant.hip, rmsnorm_quant_fp8_kernel and its shim)
  *
  * Operands: [0] x  [1] residual?  [2] w  [3] q  [4] scale  [5] out_bf16?
  *
@@ -272,7 +272,7 @@ extern "C" int r4d_fuse_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_t p
 
 /* ==========================================================================================
  * gated_quant_fp8 -- an elementwise gated product and the fp8 quantiser in one pass.
- * (kernel: libr4d/r4d_fused_quant_fp8.hip, gated_quant_fp8_kernel)
+ * (kernel: libr4d/r4d_fused_quant.hip, gated_quant_fp8_kernel)
  *
  * Operands: [0] gate_up  [1] q  [2] scale  [3] out_bf16?
  *
@@ -296,7 +296,7 @@ extern "C" int r4d_fuse_gated_quant_fp8(const RadParam* p, int n_p, uint64_t pre
     if (!out) return RAD_E_INVAL;
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
-    /* The shim (r4d_fused_quant_fp8.hip) defaults this row's `mode` to 0 (silu). */
+    /* The shim (r4d_fused_quant.hip) defaults this row's `mode` to 0 (silu). */
     if (!act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
 
     switch (step) {
@@ -361,7 +361,7 @@ extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, 
 
 /* ==========================================================================================
  * gate_quant_fp8 -- the same epilogue with the gate in its own operand.
- * (kernel: libr4d/r4d_fused_quant_fp8.hip, gate_quant_fp8_kernel)
+ * (kernel: libr4d/r4d_fused_quant.hip, gate_quant_fp8_kernel)
  *
  * Operands: [0] gate  [1] x  [2] q  [3] scale  [4] out_bf16?
  *
@@ -392,7 +392,7 @@ extern "C" int r4d_fuse_gate_quant_fp8(const RadParam* p, int n_p, uint64_t pres
     if (!out) return RAD_E_INVAL;
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
-    /* The shim (r4d_fused_quant_fp8.hip) defaults this row's `mode` to 1 (sigmoid). */
+    /* The shim (r4d_fused_quant.hip) defaults this row's `mode` to 1 (sigmoid). */
     const bool none = act_is(p, n_p, "sigmoid", "none");
     if (!none && !act_is(p, n_p, "sigmoid", "sigmoid")) return RAD_E_UNSUPPORTED;
     const int16_t mid = RAD_FUSE_HAS(present, 4) ? (int16_t)4 : RAD_FUSE_TMP(0);
@@ -455,7 +455,7 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
     const char* dt = r4d_pgets(p, n_p, "dtype");
     if (M <= 0 || N <= 0 || K <= 0 || N % 2) return RAD_E_UNSUPPORTED;
-    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", R4D_I8_GROUP) != R4D_I8_GROUP) return RAD_E_UNSUPPORTED;
     if (!dt || std::strcmp(dt, "i8a8h")) return RAD_E_UNSUPPORTED;
     if (!act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
 
@@ -744,7 +744,7 @@ extern "C" int r4d_fuse_ar_gather_hc_write(const RadParam* p, int n_p, uint64_t 
 
 /* ==========================================================================================
  * ar_rmsnorm_quant_fp8 -- the two-rank all-reduce with the norm and the quantiser folded on.
- * (kernel: libr4d/r4d_fused_quant_fp8.hip, ar_rmsnorm_quant_fp8_kernel; shim: r4d_ar_entry.hip)
+ * (kernel: libr4d/r4d_fused_quant.hip, ar_rmsnorm_quant_fp8_kernel; shim: r4d_ar_entry.hip)
  *
  * Operands: [0] x (inout)  [1] residual?  [2] w  [3] q  [4] scale  [5] out_bf16?
  *
@@ -845,5 +845,124 @@ extern "C" int r4d_fuse_ar_rmsnorm(const RadParam* p, int n_p, uint64_t present,
     }
     default:
         return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * DeepSeek-V4.1's chains (kernels: libr4d/r4d_ds41_elem.hip, "fused chains").
+ *
+ * rmsnorm_rope_roundtrip  [0] x  [1] w  [2] y  [3] cos_sin  [4] positions
+ *     rmsnorm_bf16 (x, w -> y), ds41_rope_rows_bf16 over y, quant_roundtrip over y. The kernel
+ *     takes the norm's width from r4d_act_threads(M, n) as rmsnorm_bf16 does, so `M` is mirrored.
+ * rope_rows_roundtrip     [0] x  [1] cos_sin  [2] positions
+ *     ds41_rope_rows_bf16 then quant_roundtrip over x's n_head * head_dim columns, in place.
+ * mhc_collapse_rmsnorm    [0] h  [1] pre  [2] x  [3] w  [4] y
+ *     mhc_collapse_bf16 (h, pre -> x), then rmsnorm_bf16 (x, w -> y).
+ * mhc_post_collapse_rmsnorm  [0] x  [1] h  [2] post  [3] comb  [4] out  [5] pre  [6] xc  [7] w  [8] y
+ *     mhc_post_bf16 (x, h, post, comb -> out), mhc_collapse_bf16 (out, pre -> xc), rmsnorm_bf16
+ *     (xc, w -> y).
+ * Each step's output is the bf16 its own row stores; the fused kernels keep exactly those values
+ * between steps (in LDS, a register, or the stored x).
+ */
+namespace {
+void mirror_rope(Step& s, const RadParam* p, int n_p) {
+    s.mirror(p, n_p, "M").mirror(p, n_p, "n_head").mirror(p, n_p, "head_dim")
+     .mirror(p, n_p, "rot").mirror(p, n_p, "off").mirror(p, n_p, "mode")
+     .mirror(p, n_p, "inverse").mirror(p, n_p, "dtype");
+}
+void mirror_quant(Step& s, const RadParam* p, int n_p, int64_t n) {
+    s.mirror(p, n_p, "M").pint("n", (long long)n).mirror(p, n_p, "block")
+     .mirror(p, n_p, "format").mirror(p, n_p, "scale").mirror(p, n_p, "dtype");
+}
+void mirror_norm(Step& s, const RadParam* p, int n_p) {
+    s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+     .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+}
+}  /* namespace */
+
+extern "C" int r4d_fuse_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, uint64_t present,
+                                               int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0 || n != pi(p, n_p, "n_head") * pi(p, n_p, "head_dim"))
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 1: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    case 2: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 2 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_rope_rows_roundtrip(const RadParam* p, int n_p, uint64_t present, int step,
+                                            RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n_head") * pi(p, n_p, "head_dim");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 1: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 0 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                             int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2 });                 /* h, pre, x */
+    }
+    case 1: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                                  int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_post");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3, 4 });           /* x, h, post, comb, out */
+    }
+    case 1: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6 });                 /* out, pre, xc */
+    }
+    case 2: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 6, 7, 8 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_ar_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                                     int step, RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const int64_t world = pi(p, n_p, "world_size");
+    if (M <= 0 || M > 32 || n <= 0 || n > 16384 || (n % 16) || hc < 2 || hc > 8 || world != 4)
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "all_reduce");
+        s.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+         .mirror(p, n_p, "dtype").pint("exact", 1);
+        return s.wire({ 0, RAD_FUSE_NONE });        /* x (inout), y */
+    }
+    case 1: {
+        Step s(out, "mhc_post_collapse_rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc")
+         .mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+         .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+        return s.wire({ 0, 1, 2, 3, 4, 5, 6, 7, 8 });
+    }
+    default: return RAD_E_NOTFOUND;
     }
 }

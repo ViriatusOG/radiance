@@ -18,6 +18,7 @@
  */
 #include "rad_test.h"
 
+#include "server/oai.h"
 #include "text/chat.h"
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
@@ -34,14 +35,6 @@ using namespace rad;
 using json = Json;
 
 /* ------------------------------------------------------------------ the template under test */
-
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return std::string();
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
 
 /* A template under test: the committed fixture `rel` unless `env` names a checkpoint's copy.
  * It is compiled once and kept for the process: loading parses the Jinja and probes its
@@ -225,6 +218,38 @@ TEST(a_concatenated_string_equals_its_text) {
     json msgs = json::array({ { { "role", "user" }, { "content", "hi" } } });
     CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
     CHECK(p.prompt.find("eq eq 1 in") != std::string::npos);
+}
+
+/* Inkling 2's template writes a block per content part, and a picture has its own; the chat layer
+ * joins a message's parts around the media marker, so the marker lands inside a text block. The
+ * render cuts it out into a block of its own, the text on each side keeping one (llama.cpp's
+ * inkling_split_media). The template here is the release's shape, reduced to what the cut reads. */
+TEST(an_inkling_picture_gets_its_own_message_block) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{# <|message_user|> <|content_image|> #}{% for m in messages %}<|message_{{ m.role }}|><|content_text|>"
+        "{{ m.content }}<|end_message|>{% endfor %}",
+        "", "") >= 0);
+    auto render = [&](const json& content) {
+        ChatPrompt p;
+        json msgs = json::array({ { { "role", "user" }, { "content", content } } });
+        CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
+        return p.prompt;
+    };
+    const json marker = { { "type", "media_marker" }, { "text", "<__media__>" } };
+    CHECK_EQ(render(json::array({ { { "type", "text" }, { "text", "Describe" } }, marker,
+                                  { { "type", "text" }, { "text", "briefly" } } })),
+             std::string("<|message_user|><|content_text|>Describe<|end_message|>"
+                         "<|message_user|><__media__><|end_message|>"
+                         "<|message_user|><|content_text|>briefly<|end_message|>"));
+    /* A picture alone, and two in a row: no empty text block. */
+    CHECK_EQ(render(json::array({ marker })),
+             std::string("<|message_user|><__media__><|end_message|>"));
+    CHECK_EQ(render(json::array({ marker, marker, { { "type", "text" }, { "text", "x" } } })),
+             std::string("<|message_user|><__media__><|end_message|><|message_user|><__media__>"
+                         "<|end_message|><|message_user|><|content_text|>x<|end_message|>"));
+    /* Text with no picture is untouched. */
+    CHECK_EQ(render("hi"), std::string("<|message_user|><|content_text|>hi<|end_message|>"));
 }
 
 /* Tool-call arguments sent as an object reach a template that only takes them as text as their
@@ -661,11 +686,9 @@ TEST(indented_argument_keeps_every_leading_space) {
         "<parameter=old_string>\n    return a + b\n</parameter>\n"
         "<parameter=new_string>\n    return a + b + 1\n</parameter>\n"
         "</function>\n</tool_call>");
-    CHECK_EQ(r.calls.size(), (size_t)1);
-    if (r.calls.size() != 1) return;
+    REQUIRE_EQ(r.calls.size(), (size_t)1);
     json a = json::parse(r.calls[0].arguments, nullptr, false);
-    CHECK(!a.is_discarded());
-    if (a.is_discarded()) return;
+    REQUIRE(!a.is_discarded());
     CHECK_EQ(a.value("path", std::string()), std::string("/work/a.py"));
     CHECK_EQ(a.value("old_string", std::string()), std::string("    return a + b"));
     CHECK_EQ(a.value("new_string", std::string()), std::string("    return a + b + 1"));
@@ -683,11 +706,9 @@ TEST(multiline_argument_survives_verbatim) {
         "<parameter=old_string>\n" + body + "\n</parameter>\n"
         "<parameter=new_string>\nx\n</parameter>\n"
         "</function>\n</tool_call>");
-    CHECK_EQ(r.calls.size(), (size_t)1);
-    if (r.calls.size() != 1) return;
+    REQUIRE_EQ(r.calls.size(), (size_t)1);
     json a = json::parse(r.calls[0].arguments, nullptr, false);
-    CHECK(!a.is_discarded());
-    if (a.is_discarded()) return;
+    REQUIRE(!a.is_discarded());
     CHECK_EQ(a.value("old_string", std::string()), body);
 }
 
@@ -724,6 +745,104 @@ TEST(a_refused_effort_comes_back_in_the_templates_own_words) {
     CHECK(!p.error.empty());
     CHECK(p.error.find("reasoning effort") != std::string::npos);
     CHECK(p.error.find("xhigh") != std::string::npos);
+}
+
+/* ------------------------------------------------------------- "none" as a level or a switch
+ *
+ * The server reads OpenAI's "none" and "minimal" as enable_thinking = false unless the template
+ * has the words on its own ladder and never reads the switch (server::probe_off_efforts). The
+ * probe is three renders, so it is run here on real Jinja: a ladder template shaped like
+ * Inkling 2's, and every template the tree ships, none of which may change behaviour.
+ */
+
+/* A ChatTemplate as the probe sees one. Only the prompt matters to these cases. */
+struct ProbedTemplate final : server::IChatTemplate {
+    const ChatTemplate* t;
+    explicit ProbedTemplate(const ChatTemplate* t_) : t(t_) {}
+    int apply(const json& messages, const json& tools, const server::ChatRenderOptions& opt,
+              server::ChatRender* out, std::string* why) const override {
+        ChatOptions o;
+        o.enable_thinking = opt.enable_thinking;
+        o.template_kwargs = opt.template_kwargs;
+        o.quiet = opt.quiet;
+        ChatPrompt p;
+        const int st = t->apply(messages, tools, o, &p);
+        if (st < 0) {
+            if (why) *why = p.error;
+            return st;
+        }
+        out->prompt = p.prompt;
+        return RAD_OK;
+    }
+    bool supports_tools() const override { return false; }
+    bool supports_reasoning() const override { return false; }
+};
+
+/* The effort ladder of a template that has no thinking switch: every level is a number in a
+ * system line, "none" is 0, an unknown word raises, and a render naming no effort is written at
+ * "high". RAD_TEST_LADDER_JINJA names a checkpoint's own template (Inkling 2's) to run instead. */
+static const char* kLadderJinja =
+    "{%- set ladder = {'none': 0.0, 'minimal': 0.1, 'low': 0.2, 'medium': 0.7, 'high': 0.9} -%}"
+    "{%- set e = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none"
+    " else 'high' -%}"
+    "{%- if e not in ladder -%}{{- raise_exception('Unknown reasoning_effort: ' ~ e) -}}"
+    "{%- endif -%}"
+    "{{- '<system>Thinking effort level: ' -}}"
+    "{%- if ladder[e] == 0.0 -%}0{%- else -%}{{ ladder[e] }}{%- endif -%}"
+    "{%- for m in messages -%}{{- '<' ~ m.role ~ '>' ~ m.content -}}{%- endfor -%}"
+    "{%- if add_generation_prompt -%}{{- '<model>' -}}{%- endif -%}";
+
+TEST(a_ladder_template_is_probed_to_take_none_as_a_level) {
+    const char* path = std::getenv("RAD_TEST_LADDER_JINJA");
+    const std::string src = path ? read_file(path) : std::string(kLadderJinja);
+    if (src.empty()) {
+        ::radtest::skip("no chat template at %s (named by RAD_TEST_LADDER_JINJA)", path);
+        return;
+    }
+    ChatTemplate t;
+    REQUIRE(t.load(src, "", "") >= 0);
+    const ProbedTemplate pt(&t);
+    const std::vector<std::string> off = server::probe_off_efforts(pt);
+    REQUIRE_EQ(off.size(), 2u);
+    CHECK_EQ(off[0], std::string("none"));
+    CHECK_EQ(off[1], std::string("minimal"));
+
+    /* What the server then sends: the word as the effort, the switch untouched. */
+    auto render = [&](const char* word) {
+        server::ChatRenderOptions opt;
+        if (word) server::apply_off_effort(off, word, /*replace=*/false, &opt);
+        CHECK(opt.enable_thinking);
+        server::ChatRender r;
+        std::string why;
+        CHECK_OK(pt.apply(json::array({ { { "role", "user" }, { "content", "Hello" } } }),
+                          json::array(), opt, &r, &why));
+        return r.prompt;
+    };
+    CHECK(render(nullptr).find("Thinking effort level: 0.9") != std::string::npos);
+    CHECK(render("none").find("Thinking effort level: 0<") != std::string::npos);
+    CHECK(render("minimal").find("Thinking effort level: 0.1") != std::string::npos);
+}
+
+TEST(no_shipped_template_takes_none_as_a_level) {
+    for (const char* rel : { "qwen3.8/chat_template.jinja", "qwen3.6/chat_template.jinja",
+                             "glm53/chat_template.jinja", "gemma4/chat_template.jinja",
+                             "hyv3/chat_template.jinja", "ling3/chat_template.jinja",
+                             "minicpm5/chat_template.jinja", "nemotron35/template.jinja" }) {
+        const std::string src = read_file(std::string(RAD_CHAT_FIXTURES) + "/" + rel);
+        if (src.empty()) {
+            ::radtest::artifact_missing(__FILE__, __LINE__, std::string("the chat template ") + rel);
+            continue;
+        }
+        ChatTemplate t;
+        if (t.load(src, "", "") < 0) {
+            ::radtest::fail(__FILE__, __LINE__, std::string(rel) + " does not load");
+            continue;
+        }
+        const std::vector<std::string> off = server::probe_off_efforts(ProbedTemplate(&t));
+        if (!off.empty())
+            ::radtest::fail(__FILE__, __LINE__, std::string(rel) + " takes '" + off[0] +
+                                                    "' as a level");
+    }
 }
 
 /* ================================================================== MiniCPM5: the tagged format
@@ -862,8 +981,7 @@ TEST(a_cdata_value_arrives_verbatim_without_its_delimiters) {
     mc_recovered(r, 1);
     if (r.calls.empty()) return;
     json a = json::parse(r.calls[0].arguments, nullptr, false);
-    CHECK(!a.is_discarded());
-    if (a.is_discarded()) return;
+    REQUIRE(!a.is_discarded());
     CHECK_EQ(a.value("content", std::string()),
              std::string("int main(void) { return 0; }\n/* <not a tag> & \"quotes\" */\n"));
     CHECK_EQ(r.content, std::string("Writing it."));
@@ -888,8 +1006,7 @@ TEST(a_qwen_call_followed_by_a_sentence_is_still_a_call) {
     ReplyMessage r = parse_reply("Looking.\n</think>\n\n<tool_call>\n<function=read>\n"
                                  "<parameter=path>\n/work/a.py\n</parameter>\n</function>\n"
                                  "</tool_call>\nThat is the file.");
-    CHECK_EQ(r.calls.size(), (size_t)1);
-    if (r.calls.empty()) return;
+    REQUIRE_EQ(r.calls.size(), (size_t)1);
     CHECK_EQ(r.calls[0].name, std::string("read"));
     CHECK_EQ(r.calls[0].arguments, std::string("{\"path\":\"/work/a.py\"}"));
     CHECK_EQ(r.content, std::string("That is the file."));
@@ -903,8 +1020,7 @@ TEST(a_half_written_call_is_a_call_whose_arguments_did_not_finish) {
     if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Writing.\n</think>\n\nWriting.\n<function name=\"write\">"
                               "<param name=\"content\"><![CDATA[int main(void) {");
-    CHECK_EQ(r.calls.size(), (size_t)1);
-    if (r.calls.empty()) return;
+    REQUIRE_EQ(r.calls.size(), (size_t)1);
     CHECK(!r.calls[0].closed);
     CHECK_EQ(r.calls[0].arguments, std::string("{\"content\":\"int main(void) {"));
     CHECK(json::parse(r.calls[0].arguments, nullptr, false).is_discarded());
@@ -948,8 +1064,7 @@ TEST(mc_an_undeclared_argument_does_not_lose_the_call) {
     if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Reading it.\n</think>\n\n"
                              "<function name=\"ls\"><param name=\"action\">read</param></function>");
-    CHECK_EQ((int)r.calls.size(), 1);
-    if (r.calls.empty()) return;
+    REQUIRE_EQ((int)r.calls.size(), 1);
     CHECK_EQ(r.calls[0].name, std::string("ls"));
     CHECK(r.calls[0].arguments.find("action") != std::string::npos);
     mc_content_is_clean(r);
@@ -960,8 +1075,7 @@ TEST(mc_an_extra_argument_does_not_lose_a_valid_call) {
     ReplyMessage r = mc_parse("Listing.\n</think>\n\n"
                              "<function name=\"ls\"><param name=\"path\">/work</param>"
                              "<param name=\"action\">read</param></function>");
-    CHECK_EQ((int)r.calls.size(), 1);
-    if (r.calls.empty()) return;
+    REQUIRE_EQ((int)r.calls.size(), 1);
     /* The declared argument still binds to its own schema-checked arm; the generic arm is tried
      * last. */
     CHECK(r.calls[0].arguments.find("\"path\"") != std::string::npos);
@@ -1570,7 +1684,7 @@ TEST(a_template_that_does_not_parse_is_a_value_and_not_a_throw) {
 
 /* A template that compiles but cannot render a conversation (here it calls a function the engine
  * does not have) is refused at load as a value too: the first full render, the thinking probe,
- * used to throw out of load() and end the process. */
+ * does not throw out of load(). */
 TEST(a_template_that_cannot_render_is_refused_at_load_and_not_thrown) {
     ChatTemplate t;
     CHECK(t.load("{%- for m in messages -%}{{- dict(m, x=1).content -}}{%- endfor -%}", "", "") ==

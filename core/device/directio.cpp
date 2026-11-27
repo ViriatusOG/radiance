@@ -161,6 +161,18 @@ int DirectFile::read_at(void* dst, int64_t off, int64_t bytes) {
     return RAD_OK;
 }
 
+int DirectFile::read_covering(void* dst, int64_t off, int64_t bytes, int64_t need) {
+    if (fd_ < 0) return RAD_E_STATE;
+    if (!dst || off < 0 || bytes < 0 || need < 0 || need > bytes) return RAD_E_INVAL;
+    const int64_t A = alignment();
+    const bool aligned = (off % A) == 0 && (bytes % A) == 0 &&
+                         ((uintptr_t)dst % (uintptr_t)A) == 0;
+    if (!aligned) return read_at(dst, off, need);
+    const int64_t got = pread_some(fd_, dst, bytes, off);
+    if (got < 0) return (int)got;
+    return got >= need ? RAD_OK : RAD_E_IO;
+}
+
 /* ------------------------------------------------------------------ write */
 
 /* Aligned writes go straight through; anything else is a read-modify-write of whole blocks. */

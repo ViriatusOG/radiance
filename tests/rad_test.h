@@ -145,6 +145,15 @@ inline const std::string& tmpdir() {
 /* A path inside tmpdir(). */
 inline std::string tmp_path(const std::string& leaf) { return tmpdir() + "/" + leaf; }
 
+/* A new empty directory "<stem>.XXXXXX" inside tmpdir(), which goes with it. Throws when it cannot
+ * be made, which fails the case, so a caller never writes into a path that is not its own. */
+inline std::string make_tmp_dir(const std::string& stem) {
+    std::string path = tmp_path(stem + ".XXXXXX");
+    if (!::mkdtemp(path.data()))
+        throw std::runtime_error("cannot make " + path + ": " + std::strerror(errno));
+    return path;
+}
+
 struct Options {
     std::vector<std::string> include, exclude;
     int  shard = 0, shards = 1;
@@ -343,6 +352,9 @@ inline int run_all(int argc, char** argv) {
              std::string("REQUIRE_EQ(" #a ", " #b "): ") + ::radtest::show(_a, _b));  \
              return; } } while (0)
 
+/* REQUIRE_EQ against RAD_OK: the status is ok, or the case leaves. */
+#define REQUIRE_OK(expr) REQUIRE_EQ((expr), RAD_OK)
+
 #define CHECK_NEAR(a, b, tol)                                                         \
     do { ++::radtest::checks();                                                       \
          double _a = (double)(a), _b = (double)(b);                                   \
@@ -378,6 +390,26 @@ inline int run_all(int argc, char** argv) {
 /* A substring test, so a CHECK reads as the claim it makes rather than as npos arithmetic. */
 inline bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
+}
+
+/* The bytes of a file; empty when it cannot be read. */
+inline std::string read_file(const std::string& path) {
+    std::string out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    char buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+/* Writes `body` as the file at `path`. Throws when it cannot, which fails the case. */
+inline void write_file(const std::string& path, const std::string& body) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("cannot write " + path + ": " + std::strerror(errno));
+    const bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size();
+    if (std::fclose(f) != 0 || !ok) throw std::runtime_error("short write to " + path);
 }
 
 /* Everything written to stderr while `fn` runs. Capturing also keeps an expected refusal out of

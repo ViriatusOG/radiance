@@ -30,8 +30,8 @@
  * ============================== WHAT IS QUANTISED ==============================
  *
  * One plugin serves bf16, block-fp8 and rotated int8 (IQ8R) containers: every linear of the
- * language model and of the DiT's blocks is a LinearFP8, which reads whatever the container holds
- * (rad_fp8.h), and the model is bf16 throughout when the first DiT projection is plain. That
+ * language model and of the DiT's blocks is a LinearQ, which reads whatever the container holds
+ * (rad_linear.h), and the model is bf16 throughout when the first DiT projection is plain. That
  * projection also says whether the linears are rotated int8, and then the activations they read
  * carry int8 codes in place of the E4M3 pair (declare_act). The small linears around them
  * (txt_in, img_in, the timestep MLP, the shared modulation, norm_out, proj_out), the vision tower
@@ -47,17 +47,15 @@
  * pixels, and the core reads rank 0's.
  */
 #include <arch/rad_arch.h>
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 #include <arch/rad_block_vit.h>
 #include <arch/rad_vae2d.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace qwenimage21 {
@@ -79,11 +77,12 @@ static inline int64_t ref_tokens_max() { return (int64_t)kRefArea / 256 * 11 / 1
 /* Every output side is a multiple of 32, so attainable areas are multiples of four
  * latent tokens. Keep the model's original bounds when the operator supplies none. */
 static int64_t image_tokens(int64_t pixels) {
-    return pixels > 0 ? std::min<int64_t>(kMaxImageTokens, pixels / 1024 * 4) : kMaxImageTokens;
+    return pixels > 0 ? std::min<int64_t>(kMaxImageTokens, pixels / 1024 * 4)
+                      : (int64_t)kMaxImageTokens;
 }
 
 static int64_t reference_count(int64_t refs) {
-    return refs > 0 ? std::min<int64_t>(refs, kMaxRefs) : kMaxRefs;
+    return refs > 0 ? std::min<int64_t>(refs, kMaxRefs) : (int64_t)kMaxRefs;
 }
 
 static const char* kSysPrompt = "Comprehend and analyze the provided prompt.";
@@ -92,18 +91,18 @@ static const char* kSysPrompt = "Comprehend and analyze the provided prompt.";
 /* ================================================================== the model */
 struct TeLayer {
     rad_weight w_n1 = 0, w_n2 = 0, w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_n2 = 0, op_ar2 = 0, op_add2 = 0;
 };
 
 struct DitLayer {
     rad_weight w_qn = 0, w_kn = 0;
-    LinearFP8  qkv{}, o{}, gate_up{}, down{};
-    QuantFP8   q_h{}, q_attn{}, q_h2{};
-    GateQuantFP8 gq{};
+    LinearQ  qkv{}, o{}, gate_up{}, down{};
+    QuantAct   q_h{}, q_attn{}, q_h2{};
+    GateQuant gq{};
     rad_op     op_ln1 = 0, op_qkr = 0, op_kv = 0, op_attn_c = 0, op_attn_b = 0, op_ar1 = 0;
     rad_op     op_g1 = 0, op_ln2 = 0, op_ar2 = 0, op_g2 = 0;
     /* The two all-reduces as a split pass issues them, on the second lane (step_blocks). */
@@ -141,7 +140,7 @@ struct Model {
     rad_weight w_tok = 0;
     rad_op  op_embed = 0, op_mm = 0, op_ds[VisionTower::MAX_DS] = {};
     rad_buf b_tx = 0, b_tkv = 0, b_th2 = 0, b_tgu = 0;
-    ActFP8  a_th{}, a_tattn{}, a_tffn{};
+    ActQ  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
 
     /* ---- txt_in: ZeroCenter RMSNorm (1 + w), a linear, gelu_tanh, a linear */
@@ -161,14 +160,14 @@ struct Model {
     /* ---- the DiT */
     rad_buf b_h = 0, b_qkv = 0, b_ao = 0, b_gu = 0;
     rad_buf b_k8 = 0, b_ks = 0;   /* the keys at int8 codes and their per-head scales */
-    ActFP8  a_hm{}, a_attn{}, a_ffn{};
+    ActQ  a_hm{}, a_attn{}, a_ffn{};
     std::vector<DitLayer> dit;
-    LinearFP8 qkv0{};          /* layer 0's qkv, as the probe that chose bf16 or fp8 mapped it */
+    LinearQ qkv0{};          /* layer 0's qkv, as the probe that chose bf16 or fp8 mapped it */
     /* The linears of both networks are rotated int8 (IQ8R, or the 128-group int8 before it), read
      * off that same probe: the activations then carry int8 code pairs with one scale per (token,
      * `g8` columns) in place of the E4M3 pair. */
     bool      i8 = false;
-    int64_t   g8 = RAD_FP8_BLOCK;
+    int64_t   g8 = RAD_SCALE_GROUP;
     int64_t   C = 64;          /* latent channels */
     rad_weight w_pout = 0;
     rad_op  op_nout_ln = 0, op_pout = 0, op_euler = 0;
@@ -189,53 +188,19 @@ struct Model {
 
 static Model g_model[MAX_SLOTS];
 
-/* A space-separated list off the container (rad-convert flattens arrays that way). */
-static std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
-    std::vector<double> v;
-    const char* s = rad_meta_gets(m, key, nullptr);
-    while (s && *s) {
-        char* e = nullptr;
-        const double x = std::strtod(s, &e);
-        if (e == s) { ++s; continue; }
-        v.push_back(x);
-        s = e;
-    }
-    return v;
-}
-
 /* A bf16 linear read whole on every rank: `gemm_nt`, no bias. */
-static rad_op dense(RadBuilder* b, Names& nm, const char* dn, const char* src, int64_t N, int64_t K,
+static rad_op dense(RadBuilder* b, const char* dn, const char* src, int64_t N, int64_t K,
                     int64_t rows, rad_buf in, rad_buf out, rad_weight* w, int group) {
-    if (map_copy(b, dn, src) < 0) return 0;
-    *w = decl_w(b, dn, RAD_BF16, { N, K }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(group));
+    *w = wcopy(b, dn, src, RAD_BF16, { N, K }, RAD_ACCESS_PER_TOKEN, group);
     if (!*w) return 0;
-    (void)nm;
-    return rw(b, RAD_OP(b, "gemm_nt",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", N), RAD_INT("K", K),
-                                   RAD_STR("dtype", "bf16")),
-                        RAD_WEIGHTS(*w)),
-              { in }, { out });
-}
-
-static rad_op unary(RadBuilder* b, const char* op, int64_t rows, int64_t n, rad_buf in, rad_buf out) {
-    return rw(b, RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                          RAD_STR("dtype", "bf16")),
-                        RAD_NOWEIGHTS),
-              { in }, { out });
+    return gemm_op(b, rows, N, K, *w, in, out);
 }
 
 /* `overlap`: issued on the second lane beside compute, which picks a narrow launch. */
 static rad_op all_reduce(RadBuilder* b, const Geom& g, rad_buf x, int64_t rows,
                          bool overlap = false) {
     if (g.world <= 1) return 0;
-    return rw(b, RAD_OP(b, "all_reduce",
-                        RAD_PARAMS(RAD_INT("world_size", g.world),
-                                   RAD_RANGE("numel", g.n_embd, rows * g.n_embd),
-                                   RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
-                                   RAD_INT("min_bytes", g.wire_min_bytes),
-                                   RAD_INT("overlap", overlap ? 1 : 0)),
-                        RAD_NOWEIGHTS),
-              { x }, { x });
+    return decl_all_reduce_overlap(b, g, x, g.n_embd, rows, "bf16", overlap ? 1 : 0);
 }
 
 /* ================================================================== check_format */
@@ -259,8 +224,8 @@ static int check_format(const RadModelMeta* meta) {
 
 /* ================================================================== declare */
 /* An activation's code pair, `x` already declared: E4M3, or int8 for a rotated int8 model
- * (ActFP8::declare_pair). */
-static int declare_act(RadBuilder* b, Names& nm, const Geom& g, const Model& m, ActFP8& a,
+ * (ActQ::declare_pair). */
+static int declare_act(RadBuilder* b, Names& nm, const Geom& g, const Model& m, ActQ& a,
                        const char* name, int64_t n, const char* fed_op) {
     return a.declare_pair(b, nm, g, name, n, 0, m.i8, m.g8, fed_op);
 }
@@ -421,10 +386,10 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                        RAD_STR("dtype", "bf16"), RAD_F64("wadd", 1.0)),
                             RAD_WEIGHTS(m.w_txn)),
                   { m.b_tx }, { m.b_txa });
-    m.op_tx1 = dense(b, nm, nm.f("txt.in.weight"), nm.ckpt("transformer.txt_in.in_layer.weight"),
+    m.op_tx1 = dense(b, nm.f("txt.in.weight"), nm.ckpt("transformer.txt_in.in_layer.weight"),
                      D, g.n_embd, T, m.b_txa, m.b_txb, &m.w_tx1, gti);
     m.op_txg = unary(b, "gelu_tanh", T, D, m.b_txb, m.b_txa);
-    m.op_tx2 = dense(b, nm, nm.f("txt.out.weight"), nm.ckpt("transformer.txt_in.out_layer.weight"),
+    m.op_tx2 = dense(b, nm.f("txt.out.weight"), nm.ckpt("transformer.txt_in.out_layer.weight"),
                      D, D, T, m.b_txa, m.b_txt, &m.w_tx2, gti);
     if (!m.op_tx1 || !m.op_txg || !m.op_tx2 || !m.op_txn) return RAD_E_INVAL;
     return RAD_OK;
@@ -614,17 +579,17 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                         RAD_INT("round", 1), RAD_STR("dtype", "bf16")),
                              RAD_NOWEIGHTS),
                    {}, { m.b_tproj });
-    m.op_t1 = dense(b, nm, nm.f("dit.t1.weight"),
+    m.op_t1 = dense(b, nm.f("dit.t1.weight"),
                     nm.ckpt("transformer.time_text_embed.timestep_embedder.linear_1.weight"), D, 256,
                     S, m.b_tproj, m.b_te1, &m.w_t1, gx);
     m.op_ts = unary(b, "silu", S, D, m.b_te1, m.b_te1s);
-    m.op_t2 = dense(b, nm, nm.f("dit.t2.weight"),
+    m.op_t2 = dense(b, nm.f("dit.t2.weight"),
                     nm.ckpt("transformer.time_text_embed.timestep_embedder.linear_2.weight"), D, D,
                     S, m.b_te1s, m.b_temb, &m.w_t2, gx);
     m.op_ts2 = unary(b, "silu", S, D, m.b_temb, m.b_tembs);
-    m.op_mod = dense(b, nm, nm.f("dit.mod.weight"), nm.ckpt("transformer.modulation.1.weight"),
+    m.op_mod = dense(b, nm.f("dit.mod.weight"), nm.ckpt("transformer.modulation.1.weight"),
                      4 * D, D, S, m.b_tembs, m.b_mod, &m.w_mod, gx);
-    m.op_nout = dense(b, nm, nm.f("dit.nout.weight"), nm.ckpt("transformer.norm_out.linear.weight"),
+    m.op_nout = dense(b, nm.f("dit.nout.weight"), nm.ckpt("transformer.norm_out.linear.weight"),
                       D, D, S, m.b_tembs, m.b_modo, &m.w_nout, gx);
     if (!m.op_temb || !m.op_t1 || !m.op_ts || !m.op_t2 || !m.op_ts2 || !m.op_mod || !m.op_nout)
         return RAD_E_INVAL;
@@ -650,7 +615,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                            RAD_STR("dtype", "bf16")),
                                 RAD_NOWEIGHTS),
                       { m.b_state }, { m.b_lat });
-    m.op_imgin = dense(b, nm, nm.f("dit.img_in.weight"), nm.ckpt("transformer.img_in.weight"), D,
+    m.op_imgin = dense(b, nm.f("dit.img_in.weight"), nm.ckpt("transformer.img_in.weight"), D,
                        C, T, m.b_lat, m.b_h, &m.w_imgin, gx);
     if (!m.op_gather || !m.op_randn || !m.op_lgather || !m.op_imgin) return RAD_E_INVAL;
     /* The reference pictures' latents go through img_in where they lie. */
@@ -781,11 +746,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         L.op_attn_b = attn(0, false);
         if (qk8) {
             L.op_attn_q = attn(0, true);
-            L.op_kq = rw(b, RAD_OP(b, "quant_act_i8g",
-                                   RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", qd),
-                                              RAD_INT("group", hd), RAD_STR("dtype", "bf16")),
-                                   RAD_NOWEIGHTS),
-                         { m.b_qkv }, { m.b_k8, m.b_ks });
+            L.op_kq = decl_quant_act(b, "quant_act_i8g", T, qd, hd, m.b_qkv, m.b_k8, m.b_ks);
             if (!L.op_attn_q || !L.op_kq) return RAD_E_INVAL;
         }
         L.op_kv = rw(b, RAD_OP(b, "kv_store",
@@ -828,7 +789,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the output: norm_out's adaptive norm, proj_out, and the sampler's step */
     m.op_nout_ln = ln_mod(m.b_h, m.a_hm.x);
     m.b_v = decl_b(b, nm.f("dit.v"), RAD_BF16, { T, C });
-    m.op_pout = dense(b, nm, nm.f("dit.proj_out.weight"), nm.ckpt("transformer.proj_out.weight"),
+    m.op_pout = dense(b, nm.f("dit.proj_out.weight"), nm.ckpt("transformer.proj_out.weight"),
                       C, D, T, m.a_hm.x, m.b_v, &m.w_pout, gx);
     m.op_euler = rw(b, RAD_OP(b, "flow_euler",
                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", C),
@@ -887,9 +848,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* ---- bf16 or block fp8: what the container holds for the first DiT projection decides it
-     * for every linear of both networks (rad_fp8.h, Geom::w_bf16). */
+     * for every linear of both networks (rad_linear.h, Geom::w_bf16). */
     {
-        LinearFP8& probe = m.qkv0;
+        LinearQ& probe = m.qkv0;
         RAD_ARCH_TRY(probe.probe(b, nm, gd, "dit.blk.0.attn_qkv",
                                  { "transformer.transformer_blocks.0.attn.to_q.weight",
                                    "transformer.transformer_blocks.0.attn.to_k.weight",

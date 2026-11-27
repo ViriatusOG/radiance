@@ -29,7 +29,7 @@ blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search
 output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
 
 # The drafter's seven linears: rotated int8 with a bf16 scale per row and 128 of K, read at i8a8h
-# against an int8 activation rotated the same way (rad_fp8.h's DenseFP8). The convolution projections, the selector and the norms
+# against an int8 activation rotated the same way (rad_linear.h's DenseQ). The convolution projections, the selector and the norms
 # stay bf16, as the block reads them.
 dflash.fc.weight                 rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 dflash.blk.*.attn_q.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search

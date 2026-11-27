@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <functional>
 #include <vector>
 
@@ -221,6 +220,23 @@ void composite_white(const FrameRGBA& src, Frame* out) {
             out->rgb[i * 3 + c] = (uint8_t)(((t >> 8) + t) >> 8);
         }
     }
+}
+
+/* transformers' Inkling2ImageProcessor.convert_to_rgb: alpha onto an 8-pixel checkerboard of 204
+ * and 153, ((rgb a + bg (255 - a) + 127) // 255) in integers. */
+void composite_checkerboard(const FrameRGBA& src, Frame* out) {
+    out->w = src.w;
+    out->h = src.h;
+    out->rgb.resize((size_t)src.w * src.h * 3);
+    for (int32_t y = 0; y < src.h; ++y)
+        for (int32_t x = 0; x < src.w; ++x) {
+            const size_t i = (size_t)y * src.w + x;
+            const int a = src.rgba[i * 4 + 3];
+            const int bg = ((y / 8 + x / 8) % 2 == 0) ? 204 : 153;
+            for (int c = 0; c < 3; ++c)
+                out->rgb[i * 3 + c] =
+                    (uint8_t)((src.rgba[i * 4 + c] * a + bg * (255 - a) + 127) / 255);
+        }
 }
 
 }  /* namespace mm */

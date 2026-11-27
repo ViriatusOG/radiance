@@ -205,6 +205,8 @@ struct GemmOps {
     RadTensor a_flat, y_flat;
     const RadTensor *a, *ascale, *b, *bscale, *y, *asum, *bref;
     long long M, N, K;
+    /* Row pitches of `a` and `y` in elements: K and N unless the caller took `pitched` (gemm_ops). */
+    long long lda, ldc;
 };
 
 /* The MXFP4 GEMMs' activation scale grid, read off the operand. One f32 per row (`[M]` or
@@ -310,7 +312,29 @@ static inline int fold_rows(const RadTensor** t, RadTensor* flat) {
  *
  * `parts`: the caller applies a partitioned weight's `pb1`/`pb2` (mx_parts). Any other caller
  * refuses them; ignoring them would multiply every weight row by the first activation copy. */
-static inline int gemm_ops(const RadArgs* a, GemmOps* g, int quantised, int parts = 0) {
+/* A row view: contiguous in every axis but the leading one (r4d_row_pitch), folded to rank 2 with
+ * that pitch kept. A column slice of a wider plane (one output group of a block-diagonal
+ * projection, `bcol`) is such a view. */
+static inline int pitched_rows(const RadTensor** t, RadTensor* flat, long long* pitch) {
+    if ((*t)->rank < 2) return R4D_NO(RAD_E_SHAPE);
+    const long long rp = r4d_row_pitch(*t);
+    if (rp < 0) return R4D_NO(RAD_E_STRIDE);
+    *flat = **t;
+    int64_t k = 1;
+    for (uint32_t d = 1; d < (*t)->rank; ++d) k *= (*t)->shape[d];
+    if ((*t)->shape[0] > 1 && rp < k) return R4D_NO(RAD_E_STRIDE);
+    flat->rank = 2;
+    flat->shape[1] = k;  flat->stride[1] = 1;
+    flat->stride[0] = (*t)->shape[0] > 1 ? rp : k;
+    *pitch = flat->stride[0];
+    *t = flat;
+    return RAD_OK;
+}
+
+/* `pitched`: the kernel takes `a`'s and `y`'s row pitches (g->lda, g->ldc), so row views of wider
+ * planes are accepted; otherwise both must be contiguous and lda = K, ldc = N. */
+static inline int gemm_ops(const RadArgs* a, GemmOps* g, int quantised, int parts = 0,
+                           int pitched = 0) {
     std::memset(g, 0, sizeof(*g));
     if (quantised && !parts && (r4d_geti_or(a, "pb1", 0) > 0 || r4d_geti_or(a, "pb2", 0) > 0))
         return R4D_NO(RAD_E_UNSUPPORTED);
@@ -333,16 +357,25 @@ static inline int gemm_ops(const RadArgs* a, GemmOps* g, int quantised, int part
      * `o`) to `gemm_nt`, so K is the product of the trailing dims, not shape[1]. Gated attention
      * writes q|gate into [tokens, heads, 2*head_dim], so q and gate are column slices of the last
      * dim and N is the product of the trailing two. A strided rank-3 tensor is refused. */
-    int rc = fold_rows(&g->a, &g->a_flat);
-    if (rc != RAD_OK) return rc;
-    rc = fold_rows(&g->y, &g->y_flat);
-    if (rc != RAD_OK) return rc;
-    if (!r4d_contig(g->a) || !r4d_contig(g->y)) return R4D_NO(RAD_E_STRIDE);
+    int rc;
+    if (pitched) {
+        rc = pitched_rows(&g->a, &g->a_flat, &g->lda);
+        if (rc != RAD_OK) return rc;
+        rc = pitched_rows(&g->y, &g->y_flat, &g->ldc);
+        if (rc != RAD_OK) return rc;
+    } else {
+        rc = fold_rows(&g->a, &g->a_flat);
+        if (rc != RAD_OK) return rc;
+        rc = fold_rows(&g->y, &g->y_flat);
+        if (rc != RAD_OK) return rc;
+        if (!r4d_contig(g->a) || !r4d_contig(g->y)) return R4D_NO(RAD_E_STRIDE);
+    }
     if (!r4d_aligned(g->a->data, 16) || !r4d_aligned(g->b->data, 16)) return R4D_NO(RAD_E_ALIGN);
 
     g->M = g->a->shape[0];
     g->K = g->a->shape[1];
     g->N = g->y->shape[1];
+    if (!pitched) { g->lda = g->K; g->ldc = g->N; }
     if (g->y->shape[0] != g->M) return R4D_NO(RAD_E_SHAPE);
     if (g->M < 1 || g->N < 1 || g->K < 1) return R4D_NO(RAD_E_SHAPE);
     return RAD_OK;

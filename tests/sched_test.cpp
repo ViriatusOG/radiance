@@ -1013,7 +1013,7 @@ TEST(concurrent_prefills_with_nothing_decoding_span_one_at_a_time_shortest_first
     for (int k = 0; k < 20 && b_first < 0; ++k) {
         CHECK(f.sch.step() != nullptr);
         const StepPlan& p = f.sch.plan();
-        CHECK_EQ((int64_t)p.e.size(), 1ll);
+        REQUIRE_EQ((int64_t)p.e.size(), 1ll);
         CHECK_EQ(p.e[0].seq, b);
         CHECK(p.e[0].is_prefill);
         b_chunks.push_back(p.e[0].n_tokens);
@@ -1164,7 +1164,7 @@ TEST(a_window_snapshot_is_taken_at_the_tail_of_a_short_prompt_too) {
     CHECK_EQ(f.sch.tail_checkpoint(1000), t);
     f.submit(1000, 8);
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_tok, 1000);
     CHECK_EQ(b->n_checkpoints, 1);
     CHECK_EQ(b->checkpoint_tok[0], t - 1);
@@ -1191,12 +1191,12 @@ TEST(a_long_prompt_takes_its_window_snapshot_inside_its_last_chunk) {
     const int64_t t = (1000 - back) / Q * Q;
     f.submit(1000, 8);
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_tok, 512);
     CHECK_EQ(b->n_checkpoints, 0);
     f.commit_plain();
     b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_tok, 1000 - 512);
     CHECK_EQ(b->n_checkpoints, 1);
     CHECK_EQ(b->checkpoint_tok[0], t - 512 - 1);
@@ -1487,7 +1487,7 @@ TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     f.submit(1000, 8);
 
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_tok, 256);
     CHECK_EQ(b->n_checkpoints, 1);
     /* The snapshot is the state after the chunk's last token, which the split put at the interval
@@ -1508,7 +1508,7 @@ TEST(admission_refuses_when_the_kv_pool_is_short) {
     f.submit(160, 8);      /* must not be admitted */
 
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_seq, 2);
     CHECK_EQ(f.kv.free_blocks(0), 0);
 
@@ -1579,7 +1579,7 @@ TEST(add_all_queues_a_set_under_one_lock_and_refuses_members_singly) {
     CHECK_EQ(rc[2], RAD_E_DUPLICATE);
 
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_seq, 2);
     CHECK_EQ(f.sch.metrics().admitted, 2);
 }
@@ -1669,7 +1669,7 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
 
     uint64_t a = f.submit(1000, 8);
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     /* Recompute resumes from the checkpoint rather than replaying only the linear layers over
      * (256, 300], because RadBatch carries one query length for every KV group. The chunk still
      * ends on the next interval, so the next checkpoint is still written. */
@@ -1705,8 +1705,71 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
      * reservation happens when the chunk is planned, the state exists only afterwards. */
     CHECK(f.pc.committed.empty());
     f.commit_plain();
-    CHECK_EQ((int)f.pc.committed.size(), 1);
+    REQUIRE_EQ((int)f.pc.committed.size(), 1);
     CHECK_EQ(f.pc.committed[0], 512);        /* ctx_len 256 + ckpt_tok 255 + 1 */
+}
+
+/* --checkpoint-draft-window: the step after a hit saves a checkpoint, but the engine ran no drafter
+ * context pass behind it, so the slot's drafter window would be stale. The engine reports it
+ * (Scheduler::skip_ckpt_commit): the checkpoint is not committed (no later hit resumes there),
+ * and it is counted. A checkpoint the engine does not report is committed as before. */
+TEST(a_checkpoint_saved_without_a_drafter_context_pass_is_not_committed_and_is_counted) {
+    for (int stale = 0; stale < 2; ++stale) {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.pc.seed(304);
+        f.pc.lin = 256;
+        f.pc.src = 3;
+        const uint64_t a = f.submit(1000, 8);
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, 256);
+        CHECK_EQ(b->n_checkpoints, 1);
+        bool saved = false;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == a && e.ckpt_slot >= 0 && e.ckpt_tok >= 0) {
+                saved = true;
+                if (stale) f.sch.skip_ckpt_commit(e.seq, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+            }
+        CHECK(saved);
+        f.commit_plain();
+        if (stale) {
+            CHECK(f.pc.committed.empty());
+            CHECK_EQ(f.sch.metrics().draft_window_stale_ckpts, (int64_t)1);
+        } else {
+            CHECK_EQ((int)f.pc.committed.size(), 1);
+            CHECK_EQ(f.sch.metrics().draft_window_stale_ckpts, (int64_t)0);
+        }
+    }
+}
+
+/* The mark is per step: a row cancelled between step and commit retires its mark without
+ * counting (nothing was committed to suppress), and a mark made twice is one entry and one count. */
+TEST(a_checkpoint_skip_mark_does_not_outlive_its_step_or_count_a_cancelled_row) {
+    for (int cancel = 0; cancel < 2; ++cancel) {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.pc.seed(304);
+        f.pc.lin = 256;
+        f.pc.src = 3;
+        const uint64_t a = f.submit(1000, 8);
+        CHECK(f.sch.step() != nullptr);
+        int64_t pos = -1;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == a && e.ckpt_slot >= 0 && e.ckpt_tok >= 0)
+                pos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+        CHECK(pos > 0);
+        f.sch.skip_ckpt_commit(a, pos);
+        f.sch.skip_ckpt_commit(a, pos);         /* deduplicated */
+        if (cancel) CHECK_OK(f.sch.cancel(a));
+        f.commit_plain();
+        CHECK(f.pc.committed.empty());
+        CHECK_EQ(f.sch.metrics().draft_window_stale_ckpts, (int64_t)(cancel ? 0 : 1));
+        /* No entry left behind for a later step to find. */
+        CHECK(!f.sch.take_ckpt_skip(a, pos));
+    }
 }
 
 /* A hit that resumes more than an interval below the attention blocks is counted with its own
@@ -1935,8 +1998,8 @@ TEST(a_hit_over_mixed_block_sizes_adopts_each_groups_own_blocks) {
     REQUIRE(f.sch.step() != nullptr);
     CHECK_EQ(f.sch.find(a)->n_computed, 256);
     const std::vector<int32_t> t0 = f.kv.block_table(a, 0), t1 = f.kv.block_table(a, fine);
-    CHECK_EQ((int)t0.size(), 32);                     /* 16 adopted + 16 for the 256-token chunk */
-    CHECK_EQ((int)t1.size(), 64);                     /* 32 adopted + 32 */
+    REQUIRE_EQ((int)t0.size(), 32);                     /* 16 adopted + 16 for the 256-token chunk */
+    REQUIRE_EQ((int)t1.size(), 64);                     /* 32 adopted + 32 */
     for (int i = 0; i < 16; ++i) CHECK_EQ(t0[(size_t)i], f.pc.seeded[0][(size_t)i]);
     for (int i = 0; i < 32; ++i) CHECK_EQ(t1[(size_t)i], f.pc.seeded[1][(size_t)i]);
 }
@@ -2022,7 +2085,7 @@ TEST(a_request_waiting_on_its_encoder_lets_the_queue_past_it) {
     const uint64_t c = f.submit_unencoded(160, 8, &ic);
 
     const RadBatch* s1 = f.sch.step();
-    CHECK(s1 != nullptr);
+    REQUIRE(s1 != nullptr);
     CHECK_EQ(s1->n_seq, 1);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Waiting);
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
@@ -2038,7 +2101,7 @@ TEST(a_request_waiting_on_its_encoder_lets_the_queue_past_it) {
     /* Asked again every step, and admitted the step its items are in. */
     ia->encoded = true;
     const RadBatch* s2 = f.sch.step();
-    CHECK(s2 != nullptr);
+    REQUIRE(s2 != nullptr);
     CHECK_EQ(s2->n_seq, 2);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
     CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
@@ -2046,7 +2109,7 @@ TEST(a_request_waiting_on_its_encoder_lets_the_queue_past_it) {
 
     ic->encoded = true;
     const RadBatch* s3 = f.sch.step();
-    CHECK(s3 != nullptr);
+    REQUIRE(s3 != nullptr);
     CHECK_EQ(s3->n_seq, 3);
     CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Running);
     CHECK_EQ(f.sch.queue_snapshot(q, 8), 0);
@@ -2065,7 +2128,7 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     CHECK(a && b && c);
 
     const RadBatch* s1 = f.sch.step();
-    CHECK(s1 != nullptr);
+    REQUIRE(s1 != nullptr);
     CHECK_EQ(s1->n_seq, 2);
     f.commit_plain();
 
@@ -2073,7 +2136,7 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
      * the pool has none. The victim must be A (lowest priority, and re-admitted last anyway),
      * not the head-of-line B. */
     const RadBatch* s2 = f.sch.step();
-    CHECK(s2 != nullptr);
+    REQUIRE(s2 != nullptr);
     CHECK_EQ(s2->n_seq, 1);
 
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
@@ -2147,10 +2210,101 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     f.commit_plain();
 }
 
+/* A FRESH PREFILL's room gate: it starts only when its whole prompt plus one decode position
+ * fits beside the runners' whole prompts and their next-token headroom. An admission that
+ * reserved the first chunk alone would let a long prefill reach 100% and then be preempted at
+ * the first decode step -- the full prefill thrown away. */
+TEST(a_fresh_prefill_waits_for_its_whole_prompt_and_running_headroom) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);   /* 20 x 16 = 320 tokens; prompts of 160 = 10 blocks each */
+    f.cfg.max_seqs = 2;
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160, /*max_tokens=*/64, /*priority=*/5);
+    const uint64_t b = f.submit(160, /*max_tokens=*/64, /*priority=*/0);
+
+    /* A holds 10 blocks; B needs 10 for its prompt, plus one block for B's decode position and
+     * one for A's next position: 12 > the 10 free, so B waits instead of starting a prefill it
+     * would have to throw away. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    f.commit_plain();
+
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* DeepSeek-V4.1's QSA attention: a WINDOW group holds ~window tokens, not the whole
+ * prompt. Counting ceil(prompt / block) against it would keep every long chat in Waiting while
+ * can_ever_fit (which caps at the window) still says yes. The SWA pool is shrunk so that a gate
+ * counting the whole prompt would wait; the request must still start. */
+TEST(a_fresh_prefill_is_not_held_for_a_windowed_groups_full_prompt) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096, /*windowed=*/true);
+    f.cfg.max_seqs = 2;
+    f.cfg.prefill_room_gate = true;
+    int32_t win = -1;
+    for (size_t i = 0; i < f.prog.kv_groups.size(); ++i)
+        if (f.prog.kv_groups[i].decl.kind == RAD_KV_WINDOW) win = (int32_t)i;
+    REQUIRE(win >= 0);
+    f.kv.total[(size_t)win] = 8;
+    f.kv.refcnt[(size_t)win].assign(8, 0);
+    f.kv.freelist[(size_t)win].clear();
+    for (int32_t b = 7; b >= 0; --b) f.kv.freelist[(size_t)win].push_back(b);
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(400, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* A long prefill gets a capped chunk when other requests are eligible: 4 eligible requests and a
+ * 4096-token budget floor the cap at 1024 tokens, so the long prompt cannot take every token. */
+TEST(a_long_prefill_chunk_is_capped_to_a_fair_share_when_others_exist) {
+    Fixture f;
+    f.build(/*blocks=*/512, /*states=*/64, /*max_tok=*/4096, /*max_ctx=*/4096);
+    f.cfg.max_seqs = 4;
+    f.cfg.long_prefill_token_threshold = 1024;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(3000, /*max_tokens=*/64, /*priority=*/5);
+    for (int i = 0; i < 3; ++i) f.submit(300, /*max_tokens=*/64, /*priority=*/0);
+
+    REQUIRE(f.sch.step() != nullptr);
+    int64_t a_tokens = -1;
+    for (const StepEntry& e : f.sch.plan().e)
+        if (e.req && e.req->id == a) a_tokens = e.n_tokens;
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK(a_tokens > 0 && a_tokens <= 1024);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* The same threshold does not throttle a lone prefill: nobody is waiting behind it. */
+TEST(a_lone_long_prefill_is_not_capped_by_the_long_prefill_threshold) {
+    Fixture f;
+    f.build(/*blocks=*/512, /*states=*/64, /*max_tok=*/4096, /*max_ctx=*/4096);
+    f.cfg.max_seqs = 4;
+    f.cfg.checkpoint_interval = 4096;       /* one chunk, not a 256-token interval */
+    f.cfg.long_prefill_token_threshold = 1024;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(3000, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK(f.sch.plan().e[0].n_tokens > 1024);
+}
+
 /* The whole-recompute predicate counts blocks the cache can lend back, not entries it already
- * holds. With nothing running, the old gate never entered its victim loop, so a pool filled by
- * finished conversations kept an overdue preempted request in Preempted forever -- the daily's
- * "deadlocked at preempted" incident. The overdue pass reclaims cache entries before judging fit. */
+ * holds. With nothing running there is no victim to preempt, so a pool filled by finished
+ * conversations would keep an overdue preempted request in Preempted forever unless the overdue
+ * pass reclaims cache entries before judging fit. */
 TEST(a_preempted_prefill_reclaims_cache_blocks_with_no_running_request) {
     Fixture f;
     f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
@@ -2185,7 +2339,7 @@ TEST(a_preempted_prefill_reclaims_cache_blocks_with_no_running_request) {
     f.commit_plain();
 }
 
-/* A leaked state slot (held by nobody, missing from the free list) used to make can_grow false
+/* A leaked state slot (held by nobody, missing from the free list) would make can_grow false
  * forever once nothing was running. The overdue pass puts the slot back and admits. */
 TEST(an_idle_overdue_prefill_reclaims_a_leaked_state_slot) {
     Fixture f;
@@ -2272,9 +2426,9 @@ TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
     f.commit_plain();
 }
 
-/* A waiter the idle engine cannot start must not park the queue. The room gate used to return
- * kAdmitWait when the pool could ever hold the prompt but can_grow could not, and with nothing
- * running the next step never freed a block. step() then returned null forever. */
+/* A waiter the idle engine cannot start must not park the queue. When the pool could ever hold
+ * the prompt but can_grow cannot, answering kAdmitWait with nothing running frees no block on the
+ * next step, so step() would return null forever; the waiter is failed instead. */
 TEST(an_idle_engine_fails_a_waiter_it_cannot_start) {
     Fixture f;
     f.build(/*blocks=*/64, /*states=*/4);
@@ -2507,7 +2661,7 @@ TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
         f.commit_plain();
     }
     const Request* ra = f.sch.find(a);
-    CHECK(ra);
+    REQUIRE(ra);
     CHECK(ra->state != ReqState::Preempted || f.sch.metrics().running == 0);
     CHECK(f.sch.metrics().running + f.sch.metrics().preempted_waiting > 0);
     (void)b; (void)c;
@@ -2573,7 +2727,7 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     uint64_t a = f.submit(100, 64);
     CHECK(a);
     const RadBatch* s1 = f.sch.step();
-    CHECK(s1 != nullptr);
+    REQUIRE(s1 != nullptr);
     CHECK_EQ(s1->n_tok, 100);
     f.commit_plain(4242);
 
@@ -2581,7 +2735,7 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     uint64_t b = f.submit(64, 64);
     CHECK(b);
     const RadBatch* s2 = f.sch.step();
-    CHECK(s2 != nullptr);
+    REQUIRE(s2 != nullptr);
     CHECK_EQ(s2->phase, RAD_PHASE_MIXED);
     CHECK_EQ(s2->n_seq, 2);
     CHECK_EQ(s2->n_tok, 65);
@@ -2647,7 +2801,7 @@ TEST(derived_metadata_is_computed_once_per_step_into_the_arena) {
     CHECK(b != nullptr);
 
     const int32_t* ss = f.derived("seq_start");
-    CHECK(ss != nullptr);
+    REQUIRE(ss != nullptr);
     CHECK_EQ(ss[0], 0);
     CHECK_EQ(ss[1], 1);
     CHECK_EQ(ss[2], 65);
@@ -2656,7 +2810,7 @@ TEST(derived_metadata_is_computed_once_per_step_into_the_arena) {
      * The decode row spans 100..100 and the prefill row 0..63, so neither crosses 64: one chunk
      * each, boundaries at 0, 1, 65. */
     const int32_t* cb = f.derived("chunk_bounds");
-    CHECK(cb != nullptr);
+    REQUIRE(cb != nullptr);
     CHECK_EQ(cb[0], 0);
     CHECK_EQ(cb[1], 1);
     CHECK_EQ(cb[2], 65);
@@ -2664,7 +2818,7 @@ TEST(derived_metadata_is_computed_once_per_step_into_the_arena) {
     /* The conv index is the state slot's base in a rolling window of width-1 + num_spec + 1 = 4,
      * plus the cursor the accepted count moves. */
     const int32_t* ci = f.derived("conv_idx");
-    CHECK(ci != nullptr);
+    REQUIRE(ci != nullptr);
     const StepPlan& p = f.sch.plan();
     int32_t cslot = f.kv.state_slot(p.e[0].seq, 2);   /* group 2 is the conv group */
     CHECK(cslot >= 0);
@@ -2682,7 +2836,7 @@ TEST(the_step_batch_carries_each_rows_adapter_slot) {
 
     f.submit(16, 1);
     const RadBatch* base = f.sch.step();
-    CHECK(base != nullptr);
+    REQUIRE(base != nullptr);
     CHECK_EQ(base->n_tok, (int64_t)16);
     CHECK(base->lora_slot == nullptr);
     f.commit_plain();
@@ -2692,7 +2846,7 @@ TEST(the_step_batch_carries_each_rows_adapter_slot) {
     r->lora_uid = 7;
     CHECK(f.add(std::move(r)) != 0);
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK(b->lora_slot != nullptr);
     CHECK_EQ(b->n_tok, (int64_t)100);
     for (int64_t i = 0; i < b->n_tok; ++i) CHECK_EQ(b->lora_slot[i], 1);
@@ -2700,7 +2854,7 @@ TEST(the_step_batch_carries_each_rows_adapter_slot) {
 
     f.submit(64, 64);
     b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_tok, (int64_t)65);
     CHECK_EQ(b->lora_slot[0], 1);                          /* the adapter request's decode row */
     for (int64_t i = 1; i < 65; ++i) CHECK_EQ(b->lora_slot[i], -1);   /* the base prefill */
@@ -2714,7 +2868,7 @@ TEST(no_adapters_no_slot_array) {
     CHECK_OK(f.start());
     f.submit(32, 8);
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK(b->lora_slot == nullptr);
 
     Config on = f.cfg;
@@ -2913,6 +3067,326 @@ TEST(a_prefix_hit_does_not_stop_a_full_attention_drafter) {
     CHECK_EQ((int)rows[0].seq, (int)a);
 }
 
+/* ================================================ --draft-max-lanes: the drafter gated by load */
+namespace {
+/* Three requests decoding; returns once all three have produced a token. */
+void gate_decode_three(Fixture& f, uint64_t ids[3]) {
+    for (int i = 0; i < 3; ++i) ids[i] = f.submit(16, 64);
+    for (int k = 0; k < 8; ++k) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        bool all = true;
+        for (int i = 0; i < 3; ++i)
+            if (f.sch.find(ids[i])->output.empty()) all = false;
+        if (all) break;
+    }
+}
+}  /* namespace */
+
+TEST(draft_max_lanes_gates_the_block_drafter_above_k_and_resumes_below) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 7;
+    f.cfg.draft_max_lanes = 2;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    CHECK_OK(f.start());
+    uint64_t ids[3];
+    gate_decode_three(f, ids);
+    CHECK_EQ(f.sch.metrics().running, 3);
+
+    /* Three running, K = 2: no row drafts, the step is counted, but every sequence still gets its
+     * context row (the drafter's KV keeps growing) and nothing is left half-staged. */
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 0);
+    CHECK_EQ(f.sch.metrics().draft_gated_steps, (int64_t)1);
+    CHECK(f.sch.block_context(1) != nullptr);
+    CHECK(f.sch.block_query(1) == nullptr);
+    f.sch.block_end();
+    for (int i = 0; i < 3; ++i) CHECK(f.sch.find(ids[i])->state == ReqState::Running);
+
+    /* One leaves: two running, at K, so the drafter drafts for both again. */
+    CHECK_OK(f.sch.cancel(ids[2]));
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_OK(f.sch.reap(ids[2]));
+    CHECK_EQ(f.sch.metrics().running, 2);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 2);
+    CHECK_EQ(f.sch.metrics().draft_gated_steps, (int64_t)1);   /* not counted while drafting */
+    f.sch.block_end();
+}
+
+/* Running is not decoding: a sequence still prefilling, or one that cannot speculate, is no load
+ * on the drafter. */
+TEST(draft_max_lanes_counts_decoding_sequences_not_running_ones) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 7;
+    f.cfg.draft_max_lanes = 2;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(16, 64), b = f.submit(16, 64);
+    for (int k = 0; k < 6; ++k) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        if (!f.sch.find(a)->output.empty() && !f.sch.find(b)->output.empty()) break;
+    }
+    REQUIRE(!f.sch.find(a)->output.empty() && !f.sch.find(b)->output.empty());
+    /* A third request whose prompt takes several chunks: running, but its first steps decode
+     * nothing for it. */
+    uint64_t c = f.submit(1500, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().running, 3);
+    CHECK(f.sch.find(c)->output.empty());          /* still mid-prefill */
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 2);      /* a and b still draft */
+    CHECK_EQ(f.sch.metrics().draft_gated_steps, (int64_t)0);
+    f.sch.block_end();
+}
+
+TEST(draft_max_lanes_does_not_count_a_sequence_that_cannot_speculate) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 7;
+    f.cfg.draft_max_lanes = 2;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    CHECK_OK(f.start());
+    uint64_t ids[3];
+    gate_decode_three(f, ids);
+    f.sch.find(ids[2])->may_speculate = false;
+    REQUIRE(f.sch.step() != nullptr);
+    Scheduler::BlockRow rows[4];
+    /* On the card (the engine's shape) a request that may not speculate is left out of the rows. */
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4, /*on_card=*/true), 2);
+    CHECK_EQ(f.sch.metrics().draft_gated_steps, (int64_t)0);
+    f.sch.block_end();
+    f.commit_plain();
+}
+
+/* The pipelined shape: block_begin runs right after the step is issued, before its commit. */
+TEST(draft_max_lanes_gates_on_the_card_before_the_commit) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 7;
+    f.cfg.draft_max_lanes = 2;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    CHECK_OK(f.start());
+    uint64_t ids[3];
+    gate_decode_three(f, ids);
+    REQUIRE(f.sch.step() != nullptr);
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4, /*on_card=*/true), 0);
+    CHECK_EQ(f.sch.metrics().draft_gated_steps, (int64_t)1);
+    CHECK(f.sch.block_context(1) != nullptr);
+    f.sch.block_end();
+    f.commit_plain();
+    CHECK_OK(f.sch.cancel(ids[2]));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_OK(f.sch.reap(ids[2]));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4, /*on_card=*/true), 2);
+    f.sch.block_end();
+    f.commit_plain();
+}
+
+TEST(draft_max_lanes_zero_never_gates) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 7;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    CHECK_OK(f.start());
+    uint64_t ids[3];
+    gate_decode_three(f, ids);
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 3);
+    CHECK_EQ(f.sch.metrics().draft_gated_steps, (int64_t)0);
+    f.sch.block_end();
+}
+
+/* ====================================== --draft-min-accept: the acceptance-aware per-sequence gate */
+namespace {
+/* A plain commit of a fresh token each time, so prompt lookup (which the scheduler runs beside the
+ * head) finds no repeat to propose from and every draft in these tests is the head's. */
+void acc_plain(Fixture& f) {
+    static int32_t t = 5000;
+    f.commit_plain(++t);
+}
+void acc_fixture(Fixture& f, double x) {
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    f.cfg.draft_min_accept = x;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    CHECK_OK(f.start());
+}
+/* The request's first token, so it decodes from here. */
+void acc_first_token(Fixture& f, uint64_t& a, int max_tokens = 600) {
+    a = f.submit(16, max_tokens);
+    for (int k = 0; k < 4 && f.sch.find(a)->output.empty(); ++k) {
+        REQUIRE(f.sch.step() != nullptr);
+        acc_plain(f);
+    }
+    REQUIRE(!f.sch.find(a)->output.empty());
+}
+/* One verify step of seven drafts, `acc` of them accepted. */
+void acc_verify(Fixture& f, uint64_t id, int acc) {
+    int32_t d[7] = { 21, 22, 23, 24, 25, 26, 27 };
+    CHECK_OK(f.sch.set_draft(id, d, 7));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 7);
+    static int32_t t = 9000;
+    CHECK_OK(f.commit(++t, 0, [acc](const StepEntry&) { return acc; }));
+}
+int acc_rows(Fixture& f, bool on_card = false) {
+    Scheduler::BlockRow rows[4];
+    const int n = f.sch.block_begin(8, 7, 0, 99, rows, 4, on_card);
+    f.sch.block_end();
+    return n;
+}
+}  /* namespace */
+
+TEST(draft_min_accept_stops_a_low_acceptance_sequence_probes_it_and_resumes) {
+    Fixture f;
+    acc_fixture(f, 2.0);
+    uint64_t a = 0;
+    acc_first_token(f, a);
+    /* Warm-up: the decision comes at the second verify, not before. */
+    acc_verify(f, a, 0); CHECK_EQ(acc_rows(f), 1);
+    acc_verify(f, a, 0);
+    CHECK_EQ(f.sch.metrics().draft_acc_gated_steps, (int64_t)0);
+    CHECK_EQ(acc_rows(f), 0);                                   /* stopped */
+    CHECK_EQ(f.sch.metrics().draft_acc_gated_steps, (int64_t)1);
+    /* Plain steps until 64 tokens have been generated; the drafter still covers it (context pass)
+     * but proposes nothing. */
+    int plain = 0;
+    while (acc_rows(f) == 0 && plain < 200) {
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
+        acc_plain(f);
+        ++plain;
+    }
+    CHECK(plain >= 124 && plain <= 132);                          /* the probe came due */
+    /* The probe block is verified and accepted in full: 8 tokens a step lifts the estimate over
+     * X + 0.4 at once (probes smooth at 0.5). */
+    acc_verify(f, a, 7);
+    CHECK_EQ(acc_rows(f), 1);
+    CHECK_EQ(acc_rows(f), 1);
+    const int64_t gated = f.sch.metrics().draft_acc_gated_steps;
+    CHECK_EQ(acc_rows(f), 1);
+    CHECK_EQ(f.sch.metrics().draft_acc_gated_steps, gated);
+}
+
+TEST(draft_min_accept_a_failed_probe_leaves_the_sequence_stopped) {
+    Fixture f;
+    acc_fixture(f, 2.0);
+    uint64_t a = 0;
+    acc_first_token(f, a);
+    for (int i = 0; i < 2; ++i) acc_verify(f, a, 0);
+    CHECK_EQ(acc_rows(f), 0);
+    while (acc_rows(f) == 0) { REQUIRE(f.sch.step() != nullptr); acc_plain(f); }
+    acc_verify(f, a, 0);                                        /* the probe accepts nothing */
+    CHECK_EQ(acc_rows(f), 0);
+}
+
+TEST(draft_min_accept_a_recycled_slot_does_not_inherit_a_stopped_drafter) {
+    Fixture f;
+    acc_fixture(f, 2.0);
+    uint64_t a = 0;
+    acc_first_token(f, a);
+    for (int i = 0; i < 2; ++i) acc_verify(f, a, 0);
+    CHECK_EQ(acc_rows(f), 0);
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    uint64_t b = 0;
+    acc_first_token(f, b);
+    CHECK_EQ(acc_rows(f), 1);                                   /* b drafts from its first block */
+    (void)b;
+}
+
+TEST(draft_min_accept_the_drafts_in_flight_when_it_stops_are_verified_as_usual) {
+    Fixture f;
+    acc_fixture(f, 2.0);
+    uint64_t a = 0;
+    acc_first_token(f, a);
+    acc_verify(f, a, 0);
+    /* The second verify is issued with its draft while the sequence is still on; its commit
+     * stops the drafter. Its two accepted drafts count in the output as ever. */
+    const size_t before = f.sch.find(a)->output.size();
+    acc_verify(f, a, 2);
+    CHECK_EQ(f.sch.find(a)->output.size(), before + 3);
+    CHECK_EQ(acc_rows(f), 0);                                   /* 1+0, 1+2: 1.5 < 2 */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 0);                      /* nothing is carried any more */
+    acc_plain(f);
+    CHECK(f.sch.find(a)->state == ReqState::Running);
+}
+
+TEST(draft_min_accept_on_the_card_leaves_a_stopped_sequence_out_and_admits_its_probe) {
+    Fixture f;
+    acc_fixture(f, 2.0);
+    uint64_t a = 0;
+    acc_first_token(f, a);
+    for (int i = 0; i < 2; ++i) acc_verify(f, a, 0);
+    int plain = 0;
+    for (;; ++plain) {
+        REQUIRE(f.sch.step() != nullptr);
+        const int n = acc_rows(f, /*on_card=*/true);              /* before this step's commit */
+        acc_plain(f);
+        if (n > 0 || plain > 200) { CHECK_EQ(n, 1); break; }
+    }
+    CHECK(plain >= 120 && plain <= 135);
+    CHECK(f.sch.metrics().draft_acc_gated_steps >= 120);
+}
+
+
+TEST(draft_min_accept_failed_probes_double_the_wait_up_to_the_cap_and_a_good_one_resets_it) {
+    Fixture f;
+    acc_fixture(f, 2.0);
+    uint64_t a = 0;
+    acc_first_token(f, a, /*max_tokens=*/8000);
+    for (int i = 0; i < 2; ++i) acc_verify(f, a, 0);
+    CHECK_EQ(acc_rows(f), 0);
+    /* Generated tokens between a stop (or a probe) and the next probe. */
+    auto wait = [&]() -> int {
+        int n = 0;
+        while (acc_rows(f) == 0 && n < 2000) { if (!f.sch.step()) return -1; acc_plain(f); ++n; }
+        return n;
+    };
+    const int w1 = wait(); acc_verify(f, a, 0);       /* failed: 128 -> 256 */
+    const int w2 = wait(); acc_verify(f, a, 0);       /* 256 -> 512 */
+    const int w3 = wait(); acc_verify(f, a, 0);       /* 512 -> 1024 */
+    const int w4 = wait(); acc_verify(f, a, 0);       /* capped at 1024 */
+    const int w5 = wait();
+    CHECK(w1 >= 124 && w1 <= 132);
+    CHECK(w2 >= 252 && w2 <= 260);
+    CHECK(w3 >= 508 && w3 <= 516);
+    CHECK(w4 >= 1020 && w4 <= 1028);
+    CHECK(w5 >= 1020 && w5 <= 1028);
+    acc_verify(f, a, 7);                                /* a good probe: drafting resumes ... */
+    CHECK_EQ(acc_rows(f), 1);
+    for (int i = 0; i < 5; ++i) acc_verify(f, a, 0);    /* ... and a later stop starts over at 128 */
+    CHECK_EQ(acc_rows(f), 0);
+    const int w6 = wait();
+    CHECK(w6 >= 124 && w6 <= 132);
+}
+
+TEST(draft_min_accept_zero_never_gates) {
+    Fixture f;
+    acc_fixture(f, 0.0);
+    uint64_t a = 0;
+    acc_first_token(f, a);
+    for (int i = 0; i < 8; ++i) { acc_verify(f, a, 0); CHECK_EQ(acc_rows(f), 1); }
+    CHECK_EQ(f.sch.metrics().draft_acc_gated_steps, (int64_t)0);
+}
+
 /* ====================================== a prefix hit and a windowed block drafter (draft refill)
  * The drafter's own windowed KV group is not prefix-cached, so a hit leaves it without K and V for
  * the cached tokens. The scheduler ends such a hit one drafter window before the prompt's end, at
@@ -2923,20 +3397,23 @@ struct RefillRun {
     int rows = -1;                 /* drafting rows block_begin offers at the first decode step */
     SchedMetrics m;
 };
-RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
+/* `split`: the drafter stages no window (RadDrafterDecl::window 0, its full layer reads all) and
+ * keeps its local layers in a window group of their own, marked as the drafter's. */
+RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0, bool split = false) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
     f.cfg.n_spec = 7;
     f.prog.drafter.kind = RAD_DRAFT_BLOCK;
-    f.prog.drafter.window = 512;
+    f.prog.drafter.window = split ? 0 : 512;
     KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached,
                                     * unbound. The trunk clamp reads bound trunk layers only
                                     * (scheduler.h, hit_holes_trunk_), so it leaves this hole to
                                     * the refill. */
-    w.name = "draft";
+    w.name = split ? "draft.kv_draft_local" : "draft";
     w.decl.kind = RAD_KV_WINDOW;
     w.decl.window = 512;
     w.block_size = 16;
+    w.drafter = split;
     f.prog.kv_groups.push_back(w);
     f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
     f.pc.groups = { 0 };
@@ -2950,7 +3427,7 @@ RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
         CHECK(f.sch.step() != nullptr);
         if (st == 0) r.n_after_first = f.sch.find(a)->n_computed;
         f.commit_plain(11);
-        const int n = f.sch.block_begin(8, 7, 512, 99, rows, 4);
+        const int n = f.sch.block_begin(8, 7, split ? 0 : 512, 99, rows, 4);
         f.sch.block_end();
         if (!f.sch.find(a)->output.empty()) { r.rows = n; break; }
     }
@@ -2997,6 +3474,187 @@ TEST(a_prefix_hit_already_a_window_back_is_kept_whole) {
     CHECK_EQ(r.n_after_first, 1024);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
     CHECK_EQ(r.rows, 1);
+}
+
+/* The split drafter cache (a full group that is prefix-cached, a window group of the drafter's own
+ * that is not; RadDrafterDecl::window 0): the refill spans the window group's window, and the
+ * reach guard reads it. */
+TEST(a_split_drafter_cache_refills_its_local_window_after_a_prefix_hit_and_drafts_at_once) {
+    const RefillRun r = refill_run(1100, 1024, 0, /*split=*/true);
+    CHECK_EQ(r.n_after_first, 512);                       /* ended one window before the end */
+    CHECK_EQ(r.rows, 1);
+    CHECK_EQ(r.m.draft_refills, (int64_t)1);
+    CHECK_EQ(r.m.draft_refill_tokens, (int64_t)512);
+}
+
+TEST(a_split_drafter_refill_edges_unaligned_prompt_whole_hit_and_no_checkpoint) {
+    /* A prompt that is not a block multiple: the cap 1101 - 512 = 589 ends on attention 576 and the
+     * checkpoint under it, 512, as for a windowed drafter. */
+    const RefillRun u = refill_run(1101, 1024, 0, true);
+    CHECK_EQ(u.n_after_first, 512);
+    CHECK_EQ(u.rows, 1);
+    /* A hit already a window back is kept whole and drafts at once (the hole is behind the window). */
+    const RefillRun w = refill_run(5000, 1024, 0, true);
+    CHECK_EQ(w.m.draft_refills, (int64_t)0);
+    CHECK_EQ(w.n_after_first, 1024);
+    CHECK_EQ(w.rows, 1);
+    /* No checkpoint near the cap: the whole hit stands and the drafter waits for the window. */
+    const RefillRun n = refill_run(2200, 2048, 2048, true);
+    CHECK_EQ(n.m.draft_refills, (int64_t)0);
+    CHECK_EQ(n.rows, 0);
+    /* No hit, no hole: drafts at once. */
+    const RefillRun z = refill_run(1100, 0, 0, true);
+    CHECK_EQ(z.rows, 1);
+}
+
+/* The preempted-prefill gate credits the hit the recompute will adopt, which under a drafter refill
+ * is the capped one (the same HitCap admit_one passes); crediting the uncapped hit would admit a
+ * preempted request against blocks it must still compute. */
+/* `split`: the drafter stages no window and keeps it in a group of its own; otherwise the drafter
+ * stages a window of 512 (the existing windowed block drafter) and its group is not marked. */
+static void preempted_gate_credits_capped_hit(bool split) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 60000;
+    f.cfg.n_spec = 7;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    f.prog.drafter.window = split ? 0 : 512;
+    KVGroupInfo w;
+    w.name = split ? "draft.kv_draft_local" : "draft";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 512;
+    w.block_size = 16;
+    w.drafter = split;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 26, 64);
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);                 /* B is the victim */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+    f.pc.capped_probes = 0;
+    uint64_t q[8];
+    CHECK_EQ(f.sch.queue_snapshot(q, 8), 1);
+    CHECK(f.sch.step() != nullptr);                 /* the gate is consulted for B */
+    CHECK(f.pc.capped_probes > 0);
+    (void)a;
+}
+
+TEST(a_preempted_prefill_gate_credits_the_refill_capped_hit_with_a_split_drafter) {
+    preempted_gate_credits_capped_hit(true);
+}
+
+/* Not split: a block drafter that stages its own window (draft_refill_ from drafter.window) has the
+ * gate apply the same cap, which it did not before the cap helper was shared. */
+TEST(a_preempted_prefill_gate_credits_the_refill_capped_hit_with_a_windowed_drafter) {
+    preempted_gate_credits_capped_hit(false);
+}
+
+namespace {
+/* A split drafter whose window group has `win` tokens, a hit that is kept whole (no checkpoint to cap
+ * it on), and a prompt just past it: the n_computed at which the drafter first proposes, which is
+ * where the window has slid past the hole (hit + win - 1). -1 if it never did within the run. */
+int64_t first_drafting_position(int64_t win, int n_prompt, int32_t seeded, bool on_card) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    f.prog.drafter.window = 0;
+    KVGroupInfo w;
+    w.name = "draft.kv_draft_local";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = (int32_t)win;
+    w.block_size = 16;
+    w.drafter = true;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    f.pc.ckpt_lo = seeded;              /* no checkpoint below the hit: the cap cannot end on one */
+    CHECK_OK(f.start());
+    f.pc.seed(seeded); f.pc.lin = seeded; f.pc.src = 3;
+    const uint64_t a = f.submit(n_prompt, 4000);
+    Scheduler::BlockRow rows[4];
+    static int32_t t = 20000;
+    for (int st = 0; st < 3000; ++st) {
+        if (!f.sch.step()) return -1;
+        int n = 0;
+        if (on_card) { n = f.sch.block_begin(8, 7, 0, 99, rows, 4, true); f.sch.block_end(); }
+        f.commit_plain(++t);
+        if (!on_card) { n = f.sch.block_begin(8, 7, 0, 99, rows, 4); f.sch.block_end(); }
+        if (n > 0 && !f.sch.find(a)->output.empty()) return f.sch.find(a)->n_computed;
+    }
+    return -1;
+}
+}  /* namespace */
+
+TEST(a_split_drafter_resumes_exactly_when_the_window_has_slid_past_a_whole_hit) {
+    /* A hit of 2048 kept whole, window 512: the first block's reads reach back to n_computed - 511,
+     * so drafting starts at 2048 + 511 = 2559 and not a token before, host-side and on the card. */
+    for (bool on_card : { false, true }) {
+        const int64_t at = first_drafting_position(512, 2200, 2048, on_card);
+        CHECK_EQ(at, (int64_t)2559);
+    }
+    /* A window that is not a block multiple (the real 1025 = 1024 + 1): a hit of 4096 is more than
+     * two windows (2050) from any checkpoint, so it stays whole; drafting starts at 4096 + 1024. */
+    for (bool on_card : { false, true }) {
+        const int64_t at = first_drafting_position(1025, 4200, 4096, on_card);
+        CHECK_EQ(at, (int64_t)5120);
+    }
+}
+
+/* The refill's boundary: a hit kept whole drafts at once only when the window already clears the hole,
+ * prompt - hit >= W - 1 (the last position read, prompt - W + 1, is the first the hole may not touch). */
+TEST(a_split_drafter_hit_drafts_at_once_exactly_when_the_window_clears_the_hole) {
+    /* window 512, hit 2048 kept whole (no checkpoint to cap on): drafts at the first decode iff
+     * prompt >= 2048 + 511 = 2559. */
+    CHECK_EQ(first_drafting_position(512, 2559, 2048, false), (int64_t)2559);
+    CHECK_EQ(first_drafting_position(512, 2558, 2048, false), (int64_t)2559);   /* waits one token */
+    CHECK_EQ(first_drafting_position(512, 2560, 2048, true), (int64_t)2560);
+}
+
+TEST(a_split_drafter_refill_and_the_lane_gate_together) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    f.cfg.draft_max_lanes = 1;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    f.prog.drafter.window = 0;
+    KVGroupInfo w;
+    w.name = "draft.kv_draft_local";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 512;
+    w.block_size = 16;
+    w.drafter = true;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(1024); f.pc.lin = 1024; f.pc.src = 3;
+    uint64_t a = f.submit(1100, 64), b = f.submit(1100, 64);
+    Scheduler::BlockRow rows[4];
+    int n = -1;
+    for (int st = 0; st < 40; ++st) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        n = f.sch.block_begin(8, 7, 0, 99, rows, 4);
+        f.sch.block_end();
+        if (!f.sch.find(a)->output.empty() && !f.sch.find(b)->output.empty()) break;
+    }
+    CHECK_EQ(n, 0);                                         /* two decoding > K = 1: gated */
+    CHECK(f.sch.metrics().draft_gated_steps > 0);
+    CHECK_OK(f.sch.cancel(b));
+    CHECK_OK(f.sch.reap(b));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(12);
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 1);   /* one left: drafts, hole already refilled */
+    f.sch.block_end();
 }
 
 TEST(a_prefix_hit_with_no_checkpoint_near_the_cap_is_kept_whole) {
@@ -3050,6 +3708,67 @@ TEST(a_prefix_hit_whose_window_snapshot_carries_the_drafters_window_drafts_at_on
         }
         CHECK_EQ(f.sch.metrics().draft_refills, (int64_t)0);
         CHECK_EQ(n_rows, with_drafter ? 1 : 0);
+    }
+}
+
+/* Linear state, a windowed trunk group, and a split drafter (RadDrafterDecl::window 0)
+ * whose own window group is not prefix-cached. With the drafter's window in the checkpoint slot
+ * (--checkpoint-draft-window: KVManager::window_snapshot of the drafter's group) a hit resumes at
+ * the snapshot whole, there is no refill, and the drafter drafts from the first decode. Without it the
+ * hit is capped a drafter window before the prompt's end and the tail is recomputed. */
+TEST(a_linear_and_windowed_trunk_hit_whose_slot_carries_the_drafters_window_drafts_at_once) {
+    for (int ckpt = 0; ckpt < 2; ++ckpt) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192,
+                /*windowed=*/true, /*linear=*/true);
+        f.cfg.n_spec = 7;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        f.prog.drafter.depth = 7;
+        f.prog.drafter.window = 0;
+        KVGroupInfo w;
+        w.name = "draft.kv_draft_local";
+        w.decl.kind = RAD_KV_WINDOW;
+        w.decl.window = 512;
+        w.block_size = 16;
+        w.drafter = true;
+        f.prog.kv_groups.push_back(w);
+        KVGroupInfo df;                        /* the drafter's full group: prefix-cached */
+        df.name = "draft.kv_draft";
+        df.decl.kind = RAD_KV_FULL;
+        df.block_size = 16;
+        df.drafter = true;
+        f.prog.kv_groups.push_back(df);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        const int32_t swa = 3, draft = 4, dfull = 5;   /* attn 0, gdn 1, conv 2, then the rest */
+        f.kv.snap = ckpt ? std::vector<int32_t>{ swa, draft } : std::vector<int32_t>{ swa };
+        f.pc.groups = { 0, dfull };
+        CHECK_OK(f.start());
+        f.pc.seed(1024); f.pc.lin = 1024; f.pc.src = 3;
+        const uint64_t a = f.submit(1100, 64);
+        Scheduler::BlockRow rows[4];
+        int n_rows = -1;
+        int64_t n_first = -1;
+        for (int st = 0; st < 40; ++st) {
+            CHECK(f.sch.step() != nullptr);
+            if (st == 0) n_first = f.sch.find(a)->n_computed;
+            f.commit_plain(11);
+            const int n = f.sch.block_begin(8, 7, 0, 99, rows, 4);
+            f.sch.block_end();
+            if (!f.sch.find(a)->output.empty()) { n_rows = n; break; }
+        }
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(n_rows, 1);                                   /* drafts from the first decode */
+        if (ckpt) {
+            CHECK_EQ(n_first, 1024);                           /* the whole hit */
+            CHECK_EQ(m.draft_refills, (int64_t)0);
+            CHECK_EQ(m.draft_refill_tokens, (int64_t)0);
+            CHECK_EQ(m.linear_cached_tokens, (int64_t)1024);
+        } else {
+            CHECK_EQ(n_first, 512);                            /* capped a window back */
+            CHECK_EQ(m.draft_refills, (int64_t)1);
+            CHECK_EQ(m.draft_refill_tokens, (int64_t)512);
+            CHECK_EQ(m.linear_cached_tokens, (int64_t)512);
+        }
     }
 }
 
@@ -3134,7 +3853,7 @@ TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
     CHECK_OK(f.sch.set_draft(a, draft, 4));
 
     const RadBatch* b = f.sch.step();
-    CHECK(b != nullptr);
+    REQUIRE(b != nullptr);
     CHECK_EQ(b->n_spec, 4);
     CHECK_EQ(b->n_tok, 5);
     CHECK_EQ(b->q_lens[0], 5);
@@ -3151,7 +3870,7 @@ TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
 
     const Request* ra = f.sch.find(a);
     /* Three tokens committed: the two accepted drafts and the bonus. */
-    CHECK_EQ((int)ra->output.size(), 4);
+    REQUIRE_EQ((int)ra->output.size(), 4);
     CHECK_EQ(ra->output[1], 21);
     CHECK_EQ(ra->output[2], 22);
     CHECK_EQ(ra->output[3], 99);
@@ -3417,7 +4136,7 @@ TEST(a_mixed_step_puts_its_decode_rows_first) {
 
     /* a finished its prompt and is decoding; b is on its second chunk and still outranks it. */
     const RadBatch* s1 = f.sch.step();
-    CHECK(s1 != nullptr);
+    REQUIRE(s1 != nullptr);
     CHECK_EQ((int)f.sch.plan().e.size(), 2);
     CHECK_EQ(f.sch.plan().e[0].seq, a);                /* the decode row, despite the priority */
     CHECK_EQ(f.sch.plan().e[0].is_prefill, false);
@@ -3462,7 +4181,7 @@ TEST(a_queued_request_does_not_suppress_the_draft) {
     CHECK_OK(f.sch.set_draft(b, draft, 4));
 
     const RadBatch* s = f.sch.step();
-    CHECK(s != nullptr);
+    REQUIRE(s != nullptr);
     CHECK_EQ(s->n_spec, 4);                  /* the draft survives the admission */
     CHECK_EQ((int)f.sch.plan().e.size(), 3); /* and the third was admitted into the same step */
     CHECK_EQ(f.sch.metrics().queue_depth, 0);
@@ -3494,7 +4213,7 @@ TEST(a_running_prefill_does_not_suppress_the_draft) {
     CHECK_OK(f.sch.set_draft(a, draft, 4));
 
     const RadBatch* s = f.sch.step();
-    CHECK(s != nullptr);
+    REQUIRE(s != nullptr);
     CHECK_EQ(s->phase, RAD_PHASE_MIXED);
     CHECK_EQ(s->n_spec, 4);
     CHECK_EQ(s->n_seq_decode, 1);
@@ -3952,7 +4671,7 @@ TEST(a_mixed_step_target_preserves_speculative_verification_in_a_mixed_step) {
     CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
     const Request* rd = f.sch.find(d);
     REQUIRE(rd != nullptr);
-    CHECK_EQ((int)rd->output.size(), 4);
+    REQUIRE_EQ((int)rd->output.size(), 4);
     CHECK_EQ(rd->output[1], 21);
     CHECK_EQ(rd->output[2], 22);
     CHECK_EQ(rd->output[3], 12);
@@ -4878,6 +5597,539 @@ TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
         f.commit_plain(100 + (t + 1) % 8);
     }
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+/* ------------------------------------------------------------------ depth 0 (draft.h)
+ * The adaptive policy, on the controller's row-count step costs, may also choose D = 0 -- no head
+ * pass, no verify row -- where a measured plain step emits more tokens a millisecond than the
+ * window. Never on the prior: a plain step is measured first, by a plain probe once the window is
+ * measured. At 0 a probe at the drafting depth every probe_every cycles keeps the estimates
+ * measured, and a probe that finds the window paying again leaves 0. */
+namespace {
+DraftController depth0_controller(int max_depth, int probe_every = 0, int backoff = 0) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = max_depth;
+    p.adapt = true;
+    p.depth0 = true;
+    p.probe_every = probe_every;
+    p.backoff = backoff;
+    CHECK_OK(c.configure(p));
+    return c;
+}
+/* Four sequences' drafting steps at depth d (each verifies min(d, 4) drafts): 4 + 4 d query rows,
+ * measured at 20 + 10 d ms, four times each. */
+void time_four_windows(DraftController& c) {
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) c.step_time(4 + 4 * d, 20.0 + 10.0 * d, 4);
+}
+}  /* namespace */
+
+TEST(depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window) {
+    /* Four sequences at 0.6 a position stop at 4 drafts (0.6^5 < 0.1). */
+    DraftController u0 = depth0_controller(5);
+    CHECK(u0.depth0());
+    CHECK_EQ(u0.probe_every(), DraftController::kProbeEvery);
+    DraftAdapt w[4];
+    DraftAdapt* wf[4];
+    for (int i = 0; i < 4; ++i) { w[i] = estimate(u0, 0.6, 0.6); wf[i] = &w[i]; }
+    CHECK_EQ(w[0].depth, 4);
+    /* Nothing measured: never 0, and no plain probe before the window has a price here. */
+    for (int t = 0; t < 3; ++t) {
+        CHECK(u0.plan_step(wf, 4, 4) > 0);
+        CHECK(u0.head_runs());
+    }
+    CHECK_EQ(u0.probe_cycles(), (int64_t)0);
+
+    /* Their windows measured: d = 1 pays best, 4 x 1.6 tokens in 30 ms (0.213 a ms). The plain
+     * step not measured: a plain probe, 1 + kPlainWarm + 3 cycles the first time, in which the
+     * head does not run and nothing verifies; its first kPlainWarm plain steps are no samples. */
+    DraftController c = depth0_controller(5);
+    DraftAdapt s[4];
+    DraftAdapt* four[4];
+    for (int i = 0; i < 4; ++i) { s[i] = estimate(c, 0.6, 0.6); four[i] = &s[i]; }
+    time_four_windows(c);
+    CHECK_EQ(c.plan_step(four, 4, 4), 0);
+    CHECK(!c.head_runs());
+    CHECK_EQ(c.step_window(), 0);
+    CHECK_EQ(c.window_for(s[0]), 0);
+    const int P0 = 1 + DraftController::kPlainWarm + 3;
+    for (int t = 1; t < P0; ++t) {
+        CHECK_EQ(c.plan_step(four, 4, 4), 0);
+        c.plain_time(4, 28.0);                       /* plain: 4 tokens in 28 ms, 0.143 a ms */
+    }
+    CHECK_EQ(c.plain_samples(4), (int64_t)3);
+    CHECK_EQ(c.probe_cycles(), (int64_t)P0);
+    /* 0.143 a ms against the window's 0.213: the window stays. */
+    CHECK_EQ(c.plan_step(four, 4, 4), 1);
+    CHECK(c.head_runs());
+    CHECK_EQ(c.window_for(s[0]), 1);
+    CHECK_EQ(c.zero_moves(), (int64_t)0);
+
+    /* The same with a plain step of 15 ms (0.267 a ms): 0, at once (the hold starts spent). */
+    DraftController z = depth0_controller(5);
+    DraftAdapt u[4];
+    DraftAdapt* zf[4];
+    for (int i = 0; i < 4; ++i) { u[i] = estimate(z, 0.6, 0.6); zf[i] = &u[i]; }
+    time_four_windows(z);
+    for (int t = 0; t < P0; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+        if (t > 0) z.plain_time(4, 15.0);
+    }
+    CHECK_EQ(z.plain_samples(4), (int64_t)3);
+    CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+    CHECK_EQ(z.zero_moves(), (int64_t)1);
+    CHECK(!z.head_runs());
+    CHECK_EQ(z.step_depth(), 0);
+    CHECK_EQ(z.window_for(u[0]), 0);
+    /* At 0: kProbeEvery cycles in all, then kProbeSteps at the drafting depth (the head runs, each
+     * sequence verifies its window), then 0 again while the plain step still pays. */
+    const int64_t probes = z.probe_cycles();
+    for (int t = 2; t < DraftController::kProbeEvery; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+        z.plain_time(4, 15.0);
+    }
+    for (int t = 0; t < DraftController::kProbeSteps; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 1);
+        CHECK(z.head_runs());
+        CHECK_EQ(z.window_for(u[0]), 1);
+    }
+    CHECK_EQ(z.probe_cycles(), probes + DraftController::kProbeSteps);
+    CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+    CHECK(z.zero_cycles() >= (int64_t)DraftController::kProbeEvery);
+    /* A probe whose verifies find the text predictable again (every sequence at 0.98 a position,
+     * the window 5 deep: 4 x 5.7 tokens in 70 ms, 0.33 a ms) leaves 0 when it ends. */
+    for (int t = 0; t < DraftController::kProbeEvery && !z.head_runs(); ++t)
+        (void)z.plan_step(zf, 4, 4);
+    REQUIRE(z.head_runs());
+    for (int i = 0; i < 4; ++i) u[i] = estimate(z, 0.98, 0.98);
+    int d = 0;
+    for (int t = 0; t < DraftController::kProbeSteps; ++t) d = z.plan_step(zf, 4, 4);
+    CHECK(d > 1);
+    CHECK(z.head_runs());
+    CHECK_EQ(z.zero_moves(), (int64_t)2);
+    CHECK(z.plan_step(zf, 4, 4) > 0);
+    /* Off between steps: the drafting depth at once, and a plain step is no sample. */
+    z.set_depth0(false);
+    CHECK(z.head_runs());
+    CHECK(z.plan_step(zf, 4, 4) > 0);
+    const int64_t n0 = z.plain_samples(4);
+    z.plain_time(4, 15.0);
+    CHECK_EQ(z.plain_samples(4), n0);
+    /* A probe interval of its own. */
+    DraftController p = depth0_controller(5, 4);
+    CHECK_EQ(p.probe_every(), 4);
+    p.set_probe_every(0);
+    CHECK_EQ(p.probe_every(), DraftController::kProbeEvery);
+    /* Without the adaptive policy depth 0 is inert. */
+    DraftController f;
+    DraftController::Params fp;
+    fp.max_depth = 5;
+    fp.depth0 = true;
+    CHECK_OK(f.configure(fp));
+    CHECK(f.head_runs());
+    f.plain_time(4, 15.0);
+    CHECK_EQ(f.plain_samples(4), (int64_t)0);
+}
+
+/* Off (the default), the controller plans exactly as one without depth 0: the same depths,
+ * windows and step windows cycle by cycle, whatever is timed. */
+TEST(depth_zero_off_plans_every_cycle_as_before) {
+    DraftController::Params p;
+    p.max_depth = 5;
+    p.adapt = true;
+    DraftController a, b;
+    CHECK_OK(a.configure(p));
+    p.probe_every = 4;          /* inert without depth 0 */
+    p.backoff = 3;
+    CHECK_OK(b.configure(p));
+    CHECK(!b.depth0());
+    DraftAdapt sa[4], sb[4];
+    DraftAdapt* fa[4];
+    DraftAdapt* fb[4];
+    for (int i = 0; i < 4; ++i) {
+        sa[i] = estimate(a, 0.5 + 0.1 * i, 0.45 + 0.1 * i);
+        sb[i] = sa[i];
+        fa[i] = &sa[i];
+        fb[i] = &sb[i];
+    }
+    for (int t = 0; t < 300; ++t) {
+        const int n = 1 + t % 4;
+        const int da = a.plan_step(fa, n, n + (t % 3));
+        const int db = b.plan_step(fb, n, n + (t % 3));
+        CHECK_EQ(da, db);
+        CHECK_EQ(a.step_depth(), b.step_depth());
+        CHECK_EQ(a.step_window(), b.step_window());
+        CHECK(b.head_runs());
+        for (int i = 0; i < n; ++i) {
+            CHECK_EQ(a.window_for(sa[i]), b.window_for(sb[i]));
+            const int acc = (t + i) % (da + 1);
+            CHECK_EQ(a.adapt_observe(sa[i], da, acc), b.adapt_observe(sb[i], da, acc));
+        }
+        const double ms = 20.0 + 3.0 * da + (t % 7);
+        a.step_time(n * (1 + da), ms);
+        b.step_time(n * (1 + da), ms, n, 1.0 + n);
+        b.plain_time(n, 5.0);                    /* no sample: depth 0 is off */
+    }
+    CHECK_EQ(b.plain_samples(1), (int64_t)0);
+    CHECK_EQ(b.zero_cycles(), (int64_t)0);
+    CHECK_EQ(b.probe_cycles(), (int64_t)0);
+}
+
+/* Four serving situations of DeepSeek-V4.1 (EXL3 2.25 bpw experts at TP 4, the DSpark head up to
+ * 5 deep under the adaptive window), replayed on the controller with synthetic step times: each
+ * cycle plans, then is fed what its step would measure -- a drafting step that verifies (the head ran this
+ * cycle and the one before) its time and its tokens; a plain step (the head ran in neither) its
+ * time, the first kPlainWarm of each run 2.5x slower as a pass shape's first sightings run;
+ * nothing for the transition steps. The estimates are held at what the policy starts from, more
+ * optimistic than the measured tokens, as a new sequence's prior is.
+ *   c1 essay  drafting 1.45 tokens in 26 ms, plain 16.5 ms: 0 pays 9 %
+ *   c1 code   drafting 3.10 tokens in 32 ms: drafting pays 60 %, and stays
+ *   c4        drafting 10.3 tokens in 79 ms, plain 27 ms: 0 pays 14 %
+ *   c8        drafting 19 tokens in 117 ms, plain 40 ms: 0 pays 23 % */
+namespace {
+double zero_share(int rows, double a0, double rest, double draft_ms, double draft_tok,
+                  double plain_ms, int cycles, int tail, int64_t* moves = nullptr) {
+    DraftController c = depth0_controller(5);
+    std::vector<DraftAdapt> s((size_t)rows);
+    std::vector<DraftAdapt*> sp((size_t)rows);
+    for (int i = 0; i < rows; ++i) {
+        s[(size_t)i] = estimate(c, a0, rest);
+        sp[(size_t)i] = &s[(size_t)i];
+    }
+    bool prev = true;
+    int plain_run = 0, at0 = 0;
+    for (int t = 0; t < cycles; ++t) {
+        (void)c.plan_step(sp.data(), rows, rows);
+        const bool head = c.head_runs();
+        if (head && prev)
+            c.step_time(rows * (1 + c.window_of(s[0])), draft_ms, rows, draft_tok);
+        if (!head && !prev) {
+            ++plain_run;
+            c.plain_time(rows, plain_run <= DraftController::kPlainWarm ? 2.5 * plain_ms
+                                                                        : plain_ms);
+        }
+        if (head) plain_run = 0;
+        if (!head && t >= cycles - tail) ++at0;
+        prev = head;
+    }
+    if (moves) *moves = c.zero_moves();
+    return (double)at0 / (double)tail;
+}
+}  /* namespace */
+
+TEST(depth_zero_fires_where_the_measured_plain_step_pays_and_not_where_drafting_does) {
+    int64_t mv = 0;
+    const double essay = zero_share(1, 0.5, 0.45, 26.0, 1.45, 16.5, 600, 300, &mv);
+    CHECK(essay >= 0.8);
+    CHECK(mv <= 2);
+    const double code = zero_share(1, 0.75, 0.7, 32.0, 3.10, 16.5, 600, 300, &mv);
+    CHECK_NEAR(code, 0.0, 0.03);                     /* plain probes only */
+    const double c4 = zero_share(4, 0.5, 0.45, 79.0, 10.3, 27.0, 600, 300, &mv);
+    CHECK(c4 >= 0.8);
+    CHECK(mv <= 2);
+    const double c8 = zero_share(8, 0.5, 0.45, 117.0, 19.0, 40.0, 600, 300, &mv);
+    CHECK(c8 >= 0.8);
+    CHECK(mv <= 2);
+    fprintf(stderr, "    share of cycles at 0: c1 essay %.2f, c1 code %.2f, c4 %.2f, c8 %.2f\n",
+            essay, code, c4, c8);
+}
+
+/* Through the scheduler: at D = 0 a block drafter's rows are not asked to draft (the context pass
+ * runs alone), a published proposal is cut to nothing, and the step verifies nothing. */
+TEST(depth_zero_leaves_a_block_drafter_its_context_pass_and_verifies_nothing) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+    CHECK(!f.sch.draft().depth0());                  /* off unless asked */
+    CHECK_EQ(f.sch.set_draft_depth0(1), 1);
+    CHECK_EQ(f.sch.set_draft_probe(1), DraftController::kProbeEvery);   /* below 2: unchanged */
+    CHECK_EQ(f.sch.set_draft_probe(64), 64);
+    const uint64_t a = f.submit(160, 2000);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 4);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+    /* Measured: one-row windows cost 40 ms and more, a plain step 5 ms. Plain probes, then 0. */
+    DraftController& dc = f.sch.draft();
+    for (int d = 1; d <= 4; ++d)
+        for (int k = 0; k < 4; ++k) dc.step_time(1 + d, 40.0 + d, 1);
+    f.commit_plain(12);
+    /* What step_finished would feed: a plain step wherever the head did not run. */
+    bool zero = false;
+    for (int t = 0; t < 4 * DraftController::kHold && !zero; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        if (!f.sch.draft().head_runs()) dc.plain_time(1, 5.0);
+        zero = f.sch.draft().zero_moves() > 0 && !f.sch.draft().head_runs();
+        f.commit_plain(13);
+    }
+    REQUIRE(zero);
+    /* The proposal a drafter published before the move is cut to nothing; the step verifies none. */
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 0);
+    REQUIRE(f.sch.step() != nullptr);
+    if (!f.sch.draft().head_runs()) {
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
+        Scheduler::BlockRow rows[4];
+        CHECK_EQ(f.sch.block_begin(5, 4, 0, 0, rows, 4, /*on_card=*/false), 0);
+        f.sch.block_end();
+    }
+    f.commit_plain(14);
+    CHECK(f.sch.metrics().draft_zero_cycles > 0);
+    CHECK_EQ(f.sch.set_draft_depth0(0), 0);
+    CHECK(f.sch.draft().head_runs());
+    /* Refused without the adaptive window. */
+    Fixture n;
+    n.build(/*blocks=*/4096, /*states=*/64);
+    n.cfg.n_spec = 4;
+    n.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    n.prog.drafter.depth = 4;
+    CHECK_OK(n.start());
+    CHECK_EQ(n.sch.set_draft_depth0(1), 0);
+}
+
+/* ------------------------------------------------------------------ probe back-off (draft.h)
+ * Probe back-off doubles the interval at 0 after each probe that leaves 0 in place, up to
+ * probe_every << N, and a move starts it over. */
+namespace {
+/* A controller settled at 0: four rows, the window's steps measured at 20 + 10 d ms, the plain step
+ * at 15 ms (as depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window). */
+DraftController zero_controller(int backoff, DraftAdapt* u, DraftAdapt** zf) {
+    DraftController z = depth0_controller(5, 0, backoff);
+    for (int i = 0; i < 4; ++i) { u[i] = estimate(z, 0.6, 0.6); zf[i] = &u[i]; }
+    time_four_windows(z);
+    const int P0 = 1 + DraftController::kPlainWarm + 3;
+    for (int t = 0; t < P0; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+        if (t > 0) z.plain_time(4, 15.0);
+    }
+    CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+    CHECK_EQ(z.zero_moves(), (int64_t)1);
+    return z;
+}
+/* Cycles between the starts of consecutive probes at the drafting depth over `n` cycles, each
+ * plain cycle measured at 15 ms. */
+std::vector<int> probe_gaps(DraftController& z, DraftAdapt** zf, int n) {
+    std::vector<int> starts;
+    bool prev = false;
+    for (int t = 0; t < n; ++t) {
+        (void)z.plan_step(zf, 4, 4);
+        const bool head = z.head_runs();
+        if (head && !prev) starts.push_back(t);
+        if (!head) z.plain_time(4, 15.0);
+        prev = head;
+    }
+    std::vector<int> g;
+    for (size_t i = 1; i < starts.size(); ++i) g.push_back(starts[i] - starts[i - 1]);
+    return g;
+}
+}  /* namespace */
+
+TEST(probe_back_off_doubles_the_interval_while_depth_zero_keeps_winning) {
+    DraftAdapt u[4];
+    DraftAdapt* zf[4];
+    /* Off: a probe every kProbeEvery cycles at 0, its two cycles at the drafting depth included. */
+    DraftController a = zero_controller(0, u, zf);
+    CHECK_EQ(a.backoff(), 0);
+    const std::vector<int> ga = probe_gaps(a, zf, 200);
+    CHECK(ga.size() >= 4);
+    for (int g : ga) CHECK_EQ(g, DraftController::kProbeEvery + 1);
+    CHECK_EQ(a.probe_interval(), DraftController::kProbeEvery);
+
+    /* Three doublings: 16 -> 32 -> 64 -> 128, then 128. */
+    DraftController b = zero_controller(3, u, zf);
+    CHECK_EQ(b.backoff(), 3);
+    const std::vector<int> gb = probe_gaps(b, zf, 700);
+    REQUIRE(gb.size() >= 4);
+    CHECK_EQ(gb[0], 2 * DraftController::kProbeEvery + 1);
+    CHECK_EQ(gb[1], 4 * DraftController::kProbeEvery + 1);
+    CHECK_EQ(gb[2], 8 * DraftController::kProbeEvery + 1);
+    CHECK_EQ(gb[3], 8 * DraftController::kProbeEvery + 1);
+    CHECK_EQ(b.backoff_k(), 3);
+    CHECK_EQ(b.probe_interval(), 8 * DraftController::kProbeEvery);
+    CHECK_EQ(b.zero_moves(), (int64_t)1);
+
+    /* A probe that finds the window paying again (0.98 a position) leaves 0 and starts the
+     * back-off over. */
+    for (int t = 0; t < 300 && !b.head_runs(); ++t) (void)b.plan_step(zf, 4, 4);
+    REQUIRE(b.head_runs());
+    for (int i = 0; i < 4; ++i) u[i] = estimate(b, 0.98, 0.98);
+    for (int t = 0; t < DraftController::kProbeSteps; ++t) (void)b.plan_step(zf, 4, 4);
+    CHECK(b.head_runs());
+    CHECK_EQ(b.zero_moves(), (int64_t)2);
+    CHECK_EQ(b.backoff_k(), 0);
+    CHECK_EQ(b.probe_interval(), DraftController::kProbeEvery);
+
+    /* Clamped, and a change starts over. */
+    b.set_backoff(99);
+    CHECK_EQ(b.backoff(), DraftController::kBackoffMax);
+    b.set_backoff(-1);
+    CHECK_EQ(b.backoff(), 0);
+    /* The interval never exceeds what --draft-probe takes. */
+    DraftController c = zero_controller(DraftController::kBackoffMax, u, zf);
+    c.set_probe_every(4096);
+    (void)probe_gaps(c, zf, 50);
+    CHECK(c.probe_interval() <= 4096);
+}
+
+/* ------------------------------------------------------------------ the hybrid (scheduler.h)
+ * Beside a head drafting chains, a sequence whose prompt lookup matches at least the threshold
+ * back verifies the lookup's proposal, the whole window, instead of the head's; a short match or
+ * none leaves the head's. Off, the head's always. A tree head cannot take it. */
+TEST(the_hybrid_takes_a_long_lookup_match_over_the_heads_proposal) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    CHECK_OK(f.start());
+    CHECK(!f.sch.hybrid_enabled());                  /* off unless asked */
+    CHECK_EQ(f.sch.set_draft_hybrid(1), 1);
+    CHECK_EQ(f.sch.set_draft_hybrid_match(8), 8);
+
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;   /* a period of 8 */
+    const uint64_t rep = r->id;
+    CHECK_OK(f.sch.add(std::move(r)));
+    const uint64_t other = f.submit(160, 2000);                         /* 1000 + i: no repeat */
+    /* Each step commits what continues each text: the period for one, a new id for the other. */
+    auto len = [&](uint64_t id) {
+        const Request* q = f.sch.find(id);
+        return (int64_t)(q->prompt.size() + q->output.size());
+    };
+    auto commit_next = [&]() {
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> a(p.e.size(), 0), t(p.e.size(), 0);
+        std::vector<uint8_t> e(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i)
+            t[i] = p.e[i].seq == rep ? (int32_t)(100 + len(rep) % 8)
+                                     : (int32_t)(2000 + len(other));
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = a.data();
+        res.token = t.data();
+        res.eos = e.data();
+        CHECK_OK(f.sch.commit(res));
+    };
+    for (int t = 0;
+         t < 8 && (f.sch.find(rep)->output.empty() || f.sch.find(other)->output.empty()); ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        commit_next();
+    }
+    REQUIRE(!f.sch.find(rep)->output.empty());
+    REQUIRE(!f.sch.find(other)->output.empty());
+    auto entry = [&](uint64_t id) -> const StepEntry* {
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == id) return &e;
+        return nullptr;
+    };
+    int32_t head[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(rep, head, 4));
+    CHECK_OK(f.sch.set_draft(other, head, 4));
+    const int64_t L = len(rep);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* er = entry(rep);
+    const StepEntry* eo = entry(other);
+    REQUIRE(er != nullptr);
+    REQUIRE(eo != nullptr);
+    /* The periodic one continues its period: the lookup's, the whole window. */
+    CHECK(er->ngram);
+    CHECK_EQ(er->n_spec, 4);
+    CHECK_EQ(er->draft[0], (int32_t)(100 + L % 8));
+    CHECK_EQ(er->draft[3], (int32_t)(100 + (L + 3) % 8));
+    /* The other has no match: the head's. */
+    CHECK(!eo->ngram);
+    CHECK(eo->n_spec > 0);
+    CHECK_EQ(eo->draft[0], 21);
+    CHECK(f.sch.hybrid_lookups() >= 1);
+    CHECK(f.sch.hybrid_heads() >= 1);
+    /* A step issued ahead is not: the periodic sequence's last match is long. */
+    CHECK(f.sch.step_next() == nullptr);
+    CHECK(f.sch.hybrid_unahead() >= 1);
+    commit_next();
+    /* A threshold past the match the text gives (counted at most that far, 256): the head's. */
+    CHECK_EQ(f.sch.set_draft_hybrid_match(256), 256);
+    CHECK_OK(f.sch.set_draft(rep, head, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    er = entry(rep);
+    REQUIRE(er != nullptr);
+    CHECK(!er->ngram);
+    CHECK_EQ(er->draft[0], 21);
+    commit_next();
+    /* Off: the head's. */
+    CHECK_EQ(f.sch.set_draft_hybrid_match(8), 8);
+    CHECK_EQ(f.sch.set_draft_hybrid(0), 0);
+    CHECK_OK(f.sch.set_draft(rep, head, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    er = entry(rep);
+    REQUIRE(er != nullptr);
+    CHECK(!er->ngram);
+    CHECK_EQ(er->draft[0], 21);
+    commit_next();
+
+    /* A tree head cannot take it. */
+    Fixture t;
+    adaptive_fixture(t, 4);
+    t.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    t.prog.drafter_tree = true;
+    CHECK_OK(t.start());
+    CHECK_EQ(t.sch.set_draft_hybrid(1), 0);
+    /* Nor a deployment with no head. */
+    Fixture n;
+    adaptive_fixture(n, 4);
+    n.prog.drafter.kind = RAD_DRAFT_NONE;
+    n.prog.drafter.depth = 0;
+    CHECK_OK(n.start());
+    CHECK_EQ(n.sch.set_draft_hybrid(1), 0);
+}
+
+/* --draft-depth0, --draft-probe, --draft-probe-backoff, --draft-hybrid and --draft-hybrid-match
+ * reach the controller and the hybrid at load, each off (the plain adaptive window) by default. */
+TEST(depth_zero_and_the_hybrid_are_configured_at_load) {
+    {
+        Fixture f;
+        adaptive_fixture(f, 4);
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        CHECK_OK(f.start());
+        CHECK(!f.sch.draft().depth0());
+        CHECK_EQ(f.sch.draft().probe_every(), DraftController::kProbeEvery);
+        CHECK_EQ(f.sch.draft().backoff(), 0);
+        CHECK(!f.sch.hybrid_enabled());
+        CHECK_EQ(f.sch.hybrid_match(), LookupGate::kLongMatch);
+    }
+    auto configure = [](Fixture& f) {
+        f.cfg.draft_depth0 = true;
+        f.cfg.draft_probe = 32;
+        f.cfg.draft_probe_backoff = 3;
+        f.cfg.draft_hybrid = true;
+        f.cfg.draft_hybrid_match = 12;
+    };
+    {
+        Fixture f;
+        adaptive_fixture(f, 4);
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        configure(f);
+        CHECK_OK(f.start());
+        CHECK(f.sch.draft().depth0());
+        CHECK_EQ(f.sch.draft().probe_every(), 32);
+        CHECK_EQ(f.sch.draft().backoff(), 3);
+        CHECK(f.sch.hybrid_enabled());
+        CHECK_EQ(f.sch.hybrid_match(), 12);
+        /* A tree head: the hybrid is refused at load. */
+        Fixture t;
+        adaptive_fixture(t, 4);
+        t.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        t.prog.drafter_tree = true;
+        configure(t);
+        CHECK_OK(t.start());
+        CHECK(!t.sch.hybrid_enabled());
+    }
 }
 
 /* With prompt lookup the only drafter, its drafts are what the adaptive window measures: refused
@@ -5955,8 +7207,7 @@ TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
             p.n_tok += 1;
         }
         const RadBatch* b = bb.build(p, f.kv, 0);
-        CHECK(b != nullptr);
-        if (!b) return;
+        REQUIRE(b != nullptr);
         const RadKVGroupBatch& g = b->kv[0];
         for (int64_t i = 0; i < b->n_seq; ++i) {
             const std::vector<int32_t>& bt = f.kv.block_table(p.e[(size_t)i].seq, 0);
@@ -6018,7 +7269,7 @@ TEST(each_conv_group_derives_against_its_own_window) {
     const int32_t* a = f.derived("conv_idx");
     const int32_t* c = f.derived("conv_idx_deep");
     CHECK(a != nullptr);
-    CHECK(c != nullptr);
+    REQUIRE(c != nullptr);
     /* Neither is -1. Under one shared slot array the group that is not last-declared gets -1 for
      * every sequence, so this keeps the derivation working for the first architecture to call it. */
     if (a && c) {
@@ -6119,7 +7370,7 @@ TEST(terminal_requests_are_taken_once) {
 
     std::vector<uint64_t> done;
     f.sch.take_completed(&done);
-    CHECK_EQ((int)done.size(), 2);
+    REQUIRE_EQ((int)done.size(), 2);
     CHECK(done[0] == a);
     CHECK(done[1] == b);
     f.sch.take_completed(&done);
@@ -6139,7 +7390,7 @@ TEST(every_row_names_one_of_the_cards_step_slots) {
     for (int round = 0; round < 3; ++round) {
         CHECK(f.sch.step() != nullptr);
         const StepPlan& p = f.sch.plan();
-        CHECK_EQ((int)p.e.size(), 2);
+        REQUIRE_EQ((int)p.e.size(), 2);
         CHECK(p.e[0].card >= 0 && p.e[0].card < 2);
         CHECK(p.e[1].card >= 0 && p.e[1].card < 2);
         CHECK(p.e[0].card != p.e[1].card);
@@ -6224,7 +7475,7 @@ TEST(a_restore_waits_one_step_for_a_deferred_release_before_it_is_cut) {
     uint64_t a = f.submit(160, 64);
     CHECK(f.sch.step() != nullptr);
     f.commit_plain();
-    CHECK_EQ(f.pc.restores_whole.size(), (size_t)1);
+    REQUIRE_EQ(f.pc.restores_whole.size(), (size_t)1);
     CHECK(!f.pc.restores_whole[0]);                  /* nothing deferred: no wait asked */
 
     Scheduler::BlockRow rows[4];
@@ -7802,7 +9053,7 @@ TEST(a_cancel_while_a_step_runs_ahead_keeps_the_request_until_that_step_commits)
     all.insert(all.end(), done.begin(), done.end());
     f.sch.take_completed(&done);
     all.insert(all.end(), done.begin(), done.end());
-    CHECK_EQ(all.size(), (size_t)1);
+    REQUIRE_EQ(all.size(), (size_t)1);
     CHECK(!all.empty() && all[0] == a);
 }
 

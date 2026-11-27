@@ -187,7 +187,9 @@ __device__ __forceinline__ void cpe_taps(int at, int d, int side, int* t, float*
     w[0] = 1.0f - w[1];
 }
 
-template <bool TF32>
+// SQUARE: grid_embed_cpe's target, the square of the grid's larger side; otherwise
+// grid_embed_hw's, each axis onto the grid's own extent (Inkling 2).
+template <bool TF32, bool SQUARE = true>
 __global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
     unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
     uint32_t n, int side, uint32_t x_ld, uint32_t plane, const unsigned short* __restrict__ pre,
@@ -206,8 +208,8 @@ __global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
     const int d = g[2] > g[3] ? g[2] : g[3];
     int th[2], tw[2];
     float wh[2], ww[2];
-    cpe_taps(g[0], d, side, th, wh);
-    cpe_taps(g[1], d, side, tw, ww);
+    cpe_taps(g[0], SQUARE ? d : g[2], side, th, wh);
+    cpe_taps(g[1], SQUARE ? d : g[3], side, tw, ww);
     for (uint32_t i = threadIdx.x; i < n; i += kThr) {
         const float r0 = ww[0] * ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[0]) * n + i) +
                          ww[1] * ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[1]) * n + i);
@@ -383,7 +385,7 @@ constexpr uint32_t kVPB = kVFK * 2 + 16;                               // LDS ro
 constexpr uint32_t kVCPR = kVFK * 2 / 16;                              // 16-byte chunks a row
 constexpr uint32_t kVSPT = kVBM * kVCPR / kVThreads;                   // chunks a thread stages
 constexpr uint32_t kVWC = kVFK / 16;                                   // a lane's weight chunks a tile
-// Activation bands per raster group; see gemm_8a8_prefill_kernel (r4d_gemm_fp8a8.hip).
+// Activation bands per raster group; see gemm_8a8_prefill_kernel (r4d_gemm_i8a8.hip).
 constexpr uint32_t kVGroup = 8;
 static_assert(kVBM * kVCPR % kVThreads == 0, "whole chunks a thread");
 
@@ -669,8 +671,10 @@ extern "C" int r4d_rad_grid_embed_aa(const RadArgs* a, RadStream stream) {
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
 }
 
-/* grid_embed_cpe: grid_embed's operands and checks, RADIO's cropped resample. */
-extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
+/* grid_embed_cpe: grid_embed's operands and checks, RADIO's cropped resample; grid_embed_hw the
+ * same with each axis onto the grid's own extent. */
+template <bool SQUARE>
+static int grid_embed_bilinear(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = r4d_opt(a, GE_X);
     const RadTensor* tab = r4d_opt(a, GE_TAB);
     const RadTensor* crd = r4d_opt(a, GE_CRD);
@@ -696,12 +700,22 @@ extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
         return R4D_NO(pre && pre->dtype != RAD_BF16 ? RAD_E_DTYPE : RAD_E_SHAPE);
     const unsigned short* pp = pre ? (const unsigned short*)r4d_p(pre) : nullptr;
     if (tab->dtype == RAD_F32)
-        return R4D_EMIT(stream, grid_embed_cpe_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+        return R4D_EMIT(stream, (grid_embed_cpe_kernel<true, SQUARE>), dim3((uint32_t)M),
+                        dim3(kThr), 0,
                         (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                         (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
-    return R4D_EMIT(stream, grid_embed_cpe_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+    return R4D_EMIT(stream, (grid_embed_cpe_kernel<false, SQUARE>), dim3((uint32_t)M), dim3(kThr),
+                    0,
                     (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
+}
+
+extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
+    return grid_embed_bilinear<true>(a, stream);
+}
+
+extern "C" int r4d_rad_grid_embed_hw(const RadArgs* a, RadStream stream) {
+    return grid_embed_bilinear<false>(a, stream);
 }
 
 /* ------------------------------------------------------------------ gemm_nt_bias */

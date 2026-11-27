@@ -148,6 +148,25 @@ void iq8r_encs(RadBuilder& b) {
                { "_exps", r8 }, { "blk.", iq8r } };
 }
 
+/* NVIDIA's 2-bit release as its recipe stores it: the routed and the shared experts IQ2_XXS, the
+ * latent projections, the attention's and the head Q8_0, all llama.cpp's blocks as the release
+ * holds them; the Mamba projections IQ8R (the release's NVFP4 is not served), dt's rows bf16; the
+ * drafter's linears rotated int8. `odd`, when set, answers first: a key for one weight stored
+ * otherwise. */
+void two_bit_encs(RadBuilder& b, const char* odd = nullptr, const RadEncoding* odd_enc = nullptr) {
+    RadEncoding iq8r = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&iq8r, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(iq8r.transform, "fwht128");
+    RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(r8.transform, "fwht128");
+    const RadEncoding iq2 = lq::ggml::encoding_of(lq::ggml::GGML_TYPE_IQ2_XXS);
+    const RadEncoding q8 = lq::ggml::encoding_of(lq::ggml::GGML_TYPE_Q8_0);
+    b.encs = { { "dflash.fc.", r8 }, { "dflash.blk.", r8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
+               { "_exps", iq2 }, { "shexp", iq2 }, { "ffn_latent", q8 }, { "attn_", q8 },
+               { "output.weight", q8 }, { "blk.", iq8r } };
+    if (odd) b.encs.insert(b.encs.begin(), { odd, *odd_enc });
+}
+
 int buf_named(const RadBuilder& b, const char* name) {
     for (size_t i = 0; i < b.bufs.size(); ++i)
         if (b.bufs[i].name == name) return (int)(i + 1);
@@ -360,6 +379,80 @@ TEST(an_iq8r_trunk_slices_the_shared_expert_in_whole_256_column_groups) {
     }
 }
 
+/* NVIDIA's 2-bit release keeps llama.cpp's blocks, and they are served as stored on an IQ8R trunk,
+ * at one and two ranks. In the cut's four MoE blocks the routed experts run two moe_gemm_ggml at
+ * iq2_xxs each, whole on their rank and against the bf16 latent (no quantiser between); the shared
+ * expert's two projections run gemm_nt_ggml at iq2_xxs, the latent's two and the attention's two at
+ * q8_0; the head and the drafter's candidates run logits_gemm_ggml at q8_0 over a head declared at
+ * its codes. No other grouped GEMM and no plain head is declared, and nothing is quantised to
+ * E4M3. The shared expert's slices are whole 256-value blocks and cover it once. A speculative
+ * step is lint-clean on every rank. */
+TEST(the_two_bit_release_serves_its_llama_cpp_blocks_as_stored) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2 }) {
+        int64_t total = 0;
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            two_bit_encs(b);
+            const RadBuildCtx ctx = nemo_ctx(rank, world);
+            REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+            int moe_iq2 = 0, moe_other = 0, lin_iq2 = 0, lin_q8 = 0, head_q8 = 0, head_plain = 0;
+            int fp8q = 0;
+            for (const RecOp& o : b.ops) {
+                std::string type;
+                for (const RecParam& q : o.p)
+                    if (q.key == "type") type = q.sval;
+                if (o.op == "moe_gemm_ggml") (type == "iq2_xxs" ? moe_iq2 : moe_other) += 1;
+                else if (o.op.rfind("moe_gemm", 0) == 0) ++moe_other;
+                if (o.op == "gemm_nt_ggml") {
+                    lin_iq2 += type == "iq2_xxs";
+                    lin_q8 += type == "q8_0";
+                }
+                if (o.op == "logits_gemm_ggml") head_q8 += type == "q8_0";
+                head_plain += o.op == "logits_gemm";
+                fp8q += o.op == "quant_act_fp8" || o.op == "had_quant_act_fp8";
+            }
+            CHECK_EQ(moe_iq2, 8);
+            CHECK_EQ(moe_other, 0);
+            CHECK_EQ(lin_iq2, 8);
+            CHECK_EQ(lin_q8, 10);
+            CHECK_EQ(head_q8, 2);
+            CHECK_EQ(head_plain, 0);
+            CHECK_EQ(fp8q, 0);
+            for (const RecWeight& w : b.weights)
+                if (w.name == "output.weight") CHECK_EQ((int)w.d.dtype, (int)RAD_I8);
+            const int up = buf_named(b, "shared_up");
+            REQUIRE(up != 0);
+            const int64_t sw = b.bufs[(size_t)up - 1].d.shape[1];
+            CHECK_EQ(sw % 256, (int64_t)0);
+            total += sw;
+            auto trunk = kit(b, { 8, 8 }, {});
+            auto cpass = context_pass(b, *trunk);
+            auto qpass = query_pass(b, 2, 8, 7);
+            std::vector<int32_t> anchors = { 7, 15 };   /* each sequence's last committed row */
+            qpass->b.anchor_rows = anchors.data();
+            auto v = run_passes(b, nemotronh::step, { trunk.get(), cpass.get(), qpass.get() }, rank,
+                                world);
+            CHECK_PASSES(b, v);
+        }
+        CHECK_EQ(total, (int64_t)5376);
+    }
+}
+
+/* One table of experts takes one block type a projection: a layer whose expert 7 stores its down
+ * projection Q8_0 among IQ2_XXS ones is refused with RAD_E_DTYPE, not served at the first expert's
+ * type. */
+TEST(a_layer_of_block_experts_of_two_types_is_refused) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    const RadEncoding q8 = lq::ggml::encoding_of(lq::ggml::GGML_TYPE_Q8_0);
+    two_bit_encs(b, "blk.1.ffn_down_exps.7.", &q8);
+    const RadBuildCtx ctx = nemo_ctx(0, 1);
+    CHECK_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_E_DTYPE);
+}
+
 /* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
  * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
  * counts and buffer rows smaller. The drafter's split fc gathers its message as a range; a fixed
@@ -498,7 +591,7 @@ TEST(the_routed_arm_reads_rotated_int8_codes) {
  * latent, at one, two and four ranks, no quant_act_fp8 is declared or issued, and the out
  * projections' inputs and the shared expert's product have no E4M3 plane. The relu^2 product is
  * written once, in bf16. The block norms' E4M3 codes remain (rmsnorm_quant_fp8 has no unrotated
- * int8 form), and the latent's plane is declared for MoeFP8's prepared input but not written. */
+ * int8 form), and the latent's plane is declared for MoeQ's prepared input but not written. */
 TEST(an_int8_trunk_quantises_nothing_to_e4m3_that_no_op_reads) {
     Nemo f;
     const RadModelMeta meta = f.meta();

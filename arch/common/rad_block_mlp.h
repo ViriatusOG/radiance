@@ -103,13 +103,7 @@ inline int MlpBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, c
     /* Column-sharded down projection leaves a partial sum on every rank. The plugin emits the
      * reduction so the graph dump shows it (spec §9). */
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h}, {w.h});
+        op_ar = decl_all_reduce(b, g, w.h);
 
     if (add_out)
         op_add = rw(b, RAD_OP(b, "add",

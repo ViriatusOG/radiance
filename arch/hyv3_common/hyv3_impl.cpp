@@ -17,14 +17,13 @@
 #include <arch/rad_arch.h>
 #include "hyv3_attention.h"
 #include "rad_abi_layout.h"
-#include <arch/rad_block_mlp_fp8.h>
-#include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_mlp_q.h>
+#include <arch/rad_block_moe_q.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <vector>
 
 namespace HYV3_NS {
@@ -32,9 +31,9 @@ using namespace rad::arch;
 
 struct Layer {
     bool dense = false;
-    AttnQKFP8 attn{};
-    MlpFP8 dense_mlp{};
-    MoeFP8 moe{};
+    AttnQK attn{};
+    MlpQ dense_mlp{};
+    MoeQ moe{};
 };
 
 struct Model {
@@ -44,12 +43,12 @@ struct Model {
     rad_kvgroup kv_full = 0;
 
     rad_buf x = 0, h_out = 0, logits = 0;
-    ActFP8 h{};
+    ActQ h{};
     rad_buf q = 0, k = 0, v = 0;
-    ActFP8 attn{};
+    ActQ attn{};
     rad_buf dense_gate_up = 0;
-    ActFP8 dense_ffn{};
-    MoeFP8::Wire mw{};
+    ActQ dense_ffn{};
+    MoeQ::Wire mw{};
 
     rad_weight token = 0, final_norm = 0, lm_head = 0;
     rad_op embed = 0, embed_ar = 0, shared_one = 0, final_rms = 0, gather = 0, logits_op = 0;
@@ -105,16 +104,14 @@ static int check_model_config(const RadModelMeta* meta, const Geom& g, Model& mo
     const int64_t moe_intermediate = meta_text_geti(meta, "moe_intermediate_size", 0);
     const int64_t n_ff_shared = meta_text_geti(meta, "expert_hidden_dim", 0);
     model.n_ff_expert = meta_text_geti(meta, "expert_hidden_dim", 0);
-    const int64_t route_norm = meta_text_geti(meta, "route_norm", 0);
     const double route_scale = meta_text_getf(meta, "router_scaling_factor", 1.0);
     const char* schedule = meta_text_gets(meta, "mlp_layer_types", nullptr);
     std::vector<int> kinds;
 
     if (first_dense != 1 || n_expert != meta->n_expert || top_k != meta->n_expert_used ||
         n_expert != 128 || top_k != 8 || n_shared != 1 || model.n_ff_expert != 768 ||
-        n_ff_shared != 768 || moe_intermediate != 1536 || route_norm != 1 ||
-        !std::isfinite(route_scale) || route_scale <= 0 ||
-        std::fabs(route_scale - 2.826) > 1e-6 || model.n_ff_expert % RAD_FP8_BLOCK != 0) {
+        n_ff_shared != 768 || moe_intermediate != 1536 || !std::isfinite(route_scale) ||
+        std::fabs(route_scale - 2.826) > 1e-6 || model.n_ff_expert % RAD_SCALE_GROUP != 0) {
         fprintf(stderr, "radiance: hyv3: unsupported MoE geometry/config; expected 128 experts, "
                         "top-8, 768-wide routed and shared experts, normalized "
                         "sigmoid routing scaled by 2.826, and one dense first layer\n");
@@ -123,7 +120,8 @@ static int check_model_config(const RadModelMeta* meta, const Geom& g, Model& mo
     if (schedule && *schedule) {
         RAD_ARCH_TRY(parse_layer_kinds("hyv3", schedule, {"sparse"}, "dense", &kinds));
         if ((int64_t)kinds.size() != g.n_layer) {
-            fprintf(stderr, "radiance: hyv3: mlp_layer_types names %zu layers; the model has %lld\n",
+            fprintf(stderr,
+                    "radiance: hyv3: mlp_layer_types names %zu layers; the model has %lld\n",
                     kinds.size(), (long long)g.n_layer);
             return RAD_E_UNSUPPORTED;
         }
@@ -138,18 +136,9 @@ static int check_model_config(const RadModelMeta* meta, const Geom& g, Model& mo
     }
 
     const int64_t shared_width = n_ff_shared * n_shared;
-    if (shared_width <= 0 || shared_width % RAD_FP8_BLOCK != 0) return RAD_E_SHAPE;
+    if (shared_width <= 0 || shared_width % RAD_SCALE_GROUP != 0) return RAD_E_SHAPE;
     model.n_ff_shared = shared_width;
     return RAD_OK;
-}
-
-static void block_slice_128(int64_t width, int world, int rank, int64_t* lo, int64_t* hi) {
-    const int64_t blocks = width / RAD_FP8_BLOCK;
-    const int64_t base = blocks / world, rem = blocks % world;
-    const int64_t first = rank * base + std::min<int64_t>(rank, rem);
-    const int64_t count = base + (rank < rem ? 1 : 0);
-    *lo = first * RAD_FP8_BLOCK;
-    *hi = (first + count) * RAD_FP8_BLOCK;
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -216,8 +205,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The router is replicated, while the routed experts are expert-parallel. The shared expert
      * is split only on whole FP8 scale blocks; the final block remainder is assigned to early
-     * ranks. At TP2, routed and shared BF16 outputs are all-reduced separately before FP32 combine. */
-    MoeFP8::Config mc{};
+     * ranks. At TP2, routed and shared BF16 outputs are all-reduced separately before FP32
+     * combine. */
+    MoeQ::Config mc{};
     mc.n_expert_all = n_expert_all;
     mc.n_expert = n_expert_local;
     mc.expert_base = n_expert_local * g.rank;
@@ -296,16 +286,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     RAD_WEIGHTS(m.token)),
                 {}, {m.x});
     if (g.world > 1)
-        m.embed_ar = rw(b, RAD_OP(b, "all_reduce",
-                           RAD_PARAMS(RAD_INT("world_size", g.world),
-                                      RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                      RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
-                           RAD_NOWEIGHTS),
-                       {m.x}, {m.x});
+        m.embed_ar = decl_all_reduce_exact(b, g, m.x);
 
-    AttnQKFP8::Wire aw{};
+    AttnQK::Wire aw{};
     aw.x = m.x; aw.h = m.h; aw.q = m.q; aw.k = m.k; aw.v = m.v; aw.attn = m.attn;
-    MlpFP8::Wire dw{};
+    MlpQ::Wire dw{};
     dw.x = m.x; dw.h = m.h; dw.gate_up = m.dense_gate_up; dw.ffn = m.dense_ffn;
 
     m.layers.resize((size_t)g.n_layer);
@@ -317,7 +302,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 #else
         const char* pre = nm.ckpt("model.layers.%lld", (long long)l);
 #endif
-        AttnQKFP8::Src as{};
+        AttnQK::Src as{};
 #if HYV3_GGUF_SOURCE
         as.norm = nm.ckpt("%s.attn_norm.weight", pre);
         as.q = nm.ckpt("%s.attn_q.weight", pre);
@@ -347,7 +332,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
 
         if (lay.dense) {
-            MlpFP8::Src ds{};
+            MlpQ::Src ds{};
 #if HYV3_GGUF_SOURCE
             ds.norm = nm.ckpt("%s.ffn_norm.weight", pre);
             ds.gate = nm.ckpt("%s.ffn_gate.weight", pre);
@@ -367,7 +352,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 return status;
             }
         } else {
-            MoeFP8::Src ms{};
+            MoeQ::Src ms{};
             ms.cfg = mc;
 #if HYV3_GGUF_SOURCE
             ms.norm = nm.ckpt("%s.ffn_norm.weight", pre);
@@ -388,7 +373,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ms.shared = nm.ckpt("%s.shared_mlp", mlp);
 #endif
 #if !HYV3_FP8_SOURCE
-            status = MoeFP8::probe(b, nm, (int)l, ms, &ms.cfg);
+            status = MoeQ::probe(b, nm, (int)l, ms, &ms.cfg);
             if (status < 0) {
                 fprintf(stderr, "radiance: HYV3: expert format probe failed at layer %lld (%d)\n",
                         (long long)l, status);
@@ -423,7 +408,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     {m.h_out}, {m.logits});
 
     rad_note(b, "HYV3: %lld layers (dense first, then top-%lld/%lld sigmoid MoE), %lld/%lld "
-                "attention/KV heads x %lld; expert width %lld, shared width %lld, router scale %.3f",
+                "attention/KV heads x %lld; expert width %lld, shared width %lld, router scale "
+                "%.3f",
              (long long)g.n_layer, (long long)top_k, (long long)n_expert_all,
              (long long)g.n_head_all, (long long)g.n_head_kv_all, (long long)g.head_dim,
              (long long)m.n_ff_expert, (long long)m.n_ff_shared, mc.route_scale);

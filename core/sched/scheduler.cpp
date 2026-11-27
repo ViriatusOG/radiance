@@ -56,6 +56,38 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
 }
 
 /* ------------------------------------------------------------------ init */
+/* Depth 0 and the hybrid between steps (scheduler.h): for tests; a deployment sets them at load. */
+int Scheduler::set_draft_depth0(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 1 && !draft_.adaptive())
+        RAD_WARN("draft depth 0 refused: it acts only under the adaptive window "
+                 "(--draft-window adaptive)");
+    else
+        draft_.set_depth0(v == 1);
+    return draft_.depth0() ? 1 : 0;
+}
+
+int Scheduler::set_draft_probe(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 2 && v <= 4096) draft_.set_probe_every(v);
+    return draft_.probe_every();
+}
+
+int Scheduler::set_draft_hybrid(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 1 && !draft_head_)
+        RAD_WARN("draft hybrid refused: this deployment has no draft head that drafts chains");
+    else
+        hybrid_ = v == 1;
+    return hybrid_ ? 1 : 0;
+}
+
+int Scheduler::set_draft_hybrid_match(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 1 && v <= 256) hybrid_match_ = v;
+    return hybrid_match_;
+}
+
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
                     const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo) {
     if (!kv || !pc) return RAD_E_INVAL;
@@ -201,11 +233,22 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     mixed_target_prefill_planned_ = 0;
     mixed_target_prefill_continues_ = false;
     draft_refill_ = 0;
-    if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
-        hit_holes_draft_) {
-        draft_refill_ = prog.drafter.window;
+    draft_local_window_ = 0;
+    if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window == 0) {
+        /* A drafter whose scheduler-staged window is 0 (its full layer reads every position) can
+         * still keep some layers in a window group of its own (the split cache): that group is not
+         * prefix-cached, so a hit leaves a hole there and only there. The span that must be
+         * recomputed is the widest such group's window. */
+        for (const KVGroupInfo& g : prog.kv_groups)
+            if (g.drafter && g.decl.kind == RAD_KV_WINDOW && g.decl.window > draft_local_window_)
+                draft_local_window_ = g.decl.window;
+    }
+    if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK &&
+        (prog.drafter.window > 0 || draft_local_window_ > 0) && hit_holes_draft_) {
+        draft_refill_ = prog.drafter.window > 0 ? (int64_t)prog.drafter.window : draft_local_window_;
         RAD_INFO("draft refill: a prefix hit ends %lld tokens before the prompt's end, so the "
-                 "drafter's window is recomputed", (long long)draft_refill_);
+                 "drafter's window is recomputed (--checkpoint-draft-window carries the window in the "
+                 "checkpoint slots instead)", (long long)draft_refill_);
     }
     if (pc) pc->set_drafter_floor(draft_refill_);
 
@@ -255,6 +298,76 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "%.0f%% of drafts corrupted -- a verify-path test, not a drafter",
                  debug_oracle_.size(), f, 100.0 * kDebugMiss);
     }
+    draft_gate_off_ = false;
+    if (cfg.draft_max_lanes > 0) {
+        if (prog.drafter.kind != RAD_DRAFT_BLOCK || prog.drafter.depth <= 0 || cfg.n_spec <= 0)
+            RAD_WARN("--draft-max-lanes %lld: this deployment runs no block drafter, so there is "
+                     "nothing to gate (ignored)", (long long)cfg.draft_max_lanes);
+        else if (cfg.draft_max_lanes >= cfg.max_seqs)
+            RAD_WARN("--draft-max-lanes %lld is not below --max-num-seqs %lld, so the drafter is "
+                     "never gated", (long long)cfg.draft_max_lanes, (long long)cfg.max_seqs);
+        else
+            RAD_INFO("--draft-max-lanes %lld: the block drafter drafts while at most %lld sequences "
+                     "decode; above that every sequence takes the plain target step and the drafter "
+                     "only runs its context pass (steps gated off: radiance:draft_gated_steps_total)",
+                     (long long)cfg.draft_max_lanes, (long long)cfg.draft_max_lanes);
+    }
+    acc_flips_ = 0;
+    gate_flips_ = 0;
+    ckpt_skip_.clear();
+    if (cfg.draft_min_accept > 0) {
+        if (prog.drafter.kind != RAD_DRAFT_BLOCK || prog.drafter.depth <= 0 || cfg.n_spec <= 0)
+            RAD_WARN("--draft-min-accept %.2f: this deployment runs no block drafter, so there is "
+                     "nothing to gate (ignored)", cfg.draft_min_accept);
+        else {
+            RAD_INFO("--draft-min-accept %.2f: the block drafter stops for a sequence whose smoothed "
+                     "tokens per verify step (after %d verifies) is below %.2f, resumes at %.2f, and "
+                     "proposes one block after %lld generated tokens while stopped (doubling after each "
+                     "failed probe, up to %lld; steps skipped: radiance:draft_acc_gated_steps_total)",
+                     cfg.draft_min_accept, (int)kAccWarm, cfg.draft_min_accept,
+                     cfg.draft_min_accept + kAccBand, (long long)kAccProbeFirst,
+                     (long long)kAccProbeMax);
+            if (cfg.draft_min_accept + kAccBand > 1.0 + (double)cfg.n_spec)
+                RAD_WARN("--draft-min-accept %.2f: a verify carries at most %d tokens, below the %.2f "
+                         "needed to resume; a stopped sequence would stay stopped",
+                         cfg.draft_min_accept, 1 + cfg.n_spec, cfg.draft_min_accept + kAccBand);
+        }
+    }
+    /* One block for an operator: a block drafter's own KV groups and the policy gating it, so a
+     * drafter that silently sits out (hit cap, lane gate, acceptance gate) is attributable. Log
+     * only; nothing here is read back. */
+    if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK) {
+        std::string groups;
+        for (size_t i = 0; i < prog.kv_groups.size(); ++i) {
+            const KVGroupInfo& g = prog.kv_groups[i];
+            if (!g.drafter) continue;
+            const char* kind = g.decl.kind == RAD_KV_FULL ? "full" : g.decl.kind == RAD_KV_WINDOW ? "window"
+                             : g.decl.kind == RAD_KV_LINEAR ? "linear" : g.decl.kind == RAD_KV_CONV ? "conv"
+                             : "ring";
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "\n    %s: %s, window %lld, %lld block(s), %lld byte(s)",
+                          g.name.c_str(), kind, (long long)g.decl.window,
+                          (long long)kv->total_blocks((int32_t)i), (long long)kv->pool_bytes((int32_t)i));
+            groups += buf;
+        }
+        if (!groups.empty()) {
+            std::string cap = "no hit cap for the drafter";
+            if (!cfg.prefix_cache)
+                cap = "no hit cap (prefix cache off, no hits are taken)";
+            else if (draft_refill_ > 0)
+                cap = "a prefix hit ends " + std::to_string((long long)draft_refill_) +
+                      " tokens before the prompt's end so the drafter's window is recomputed "
+                      "(radiance:draft_refill_tokens_total), " +
+                      std::string(prog.drafter.window > 0 ? "drafter window " : "local window ") +
+                      std::to_string((long long)(prog.drafter.window > 0 ? (int64_t)prog.drafter.window
+                                                                        : draft_local_window_));
+            RAD_INFO("draft policy: block drafter depth %d, draft-max-lanes %lld, draft-min-accept %.2f; "
+                     "prefix cache %s, hit_holes_draft %s: %s\ndrafter KV groups:%s",
+                     cfg.n_spec, (long long)cfg.draft_max_lanes, cfg.draft_min_accept,
+                     cfg.prefix_cache ? "on" : "off", hit_holes_draft_ ? "yes" : "no",
+                     cap.c_str(), groups.c_str());
+        }
+    }
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0)
@@ -273,6 +386,36 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                          "proposed whole, and each sequence verifies the first min(D, its stop) "
                          "of it", dd.depth);
         }
+    }
+    /* Depth 0, its probes and the hybrid (draft.h; hybrid_ in scheduler.h): --draft-depth0,
+     * --draft-probe, --draft-probe-backoff, --draft-hybrid and --draft-hybrid-match, each off
+     * (the plain adaptive window) by default. */
+    draft_head_ = cfg.n_spec > 0 && (prog.drafter.kind == RAD_DRAFT_SERIAL ||
+                                     prog.drafter.kind == RAD_DRAFT_BLOCK) &&
+                  prog.drafter.depth > 0 && !tree_;
+    {
+        dp.depth0 = cfg.draft_depth0;
+        dp.probe_every = std::clamp(cfg.draft_probe, 2, 4096);
+        dp.backoff = std::clamp(cfg.draft_probe_backoff, 0, DraftController::kBackoffMax);
+        hybrid_ = cfg.draft_hybrid;
+        hybrid_match_ = std::clamp(cfg.draft_hybrid_match, 1, 256);
+        if (dp.depth0 && !dp.adapt)
+            RAD_WARN("--draft-depth0 on: depth 0 acts only under the adaptive window, which is off "
+                     "(--draft-window)");
+        if (dp.depth0 && dp.adapt)
+            RAD_INFO("--draft-depth0 on: the adaptive window may choose depth 0 (the plain step), "
+                     "probing the drafting depth every %d cycles there (back-off: %d doubling(s))",
+                     dp.probe_every, dp.backoff);
+        if (hybrid_ && !draft_head_) {
+            RAD_WARN("--draft-hybrid on: this deployment has no draft head that drafts chains%s; off",
+                     tree_ ? " (a tree head is verified only ahead)" : "");
+            hybrid_ = false;
+        }
+        if (hybrid_)
+            RAD_INFO("--draft-hybrid on: a sequence whose prompt lookup matches %d or more tokens back "
+                     "verifies the lookup's proposal instead of the head's, and its next step is "
+                     "planned after the commit", hybrid_match_);
+        hybrid_lookup_ = hybrid_head_ = hybrid_unahead_ = 0;
     }
     RAD_TRY(draft_.configure(dp));
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
@@ -478,6 +621,12 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.drafter_reset();
+    s.acc_ewma = 0.0;
+    s.acc_n = 0;
+    s.spec_off = false;
+    s.probe_at = 0;
+    s.probe_gap = kAccProbeFirst;
+    s.probing = false;
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
     s.adapt.held  = 0;
@@ -1066,6 +1215,12 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
 }
 
 /* ------------------------------------------------------------------ drafting */
+/* The request's committed history: prompt, then output. */
+static TokenSeq history_of(const Request& r) {
+    return TokenSeq{ r.prompt.data(), (int64_t)r.prompt.size(), r.output.data(),
+                     (int64_t)r.output.size() };
+}
+
 /* Prompt-lookup drafting: find where the last few committed tokens last occurred in the same
  * sequence and propose what followed. On code, diffs and JSON it is right often enough to pay,
  * and a wrong guess costs only bandwidth, since the verify still emits the target's token. Built
@@ -1081,11 +1236,7 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
     if (match) *match = -1;
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
-    TokenSeq seq;
-    seq.a = r.prompt.data();
-    seq.na = (int64_t)r.prompt.size();
-    seq.b = r.output.data();
-    seq.nb = (int64_t)r.output.size();
+    const TokenSeq seq = history_of(r);
     if (seq.size() < 2) return 0;
     if (depth > RAD_SCHED_MAX_SPEC) depth = RAD_SCHED_MAX_SPEC;
     if (!debug_oracle_.empty()) {
@@ -1114,17 +1265,28 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
     if (match) *match = -1;
     if (!s.req) return 0;
     const Request& r = *s.req;
-    TokenSeq seq;
-    seq.a = r.prompt.data();
-    seq.na = (int64_t)r.prompt.size();
-    seq.b = r.output.data();
-    seq.nb = (int64_t)r.output.size();
+    const TokenSeq seq = history_of(r);
     const SuffixIndex::Out o =
         s.suffix_ix.propose(seq, r.id, cfg_.draft_suffix_min_match,
                             std::min(cfg_.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC),
                             cfg_.draft_suffix_min_score, out);
     if (match && o.n > 0) *match = o.match;
     return o.n;
+}
+
+int Scheduler::lookup_into(SchedReq& s, int depth, int32_t* out, int* match, int match_cap) const {
+    *match = 0;
+    if (depth <= 0 || !s.req) return 0;
+    const Request& r = *s.req;
+    const TokenSeq seq = history_of(r);
+    if (seq.size() < 2) return 0;
+    if (depth > RAD_SCHED_MAX_SPEC) depth = RAD_SCHED_MAX_SPEC;
+    if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
+    int m = -1;
+    const int n = s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, out, &m,
+                                     match_cap);
+    *match = n > 0 && m > 0 ? m : 0;
+    return n;
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -1426,14 +1588,27 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
                             int64_t reserve, bool shared, bool rows_only,
                             int64_t mixed_target_shares, int64_t mixed_target_decode_reserve) const {
     const int64_t mode = cfg_.busy_prefill_chunk;
-    if (budget <= 0 || (mode == 0 && !mixed_target_active_)) return budget;
+    if (budget <= 0) return budget;
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+    /* Long-prefill fair share (vLLM's long_prefill_token_threshold), applied to whatever cap the
+     * rest of this function settles on: when another request is eligible and this one would take a
+     * big chunk, hold it to N, floored by the fair share of the token budget. A lone prefill still
+     * gets the whole budget, so TTFT does not suffer when there is nobody to starve. Off (0), this
+     * is the plain clamp. */
+    const auto finish = [&](int64_t cap) -> int64_t {
+        const int64_t long_thr = cfg_.long_prefill_token_threshold;
+        const int64_t eligible = (int64_t)running_.size() + (int64_t)waiting_.size();
+        if (long_thr > 0 && eligible > 1 && n_target - n_computed > long_thr)
+            cap = std::min(cap, std::max(long_thr, budget / eligible));
+        return std::min(std::max(cap, Q), budget);
+    };
+    if (mode == 0 && !mixed_target_active_) return finish(budget);
     /* Auto holds a chunk back only for work that would otherwise get nothing this step: rows
      * behind it, or a request waiting to start. Rows planned ahead of it are in the step anyway.
      * An explicit N trades prefill speed for every other row's latency, so it applies whenever
      * the chunk shares the step. */
-    if (reserve <= 0 && !(mode > 0 && shared) && !(mixed_target_active_ && shared)) return budget;
+    if (reserve <= 0 && !(mode > 0 && shared) && !(mixed_target_active_ && shared)) return finish(budget);
     reserve = std::max<int64_t>(reserve, 0);
-    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
 
     int64_t cap = mode == 0 ? budget : budget - reserve;
     if (mode > 0) {
@@ -1476,7 +1651,7 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
         if (fair < Q || cap < Q) return 0;
         cap = std::min(cap, fair);
     }
-    return std::min(std::max(cap, Q), budget);
+    return finish(cap);
 }
 
 /* ------------------------------------------------------------------ decode-only steps */
@@ -1626,11 +1801,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
         }
         s.restore_cut = rr == RestoreResult::Cut;
         HitCap cap;
-        if (draft_refill_ > 0) {
-            cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
-            cap.max_give_back = 2 * draft_refill_;
-        }
-        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        const bool capped = refill_cap(r, &cap);
+        const CacheHit h = pc_->lookup(r, &hit_blocks_, capped ? &cap : nullptr);
         if (h.given_back > 0) {
             m_.draft_refill_tokens += h.given_back;
             ++m_.draft_refills;
@@ -1699,7 +1871,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
          *
          * A drafter's own group (bound at base_layer and above) is not this clamp's business: it
          * rides in the window snapshot where the engine puts it there
-         * (IKVManager::window_snapshot), and otherwise draft refill caps the hit so the recompute
+         * (IKVManager::window_snapshot; on a model with linear state only under
+         * --checkpoint-draft-window), and otherwise draft refill caps the hit so the recompute
          * covers the drafter's window. */
         if (reuse > 0 && (hit_holes_trunk_ || (hit_needs_window_ && !win_hit))) {
             reuse = 0;
@@ -1730,7 +1903,18 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
             }
             /* The windowed groups start at the floor of the window behind the hit, in fresh
              * blocks the entry's restore fills from the snapshot. */
-            if (reuse > 0 && win_hit && kv_->seed_window(r.id, reuse) < 0) {
+            const int seeded = (reuse > 0 && win_hit) ? kv_->seed_window(r.id, reuse) : RAD_OK;
+            if (seeded < 0) {
+                /* With a drafter's window in the slot (--checkpoint-draft-window) the seed needs
+                 * its blocks too, so a full pool drops the whole hit, not only the drafter's part. */
+                const int64_t nf = ++m_.window_seed_failures;
+                /* Rate-limited: the 1st, 2nd, 4th, 8th ... */
+                if ((nf & (nf - 1)) == 0)
+                    RAD_INFO("admit %llu: the window behind the prefix hit at %lld could not be "
+                             "seeded (%s); the hit is dropped and the prompt re-prefilled "
+                             "(%lld such so far; radiance:prefix_window_seed_failures_total)",
+                             (unsigned long long)r.id, (long long)reuse, rad_strerror(seeded),
+                             (long long)nf);
                 kv_->preempt(r.id);
                 reuse = 0;
                 s.hit_cut = SchedReq::HitCut::Adopt;
@@ -1895,6 +2079,27 @@ void Scheduler::undo_hit(SchedReq& s) {
     s.hit_attn = 0;
 }
 
+/* The cap a drafter refill puts on a prefix hit (draft_refill_): the hit ends one window before the
+ * prompt's end, giving back at most two windows. False when no refill is armed. admit_one and
+ * preempted_can_prefill both use it, so the gate credits what admission adopts. */
+bool Scheduler::refill_cap(const Request& r, HitCap* cap) const {
+    if (draft_refill_ <= 0) return false;
+    cap->tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
+    cap->max_give_back = 2 * draft_refill_;
+    return true;
+}
+
+/* The blocks a running request still wants in KV group `g`: enough for its whole prompt if it is
+ * still prefilling, else for the next position, minus what it holds, plus one block past that so
+ * its next step is not the preemption victim. */
+int64_t Scheduler::blocks_still_needed(const Request& r, int32_t g, int64_t block_size) const {
+    int64_t goal = r.n_computed + 1;
+    if (r.n_computed < (int64_t)r.prompt.size()) goal = std::max(goal, (int64_t)r.prompt.size());
+    const int64_t rows = (goal + block_size - 1) / block_size;
+    const int64_t held = (int64_t)kv_->block_table(r.id, g).size();
+    return std::max<int64_t>(rows - held, 0) + 1;
+}
+
 /* Whether a preempted request can be admitted without becoming the next victim. The first
  * requirement is the whole recompute's blocks. The second is the blocks every running sequence
  * still needs: a prefill must be able to finish its prompt, and every runner keeps one block
@@ -1905,29 +2110,23 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len();
     /* Whether the pools hold the recompute plus every runner's remaining need, given `hit` tokens
-     * of prefix the recompute adopts without new blocks. */
+     * of prefix the recompute adopts without new blocks. The recompute's blocks cover its whole
+     * prompt and its first decode position. */
     auto enough = [&](int64_t hit) {
         for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
             const KVGeom::G& gg = kvgeom_.g[g];
-            /* A group the manager gives no blocks (the sentinel at index 0) asks nothing. Counting
-             * it wanted the whole prompt from a pool of none and kept a preempted request out for
-             * good. */
-            if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
-            int64_t need = (target + gg.block_size - 1) / gg.block_size -
+            /* FULL groups grow with the prompt. WINDOW and RING groups recycle past their window,
+             * so counting ceil(prompt / block) against them keeps every long sparse-attention
+             * prompt (DeepSeek-V4.1's QSA) out for good. A group the manager gives no blocks (the
+             * sentinel at index 0) asks nothing: counting it would want the whole prompt from a
+             * pool of none and keep a preempted request out for good. */
+            if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+            int64_t need = (target + 1 + gg.block_size - 1) / gg.block_size -
                            (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
             if (need < 0) need = 0;
-            for (int32_t slot : running_) {
-                const SchedReq& rs = *reqs_[(size_t)slot];
-                if (!rs.req) continue;
-                const Request& rr = *rs.req;
-                int64_t goal = rr.n_computed + 1;
-                if (rr.n_computed < (int64_t)rr.prompt.size())
-                    goal = std::max(goal, (int64_t)rr.prompt.size());
-                const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
-                const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
-                if (rows > held) need += rows - held;
-                need += 1;               /* one block past that, so the next step is not the victim */
-            }
+            for (int32_t slot : running_)
+                if (const SchedReq& rs = *reqs_[(size_t)slot]; rs.req)
+                    need += blocks_still_needed(*rs.req, (int32_t)g, gg.block_size);
             if (need > kv_->available_blocks((int32_t)g)) return false;
         }
         return true;
@@ -1948,7 +2147,10 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
          * loop this gate exists to stop. The exact-mode grid floor is folded in as a bound too
          * -- crediting less than admission adopts only delays a re-admission by one round,
          * crediting more reopens the loop. */
-        const CacheHit h = pc_->lookup(r, nullptr, nullptr);
+        /* The same drafter-refill cap admit_one applies, so the credit is what admission adopts. */
+        HitCap cap;
+        const bool capped = refill_cap(r, &cap);
+        const CacheHit h = pc_->lookup(r, nullptr, capped ? &cap : nullptr);
         int64_t hit = h.n_attn_tokens;
         if (geo_.checkpoints() && h.n_linear_tokens < hit) hit = h.n_linear_tokens;
         if (geo_.exact && hit > 0) hit = geo_.grid_floor(hit);
@@ -1989,14 +2191,7 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
         auto beside = [&](int32_t slot) {
             const SchedReq& rs = *reqs_[(size_t)slot];
             if (!rs.req || &rs == &s) return;
-            const Request& rr = *rs.req;
-            int64_t goal = rr.n_computed + 1;
-            if (rr.n_computed < (int64_t)rr.prompt.size())
-                goal = std::max(goal, (int64_t)rr.prompt.size());
-            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
-            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
-            if (rows > held) need += rows - held;
-            need += 1;                       /* one block past that for the sequence */
+            need += blocks_still_needed(*rs.req, (int32_t)g, gg.block_size);
         };
         for (int32_t slot : running_) beside(slot);
         for (size_t i : took_) beside(waiting_[i]);
@@ -2353,6 +2548,20 @@ const RadBatch* Scheduler::step() {
                         s.n_draft = 0;
                         ngram = false;
                     }
+                }
+            } else if (hybrid_on() && draft_.head_runs()) {
+                /* The hybrid (scheduler.h): the head proposed; a long lookup match takes the
+                 * window instead, the whole of it. */
+                int32_t look[RAD_SCHED_MAX_SPEC];
+                int match = 0;
+                const int k = lookup_into(s, draft_.next_depth(), look, &match, hybrid_match_);
+                if (k > 0 && match >= hybrid_match_) {
+                    for (int j = 0; j < k; ++j) s.draft[j] = look[j];
+                    s.n_draft = k;
+                    ngram = true;
+                    ++hybrid_lookup_;
+                } else {
+                    ++hybrid_head_;
                 }
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
@@ -2791,6 +3000,8 @@ const RadBatch* Scheduler::step() {
     }
     ++step_;
     step_open_ = true;
+    open_start_ns_.store(step_start_.time_since_epoch().count(), std::memory_order_relaxed);
+    open_phase_.store(plan_.phase, std::memory_order_release);
     return b;
 }
 
@@ -2952,6 +3163,23 @@ const RadBatch* Scheduler::step_next_locked() {
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
+    /* The hybrid (scheduler.h): a sequence whose lookup matches long on the text committed so far
+     * verifies the lookup's proposal next, which only step() can plan, after the commit. Off, this
+     * is never entered and no step is held back from issuing ahead. */
+    if (hybrid_on() && draft_.head_runs()) {
+        for (const StepEntry& e : plan_.e) {
+            if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+            SchedReq& s = *reqs_[(size_t)e.slot];
+            if (!s.req || !s.req->may_speculate) continue;
+            int32_t look[RAD_SCHED_MAX_SPEC];
+            int match = 0;
+            if (lookup_into(s, draft_.next_depth(), look, &match, hybrid_match_) > 0 &&
+                match >= hybrid_match_) {
+                ++hybrid_unahead_;
+                return nullptr;
+            }
+        }
+    }
 
     plan_next_.reset();
     plan_next_.spec_is_tree = tree_;
@@ -3063,6 +3291,8 @@ void Scheduler::promote_next() {
     ++step_;
     step_open_ = true;
     next_open_ = false;
+    open_start_ns_.store(step_start_.time_since_epoch().count(), std::memory_order_relaxed);
+    open_phase_.store(RAD_PHASE_DECODE, std::memory_order_release);
 }
 
 /* ------------------------------------------------------------------ commit */
@@ -3103,6 +3333,10 @@ int Scheduler::commit(StepResult& res) {
              * with them. If the server also reaped it, the sweep at the end of this function
              * returns the slot once every entry is retired. */
             s.entry = -1;
+            /* A mark for this step's checkpoint is retired with the entry, not counted: nothing
+             * was committed to suppress. */
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0)
+                (void)take_ckpt_skip(e.seq, (int64_t)e.ctx_len + e.ckpt_tok + 1);
             /* Unless the drafter's snapshot still names it, or the next step carries it: the
              * sweep below, or that step's commit, releases it once nothing does. */
             if (s.pending_free && !block_holds(r.id) && !(next_open_ && s.entry_next >= 0)) {
@@ -3127,8 +3361,12 @@ int Scheduler::commit(StepResult& res) {
          * (which happens at planning), so a lookup in between cannot adopt a slot still holding
          * the previous tenant's state. A later restore is enqueued on the same stream behind this
          * save, so issuing the copy is enough. */
-        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
-            pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_) {
+            const int64_t cpos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+            /* Counted here, when a commit is actually suppressed. */
+            if (take_ckpt_skip(r.id, cpos)) ++m_.draft_window_stale_ckpts;
+            else pc_->commit_checkpoint(r, cpos);
+        }
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
@@ -3262,6 +3500,38 @@ int Scheduler::commit(StepResult& res) {
                     ++m_.suffix_steps;
                     m_.suffix_rows += e.n_spec;
                     m_.suffix_accepted += a;
+                }
+                /* --draft-min-accept: the block drafter's steps only; a prompt-lookup or suffix
+                 * proposal is accepted on different text by a different rule. */
+                if (cfg_.draft_min_accept > 0 && !e.ngram && !e.suffix) {
+                    const double obs = 1.0 + (double)a;
+                    /* A probe is the one block block_begin proposed while stopped; a verify that was
+                     * already in flight when the sequence stopped is an ordinary sample. */
+                    const bool probe = s.spec_off && s.probing;
+                    const double al = probe ? kAccProbeAlpha : kAccAlpha;
+                    s.acc_ewma = s.acc_n == 0 ? obs : s.acc_ewma + al * (obs - s.acc_ewma);
+                    ++s.acc_n;
+                    s.probing = false;
+                    const bool was_off = s.spec_off;
+                    if (!s.spec_off && s.acc_n >= kAccWarm && s.acc_ewma < cfg_.draft_min_accept) {
+                        s.spec_off = true;
+                        s.probe_gap = kAccProbeFirst;
+                        s.probe_at = (int64_t)r.output.size() + s.probe_gap;
+                    } else if (s.spec_off && s.acc_ewma >= cfg_.draft_min_accept + kAccBand) {
+                        s.spec_off = false;
+                        s.probe_gap = kAccProbeFirst;
+                    } else if (probe) {       /* a failed probe: wait twice as long, up to the cap */
+                        s.probe_gap = std::min<int64_t>(2 * s.probe_gap, kAccProbeMax);
+                        s.probe_at = (int64_t)r.output.size() + s.probe_gap;
+                    }
+                    if (s.spec_off != was_off) {
+                        ++acc_flips_;
+                        if (acc_flips_ <= 8 || (acc_flips_ & 63) == 0)
+                            RAD_INFO("--draft-min-accept %.2f: request %llu drafting %s (%.2f tokens "
+                                     "a verify; %lld transition(s) so far)", cfg_.draft_min_accept,
+                                     (unsigned long long)r.id, s.spec_off ? "off" : "on again",
+                                     s.acc_ewma, (long long)acc_flips_);
+                    }
                 }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
@@ -3420,15 +3690,32 @@ void Scheduler::step_finished() {
     }
     /* The step's cost by query rows, for the adaptive window (draft.h): the same wall time,
      * including the draft rounds after it, with a step issued ahead counted once. Drafting decode
-     * steps only: a step that verified nothing ran no head round. */
-    if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && plan_.n_spec > 0 && wall > 0) {
+     * steps only: a step that verified nothing ran no head round. Under depth 0 the cycle decides
+     * as well: a step verifying drafts while the head no longer runs (the step after a move to 0)
+     * lacks the head's pass and is not a drafting step's time, and a step verifying none while
+     * the head runs (the step after a move from 0) carries a pass it does not verify. A plain step
+     * at D = 0 is depth 0's price (plain_time). With depth 0 off, `zero` is false and every such
+     * step is a drafting sample. */
+    if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && wall > 0) {
+        const bool head = draft_.head_runs();
+        const bool zero = draft_.depth0();
         int64_t rows = 0;
-        for (const StepEntry& e : plan_.e) rows += e.is_prefill ? 0 : e.n_tokens;
-        if (rows > 0) draft_.step_time((int)rows, wall * 1e3);
+        int n_rows = 0;
+        for (const StepEntry& e : plan_.e) {
+            rows += e.is_prefill ? 0 : e.n_tokens;
+            n_rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
+        }
+        if (plan_.n_spec > 0 && (head || !zero)) {
+            if (rows > 0)
+                draft_.step_time((int)rows, wall * 1e3, n_rows, (double)step_decode_tok_);
+        } else if (plan_.n_spec == 0 && !head && zero && n_rows > 0) {
+            draft_.plain_time(n_rows, wall * 1e3);
+        }
     }
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};
+    open_phase_.store(-1, std::memory_order_release);
 }
 
 /* The mixed-step target's one timing entry point. `step_finished` supplies the live bracket;
@@ -3492,7 +3779,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * take the recurrent path. Neither answer skips the history pass: the head's K and V must be
      * filled either way, e.g. for a sequence still in the middle of a long prompt. */
     const int depth = draft_.next_depth();
-    bool may_draft = depth > 0;
+    /* Depth 0 holds D at 0 (draft.h): the history pass only. */
+    bool may_draft = depth > 0 && draft_.head_runs();
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
 
@@ -3742,8 +4030,43 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_mask_.assign((size_t)(block - 1), mask);
 
     /* Not the drafter's declared `depth`: whether the draft policy wants any tokens this step
-     * (0 when it has backed off). */
-    const bool may_draft = draft_.next_depth() > 0;
+     * (0 when it has backed off, or depth 0 holds D at 0: then the context pass runs alone). */
+    bool may_draft = draft_.head_runs();
+    /* --draft-max-lanes: above K decoding sequences the drafter sits this step out, which is the
+     * existing no-draft path (the same as a controller that has backed off): no query pass, no
+     * set_draft, no expect_draft, so the step issued ahead verifies nothing and every sequence
+     * takes the plain target step. The load is the sequences this step decodes and that may
+     * speculate (not a mid-prefill chunk, not a request that cannot speculate), so an admission
+     * still prefilling does not switch drafting off. Nothing is rolled back here: a draft already
+     * published was verified by the step just run and its rejected suffix was rolled back by that
+     * commit. The context pass below still runs for every row, so each sequence's drafter KV stays
+     * whole ([draft_lo, draft_hi) keeps growing) and drafting resumes at once, with no hole and no
+     * refill, when the load falls back to K. */
+    int64_t gate_load = 0;
+    if (cfg_.draft_max_lanes > 0) {
+        for (const StepEntry& e : plan_.e) {
+            /* a mid-prompt chunk produces no token and is not counted */
+            if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+            const SchedReq& g = *reqs_[(size_t)e.slot];
+            if (g.req && g.req->id == e.seq && g.req->state == ReqState::Running && g.running &&
+                g.req->may_speculate)
+                ++gate_load;
+        }
+        const bool gated = gate_load > cfg_.draft_max_lanes;
+        if (gated && may_draft) {
+            may_draft = false;
+            ++m_.draft_gated_steps;
+        }
+        if (gated != draft_gate_off_) {
+            draft_gate_off_ = gated;
+            ++gate_flips_;
+            if (gate_flips_ <= 8 || (gate_flips_ & 63) == 0)
+                RAD_INFO("--draft-max-lanes %lld: %lld decoding sequence(s), drafting %s "
+                         "(%lld transition(s) so far)",
+                         (long long)cfg_.draft_max_lanes, (long long)gate_load,
+                         gated ? "off (plain target steps)" : "on again", (long long)gate_flips_);
+        }
+    }
     /* The query pass is `block` tokens per drafting sequence, and the builder's staging arrays
      * are sized at max_tok. Unlike a decode step it can put more rows than sequences in a batch,
      * which on a small token budget would overrun h_tok. Under --prefill-span a step of several
@@ -3799,37 +4122,48 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
          * the hit length after a prefix-cache hit). The binding query row is the lowest, at
          * n_computed, and it reads back to n_computed - window + 1. */
         const int64_t lo = draft_floor(s, (int64_t)d.ctx_len);
+        /* A drafter with no staged window of its own but a window group (draft_local_window_)
+         * reads only that far back through it; the rest of its cache is whole. */
+        const int64_t reach_win = window > 0 ? (int64_t)window : draft_local_window_;
         const bool reach = lo <= 0 ? true
-                                   : (window > 0 && next_lo - window + 1 >= lo);
+                                   : (reach_win > 0 && next_lo - reach_win + 1 >= lo);
 
         /* RADIANCE_DEBUG_DRAFT counts which gate declined. A drafter that silently stops
          * proposing looks like collapsed acceptance downstream (accept% is conditional on
-         * drafting), and no other counter tells the five gates apart. */
+         * drafting), and no other counter tells the gates apart. */
+        /* --draft-min-accept: a sequence the drafter has stopped for proposes only when its probe
+         * is due. The context pass above still covers it, so no hole opens. */
+        const bool probe_due = s.spec_off && (int64_t)r.output.size() >= s.probe_at;
+        const bool acc_off = cfg_.draft_min_accept > 0 && s.spec_off && !probe_due;
         const bool ok_room = n_draft_rows < max;
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
         const bool ok_ctx  = ctx_limit_ <= 0 || next_hi + block <= ctx_limit_;
-        const bool ok_kv   = ok_room && ok_ctx &&
+        const bool ok_kv   = ok_room && ok_ctx && !acc_off &&
                              kv_->ensure_from(r.id, next_hi + block, r.n_computed) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
                                      return v && *v && *v != '0'; }();
         if (dbg) {
-            static int64_t n_call = 0, n_depth = 0, n_tok = 0, n_reach = 0, n_room = 0, n_kv = 0, n_ok = 0;
+            static int64_t n_call = 0, n_depth = 0, n_tok = 0, n_reach = 0, n_room = 0, n_acc = 0, n_kv = 0, n_ok = 0;
             ++n_call;
             if (!may_draft)      ++n_depth;
             else if (!have_tok)  ++n_tok;
             else if (!reach)     ++n_reach;
             else if (!ok_room)   ++n_room;
+            else if (acc_off)    ++n_acc;
             else if (!ok_kv)     ++n_kv;
             else                 ++n_ok;
             if ((n_call % 256) == 0)
                 RAD_INFO("draft gates over %lld asks: ok %lld | declined depth %lld tok %lld "
-                         "reach %lld room %lld kv %lld  (window %d, floor %lld, ctx_len %lld)",
+                         "reach %lld room %lld acc %lld kv %lld  (window %d, floor %lld, ctx_len %lld)",
                          (long long)n_call, (long long)n_ok, (long long)n_depth, (long long)n_tok,
-                         (long long)n_reach, (long long)n_room, (long long)n_kv,
+                         (long long)n_reach, (long long)n_room, (long long)n_acc, (long long)n_kv,
                          window, (long long)lo, (long long)e.ctx_len);
         }
+        if (may_draft && have_tok && reach && ok_room && ok_ctx && acc_off) ++m_.draft_acc_gated_steps;
+        if (may_draft && have_tok && !reach) ++m_.draft_reach_declined_steps;
         if (may_draft && have_tok && reach && ok_kv) {
+            if (probe_due) { s.probing = true; s.probe_at = (int64_t)r.output.size() + s.probe_gap; }
             d.can_draft = true;
             out[n_draft_rows].seq  = d.seq;
             out[n_draft_rows].slot = d.slot;
@@ -3854,6 +4188,26 @@ int Scheduler::decoded_seqs() const {
 
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
 const Request* Scheduler::serial_req(const SerialSeq& m) const { return live_req(m.slot, m.seq); }
+
+void Scheduler::skip_ckpt_commit_locked(uint64_t seq, int64_t pos) {
+    for (const auto& k : ckpt_skip_)
+        if (k.first == seq && k.second == pos) return;      /* marked already: one entry */
+    ckpt_skip_.emplace_back(seq, pos);
+}
+
+bool Scheduler::take_ckpt_skip(uint64_t seq, int64_t pos) {
+    for (size_t k = 0; k < ckpt_skip_.size(); ++k)
+        if (ckpt_skip_[k].first == seq && ckpt_skip_[k].second == pos) {
+            ckpt_skip_.erase(ckpt_skip_.begin() + (std::ptrdiff_t)k);
+            return true;
+        }
+    return false;
+}
+
+void Scheduler::skip_ckpt_commit(uint64_t seq, int64_t pos) {
+    std::lock_guard<std::mutex> lk(mu_);
+    skip_ckpt_commit_locked(seq, pos);
+}
 
 const RadBatch* Scheduler::block_context(int step) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -3991,9 +4345,18 @@ static SchedMetrics with_encode_in_flight(SchedMetrics m) {
     return m;
 }
 
+/* The running step's phase and age, read from the atomics the engine thread keeps. */
+static void with_open_step(SchedMetrics& m, int phase, int64_t start_ns) {
+    m.step_open_phase = phase;
+    m.step_open_ns = phase >= 0 ? std::max<int64_t>(0, mono_ns() - start_ns) : 0;
+}
+
 SchedMetrics Scheduler::metrics() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return with_encode_in_flight(metrics_locked());
+    SchedMetrics m = with_encode_in_flight(metrics_locked());
+    const int phase = open_phase_.load(std::memory_order_acquire);
+    with_open_step(m, phase, open_start_ns_.load(std::memory_order_relaxed));
+    return m;
 }
 
 void Scheduler::publish(bool idle) {
@@ -4026,8 +4389,14 @@ void Scheduler::publish_held() {
 }
 
 SchedMetrics Scheduler::observed_metrics() const {
-    std::lock_guard<std::mutex> lk(pub_mu_);
-    return with_encode_in_flight(pub_m_);
+    SchedMetrics m;
+    {
+        std::lock_guard<std::mutex> lk(pub_mu_);
+        m = with_encode_in_flight(pub_m_);
+    }
+    const int phase = open_phase_.load(std::memory_order_acquire);
+    with_open_step(m, phase, open_start_ns_.load(std::memory_order_relaxed));
+    return m;
 }
 
 int Scheduler::observed_requests(ReqStat* out, int max) const {
@@ -4109,6 +4478,9 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.linear_hit_rate = m.prompt_tokens
         ? (float)((double)m.linear_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.draft_acceptance = draft_.acceptance();
+    if (cfg_.draft_min_accept > 0)
+        for (int32_t slot : running_)
+            if (reqs_[(size_t)slot]->spec_off) ++m.draft_spec_off_seqs;
     m.draft_depth = draft_.next_depth();
     /* The loop bound is the array's extent, not RAD_SCHED_MAX_SPEC: the values are equal, but gcc
      * cannot prove the boundary index safe through the inlined accessors (which guard with
@@ -4124,6 +4496,12 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.lookup_held        = lookup_.held_count();
     m.lookup_held_drafts = lookup_.held_drafts();
     m.lookup_held_hits   = lookup_.held_hits();
+    m.draft_zero_cycles  = draft_.zero_cycles();
+    m.draft_probe_cycles = draft_.probe_cycles();
+    m.draft_zero_moves   = draft_.zero_moves();
+    m.hybrid_lookup      = hybrid_lookup_;
+    m.hybrid_head        = hybrid_head_;
+    m.hybrid_unahead     = hybrid_unahead_;
     if (draft_.adaptive()) {
         m.draft_adaptive = true;
         /* Over the running sequences whose estimate has started; one that has not drafted yet

@@ -1,12 +1,13 @@
 /* rad_mtp_traversal.h -- Traversal Verification (Weng et al., arXiv 2505.12398) of a draft under
- * sampling (--draft-verify traversal, needs --draft-coupling on). The walk is defined on a tree; the
- * serial head of this engine drafts a chain, a tree of one child a node, which the sampler stages
- * (core/sample/sampler.cpp). Plain code shared by the host oracle, the device kernel and the tests;
- * the short form of the argument:
+ * sampling (--draft-verify traversal, needs --draft-coupling on). The walk is defined on a tree;
+ * the serial head of this engine drafts a chain, a tree of one child a node, which the sampler
+ * stages (core/sample/sampler.cpp). Plain code shared by the host oracle, the device kernel and the
+ * tests; the short form of the argument:
  *
  * Row-wise verification (rad_mtp_rrs_decide) decides each node on its own. Traversal verification
  * decides a whole ROOT-TO-LEAF PATH at once, bottom-up, and so can accept a longer prefix from the
- * same tree (for a chain it is Block Verification, never worse than token-level rejection sampling).
+ * same tree (for a chain it is Block Verification, never worse than token-level rejection
+ * sampling).
  *
  * State of a node v during the walk: p_v (its acceptance rate, a sequence-level ratio), the target
  * law M_b(.|v) restricted to what has not been rejected below it (r), and the law the NEXT child of
@@ -58,10 +59,10 @@
  * reduction tree to mirror. e() is basic FP32 arithmetic and integer shifts, identical on host and
  * device (no libm call, no contraction: -ffp-contract=off, and the attribute below for a host
  * build that enables FMA).
- * Why FP32 suffices: the algorithm is exact for whatever positive weights define the law, as long as
- * every decision reads the same ones, which the integers guarantee. The law it realises is
- * P~(y) = m_y / sum m, within 2^-22 relative per candidate (e's error, tests/mtp_rrs_test.cpp checks
- * it) plus 2^-40 absolute of the softmax of the sampler's FP32 candidates: the accuracy class of the
+ * Why FP32 suffices: the algorithm is exact for whatever positive weights define the law, as long
+ * as every decision reads the same ones, which the integers guarantee. The law it realises is P~(y)
+ * = m_y / sum m, within 2^-22 relative per candidate (e's error, tests/mtp_rrs_test.cpp checks it)
+ * plus 2^-40 absolute of the softmax of the sampler's FP32 candidates: the accuracy class of the
  * uncoupled sample_pick (FP32 expf, FP32 running sum, a 24-bit uniform), which is the law a request
  * gets without speculation. The 8-wide FP64 sums of the walk are a fixed tree (rad_mtp_trav_sum8),
  * so a device may run them on one lane or across eight.
@@ -80,9 +81,9 @@
 #ifdef __cplusplus
 
 #define RAD_MTP_TRAV_MAX_DEPTH 16
-#define RAD_MTP_TRAV_MAX_ROWS  64              /* rows of one request the walk reads (its first ones) */
+#define RAD_MTP_TRAV_MAX_ROWS  64              /* rows of one request the walk reads (first ones) */
 #define RAD_MTP_TRAV_KEY       0x54524156ull   /* "TRAV": the walk's acceptance uniforms */
-#define RAD_MTP_TRAV_QBITS     40              /* the unit of a candidate's mass: 2^-40 of the top's */
+#define RAD_MTP_TRAV_QBITS     40              /* a candidate's mass unit: 2^-40 of the top's */
 
 /* A host build with FMA enabled must not contract the exponential's products into its sums: the
  * device does not (-ffp-contract=off), and the masses have to be the same bits. */
@@ -226,7 +227,7 @@ static inline RAD_RRS_HD int32_t rad_mtp_trav_off_token(const int32_t* ids, cons
 /* ---------------------------------------------------------------- the prepared tree */
 
 /* The eight-wide FP64 sums of the walk, as one fixed tree: the xor-4, xor-2, xor-1 butterfly of
- * eight lanes (IEEE addition is commutative, so every lane of the butterfly ends with these bits). */
+ * eight lanes (IEEE addition is commutative, so every lane ends with the same bits). */
 static inline RAD_RRS_HD double rad_mtp_trav_sum8(const double* v) {
     return ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]));
 }
@@ -237,9 +238,10 @@ static inline RAD_RRS_HD double rad_mtp_trav_sum8(const double* v) {
  * whether the node carries it), `swap` the stored slot that changed places with slot 0 (a chain row
  * whose x was not first; else 0).
  * False when the state names no child (unreachable for a rad_mtp_couple_state_valid state). */
-static inline RAD_RRS_HD bool rad_mtp_trav_canon(const RadMtpCoupleState& s, int ctl, int32_t* ids,
-                                                 double* q, int* nk, int* nt, int* tail, int* swap) {
-    /* Every index below is a constant: a device lane keeps the state and the result in registers. */
+static inline RAD_RRS_HD bool rad_mtp_trav_canon(const RadMtpCoupleState& s, int ctl,
+                                                 int32_t* ids, double* q, int* nk, int* nt,
+                                                 int* tail, int* swap) {
+    /* Every index below is a constant: a device lane keeps the state and result in registers. */
     *swap = 0;
     *tail = 0;
     if (s.scheme > 0 && ctl != 4) {
@@ -288,19 +290,21 @@ struct RadTravTree {
     int      n;                                   /* nodes */
     int      ok[RAD_MTP_TRAV_MAX_ROWS];           /* an eligible state with a valid target law */
     int      nk[RAD_MTP_TRAV_MAX_ROWS];           /* children the walk tries */
-    int      nt[RAD_MTP_TRAV_MAX_ROWS];           /* -1 Gumbel; else a rheo node's deterministic children */
-    int      tail[RAD_MTP_TRAV_MAX_ROWS];         /* a rheo node that carries its sampled tail child */
+    int      nt[RAD_MTP_TRAV_MAX_ROWS];           /* -1 Gumbel; else a rheo node's top children */
+    int      tail[RAD_MTP_TRAV_MAX_ROWS];         /* a rheo node that carries its tail child */
     int      ci[RAD_MTP_TRAV_MAX_ROWS];           /* children tried so far */
     int      child[RAD_MTP_TRAV_MAX_ROWS][8];     /* slot k's child node, or -1 */
     int32_t  ids[RAD_MTP_TRAV_MAX_ROWS][8];       /* the support, canonical order, -1 past it */
-    double   qr[RAD_MTP_TRAV_MAX_ROWS][8];        /* the draft law (Gumbel: tried children zeroed) */
-    double   m[RAD_MTP_TRAV_MAX_ROWS][8];         /* rate * residual on the support slots (the target's
-                                                     law itself until the node is entered) */
+    double   qr[RAD_MTP_TRAV_MAX_ROWS][8];        /* the draft law (Gumbel: tried ones zeroed) */
+    double   m[RAD_MTP_TRAV_MAX_ROWS][8];         /* rate * residual on the support slots (the
+                                                     target's law itself until the node is
+                                                     entered) */
     double   moff[RAD_MTP_TRAV_MAX_ROWS];         /* the same off the support, in all */
-    double   sc[RAD_MTP_TRAV_MAX_ROWS];           /* the factor m and moff still owe: the node's rate from
-                                                     its entry to its first rejected child, then 1 */
+    double   sc[RAD_MTP_TRAV_MAX_ROWS];           /* the factor m and moff still owe: the node's
+                                                     rate from its entry to its first rejected
+                                                     child, then 1 */
     double   p[RAD_MTP_TRAV_MAX_ROWS];            /* the node's acceptance rate */
-    uint64_t off[RAD_MTP_TRAV_MAX_ROWS];          /* the off-support mass in units (the final draw) */
+    uint64_t off[RAD_MTP_TRAV_MAX_ROWS];          /* the off-support mass in units (final draw) */
     float    top[RAD_MTP_TRAV_MAX_ROWS];          /* the row's largest value */
     int      stack[RAD_MTP_TRAV_MAX_DEPTH + 1];
 };
@@ -328,7 +332,8 @@ static inline RAD_RRS_HD int rad_mtp_trav_try_slot(const RadTravTree& t, int v, 
 }
 
 /* The law node v's j-th tried child was drawn from, at support slot k. `isq` is the reciprocal of
- * rad_mtp_trav_try_norm: the sum of the node's remaining draft law (Gumbel) or of its tail's (rheo). */
+ * rad_mtp_trav_try_norm: the sum of the node's remaining draft law (Gumbel) or of its tail's
+ * (rheo). */
 static inline RAD_RRS_HD double rad_mtp_trav_try_norm(const RadTravTree& t, int v) {
     const int nt = t.nt[v];
     if (nt < 0) return rad_mtp_trav_sum8(t.qr[v]);
@@ -383,7 +388,10 @@ static inline RAD_RRS_HD bool rad_mtp_trav_walk_tree(RadTravTree& t, uint64_t se
             const double f = opt.ctl == 1 ? (t.p[v] > 0 ? t.sc[v] / t.p[v] : 0.0) : t.sc[v];
             const double ratio = rad_mtp_trav_try_ratio(t, v, j, i, f * t.m[v][i]);
             const int c = top < RAD_MTP_TRAV_MAX_DEPTH && ratio >= 0 ? t.child[v][i] : -1;
-            if (c < 0) { t.nk[v] = j; continue; }   /* a child the verify no longer carries: cut here */
+            if (c < 0) {   /* a child the verify no longer carries: cut here */
+                t.nk[v] = j;
+                continue;
+            }
             const double pc = ratio < 1.0 ? ratio : 1.0;
             t.p[c] = pc;
             t.sc[c] = pc;   /* the child's law becomes rate * law, when it is first needed */
@@ -421,7 +429,8 @@ static inline RAD_RRS_HD bool rad_mtp_trav_walk_tree(RadTravTree& t, uint64_t se
         const double moff = sc * t.moff[g];
         const double S = moff + rad_mtp_trav_sum8(d);
         if (!(S > 0) || !rad_spechub_finite(S)) {
-            /* nothing of the target is left above the draft: this node cannot accept, nor a child of it */
+            /* nothing of the target is left above the draft: this node cannot accept, nor can a
+             * child of it */
             t.p[g] = 0;
             t.sc[g] = 0;
         } else {
@@ -439,16 +448,17 @@ static inline RAD_RRS_HD bool rad_mtp_trav_walk_tree(RadTravTree& t, uint64_t se
     }
 }
 
-/* The final token of node v's residual law (in proportion to m on the support slots and moff off it:
- * the node's factor sc is common to both and cancels), by the uniform
- * u: the support slots first, in the canonical order, then the off-support candidates in slot
- * order. kind 0: no token (the row keeps the pick); 1: the token of support slot `slot`; 2: the
- * off-support candidate holding unit `t` of the row's off-support mass (rad_mtp_trav_off_token). */
+/* The final token of node v's residual law (in proportion to m on the support slots and moff off
+ * it: the node's factor sc is common to both and cancels), by the uniform u: the support slots
+ * first, in the canonical order, then the off-support candidates in slot order. kind 0: no token
+ * (the row keeps the pick); 1: the token of support slot `slot`; 2: the off-support candidate
+ * holding unit `t` of the row's off-support mass (rad_mtp_trav_off_token). */
 struct RadTravPick {
     int      kind, slot;
     uint64_t t;
 };
-static inline RAD_RRS_HD RadTravPick rad_mtp_trav_final_pick(const RadTravTree& t, int v, double u) {
+static inline RAD_RRS_HD RadTravPick rad_mtp_trav_final_pick(const RadTravTree& t, int v,
+                                                             double u) {
     RadTravPick o;
     o.kind = 0; o.slot = -1; o.t = 0;
     const double woff = t.moff[v];
@@ -500,12 +510,16 @@ static inline bool rad_mtp_trav_walk(const Tree& T, int root, uint64_t seed, uin
         const int v = id[a];
         t.ok[a] = 0; t.nk[a] = 0; t.nt[a] = -1; t.tail[a] = 0; t.ci[a] = 0;
         t.moff[a] = 0; t.sc[a] = 1.0; t.p[a] = 0; t.off[a] = 0; t.top[a] = -INFINITY;
-        for (int k = 0; k < 8; ++k) { t.child[a][k] = -1; t.ids[a][k] = -1; t.qr[a][k] = 0; t.m[a][k] = 0; }
+        for (int k = 0; k < 8; ++k) {
+            t.child[a][k] = -1; t.ids[a][k] = -1; t.qr[a][k] = 0; t.m[a][k] = 0;
+        }
         rows[a] = Row{ nullptr, nullptr, 0 };
         const RadMtpCoupleState* sp = T.state(v);
         if (!sp) continue;
         int swap = 0;
-        if (!rad_mtp_trav_canon(*sp, opt.ctl, t.ids[a], t.qr[a], &t.nk[a], &t.nt[a], &t.tail[a], &swap)) continue;
+        if (!rad_mtp_trav_canon(*sp, opt.ctl, t.ids[a], t.qr[a], &t.nk[a], &t.nt[a], &t.tail[a],
+                                &swap))
+            continue;
         const int32_t* ids = nullptr; const float* val = nullptr;
         int64_t n = 0;
         if (!T.cand(v, &ids, &val, &n)) continue;
@@ -531,14 +545,16 @@ static inline bool rad_mtp_trav_walk(const Tree& T, int root, uint64_t seed, uin
     out->has_y = false;
     const int f = path[np - 1];
     if (t.ok[f]) {
-        const double ur = opt.u_final >= 0 ? opt.u_final
-                                           : rad_spechub_uniform(seed, pos0 + (uint64_t)(np - 1), RAD_SAMPLE_KEY_RESID);
+        const double ur = opt.u_final >= 0
+            ? opt.u_final
+            : rad_spechub_uniform(seed, pos0 + (uint64_t)(np - 1), RAD_SAMPLE_KEY_RESID);
         const RadTravPick pk = rad_mtp_trav_final_pick(t, f, ur);
         if (pk.kind == 1) { out->y = t.ids[f][pk.slot]; out->has_y = true; }
         if (pk.kind == 2) {
             int cnt = 0;
             while (cnt < 8 && t.ids[f][cnt] >= 0) ++cnt;
-            out->y = rad_mtp_trav_off_token(rows[f].ids, rows[f].val, rows[f].n, t.top[f], t.ids[f], cnt, pk.t);
+            out->y = rad_mtp_trav_off_token(rows[f].ids, rows[f].val, rows[f].n, t.top[f],
+                                            t.ids[f], cnt, pk.t);
             out->has_y = out->y >= 0;
         }
     }

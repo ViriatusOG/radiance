@@ -11,6 +11,7 @@
  */
 #include "quant_fixture.h"
 #include "format/ggml_planes.h"
+#include "lq_ggml_port.h"
 
 #include <cstdint>
 
@@ -151,6 +152,16 @@ TEST(the_reader_names_the_planes_the_quantiser_writes) {
         CHECK_EQ(enc_name(read), enc_name(written));
         CHECK(rad_enc_equal(&read, &written));
     }
+}
+
+/* The core's two IQ2_XXS table copies hold the same bytes libquant's hold. */
+TEST(the_reader_holds_the_iq2_xxs_tables_the_quantiser_holds) {
+    NEED_LIBQUANT();
+    CHECK_EQ(std::memcmp(ggml_planes::kSignsIq2xs, lq::ggml::ksigns_iq2xs,
+                         sizeof lq::ggml::ksigns_iq2xs), 0);
+    CHECK_EQ(std::memcmp(ggml_planes::kIq2xxsGrid, lq::ggml::iq2xxs_grid,
+                         sizeof lq::ggml::iq2xxs_grid),
+            0);
 }
 
 TEST(every_type_decodes_within_its_bound) {

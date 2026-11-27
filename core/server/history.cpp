@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 
 namespace rad {
@@ -61,25 +62,46 @@ double state_code(const std::string& s) {
 
 History::Row History::model_row(const json& s, const json* prev, double dt) {
     Row row;
-    /* The engine's decode rate is its own recent average, so it keeps reporting the last
-     * healthy number while the device has advanced nothing: emit it only where the decode
-     * step counter proves the model stepped since the last sample, so a frozen queue reads
-     * as a gap in the chart and not as a plausible rate. A zero is a reading -- idle, or
-     * nothing accepted -- and never a leftover, so it always passes. */
-    if (const double d = num(s, "decode_tps");
-        std::isfinite(d) && (d == 0.0 || !prev || num0(s, "steps_decode") > num0(*prev, "steps_decode")))
-        put(row, "decode", d);
-    /* The same trap as decode, from the other side. The scheduler's idle decay is keyed to the last
-     * step of ANY kind, so while the model only decodes the prefill window is never aged and
-     * prefill_tps keeps reporting the last prompt's rate: on a live lane that drew a flat
-     * ~3,500 tok/s prefill line across four minutes the model spent decoding. Emit it only where a
-     * prefill-bearing step proves prefill ran, or where it reads a true zero -- a zero is a reading
-     * and never a leftover. A mixed step carries a prefill chunk too, so it counts as progress. */
-    if (const double p = num(s, "prefill_tps");
-        std::isfinite(p) && (p == 0.0 || !prev
-                             || num0(s, "steps_prefill") + num0(s, "steps_mixed")
-                                    > num0(*prev, "steps_prefill") + num0(*prev, "steps_mixed")))
-        put(row, "prefill", p);
+    /* What the model is doing at this sample, from its live requests and the step under way. The
+     * counters are published when a step ends, so inside a long step they still describe the one
+     * before; the request states and the open step do not lag. */
+    bool in_prefill = false, in_decode = false;
+    if (const json* rq = member(s, "requests"); rq && rq->is_array())
+        for (const json& r : *rq) {
+            const std::string st = text(r, "state");
+            in_prefill |= st == "prefill";
+            in_decode |= st == "decode";
+        }
+    const double open_phase = num(s, "step_open_phase");
+    in_prefill |= open_phase == 0.0 || open_phase == 2.0;
+    auto advanced = [&](std::initializer_list<const char*> fields) {
+        if (!prev) return true;
+        double now = 0, was = 0;
+        for (const char* f : fields) {
+            now += num0(s, f);
+            was += num0(*prev, f);
+        }
+        return now > was;
+    };
+    const bool busy = in_prefill || in_decode || num0(s, "running") > 0 || open_phase >= 0.0
+                      || (prev && advanced({ "steps" }));
+    put(row, "busy", busy ? 1.0 : 0.0);
+    /* The decode and prefill rates are the engine's own recent averages, which hold their last
+     * value while nothing of their kind runs (the decay is keyed to steps of any kind), so with no
+     * work of that kind they read 0. Where such work exists but none of its steps finished since
+     * the last sample (a long prefill step holds decode back) the rate is left out, and the page
+     * draws through those gaps while the model is busy. */
+    if (const double d = num(s, "decode_tps"); std::isfinite(d)) {
+        if (advanced({ "steps_decode" })) put(row, "decode", d);
+        else if (!in_decode) put(row, "decode", 0.0);
+    }
+    if (const double p = num(s, "prefill_tps"); std::isfinite(p)) {
+        if (in_prefill || advanced({ "steps_prefill", "steps_mixed" })) {
+            if (p > 0.0 || !in_prefill) put(row, "prefill", p);
+        } else {
+            put(row, "prefill", 0.0);
+        }
+    }
     put(row, "running", num(s, "running"));
     put(row, "waiting", num(s, "waiting"));
     put(row, "preempted", num(s, "preempted"));
@@ -87,6 +109,12 @@ History::Row History::model_row(const json& s, const json* prev, double dt) {
     put(row, "hit", num(s, "prefix_hit_rate"));
     put(row, "kvUsed", num(s, "kv_bytes_used"));
     put(row, "kvCap", num(s, "kv_bytes_total"));
+    /* The same pool in tokens: held now, what the pool holds at present, and what it could hold
+     * with every block of its carve (VRAM lent to the expert slab included). */
+    put(row, "kvTokUsed", num(s, "kv_tokens_used"));
+    put(row, "kvTokCap", num(s, "kv_tokens_total"));
+    if (const double mx = num(s, "kv_tokens_max"); mx > num0(s, "kv_tokens_total"))
+        put(row, "kvTokMax", mx);
     /* The pool's bytes split by tokens: what finished turns keep for reuse and what running
      * requests read. */
     {
@@ -95,6 +123,8 @@ History::Row History::model_row(const json& s, const json* prev, double dt) {
         const double kept_b = used > 0 ? held * kept / used : 0.0;
         put(row, "kvKept", kept_b);
         put(row, "kvRead", std::max(0.0, held - kept_b));
+        put(row, "kvTokKept", kept);
+        put(row, "kvTokRead", std::max(0.0, used - kept));
     }
     if (const double best = num(s, "step_ns_decode_best"); best > 0) put(row, "stepBest", best / 1e6);
     const json* jobs = member(s, "jobs");
@@ -182,7 +212,9 @@ History::Row History::model_row(const json& s, const json* prev, double dt) {
     {
         const json* ex = member(s, "experts");
         const json* xp = member(p, "experts");
-        if (ex && xp) {
+        /* Nothing to hit or move while every expert sits in VRAM. */
+        const json* tf = ex ? member(*ex, "tiered") : nullptr;
+        if (ex && xp && tf && tf->is_boolean() && tf->get<bool>()) {
             if (const double routed = num0(*ex, "routed") - num0(*xp, "routed"); routed > 0)
                 put(row, "expHit", (num0(*ex, "routed_res") - num0(*xp, "routed_res")) / routed);
             put(row, "expIn", std::max(0.0, (num0(*ex, "promotions") - num0(*xp, "promotions")) / dt));

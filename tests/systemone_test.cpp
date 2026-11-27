@@ -89,6 +89,18 @@ int parse(DictTokenizer& tok, const std::string& body, DecisionRequest* r, ApiEr
 
 }  /* namespace */
 
+TEST(a_request_with_too_many_questions_is_refused) {
+    DictTokenizer tok;
+    json qs = json::object();
+    for (size_t i = 0; i <= kMaxDecisionQuestions; ++i)
+        qs["q" + std::to_string(i)] = { { "type", "noul" }, { "instructions", "Is it so?" } };
+    DecisionRequest r;
+    ApiError e;
+    CHECK(parse(tok, json({ { "state", "x" }, { "questions", qs } }).dump(), &r, &e) != RAD_OK);
+    CHECK_EQ(e.status, 400);
+    CHECK(e.message.find(std::to_string(kMaxDecisionQuestions)) != std::string::npos);
+}
+
 TEST(a_single_question_is_d1s_prompt_as_one_text) {
     DictTokenizer tok;
     DecisionRequest r;

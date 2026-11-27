@@ -36,8 +36,8 @@ namespace lq {
 using Gram = std::shared_ptr<const std::vector<float>>;
 
 /* `blk.7.ffn_gate_up_exps.123.weight` -> `blk.7.ffn_gate_up_exps`: the stem a layer's pooled
- * Hessian file is named by. A vocabulary-weighted head's width class, `output.k4.weight`, pools
- * to `output`. */
+ * Hessian file is named by. An expert named by an `e<index>` component, `blk.7.e12.gu`, pools to
+ * `blk.7.gu`. A vocabulary-weighted head's width class, `output.k4.weight`, pools to `output`. */
 std::string calib_stem(const char* name);
 
 /* The stem `name`'s Hessian is read from in `dir`: the weight's own (the name less `.weight`,

@@ -398,7 +398,11 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.weights.push_back(w);
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
-        if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        if (!in_.container ||
+            !(weight_file_direct(wi, prog.ctx.world_size) ||
+              (in_.file_relayout && weight_file_relaid(prog, wi, prog.ctx.world_size) &&
+               weight_bytes(wi) <= RAD_PLACE_FILE_WINDOW_BYTES)))
+            mu.file_direct = false;
         /* The drafter's own weights (the "mtp." namespace) run on every draft pass of every
          * decode step; the expert fill pins them in the host pool ahead of everything ranked. */
         if (wi.name.rfind("mtp.", 0) == 0) mu.draft_head = true;
@@ -529,7 +533,8 @@ struct HostFall {
             }
             return true;
         }
-        /* The file tier, for a unit stored in the container as its kernel reads it. A Tier::SSD
+        /* The file tier, for a unit stored in the container as its kernel reads it or relaid on
+         * each read (MoveUnit::file_direct). A Tier::SSD
          * unit has no address until staged. A scheduled unit is staged by Plan::prefetch. A routed
          * one cannot be scheduled, since a grouped MoE GEMM needs every expert's pointer at issue,
          * so the file stager reads all of a routed layer's file-tier experts into a VRAM buffer
@@ -732,9 +737,10 @@ int Planner::assign_expert_tiered(Plan* p) {
                 mu.reason = "fits in no tier";
                 /* With the file tier on, only a non-file-direct unit gets here (HostFall::place). */
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room, and its "
-                                         "stored form is not the container's (a relayout, a "
-                                         "dtype conversion or a shard), so the file tier cannot "
-                                         "read it in place"
+                                         "stored form is not the container's in a way a file "
+                                         "read cannot make (a widening, a shard, or a relayout "
+                                         "whose kernel has no relayout function), so the file "
+                                         "tier cannot serve it"
                                        : "the host pool is full and no --weights-disk-tier was "
                                          "given");
                 rc = RAD_E_NOMEM;
@@ -1022,8 +1028,8 @@ int Planner::pin_embedding(const Program& prog, const Config& cfg, Plan* p) cons
     /* Engine::plan resolves Ram only where weight_footprint found a table by the same test, so
      * finding none means the plan and the budget saw different programs. */
     if (!found) {
-        RAD_ERR("placement: --embedding-placement ram found no model-level weight that only "
-                "embed_lookup reads");
+        RAD_ERR("placement: --embedding-placement ram found no model-level weight that only a "
+                "token gather (embed_lookup, embed_tq, embed_exl3i) reads");
         p->notes.push_back("--embedding-placement ram: no token embedding table to place");
         rc = RAD_E_STATE;
     }

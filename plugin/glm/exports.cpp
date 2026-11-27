@@ -52,7 +52,7 @@ extern "C" int rad_plugin_reference(void) { return 0; }
 
 /* The plugin declines a machine whose cards are all another family's, as libr4d does
  * (r4d_rows.cpp, rad_plugin_open). Its device rows are gfx12 code; where no code object fits, the
- * loader leaves them out, but the schema would stay declared, and GateQuantFP8 asks
+ * loader leaves them out, but the schema would stay declared, and GateQuant asks
  * rad_op_declared before it issues swiglu_clamped_had_quant_i8g: on such a card a model would
  * pick the fused form and fail at startup with the op unserved (the host row is a reference row,
  * kept out of serving). The test reads the KFD topology (gfx_target_version 120000..129999 is the

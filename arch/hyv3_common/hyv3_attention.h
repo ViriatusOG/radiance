@@ -4,30 +4,29 @@
  *   rmsnorm -> q/k/v gemm_nt_q -> per-head q/k RMSNorm -> rope -> kv_store -> attn_paged
  *   -> quant_act_fp8 -> o gemm_nt_q -> [all_reduce] -> residual add
  *
- * Unlike AttnFP8, the projections stay separate so Q and K can be normalized independently before
+ * Unlike AttnQ, the projections stay separate so Q and K can be normalized independently before
  * rotation. The weights and all non-attention activations use the same contracts as the other FP8
- * blocks in rad_fp8.h.
+ * blocks in rad_linear.h.
  */
 #ifndef HYV3_ATTENTION_H
 #define HYV3_ATTENTION_H
 
-#include <arch/rad_fp8.h>
+#include <arch/rad_linear.h>
 
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 
 namespace rad {
 namespace arch {
 
-struct AttnQKFP8 {
+struct AttnQK {
     struct Wire {
         rad_buf x = 0;       /* [max_tok, n_embd] residual stream */
-        ActFP8 h{};          /* [max_tok, n_embd] normed input, then o output */
+        ActQ h{};          /* [max_tok, n_embd] normed input, then o output */
         rad_buf q = 0;       /* [max_tok, q_dim], projected, normed and rotated */
         rad_buf k = 0;       /* [max_tok, kv_dim], projected, normed and rotated */
         rad_buf v = 0;       /* [max_tok, kv_dim], projected */
-        ActFP8 attn{};       /* [max_tok, q_dim] attention output */
+        ActQ attn{};       /* [max_tok, q_dim] attention output */
     };
 
     struct Src {
@@ -46,9 +45,9 @@ struct AttnQKFP8 {
     rad_kvgroup kv = 0;
 
     rad_weight w_norm = 0, w_q_norm = 0, w_k_norm = 0;
-    LinearFP8 q{}, k{}, v{}, o{};
-    NormQuantFP8 nq_h{};
-    QuantFP8 q_attn{};
+    LinearQ q{}, k{}, v{}, o{};
+    NormQuant nq_h{};
+    QuantAct q_attn{};
     rad_op op_q_norm = 0, op_k_norm = 0;
     rad_op op_rope_q = 0, op_rope_k = 0, op_attn = 0, op_kv_store = 0;
     rad_op op_qkr_store = 0; /* Q/K norms, NeoX rotary and BF16 cache store, decode band */
@@ -60,7 +59,7 @@ struct AttnQKFP8 {
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
-inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+inline int AttnQK::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                               rad_kvgroup group, const Wire& wire, const Src& src,
                               bool fold, bool add_out) {
     g = geom;
@@ -112,7 +111,8 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                    {w.k}, {w.k});
 
     const rad_op attn = rad_decl_op(b, "attn_paged",
-                         RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                         RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
+                                    RAD_INT("head_dim", g.head_dim),
                                     RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                     RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
                                     RAD_INT("block_size", RAD_KV_BLOCK),
@@ -129,8 +129,8 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                      {w.k, w.v}, {});
 
     /* The standalone chain stays available for prefill, scaled/multicomponent rotary, the int8
-     * cache and libraries without the fold. A 128-channel BF16 decode prologue is otherwise five tiny
-     * launches; the fused kernel preserves the BF16 norm rounding before the rotary. */
+     * cache and libraries without the fold. A 128-channel BF16 decode prologue is otherwise five
+     * tiny launches; the fused kernel preserves the BF16 norm rounding before the rotary. */
     if (g.head_dim == 128 && !std::strcmp(g.dtype, "bf16") &&
         !std::strcmp(g.kv_dtype, "bf16") &&
         !g.rope_mc && g.yarn.factor == 0.0f &&
@@ -142,7 +142,8 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
                                     RAD_F64("scale", g.rope_scale), RAD_STR("mode", "neox"),
                                     RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype),
-                                    RAD_INT("v_norm", 0), RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                    RAD_INT("v_norm", 0),
+                                    RAD_INT("block_size", rad_kv_block_size(b, kv)),
                                     RAD_STR("kv_dtype", g.kv_dtype)),
                          RAD_WEIGHTS(w_q_norm, w_k_norm));
         if (!op_qkr_store || !rad_op_resolved(b, op_qkr_store)) op_qkr_store = 0;
@@ -154,13 +155,7 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), {src.o}, w.attn, w.h.x));
     if (g.world > 1)
-        op_ar = rw(b, RAD_OP(b, "all_reduce",
-                       RAD_PARAMS(RAD_INT("world_size", g.world),
-                                  RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
-                                  RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                  RAD_INT("min_bytes", g.wire_min_bytes)),
-                       RAD_NOWEIGHTS),
-                   {w.h.x}, {w.h.x});
+        op_ar = decl_all_reduce(b, g, w.h.x);
     if (add_out) op_add = rw(b, RAD_OP(b, "add",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_STR("dtype", g.dtype)),
@@ -169,7 +164,7 @@ inline int AttnQKFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     return op_attn && op_kv_store && (!add_out || op_add) ? RAD_OK : RAD_E_INVAL;
 }
 
-inline void AttnQKFP8::step(RadCtx* c, const RadBatch* batch) const {
+inline void AttnQK::step(RadCtx* c, const RadBatch* batch) const {
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
     const int32_t* slot = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table : nullptr;

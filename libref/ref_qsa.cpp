@@ -151,7 +151,8 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
         } else {
             std::vector<float> ord;
             for (int64_t b : live) ord.push_back(val[(size_t)b]);
-            std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
+            std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(),
+                             std::greater<float>());
             const float thr = ord[(size_t)(topk - 1)];
             for (int64_t b : live)
                 if (val[(size_t)b] > thr) take.push_back(b);
@@ -167,7 +168,8 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
         }
         for (int64_t i = out; i <= topk; ++i) st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);
         st_int(ns->dtype, ns->data, offlin(ns, m), out);
-        st_int(su->dtype, su->data, offlin(su, m), out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
+        st_int(su->dtype, su->data, offlin(su, m), out == 0 ? 0
+               : (out - 1) * ratio + p % ratio + 1);
     }
     return RAD_OK;
 }
@@ -212,9 +214,9 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
  * block's page bt[s][b] (-1 when the sequence has no tail slot), its first-token position b * ratio
  * in bpos (or, with `rope`, three components: a first token in the batch reads its own, an earlier
  * one its position plus the shift rope[0][cu[s]] - p0), and, when the slot exists, the block's
- * `ratio` raw keys in stage rows w * ratio + i: key q from the batch row cu[s] + q - p0 when q >= p0,
- * else from tail row q % ring. Items past the count get page -1 and position 0 and leave `stage`
- * alone. nc[s] = (last position + 1) / ratio, 0 for an empty sequence. */
+ * `ratio` raw keys in stage rows w * ratio + i: key q from the batch row cu[s] + q - p0 when
+ * q >= p0, else from tail row q % ring. Items past the count get page -1 and position 0 and
+ * leave `stage` alone. nc[s] = (last position + 1) / ratio, 0 for an empty sequence. */
 int ref_qsa_work(const RadArgs* a, RadStream) {
     if (a->n_t < 11) return RAD_E_INVAL;
     const RadTensor *k = t_in(a, 0), *po = t_in(a, 1), *cu = t_in(a, 2), *tl = t_in(a, 3);

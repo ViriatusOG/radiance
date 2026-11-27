@@ -321,7 +321,7 @@ AVX_KERNEL(vol_index) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ tile_grid / tile_crop / tile_stitch */
+/* ---------------------------------------------------- tile_grid / tile_crop / tile_stitch */
 /* diffusers' tiled decodes: libref/ref_ltx.cpp states the cuts and the blends. */
 namespace {
 struct TileCut {
@@ -394,7 +394,8 @@ AVX_KERNEL(tile_crop) {
     for (int64_t r = 0; r < t * h * w; ++r) {
         const int64_t f = r / (h * w), i = (r / w) % h, j = r % w;
         const int64_t xb = rowoff(X, ((t0 + f) * H + y0 + i) * W + x0 + j, C), yb = rowoff(Y, r, C);
-        for (int64_t c = 0; c < C; ++c) st_elem(Y->data, Y->dtype, yb + c * ys, ldt(X, xb + c * xs));
+        for (int64_t c = 0; c < C; ++c)
+            st_elem(Y->data, Y->dtype, yb + c * ys, ldt(X, xb + c * xs));
     }
     return RAD_OK;
 }
@@ -437,7 +438,8 @@ AVX_KERNEL(tile_stitch) {
         return RAD_E_SHAPE;
     const int64_t T = at_i(G, 0), H = at_i(G, 1), W = at_i(G, 2), f0 = at_i(Fst, 0);
     const int64_t Hpx = H * sc * p, Wpx = W * sc * p, P = C * p * p;
-    if (T <= 0 || H <= 0 || W <= 0 || Y->shape[1] != Wpx * C || Y->shape[0] % Hpx) return RAD_E_SHAPE;
+    if (T <= 0 || H <= 0 || W <= 0 || Y->shape[1] != Wpx * C || Y->shape[0] % Hpx)
+        return RAD_E_SHAPE;
     const int64_t nf = Y->shape[0] / Hpx;
     const TileStore ts(cs, ct, T, H, W, sc, st);
     if (nf <= 0 || f0 < 0 || f0 + nf > st * T - (st - 1) || rows_of(X, P) < ts.rows())
@@ -487,7 +489,8 @@ AVX_KERNEL(tile_stitch) {
         for (int64_t Xp = 0; Xp < Wpx; ++Xp)
             for (int64_t c = 0; c < C; ++c) {
                 float v = S(kt, f, Yp, Xp, c);
-                if (kt > 0 && f < et) v = mix(S(kt - 1, ts.frames(kt - 1) - et + f, Yp, Xp, c), v, f, et);
+                if (kt > 0 && f < et)
+                    v = mix(S(kt - 1, ts.frames(kt - 1) - et + f, Yp, Xp, c), v, f, et);
                 const float cl = std::min(std::max(v, -1.0f), 1.0f);
                 float u = narrow1(dt, narrow1(dt, cl / 2.0f) + 0.5f);
                 u = std::min(std::max(u, 0.0f), 1.0f);
@@ -571,7 +574,8 @@ AVX_KERNEL(bwe_up) {
             }
             const float up = narrow1(dt, (float)r * narrow1(dt, acc));
             const float v = narrow1(dt, ldt(Rz, rowoff(Rz, o, ch) + h * rs) + up);
-            st_elem(Y->data, Y->dtype, rowoff(Y, o, ch) + h * ys, std::min(std::max(v, -1.0f), 1.0f));
+            st_elem(Y->data, Y->dtype, rowoff(Y, o, ch) + h * ys,
+                    std::min(std::max(v, -1.0f), 1.0f));
         }
     return RAD_OK;
 }

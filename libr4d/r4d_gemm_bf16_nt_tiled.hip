@@ -38,7 +38,7 @@
 template <int TM, int TN, bool SPLIT>
 __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk, int LDA, int LDC) {
   constexpr int BM = BT_WM * TM * 16, BN = BT_WN * TN * 16;
   constexpr int CPR = BT_BK / 8;                  // 16-byte chunks a staged row
   constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
@@ -69,7 +69,7 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
   for (int i = 0; i < AL; ++i) {
     const int c = tid + 256 * i, r = c / CPR, e = (c % CPR) * 8;
     const int gr = m0 + r < M ? m0 + r : M - 1;
-    aoff[i] = (unsigned)gr * (unsigned)K + (unsigned)e;
+    aoff[i] = (unsigned)gr * (unsigned)LDA + (unsigned)e;
     adst[i] = sA + r * BT_PITCH + e;
   }
 #pragma unroll
@@ -162,7 +162,7 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
         if constexpr (SPLIT) v = tot[i][j][e];
         else v += acc[i][j][e];
         const int m = mb + e;
-        if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
+        if (n < N && m < M) C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
       }
     }
 }
@@ -179,27 +179,38 @@ int r4d_gemm_bf16_nt_tiled_arm(int M, int N) {
 }
 
 // `tile`: 1 = 128 x 128, 2 = 64 x 64 (M x N).
+static int gemm_bf16_tiled_p(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                             long stream, long long lda, long long ldc);
 int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, int tile,
                            long stream) {
+  return gemm_bf16_tiled_p(a, w, c, M, K, N, SK, tile, stream, K, N);
+}
+/* `lda` / `ldc`: the rows' pitches in elements. A is staged in 16-byte chunks, so its pitch is a
+ * multiple of 8. */
+static int gemm_bf16_tiled_p(long a, long w, long c, int M, int K, int N, int SK, int tile,
+                             long stream, long long lda, long long ldc) {
   if (M < 1 || N < 1 || K < BT_BK || K % BT_BK) return -1;
+  if (lda < K || ldc < N || lda % 8 || ldc > INT32_MAX) return -1;
   if (SK < 1 || K % ((int64_t)SK * 16)) return -1;
   if (tile != 1 && tile != 2) return -1;
+  // 32-bit element offsets: W whole, and A from each launch's base (a chunk of rows).
+  if ((long long)N * K >= (1ll << 32)) return -1;
   const int spk = K / SK / 16;
   const int bt = tile == 1 ? 128 : 64;
-  const int chunk = r4d_bf16_gemm_chunk_rows(M, N, K, bt, bt);
+  const int chunk = r4d_bf16_gemm_chunk_rows_lda(M, N, K, lda, bt, bt);
   if (!chunk) return -1;
   dim3 block(256);
   auto Wp = (const unsigned short*)w;
   hipStream_t st = (hipStream_t)stream;
 #define LAUNCH(TM, TN, S)                                                                          \
   hipLaunchKernelGGL((r4d_gemm_bf16_nt_tiled_kernel<TM, TN, S>), grid, block, 0, st, Ap, Wp, Cp,   \
-                     mm, K, N, spk)
+                     mm, K, N, spk, (int)lda, (int)ldc)
   const bool split = SK > 1;
   for (int64_t m0 = 0; m0 < M; m0 += chunk) {
     const int mm = (int)std::min<int64_t>(chunk, M - m0);
     dim3 grid((N + bt - 1) / bt, (mm + bt - 1) / bt);
-    auto Ap = (const unsigned short*)a + m0 * K;
-    auto Cp = (__hip_bfloat16*)c + m0 * N;
+    auto Ap = (const unsigned short*)a + m0 * lda;
+    auto Cp = (__hip_bfloat16*)c + m0 * ldc;
     if (tile == 1) {
       if (split)
         LAUNCH(4, 2, true);
@@ -221,16 +232,17 @@ int r4d_gemm_bf16_nt_tiled(long a, long w, long c, int M, int K, int N, int SK, 
 // ============================================================== the plugin ABI entry point
 extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   GemmOps g;
-  int rc = gemm_ops(a, &g, 0);
+  int rc = gemm_ops(a, &g, 0, 0, /*pitched=*/1);
   if (rc != RAD_OK) return rc;
   if (!r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, 64, 64)) return R4D_NO(RAD_E_SHAPE);
+  if (g.lda % 8) return R4D_NO(RAD_E_STRIDE);
   // The skinny row's split rule with the same arguments keeps the two rows' outputs identical.
   Cfg c;
   rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);
   if (rc != RAD_OK) return rc;
   int tile = (int)r4d_geti_or(a, "tile", 0);
   if (tile == 0) tile = r4d_gemm_bf16_nt_tiled_arm((int)g.M, (int)g.N);
-  const int e = r4d_gemm_bf16_nt_tiled(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
-                                       (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s);
+  const int e = gemm_bf16_tiled_p(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M,
+                                  (int)g.K, (int)g.N, c.sk, tile, (long)(uintptr_t)s, g.lda, g.ldc);
   return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
 }

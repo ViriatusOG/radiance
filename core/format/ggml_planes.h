@@ -1,7 +1,7 @@
-/* ggml_planes.h -- llama.cpp's Q8_0, Q4_K and Q6_K blocks as the affine planes libquant/lq_ggml.cpp
- * writes them, for reading a GGUF without a recipe. The core cannot call libquant, so this is the
- * reader's copy; quant_ggml_test holds the two to the same encoding, and checkpoint_test decodes
- * the planes against the block definition.
+/* ggml_planes.h -- llama.cpp's Q8_0, Q4_K, Q6_K and IQ2_XXS blocks as the affine planes
+ * libquant/lq_ggml.cpp writes them, for reading a GGUF without a recipe. The core cannot call
+ * libquant, so this is the reader's copy; quant_ggml_test holds the two to the same encoding and
+ * the same table bytes, and checkpoint_test decodes the planes against the block definition.
  *
  * The planes are bit for bit what lq_ggml's unpack_<type> writes from the same blocks (its header
  * lists them), so a container holds the same numbers whichever way a GGUF reached it. The blocks
@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "rad_encoding.h"
+#include "ggml_iq2_tables.h"
 #include "../text/gguf.h"
 
 #include <cstdint>
@@ -131,11 +132,48 @@ inline void split_q6_K(const uint8_t* blocks, int64_t nb, size_t bb, uint8_t* co
     c.flush();
 }
 
-/* A plane as lq_ggml's encoding_of lists it: one row high, `block` values wide. */
+/* block_iq2_xxs: d f16 @0, qs u16[32] @2. Each 32-value subblock holds a0, four 8-bit grid codes
+ * (value l's the low byte of word 4l), and a1, four 7-bit sign indices (bits 7l..7l+6 of the word)
+ * and one 4-bit scale word in the top bits. The grid row is the 256-entry codebook every row
+ * shares, and scale.2 the row's 1/8. */
+inline uint32_t le32(const uint8_t* p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+inline void split_iq2_xxs(const uint8_t* blocks, int64_t nb, size_t bb, uint8_t* const* row) {
+    Bits s(row[3]);
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b = blocks + bb * i;
+        const uint8_t* qs = b + 2;
+        for (int ib = 0; ib < kQK_K / 32; ++ib) {
+            const uint8_t* w = qs + 8 * ib;
+            const uint32_t a0 = le32(w);
+            const uint32_t a1 = le32(w + 4);
+            for (int l = 0; l < 4; ++l) {
+                row[0][kQK_K / 8 * i + 4 * ib + l] = (uint8_t)(a0 >> (8 * l));
+                row[2][kQK_K / 8 * i + 4 * ib + l] = kSignsIq2xs[(a1 >> (7 * l)) & 127];
+            }
+            s.put(2 * (a1 >> 28) + 1, 5);
+        }
+        copy16(row[4], i, b);
+    }
+    s.flush();
+    for (int k = 0; k < 256; ++k)
+        for (int j = 0; j < 8; ++j) row[1][8 * k + j] = (uint8_t)(kIq2xxsGrid[k] >> (8 * j));
+    const uint32_t one8 = 0x3E000000u;  /* 0.125f in f32, little endian */
+    row[5][0] = (uint8_t)one8;
+    row[5][1] = (uint8_t)(one8 >> 8);
+    row[5][2] = (uint8_t)(one8 >> 16);
+    row[5][3] = (uint8_t)(one8 >> 24);
+}
+
+/* A plane as lq_ggml's encoding_of lists it: block[2] rows x columns one element covers (0 =
+ * whole), a table instead carries its own [extent[0] x extent[1]]. */
 struct Plane {
     const char* role;
     uint32_t    dtype;
-    int64_t     block;
+    int64_t     block[2];
+    int64_t     extent[2];
 };
 
 /* A block type this header splits: ggml's type number, its planes in encoding order (the rest
@@ -147,13 +185,20 @@ struct Type {
 };
 
 inline constexpr Type kTypes[] = {
-    { 8, { { "codes", RAD_I8, 1 }, { "scale", RAD_F16, 32 } }, split_q8_0 },
+    { 8, { { "codes", RAD_I8, { 1, 1 } }, { "scale", RAD_F16, { 1, 32 } } }, split_q8_0 },
     { 12,
-      { { "codes", RAD_U4, 1 }, { "scale", RAD_U6, 32 }, { "scale.1", RAD_F16, 256 },
-        { "min", RAD_U6, 32 }, { "min.1", RAD_F16, 256 } },
+      { { "codes", RAD_U4, { 1, 1 } }, { "scale", RAD_U6, { 1, 32 } },
+        { "scale.1", RAD_F16, { 1, 256 } }, { "min", RAD_U6, { 1, 32 } },
+        { "min.1", RAD_F16, { 1, 256 } } },
       split_q4_K },
-    { 14, { { "codes", RAD_I6, 1 }, { "scale", RAD_I8, 16 }, { "scale.1", RAD_F16, 256 } },
+    { 14,
+      { { "codes", RAD_I6, { 1, 1 } }, { "scale", RAD_I8, { 1, 16 } }, { "scale.1", RAD_F16, { 1, 256 } } },
       split_q6_K },
+    { 16,
+      { { "codes", RAD_U8, { 1, 8 } }, { "grid", RAD_U8, { 0, 0 }, { 256, 8 } },
+        { "signs", RAD_U1, { 1, 1 } }, { "scale", RAD_U5, { 1, 32 } },
+        { "scale.1", RAD_F16, { 1, 256 } }, { "scale.2", RAD_F32, { 0, 0 } } },
+      split_iq2_xxs },
 };
 
 inline const Type* type_of(uint32_t ggml_type) {
@@ -173,15 +218,18 @@ inline bool ggml_plane_encoding(uint32_t ggml_type, RadEncoding* e) {
     rad_enc_copy_str(e->scheme, "affine");
     for (const ggml_planes::Plane& p : t->planes) {
         if (!p.role) break;
-        rad_enc_add_plane(e, p.role, p.dtype, 1, p.block);
+        if (p.extent[0] > 0)
+            rad_enc_add_table(e, p.role, p.dtype, p.extent[0], p.extent[1]);
+        else
+            rad_enc_add_plane(e, p.role, p.dtype, p.block[0], p.block[1]);
     }
     return true;
 }
 
 /* One row of `cols` values held as GGUF blocks, split into one row of every plane of
  * ggml_plane_encoding's encoding: plane i's row goes to row[i], sized rad_enc_plane_dims and
- * rad_enc_row_bytes give for a one-row weight. `cols` is a whole number of blocks, and the type one
- * ggml_plane_encoding accepts. */
+ * rad_enc_row_bytes give for a one-row weight, a TABLE plane's row its whole table. `cols` is a
+ * whole number of blocks, and the type one ggml_plane_encoding accepts. */
 inline void ggml_plane_row(uint32_t ggml_type, const uint8_t* blocks, int64_t cols,
                            uint8_t* const* row) {
     const GgufDtype& gd = *gguf_dtype(ggml_type);

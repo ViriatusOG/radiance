@@ -27,7 +27,7 @@ TEST(a_failed_device_selection_cannot_publish_a_pager_stream) {
     CHECK_OK(rad_dev_set(0));
 }
 TEST(a_read_error_cannot_hide_an_unproven_readback_fence) {
-    if (!rad::device_is_host()) { radtest::skip("host backend only"); return; }
+    if (!rad::device_is_host()) SKIP("host backend only");
     const pid_t child = fork();
     REQUIRE(child >= 0);
     if (child == 0) {

@@ -428,14 +428,6 @@ extern "C" int r4d_attn_vit_h72_strided_bf16(const void* q, const void* k, const
     return 0;
 }
 
-// Compiled geometry: head_dim, the two query-block heights, and the switch length.
-extern "C" void r4d_attn_vit_dims(int* head_dim, int* rows_large, int* rows_small, int* split) {
-    if (head_dim)    *head_dim    = 72;
-    if (rows_large)  *rows_large  = V_NWARPS * 16 * V_QB;
-    if (rows_small)  *rows_small  = V_SNWARPS * 16 * V_SQB;
-    if (split)       *split       = V_SPLIT;
-}
-
 // ============================================================== the plugin ABI entry points
 
 /* ------------------------------------------------------------------ dense (vision) */

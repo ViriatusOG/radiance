@@ -24,6 +24,9 @@ void resize_lanczos_rgb(const Frame& src, int32_t w, int32_t h, Frame* out);
 void resize_bilinear_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out);
 /* `src` over an opaque white ground. */
 void composite_white(const FrameRGBA& src, Frame* out);
+/* `src` over an 8-pixel checkerboard of 204 and 153, in integers, as Inkling 2's processor
+ * composites a picture with alpha (an opaque one is its RGB). */
+void composite_checkerboard(const FrameRGBA& src, Frame* out);
 
 }  /* namespace mm */
 }  /* namespace rad */

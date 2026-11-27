@@ -31,7 +31,6 @@
 
 #include "util/json.h"
 
-#include <chrono>
 #include <cmath>
 #include <thread>
 
@@ -90,9 +89,9 @@ int read_ask(const HttpRequest& q, const OaiLimits& lim, const gen::ShapeGenInfo
     if (!b.contains("image") || !b["image"].is_string() || b["image"].get<std::string>().empty())
         return bad("image", "'image' must be the picture as base64");
     std::string img = b["image"].get<std::string>();
-    if (img.rfind("data:", 0) == 0) {
+    if (img.starts_with("data:")) {
         const size_t comma = img.find(',');
-        if (comma == std::string::npos || img.compare(comma - 7, 7, ";base64") != 0)
+        if (comma == std::string::npos || comma < 7 || img.compare(comma - 7, 7, ";base64") != 0)
             return bad("image", "a data URL must be base64 ('data:<type>;base64,...')");
         img = img.substr(comma + 1);
     }
@@ -199,16 +198,24 @@ HttpResponse Server::handle_shape_generate(const HttpRequest& req) {
     ShapeAsk a;
     ApiError err;
     if (read_ask(req, lim_, info, &a, &err) < 0) return error_response(err, req.peer);
+    if (auto no = admit(1, req.peer)) return *no;
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
     std::shared_ptr<gen::ShapeTicket> t = a.req->ticket;
     std::string why;
     if (const int st = deps_.shapes->submit(std::move(a.req), &why); st < 0)
         return error_response(st == RAD_E_INVAL ? err_bad("image", why) : err_overloaded(why),
                               req.peer);
-    while (!t->wait(500))
+    while (!t->wait(500)) {
+        if (req.peer_gone()) {
+            t->cancel.store(true);
+            return client_closed();
+        }
         if (stopping_.load()) {
             t->cancel.store(true);
             return error_response(err_overloaded("the server is stopping"), req.peer);
         }
+    }
     std::string file, mime;
     if (const int st = finish_file(*t, info, a.type, &file, &mime, &why); st < 0)
         return error_response(st == RAD_E_INVAL ? err_bad("image", why) : err_internal(why),
@@ -231,6 +238,7 @@ void Server::shape_work(std::shared_ptr<ShapeJob> j) {
     std::string file, mime, why;
     const int st = t.finished() ? finish_file(t, info, j->type, &file, &mime, &why)
                                 : RAD_E_CANCELLED;
+    release(1);
     std::lock_guard<std::mutex> lk(shapes_m_);
     j->finished = true;
     j->done_at = unix_now();
@@ -306,6 +314,9 @@ HttpResponse Server::handle_shape_send(const HttpRequest& req) {
     ShapeAsk a;
     ApiError err;
     if (read_ask(req, lim_, info, &a, &err) < 0) return error_response(err, req.peer);
+    if (auto no = admit(1, req.peer)) return *no;
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
     auto j = std::make_shared<ShapeJob>();
     j->uid = random_id("shape_");
     j->type = a.type;
@@ -319,12 +330,22 @@ HttpResponse Server::handle_shape_send(const HttpRequest& req) {
         std::lock_guard<std::mutex> lk(shapes_m_);
         sweep_shapes_locked(unix_now());
         shapes_.push_back(j);
+        if (deps_.background) deps_.background->fetch_add(1);
+        try {
+            j->worker = std::thread([this, j] {
+                shape_work(j);
+                if (deps_.background) deps_.background->fetch_sub(1);
+            });
+        } catch (const std::exception& e) {
+            /* No worker will ever finish the job: take it back out, as it was never queued. */
+            j->ticket->cancel.store(true);
+            shapes_.pop_back();
+            if (deps_.background) deps_.background->fetch_sub(1);
+            return error_response(err_overloaded(std::string("the job's thread could not be "
+                                                             "started: ") + e.what()), req.peer);
+        }
     }
-    if (deps_.background) deps_.background->fetch_add(1);
-    j->worker = std::thread([this, j] {
-        shape_work(j);
-        if (deps_.background) deps_.background->fetch_sub(1);
-    });
+    admission.release();   /* the worker owns the admission place now */
     json o;
     o["uid"] = j->uid;
     return HttpResponse::json_body(200, json_dump(o));

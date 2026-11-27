@@ -36,6 +36,7 @@
 #include "device/device.h"
 #include "place/xstats.h"
 #include "server/adapters.h"
+#include "server/oai.h"
 #include "server/sink.h"
 
 #include <algorithm>
@@ -168,6 +169,10 @@ int Engine::run_diagnose() {
      * What the salt cannot cover is the tiers that outlive the process; the cached-token check
      * after every run catches a hit and refuses the run (below). */
     uint64_t salt_n = 0;
+    /* "none" and "minimal" reach the template as the server sends them, so the workload is the
+     * prompt chat traffic gets. */
+    const std::vector<std::string> off_efforts =
+        use_chat ? server::probe_off_efforts(chat) : std::vector<std::string>();
     auto render = [&](const json& messages, std::vector<int32_t>* out) -> int {
         char tag[64];
         std::snprintf(tag, sizeof tag, "diagnose request %llu", (unsigned long long)++salt_n);
@@ -175,7 +180,8 @@ int Engine::run_diagnose() {
         if (use_chat) {
             server::ChatRenderOptions o;
             const std::string& def = cfg_.reasoning_effort;
-            if (def == "none" || def == "minimal") o.enable_thinking = false;
+            if (def == "none" || def == "minimal")
+                server::apply_off_effort(off_efforts, def, /*replace=*/false, &o);
             else if (!def.empty()) o.template_kwargs.emplace("reasoning_effort", json(def).dump());
             server::ChatRender r;
             std::string why;

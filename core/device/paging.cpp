@@ -144,6 +144,15 @@ struct Page {
 std::mutex                 g_mu;
 std::map<char*, Page>      g_pages;
 std::atomic<uint64_t>      g_file_seq{0};
+
+/* Calls f(base, page, chunk index) for every chunk of every page `owner` holds. g_mu held. */
+template <class F>
+void for_owned_chunks(int owner, F&& f) {
+    for (auto& [base, pg] : g_pages) {
+        if (pg.owner != owner) continue;
+        for (size_t i = 0; i < pg.ch.size(); ++i) f(base, pg, i);
+    }
+}
 /* Containers named by dev_page_file, opened for reading on first use. */
 std::vector<std::string>                  g_files;
 std::vector<std::unique_ptr<DirectFile>>  g_dio;
@@ -1245,13 +1254,10 @@ void dev_page_stats(int owner, int64_t* device, int64_t* host) {
     int64_t dv = 0, h = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        for (auto& [base, pg] : g_pages) {
-            if (pg.owner != owner) continue;
-            for (size_t i = 0; i < pg.ch.size(); ++i) {
-                if (!pg.ch[i].out) dv += pg.len(i);
-                if (pg.ch[i].hloc) h += pg.len(i);
-            }
-        }
+        for_owned_chunks(owner, [&](char*, Page& pg, size_t i) {
+            if (!pg.ch[i].out) dv += pg.len(i);
+            if (pg.ch[i].hloc) h += pg.len(i);
+        });
     }
     for (VMem* v : vmems_of(owner)) {
         dv += v->committed();
@@ -1265,13 +1271,10 @@ std::map<int, int64_t> dev_page_out_bytes(int owner, bool live) {
     std::map<int, int64_t> m;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        for (auto& [base, pg] : g_pages) {
-            if (pg.owner != owner) continue;
-            for (size_t i = 0; i < pg.ch.size(); ++i) {
-                const Chunk& c = pg.ch[i];
-                if (c.out && !(live && c.sealed && c.hloc == kAtBase)) m[pg.device] += pg.len(i);
-            }
-        }
+        for_owned_chunks(owner, [&](char*, Page& pg, size_t i) {
+            const Chunk& c = pg.ch[i];
+            if (c.out && !(live && c.sealed && c.hloc == kAtBase)) m[pg.device] += pg.len(i);
+        });
     }
     for (VMem* v : vmems_of(owner))
         if (v->parked()) m[v->device()] += v->parked_bytes();
@@ -1328,11 +1331,9 @@ std::map<int, int64_t> dev_page_mapped_bytes(int owner) {
     std::map<int, int64_t> m;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        for (auto& [base, pg] : g_pages) {
-            if (pg.owner != owner) continue;
-            for (size_t i = 0; i < pg.ch.size(); ++i)
-                if (!pg.ch[i].out) m[pg.device] += pg.len(i);
-        }
+        for_owned_chunks(owner, [&](char*, Page& pg, size_t i) {
+            if (!pg.ch[i].out) m[pg.device] += pg.len(i);
+        });
     }
     for (VMem* v : vmems_of(owner)) m[v->device()] += v->committed();
     return m;
@@ -1364,18 +1365,15 @@ int64_t dev_page_uncopied(int owner) {
     int64_t n = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        for (auto& [base, pg] : g_pages) {
-            if (pg.owner != owner) continue;
-            for (size_t i = 0; i < pg.ch.size(); ++i) {
-                const Chunk& c = pg.ch[i];
-                /* A chunk the load filled from the container is counted as free: the check
-                 * against it almost always passes. */
-                if (c.out || c.discard || (c.sealed && (pg.refill || pg.has_copy(i))) ||
-                    pg.checkable(i))
-                    continue;
-                n += pg.patchable(i) ? c.dirty_bytes() : pg.len(i);
-            }
-        }
+        for_owned_chunks(owner, [&](char*, Page& pg, size_t i) {
+            const Chunk& c = pg.ch[i];
+            /* A chunk the load filled from the container is counted as free: the check against it
+             * almost always passes. */
+            if (c.out || c.discard || (c.sealed && (pg.refill || pg.has_copy(i))) ||
+                pg.checkable(i))
+                return;
+            n += pg.patchable(i) ? c.dirty_bytes() : pg.len(i);
+        });
     }
     return n;
 }
@@ -1385,16 +1383,13 @@ int64_t dev_page_drop_copies(int owner) {
     std::vector<Gone> gone;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        for (auto& [base, pg] : g_pages) {
-            if (pg.owner != owner) continue;
-            for (size_t i = 0; i < pg.ch.size(); ++i) {
-                Chunk& c = pg.ch[i];
-                if (c.out || c.hloc != kAtShadow) continue;
-                gone.push_back({ pg.shadow + pg.off(i), pg.len(i), pg.device });
-                c.hloc = kNoHost;
-                n += pg.len(i);
-            }
-        }
+        for_owned_chunks(owner, [&](char*, Page& pg, size_t i) {
+            Chunk& c = pg.ch[i];
+            if (c.out || c.hloc != kAtShadow) return;
+            gone.push_back({ pg.shadow + pg.off(i), pg.len(i), pg.device });
+            c.hloc = kNoHost;
+            n += pg.len(i);
+        });
     }
     release_all(gone);
     return n;
@@ -1453,19 +1448,17 @@ int64_t dev_page_drop_host(int owner) {
     std::vector<Gone> gone;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        for (auto& [base, pg] : g_pages) {
-            if (pg.owner != owner) continue;
-            for (size_t i = 0; i < pg.ch.size(); ++i) {
-                Chunk& c = pg.ch[i];
-                if (!c.hloc || !(c.on_disk || c.backed || (pg.refill && c.sealed))) continue;
-                /* Out and read in place: unmapped now, it comes back from its other copy (on an
-                 * allocation its owner refills, the container: the page-in hands it back). */
-                gone.push_back({ (c.hloc == kAtBase ? base : pg.shadow) + pg.off(i), pg.len(i), pg.device });
-                if (c.hloc == kAtBase && pg.refill && !c.on_disk && !c.backed) c.refill = true;
-                c.hloc = kNoHost;
-                n += pg.len(i);
-            }
-        }
+        for_owned_chunks(owner, [&](char* base, Page& pg, size_t i) {
+            Chunk& c = pg.ch[i];
+            if (!c.hloc || !(c.on_disk || c.backed || (pg.refill && c.sealed))) return;
+            /* Out and read in place: unmapped now, it comes back from its other copy (on an
+             * allocation its owner refills, the container: the page-in hands it back). */
+            char* host = c.hloc == kAtBase ? base : pg.shadow;
+            gone.push_back({ host + pg.off(i), pg.len(i), pg.device });
+            if (c.hloc == kAtBase && pg.refill && !c.on_disk && !c.backed) c.refill = true;
+            c.hloc = kNoHost;
+            n += pg.len(i);
+        });
     }
     release_all(gone);
     for (VMem* v : vmems_of(owner)) n += v->drop_host();

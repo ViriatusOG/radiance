@@ -105,15 +105,18 @@ struct LiliCorr {
     rad_op op_onorm = 0, op_anc = 0, op_ctx = 0, op_annorm = 0, op_factor = 0, op_fac = 0;
     rad_op op_silu_f = 0, op_edge = 0, op_aout = 0, op_walk = 0;
 
+    /* `lm_head_type`: the llama.cpp block type the target stores its head as (rad_ggml.h), whose
+     * logits then come from logits_gemm_ggml as the target's own do; null for a plain bf16 head. */
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, rad_weight lm_head,
-                 rad_weight tok_embd, const char* ck, const Wire& wire);
+                 rad_weight tok_embd, const char* ck, const Wire& wire,
+                 const char* lm_head_type = nullptr);
     /* After Dflash2::step, on the same query batch: `sel_h` holds the draft rows. */
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int LiliCorr::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c,
                              rad_weight lm_head, rad_weight tok_embd, const char* ck,
-                             const Wire& wire) {
+                             const Wire& wire, const char* lm_head_type) {
     g = geom; cfg = c; w = wire; w_lm = lm_head; w_tok = tok_embd;
     if (!w_lm || !w_tok || !ck || cfg.steps < 1 || cfg.k < 2 || cfg.n_layer < 1 ||
         cfg.n_layer > MAX_LAYERS || cfg.hs % cfg.n_head)
@@ -230,11 +233,19 @@ inline int LiliCorr::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     const int64_t sw = 2 + 2 * rk;
 
     /* The candidates: this rank's shard of the target's logits, its logprob row, the exchange. */
-    op_logits = rw(b, RAD_OP(b, "logits_gemm",
-                             RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n_vocab", g.n_vocab),
-                                        RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
-                             RAD_WEIGHTS(w_lm)),
-                   { w.sel_h }, { w.logits });
+    if (lm_head_type)
+        op_logits = rw(b, RAD_OP(b, "logits_gemm_ggml",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n_vocab", g.n_vocab),
+                                            RAD_INT("n_embd", E), RAD_STR("type", lm_head_type),
+                                            RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(w_lm)),
+                       { w.sel_h }, { w.logits });
+    else
+        op_logits = rw(b, RAD_OP(b, "logits_gemm",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n_vocab", g.n_vocab),
+                                            RAD_INT("n_embd", E), RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(w_lm)),
+                       { w.sel_h }, { w.logits });
     /* Replicated, `vocab_off` is omitted: an optional parameter present at 0 is a different
      * declaration from an absent one. */
     op_stats = g.world > 1
@@ -272,12 +283,7 @@ inline int LiliCorr::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                           RAD_WEIGHTS(w_tok)),
                 { w.cand }, { w.emb });
     if (g.world > 1)
-        op_emb_ar = rw(b, RAD_OP(b, "all_reduce",
-                                 RAD_PARAMS(RAD_INT("world_size", g.world),
-                                            RAD_RANGE("numel", E, lrows * E),
-                                            RAD_STR("dtype", "bf16"), RAD_INT("exact", 1)),
-                                 RAD_NOWEIGHTS),
-                       { w.emb }, { w.emb });
+        op_emb_ar = decl_all_reduce_exact(b, g, w.emb, E, lrows, "bf16");
     op_tokp = rw(b, gemm_b(lrows, hs, E, w_tokp, b_tokp), { w.emb, w.hh }, { w.hh });
     op_fdn  = rw(b, gemm_b(lrows, hs, hs, w_fdn, b_fdn), { w.feat, w.hh }, { w.hh });
     for (int64_t l = 0; l < cfg.n_layer; ++l) {

@@ -39,8 +39,8 @@ TEST(concurrent_quiet_callers_keep_their_own_callbacks) {
         return e.run_quiet([&] { callbacks.fetch_add(1); return 22; });
     });
     REQUIRE(second_started.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready);
-    /* Give the contender a scheduling interval. The old implementation replaces
-     * the first callback while its caller waits on the condition variable. */
+    /* Give the contender a scheduling interval: it must not replace the first callback while
+     * that callback's caller waits on the condition variable. */
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK(Access::callback(e) == first_callback);
 

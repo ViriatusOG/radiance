@@ -158,7 +158,7 @@ TolPick tolerance_for(const std::string& op, const Geometry& g, const char* oper
     const char* dt = activation_dtype(g);
     if (!dt) dt = "*";
     for (const TolRow& t : g_tol) {
-        const bool op_match = std::strcmp(t.op, "*") == 0 || op.rfind(t.op, 0) == 0;
+        const bool op_match = std::strcmp(t.op, "*") == 0 || op.starts_with(t.op);
         const bool dt_match = std::strcmp(t.dtype, "*") == 0 || std::strcmp(t.dtype, dt) == 0;
         if (op_match && dt_match) {
             p.rel_l2 = t.rel_l2;
@@ -587,7 +587,8 @@ std::vector<int64_t> skewed_counts(int64_t buckets, int64_t total, int64_t cap, 
                      [](const std::pair<double, int64_t>& a, const std::pair<double, int64_t>& b) {
                          return a.first > b.first;
                      });
-    for (size_t i = 0; placed < total && i < frac.size(); ++i, ++placed) ++by_rank[(size_t)frac[i].second];
+    for (size_t i = 0; placed < total && i < frac.size(); ++i, ++placed)
+        ++by_rank[(size_t)frac[i].second];
     /* Over the cap: the excess goes to the hottest experts with room. */
     int64_t excess = 0;
     for (int64_t& x : by_rank)

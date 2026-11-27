@@ -29,4 +29,17 @@ static inline int r4d_bf16_gemm_chunk_rows(int64_t M, int64_t N, int64_t K, int 
     return (int)std::min(M, rows);
 }
 
+/* r4d_bf16_gemm_chunk_rows for an A whose rows sit `lda` elements apart (a row view, lda >= K).
+ * A's 32-bit offsets are taken from each launch's rebased base, so a launch holds at most
+ * UINT32_MAX / lda rows, whole row tiles. Y is addressed in 64 bits and needs no bound. lda == K
+ * is the contiguous plane and gives r4d_bf16_gemm_chunk_rows exactly. */
+static inline int r4d_bf16_gemm_chunk_rows_lda(int64_t M, int64_t N, int64_t K, int64_t lda,
+                                               int row_tile, int col_tile) {
+    const int rows = r4d_bf16_gemm_chunk_rows(M, N, K, row_tile, col_tile);
+    if (!rows || lda <= K) return rows;
+    int64_t cap = (int64_t)UINT32_MAX / lda;
+    if (cap >= row_tile) cap -= cap % row_tile;
+    return (int)std::min<int64_t>(rows, cap);
+}
+
 #endif

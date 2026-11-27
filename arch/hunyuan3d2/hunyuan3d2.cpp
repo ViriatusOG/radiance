@@ -184,12 +184,6 @@ struct Model {
 static Model g_model[RAD_MAX_SLOTS];
 
 /* ================================================================== declare helpers */
-static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
-                        std::initializer_list<int64_t> shape, int access, int group) {
-    if (map_copy(b, dn, src) < 0) return 0;
-    return decl_w(b, dn, dtype, shape, access, RAD_SHARD_NONE, grp_layer(group));
-}
-
 /* A biased linear [N, K] (bias absent with `bias` false), read whole, over at most `rows` rows,
  * its activation and residual in the epilogue. The weight is mapped by the caller (`mapped`) or
  * copied from `src`.weight. `adt` is the activation's dtype ("bf16", or "f32" with an f32
@@ -579,11 +573,7 @@ static int declare_dit(RadBuilder* b, Model& m) {
     RAD_ARCH_TRY(linear(b, nm, m.latent_in, "dit.latent_in", "model.latent_in", D, m.C, L2,
                         m.b_lx, m.b_x, acc, gx));
     /* The conditioning rows from the lane's store. */
-    m.op_ccopy = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, kCond), RAD_INT("n", D),
-                                         RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                              RAD_NOWEIGHTS),
-                    { m.b_cstore }, { m.b_x });
+    m.op_ccopy = cast_op(b, kCond, D, "bf16", "bf16", m.b_cstore, m.b_x);
     /* ---- the timestep: the sinusoid of 1000 sigma, time_in, silu. The reference passes its
      * time_factor (1000) where timestep_embedding takes max_period, so the model was trained on
      * a period of 1000, and the time is scaled by the default factor, also 1000. */
@@ -880,11 +870,7 @@ static int declare_query(RadBuilder* b, Model& m) {
     m.op_qpost = affine_norm(b, Q, D, 1e-5, m.q_pw, m.q_pb, m.b_qx, m.b_qh);
     RAD_ARCH_TRY(linear(b, nm, m.q_head, "geo.output_proj", "vae.geo_decoder.output_proj", 1, D, Q,
                         m.b_qh, m.b_qlogit, acc, g));
-    m.op_qcast = rw(b, RAD_OP(b, "cast",
-                              RAD_PARAMS(RAD_RANGE("M", 1, Q), RAD_INT("n", 1),
-                                         RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
-                              RAD_NOWEIGHTS),
-                    { m.b_qlogit }, { m.b_field });
+    m.op_qcast = cast_op(b, Q, 1, "bf16", "f32", m.b_qlogit, m.b_field);
     return m.op_four && m.op_qn1 && m.op_qqn && m.op_qattn && m.op_qn3 && m.op_qpost &&
                    m.op_qcast
                ? RAD_OK : RAD_E_INVAL;

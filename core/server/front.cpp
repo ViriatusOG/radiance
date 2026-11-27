@@ -18,18 +18,33 @@ namespace {
 
 /* Requests that name a job by its id in the path. Without a model, ask the resident servers. */
 bool id_route(const std::string& path) {
-    return path.rfind("/v1/videos/", 0) == 0 || path.rfind("/status/", 0) == 0;
+    return path.starts_with("/v1/videos/") || path.starts_with("/status/");
 }
 
 /* The id in such a path: the segment after the route's prefix. */
 std::string route_id(const std::string& path) {
-    const size_t at = path.rfind("/status/", 0) == 0 ? 8 : 11;
+    const size_t at = path.starts_with("/status/") ? 8 : 11;
     const size_t end = path.find('/', at);
     return path.substr(at, end == std::string::npos ? std::string::npos : end - at);
 }
 
 HttpResponse refuse(const std::string& path, int status, const char* type, const std::string& msg) {
     return HttpResponse::json_body(status, error_body(path, status, type, msg));
+}
+
+/* A chat or completion request's model-free checks (precheck_request), by the route's last
+ * segments; false for any other route. A base prefix (/models/NAME) may precede them. */
+bool precheck_route(const HttpRequest& q, ApiError* err) {
+    auto ends = [&](const char* s) {
+        const size_t n = std::strlen(s);
+        return q.path.size() >= n && q.path.compare(q.path.size() - n, n, s) == 0;
+    };
+    if (q.method != "POST") return true;
+    if (ends("/chat/completions")) return precheck_request(q.body, Endpoint::Chat, false, err) >= 0;
+    if (ends("/v1/completions")) return precheck_request(q.body, Endpoint::Completion, false, err) >= 0;
+    if (ends("/completion") || ends("/completions"))
+        return precheck_request(q.body, Endpoint::Completion, true, err) >= 0;
+    return true;
 }
 
 /* `r` holds `lease` until the transport has finished with it (on_close), so the model's server
@@ -159,7 +174,7 @@ std::string merge_metrics(const std::vector<std::string>& texts) {
             const std::string line = t.substr(at, nl - at);
             at = nl + 1;
             if (line.empty()) continue;
-            if (line.rfind("# HELP ", 0) == 0 || line.rfind("# TYPE ", 0) == 0) {
+            if (line.starts_with("# HELP ") || line.starts_with("# TYPE ")) {
                 const size_t ns = 7, ne = line.find(' ', ns);
                 current = line.substr(ns, ne == std::string::npos ? std::string::npos : ne - ns);
                 Family& f = family(current);
@@ -290,6 +305,13 @@ void Front::abandon(const std::string& name) {
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& p : entries_)
         if (p->name == name && !p->removed && p->state == State::Loading) p->state = State::Cold;
+    changed_.notify_all();
+}
+
+void Front::retry(const std::string& name) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& p : entries_)
+        if (p->name == name && !p->removed && p->state == State::Failed) p->state = State::Cold;
     changed_.notify_all();
 }
 
@@ -580,7 +602,7 @@ std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open(bo
     for (auto& p : entries_)
         if (!p->removed && p->server &&
             (p->state == State::Open || (include_draining_jobs && p->state == State::Closing)))
-            held.emplace_back(p.get(), include_draining_jobs ? lease_quiet(p.get()) : lease_entry(p.get()));
+            held.emplace_back(p.get(), lease_quiet(p.get()));
     return held;
 }
 
@@ -656,7 +678,20 @@ HttpResponse Front::forward(HttpRequest q) {
     const bool names_job = id_route(canonical);
     if (names_job) q.path = std::move(canonical);
     if (Handler kept = kept_job(q)) return kept(q);
-    const std::string model = requested_model(q);
+    const bool validation = q.method == "POST" && path_canonical(q.path) == "/v1/loras/validate";
+    std::string model;
+    if (validation) {
+        bool over = false, deep = false;
+        const json body = parse_json_bounded(q.body, 0, &over, &deep);
+        if (!body.is_object() || !body.contains("model") || !body["model"].is_string() ||
+            body["model"] == "")
+            return refuse(q.path, 400, "invalid_request_error", "expected a nonempty model ID");
+        model = body["model"].get<std::string>();
+        if (auto it = q.query.find("model"); it != q.query.end() && it->second != model)
+            return refuse(q.path, 400, "invalid_request_error", "query and body name different models");
+    } else {
+        model = requested_model(q);
+    }
     if (model.empty() && names_job) {
         /* The default model is irrelevant to a job id. Polling must never start a cold model. */
         for (auto& [entry, hold] : hold_open(/*include_draining_jobs=*/true)) {
@@ -671,12 +706,15 @@ HttpResponse Front::forward(HttpRequest q) {
     }
     /* A dashboard read is not a use of the model: it does not bring one back, and it does not
      * keep one that nobody asks anything of from going idle. */
-    if (dashboard_read(q)) {
+    if (dashboard_read(q) || validation) {
         Entry* r = nullptr;
         std::shared_ptr<void> hold;
         {
             std::lock_guard<std::mutex> lk(mu_);
             r = resolve(model);
+            if (validation && (!r || (r->name != model &&
+                std::find(r->aliases.begin(), r->aliases.end(), model) == r->aliases.end())))
+                return refuse(q.path, 404, "not_found_error", "unknown model");
             if (r && r->state != State::Open)
                 return refuse(q.path, 409, "model_not_open", "model '" + r->name + "' is " +
                                                                  state_name(r->state) +
@@ -699,7 +737,7 @@ HttpResponse Front::forward(HttpRequest q) {
                     return kept;
                 }
             }
-            strip_base(&q, model);
+            if (!validation) strip_base(&q, model);
             HttpResponse resp = r->server->router().dispatch(std::move(q));
             if (sessions && resp.status == 200) {
                 std::lock_guard<std::mutex> lk(sessions_mu_);
@@ -725,16 +763,21 @@ HttpResponse Front::forward(HttpRequest q) {
                                                              state_name(r->state) +
                                                              "; this request does not bring it back");
     }
-    /* A streaming request for a model that is not open gets its event stream at once. */
-    if (keepalive_ms_ > 0 && wants_stream(q)) {
-        bool open = false;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            Entry* r = resolve(model);
-            open = !r || r->state == State::Open;
-        }
-        if (!open) return forward_waiting(std::move(q), model);
+    bool open = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        Entry* r = resolve(model);
+        open = !r || r->state == State::Open;
     }
+    /* A request for a model that is not open is checked before the wait: its server would refuse
+     * the same fields once loaded, inside a stream already answered 200, and the load would be
+     * paid for a refusal. */
+    if (!open) {
+        ApiError err;
+        if (!precheck_route(q, &err)) return HttpResponse::json_body(err.status, err.dump());
+    }
+    /* A streaming request for a model that is not open gets its event stream at once. */
+    if (keepalive_ms_ > 0 && wants_stream(q) && !open) return forward_waiting(std::move(q), model);
     const Got g = lease(model, q.path, -1, nullptr, &e, &l, &refusal, caller_is_operator(q));
     if (g != Got::Leased) return refusal;
     strip_base(&q, model);
@@ -820,7 +863,7 @@ HttpResponse Front::models(const HttpRequest& q) {
      * restart the idle TTL or keep a warm-up model resident. */
     /* One model's card: asked of the model it names, under its own id. A model not loaded is
      * described without loading it. */
-    if (q.path.rfind("/v1/models/", 0) == 0 && q.path.size() > 11) {
+    if (q.path.starts_with("/v1/models/") && q.path.size() > 11) {
         const std::string id = q.path.substr(11);
         Entry* e = nullptr;
         std::shared_ptr<void> l;
@@ -914,7 +957,7 @@ HttpResponse Front::health(const HttpRequest& q) {
                 if (e->state == State::Failed) j["error"] = e->why;
                 return HttpResponse::json_body(503, j.dump());
             }
-            l = lease_entry(e);
+            l = lease_quiet(e);
         }
         return e->server->router().dispatch(q);
     }
@@ -929,7 +972,7 @@ HttpResponse Front::health(const HttpRequest& q) {
             if (p->removed) continue;
             states[p->name] = state_name(p->state);
             if (!p->required) continue;
-            if (p->state == State::Open) held.emplace_back(p.get(), lease_entry(p.get()));
+            if (p->state == State::Open) held.emplace_back(p.get(), lease_quiet(p.get()));
             else missing += (missing.empty() ? "" : ", ") + p->name;
         }
     }
