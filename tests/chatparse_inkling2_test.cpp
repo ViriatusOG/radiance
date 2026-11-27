@@ -202,22 +202,49 @@ TEST(an_answer_reads_as_reasoning_and_content_with_no_markup) {
 TEST(the_answer_close_is_in_the_format_once_a_header) {
     const auto p = parser(inkling());
     REQUIRE(p);
-    struct Case { const char* what; const char* reply; bool strict; const char* content; };
+    const std::string call =
+        "<|message_model|>get_weather<|content_invoke_tool_json|>"
+        "{\"name\":\"get_weather\",\"args\":{\"city\":\"Lehi\"}}<|end_message|>";
+    struct Case {
+        const char* what;
+        std::string reply;
+        bool        strict;
+        const char* content;
+        const char* reasoning;
+        const char* call_args;   /* the one call's arguments, or null for none */
+    };
     const Case cases[] = {
         { "the header opens the reply",
-          "<|content_text|>Hi.<|end_message|>", true, "Hi." },
+          "<|content_text|>Hi.<|end_message|>", true, "Hi.", "", nullptr },
         { "two answers, each closed",
           "<|message_model|><|content_text|>Hi.<|end_message|>"
-          "<|message_model|><|content_text|> Bye.<|end_message|>", true, "Hi. Bye." },
+          "<|message_model|><|content_text|> Bye.<|end_message|>", true, "Hi. Bye.", "", nullptr },
+        { "an answer, then a call",
+          "<|message_model|><|content_thinking|>Say, then call.<|end_message|>"
+          "<|message_model|><|content_text|>Let me check.<|end_message|>" + call,
+          true, "Let me check.", "Say, then call.", R"({"city":"Lehi"})" },
+        { "reasoning that opens again after the answer",
+          "<|message_model|><|content_thinking|>First.<|end_message|>"
+          "<|message_model|><|content_text|>Hi.<|end_message|>"
+          "<|message_model|><|content_thinking|>Later.<|end_message|>",
+          true, "Hi.", "First.Later.", nullptr },
+        /* generation can stop before the close (max_tokens): the answer is still the answer */
+        { "an answer cut off before its close",
+          "<|message_model|><|content_text|>Hi.", true, "Hi.", "", nullptr },
         { "a second close, with no message open",
-          "<|message_model|><|content_text|>Hi.<|end_message|><|end_message|>", false, "Hi." },
+          "<|message_model|><|content_text|>Hi.<|end_message|><|end_message|>", false, "Hi.", "",
+          nullptr },
         { "a close with no header before it",
-          "Hi.<|end_message|>", false, "Hi." },
+          "Hi.<|end_message|>", false, "Hi.", "", nullptr },
     };
     for (const Case& c : cases) {
         bool strict = !c.strict;
         const ReplyMessage m = reply_parse(*p, c.reply, &strict);
-        if (strict != c.strict || m.content != c.content)
+        const bool calls_ok = c.call_args
+            ? m.calls.size() == 1u && m.calls[0].name == "get_weather" && m.calls[0].closed &&
+                  args(m.calls[0]) == json::parse(c.call_args)
+            : m.calls.empty();
+        if (strict != c.strict || m.content != c.content || m.reasoning != c.reasoning || !calls_ok)
             ::radtest::fail(__FILE__, __LINE__, std::string(c.what) + ": " + show(m) +
                                                     (strict ? " (strict)" : " (not strict)"));
         streams(*p, c.reply);
