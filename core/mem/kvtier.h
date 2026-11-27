@@ -268,6 +268,9 @@ public:
      * served); a release by label means all of them. */
     void find_sessions(const std::string& label, uint64_t id,
                        std::vector<SessionChain>* out) const;
+    /* Calls `f` with every row's id and chain under the tiers' lock, copying nothing
+     * (PrefixCache::sweep_dead). `f` must not call back into the tiers. */
+    void for_each_session(const std::function<void(uint64_t, const std::vector<BlockHash>&)>& f) const;
     /* How many blocks at the start of `chain` another stored session walks too: the longest
      * common prefix with any row at the same root whose id is not in `except`. Those blocks
      * belong to the other conversation as much as to this one. */

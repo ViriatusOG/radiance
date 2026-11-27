@@ -652,6 +652,12 @@ void IdleTiers::find_sessions(const std::string& label, uint64_t id,
     }
 }
 
+void IdleTiers::for_each_session(
+        const std::function<void(uint64_t, const std::vector<BlockHash>&)>& f) const {
+    std::lock_guard lk(mu_);
+    for (const auto& kv : sessions_) f(kv.first, kv.second.chain);
+}
+
 int64_t IdleTiers::shared_prefix_blocks(const std::vector<BlockHash>& chain,
                                         const std::vector<uint64_t>& except) const {
     if (chain.empty()) return 0;

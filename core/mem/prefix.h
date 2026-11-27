@@ -390,7 +390,17 @@ public:
      * read by its forward by now, and the ones it reserved have been saved into (the engine
      * issues the save before the next step is planned); until this call they keep their slots
      * against retention, reserve_checkpoint's eviction and expiry. */
-    void begin_step() { handed_.clear(); reserved_.clear(); }
+    void begin_step();
+    /* On a model whose hit resumes from a snapshot (has_linear_), a conversation is usable only
+     * up to its deepest snapshot at or below the first block the cache lost. Eviction takes a
+     * conversation's end first, and a lost end leaves the rest of it cached yet unusable: under
+     * tip-only retention all of it. Two LRUs that do not know of each other (blocks, snapshot
+     * slots) then hold dead data while live conversations are evicted. Once a block was lost for
+     * good (evict_lru with no host copy, the host tier giving one up), this walks every session's
+     * chain and gives up what nothing can hit: entries past the deepest reachable snapshot, down
+     * to what another session shares, and snapshots past the first lost block. Entries a live
+     * sequence or a waiting request holds stay. Returns the entries given up. */
+    int64_t sweep_dead();
 
     /* ---------------- expiry ----------------
      *
@@ -461,6 +471,9 @@ public:
         int64_t expired = 0, ckpt_expired = 0;
         /* Entries and snapshots a client released (release_session). */
         int64_t released = 0, ckpt_released = 0;
+        /* Entries and snapshots sweep_dead gave up: cached KV past the deepest snapshot a lookup
+         * can still reach, and snapshots past a block the cache lost. Nothing could hit them. */
+        int64_t dead = 0, ckpt_dead = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -539,6 +552,9 @@ private:
 
     KVManager*  kv_ = nullptr;
     IdleTiers*  tiers_ = nullptr;
+    /* A block was lost for good since the last sweep (sweep_dead), and when the last ran. */
+    bool        dead_pending_ = false;
+    uint64_t    dead_swept_ns_ = 0;
     bool        enabled_ = false;
     int64_t     block_size_ = 0;
     int64_t     interval_ = 0;

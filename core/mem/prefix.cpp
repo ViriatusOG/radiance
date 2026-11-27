@@ -675,7 +675,118 @@ void PrefixCache::drop_offdevice(const BlockHash& key) {
     ++stats_.evictions;
     /* A snapshot under the same key stays: no lookup reaches it past the missing block, and
      * retention or expiry retires it via retire_ckpt. It cannot be retired here because the tiers
-     * call this holding their lock. */
+     * call this holding their lock; sweep_dead retires it at the next step. */
+    dead_pending_ = true;
+}
+
+void PrefixCache::begin_step() {
+    handed_.clear();
+    reserved_.clear();
+    /* At most every 100 ms: a sweep walks every session's chain. */
+    if (dead_pending_) {
+        const uint64_t now = rad_mono_ns();
+        if (now - dead_swept_ns_ >= 100000000ull) {
+            dead_swept_ns_ = now;
+            (void)sweep_dead();
+        }
+    }
+}
+
+int64_t PrefixCache::sweep_dead() {
+    dead_pending_ = false;
+    if (!enabled_ || !has_linear_ || !tiers_ || block_size_ <= 0) return 0;
+    /* Rows are kept until they expire (--prefix-cache-ttl) or are released, so a long-running
+     * server holds many, most of them sound. A sound row ends on a block the cache holds with a
+     * valid snapshot right there: nothing past its snapshot to give up, decided in constant time
+     * and without copying the chain. The rest are looked at one by one below, and a row cleaned
+     * is cut to what it can resume from, so the next sweep finds it sound. A row whose end is
+     * held but a block inside it is not is passed over: that only leaves it uncleaned. */
+    auto sound = [&](const std::vector<BlockHash>& c) {
+        const BlockHash& tip = c.back();
+        if (!map_.count(tip)) return false;
+        auto ck = ck_by_prefix_.find(tip);
+        return ck != ck_by_prefix_.end() && ck->second.valid &&
+               ck->second.pos == (int64_t)c.size() * block_size_;
+    };
+    std::vector<uint64_t> suspects;
+    tiers_->for_each_session([&](uint64_t id, const std::vector<BlockHash>& c) {
+        if (!c.empty() && !sound(c)) suspects.push_back(id);
+    });
+
+    int64_t gone = 0, ck_gone = 0;
+    std::vector<IdleTiers::SessionChain> rows;
+    for (uint64_t id : suspects) {
+        tiers_->find_sessions(std::string(), id, &rows);
+        if (rows.empty()) continue;
+        const IdleTiers::SessionChain& row = rows[0];
+        const int64_t n = (int64_t)row.chain.size();
+        if (n == 0) continue;
+        /* How far a lookup reaches: the first block the cache no longer holds in any tier. */
+        int64_t reach = 0;
+        while (reach < n && map_.count(row.chain[(size_t)reach])) ++reach;
+        /* Snapshots past it are unreachable: retire them (their slot serves another session). */
+        for (auto pit = ck_positions_.upper_bound(reach * block_size_); pit != ck_positions_.end();) {
+            const int64_t pos = pit->first;
+            ++pit;   /* retire_ckpt may erase the position */
+            if (pos <= 0 || pos % block_size_ != 0 || pos / block_size_ > n) continue;
+            const BlockHash& h = row.chain[(size_t)(pos / block_size_ - 1)];
+            auto ck = ck_by_prefix_.find(h);
+            /* Not one still being written, nor one a live sequence made: a request mid-prefill
+             * snapshots past what it has published, and reaches it with its own blocks. */
+            if (ck == ck_by_prefix_.end() || ck->second.pos != pos || !ck->second.valid ||
+                handed(h) || reserved(h) || kv_->has_sequence(ck->second.session))
+                continue;
+            const uint64_t session = ck->second.session;
+            retire_ckpt(ck);
+            unindex_ckpt(session, h);
+            ++ck_gone;
+        }
+        /* The deepest snapshot a hit can resume from, at or below the reach. */
+        int64_t resume = 0;
+        for (auto pit = ck_positions_.upper_bound(reach * block_size_); pit != ck_positions_.begin();) {
+            --pit;
+            const int64_t pos = pit->first;
+            if (pos <= 0 || pos % block_size_ != 0) continue;
+            auto ck = ck_by_prefix_.find(row.chain[(size_t)(pos / block_size_ - 1)]);
+            if (ck != ck_by_prefix_.end() && ck->second.pos == pos && ck->second.valid) {
+                resume = pos / block_size_;
+                break;
+            }
+        }
+        /* Blocks [resume, reach) are cached and unusable, but a prefix another session walks is
+         * that session's too: it may hold a snapshot of its own deeper in it. */
+        int64_t kept = reach;     /* blocks [0, kept) of the row are what is left of it */
+        if (resume < reach) {
+            const int64_t shared = tiers_->shared_prefix_blocks(row.chain, { row.id });
+            for (int64_t b = reach - 1; b >= std::max(resume, shared); --b) {
+                const BlockHash& h = row.chain[(size_t)b];
+                auto it = map_.find(h);
+                if (it == map_.end()) { kept = b; continue; }
+                Entry& e = it->second;
+                if (e.in_lru && (shared_with_live(e) || held_.count(h) > 0)) break;
+                if (e.in_lru) {
+                    lru_.erase(e.lru);
+                    e.in_lru = false;
+                    release_blocks(e);
+                }
+                tiers_->forget(h);
+                map_.erase(it);
+                kept = b;
+                ++gone;
+            }
+        }
+        /* Cut the row to what it can still resume from, so the next sweep finds it sound. Not
+         * when something live stopped the walk above it, nor to nothing: a row with no snapshot
+         * left still says, in the session view, that its conversation will restart. */
+        if (kept == resume && resume > 0 && resume < n)
+            tiers_->cut_session(row.id, resume, resume * block_size_);
+    }
+    stats_.dead += gone;
+    stats_.ckpt_dead += ck_gone;
+    if (gone || ck_gone)
+        RAD_DEBUG("prefix cache: %lld entr%s and %lld snapshot(s) nothing could hit given up",
+                  (long long)gone, gone == 1 ? "y" : "ies", (long long)ck_gone);
+    return gone;
 }
 
 int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks) {
@@ -750,6 +861,7 @@ int64_t PrefixCache::evict_lru(int64_t n) {
         map_.erase(it);
         ++done;
         ++stats_.evictions;
+        dead_pending_ = true;
     }
     return done;
 }
@@ -790,6 +902,7 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
             if (tiers_) tiers_->forget(h);
             map_.erase(m);
             ++stats_.evictions;
+            dead_pending_ = true;
         }
         ++done;
     }
@@ -876,6 +989,7 @@ int64_t PrefixCache::drop_stragglers(int64_t loan_goal, bool recheck) {
         tiers_->forget(h);
         map_.erase(m);
         ++stats_.evictions;
+        dead_pending_ = true;
         ++n;
     }
     return n;
