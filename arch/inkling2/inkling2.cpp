@@ -41,6 +41,7 @@
  * layout.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_hc.h>
 #include <arch/rad_block_inkling2_tower.h>
 #include <arch/rad_inkling2_chat.h>
 
@@ -109,6 +110,10 @@ struct Layer {
     rad_op op_mlp_norm_q8 = 0, op_mlp_norm_ctl_q8 = 0, op_router_scatter = 0;
     rad_op op_scatter = 0, op_egu = 0, op_situ = 0, op_edn = 0, op_gather = 0;
     rad_op op_push = 0, op_resid = 0, op_push_copy = 0, op_resid_copy = 0, op_attn_add = 0, op_mlp_add = 0;
+    /* the control vector's projection on the stream at this layer's output (HcProject; hc 1,
+     * because the stream here is a plain bf16 residual and not a gated one). Unsteered layers
+     * hold the default and issue nothing. */
+    HcProject proj;
     /* the experts' stored form (ExpertForm), its codes and scale planes, and for an IQR expert the
      * quantiser of the routed input and of the SiTU product */
     int ex_form = 0;
@@ -695,6 +700,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- activations: [max_tok, width] unless stated */
     m.b_s     = decl_b(b, nm.f("S"),     RAD_BF16, {T, m.H});
+    /* The control vector's per-token switch, once per model (HcProject). All zeros -- or no
+     * vector at all -- leaves every layer unsteered and the model byte-identical to a deployment
+     * without one. */
+    const rad_buf proj_on = HcProject::declare_mask(b, nm.f("projection_on"), g, ctx->cvec);
     m.b_pre   = decl_b(b, nm.f("pre"),   RAD_BF16, {T, m.H});
     m.b_bank1 = decl_b(b, nm.f("bank1"), RAD_BF16, {T, m.H});
     m.b_bank0 = decl_b(b, nm.f("bank0"), RAD_BF16, {1, T, m.H});
@@ -1545,6 +1554,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             L.op_ar_m = all_reduce(m.b_mo);
             if (g.world > 1 && (!L.op_ar_o || !L.op_ar_m)) return RAD_E_UNSUPPORTED;
             L.op_mlp_add = ew("add", T, m.H, {m.b_s, m.b_zc}, m.b_s);
+            /* The control vector's projection for this layer, if the vector steers it: the same
+             * op qwen4exp declares on its gated stream, here on the plain one (hc 1). It sits
+             * at the layer's output -- every reader of the stream from here on, the draft's taps
+             * included, sees the projected residuals. */
+            RAD_ARCH_TRY(L.proj.declare(b, nm.f("blk.%lld.proj", (long long) ip), g, ip,
+                                        ctx->cvec, proj_on, m.b_s, 1));
             /* the controllers: (1 - tanh(F g)) x + tanh(G g) msg, g = D [rms x | rms msg] */
             if (L.core) {
                 {
@@ -2106,6 +2121,11 @@ static void run_layer(RadCtx* c, const Model& m, const RadBatch* batch, int a, b
         issue_sconv(c, batch, L.op_mconv, L.w_mconv, m.cv_m, a, m.b_mo, 0, m.b_zc);
         RAD_ISSUE(c, L.op_mlp_add, brows(m.b_s, T), brows(m.b_zc, T), brows(m.b_s, T));
     }
+    /* The control vector's projection at the layer output, on either write path (the FF delta
+     * enters the stream through the message convolution when this model has one). Issues nothing
+     * when the pass has no row taking the vector (HcProject::step, RadBatch::control_vector),
+     * so an ordinary request's step is the stock one. */
+    L.proj.step(c, batch, 0, T);
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
@@ -2202,6 +2222,9 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return inkling2_c
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->chain_pays = RAD_CHAIN_ALWAYS;
     if (meta && Inkling2Tower::present(meta)) out->enc_merge = 4;
+    /* The plugin declares the control vector's projection on its stream (HcProject, hc 1), so
+     * the engine loads a vector file for this architecture. */
+    out->control_vector_ok = 1;
     out->draft_depth = 0;
     out->draft_depth_fixed = 0;
     if (meta && dflash2_present(meta)) {

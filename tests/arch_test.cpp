@@ -15887,6 +15887,41 @@ RadEncoding ink2_iqr(int64_t run) {
 }
 }  /* namespace */
 
+/* The control vector on Inkling 2's plain stream: the probe admits the architecture, and a build
+ * with a vector declares one hc_project per layer the file's scale profile steers (here the
+ * OpenUncensored profile, layers 4..23) on a single stream -- hc 1, the bf16 residual, not a
+ * gated one. A build with no vector declares nothing at all. */
+TEST(inkling2_declares_the_control_vector_projection_on_its_stream) {
+    MetaKV mk = ink2_df2_meta();
+    RadArchProbe p{};
+    CHECK_OK(inkling2::probe(mk.meta(), &p));
+    CHECK_EQ(p.control_vector_ok, 1);
+
+    std::vector<float> dir((size_t) (24 * 2304), 0.0f);
+    for (int l = 4; l < 24; ++l)
+        for (int64_t i = 0; i < 2304; ++i)
+            dir[(size_t) l * 2304 + (size_t) i] = (float) ((i % 7) - 3) * 0.1f;
+    float scales[24] = {};
+    for (int l = 4; l < 24; ++l) scales[l] = (l < 6 || l >= 18) ? 4.0f : 2.5f;
+    const RadControlVector cv{ dir.data(), scales, 2304, 24 };
+
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_tok = 512;
+    ctx.max_spec = 7;
+    ctx.cvec = &cv;
+    REQUIRE_EQ(inkling2::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "hc_project"), 20);
+
+    /* And no vector: no switch, no projections -- the stock build. */
+    RadBuilder b0;
+    RadBuildCtx c0 = build_ctx();
+    c0.max_tok = 512;
+    c0.max_spec = 7;
+    REQUIRE_EQ(inkling2::declare(&b0, mk.meta(), &c0), RAD_OK);
+    CHECK_EQ(count_op(b0, "hc_project"), 0);
+}
+
 /* Inkling 2 declares incoai's DFlash2 drafter as it was trained (the SGLang integration it ships
  * with): depth 7, mask 200056, a 2048-token window; the four streams it reads (entering
  * applications 5, 23 and 41, and the final norm's output) copied into its tap buffer, four per

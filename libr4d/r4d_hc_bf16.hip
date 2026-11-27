@@ -5479,10 +5479,10 @@ enum { HCR_H = 0, HCR_W, HCR_DOWN, HCR_UP, HCR_INJW, HCR_X, HCR_INJ, HCR_Q, HCR_
 static const long kHcLdsMaxHN = (65536 - kHcReadAStaticLds) / (long)sizeof(unsigned short);
 
 static int hc_common(const RadArgs* a, const RadTensor* h, long long* rows, long long* n,
-                     long long* hc, long long* hrow) {
+                     long long* hc, long long* hrow, long long hc_min = 2) {
     *n  = r4d_geti_or(a, "n", 0);
     *hc = r4d_geti_or(a, "hc", 0);
-    if (*n <= 0 || *hc <= 1 || *hc > kHcMax) return R4D_NO(RAD_E_SHAPE);
+    if (*n <= 0 || *hc < hc_min || *hc > kHcMax) return R4D_NO(RAD_E_SHAPE);
     const long long HN = *n * *hc;
     *hrow = r4d_rows_pitch(h, HN, rows);
     if (*hrow < 0 || *rows <= 0) return R4D_NO(RAD_E_STRIDE);
@@ -5545,7 +5545,9 @@ extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
     if (!h || !v || !on) return R4D_NO(RAD_E_INVAL);
     R4D_DT(h, RAD_BF16); R4D_DT(v, RAD_F32); R4D_DT(on, RAD_I32);
     long long rows = 0, n = 0, hc = 0, hrow = 0;
-    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    /* hc_min 1, unlike every other caller: this op steers a plain residual stream (inkling2's),
+     * where the stream loop's degenerate single pass is exactly the wanted projection. */
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow, 1);
     if (rc != RAD_OK) return rc;
     long long vrows = 0, onrows = 0;
     if (r4d_rows_pitch(v, n, &vrows) < 0 || vrows != 1) return R4D_NO(RAD_E_STRIDE);

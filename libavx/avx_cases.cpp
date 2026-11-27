@@ -193,6 +193,9 @@ std::vector<Case> build_cases() {
          * geometry is what says whether 41 of these a step is affordable. */
         add("hc_project",{ HI("M", 4), HI("n", 2560), HI("hc", 4), HF("scale", 1.0),
                            HS("dtype", "bf16") });
+        /* Inkling 2's stream: a plain bf16 residual, one stream, at its 2304 width. */
+        add("hc_project",{ HI("M", 4), HI("n", 2304), HI("hc", 1), HF("scale", 1.0),
+                           HS("dtype", "bf16") });
         add("hc_read",   { HI("M", 5), HI("n", 128), HI("hc", 4), HI("lowrank", 8),
                            HF("eps", 1e-6), HS("dtype", dt), HF("wadd", 1), HI("inject", 1),
                            HI("group", 0) });
