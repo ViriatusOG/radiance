@@ -116,7 +116,9 @@ std::string judge(const Verdict& v);
 
 /* Feed `text` to a fresh stream cut at `cuts` (ascending offsets). On every piece, the emitted
  * text must be a prefix of `expect` and the held bytes within the bound; at the end, the
- * concatenated deltas and the message must equal `expect`. Returns "" or the first violation. */
+ * concatenated deltas and the message must equal `expect`, and the stream must agree with the
+ * whole reply read at once on whether it stayed in the format (ReplyStream::strict). Returns ""
+ * or the first violation. */
 std::string check_stream(const ReplyParser& p, const std::string& text,
                          const std::vector<size_t>& cuts, const ReplyMessage& expect);
 

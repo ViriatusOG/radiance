@@ -142,6 +142,23 @@ int message_open_check(const ChatFormat& f, std::string* why) {
     return RAD_OK;
 }
 
+/* The answer's close is matched where the parser already looks for a reasoning close in content,
+ * so it is read only as that close, in a format whose answer has a header and is scanned for it. */
+int content_close_check(const ChatFormat& f, std::string* why) {
+    const std::string& cc = f.content_close;
+    if (cc.empty()) return RAD_OK;
+    if (trim_ws(cc) != cc) return refuse(why, "content_close may not begin or end with whitespace");
+    if (f.content_open.empty())
+        return refuse(why, "content_close " + show(cc) + " needs content_open to open the answer");
+    if (!f.reasoning_anywhere)
+        return refuse(why, "content_close " + show(cc) + " needs reasoning_anywhere: only then is "
+                           "the answer scanned for a close");
+    if (cc != trim_ws(f.reasoning_close))
+        return refuse(why, "content_close " + show(cc) + " other than reasoning_close " +
+                           show(f.reasoning_close) + " is not read yet");
+    return RAD_OK;
+}
+
 /* Does the template write an argument's value on lines of its own? Then one newline at each end
  * is the tags' (ChatFormat::value_newlines). A template that writes it flush against its tags
  * (`<arg_value>VALUE</arg_value>`) leaves those newlines to the value; reading them as the tags'
@@ -185,6 +202,10 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         return no("reasoning_anywhere needs a reasoning block with an opener");
     {
         const int st = message_open_check(f, why);
+        if (st < 0) return st;
+    }
+    {
+        const int st = content_close_check(f, why);
         if (st < 0) return st;
     }
 
@@ -402,6 +423,7 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.content_open        = s(c.content_open);
     f.object_args_key     = s(c.object_args_key);
     f.message_open        = s(c.message_open);
+    f.content_close       = s(c.content_close);
     *out = std::move(f);
     return RAD_OK;
 }
@@ -517,7 +539,9 @@ std::string chat_format_describe(const ChatFormat& f) {
              (f.reasoning_anywhere ? " anywhere" : "");
     else
         s += " no reasoning";
-    if (!f.content_open.empty()) s += "; content " + show(f.content_open);
+    if (!f.content_open.empty())
+        s += "; content " + show(f.content_open) +
+             (f.content_close.empty() ? std::string() : ".." + show(f.content_close));
     if (!f.message_open.empty()) s += "; messages open with " + show(f.message_open);
     if (f.has_tools() && !f.section_open.empty())
         s += "; section " + show(f.section_open) + ".." + show(f.section_close);
@@ -558,7 +582,8 @@ std::vector<std::string> chat_format_markers(const ChatFormat& f) {
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
                                   &f.arg_value_prefix, &f.arg_json_value_prefix,
                                   &f.arg_value_suffix, &f.object_string_open,
-                                  &f.object_string_close, &f.message_open }) {
+                                  &f.object_string_close, &f.message_open,
+                                  &f.content_close }) {
         const std::string t = trim_ws(*s);
         if (!t.empty() && std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
     }

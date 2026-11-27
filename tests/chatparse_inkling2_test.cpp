@@ -177,7 +177,9 @@ TEST(an_answer_reads_as_reasoning_and_content_with_no_markup) {
     for (const json* t : { &tools(), (const json*)nullptr }) {
         const auto p = parser(inkling(), t);
         REQUIRE(p);
-        const ReplyMessage m = reply_parse(*p, kNoCall);
+        bool strict = false;
+        const ReplyMessage m = reply_parse(*p, kNoCall, &strict);
+        CHECK(strict);   /* the answer's own <|end_message|> is in the format */
         CHECK_EQ(m.reasoning, want_r);
         CHECK_EQ(m.content, std::string("Hello! Nice to meet you."));
         CHECK(m.calls.empty());
@@ -186,11 +188,80 @@ TEST(an_answer_reads_as_reasoning_and_content_with_no_markup) {
     /* an answer with no reasoning before it */
     const auto p = parser(inkling());
     REQUIRE(p);
+    bool strict = false;
     const ReplyMessage m =
-        reply_parse(*p, "<|message_model|><|content_text|>Hi there.<|end_message|>");
+        reply_parse(*p, "<|message_model|><|content_text|>Hi there.<|end_message|>", &strict);
+    CHECK(strict);
     CHECK_EQ(m.reasoning, std::string());
     CHECK_EQ(m.content, std::string("Hi there."));
     CHECK(m.calls.empty());
+}
+
+/* content_close: the answer's <|end_message|> closes the message its header opened, so it is in the
+ * format once for each header, whether the frame reader or the reply's first bytes read it. */
+TEST(the_answer_close_is_in_the_format_once_a_header) {
+    const auto p = parser(inkling());
+    REQUIRE(p);
+    const std::string call =
+        "<|message_model|>get_weather<|content_invoke_tool_json|>"
+        "{\"name\":\"get_weather\",\"args\":{\"city\":\"Lehi\"}}<|end_message|>";
+    struct Case {
+        const char* what;
+        std::string reply;
+        bool        strict;
+        const char* content;
+        const char* reasoning;
+        const char* call_args;   /* the one call's arguments, or null for none */
+    };
+    const Case cases[] = {
+        { "the header opens the reply",
+          "<|content_text|>Hi.<|end_message|>", true, "Hi.", "", nullptr },
+        { "two answers, each closed",
+          "<|message_model|><|content_text|>Hi.<|end_message|>"
+          "<|message_model|><|content_text|> Bye.<|end_message|>", true, "Hi. Bye.", "", nullptr },
+        { "an answer, then a call",
+          "<|message_model|><|content_thinking|>Say, then call.<|end_message|>"
+          "<|message_model|><|content_text|>Let me check.<|end_message|>" + call,
+          true, "Let me check.", "Say, then call.", R"({"city":"Lehi"})" },
+        { "reasoning that opens again after the answer",
+          "<|message_model|><|content_thinking|>First.<|end_message|>"
+          "<|message_model|><|content_text|>Hi.<|end_message|>"
+          "<|message_model|><|content_thinking|>Later.<|end_message|>",
+          true, "Hi.", "First.Later.", nullptr },
+        /* generation can stop before the close (max_tokens): the answer is still the answer */
+        { "an answer cut off before its close",
+          "<|message_model|><|content_text|>Hi.", true, "Hi.", "", nullptr },
+        { "a second close, with no message open",
+          "<|message_model|><|content_text|>Hi.<|end_message|><|end_message|>", false, "Hi.", "",
+          nullptr },
+        { "a close with no header before it",
+          "Hi.<|end_message|>", false, "Hi.", "", nullptr },
+    };
+    for (const Case& c : cases) {
+        bool strict = !c.strict;
+        const ReplyMessage m = reply_parse(*p, c.reply, &strict);
+        const bool calls_ok = c.call_args
+            ? m.calls.size() == 1u && m.calls[0].name == "get_weather" && m.calls[0].closed &&
+                  args(m.calls[0]) == json::parse(c.call_args)
+            : m.calls.empty();
+        if (strict != c.strict || m.content != c.content || m.reasoning != c.reasoning || !calls_ok)
+            ::radtest::fail(__FILE__, __LINE__, std::string(c.what) + ": " + show(m) +
+                                                    (strict ? " (strict)" : " (not strict)"));
+        streams(*p, c.reply);
+    }
+}
+
+/* Without content_close the same reply reads the same, but its close leaves the format, as it did
+ * before the field: nothing is inferred from the close happening to be reasoning_close. */
+TEST(without_content_close_the_answer_close_leaves_the_format) {
+    ChatFormat f = inkling();
+    f.content_close.clear();
+    const auto p = parser(f);
+    REQUIRE(p);
+    bool strict = true;
+    const ReplyMessage m = reply_parse(*p, kNoCall, &strict);
+    CHECK(!strict);
+    CHECK_EQ(m.content, std::string("Hello! Nice to meet you."));
 }
 
 TEST(the_answer_reads_as_before_the_header_was_named) {
@@ -199,6 +270,7 @@ TEST(the_answer_reads_as_before_the_header_was_named) {
     ChatFormat old = inkling();
     old.message_open.clear();
     old.content_open.clear();
+    old.content_close.clear();
     old.name_prefix.clear();
     old.name_suffix.clear();
     old.call_end.clear();
@@ -347,7 +419,9 @@ TEST(the_format_is_accepted_and_described) {
     CHECK_OK(chat_format_check(f, &why));
     CHECK_EQ(f.object_args_key, std::string("args"));
     CHECK_EQ(f.message_open, std::string("<|message_model|>"));
+    CHECK_EQ(f.content_close, std::string("<|end_message|>"));
     const std::string d = chat_format_describe(f);
+    CHECK(d.find("content \"<|content_text|>\"..\"<|end_message|>\"") != std::string::npos);
     CHECK(d.find("envelope {\"name\":NAME,\"args\":OBJECT}") != std::string::npos);
     CHECK(d.find("messages open with \"<|message_model|>\"") != std::string::npos);
     CHECK(d.find("no tool calls") == std::string::npos);
@@ -392,6 +466,10 @@ TEST(what_the_envelope_and_header_cannot_read_is_refused) {
                 f.reasoning_open.clear(); f.reasoning_close.clear(); f.reasoning_anywhere = false;
                 f.content_open.clear(); },
             "message_open needs");
+    refused([](ChatFormat& f) { f.content_close = "<|end_message|> "; }, "whitespace");
+    refused([](ChatFormat& f) { f.content_open.clear(); }, "needs content_open");
+    refused([](ChatFormat& f) { f.reasoning_anywhere = false; }, "needs reasoning_anywhere");
+    refused([](ChatFormat& f) { f.content_close = "<|end_text|>"; }, "not read yet");
 }
 
 TEST(a_plugin_compiled_before_the_fields_reads_them_as_empty) {
@@ -409,6 +487,11 @@ TEST(a_plugin_compiled_before_the_fields_reads_them_as_empty) {
     CHECK_OK(chat_format_from_abi(&c, &f, &why));
     CHECK_EQ(f.object_args_key, std::string("args"));
     CHECK(f.message_open.empty());
+    CHECK(f.content_close.empty());
+    c.struct_size = (uint32_t)offsetof(RadChatFormat, content_close);
+    CHECK_OK(chat_format_from_abi(&c, &f, &why));
+    CHECK_EQ(f.message_open, std::string("<|message_model|>"));
+    CHECK(f.content_close.empty());
 }
 
 /* ================================================================== the grammar */

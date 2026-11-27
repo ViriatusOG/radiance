@@ -318,6 +318,13 @@ std::string check_stream(const ReplyParser& p, const std::string& text,
     if (!err.empty()) return err;
     if (!same(got, expect)) return "the deltas add up to\n      " + show(got);
     if (!same(s->message(), expect)) return "the message is\n      " + show(s->message());
+    /* Whether the reply stayed in the format is the reply's, not the cut's: the server logs a
+     * reply that left it, so a cut that changes the verdict changes what is logged. */
+    bool whole = false;
+    reply_parse(p, text, &whole);
+    if (s->strict() != whole)
+        return std::string("read ") + (s->strict() ? "strict" : "lenient") + " cut this way, " +
+               (whole ? "strict" : "lenient") + " read whole";
     /* Where each call begins (an open call's text is read back from there) depends on the reply,
      * not on how it was cut. */
     for (size_t i = 0; i < expect.calls.size(); ++i) {
