@@ -31,7 +31,7 @@ models:
 Keep this order: the library hierarchy wins before row priority. Libr4d's bf16 MLA rows do not
 constrain `kv_dtype`, so putting libr4d first can select a row that rejects the i8 operand.
 Bf16 and fp8 MLA selection stays in libr4d. The container recipe is
-`data/recipes/glm53-iqr-v4.recipe`; IQ8R MTP and the MLA row form are not served
+`data/recipes/glm53-iqr-v4.recipe`; the MLA row form is not served on an IQ8R trunk
 (`docs/ARCHITECTURES.md`, `arch/glm5next/glm5next.cpp`).
 
 ## Measured

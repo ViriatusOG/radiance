@@ -56,6 +56,7 @@ static std::vector<std::pair<std::string, RadEncoding>> glm_v2_encs(const RadEnc
         { "attn_q_a.weight", q },        { "attn_kv_a.weight", q },
         { "attn_q_b.weight", q } };
     for (int l = 3; l < 45; l += 4) e.push_back({ "blk." + std::to_string(l) + ".attn_output.", q });
+    e.push_back({ "blk.45.attn_output.", q });
     return e;
 }
 static RadModelMeta glm_meta() {
@@ -1892,56 +1893,71 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
  * and the routed arm takes its own rotated copy of the block input. */
 TEST(glm53_v2_declares_an_iq8r_trunk_with_iqr_experts) {
     const RadModelMeta meta = glm_meta();
-    for (const bool fed : { true, false })
-        for (const int world : { 1, 2, 4, 8 }) {
-            RadBuilder b;
-            b.kv_block = 4;
-            b.encs = glm_v2_encs(glm_iqr());
-            if (!fed) b.undeclared = { "rmsnorm_had_quant_i8g" };
-            RadBuildCtx ctx = spec_ctx(0, world, 0);
-            ctx.max_tok = 256;
-            ctx.max_seqs = 4;
-            ctx.max_ctx = 32768;
-            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
-            const int64_t T = 256;
-            const RecBuf* nq = find_b(b, "normalized.q8");
-            const RecBuf* ns = find_b(b, "normalized.s8");
-            REQUIRE(nq && ns);
-            CHECK_EQ(nq->d.dtype, (uint32_t)RAD_I8);
-            CHECK_EQ(ns->d.shape[1], 4096 / 256);
-            /* The E4M3 pair only where the norm cannot write the codes. */
-            CHECK_EQ(find_b(b, "normalized.q") != nullptr, !fed);
-            const RecBuf* eq = find_b(b, "expert_ff.q8");
-            const RecBuf* es = find_b(b, "expert_ff.s8");
-            REQUIRE(eq && es);
-            CHECK_EQ(eq->d.shape[0], 8 * T);
-            const int64_t FE = world <= 2 ? 2048 : 2048 / world;  /* split by width from four */
-            CHECK_EQ(eq->d.shape[1], FE);
-            CHECK_EQ(es->d.shape[1], FE / 128);
-            CHECK(find_b(b, "expert_ff.q") == nullptr);
-            CHECK_EQ(find_b(b, "normalized_rot.q8") != nullptr, !fed);
-            for (const char* n : { "q_low.q8", "expanded.q8", "dense_ff.q8", "shared_ff.q8" })
-                CHECK(find_b(b, n) != nullptr);
-            for (const char* n : { "expanded.q", "dense_ff.q", "shared_ff.q" })
-                CHECK(find_b(b, n) == nullptr);
-            /* The trunk's int8 GEMMs are IQ8R's; KDA's projections stay bf16 GEMMs. */
-            int iq8r = 0;
-            for (const auto& o : b.ops)
-                if (o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h") {
-                    CHECK_EQ(pint(&o, "group"), 256);
-                    ++iq8r;
+    for (const int max_spec : { 0, 3 })
+        for (const bool fed : { true, false })
+            for (const int world : { 1, 2, 4, 8 }) {
+                RadBuilder b;
+                b.kv_block = 4;
+                b.encs = glm_v2_encs(glm_iqr());
+                if (!fed) b.undeclared = { "rmsnorm_had_quant_i8g" };
+                RadBuildCtx ctx = spec_ctx(0, world, max_spec);
+                ctx.max_tok = 256;
+                ctx.max_seqs = 4;
+                ctx.max_ctx = 32768;
+                REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+                CHECK(glm_maps_are_unique(b));
+                const int64_t T = 256;
+                const RecBuf* nq = find_b(b, "normalized.q8");
+                const RecBuf* ns = find_b(b, "normalized.s8");
+                REQUIRE(nq && ns);
+                CHECK_EQ(nq->d.dtype, (uint32_t)RAD_I8);
+                CHECK_EQ(ns->d.shape[1], 4096 / 256);
+                /* The E4M3 pair only where the norm cannot write the codes. */
+                CHECK_EQ(find_b(b, "normalized.q") != nullptr, !fed);
+                const RecBuf* eq = find_b(b, "expert_ff.q8");
+                const RecBuf* es = find_b(b, "expert_ff.s8");
+                REQUIRE(eq && es);
+                CHECK_EQ(eq->d.shape[0], 8 * T);
+                const int64_t FE = world <= 2 ? 2048 : 2048 / world;  /* split by width from four */
+                CHECK_EQ(eq->d.shape[1], FE);
+                CHECK_EQ(es->d.shape[1], FE / 128);
+                CHECK(find_b(b, "expert_ff.q") == nullptr);
+                CHECK_EQ(find_b(b, "normalized_rot.q8") != nullptr, !fed);
+                for (const char* n : { "q_low.q8", "expanded.q8", "dense_ff.q8", "shared_ff.q8" })
+                    CHECK(find_b(b, n) != nullptr);
+                for (const char* n : { "expanded.q", "dense_ff.q", "shared_ff.q" })
+                    CHECK(find_b(b, n) == nullptr);
+                /* The trunk's int8 GEMMs are IQ8R's; KDA's projections stay bf16 GEMMs. */
+                int iq8r = 0;
+                for (const auto& o : b.ops)
+                    if (o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h") {
+                        CHECK_EQ(pint(&o, "group"), 256);
+                        ++iq8r;
+                    }
+                /* 3 dense x 2 + (11 or 12) MLA x 4 + (42 or 43) shared x 2. */
+                const int n_mla = max_spec > 0 ? 12 : 11;
+                const int n_routed = max_spec > 0 ? 43 : 42;
+                CHECK_EQ(iq8r, 3 * 2 + n_mla * 4 + n_routed * 2);
+                CHECK(count_op(b, "swiglu_clamped_had_quant_i8g") >= 3 + 2 * n_routed);
+                CHECK(count_op(b, "moe_gemm_q") > 0);
+                CHECK(count_op(b, "gemm_nt") > 0);
+                CHECK(find_op(b, "quant_act_fp8") == nullptr);
+                /* A mixed step (two decode rows beside a 200-row prefill chunk) issues every op with
+                 * the int8 pairs written before they are read. */
+                auto k = kit(b, { 1, 1 }, { 200 }, 300);
+                if (max_spec > 0) {
+                    auto hp = history_pass(b, *k);
+                    auto cp = context_pass(b, *k);
+                    auto rp = round_pass(b, k->b.n_seq, 2);
+                    auto passes = run_passes(b, glm5next::step, { k.get(), hp.get(), rp.get() }, 0, world);
+                    CHECK_PASSES(b, passes);
+                    auto ctx_passes = run_passes(b, glm5next::step, { k.get(), cp.get() }, 0, world);
+                    CHECK_PASSES(b, ctx_passes);
+                } else {
+                    auto passes = run_passes(b, glm5next::step, { k.get() }, 0, world);
+                    CHECK_PASSES(b, passes);
                 }
-            /* 3 dense x 2 + 11 MLA x 4 + 42 shared x 2. */
-            CHECK_EQ(iq8r, 3 * 2 + 11 * 4 + 42 * 2);
-            CHECK(count_op(b, "moe_gemm_q") > 0);
-            CHECK(count_op(b, "gemm_nt") > 0);
-            CHECK(find_op(b, "quant_act_fp8") == nullptr);
-            /* A mixed step (two decode rows beside a 200-row prefill chunk) issues every op with
-             * the int8 pairs written before they are read. */
-            auto k = kit(b, { 1, 1 }, { 200 }, 300);
-            auto passes = run_passes(b, glm5next::step, { k.get() }, 0, world);
-            CHECK_PASSES(b, passes);
-        }
+            }
 }
 
 /* A protected bf16 expert pair among IQR experts is declared at the expert's own width (2048),
@@ -1983,42 +1999,44 @@ TEST(glm53_v2_kv_cache_dtype_narrows_the_latent_group_only) {
         { (int)RAD_F8E4M3, RAD_F8E4M3, "fp8_e4m3", "fp8_e4m3" },
         { (int)RAD_I8, RAD_I8, "i8", "i8" },
     };
-    for (const Want& w : wants)
-        for (const int world : { 1, 4, 8 })
-            for (int rank = 0; rank < world; rank += world > 1 ? world - 1 : 1) {
-                RadBuilder b;
-                b.kv_block = 4;
-                b.encs = glm_v2_encs(glm_iqr());
-                RadBuildCtx ctx = spec_ctx(rank, world, 0);
-                ctx.max_tok = 256;
-                ctx.max_seqs = 4;
-                ctx.max_ctx = 32768;
-                ctx.kv_dtype = w.dtype;
-                REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
-                std::map<std::string, RadKVGroupDecl> groups;
-                for (const auto& g : b.kv_groups) groups[g.name] = g.d;
-                CHECK_EQ(groups["kv_latent"].dtype, w.group);
-                CHECK_EQ(groups["kv_latent"].head_dim, 256);
-                CHECK_EQ(groups["kv_latent"].n_head_kv, 1);
-                CHECK_EQ(groups["kv_index_tail"].dtype, (uint32_t)RAD_BF16);
-                CHECK_EQ(groups["kv_dsa_index"].dtype, (uint32_t)RAD_U8);
-                CHECK_EQ(groups["kv_kda"].dtype, (uint32_t)RAD_F32);
-                CHECK_EQ(groups["kv_kda_conv"].dtype, (uint32_t)RAD_BF16);
-                int stores = 0, attns = 0;
-                for (const auto& o : b.ops) {
-                    if (o.op == "kv_store" || o.op == "kv_store_streamed") {
-                        ++stores;
-                        CHECK_EQ(pstr(&o, "kv_dtype"), w.store);
+    for (const int max_spec : { 0, 3 })
+        for (const Want& w : wants)
+            for (const int world : { 1, 4, 8 })
+                for (int rank = 0; rank < world; rank += world > 1 ? world - 1 : 1) {
+                    RadBuilder b;
+                    b.kv_block = 4;
+                    b.encs = glm_v2_encs(glm_iqr());
+                    RadBuildCtx ctx = spec_ctx(rank, world, max_spec);
+                    ctx.max_tok = 256;
+                    ctx.max_seqs = 4;
+                    ctx.max_ctx = 32768;
+                    ctx.kv_dtype = w.dtype;
+                    REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+                    std::map<std::string, RadKVGroupDecl> groups;
+                    for (const auto& g : b.kv_groups) groups[g.name] = g.d;
+                    CHECK_EQ(groups["kv_latent"].dtype, w.group);
+                    CHECK_EQ(groups["kv_latent"].head_dim, 256);
+                    CHECK_EQ(groups["kv_latent"].n_head_kv, 1);
+                    CHECK_EQ(groups["kv_index_tail"].dtype, (uint32_t)RAD_BF16);
+                    CHECK_EQ(groups["kv_dsa_index"].dtype, (uint32_t)RAD_U8);
+                    CHECK_EQ(groups["kv_kda"].dtype, (uint32_t)RAD_F32);
+                    CHECK_EQ(groups["kv_kda_conv"].dtype, (uint32_t)RAD_BF16);
+                    int stores = 0, attns = 0;
+                    for (const auto& o : b.ops) {
+                        if (o.op == "kv_store" || o.op == "kv_store_streamed") {
+                            ++stores;
+                            CHECK_EQ(pstr(&o, "kv_dtype"), w.store);
+                        }
+                        if (o.op == "mla_attn") {
+                            ++attns;
+                            CHECK_EQ(pstr(&o, "kv_dtype"), w.attn);
+                            CHECK_EQ(pint(&o, "block_size"), 4);
+                        }
                     }
-                    if (o.op == "mla_attn") {
-                        ++attns;
-                        CHECK_EQ(pstr(&o, "kv_dtype"), w.attn);
-                        CHECK_EQ(pint(&o, "block_size"), 4);
-                    }
+                    const int n_mla = max_spec > 0 ? 12 : 11;
+                    CHECK(stores >= n_mla);
+                    CHECK_EQ(attns, n_mla);
                 }
-                CHECK(stores >= 11);
-                CHECK_EQ(attns, 11);
-            }
     RadBuilder b;
     b.kv_block = 4;
     b.encs = glm_v2_encs(glm_iqr());
@@ -2091,15 +2109,59 @@ TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {
     CHECK_EQ(declare({ { "ffn_gate_up_exps", glm_iqr() }, { "ffn_down_exps", glm_iqr() } }, 0),
              RAD_E_UNSUPPORTED);
     CHECK_EQ(declare(glm_v2_encs(glm_iqr()), 2048), RAD_E_UNSUPPORTED);
-    /* The draft layer is not served on an IQ8R trunk yet. */
-    RadBuilder b;
-    b.kv_block = 4;
-    b.encs = glm_v2_encs(glm_iqr());
-    RadBuildCtx ctx = spec_ctx(0, 4, 3);
-    ctx.max_tok = 256;
-    ctx.max_seqs = 4;
-    ctx.max_ctx = 32768;
-    CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+    /* Native MTP on IQ8R + IQR declares at every rank count with and without norm-fed codes. */
+    for (const bool fed : { true, false })
+        for (const int world : { 1, 2, 4, 8 }) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            if (!fed) b.undeclared = { "rmsnorm_had_quant_i8g" };
+            RadBuildCtx ctx = spec_ctx(0, world, 3);
+            ctx.max_tok = 256;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 32768;
+            CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK(glm_maps_are_unique(b));
+        }
+    /* Layer-45 experts in plain bf16 on an IQ8R trunk are refused. */
+    {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", rad_enc_plain(RAD_BF16) },
+                   { "mtp.blk.45.ffn_down_exps", rad_enc_plain(RAD_BF16) } };
+        for (const auto& e : glm_v2_encs(glm_iqr())) b.encs.push_back(e);
+        RadBuildCtx ctx = spec_ctx(0, 4, 3);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+    }
+    /* Container converted with --max-spec 0 (layer-45 experts omitted) is refused for native MTP,
+     * but accepted when draft_head_off is set (e.g. --spec-ngram). */
+    {
+        const RadEncoding q = glm_iq8r(), iqr = glm_iqr();
+        std::vector<std::pair<std::string, RadEncoding>> no_mtp = {
+            { "ffn_gate_up_shexp", q },  { "ffn_down_shexp", q },
+            { "ffn_gate_up.weight", q }, { "ffn_down.weight", q },
+            { "attn_q_a.weight", q },    { "attn_kv_a.weight", q },
+            { "attn_q_b.weight", q } };
+        for (int l = 3; l < 45; ++l) {
+            no_mtp.push_back({ "blk." + std::to_string(l) + ".ffn_gate_up_exps", iqr });
+            no_mtp.push_back({ "blk." + std::to_string(l) + ".ffn_down_exps", iqr });
+            if (l % 4 == 3) no_mtp.push_back({ "blk." + std::to_string(l) + ".attn_output.", q });
+        }
+        for (const int draft_off : { 0, 1 }) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = no_mtp;
+            RadBuildCtx ctx = spec_ctx(0, 4, 3);
+            ctx.draft_head_off = draft_off;
+            ctx.max_tok = 256;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 32768;
+            CHECK_EQ(glm5next::declare(&b, &meta, &ctx), draft_off ? RAD_OK : RAD_E_UNSUPPORTED);
+        }
+    }
 }
 
 /* Expert parallelism gives every rank a disjoint whole-expert window: no width spans, the router
@@ -3035,11 +3097,11 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
         RadBuilder b;
         b.kv_block = 4;
         b.encs = glm_v2_encs(glm_iqr());
-        RadBuildCtx ctx = spec_ctx(rank, world, 0);
+        RadBuildCtx ctx = spec_ctx(rank, world, 3);
         ctx.max_tok = 4096;
         ctx.max_seqs = 8;
         ctx.max_ctx = 65536;
-        // Keep the multi-row KDA verifies and the split-decode logits without declaring MTP.
+        ctx.kv_dtype = RAD_I8;
         ctx.max_out_rows = 48;
         REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
         for (const RecOp& r : b.ops) {
@@ -3060,7 +3122,10 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
         }
         std::vector<std::unique_ptr<Kit>> kits;
         kits.push_back(kit(b, { 1, 1 }, { 498 }, 100));
+        kits.push_back(history_pass(b, *kits.back()));
+        kits.push_back(round_pass(b, kits[0]->b.n_seq, 2));
         kits.push_back(kit(b, {}, { 255 }));
+        kits.push_back(context_pass(b, *kits.back()));
         kits.push_back(kit(b, { 6 }, {}));
         kits.push_back(kit(b, std::vector<int>(6, 1), {}));
         {
