@@ -1219,37 +1219,30 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         xl.unlock();
     }
 
-    /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
-     * transfer stream, and the turnover slots are filled for it (below). Histograms are still
-     * credited; the next unstaged step swaps on them. */
+    /* Swaps go behind every trunk pass, one the prefill stager armed included, so the residency
+     * follows a long prompt's routing as it does when nothing is staged. They share the transfer
+     * stream with the stager's copies, but each promotion is a unit the stager no longer copies
+     * in later passes: on ERNIE-5.5 at TP3 a 32K-token prompt took 46.0 s with them and 46.2 s
+     * without. Withheld, the prompt ran on the placement it started with, and the short turns
+     * that followed on its context hit VRAM less and ran slower than with no ring at all (a
+     * 600-token turn 2.95 s against 2.60 s; 2.55 s with the swaps).
+     *
+     * Fill after the swaps: swaps are the policy's decisions, fills only use spare memory, and a
+     * fill must not take a move record the next swap needs. The turnover slots stay free behind
+     * a staged pass as behind any other, since its swaps use them. Filled there instead, the
+     * swaps fell to the shadow slots, and the first unstaged step after the prompt refilled the
+     * lent arena with the turnover on top (3.2 GiB a card instead of 2.5 at the 600-token turn
+     * above). */
     std::vector<Swap> swaps;
-    if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
-    /* What the turnover slots follow (MoverConfig::turnover_adaptive). A staged step proposes
-     * nothing and holds the turnover filled anyway (below), so it is not a quiet step. */
-    if (!r.stager.staged()) r.mover.swap_demand((int64_t)swaps.size());
+    if (r.heat.step(&swaps) < 0) return;
+    /* What the turnover slots follow (MoverConfig::turnover_adaptive). */
+    r.mover.swap_demand((int64_t)swaps.size());
     for (const Swap& s : swaps) {
         /* Contract: every proposed unit is busy until `issue` takes it or `abandon` returns it;
          * a dropped proposal stays busy forever. */
         if (r.mover.issue(s, &r.heat) < 0) r.heat.abandon(s);
     }
-
-    /* Fill after the swaps: swaps are the policy's decisions, fills only use spare memory, and a
-     * fill must not take a move record the next swap needs.
-     *
-     * Behind a staged pass the turnover slots are filled too, since that step swaps nothing; left
-     * free, the stager would copy those residents instead (at TP2 a 160K-token prompt staged 9.6%
-     * more and ran 3-5% slower).
-     *
-     * They stay filled until kTurnoverAfter consecutive unstaged steps (idle ticks included).
-     * Otherwise a short answer or a pause drops them and the next prompt's first chunk copies them
-     * back, scattering the lent residents through the pool runs the stager coalesces on (at TP2,
-     * back-to-back 26K-token prompts: 33 copies per staged layer instead of 16). Decode reaches the
-     * count in a few steps. */
-    constexpr int kTurnoverAfter = 4;
-    r.unstaged_steps = r.stager.staged() ? 0 : r.unstaged_steps + 1;
-    const bool hold = r.unstaged_steps < kTurnoverAfter;
-    r.mover.hold_turnover(hold);
-    (void)r.mover.balance(&r.heat, !hold);
+    (void)r.mover.balance(&r.heat);
 }
 
 /* ------------------------------------------------------------------ --expert-stats

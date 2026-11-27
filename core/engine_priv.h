@@ -56,8 +56,6 @@ struct Engine::Rank {
      * because its bank holds an already-credited step (the layer did not route). Counting these
      * apart keeps a placement engine starved of evidence from looking like idle layers. */
     uint64_t heat_credited = 0, heat_idle = 0;
-    /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
-    int unstaged_steps = 0;
     KVManager kv;
     PrefixCache prefix;
     /* Idle session tiers (spec 7.3). Rank 0 owns the policy and session index, since a

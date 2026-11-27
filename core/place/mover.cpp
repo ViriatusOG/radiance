@@ -1401,9 +1401,9 @@ int Mover::drop(int32_t unit, HeatEngine* heat) {
 int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
     ClassPools& cp = pools_[klass];
     if (cp.n_donated >= cp.n_turn) return -1;
-    /* Not while the turnover slots are held (around a prompt): a donation releases a starved
-     * swap, two copies on the stream the next prompt stages on. A decode run reaches the donor
-     * count within a few steps anyway. */
+    /* Not while the turnover slots are held (hold_turnover): a donation releases a starved swap,
+     * two copies on the transfer stream. A decode run reaches the donor count within a few steps
+     * anyway. */
     if (hold_turnover_) return -1;
     DonorRank& d = donors_[klass];
     if (d.at != dispatch_) {

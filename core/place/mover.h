@@ -589,15 +589,16 @@ public:
      * rate at the shadow slots. When fewer than the working plus turnover slots are free, the
      * coldest lent units are dropped (an address change, never a copy).
      *
-     * `turnover` false fills the turnover slots too, for steps bound by their own staging copies
-     * (Engine::tiering_dispatch); the next call with true drops them back out. */
+     * `turnover` false fills the turnover slots too, for a caller that proposes no swaps for a
+     * while; the next call with true drops them back out. The engine always passes true: it swaps
+     * behind every pass, a staged one included (Engine::tiering_dispatch). */
     int balance(HeatEngine* heat, bool turnover = true);
 
     /* retire() then balance() for an idle rank, so a loan made while idle is filled before the
      * next request. Call only while the rank thread is parked. */
     int idle_tick(HeatEngine* heat);
-    /* Whether idle ticks keep the turnover slots filled; the engine holds them through a prompt
-     * and the few steps after it (Engine::tiering_dispatch). */
+    /* Whether idle ticks keep the turnover slots filled, and donations wait, as balance(heat,
+     * false) does for a step. The engine never holds them (see balance). */
     void hold_turnover(bool held) { hold_turnover_ = held; }
     /* The swaps the heat engine proposed this step (all classes), once a step before they are
      * issued: what the kept-free turnover follows under MoverConfig::turnover_adaptive, as a
