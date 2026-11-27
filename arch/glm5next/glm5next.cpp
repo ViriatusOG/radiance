@@ -108,16 +108,21 @@ static thread_local std::unique_ptr<Model> probe_model;
 /* Whether every routed expert can be split by width over the ranks: MXFP4 (format 8) or the IQR
  * computed trellis (format 11), each a scale a row and K in whole 128-wide units, so a rank's 512
  * columns of an expert's down projection are four whole units and its gate/up rows whole rows. */
-static bool experts_split_by_width(RadBuilder* b, Names& nm) {
-    for (int l = 3; l < 45; ++l)
+static bool experts_split_by_width(RadBuilder* b, Names& nm, Names* mtp_nm = nullptr) {
+    auto check_layer = [&](Names& n, int l) {
         for (int ge = 0; ge < 288; ++ge)
             for (const char* fmt : { "blk.%d.ffn_gate_up_exps.%d.weight",
                                      "blk.%d.ffn_down_exps.%d.weight" }) {
                 RadEncoding e{};
-                if (!weight_enc(b, nm.f(fmt, l, ge), &e)) return false;
+                if (!weight_enc(b, n.f(fmt, l, ge), &e)) return false;
                 const int f = MoeQ::format_of(e);
                 if (f != 8 && f != 11) return false;
             }
+        return true;
+    };
+    for (int l = 3; l < 45; ++l)
+        if (!check_layer(nm, l)) return false;
+    if (mtp_nm && !check_layer(*mtp_nm, 45)) return false;
     return true;
 }
 
@@ -433,7 +438,7 @@ static MoeQ::Src moe_source(const Model& m, Names& nm, int l) {
 
 static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool draft) {
     const auto& g = m.g;
-    if (!draft && l >= 3 && (size_t)l >= m.moe_src.size()) return RAD_E_INVAL;
+    if (l >= 3 && (size_t)l >= m.moe_src.size()) return RAD_E_INVAL;
     lay.draft = draft;
     lay.full = draft || l % 4 == 3;
     const char* pre = nm.ckpt("model.language_model.layers.%d", l);
@@ -492,15 +497,9 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
     } else {
         auto w = m.mw;
         w.x = input;
-        /* The trunk's routed layers were probed before the buffers (declare); the draft layer is
-         * probed here, through its own names. */
-        MoeQ::Src s;
-        if (draft) {
-            s = moe_source(m, nm, l);
-            RAD_ARCH_TRY(MoeQ::probe(b, nm, l, s, &s.cfg));
-        } else {
-            s = m.moe_src[(size_t)l];
-        }
+        /* Every routed layer (trunk 3..44, and draft 45 when declared) was probed before the
+         * buffers in declare(); reuse its source so no name map is declared twice. */
+        MoeQ::Src s = m.moe_src[(size_t)l];
         /* The MoE helper takes a protected bf16 expert's whole width from `n_ff_all`, which the
          * model sets to the dense layers' 12288; an expert is 2048 wide. */
         Geom mg = g;
@@ -598,8 +597,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& nm = m.nm;
     m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
+    const bool want_mtp = rad_ctx_draft_head(ctx) != 0;
     m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
-                                                   !experts_split_by_width(b, nm)));
+                                                   !experts_split_by_width(
+                                                       b, nm, want_mtp ? &m.mtp.nm : nullptr)));
     if (m.whole_experts) {
         /* Even counts, as the quantised GEMM's two parity tables need. A rank given few enough
          * experts to hold them all in VRAM streams none over its link. */
@@ -625,10 +626,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- each routed layer's expert format, read before any buffer is declared: the format
      * decides the routed arm's code pair (ffn_buffers). The probe declares the layer's first
      * experts' name maps, which the layer's declare skips. */
-    m.moe_src.assign(45, MoeQ::Src{});
+    const int n_routed_end = want_mtp ? 46 : 45;
+    m.moe_src.assign((size_t)n_routed_end, MoeQ::Src{});
     for (int l = 3; l < 45; ++l) {
         m.moe_src[(size_t)l] = moe_source(m, nm, l);
         RAD_ARCH_TRY(MoeQ::probe(b, nm, l, m.moe_src[(size_t)l], &m.moe_src[(size_t)l].cfg));
+    }
+    if (want_mtp) {
+        m.moe_src[45] = moe_source(m, m.mtp.nm, 45);
+        RAD_ARCH_TRY(MoeQ::probe(b, m.mtp.nm, 45, m.moe_src[45], &m.moe_src[45].cfg));
     }
     /* ---- the trunk's stored form, read from layer 0's dense gate_up through that layer's own
      * LinearQ (MlpQ then does not map it again). */
@@ -643,7 +649,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       linear_is_w8h(enc) && !linear_is_wnh(enc);
         m.trunk_g8 = m.trunk_rot ? linear_w8h_group(enc) : (int64_t)RAD_SCALE_GROUP;
     }
-    for (int l = 3; l < 45; ++l) {
+    if (m.trunk_rot && want_mtp) {
+        RadEncoding e45{};
+        const char* p45 = m.mtp.nm.f("blk.45.ffn_gate_up_exps.%lld.weight",
+                                     (long long)m.moe_src[45].cfg.probed_expert);
+        if (!weight_enc(b, p45, &e45)) {
+            fprintf(stderr, "radiance: glm5next: container has no MTP draft layer "
+                            "(converted with --max-spec 0); serve with "
+                            "num-speculative-tokens: 0 or re-convert with --max-spec > 0\n");
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    for (int l = 3; l < n_routed_end; ++l) {
         const MoeQ::Config& c = m.moe_src[(size_t)l].cfg;
         const bool int8_experts = c.expert_iqr || c.expert_i8;
         if (m.trunk_rot && (c.expert_bf16 || !int8_experts)) {
@@ -658,15 +675,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "trunk is not IQ8R; they read the trunk's rotated int8 codes\n", l);
             return RAD_E_UNSUPPORTED;
         }
-    }
-    /* The draft layer's IQ8R and IQR wiring is not yet covered (its names are under the draft
-     * scope and it reads the trunk's pairs from its own join), so an IQ8R container is served
-     * without it until it is. */
-    if (m.trunk_rot && ctx->max_spec > 0) {
-        fprintf(stderr, "radiance: glm5next: the MTP draft layer of an IQ8R trunk is not served yet; "
-                        "`num-speculative-tokens: 0` serves the model without it (and rad-convert "
-                        "--max-spec 0 converts it without it)\n");
-        return RAD_E_UNSUPPORTED;
     }
     if (m.trunk_rot && m.form == GlmMla::Form::rows) {
         fprintf(stderr, "radiance: glm5next: the MLA row form (tp-attn-rows) views its head-form "
