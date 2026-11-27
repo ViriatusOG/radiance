@@ -1699,6 +1699,7 @@ bool Scheduler::preempt_back() {
     r.n_accepted = 0;
     r.state = ReqState::Preempted;
     s.preempted_us = mono_us();
+    server::sink_preempted(r.sink);
     s.drafter_reset();
     /* Also clear the request's own window. The sampler stages 1 + Request::n_draft rows
      * (Sampler::build_step), and a drafter may have set it for the step this preemption removed;

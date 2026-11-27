@@ -89,12 +89,18 @@ public:
      * IScheduler::cancel() also tells it; this is the cheap path with no lookup. */
     bool cancel_requested() const { return cancel_.load(std::memory_order_acquire); }
 
-    /* Admission accounting, set once by the scheduler when the prompt is placed. */
+    /* Admission accounting, from the first time the scheduler places the prompt; a recompute
+     * after preemption does not replace it. */
     void set_prompt_stats(int32_t n_prompt, int32_t n_cached);
 
     /* Marks the first step the scheduler gives this request, where its prompt phase starts, so
-     * queue time is not counted as prefill. A preempted request keeps its first mark. */
+     * queue time is not counted as prefill. A preempted request keeps its first mark; a later
+     * call ends the preemption mark_preempted() opened. */
     void mark_admitted();
+    /* The scheduler took this request out of the running batch. Only a preemption after the
+     * first token is timed, from here to the re-admission, and it counts once a token follows,
+     * so preempted_ns() lies inside [t_first_token_ns, t_last_token_ns]. */
+    void mark_preempted();
     /* One verify step: `n` draft tokens proposed, `accepted` taken. Summed per request for
      * /metrics' draft counters. */
     void add_drafts(int32_t n, int32_t accepted);
@@ -130,6 +136,8 @@ public:
     int64_t t_first_token_ns() const { return t_first_.load(std::memory_order_acquire); }
     int64_t t_last_token_ns() const  { return t_last_.load(std::memory_order_acquire); }
     int64_t t_admitted_ns() const    { return t_admit_.load(std::memory_order_acquire); }
+    /* Time spent preempted between the first token and the last: a duration, not a time. */
+    int64_t preempted_ns() const     { return n_preempt_.load(std::memory_order_acquire); }
     int64_t age_ns() const;
     /* The steady clock at construction, which the times above count from; puts two sinks'
      * times on one axis. */
@@ -176,6 +184,9 @@ private:
     std::atomic<int64_t>  t_first_{-1};
     std::atomic<int64_t>  t_last_{-1};
     std::atomic<int64_t>  t_admit_{-1};
+    std::atomic<int64_t>  n_preempt_{0};
+    int64_t               t_preempt_ = -1;      /* producer only: the open preemption's start */
+    int64_t               preempt_owed_ = 0;    /* producer only: ended, no token after it yet */
     std::atomic<int64_t>  n_draft_{0};
     std::atomic<int64_t>  n_draft_acc_{0};
     int64_t               t_start_ns_ = 0;
@@ -216,6 +227,9 @@ inline void sink_prompt_stats(void* s, int32_t n_prompt, int32_t n_cached) {
 }
 inline void sink_admitted(void* s) {
     if (s) static_cast<Sink*>(s)->mark_admitted();
+}
+inline void sink_preempted(void* s) {
+    if (s) static_cast<Sink*>(s)->mark_preempted();
 }
 inline void sink_prompt_progress(void* s, int32_t processed, int32_t total, int32_t cached) {
     if (s) static_cast<Sink*>(s)->set_prompt_progress(processed, total, cached);

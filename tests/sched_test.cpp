@@ -17,6 +17,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 using namespace rad;
@@ -2154,6 +2155,43 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
 
     CHECK_EQ(f.sch.metrics().preemptions, 1);
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
+}
+
+/* A request preempted mid-decode tells its sink, which times it out of the batch until it is
+ * re-admitted, so timings can split the decode window into the time it ran and the time it
+ * waited. A request never preempted reports none. */
+TEST(a_preempted_requests_sink_times_its_wait_out_of_the_batch) {
+    server::Sink sa, sb;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+
+    auto submit = [&](server::Sink* sink, int priority) {
+        auto r = f.request(160, 16);
+        r->sink = sink;
+        r->priority = priority;
+        return f.add(std::move(r));
+    };
+    const uint64_t a = submit(&sa, 0);
+    const uint64_t b = submit(&sb, 5);
+    CHECK(a && b);
+
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                             /* both have their first token */
+    CHECK(f.sch.step() != nullptr);               /* the next block: A is the victim */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+    CHECK_EQ(sa.preempted_ns(), (int64_t)0);      /* counted once a token follows */
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    for (int step = 0; step < 200 && !(sa.done() && sb.done()); ++step) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    REQUIRE(sa.done() && sb.done());
+    CHECK(sa.preempted_ns() >= 20000000);
+    CHECK(sa.preempted_ns() <= sa.t_last_token_ns() - sa.t_first_token_ns());
+    CHECK_EQ(sb.preempted_ns(), (int64_t)0);
 }
 
 /* ================================================================== the step batch */

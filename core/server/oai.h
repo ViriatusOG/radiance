@@ -416,6 +416,9 @@ struct UsageOut {
  *                 without the admission wait
  *   predicted_n   tokens generated: usage.completion_tokens
  *   predicted_ms  from the first token to the last
+ *   preempted_ms  of predicted_ms, the time the request spent preempted, out of the batch
+ *                 until re-admitted; 0 if it never was. predicted_ms - preempted_ms is the
+ *                 time it was in the running batch (a radiance field, not llama.cpp's)
  *   draft_n, draft_n_accepted
  *                 speculative tokens proposed for this request and accepted; present when any
  *                 were proposed, as in llama.cpp
@@ -427,7 +430,8 @@ struct UsageOut {
  * Rates are prompt_n / prompt_ms and (predicted_n - 1) / predicted_ms, since the first token
  * belongs to the prompt phase; the latter matches /metrics' time per output token. A rate with a
  * zero count or time is null. Over several choices the counts are summed and each time spans the
- * earliest choice's start to the latest choice's end. */
+ * earliest choice's start to the latest choice's end; preempted_ms is the longest any choice was
+ * preempted. */
 struct TimingsOut {
     bool    valid = false;       /* some choice produced a token; nothing is reported otherwise */
     int64_t prompt_n = 0, cache_n = 0;
@@ -435,6 +439,7 @@ struct TimingsOut {
     int64_t predicted_n = 0;
     int64_t decode_n = 0;        /* of predicted_n, the tokens after each choice's first */
     double  predicted_ms = 0.0;
+    double  preempted_ms = 0.0;
     int64_t draft_n = 0, draft_n_accepted = 0;
     double  ttft_ms = -1.0, total_ms = -1.0;   /* < 0: the body's arrival is not known */
 };
