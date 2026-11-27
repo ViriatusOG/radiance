@@ -133,10 +133,6 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
 
 # ------------------------------------------------------------------------------------------ build
 FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION} AS build
-ARG GPU_TARGETS="gfx1201;gfx11-generic;gfx1151"
-# Parallel compile jobs; empty means one per core. A device-kernel translation unit takes 2-3 GB
-# of RAM under hipcc, so lower it on a host that is also serving.
-ARG JOBS=
 
 # g++-14 rather than the default 13: hipcc compiles device-side translation units against its
 # libstdc++, which is also the runtime image's. gawk: tools/ops_doc_check.sh uses gensub, which
@@ -147,7 +143,7 @@ ARG JOBS=
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 libopenh264-7 busybox-static \
-      libopenblas-dev \
+      libopenblas-dev ccache \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
@@ -188,18 +184,34 @@ RUN set -e; R=/opt/rocm; D=/opt/rocm-repeatable; L=lib/llvm; \
 WORKDIR /src
 COPY . .
 
+# Declared after COPY so changing -t or -j keeps the layers above.
+ARG GPU_TARGETS="gfx1201;gfx11-generic;gfx1151"
+# Parallel compile jobs; empty means one per core. A device-kernel translation unit takes 2-3 GB
+# of RAM under hipcc, so lower it on a host that is also serving.
+ARG JOBS=
+
 # The prefix is fixed at configure time because the default $RADIANCE_HOME is compiled in as
 # <prefix>/share/radiance; DESTDIR stages the tree without moving that default.
 # oom_score_adj 1000: on a host that is also serving, the OOM killer takes the compiler first.
-RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
-    cmake -S . -B /build -G Ninja \
+# ccache: /build starts empty in every build (any source change re-runs this layer), so only a
+# content-keyed cache keeps the compiles. The rebuilt libLLVM is part of the key, so a VOPD or ROCm
+# change starts clean.
+RUN --mount=type=cache,id=radiance-ccache,target=/ccache \
+    echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
+    export CCACHE_DIR=/ccache CCACHE_MAXSIZE=30G CCACHE_DEPEND=1 \
+      CCACHE_EXTRAFILES=/opt/rocm-repeatable/lib/llvm/lib/$(basename $(readlink -f /opt/rocm/lib/llvm/lib/libLLVM.so)); \
+    ccache -z > /dev/null \
+ && cmake -S . -B /build -G Ninja \
       -DCMAKE_INSTALL_PREFIX=/opt/radiance \
       -DRAD_WITH_HIP=ON -DRAD_WITH_FFMPEG=ON \
       "-DRAD_GPU_TARGETS=${GPU_TARGETS}" \
       -DCMAKE_HIP_COMPILER=/opt/rocm-repeatable/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
       -DCMAKE_HIP_FLAGS=--rocm-path=/opt/rocm \
       -DRAD_HIP_VOPD_REPEATABLE=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
  && cmake --build /build ${JOBS:+-j${JOBS}} \
+ && ccache -s \
  && DESTDIR=/stage cmake --install /build \
  && mkdir -p /stage/opt/radiance/share/radiance/recipes \
  && cp data/recipes/*.recipe /stage/opt/radiance/share/radiance/recipes/

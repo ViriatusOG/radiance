@@ -28,6 +28,8 @@ cmds=$(ninja -t commands libr4d 2>/dev/null) || {
 line=$(grep -m1 -F -- "-o $O " <<< "$cmds") || fail "no compile command for $O"
 eval "set -- $line"
 args=("$@")
+# The build compiles through ccache (Dockerfile); check the compiler behind it.
+[ "${args[0]##*/}" != ccache ] || args=("${args[@]:1}")
 [ "${args[0]}" = "$IMAGE" ] || fail "the build compiled with ${args[0]}, not $IMAGE"
 for a in "${args[@]}"; do
     case "$a" in *amdgpu-enable-vopd*) fail "the build turned VOPD pairing off ($a)" ;; esac
